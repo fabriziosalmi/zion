@@ -274,8 +274,8 @@ pub(crate) async fn process_request(
         };
 
         // Gate: WAF URI scan (catches SQLi/XSS in query parameters for ALL methods)
-        let uri_str = req.uri().to_string();
-        if let waf::WafVerdict::Deny(reason) = waf::validate_uri(&uri_str) {
+        let uri_str = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or_else(|| req.uri().path());
+        if let waf::WafVerdict::Deny(reason) = waf::validate_uri(uri_str) {
             metrics::METRICS
                 .waf_denied
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

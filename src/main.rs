@@ -251,8 +251,10 @@ async fn async_main(
         http_builder: {
             let mut b = AutoBuilder::new(TokioExecutor::new());
             // Limit header count and total header buffer size to prevent header bomb DoS.
-            // hyper defaults: 100 headers, 400KB buf. We tighten both.
-            b.http1().max_headers(64).max_buf_size(32 * 1024); // 64 headers, 32KB total
+            // 16KB buffer is optimal for L1 CPU cache on micro-payloads (API/CSS).
+            b.http1().max_headers(64).max_buf_size(16 * 1024);
+            b.http1().preserve_header_case(false);
+            b.http1().title_case_headers(false);
             b
         },
     });
