@@ -1,0 +1,31 @@
+# Zion profile: TLS + Cache (no WAF)
+[server]
+listen_http = "0.0.0.0:8080"
+listen_https = "0.0.0.0:4432"
+
+[tls]
+cert_path = "./benchmarks/certs/tls.crt"
+key_path = "./benchmarks/certs/tls.key"
+hot_reload = false
+
+[upstreams]
+backend = "http://127.0.0.1:9090"
+frontend = "http://127.0.0.1:9090"
+
+[[route]]
+path = "/api/{*rest}"
+upstream = "backend"
+mode = "standard"
+waf = false
+
+[[route]]
+path = "/_next/static/{*rest}"
+upstream = "frontend"
+mode = "static_cache"
+waf = false
+
+[[route]]
+path = "/{*rest}"
+upstream = "frontend"
+mode = "standard"
+waf = false

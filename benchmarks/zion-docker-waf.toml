@@ -1,0 +1,29 @@
+# Zion config for Docker benchmark — TLS + WAF
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+
+[tls]
+cert_path = "/etc/ssl/bench/tls.crt"
+key_path = "/etc/ssl/bench/tls.key"
+hot_reload = false
+
+[upstreams]
+backend = "http://bench-backend:9090"
+
+[[route]]
+path = "/api/{*rest}"
+upstream = "backend"
+mode = "standard"
+waf = true
+max_body_mb = 10
+
+[[route]]
+path = "/_next/static/{*rest}"
+upstream = "backend"
+mode = "standard"
+
+[[route]]
+path = "/{*rest}"
+upstream = "backend"
+mode = "standard"

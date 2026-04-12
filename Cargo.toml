@@ -1,0 +1,88 @@
+[package]
+name = "zion"
+version = "1.2.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP/1.1 server + client
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1"
+
+# Radix tree routing (same engine as Axum)
+matchit = "0.8"
+
+# TLS + hot-reload
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+arc-swap = "1"
+notify = "7"
+
+# Config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Lock-free concurrent cache
+dashmap = "6"
+
+# High-performance allocator — 2-3x faster than system malloc on small allocs
+mimalloc = { version = "0.1", default-features = false }
+
+# Socket tuning
+socket2 = { version = "0.5", features = ["all"] }
+
+# WAF: Aho-Corasick multi-pattern scanner — O(N) single-pass, no regex
+aho-corasick = "1"
+
+# Fast byte search (used by WAF for encoding detection)
+memchr = "2"
+
+# FNV hash — ~2x faster than SipHash for short keys (SNI hostnames)
+fnv = "1"
+
+# Upstream TLS root CAs (embedded Mozilla bundle — deterministic, no system dep)
+webpki-roots = "0.26"
+
+# WAF: SIMD-accelerated JSON validation (10x faster than serde_json for validation)
+simd-json = "0.14"
+
+# Low-level OS interface (SO_REUSEPORT, TCP_QUICKACK on Linux; sysctlbyname on macOS)
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+io-uring = { version = "0.7", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+# ACME auto-renewal (opt-in: cargo build --features acme)
+instant-acme = { version = "0.8", features = ["hyper-rustls"], optional = true }
+rcgen = { version = "0.14", optional = true }
+base64 = { version = "0.22", optional = true }
+
+# Auth-gate JWT/OIDC (opt-in: cargo build --features auth)
+jsonwebtoken = { version = "9", optional = true }
+
+# HTTP/3 QUIC (opt-in: cargo build --features http3)
+quinn = { version = "0.11", optional = true }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
+
+[features]
+default = []
+io-uring-accept = ["io-uring"]
+acme = ["instant-acme", "rcgen", "base64"]
+auth = ["jsonwebtoken"]
+http3 = ["quinn", "h3", "h3-quinn"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

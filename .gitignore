@@ -1,0 +1,20 @@
+/target
+*.DS_Store
+
+# Benchmark results (generated, large, machine-specific)
+benchmarks/results/
+
+# Generated artifacts
+*.svg
+
+# Docs (VitePress)
+docs/node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+docs/package-lock.json
+
+# Local workspace files
+TODO.md
+
+# Local config (copy zion.example.toml and customize)
+zion.toml

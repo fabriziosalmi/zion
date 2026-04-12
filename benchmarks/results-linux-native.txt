@@ -1,0 +1,24 @@
+test-server listening on :9090
+╔═══════════════════════════════════════════════════╗
+║ NATIVE LINUX — 1 core x86_64, 4GB, Ubuntu 22.04 ║
+║ c=100  10s/test  wrk  NO Docker           ║
+╚═══════════════════════════════════════════════════╝
+
+=== NGINX 1.18 (optimized, native) ===
+  api_get         12338 req/s
+  html            10331 req/s
+  waf_post        11878 req/s
+
+=== ZION TLS (native) ===
+  api_get         12485 req/s
+  html            41673 req/s
+
+=== ZION WAF (native) ===
+  api_get         12477 req/s
+  waf_post        11559 req/s
+
+=== ZION FULL — cache (native) ===
+  js_cached       35973 req/s
+  css_cached      36277 req/s
+
+DONE

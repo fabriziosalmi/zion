@@ -1,0 +1,89 @@
+# ============================================================================
+# FAIR BENCHMARK: Zion vs nginx — identical resource constraints
+# Both containers: 1 CPU, 256MB RAM, same Docker network, same backend
+# ============================================================================
+
+services:
+  # Shared backend (Go, minimal)
+  bench-backend:
+    build: ./backend
+    cpus: 2.0
+    mem_limit: 512m
+    networks:
+      - benchnet
+
+  # ── nginx: TLS reverse proxy (1 worker, access_log off) ──
+  nginx:
+    image: nginx:1.27-alpine
+    cpus: 1.0
+    mem_limit: 256m
+    ports:
+      - "8443:443"
+    volumes:
+      - ./nginx-bench.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/ssl/bench:ro
+    depends_on:
+      - bench-backend
+    networks:
+      - benchnet
+
+  # ── Zion: TLS only (apples-to-apples with nginx) ──
+  zion-tls:
+    build:
+      context: ..
+      dockerfile: benchmarks/Dockerfile.zion
+    cpus: 1.0
+    mem_limit: 256m
+    ports:
+      - "9443:443"
+    environment:
+      - ZION_CONFIG=/etc/zion/zion.toml
+    volumes:
+      - ./zion-docker.toml:/etc/zion/zion.toml:ro
+      - ./certs:/etc/ssl/bench:ro
+    depends_on:
+      - bench-backend
+    networks:
+      - benchnet
+
+  # ── Zion: TLS + WAF ──
+  zion-waf:
+    build:
+      context: ..
+      dockerfile: benchmarks/Dockerfile.zion
+    cpus: 1.0
+    mem_limit: 256m
+    ports:
+      - "9444:443"
+    environment:
+      - ZION_CONFIG=/etc/zion/zion.toml
+    volumes:
+      - ./zion-docker-waf.toml:/etc/zion/zion.toml:ro
+      - ./certs:/etc/ssl/bench:ro
+    depends_on:
+      - bench-backend
+    networks:
+      - benchnet
+
+  # ── Zion: TLS + WAF + Cache (full stack) ──
+  zion-full:
+    build:
+      context: ..
+      dockerfile: benchmarks/Dockerfile.zion
+    cpus: 1.0
+    mem_limit: 256m
+    ports:
+      - "9445:443"
+    environment:
+      - ZION_CONFIG=/etc/zion/zion.toml
+    volumes:
+      - ./zion-docker-full.toml:/etc/zion/zion.toml:ro
+      - ./certs:/etc/ssl/bench:ro
+    depends_on:
+      - bench-backend
+    networks:
+      - benchnet
+
+networks:
+  benchnet:
+    driver: bridge

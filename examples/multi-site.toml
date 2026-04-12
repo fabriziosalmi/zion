@@ -1,0 +1,123 @@
+# ============================================================================
+# MULTI-SITE EXAMPLE — 3 domains, 3 backends, auto-renew certs
+# ============================================================================
+#
+# This config serves:
+#   - api.example.com    → Go backend on :8000 (with WAF)
+#   - app.example.com    → Next.js on :3000 (with cache)
+#   - admin.example.com  → Admin panel on :4000 (internal only)
+#
+# Each domain has its own TLS certificate.
+# Certificates are auto-renewed via ACME (Let's Encrypt).
+
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+
+# ── TLS ──────────────────────────────────────────────────────────
+[tls]
+# Default cert (used for unknown SNI or direct IP access)
+cert_path = "/etc/zion/certs/default/fullchain.pem"
+key_path = "/etc/zion/certs/default/privkey.pem"
+hot_reload = true
+
+# Per-domain certificates (matched by SNI during TLS handshake)
+[[tls.sni]]
+server_name = "api.example.com"
+cert_path = "/etc/zion/certs/api/fullchain.pem"
+key_path = "/etc/zion/certs/api/privkey.pem"
+
+[[tls.sni]]
+server_name = "app.example.com"
+cert_path = "/etc/zion/certs/app/fullchain.pem"
+key_path = "/etc/zion/certs/app/privkey.pem"
+
+[[tls.sni]]
+server_name = "admin.example.com"
+cert_path = "/etc/zion/certs/admin/fullchain.pem"
+key_path = "/etc/zion/certs/admin/privkey.pem"
+
+# Auto-renewal via ACME (Let's Encrypt HTTP-01 challenge)
+# Zion handles the challenge on port 80 automatically.
+[tls.acme]
+email = "ops@example.com"
+domains = ["api.example.com", "app.example.com", "admin.example.com"]
+renew_before_days = 30
+state_dir = "/etc/zion/acme"
+# directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"  # staging
+
+# ── Upstreams ────────────────────────────────────────────────────
+[upstream.api]
+url = "http://127.0.0.1:8000"
+connect_timeout_ms = 3000
+keepalive = 64
+
+[upstream.frontend]
+url = "http://127.0.0.1:3000"
+connect_timeout_ms = 2000
+keepalive = 32
+
+[upstream.admin]
+url = "http://127.0.0.1:4000"
+connect_timeout_ms = 1000
+keepalive = 16
+
+# ── WAF Profiles ─────────────────────────────────────────────────
+[waf_profile.strict]
+max_body_mb = 10
+max_depth = 10
+deny_unknown_content_types = true
+
+# ── Cache Profiles ───────────────────────────────────────────────
+[cache_profile.immutable]
+mode = "memory"
+max_entries = 10000
+ttl_seconds = 31536000
+
+# ── Routes ───────────────────────────────────────────────────────
+# API backend (with WAF)
+[[route]]
+path = "/api/{*rest}"
+upstream = "api"
+waf_profile = "strict"
+
+# Next.js static assets (cached in RAM)
+[[route]]
+path = "/_next/static/{*rest}"
+upstream = "frontend"
+cache_profile = "immutable"
+
+# WebSocket endpoint
+[[route]]
+path = "/ws"
+upstream = "api"
+mode = "websocket"
+
+# SSE streaming
+[[route]]
+path = "/events/stream"
+upstream = "api"
+mode = "sse_stream"
+
+# Admin panel (internal network only)
+[[route]]
+path = "/admin/{*rest}"
+upstream = "admin"
+internal_only = true
+
+# Health + metrics (built-in, no upstream needed)
+[[route]]
+path = "/metrics"
+upstream = "api"
+internal_only = true
+
+# Catch-all → frontend
+[[route]]
+path = "/{*rest}"
+upstream = "frontend"
+
+# ── CORS (for API) ───────────────────────────────────────────────
+[cors]
+allowed_origins = ["https://app.example.com"]
+allowed_headers = ["Content-Type", "Authorization"]
+max_age = 86400

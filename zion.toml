@@ -1,0 +1,65 @@
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+
+[tls]
+cert_path = "/etc/ssl/zion/tls.crt"
+key_path = "/etc/ssl/zion/tls.key"
+hot_reload = true
+
+[upstreams]
+backend = "http://127.0.0.1:8000"
+frontend = "http://127.0.0.1:3000"
+
+# --- ROUTE TABLE (evaluated via Radix Tree, order doesn't matter) ---
+
+[[route]]
+path = "/.well-known/acme-challenge/{*rest}"
+upstream = "backend"
+mode = "standard"
+waf = false
+
+[[route]]
+path = "/api/v1/events/stream"
+upstream = "backend"
+mode = "sse_stream"
+waf = false
+
+[[route]]
+path = "/api/web/logs/stream"
+upstream = "backend"
+mode = "sse_stream"
+waf = false
+
+[[route]]
+path = "/api/v1/backups"
+upstream = "backend"
+mode = "standard"
+waf = true
+max_body_mb = 100
+
+[[route]]
+path = "/api/{*rest}"
+upstream = "backend"
+mode = "standard"
+waf = true
+max_body_mb = 10
+
+[[route]]
+path = "/metrics"
+upstream = "backend"
+mode = "standard"
+waf = false
+internal_only = true
+
+[[route]]
+path = "/_next/static/{*rest}"
+upstream = "frontend"
+mode = "static_cache"
+waf = false
+
+[[route]]
+path = "/{*rest}"
+upstream = "frontend"
+mode = "standard"
+waf = false
