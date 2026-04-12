@@ -164,29 +164,76 @@ fn ensure_l1(max_entries: usize) {
     });
 }
 
+thread_local! {
+    static LOCAL_L2: RefCell<HashMap<Arc<str>, L2Entry>> = RefCell::new(HashMap::new());
+}
+
 /// Two-level static cache.
 pub struct StaticCache {
-    l2: DashMap<Arc<str>, L2Entry>,
+    l2: Option<DashMap<Arc<str>, L2Entry>>,
     l1_max_entries: usize,
 }
 
 impl StaticCache {
     pub fn new() -> Self {
-        // Get L1 capacity from bootstrap detection
-        let l1_max = crate::bootstrap::detect().l1_hot_entries;
+        let platform = crate::bootstrap::detect();
+        let l1_max = platform.l1_hot_entries;
+        // Phase 2 Tuning: adaptive backend fallback
+        // If we only have 1 worker thread (e.g. 1 vCPU docker container), DashMap lock sharding
+        // generates pointless context switching overhead. We bypass it entirely.
+        let l2 = if platform.worker_threads < 2 {
+            crate::logging::info("cache", "deploying single-core lock-free backend");
+            None
+        } else {
+            Some(DashMap::new())
+        };
+
         Self {
-            l2: DashMap::new(),
+            l2,
             l1_max_entries: l1_max,
         }
     }
 
-    /// Lookup: L1 → L2 → None.
-    /// L1 hit: ~5ns (no atomic, no contention).
-    /// L2 hit: ~30ns (sharded DashMap) + promote to L1.
-    /// Returns CacheHit with body + metadata (Content-Type, status).
     #[inline]
     pub fn get(&self, path: &str) -> Option<CacheHit> {
         let l1_max = self.l1_max_entries;
+
+        // If Single-Core fallback is active, bypass L1/L2 distinction.
+        // The L2 becomes thread-local Hashmap (L1 speed for all misses).
+        if self.l2.is_none() {
+            let mut expired = false;
+            let hit = LOCAL_L2.with(|map| {
+                let m = map.borrow();
+                if let Some(entry) = m.get(path) {
+                    if Instant::now() >= entry.expires_at {
+                        expired = true;
+                        None
+                    } else {
+                        Some(CacheHit {
+                            body: entry.body.clone(),
+                            meta: entry.meta.clone(),
+                        })
+                    }
+                } else {
+                    None
+                }
+            });
+            if expired {
+                LOCAL_L2.with(|map| map.borrow_mut().remove(path));
+            }
+            if hit.is_some() {
+                crate::metrics::METRICS
+                    .cache_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                crate::metrics::METRICS
+                    .cache_misses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return hit;
+        }
+
+        let Some(l2_concurrent) = &self.l2 else { unreachable!() };
 
         // L1: thread-local, zero contention
         let l1_hit = L1.with(|l1| {
@@ -203,10 +250,10 @@ impl StaticCache {
         }
 
         // L2: shared DashMap
-        let entry = self.l2.get(path)?;
+        let entry = l2_concurrent.get(path)?;
         if Instant::now() >= entry.expires_at {
             drop(entry);
-            self.l2.remove(path);
+            l2_concurrent.remove(path);
             crate::metrics::METRICS
                 .cache_misses
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -240,17 +287,57 @@ impl StaticCache {
         ttl_seconds: u64,
         max_entries: usize,
     ) {
-        if max_entries > 0 && self.l2.len() >= max_entries {
+        if self.l2.is_none() {
+            // Lock-free single-core backend insertion
+            LOCAL_L2.with(|map| {
+                let mut m = map.borrow_mut();
+                if max_entries > 0 && m.len() >= max_entries {
+                    let now = Instant::now();
+                    let mut expired_keys = Vec::new();
+                    let mut oldest_key = None;
+                    let mut oldest_expiry = now + Duration::from_secs(86400 * 365);
+                    for (k, v) in m.iter().take(64) {
+                        if now >= v.expires_at {
+                            expired_keys.push(k.clone());
+                        } else if v.expires_at < oldest_expiry {
+                            oldest_expiry = v.expires_at;
+                            oldest_key = Some(k.clone());
+                        }
+                    }
+                    for k in &expired_keys {
+                        m.remove(k);
+                    }
+                    if expired_keys.is_empty() {
+                        if let Some(k) = oldest_key {
+                            m.remove(&k);
+                        }
+                    }
+                }
+                m.insert(
+                    Arc::from(path),
+                    L2Entry {
+                        body,
+                        meta,
+                        expires_at: Instant::now() + Duration::from_secs(ttl_seconds),
+                    },
+                );
+            });
+            return;
+        }
+
+        let Some(l2_concurrent) = &self.l2 else { unreachable!() };
+
+        if max_entries > 0 && l2_concurrent.len() >= max_entries {
             let now = Instant::now();
 
             // Sampled eviction: scan at most 64 entries to avoid O(N) full scan.
             // Phase 1: collect expired entries from sample.
-            let sample_size = 64.min(self.l2.len());
+            let sample_size = 64.min(l2_concurrent.len());
             let mut expired_keys: Vec<Arc<str>> = Vec::new();
             let mut oldest_key: Option<Arc<str>> = None;
             let mut oldest_expiry = Instant::now() + Duration::from_secs(86400 * 365);
 
-            for (i, entry) in self.l2.iter().enumerate() {
+            for (i, entry) in l2_concurrent.iter().enumerate() {
                 if i >= sample_size {
                     break;
                 }
@@ -264,18 +351,18 @@ impl StaticCache {
 
             // Remove expired entries
             for key in &expired_keys {
-                self.l2.remove(key);
+                l2_concurrent.remove(key);
             }
 
             // Phase 2: if still full after removing expired, evict closest-to-expiry from sample
             if expired_keys.is_empty() {
                 if let Some(key) = oldest_key {
-                    self.l2.remove(&key);
+                    l2_concurrent.remove(&key);
                 }
             }
         }
 
-        self.l2.insert(
+        l2_concurrent.insert(
             Arc::from(path),
             L2Entry {
                 body,
@@ -287,7 +374,11 @@ impl StaticCache {
 
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.l2.len()
+        if let Some(l2_concurrent) = &self.l2 {
+            l2_concurrent.len()
+        } else {
+            LOCAL_L2.with(|m| m.borrow().len())
+        }
     }
 }
 
