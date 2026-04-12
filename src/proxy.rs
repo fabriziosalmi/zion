@@ -253,6 +253,7 @@ pub async fn proxy_websocket(
         }
     };
     let _ = tcp_stream.set_nodelay(true);
+    crate::net::tune_accepted(&tcp_stream);
 
     // Perform HTTP upgrade handshake with upstream
     *req.uri_mut() = upstream_uri;
