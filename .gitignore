@@ -22,3 +22,8 @@ GEMINI_IMPRO.md
 # Build outputs
 zion-*
 *.tar.gz
+
+# Python
+.venv/
+__pycache__/
+*.pyc
