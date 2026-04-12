@@ -1,0 +1,30 @@
+[Unit]
+Description=Zion Edge Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zion
+Group=zion
+ExecStart=/usr/local/bin/zion
+Environment=ZION_CONFIG=/etc/zion/zion.toml
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/zion
+PrivateTmp=true
+
+# Allow binding to privileged ports (80, 443)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Resource limits
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

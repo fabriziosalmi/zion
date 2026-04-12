@@ -1,0 +1,23 @@
+# ============================================================================
+# ZION EDGE GATEWAY — Minimal Configuration
+# ============================================================================
+# Bare minimum: TLS proxy, no WAF, no cache.
+# For production, use the full template: cp zion.example.toml zion.toml
+
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+
+[tls]
+cert_path = "/etc/ssl/zion/tls.crt"
+key_path = "/etc/ssl/zion/tls.key"
+hot_reload = true
+min_version = "1.3"
+alpn = ["h2", "http/1.1"]
+
+[upstream.backend]
+url = "http://127.0.0.1:8000"
+
+[[route]]
+path = "/{*rest}"
+upstream = "backend"

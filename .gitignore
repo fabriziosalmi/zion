@@ -1,0 +1,24 @@
+/target
+*.DS_Store
+
+# Benchmark results (generated, large, machine-specific)
+benchmarks/results/
+
+# Generated benchmark artifacts
+benchmarks/results/**/*.svg
+
+# Docs (VitePress)
+docs/node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+
+# Local workspace files
+TODO.md
+
+# Local config (copy zion.example.toml and customize)
+zion.toml
+GEMINI_IMPRO.md
+
+# Build outputs
+zion-*
+*.tar.gz

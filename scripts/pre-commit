@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================================
+# ZION PRE-COMMIT HOOK
+# Runs: cargo check + cargo test (fast, ~5 seconds)
+# Benchmark regression check runs post-commit (optional).
+# ============================================================================
+
+echo "── zion pre-commit ──"
+
+# 1. Compile check (catches type errors, borrow issues)
+echo -n "  cargo check... "
+if ! cargo check --quiet 2>&1; then
+    echo "FAILED"
+    echo "Fix compilation errors before committing."
+    exit 1
+fi
+echo "ok"
+
+# 2. Run tests (77 tests, ~0.5s)
+echo -n "  cargo test... "
+if ! cargo test --quiet 2>&1; then
+    echo "FAILED"
+    echo "Fix failing tests before committing."
+    exit 1
+fi
+echo "ok (77 tests)"
+
+# 3. Check for warnings (non-blocking)
+WARNINGS=$(cargo check 2>&1 | grep -c "^warning\[" || true)
+if [[ "$WARNINGS" -gt 0 ]]; then
+    echo "  WARNING: $WARNINGS compiler warnings found"
+fi
+
+echo "── pre-commit passed ──"

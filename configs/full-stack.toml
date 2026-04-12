@@ -1,0 +1,117 @@
+# ============================================================================
+# ZION EDGE GATEWAY — Full Stack Configuration
+# ============================================================================
+# TLS + WAF + cache + rate limiting + ACME + CSP.
+# Production-ready template. Adjust upstreams and domains.
+
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+rate_limit_rps = 100
+rate_limit_window_secs = 1
+
+[tls]
+cert_path = "/etc/ssl/zion/tls.crt"
+key_path = "/etc/ssl/zion/tls.key"
+hot_reload = true
+min_version = "1.3"
+alpn = ["h2", "http/1.1"]
+
+# Uncomment for ACME auto-renewal (requires --features acme)
+# [tls.acme]
+# email = "ops@example.com"
+# domains = ["example.com", "www.example.com"]
+# directory_url = "https://acme-v02.api.letsencrypt.org/directory"
+# state_dir = "/var/lib/zion/acme"
+# renew_before_days = 30
+
+# ── Upstreams ──
+
+[upstream.api]
+url = "http://127.0.0.1:8000"
+connect_timeout_ms = 3000
+keepalive = 64
+
+[upstream.frontend]
+url = "http://127.0.0.1:3000"
+connect_timeout_ms = 2000
+keepalive = 32
+
+[upstream.internal]
+url = "http://127.0.0.1:9090"
+connect_timeout_ms = 1000
+keepalive = 16
+
+# ── WAF Profiles ──
+
+[waf_profile.strict]
+max_body_mb = 10
+max_depth = 10
+max_string_len = 1048576
+deny_unknown_content_types = true
+allowed_content_types = ["application/json", "multipart/form-data"]
+
+[waf_profile.upload]
+max_body_mb = 500
+max_depth = 5
+max_string_len = 1048576
+deny_unknown_content_types = false
+allowed_content_types = ["multipart/form-data", "application/octet-stream"]
+
+# ── Cache Profiles ──
+
+[cache_profile.immutable]
+mode = "memory"
+max_entries = 10000
+ttl_seconds = 31536000   # 1 year
+
+[cache_profile.short]
+mode = "memory"
+max_entries = 1000
+ttl_seconds = 60         # 1 minute
+
+# ── Routes ──
+
+[[route]]
+path = "/.well-known/acme-challenge/{*rest}"
+upstream = "api"
+
+[[route]]
+path = "/api/v1/events/stream"
+upstream = "api"
+mode = "sse_stream"
+
+[[route]]
+path = "/api/v1/ws"
+upstream = "api"
+mode = "websocket"
+
+[[route]]
+path = "/api/v1/backups"
+upstream = "api"
+waf_profile = "upload"
+
+[[route]]
+path = "/api/{*rest}"
+upstream = "api"
+waf_profile = "strict"
+
+[[route]]
+path = "/metrics"
+upstream = "internal"
+internal_only = true
+
+[[route]]
+path = "/admin/{*rest}"
+upstream = "api"
+csp = "default-src 'self'; script-src 'self'"
+waf_profile = "strict"
+
+[[route]]
+path = "/_next/static/{*rest}"
+upstream = "frontend"
+cache_profile = "immutable"
+
+[[route]]
+path = "/{*rest}"
+upstream = "frontend"

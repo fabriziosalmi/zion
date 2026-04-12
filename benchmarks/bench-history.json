@@ -1,0 +1,26 @@
+[
+  {
+    "commit": "7a1fca2",
+    "branch": "master",
+    "arch": "native",
+    "timestamp": "2026-04-12T16:22:31Z",
+    "tls_proxy_rps": 95152,
+    "html_rps": 241688,
+    "js_rps": 76404,
+    "png_rps": 46704,
+    "waf_post_rps": 93020,
+    "cache_hit_rps": 214897,
+    "font_rps": 53555,
+    "css_rps": 161360,
+    "sqli_blocked": 0,
+    "xss_blocked": 0,
+    "meta": {
+      "cpu": "Apple M4",
+      "os": "Darwin arm64",
+      "duration": 10,
+      "runs": 5,
+      "conns": 100,
+      "method": "wrk, median of N runs, native binary"
+    }
+  }
+]
