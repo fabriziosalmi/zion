@@ -2693,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "zion"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aho-corasick",
  "arc-swap",
