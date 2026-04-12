@@ -137,147 +137,81 @@ fn get_scanner() -> &'static AhoCorasick {
 
 const MAX_ENTROPY_THRESHOLD: f64 = 5.5; // bits per byte
 
-/// URL-decode a byte slice. Converts %XX sequences to their byte value
-/// and '+' to space (application/x-www-form-urlencoded).
-/// Uses Cow to allocate only exactly once (even on recursive decodes).
-fn url_decode(mut input: std::borrow::Cow<[u8]>) -> std::borrow::Cow<[u8]> {
-    let mut needs_decode = false;
-    for &b in input.as_ref() {
-        if b == b'%' || b == b'+' {
-            needs_decode = true;
-            break;
-        }
-    }
+/// Unified WAF Normalizer (Single-Pass, Zero-Alloc)
+/// Replaces recursive Cow allocations with a fast byte-by-byte state machine.
+/// Normalizes:
+/// - URL encoding (%XX and +)
+/// - JSON unicode escapes (\uXXXX)
+/// - SQL inline comments (/* ... */) -> space
+fn normalize_unified(input: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    let len = input.len();
+    let mut i = 0;
+    let mut in_sql_comment = false;
 
-    if !needs_decode {
-        return input;
-    }
-
-    let out = input.to_mut();
-    let mut read_idx = 0;
-    let mut write_idx = 0;
-
-    while read_idx < out.len() {
-        if out[read_idx] == b'%' && read_idx + 2 < out.len() {
-            if let (Some(hi), Some(lo)) = (hex_val(out[read_idx + 1]), hex_val(out[read_idx + 2])) {
-                out[write_idx] = (hi << 4) | lo;
-                read_idx += 3;
-                write_idx += 1;
-                continue;
+    while i < len {
+        // 1. SQL Comment Stripping State
+        if in_sql_comment {
+            if i + 1 < len && input[i] == b'*' && input[i + 1] == b'/' {
+                in_sql_comment = false;
+                i += 2;
+                if out.last() != Some(&b' ') {
+                    out.push(b' '); // Pad with space to block `1/*comment*/OR` concat
+                }
+            } else {
+                i += 1;
             }
-        } else if out[read_idx] == b'+' {
-            out[write_idx] = b' ';
-            read_idx += 1;
-            write_idx += 1;
             continue;
         }
-        out[write_idx] = out[read_idx];
-        read_idx += 1;
-        write_idx += 1;
-    }
 
-    out.truncate(write_idx);
-    input
-}
-
-/// Strip SQL inline comments (`/*...*/`) from input.
-/// Prevents evasion like `union/**/select` → `union select`.
-/// Also strips multi-line comments (`/* ... \n ... */`).
-/// O(N) single pass, allocates only when `/*` is present.
-fn strip_sql_comments(mut input: std::borrow::Cow<[u8]>) -> std::borrow::Cow<[u8]> {
-    let mut has_comments = false;
-    let bytes = input.as_ref();
-    for i in 0..bytes.len().saturating_sub(1) {
-        if bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            has_comments = true;
-            break;
+        if i + 1 < len && input[i] == b'/' && input[i + 1] == b'*' {
+            in_sql_comment = true;
+            i += 2;
+            continue;
         }
-    }
-    if !has_comments {
-        return input;
-    }
 
-    let out = input.to_mut();
-    let mut read_idx = 0;
-    let mut write_idx = 0;
-    let len = out.len();
-    while read_idx < len {
-        if read_idx + 1 < len && out[read_idx] == b'/' && out[read_idx + 1] == b'*' {
-            read_idx += 2;
-            while read_idx + 1 < len {
-                if out[read_idx] == b'*' && out[read_idx + 1] == b'/' {
-                    read_idx += 2;
-                    break;
-                }
-                read_idx += 1;
+        let b = input[i];
+
+        // 2. URL Decode State
+        if b == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        } else if b == b'%' && i + 2 < len {
+            if let (Some(hi), Some(lo)) = (hex_val(input[i + 1]), hex_val(input[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
             }
-            if write_idx == 0 || out[write_idx - 1] != b' ' {
-                out[write_idx] = b' ';
-                write_idx += 1;
-            }
-        } else {
-            out[write_idx] = out[read_idx];
-            write_idx += 1;
-            read_idx += 1;
         }
-    }
-    out.truncate(write_idx);
-    input
-}
 
-/// Normalize JSON unicode escapes (`\uXXXX`) to their literal byte values.
-/// Only handles BMP codepoints that fit in a single byte (U+0000..U+00FF).
-/// Prevents evasion like `\u0027` → `'`, `\u003c` → `<`.
-fn normalize_json_unicode(mut input: std::borrow::Cow<[u8]>) -> std::borrow::Cow<[u8]> {
-    let mut has_unicode_esc = false;
-    let bytes = input.as_ref();
-    for i in 0..bytes.len().saturating_sub(5) {
-        if bytes[i] == b'\\' && bytes[i + 1] == b'u' {
-            has_unicode_esc = true;
-            break;
-        }
-    }
-    if !has_unicode_esc {
-        return input;
-    }
-
-    let out = input.to_mut();
-    let mut read_idx = 0;
-    let mut write_idx = 0;
-    let len = out.len();
-    while read_idx < len {
-        if read_idx + 5 < len && out[read_idx] == b'\\' && out[read_idx + 1] == b'u' {
+        // 3. JSON Unicode State
+        if b == b'\\' && i + 5 < len && input[i + 1] == b'u' {
             if let (Some(h1), Some(h2), Some(h3), Some(h4)) = (
-                hex_val(out[read_idx + 2]),
-                hex_val(out[read_idx + 3]),
-                hex_val(out[read_idx + 4]),
-                hex_val(out[read_idx + 5]),
+                hex_val(input[i + 2]),
+                hex_val(input[i + 3]),
+                hex_val(input[i + 4]),
+                hex_val(input[i + 5]),
             ) {
                 let codepoint =
                     ((h1 as u16) << 12) | ((h2 as u16) << 8) | ((h3 as u16) << 4) | (h4 as u16);
 
                 if codepoint <= 0xFF {
-                    out[write_idx] = codepoint as u8;
-                    write_idx += 1;
+                    out.push(codepoint as u8);
                 } else {
                     let mut utf8_buf = [0u8; 3];
                     let ch = char::from_u32(codepoint as u32).unwrap_or('?');
-                    let encoded = ch.encode_utf8(&mut utf8_buf).as_bytes();
-                    for &b in encoded {
-                        out[write_idx] = b;
-                        write_idx += 1;
-                    }
+                    out.extend_from_slice(ch.encode_utf8(&mut utf8_buf).as_bytes());
                 }
-                read_idx += 6;
+                i += 6;
                 continue;
             }
         }
-        out[write_idx] = out[read_idx];
-        write_idx += 1;
-        read_idx += 1;
+
+        // 4. Default: push lowercase byte for case-insensitive normalization
+        out.push(b.to_ascii_lowercase());
+        i += 1;
     }
-    out.truncate(write_idx);
-    input
 }
 
 #[inline]
@@ -319,11 +253,12 @@ fn shannon_entropy(data: &[u8]) -> f64 {
 //   - String length <= max_string_len
 // ═══════════════════════════════════════════════════════════════════
 
-// Thread-local buffer pool for simd-json validation.
+// Thread-local buffer pool for simd-json and WAF zero-allocation parsing.
 // Eliminates per-request heap allocation for the mutable buffer that
-// simd-json requires. Buffer is reused across requests on the same thread.
+// simd-json and Aho-Corasick normalization require. Buffer is reused.
 thread_local! {
     static JSON_BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(8192));
+    static WAF_BUF_SEC: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(8192));
 }
 
 fn validate_json_structure(body: &[u8], max_depth: usize, max_string_len: usize) -> WafVerdict {
@@ -472,29 +407,43 @@ pub fn validate_request(
     let has_unicode_esc = body.windows(2).any(|w| w == b"\\u");
 
     if needs_decode || has_sql_comments || has_unicode_esc {
-        let mut normalized = std::borrow::Cow::Borrowed(body);
-
-        if needs_decode {
-            normalized = url_decode(normalized);
-            // Decode up to 2 extra times to defeat multi-encoding evasion
-            for _ in 0..2 {
-                if memchr::memchr(b'%', normalized.as_ref()).is_none() {
-                    break;
+        let verdict = JSON_BUF.with(|buf1| {
+            WAF_BUF_SEC.with(|buf2| {
+                let mut out = buf1.borrow_mut();
+                let mut sec = buf2.borrow_mut();
+                
+                // First pass from body -> out
+                normalize_unified(body, &mut out);
+                
+                for _ in 0..2 {
+                    if get_scanner().is_match(out.as_slice()) {
+                        return Some(WafVerdict::Deny("injection pattern detected (encoded)"));
+                    }
+                    
+                    let still_needs_decode = memchr::memchr(b'%', &out).is_some() || memchr::memchr(b'+', &out).is_some();
+                    let still_has_sql_comments = out.windows(2).any(|w| w == b"/*");
+                    let still_has_unicode_esc = out.windows(2).any(|w| w == b"\\u");
+                    
+                    if !still_needs_decode && !still_has_sql_comments && !still_has_unicode_esc {
+                        break;
+                    }
+                    
+                    // Recursive pass: out -> sec
+                    normalize_unified(&out, &mut sec);
+                    // Swap back: sec -> out
+                    std::mem::swap(&mut *out, &mut *sec);
                 }
-                normalized = url_decode(normalized);
-            }
-        }
+                
+                // Final check
+                if get_scanner().is_match(out.as_slice()) {
+                    return Some(WafVerdict::Deny("injection pattern detected (encoded)"));
+                }
+                None
+            })
+        });
 
-        if has_sql_comments || normalized.as_ref().windows(2).any(|w| w == b"/*") {
-            normalized = strip_sql_comments(normalized);
-        }
-
-        if has_unicode_esc || normalized.as_ref().windows(2).any(|w| w == b"\\u") {
-            normalized = normalize_json_unicode(normalized);
-        }
-
-        if get_scanner().is_match(normalized.as_ref()) {
-            return WafVerdict::Deny("injection pattern detected (encoded)");
+        if let Some(v) = verdict {
+            return v;
         }
     }
 
@@ -533,24 +482,39 @@ pub fn validate_uri(uri: &str) -> WafVerdict {
     let has_sql_comments = uri_bytes.windows(2).any(|w| w == b"/*");
 
     if needs_decode || has_sql_comments {
-        let mut normalized = std::borrow::Cow::Borrowed(uri_bytes);
+        let verdict = JSON_BUF.with(|buf1| {
+            WAF_BUF_SEC.with(|buf2| {
+                let mut out = buf1.borrow_mut();
+                let mut sec = buf2.borrow_mut();
 
-        if needs_decode {
-            normalized = url_decode(normalized);
-            for _ in 0..2 {
-                if memchr::memchr(b'%', normalized.as_ref()).is_none() {
-                    break;
+                normalize_unified(uri_bytes, &mut out);
+
+                for _ in 0..2 {
+                    if get_scanner().is_match(out.as_slice()) {
+                        return Some(WafVerdict::Deny("injection pattern in URI (encoded)"));
+                    }
+
+                    let still_needs_decode = memchr::memchr(b'%', &out).is_some() || memchr::memchr(b'+', &out).is_some();
+                    let still_has_sql_comments = out.windows(2).any(|w| w == b"/*");
+                    let still_has_unicode_esc = out.windows(2).any(|w| w == b"\\u");
+
+                    if !still_needs_decode && !still_has_sql_comments && !still_has_unicode_esc {
+                        break;
+                    }
+
+                    normalize_unified(&out, &mut sec);
+                    std::mem::swap(&mut *out, &mut *sec);
                 }
-                normalized = url_decode(normalized);
-            }
-        }
 
-        if has_sql_comments || normalized.as_ref().windows(2).any(|w| w == b"/*") {
-            normalized = strip_sql_comments(normalized);
-        }
+                if get_scanner().is_match(out.as_slice()) {
+                    return Some(WafVerdict::Deny("injection pattern in URI (encoded)"));
+                }
+                None
+            })
+        });
 
-        if get_scanner().is_match(normalized.as_ref()) {
-            return WafVerdict::Deny("injection pattern in URI (encoded)");
+        if let Some(v) = verdict {
+            return v;
         }
     }
     WafVerdict::Allow
@@ -563,6 +527,24 @@ pub fn validate_uri(uri: &str) -> WafVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn url_decode(input: std::borrow::Cow<[u8]>) -> std::borrow::Cow<[u8]> {
+        let mut out = Vec::new();
+        normalize_unified(input.as_ref(), &mut out);
+        std::borrow::Cow::Owned(out)
+    }
+
+    fn strip_sql_comments(input: std::borrow::Cow<[u8]>) -> std::borrow::Cow<[u8]> {
+        let mut out = Vec::new();
+        normalize_unified(input.as_ref(), &mut out);
+        std::borrow::Cow::Owned(out)
+    }
+
+    fn normalize_json_unicode(input: std::borrow::Cow<[u8]>) -> std::borrow::Cow<[u8]> {
+        let mut out = Vec::new();
+        normalize_unified(input.as_ref(), &mut out);
+        std::borrow::Cow::Owned(out)
+    }
 
     fn strict_profile() -> WafProfile {
         WafProfile::default()
@@ -1098,7 +1080,7 @@ mod tests {
         // %27 = ' and + = space
         assert_eq!(
             url_decode(std::borrow::Cow::Borrowed(b"admin%27+OR+%271%27=%271")).as_ref(),
-            b"admin' OR '1'='1"
+            b"admin' or '1'='1"
         );
     }
 
