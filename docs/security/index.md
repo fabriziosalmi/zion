@@ -1,11 +1,26 @@
 # WAF Pipeline
 
-Zion's WAF is a 6-gate pipeline. Each gate is fail-fast: the first denial terminates inspection. No gate uses regex; pattern matching uses the Aho-Corasick algorithm (deterministic finite automaton, no backtracking).
+Zion's WAF is a 6-gate pipeline with a SIMD pre-filter. Each gate is fail-fast: the first denial terminates inspection. No gate uses regex; pattern matching uses the Aho-Corasick algorithm (deterministic finite automaton, no backtracking).
+
+::: info v0.1.2 Improvements
+- **SIMD pre-filter**: `memchr3` fast-reject skips the full Aho-Corasick scan for clean bodies (90%+ of traffic)
+- **80+ patterns** (up from 70+): added SSRF HTTPS/hex IP/decimal IP, spaceless command injection, 2-level path traversal
+- **DELETE body validation**: DELETE requests with bodies are now WAF-inspected (RFC 9110 allows bodies on DELETE)
+- **Content-Type delimiter enforcement**: `application/jsonFOO` no longer matches `application/json`
+- **Normalization convergence**: iterates until no further decoding needed (was fixed at 3 passes)
+- **Buffer safety**: thread-local buffers shrink above 64KB to prevent OOM under adversarial large bodies
+:::
 
 ## Gate Architecture
 
 ```
 Request Body
+    │
+    ▼
+┌─ SIMD Pre-Filter (memchr3) ──────────────────────┐
+│  Fast-reject: if no trigger bytes (' < ; $ { |)   │
+│  present → skip Aho-Corasick entirely → Gate 4    │
+└───────────────────────────────────────────────────┘
     │
     ▼
 ┌─ Gate 1: Body Size ──────────────────────────────┐
