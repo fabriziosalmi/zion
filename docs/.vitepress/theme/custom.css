@@ -1,0 +1,321 @@
+/* Zion Docs — Apple-native design system
+ *
+ * Design principles:
+ * - SF Pro-inspired typography (system font stack)
+ * - Generous whitespace, clean hierarchy
+ * - Subtle gradients, no harsh borders
+ * - Muted color palette with vibrant accents
+ * - Smooth transitions everywhere
+ */
+
+/* ── Typography: system font stack (SF Pro on macOS, Segoe on Windows) ── */
+:root {
+  --vp-font-family-base: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI',
+    Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --vp-font-family-mono: 'SF Mono', 'Fira Code', 'JetBrains Mono', 'Cascadia Code',
+    Menlo, Monaco, Consolas, monospace;
+
+  /* Color palette — Apple-inspired blues */
+  --vp-c-brand-1: #0071e3;
+  --vp-c-brand-2: #0077ed;
+  --vp-c-brand-3: #006edb;
+  --vp-c-brand-soft: rgba(0, 113, 227, 0.12);
+
+  /* Backgrounds */
+  --vp-c-bg: #fbfbfd;
+  --vp-c-bg-alt: #f5f5f7;
+  --vp-c-bg-soft: #f5f5f7;
+  --vp-c-bg-elv: #ffffff;
+
+  /* Text */
+  --vp-c-text-1: #1d1d1f;
+  --vp-c-text-2: #6e6e73;
+  --vp-c-text-3: #86868b;
+
+  /* Borders — subtle */
+  --vp-c-border: rgba(0, 0, 0, 0.06);
+  --vp-c-divider: rgba(0, 0, 0, 0.06);
+  --vp-c-gutter: rgba(0, 0, 0, 0.04);
+
+  /* Layout */
+  --vp-nav-height: 64px;
+  --vp-sidebar-width: 272px;
+
+  /* Shadows */
+  --apple-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.06);
+  --apple-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08), 0 2px 4px rgba(0, 0, 0, 0.04);
+  --apple-shadow-lg: 0 8px 30px rgba(0, 0, 0, 0.08), 0 4px 8px rgba(0, 0, 0, 0.04);
+}
+
+/* Dark mode */
+.dark {
+  --vp-c-bg: #000000;
+  --vp-c-bg-alt: #161617;
+  --vp-c-bg-soft: #1c1c1e;
+  --vp-c-bg-elv: #1c1c1e;
+  --vp-c-text-1: #f5f5f7;
+  --vp-c-text-2: #a1a1a6;
+  --vp-c-text-3: #6e6e73;
+  --vp-c-border: rgba(255, 255, 255, 0.08);
+  --vp-c-divider: rgba(255, 255, 255, 0.06);
+  --vp-c-brand-soft: rgba(0, 113, 227, 0.16);
+  --apple-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+  --apple-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --apple-shadow-lg: 0 8px 30px rgba(0, 0, 0, 0.5);
+}
+
+/* ── Global ── */
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* ── Navigation — frosted glass ── */
+.VPNav {
+  backdrop-filter: saturate(180%) blur(20px) !important;
+  -webkit-backdrop-filter: saturate(180%) blur(20px) !important;
+  background: rgba(251, 251, 253, 0.72) !important;
+  border-bottom: 0.5px solid rgba(0, 0, 0, 0.08) !important;
+}
+
+.dark .VPNav {
+  background: rgba(0, 0, 0, 0.72) !important;
+  border-bottom: 0.5px solid rgba(255, 255, 255, 0.08) !important;
+}
+
+/* ── Hero section — Apple keynote style ── */
+.VPHero .name {
+  background: linear-gradient(135deg, #1d1d1f 0%, #0071e3 100%) !important;
+  -webkit-background-clip: text !important;
+  background-clip: text !important;
+  -webkit-text-fill-color: transparent !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.03em !important;
+}
+
+.dark .VPHero .name {
+  background: linear-gradient(135deg, #f5f5f7 0%, #2997ff 100%) !important;
+  -webkit-background-clip: text !important;
+  background-clip: text !important;
+}
+
+.VPHero .text {
+  font-weight: 700 !important;
+  letter-spacing: -0.02em !important;
+  color: var(--vp-c-text-1) !important;
+}
+
+.VPHero .tagline {
+  font-size: 1.15rem !important;
+  line-height: 1.6 !important;
+  color: var(--vp-c-text-2) !important;
+  max-width: 520px !important;
+  font-weight: 400 !important;
+}
+
+/* ── Hero actions — pill buttons ── */
+.VPHero .actions .VPButton {
+  border-radius: 980px !important;
+  padding: 0.6rem 1.5rem !important;
+  font-weight: 500 !important;
+  font-size: 0.95rem !important;
+  letter-spacing: -0.01em !important;
+  transition: all 0.3s cubic-bezier(0.25, 0.1, 0.25, 1) !important;
+}
+
+.VPHero .actions .VPButton.brand {
+  background: var(--vp-c-brand-1) !important;
+  border-color: transparent !important;
+  box-shadow: 0 2px 8px rgba(0, 113, 227, 0.3) !important;
+}
+
+.VPHero .actions .VPButton.brand:hover {
+  background: var(--vp-c-brand-2) !important;
+  box-shadow: 0 4px 16px rgba(0, 113, 227, 0.4) !important;
+  transform: translateY(-1px) !important;
+}
+
+.VPHero .actions .VPButton.alt {
+  border-radius: 980px !important;
+  background: transparent !important;
+  border: 1.5px solid var(--vp-c-border) !important;
+  color: var(--vp-c-brand-1) !important;
+}
+
+.VPHero .actions .VPButton.alt:hover {
+  background: var(--vp-c-brand-soft) !important;
+  border-color: var(--vp-c-brand-1) !important;
+}
+
+/* ── Feature cards — glass morphism ── */
+.VPFeatures .VPFeature {
+  border-radius: 20px !important;
+  border: 1px solid var(--vp-c-border) !important;
+  background: var(--vp-c-bg-elv) !important;
+  box-shadow: var(--apple-shadow-sm) !important;
+  transition: all 0.3s cubic-bezier(0.25, 0.1, 0.25, 1) !important;
+  padding: 28px !important;
+}
+
+.VPFeatures .VPFeature:hover {
+  box-shadow: var(--apple-shadow-md) !important;
+  transform: translateY(-2px) !important;
+  border-color: var(--vp-c-brand-soft) !important;
+}
+
+.VPFeatures .VPFeature .title {
+  font-weight: 600 !important;
+  font-size: 1.05rem !important;
+  letter-spacing: -0.01em !important;
+  color: var(--vp-c-text-1) !important;
+}
+
+.VPFeatures .VPFeature .details {
+  font-size: 0.88rem !important;
+  line-height: 1.6 !important;
+  color: var(--vp-c-text-2) !important;
+}
+
+/* ── Sidebar — cleaner ── */
+.VPSidebar {
+  border-right: 0.5px solid var(--vp-c-border) !important;
+  background: var(--vp-c-bg) !important;
+}
+
+.VPSidebarItem .text {
+  font-weight: 450 !important;
+  font-size: 0.9rem !important;
+}
+
+.VPSidebarItem.is-active > .item > .link > .text {
+  color: var(--vp-c-brand-1) !important;
+  font-weight: 600 !important;
+}
+
+/* ── Content — reading optimized ── */
+.vp-doc h1 {
+  font-weight: 700 !important;
+  letter-spacing: -0.03em !important;
+  font-size: 2rem !important;
+}
+
+.vp-doc h2 {
+  font-weight: 600 !important;
+  letter-spacing: -0.02em !important;
+  padding-bottom: 0.5rem !important;
+  border-bottom: 0.5px solid var(--vp-c-divider) !important;
+}
+
+.vp-doc h3 {
+  font-weight: 600 !important;
+  letter-spacing: -0.01em !important;
+}
+
+.vp-doc p {
+  line-height: 1.7 !important;
+}
+
+/* ── Code blocks — refined ── */
+.vp-doc div[class*='language-'] {
+  border-radius: 12px !important;
+  border: 1px solid var(--vp-c-border) !important;
+  box-shadow: var(--apple-shadow-sm) !important;
+}
+
+.vp-doc :not(pre) > code {
+  border-radius: 6px !important;
+  padding: 2px 6px !important;
+  background: var(--vp-c-bg-soft) !important;
+  font-size: 0.88em !important;
+}
+
+/* ── Tables — clean Apple style ── */
+.vp-doc table {
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+  border-radius: 12px !important;
+  overflow: hidden !important;
+  border: 1px solid var(--vp-c-border) !important;
+  box-shadow: var(--apple-shadow-sm) !important;
+}
+
+.vp-doc th {
+  background: var(--vp-c-bg-soft) !important;
+  font-weight: 600 !important;
+  font-size: 0.85rem !important;
+  text-transform: none !important;
+  letter-spacing: 0 !important;
+  padding: 12px 16px !important;
+}
+
+.vp-doc td {
+  padding: 10px 16px !important;
+  font-size: 0.9rem !important;
+  border-bottom: 0.5px solid var(--vp-c-divider) !important;
+}
+
+.vp-doc tr:last-child td {
+  border-bottom: none !important;
+}
+
+/* ── Tip/Warning boxes — softer ── */
+.vp-doc .custom-block {
+  border-radius: 12px !important;
+  border: 1px solid var(--vp-c-border) !important;
+  box-shadow: none !important;
+}
+
+/* ── Footer — minimal ── */
+.VPFooter {
+  border-top: 0.5px solid var(--vp-c-border) !important;
+}
+
+/* ── Smooth scrolling ── */
+html {
+  scroll-behavior: smooth;
+}
+
+/* ── Selection color ── */
+::selection {
+  background: rgba(0, 113, 227, 0.2);
+}
+
+/* ── Homepage custom sections (markdown below features) ── */
+.vp-doc .benchmark-highlight {
+  background: linear-gradient(135deg, var(--vp-c-bg-soft) 0%, var(--vp-c-bg) 100%);
+  border-radius: 20px;
+  padding: 2rem 2.5rem;
+  border: 1px solid var(--vp-c-border);
+  margin: 2rem 0;
+}
+
+.vp-doc .stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1.5rem;
+  margin: 1.5rem 0;
+}
+
+.vp-doc .stat-card {
+  background: var(--vp-c-bg-elv);
+  border-radius: 16px;
+  padding: 1.5rem;
+  border: 1px solid var(--vp-c-border);
+  box-shadow: var(--apple-shadow-sm);
+  text-align: center;
+}
+
+.vp-doc .stat-card .number {
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  color: var(--vp-c-brand-1);
+  line-height: 1.2;
+}
+
+.vp-doc .stat-card .label {
+  font-size: 0.85rem;
+  color: var(--vp-c-text-2);
+  margin-top: 0.25rem;
+}

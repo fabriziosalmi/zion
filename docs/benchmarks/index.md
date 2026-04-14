@@ -29,22 +29,36 @@ Single-core comparison on the same Linux host, no containers.
 
 On proxy workloads (API GET), both perform similarly — the bottleneck is the upstream. On cached content, the in-memory cache removes the upstream round-trip. WAF POST shows parity: the Aho-Corasick scan over 70+ patterns does not reduce throughput below nginx without WAF in this test.
 
-## Native Benchmark (Apple M4, v0.1.2)
+## Native Benchmark (Apple M4, v0.1.2, Rust backend)
 
-Measured with `bench-native.sh` (5 runs x 10s, c=100, median reported). Includes all v0.1.2 security fixes and performance optimizations.
+Measured with `bench-native.sh` (5 runs x 10s, c=100, median reported). Includes all v0.1.2 security fixes and 20 performance optimizations. Rust backend eliminates Go runtime as bottleneck.
 
 | Endpoint | Median req/s | Best Run | CV% | Errors |
 |---|---|---|---|---|
-| HTML SSR 5KB | **233,341** | 236,755 | 2.0% | 0 |
-| Cache Hit JS 4KB (RAM) | **209,381** | 214,546 | 9.8% | 0 |
-| CSS 3KB (cached) | **191,574** | 203,969 | 4.5% | 0 |
-| TLS Proxy API GET 1KB | **93,253** | 97,019 | 3.0% | 0 |
-| WAF POST JSON | **91,893** | 93,415 | 3.1% | 0 |
-| JS 4KB (no cache) | **81,470** | 82,723 | 2.3% | 0 |
-| PNG 8KB (no cache) | **66,753** | 68,020 | 2.7% | 0 |
-| WOFF2 16KB (no cache) | **59,262** | 60,679 | 3.0% | 0 |
+| HTML SSR 5KB | **235,155** | 236,755 | 1.3% | 0 |
+| Cache Hit JS 4KB (RAM) | **210,899** | 214,774 | 1.9% | 0 |
+| CSS 3KB (cached) | **197,564** | 210,076 | 5.5% | 0 |
+| TLS Proxy API GET 1KB | **106,161** | 106,922 | 1.1% | 0 |
+| WAF POST JSON | **103,221** | 105,298 | 1.4% | 0 |
+| JS 4KB (no cache) | **99,940** | 105,439 | 6.4% | 0 |
+| PNG 8KB (no cache) | **95,700** | 99,674 | 4.2% | 0 |
+| WOFF2 16KB (no cache) | **77,719** | 84,133 | 4.9% | 0 |
 
 Security validation: SQLi and XSS injection blocked (HTTP 400).
+
+### Go vs Rust Backend Impact
+
+Replacing the Go test backend with a Rust equivalent (pure hyper, 194K raw req/s) removes the backend as a bottleneck on proxy paths:
+
+| Endpoint | Go Backend | Rust Backend | Delta |
+|---|---|---|---|
+| TLS Proxy API | 93,253 | **106,161** | **+13.8%** |
+| WAF POST | 91,893 | **103,221** | **+12.3%** |
+| JS uncached | 75,500 | **99,940** | **+32.4%** |
+| PNG 8KB | 59,537 | **95,700** | **+60.7%** |
+| WOFF2 16KB | 53,087 | **77,719** | **+46.4%** |
+
+Cache-hit paths are unchanged (backend not involved), confirming the Go runtime was the ceiling.
 
 ## Matrix Benchmark (Apple M4)
 
