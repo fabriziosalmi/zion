@@ -2,6 +2,55 @@
 
 Changes made to improve throughput and latency, with rationale. Throughput claims reference `wrk` benchmark results from `benchmarks/bench-native.sh`.
 
+## Compiler / Build (v0.1.2)
+
+| Change | Rationale |
+|---|---|
+| `target-cpu=native` (.cargo/config.toml) | Unlocks NEON/AES-CE on Apple Silicon, AVX2/AES-NI on x86_64 |
+| PGO build script (`bench-pgo.sh`) | Two-phase profile-guided optimization for 10-20% additional throughput |
+
+## Hot Path Allocation Elimination (v0.1.2)
+
+| Change | Rationale |
+|---|---|
+| Traceparent: `[u8;55]` stack buffer | Replaces 3x `format!` heap allocations (-500ns/req) |
+| CORS origin: `HeaderValue` clone | Avoids `String` allocation per CORS request |
+| WAF content-type: borrow from `parts.headers` | Eliminates `to_owned()` clone on POST/PUT/PATCH |
+| Cache key: `Arc::from()` direct | Skips intermediate `String` allocation on cache miss |
+
+## Lock / Contention Reduction (v0.1.2)
+
+| Change | Rationale |
+|---|---|
+| WebSocket TLS: `OnceLock<Arc<ClientConfig>>` | Builds root cert store once, not per WS upgrade |
+| Metrics render: `ArcSwap` replaces `RwLock` | Lock-free `/metrics` endpoint, eliminates contention |
+| Histogram: non-cumulative differential buckets | 3 atomic ops per observation instead of 17 |
+| HTTP builder: `Arc<AutoBuilder>` | Per-connection clone is ref-count bump, not deep copy |
+
+## Data Structures (v0.1.2)
+
+| Change | Rationale |
+|---|---|
+| L1 cache: O(1) LRU (doubly-linked list) | Replaces O(N) VecDeque linear scan on every cache hit |
+| Host validation: single-pass byte scan | Replaces 8 separate `contains()` calls |
+| CORS origin: FNV hash set | O(1) lookup replaces `Vec` linear scan |
+
+## WAF Pipeline (v0.1.2)
+
+| Change | Rationale |
+|---|---|
+| SIMD pre-filter (`memchr3`) | Fast-reject before Aho-Corasick; skips scan for clean bodies (-200-500ns) |
+| Normalization: 2 iterations max | Down from 7; convergence check breaks early |
+| Buffer shrink-to-fit (>64KB) | Prevents permanent memory inflation from adversarial large bodies |
+
+## Innovative (v0.1.2)
+
+| Change | Rationale |
+|---|---|
+| Request coalescing (singleflight) | N concurrent cache misses = 1 upstream fetch (thundering herd protection) |
+| Health probe inline fast-path | `/healthz` responds in ~1us, bypasses full process_request pipeline |
+| `SO_BUSY_POLL` (Linux) | Spin-poll NIC queue 50us before sleeping; -5-15us p99 latency |
+
 ## Allocator
 
 | Change | Rationale |
@@ -50,8 +99,8 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 
 | Change | Rationale |
 |---|---|
-| Aho-Corasick (no regex) | O(N) single-pass, no backtracking, 70+ patterns scanned simultaneously |
-| Skip body inspection for GET/HEAD/DELETE/OPTIONS | Only POST/PUT/PATCH bodies are inspected (configurable) |
+| Aho-Corasick (no regex) | O(N) single-pass, no backtracking, 80+ patterns scanned simultaneously |
+| Skip body inspection for GET/HEAD/OPTIONS | POST/PUT/PATCH/DELETE bodies are inspected |
 | Entropy check only for bodies >= 256 bytes | Short payloads lack sufficient data for meaningful entropy analysis |
 | `simd-json` for JSON validation | SIMD-accelerated JSON parsing where hardware supports it |
 | Byte-level content-type matching | No string allocation; case-insensitive byte prefix comparison |

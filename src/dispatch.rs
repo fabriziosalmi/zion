@@ -41,8 +41,15 @@ pub(crate) async fn process_request(
 
     // ── Pre-routing security gates (zero-cost, before any processing) ──
 
-    // Gate: URI length (reject oversized URIs before routing)
-    if req.uri().path().len() > MAX_URI_LEN {
+    // Gate: URI length (reject oversized URIs before routing).
+    // Check full path+query, not just path — an attacker could send a short
+    // path with an enormous query string to consume memory downstream.
+    let uri_len = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().len())
+        .unwrap_or_else(|| req.uri().path().len());
+    if uri_len > MAX_URI_LEN {
         return Ok(empty_response(StatusCode::URI_TOO_LONG));
     }
 
@@ -128,17 +135,23 @@ pub(crate) async fn process_request(
     };
 
     // ── CORS (Per-Route) ──
-    let req_origin: Option<String> = if rule.cors.is_some() {
-        req.headers()
-            .get(hyper::header::ORIGIN)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_owned())
+    // Clone origin HeaderValue (16 bytes, ref-counted) to release the
+    // immutable borrow on req before any mutations below.
+    let req_origin: Option<hyper::header::HeaderValue> = if rule.cors.is_some() {
+        req.headers().get(hyper::header::ORIGIN).cloned()
     } else {
         None
     };
 
+    // Pre-compute CORS allow origin for response injection later
+    let cors_allow_origin: Option<hyper::header::HeaderValue> = req_origin
+        .as_ref()
+        .and_then(|v| v.to_str().ok())
+        .and_then(|o| rule.cors.as_ref().and_then(|c| c.check_origin(o)));
+
     if let Some(ref cors) = rule.cors {
-        if let Some(ref origin_str) = req_origin {
+        if let Some(ref origin_val) = req_origin {
+            let origin_str = origin_val.to_str().unwrap_or("");
             if let Some(allow_origin) = cors.check_origin(origin_str) {
                 // Pre-flight OPTIONS — respond immediately without proxying
                 if *req.method() == hyper::Method::OPTIONS {
@@ -158,14 +171,16 @@ pub(crate) async fn process_request(
                     return Ok(resp);
                 }
             } else {
-                // Origin not in allowed list — block state-changing methods (CSRF prevention).
-                if matches!(
-                    *req.method(),
-                    hyper::Method::POST
-                        | hyper::Method::PUT
-                        | hyper::Method::PATCH
-                        | hyper::Method::DELETE
-                ) {
+                // Origin not in allowed list — block state-changing methods AND preflight.
+                if *req.method() == hyper::Method::OPTIONS
+                    || matches!(
+                        *req.method(),
+                        hyper::Method::POST
+                            | hyper::Method::PUT
+                            | hyper::Method::PATCH
+                            | hyper::Method::DELETE
+                    )
+                {
                     return Ok(empty_response(StatusCode::FORBIDDEN));
                 }
             }
@@ -284,15 +299,15 @@ pub(crate) async fn process_request(
             return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
         }
 
-        if matches!(method, "POST" | "PUT" | "PATCH") {
-            // Extract content-type before consuming req
-            let ct_owned: Option<String> = req
-                .headers()
-                .get(hyper::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_owned());
-
+        if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
             let (parts, body) = req.into_parts();
+
+            // Borrow content-type from parts.headers — no String allocation needed.
+            // The header lives in `parts` which is alive through this scope.
+            let ct: Option<&str> = parts
+                .headers
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok());
 
             let max_body_bytes = (waf_profile.max_body_mb * 1_048_576) as usize;
             let limited = Limited::new(body, max_body_bytes);
@@ -306,8 +321,7 @@ pub(crate) async fn process_request(
                 }
             };
 
-            let verdict =
-                waf::validate_request(method, ct_owned.as_deref(), &body_bytes, waf_profile);
+            let verdict = waf::validate_request(method, ct, &body_bytes, waf_profile);
             if let waf::WafVerdict::Deny(_) = verdict {
                 metrics::METRICS
                     .waf_denied
@@ -316,32 +330,27 @@ pub(crate) async fn process_request(
                 return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
             }
 
-            let mut resp = proxy::proxy_pass_bytes(
-                &state.http_client,
-                parts,
-                body_bytes,
-                &dyn_scheme,
-                &dyn_authority,
-                remote_addr,
-                "https", // Always passed as "https" for the connection-level x-forwarded-proto, not the upstream target scheme
-            )
-            .await?;
-            inject_security_headers(&mut resp);
-            return Ok(resp);
-        }
-
-        // GET/HEAD/DELETE/OPTIONS — no body to validate
-        let ct = req
-            .headers()
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok());
-        let verdict = waf::validate_request(method, ct, &[], waf_profile);
-        if let waf::WafVerdict::Deny(_) = verdict {
-            metrics::METRICS
-                .waf_denied
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            metrics::METRICS.record_status(400);
-            return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
+            // Re-assemble request with validated body for dispatch below.
+            // Do NOT return early — fall through to post-response processing
+            // (CORS, metrics, request-ID, security headers).
+            let body: ZionBody = Full::new(body_bytes)
+                .map_err(|never| match never {})
+                .boxed();
+            req = Request::from_parts(parts, body);
+        } else {
+            // GET/HEAD/DELETE/OPTIONS — no body to validate
+            let ct = req
+                .headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok());
+            let verdict = waf::validate_request(method, ct, &[], waf_profile);
+            if let waf::WafVerdict::Deny(_) = verdict {
+                metrics::METRICS
+                    .waf_denied
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics::METRICS.record_status(400);
+                return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
+            }
         }
     }
 
@@ -380,28 +389,43 @@ pub(crate) async fn process_request(
     // Preserve incoming traceparent or generate a new one.
     // Forward to upstream for distributed tracing (Jaeger, Tempo, etc.)
     if !req.headers().contains_key("traceparent") {
-        // Generate: version-trace_id-parent_id-flags (00-{32hex}-{16hex}-01)
-        // Use SystemTime for entropy (not elapsed() which is ~0ns at this point)
+        // Generate: 00-{32hex trace_id}-{16hex span_id}-01
+        // Zero-alloc: stack buffer + hex lookup table (no format! calls).
         let ts_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
         let seq = REQUEST_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
-        let trace_id = format!("{:016x}{:016x}", ts_us, seq);
-        let span_id = format!("{:016x}", seq);
-        let traceparent = format!("00-{}-{}-01", trace_id, span_id);
-        if let Ok(val) = hyper::header::HeaderValue::from_str(&traceparent) {
+
+        let mut buf = [0u8; 55]; // "00-" + 32hex + "-" + 16hex + "-01"
+        buf[0..3].copy_from_slice(b"00-");
+        // trace_id: 16 hex from ts_us + 16 hex from seq = 32 hex
+        for i in 0..8 {
+            let b = (ts_us >> (56 - i * 8)) as u8;
+            buf[3 + i * 2] = crate::HEX_DIGITS[(b >> 4) as usize];
+            buf[3 + i * 2 + 1] = crate::HEX_DIGITS[(b & 0xF) as usize];
+        }
+        for i in 0..8 {
+            let b = (seq >> (56 - i * 8)) as u8;
+            buf[19 + i * 2] = crate::HEX_DIGITS[(b >> 4) as usize];
+            buf[19 + i * 2 + 1] = crate::HEX_DIGITS[(b & 0xF) as usize];
+        }
+        buf[35] = b'-';
+        // span_id: 16 hex from seq
+        for i in 0..8 {
+            let b = (seq >> (56 - i * 8)) as u8;
+            buf[36 + i * 2] = crate::HEX_DIGITS[(b >> 4) as usize];
+            buf[36 + i * 2 + 1] = crate::HEX_DIGITS[(b & 0xF) as usize];
+        }
+        buf[52..55].copy_from_slice(b"-01");
+        // SAFETY: all bytes are ASCII hex, '-', or '0'/'1'
+        if let Ok(val) = hyper::header::HeaderValue::from_bytes(&buf) {
             req.headers_mut().insert("traceparent", val);
         }
     }
 
     // Pre-extract X-Request-ID for response echo (before req is consumed)
     let request_id_val = req.headers().get("X-Request-ID").cloned();
-
-    // Pre-compute CORS allow origin before state is consumed
-    let cors_allow_origin: Option<hyper::header::HeaderValue> = req_origin
-        .as_deref()
-        .and_then(|o| rule.cors.as_ref().and_then(|c| c.check_origin(o)));
 
     // --- Dispatch by mode ---
     let mut resp = if rule.cache.is_some() {
@@ -502,23 +526,66 @@ async fn handle_static_cache(
     dyn_scheme: &hyper::http::uri::Scheme,
     dyn_authority: &hyper::http::uri::Authority,
 ) -> Result<Response<ZionBody>, hyper::Error> {
-    let path = req.uri().path();
+    // Use full path+query as cache key to prevent cache poisoning:
+    // /api?user=alice and /api?user=bob must NOT share a cache entry.
+    let cache_key = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| req.uri().path());
 
-    // RAM hit — zero-copy serve with preserved Content-Type
-    if let Some(hit) = state.static_cache.get(path) {
+    // RAM hit — zero-copy serve with preserved Content-Type and Content-Encoding
+    if let Some(hit) = state.static_cache.get(cache_key) {
         let mut builder = Response::builder()
             .status(hit.meta.status)
             .header("Cache-Control", CACHE_CONTROL_IMMUTABLE);
         if let Some(ct) = &hit.meta.content_type {
             builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
         }
+        if let Some(ce) = &hit.meta.content_encoding {
+            builder = builder.header(hyper::header::CONTENT_ENCODING, ce.clone());
+        }
         return Ok(builder
             .body(Full::new(hit.body).map_err(|never| match never {}).boxed())
             .unwrap());
     }
 
-    // Need to own path before consuming req
-    let path_owned = path.to_owned();
+    // Own cache key before consuming req — use Arc directly (cache stores Arc<str>)
+    let path_owned: Arc<str> = Arc::from(cache_key);
+
+    // Singleflight: coalesce concurrent cache misses for the same key.
+    // If another request is already fetching, wait for it then serve from cache.
+    let existing_notify = state
+        .inflight
+        .get(&path_owned)
+        .map(|entry| entry.value().clone());
+
+    if let Some(n) = existing_notify {
+        n.notified().await;
+        // Re-check cache after coalesced fetch
+        if let Some(hit) = state.static_cache.get(path_owned.as_ref()) {
+            metrics::METRICS
+                .cache_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut builder = Response::builder()
+                .status(hit.meta.status)
+                .header("Cache-Control", CACHE_CONTROL_IMMUTABLE);
+            if let Some(ct) = &hit.meta.content_type {
+                builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
+            }
+            if let Some(ce) = &hit.meta.content_encoding {
+                builder = builder.header(hyper::header::CONTENT_ENCODING, ce.clone());
+            }
+            return Ok(builder
+                .body(Full::new(hit.body).map_err(|never| match never {}).boxed())
+                .unwrap());
+        }
+        // Cache miss even after wait — fall through to fetch from upstream
+    }
+
+    // Register as the inflight fetcher for this key
+    let notify = Arc::new(tokio::sync::Notify::new());
+    state.inflight.insert(path_owned.clone(), notify.clone());
 
     // RAM miss — fetch from upstream
     let resp = proxy::proxy_pass(
@@ -543,25 +610,33 @@ async fn handle_static_cache(
             .get(hyper::header::VARY)
             .and_then(|v| v.to_str().ok())
             .map(|v| {
+                // Check for content-negotiation headers that make path-only
+                // caching unsafe. Use exact token matching to avoid false positives:
+                // "Accept-Encoding" is safe (cache stores raw bytes), but "Accept"
+                // means the upstream varies on media type which IS unsafe.
                 let v_lower = v.to_ascii_lowercase();
-                v_lower.contains("accept")
-                    || v_lower.contains("negotiate")
-                    || v_lower.contains("authorization")
-                    || v_lower.contains("cookie")
-                    || v_lower == "*"
+                v_lower.split(',').any(|token| {
+                    let t = token.trim();
+                    t == "accept" || t == "negotiate" || t == "authorization" || t == "cookie"
+                }) || v_lower == "*"
             })
             .unwrap_or(false);
 
         if has_unsafe_vary {
             // Stream the body straight to the client without dropping back to RAM allocation!
+            state.inflight.remove(&path_owned);
+            notify.notify_waiters();
             let resp = Response::from_parts(parts, body.map_err(hyper::Error::from).boxed());
             return Ok(resp);
         }
 
-        // Preserve Content-Type for cache (S-05 fix)
+        // Preserve Content-Type and Content-Encoding for cache (S-05 fix).
+        // Without Content-Encoding, gzip-compressed bodies are served garbled.
         let content_type = parts.headers.get(hyper::header::CONTENT_TYPE).cloned();
+        let content_encoding = parts.headers.get(hyper::header::CONTENT_ENCODING).cloned();
         let meta = cache::CachedMeta {
             content_type,
+            content_encoding,
             status: parts.status,
         };
 
@@ -573,6 +648,7 @@ async fn handle_static_cache(
         let state_clone = state.clone();
         let path_clone = path_owned.clone();
         let meta_clone = meta.clone();
+        let notify_clone = notify.clone();
 
         let (cache_ttl, cache_max) = match &rule.cache {
             Some(cp) => (cp.ttl_seconds, cp.max_entries),
@@ -630,6 +706,9 @@ async fn handle_static_cache(
                     cache_max,
                 );
             }
+            // Singleflight: notify waiters and remove inflight entry
+            state_clone.inflight.remove(&path_clone);
+            notify_clone.notify_waiters();
         });
 
         let mut resp = Response::from_parts(parts, stream_body.boxed());
@@ -639,6 +718,10 @@ async fn handle_static_cache(
         );
         return Ok(resp);
     }
+
+    // Non-200 or non-cacheable: clean up inflight and notify waiters
+    state.inflight.remove(&path_owned);
+    notify.notify_waiters();
 
     Ok(resp)
 }

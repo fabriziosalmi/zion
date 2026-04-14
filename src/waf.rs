@@ -84,28 +84,45 @@ fn get_scanner() -> &'static AhoCorasick {
             "; rm ",
             "; wget ",
             "; curl ",
+            ";cat ",
+            ";ls ",
+            ";rm ",
+            ";wget ",
+            ";curl ",
             "| cat ",
             "| ls ",
             "| rm ",
+            "|cat ",
+            "|ls ",
+            "|rm ",
             "$(cat ",
             "$(ls ",
             "`cat ",
             "`ls ",
+            "\ncat ",      // newline injection
+            "\nls ",
+            "\nwget ",
+            "\ncurl ",
             "/etc/passwd",
             "/etc/shadow",
             "cmd.exe",
             "powershell",
             // ── Path Traversal ──
-            "../../../",
+            "../../",     // 2 levels (sufficient for most attacks)
             "..\\..\\",
             "%2e%2e%2f",
             "%2e%2e/",
             "....//",
             // ── SSRF ──
-            "http://169.254.169.254", // AWS metadata
-            "http://[::ffff:169.254", // IPv6-mapped
-            "http://metadata.google", // GCP metadata
-            "http://100.100.100.200", // Alibaba metadata
+            "http://169.254.169.254",  // AWS metadata (HTTP)
+            "https://169.254.169.254", // AWS metadata (HTTPS)
+            "http://[::ffff:169.254",  // IPv6-mapped
+            "http://metadata.google",  // GCP metadata (HTTP)
+            "https://metadata.google", // GCP metadata (HTTPS)
+            "http://100.100.100.200",  // Alibaba metadata
+            "http://0xA9FEA9FE",       // AWS hex IP
+            "http://2852039166",       // AWS decimal IP
+            "http://169.254.169.254.nip.io", // DNS rebinding
             // ── Log4Shell / JNDI ──
             "${jndi:",
             "${env:",
@@ -359,8 +376,9 @@ pub fn validate_request(
         return WafVerdict::Deny("body exceeds max size");
     }
 
-    // Methods without body semantics: skip body inspection
-    if !matches!(method, "POST" | "PUT" | "PATCH") {
+    // Methods without body semantics: skip body inspection.
+    // DELETE can carry a body (RFC 9110) — some APIs use it.
+    if !matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
         return WafVerdict::Allow;
     }
 
@@ -371,9 +389,20 @@ pub fn validate_request(
     // ── Gate 2: Content-Type (zero-alloc case-insensitive) ──
     let is_json = match content_type {
         Some(ct) => {
+            // Prefix match with delimiter check: "application/json" must be
+            // followed by EOF, ';' (charset), or ' ' — not arbitrary chars.
+            // Without this, "application/jsonFOO" would be treated as allowed.
             let is_allowed = profile.allowed_content_types.iter().any(|allowed| {
-                ct.len() >= allowed.len()
-                    && ct.as_bytes()[..allowed.len()].eq_ignore_ascii_case(allowed.as_bytes())
+                if ct.len() < allowed.len() {
+                    return false;
+                }
+                if !ct.as_bytes()[..allowed.len()].eq_ignore_ascii_case(allowed.as_bytes()) {
+                    return false;
+                }
+                // Must be exact match or followed by a parameter delimiter
+                ct.len() == allowed.len()
+                    || ct.as_bytes()[allowed.len()] == b';'
+                    || ct.as_bytes()[allowed.len()] == b' '
             });
 
             if !is_allowed {
@@ -392,6 +421,30 @@ pub fn validate_request(
     };
 
     // ── Gate 3: Aho-Corasick injection scan (O(N), single pass) ──
+
+    // SIMD fast-reject: if no injection trigger bytes are present, the body
+    // cannot match any pattern — skip the full Aho-Corasick scan entirely.
+    // memchr uses NEON/AVX2 on all platforms. Covers: ' < ; $ { | / \ ` #
+    let has_trigger = memchr::memchr3(b'\'', b'<', b';', body).is_some()
+        || memchr::memchr3(b'$', b'{', b'|', body).is_some()
+        || memchr::memchr3(b'/', b'\\', b'`', body).is_some()
+        || memchr::memchr2(b'#', b'.', body).is_some();
+
+    if !has_trigger {
+        // No trigger bytes → impossible to match any injection pattern.
+        // Jump straight to Gate 4 (entropy) or Gate 5 (JSON).
+        if body.len() >= 256 {
+            let entropy = shannon_entropy(body);
+            if entropy > MAX_ENTROPY_THRESHOLD {
+                return WafVerdict::Deny("suspicious payload entropy");
+            }
+        }
+        if is_json {
+            return validate_json_structure(body, profile.max_depth, profile.max_string_len);
+        }
+        return WafVerdict::Allow;
+    }
+
     // Scan raw body first (fast path — no alloc if no encoding present).
     if get_scanner().is_match(body) {
         return WafVerdict::Deny("injection pattern detected");
@@ -411,32 +464,49 @@ pub fn validate_request(
             WAF_BUF_SEC.with(|buf2| {
                 let mut out = buf1.borrow_mut();
                 let mut sec = buf2.borrow_mut();
-                
+
                 // First pass from body -> out
                 normalize_unified(body, &mut out);
-                
+
+                // Iterate until convergence or safety cap.
+                // 2 iterations catches double/triple encoding (real-world max).
+                // Convergence check breaks early if no further decoding is needed.
                 for _ in 0..2 {
                     if get_scanner().is_match(out.as_slice()) {
                         return Some(WafVerdict::Deny("injection pattern detected (encoded)"));
                     }
-                    
+
                     let still_needs_decode = memchr::memchr(b'%', &out).is_some() || memchr::memchr(b'+', &out).is_some();
                     let still_has_sql_comments = out.windows(2).any(|w| w == b"/*");
                     let still_has_unicode_esc = out.windows(2).any(|w| w == b"\\u");
-                    
+
                     if !still_needs_decode && !still_has_sql_comments && !still_has_unicode_esc {
                         break;
                     }
-                    
-                    // Recursive pass: out -> sec
+
+                    // Recursive pass: out -> sec, then swap
                     normalize_unified(&out, &mut sec);
-                    // Swap back: sec -> out
+
+                    // If output didn't change, we've converged — stop
+                    if *out == *sec {
+                        break;
+                    }
+
                     std::mem::swap(&mut *out, &mut *sec);
                 }
-                
-                // Final check
+
+                // Final check after convergence
                 if get_scanner().is_match(out.as_slice()) {
                     return Some(WafVerdict::Deny("injection pattern detected (encoded)"));
+                }
+
+                // Shrink inflated buffers to prevent OOM from adversarial large bodies.
+                // A single 10MB POST would permanently inflate all worker threads.
+                if out.capacity() > 65_536 {
+                    out.shrink_to(8192);
+                }
+                if sec.capacity() > 65_536 {
+                    sec.shrink_to(8192);
                 }
                 None
             })
@@ -503,6 +573,9 @@ pub fn validate_uri(uri: &str) -> WafVerdict {
                     }
 
                     normalize_unified(&out, &mut sec);
+                    if *out == *sec {
+                        break;
+                    }
                     std::mem::swap(&mut *out, &mut *sec);
                 }
 
@@ -767,6 +840,29 @@ mod tests {
         assert_eq!(
             validate_request("POST", Some("application/json"), body, &strict_profile()),
             WafVerdict::Deny("injection pattern detected (encoded)")
+        );
+    }
+
+    #[test]
+    fn denies_triple_url_encoded_sqli() {
+        // %252527 → %2527 → %27 → ' (triple encoded)
+        let body = br#"{"user":"admin%252527 OR %2525271%252527=%2525271"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected (encoded)")
+        );
+    }
+
+    #[test]
+    fn denies_quadruple_url_encoded_xss() {
+        // %25253C → %253C → %3C → < (quadruple encoded)
+        // May match on raw scan (partial decode) or normalized scan
+        let body = br#"{"html":"%2525253Cscript%2525253Ealert(1)"}"#;
+        let result = validate_request("POST", Some("application/json"), body, &strict_profile());
+        assert!(
+            matches!(result, WafVerdict::Deny(_)),
+            "expected Deny, got {:?}",
+            result
         );
     }
 

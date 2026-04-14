@@ -30,11 +30,13 @@ pub const MAX_RATE_MAP_ENTRIES: usize = 100_000;
 // ============================================================================
 
 /// Pre-compiled CORS headers (built at boot from config, zero alloc per request).
+/// Uses FNV hash set for O(1) origin lookup (case-insensitive via lowercased storage).
 #[derive(Debug)]
 pub struct CorsHeaders {
     pub enabled: bool,
     pub allow_origin_wildcard: bool,
-    pub allowed_origins: Vec<String>,
+    /// Lowercased origins for O(1) case-insensitive lookup.
+    allowed_origins_set: fnv::FnvHashSet<String>,
     pub allow_methods: HeaderValue,
     pub allow_headers: HeaderValue,
     pub max_age: HeaderValue,
@@ -52,10 +54,17 @@ impl CorsHeaders {
         let max_age = HeaderValue::from_str(&cors.max_age.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("86400"));
 
+        // Store lowercased for case-insensitive O(1) lookup (RFC 6454 §5)
+        let allowed_origins_set: fnv::FnvHashSet<String> = cors
+            .allowed_origins
+            .iter()
+            .map(|o| o.to_ascii_lowercase())
+            .collect();
+
         Self {
             enabled,
             allow_origin_wildcard: wildcard,
-            allowed_origins: cors.allowed_origins.clone(),
+            allowed_origins_set,
             allow_methods: methods,
             allow_headers,
             max_age,
@@ -63,11 +72,14 @@ impl CorsHeaders {
     }
 
     /// Check if origin is allowed. Returns the origin value to echo back.
+    /// O(1) FNV hash lookup, case-insensitive per RFC 6454 §5.
     pub fn check_origin(&self, origin: &str) -> Option<HeaderValue> {
         if self.allow_origin_wildcard {
             return Some(HeaderValue::from_static("*"));
         }
-        if self.allowed_origins.iter().any(|o| o == origin) {
+        // Lowercase the incoming origin for case-insensitive comparison
+        let lower = origin.to_ascii_lowercase();
+        if self.allowed_origins_set.contains(&lower) {
             return HeaderValue::from_str(origin).ok();
         }
         None
@@ -78,37 +90,30 @@ impl CorsHeaders {
 // Security headers injection
 // ============================================================================
 
-// Pre-parsed header names for non-standard headers (S-03 fix).
-// Using HeaderName::from_static() avoids parsing the string on every response.
-static REFERRER_POLICY: hyper::header::HeaderName =
-    hyper::header::HeaderName::from_static("referrer-policy");
-static PERMISSIONS_POLICY: hyper::header::HeaderName =
-    hyper::header::HeaderName::from_static("permissions-policy");
-#[allow(dead_code)] // Kept for future per-route CSP feature
+// CSP header name kept for future per-route CSP feature
+#[allow(dead_code)]
 static CSP_NAME: hyper::header::HeaderName =
     hyper::header::HeaderName::from_static("content-security-policy");
 
-/// Inject security headers into any response. All pre-compiled static values.
-/// Cost: 6 hashmap inserts with pre-parsed keys = ~30ns total.
+/// Inject security headers and strip hop-by-hop headers.
+/// All values are pre-compiled statics — zero allocation per response.
 #[inline]
 pub fn inject_security_headers(resp: &mut Response<ZionBody>) {
     let h = resp.headers_mut();
+    // Security headers (pre-compiled static values)
     h.insert(hyper::header::STRICT_TRANSPORT_SECURITY, HSTS.clone());
     h.insert(hyper::header::X_CONTENT_TYPE_OPTIONS, XCTO.clone());
     h.insert(hyper::header::X_FRAME_OPTIONS, XFO.clone());
-    h.insert(REFERRER_POLICY.clone(), REFERRER.clone());
-    h.insert(PERMISSIONS_POLICY.clone(), PERMISSIONS.clone());
-    // S-05 FIX: CSP removed — as a reverse proxy, Zion should not override
-    // upstream Content-Security-Policy. The upstream application knows its own
-    // resource origins (CDNs, inline scripts, etc.) and must set its own CSP.
-    // Injecting a restrictive default-src 'self' would break most frontends.
-    // If CSP enforcement is needed, configure it per-route (future feature).
-    // h.insert(CSP_NAME.clone(), CSP.clone());
-
-    // Strip server identity — zero information leakage
+    h.insert(
+        hyper::header::HeaderName::from_static("referrer-policy"),
+        REFERRER.clone(),
+    );
+    h.insert(
+        hyper::header::HeaderName::from_static("permissions-policy"),
+        PERMISSIONS.clone(),
+    );
+    // Strip server identity + hop-by-hop (RFC 7230 §6.1)
     h.remove(hyper::header::SERVER);
-    // S-04 FIX: Strip hop-by-hop headers from upstream responses.
-    // Per RFC 7230 §6.1, proxies MUST NOT forward hop-by-hop headers.
     h.remove(hyper::header::CONNECTION);
     h.remove(hyper::header::TRANSFER_ENCODING);
     h.remove("Keep-Alive");
@@ -223,17 +228,15 @@ pub fn check_rate_limit(
 // ============================================================================
 
 /// Validate Host header to prevent header injection in redirects.
+/// Single-pass byte scan instead of 8 separate contains() calls.
 #[inline]
 pub fn is_valid_host(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= 253
-        && !host.contains('/')
-        && !host.contains('\\')
-        && !host.contains('@')
-        && !host.contains('\n')
-        && !host.contains('\r')
-        && !host.contains('\0')
-        && !host.contains(' ')
+        && !host
+            .as_bytes()
+            .iter()
+            .any(|&b| matches!(b, b'/' | b'\\' | b'@' | b'\n' | b'\r' | b'\0' | b' '))
 }
 
 /// Check if an IP is internal (loopback, private RFC1918, link-local).

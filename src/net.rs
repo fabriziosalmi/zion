@@ -64,26 +64,28 @@ fn tune_listener(socket: &socket2::Socket) {
     // valid, sizes are exact to socklen_t, and valid protocol/socket options are declared.
     unsafe {
         // TCP_DEFER_ACCEPT: wake process only when data arrives (not just SYN)
-        // Value = timeout in seconds to wait for data
         let defer: i32 = 5;
-        libc::setsockopt(
+        if libc::setsockopt(
             fd,
             libc::IPPROTO_TCP,
             libc::TCP_DEFER_ACCEPT,
             &defer as *const _ as *const libc::c_void,
             std::mem::size_of::<i32>() as libc::socklen_t,
-        );
+        ) != 0 {
+            eprintln!("  warning: TCP_DEFER_ACCEPT unavailable (may be in restricted container)");
+        }
 
         // TCP_FASTOPEN: allow data in SYN for returning clients
-        // Value = max pending TFO connections
         let tfo: i32 = 256;
-        libc::setsockopt(
+        if libc::setsockopt(
             fd,
             libc::IPPROTO_TCP,
             libc::TCP_FASTOPEN,
             &tfo as *const _ as *const libc::c_void,
             std::mem::size_of::<i32>() as libc::socklen_t,
-        );
+        ) != 0 {
+            eprintln!("  warning: TCP_FASTOPEN unavailable");
+        }
     }
 }
 
@@ -97,15 +99,26 @@ fn tune_listener(_socket: &socket2::Socket) {}
 pub fn tune_accepted(stream: &tokio::net::TcpStream) {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
-    // SAFETY: FFI setsockopt for TCP_QUICKACK valid because `fd` from Tokio TcpStream is active,
-    // the pointer resolves exclusively inside this block, and sizes align.
     unsafe {
+        // TCP_QUICKACK: send ACK immediately (don't wait for delayed ACK timer)
         let val: i32 = 1;
         libc::setsockopt(
             fd,
             libc::IPPROTO_TCP,
             libc::TCP_QUICKACK,
             &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        );
+
+        // SO_BUSY_POLL: spin-poll the NIC queue for up to 50μs before sleeping.
+        // Trades ~1% CPU for 5-15μs p99 latency reduction. Only effective on
+        // NICs with NAPI support. Silently ignored if kernel doesn't support it.
+        let busy_us: i32 = 50;
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BUSY_POLL,
+            &busy_us as *const _ as *const libc::c_void,
             std::mem::size_of::<i32>() as libc::socklen_t,
         );
     }

@@ -18,10 +18,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Cached response metadata — stored alongside the body so cache hits
-/// preserve upstream Content-Type, status, and other essential headers.
+/// preserve upstream Content-Type, Content-Encoding, status, and other
+/// essential headers.
 #[derive(Clone, Debug)]
 pub struct CachedMeta {
     pub content_type: Option<HeaderValue>,
+    pub content_encoding: Option<HeaderValue>,
     pub status: StatusCode,
 }
 
@@ -37,6 +39,8 @@ struct L1Entry {
     body: Bytes,
     meta: CachedMeta,
     expires_at: Instant,
+    /// Cache generation at promotion time — stale if < StaticCache.generation.
+    generation: u64,
 }
 
 /// L2 entry — with TTL.
@@ -46,105 +50,138 @@ struct L2Entry {
     expires_at: Instant,
 }
 
-/// Thread-local L1 cache. One per tokio worker thread.
-/// Uses a VecDeque as an LRU eviction queue for true O(1) eviction.
-/// The deque maintains access order (front = oldest, back = newest).
+/// Thread-local L1 cache with O(1) LRU eviction.
+///
+/// Uses a HashMap for O(1) lookup + a compact doubly-linked list via Vec
+/// indices for O(1) touch/evict. No linear scans — all operations are O(1).
+/// The linked list tracks access order: head = LRU (evict first), tail = MRU.
 struct L1Cache {
-    map: HashMap<Arc<str>, L1Entry>,
-    /// LRU eviction queue — front is oldest, back is most recently used.
-    /// On eviction, pop_front() in O(1). On access, move-to-back.
-    order: std::collections::VecDeque<Arc<str>>,
+    /// Key → (entry, node index in `nodes`)
+    map: HashMap<Arc<str>, (L1Entry, usize)>,
+    /// Doubly-linked list nodes stored in a Vec (cache-line friendly)
+    nodes: Vec<LruNode>,
+    /// Free list of recycled node indices
+    free: Vec<usize>,
+    /// Index of LRU head (oldest), or usize::MAX if empty
+    head: usize,
+    /// Index of MRU tail (newest), or usize::MAX if empty
+    tail: usize,
     max_entries: usize,
 }
+
+struct LruNode {
+    key: Arc<str>,
+    prev: usize, // usize::MAX = no prev
+    next: usize, // usize::MAX = no next
+}
+
+const NIL: usize = usize::MAX;
 
 impl L1Cache {
     fn new(max_entries: usize) -> Self {
         Self {
             map: HashMap::with_capacity(max_entries),
-            order: std::collections::VecDeque::with_capacity(max_entries),
+            nodes: Vec::with_capacity(max_entries),
+            free: Vec::new(),
+            head: NIL,
+            tail: NIL,
             max_entries,
         }
     }
 
-    /// Move a key to the back of the eviction queue (most recently used).
-    /// O(N) in theory but L1 is tiny (32–128 entries), so this is ~3ns.
+    /// Allocate a node index (reuse from free list or push new)
     #[inline]
-    fn touch(&mut self, key: &Arc<str>) {
-        // Remove from current position (linear scan on small deque)
-        if let Some(pos) = self.order.iter().position(|k| k.as_ref() == key.as_ref()) {
-            self.order.remove(pos);
+    fn alloc_node(&mut self, key: Arc<str>) -> usize {
+        if let Some(idx) = self.free.pop() {
+            self.nodes[idx] = LruNode { key, prev: NIL, next: NIL };
+            idx
+        } else {
+            let idx = self.nodes.len();
+            self.nodes.push(LruNode { key, prev: NIL, next: NIL });
+            idx
         }
-        self.order.push_back(key.clone());
+    }
+
+    /// Unlink a node from the list (O(1))
+    #[inline]
+    fn unlink(&mut self, idx: usize) {
+        let prev = self.nodes[idx].prev;
+        let next = self.nodes[idx].next;
+        if prev != NIL {
+            self.nodes[prev].next = next;
+        } else {
+            self.head = next;
+        }
+        if next != NIL {
+            self.nodes[next].prev = prev;
+        } else {
+            self.tail = prev;
+        }
+        self.nodes[idx].prev = NIL;
+        self.nodes[idx].next = NIL;
+    }
+
+    /// Append a node to tail (MRU position) — O(1)
+    #[inline]
+    fn push_tail(&mut self, idx: usize) {
+        self.nodes[idx].prev = self.tail;
+        self.nodes[idx].next = NIL;
+        if self.tail != NIL {
+            self.nodes[self.tail].next = idx;
+        } else {
+            self.head = idx;
+        }
+        self.tail = idx;
+    }
+
+    /// Move a node to MRU position — O(1) unlink + push_tail
+    #[inline]
+    fn touch(&mut self, idx: usize) {
+        self.unlink(idx);
+        self.push_tail(idx);
     }
 
     #[inline]
-    fn get(&mut self, path: &str) -> Option<CacheHit> {
-        // Check if entry exists
-        let (body, meta, expired, key) = {
-            let entry = self.map.get(path)?;
-            if Instant::now() >= entry.expires_at {
-                (None, None, true, None)
-            } else {
-                (
-                    Some(entry.body.clone()),
-                    Some(entry.meta.clone()),
-                    false,
-                    // Find the key Arc for touch
-                    self.order.iter().find(|k| k.as_ref() == path).cloned(),
-                )
-            }
-        };
-
-        if expired {
+    fn get(&mut self, path: &str, current_gen: u64) -> Option<CacheHit> {
+        let (entry, node_idx) = self.map.get(path)?;
+        if Instant::now() >= entry.expires_at || entry.generation < current_gen {
+            // Expired or stale generation — remove
+            let idx = *node_idx;
+            self.unlink(idx);
+            self.free.push(idx);
             self.map.remove(path);
-            self.order.retain(|k| k.as_ref() != path);
             return None;
         }
+        let body = entry.body.clone();
+        let meta = entry.meta.clone();
+        let idx = *node_idx;
+        self.touch(idx);
 
-        if let Some(key) = key {
-            self.touch(&key);
-        }
-
-        Some(CacheHit {
-            body: body.unwrap(),
-            meta: meta.unwrap(),
-        })
+        Some(CacheHit { body, meta })
     }
 
     #[inline]
-    fn insert(&mut self, path: Arc<str>, body: Bytes, meta: CachedMeta, expires_at: Instant) {
-        // If key already exists, update in place and move to back
-        if self.map.contains_key(&path) {
-            self.map.insert(
-                path.clone(),
-                L1Entry {
-                    body,
-                    meta,
-                    expires_at,
-                },
-            );
-            self.touch(&path);
+    fn insert(&mut self, path: Arc<str>, body: Bytes, meta: CachedMeta, expires_at: Instant, generation: u64) {
+        // If key already exists, update in place and move to MRU
+        if let Some((entry, node_idx)) = self.map.get_mut(path.as_ref()) {
+            *entry = L1Entry { body, meta, expires_at, generation };
+            let idx = *node_idx;
+            self.touch(idx);
             return;
         }
 
-        // Evict from front of queue until we have space
-        while self.map.len() >= self.max_entries {
-            if let Some(oldest) = self.order.pop_front() {
-                self.map.remove(&oldest);
-            } else {
-                break;
-            }
+        // Evict LRU entries until we have space
+        while self.map.len() >= self.max_entries && self.head != NIL {
+            let lru_idx = self.head;
+            let lru_key = self.nodes[lru_idx].key.clone();
+            self.unlink(lru_idx);
+            self.free.push(lru_idx);
+            self.map.remove(&lru_key);
         }
 
-        self.order.push_back(path.clone());
-        self.map.insert(
-            path,
-            L1Entry {
-                body,
-                meta,
-                expires_at,
-            },
-        );
+        let idx = self.alloc_node(path.clone());
+        self.push_tail(idx);
+        self.map.insert(path, (L1Entry { body, meta, expires_at, generation }, idx));
     }
 }
 
@@ -172,6 +209,11 @@ thread_local! {
 pub struct StaticCache {
     l2: Option<DashMap<Arc<str>, L2Entry>>,
     l1_max_entries: usize,
+    /// Monotonic counter bumped on every L2 insert/update.
+    /// L1 caches store the generation at promotion time; on get, if the
+    /// global generation has advanced, the L1 entry is stale and re-fetched
+    /// from L2. This prevents serving stale data for the TTL duration.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl StaticCache {
@@ -191,6 +233,7 @@ impl StaticCache {
         Self {
             l2,
             l1_max_entries: l1_max,
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -235,11 +278,13 @@ impl StaticCache {
 
         let Some(l2_concurrent) = &self.l2 else { unreachable!() };
 
+        let current_gen = self.generation.load(std::sync::atomic::Ordering::Acquire);
+
         // L1: thread-local, zero contention
         let l1_hit = L1.with(|l1| {
             let mut l1 = l1.borrow_mut();
             let l1 = l1.get_or_insert_with(|| L1Cache::new(l1_max));
-            l1.get(path)
+            l1.get(path, current_gen)
         });
 
         if let Some(hit) = l1_hit {
@@ -265,11 +310,11 @@ impl StaticCache {
         let expires_at = entry.expires_at;
         drop(entry); // release DashMap read lock
 
-        // Promote to L1 with same TTL
+        // Promote to L1 with same TTL and current generation
         L1.with(|l1| {
             let mut l1 = l1.borrow_mut();
             let l1 = l1.get_or_insert_with(|| L1Cache::new(l1_max));
-            l1.insert(key, body.clone(), meta.clone(), expires_at);
+            l1.insert(key, body.clone(), meta.clone(), expires_at, current_gen);
         });
 
         crate::metrics::METRICS
@@ -370,6 +415,8 @@ impl StaticCache {
                 expires_at: Instant::now() + Duration::from_secs(ttl_seconds),
             },
         );
+        // Bump generation so L1 caches on other threads see the update
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     #[allow(dead_code)]
@@ -389,6 +436,7 @@ mod tests {
     fn default_meta() -> CachedMeta {
         CachedMeta {
             content_type: Some(HeaderValue::from_static("text/css")),
+            content_encoding: None,
             status: StatusCode::OK,
         }
     }
@@ -421,6 +469,7 @@ mod tests {
         cache.insert("/a.js", Bytes::from("v1"), default_meta(), 3600, 100);
         let meta2 = CachedMeta {
             content_type: Some(HeaderValue::from_static("application/javascript")),
+            content_encoding: None,
             status: StatusCode::OK,
         };
         cache.insert("/a.js", Bytes::from("v2"), meta2, 3600, 100);
@@ -530,6 +579,7 @@ mod tests {
         let cache = StaticCache::new();
         let meta = CachedMeta {
             content_type: None,
+            content_encoding: None,
             status: StatusCode::OK,
         };
         cache.insert("/no-ct", Bytes::from("data"), meta, 3600, 100);
@@ -542,6 +592,7 @@ mod tests {
         let cache = StaticCache::new();
         let meta = CachedMeta {
             content_type: None,
+            content_encoding: None,
             status: StatusCode::NOT_MODIFIED,
         };
         cache.insert("/304", Bytes::new(), meta, 3600, 100);

@@ -14,7 +14,10 @@ use std::time::Duration;
 /// Bucket boundaries (ms): 1, 2, 4, 8, 16, 32, 64, 128, 256, 512,
 ///                         1024, 2048, 4096, 8192, 16384, 32768, +Inf
 pub struct LatencyHistogram {
-    /// 16 cumulative buckets + overflow
+    /// 16 non-cumulative (differential) buckets + overflow.
+    /// Each bucket stores only the count for that exact range.
+    /// Cumulative sums are computed in render() (1x/sec, not 200K/sec).
+    /// This reduces observe() from 17 atomics to 3.
     buckets: [AtomicU64; 17],
     /// Running sum in microseconds (for computing mean)
     sum_us: AtomicU64,
@@ -62,6 +65,7 @@ impl LatencyHistogram {
     }
 
     /// Record a duration observation. O(1), lock-free, zero-alloc.
+    /// Only 3 atomic ops per observation (was 17 with cumulative buckets).
     #[inline]
     pub fn observe(&self, duration: Duration) {
         let us = duration.as_micros() as u64;
@@ -74,10 +78,9 @@ impl LatencyHistogram {
             .position(|&bound| us <= bound)
             .unwrap_or(16); // +Inf bucket
 
-        // Increment this bucket AND all subsequent buckets (cumulative)
-        for i in idx..17 {
-            self.buckets[i].fetch_add(1, Relaxed);
-        }
+        // Non-cumulative: increment only the target bucket.
+        // Cumulative sums computed in render() (once per scrape, not per request).
+        self.buckets[idx].fetch_add(1, Relaxed);
     }
 
     /// Render Prometheus histogram lines. Zero-alloc using BytesMut/itoa/ryu.
@@ -93,18 +96,23 @@ impl LatencyHistogram {
         let mut itoa_buf = itoa::Buffer::new();
         let mut ryu_buf = ryu::Buffer::new();
 
+        // Load non-cumulative bucket counts and compute cumulative sums
+        // for Prometheus output. This runs once per scrape (~1/15s), not per request.
+        let mut cumulative = 0u64;
         for (i, &bound) in BUCKET_BOUNDS_SEC.iter().enumerate() {
+            cumulative += self.buckets[i].load(Relaxed);
             out.extend_from_slice(name.as_bytes());
             out.extend_from_slice(b"_bucket{le=\"");
             out.extend_from_slice(ryu_buf.format(bound).as_bytes());
             out.extend_from_slice(b"\"} ");
-            out.extend_from_slice(itoa_buf.format(self.buckets[i].load(Relaxed)).as_bytes());
+            out.extend_from_slice(itoa_buf.format(cumulative).as_bytes());
             out.extend_from_slice(b"\n");
         }
 
+        cumulative += self.buckets[16].load(Relaxed);
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(b"_bucket{le=\"+Inf\"} ");
-        out.extend_from_slice(itoa_buf.format(self.buckets[16].load(Relaxed)).as_bytes());
+        out.extend_from_slice(itoa_buf.format(cumulative).as_bytes());
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(name.as_bytes());
@@ -246,12 +254,14 @@ pub struct Metrics {
     pub upstream_duration: LatencyHistogram,
     pub tls_handshake_duration: LatencyHistogram,
 
-    // Caching for Prometheus Output (P2)
-    pub cached_render: std::sync::RwLock<(u64, bytes::Bytes)>,
+    // Caching for Prometheus Output — lock-free via ArcSwap.
+    // RwLock was a contention point under concurrent /metrics scrapes.
+    pub cached_render_ts: AtomicU64,
+    pub cached_render_buf: arc_swap::ArcSwap<bytes::Bytes>,
 }
 
 impl Metrics {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             requests_total: ShardedCounter::new(),
             requests_2xx: ShardedCounter::new(),
@@ -268,7 +278,8 @@ impl Metrics {
             request_duration: LatencyHistogram::new(),
             upstream_duration: LatencyHistogram::new(),
             tls_handshake_duration: LatencyHistogram::new(),
-            cached_render: std::sync::RwLock::new((0, bytes::Bytes::new())),
+            cached_render_ts: AtomicU64::new(0),
+            cached_render_buf: arc_swap::ArcSwap::from_pointee(bytes::Bytes::new()),
         }
     }
 
@@ -290,17 +301,16 @@ impl Metrics {
         }
     }
 
-    /// Render Prometheus text exposition format. Zero-alloc generation.
+    /// Render Prometheus text exposition format. Lock-free cached.
     pub fn render(&self) -> bytes::Bytes {
         let now_sec = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        if let Ok(guard) = self.cached_render.read() {
-            if guard.0 == now_sec {
-                return guard.1.clone();
-            }
+        // Lock-free cache check: load timestamp (Relaxed), compare, return cached if fresh
+        if self.cached_render_ts.load(Relaxed) == now_sec {
+            return self.cached_render_buf.load_full().as_ref().clone();
         }
 
         // Preallocate estimated capacity to avoid reallocations
@@ -429,17 +439,16 @@ impl Metrics {
 
         let b: bytes::Bytes = out.into();
 
-        if let Ok(mut guard) = self.cached_render.write() {
-            guard.0 = now_sec;
-            guard.1 = b.clone();
-        }
+        // Lock-free cache update
+        self.cached_render_buf.store(std::sync::Arc::new(b.clone()));
+        self.cached_render_ts.store(now_sec, Relaxed);
 
         b
     }
 }
 
 /// Global static metrics instance.
-pub static METRICS: Metrics = Metrics::new();
+pub static METRICS: std::sync::LazyLock<Metrics> = std::sync::LazyLock::new(Metrics::new);
 
 /// RAII guard for tracking active connections.
 /// Increments on creation, decrements on drop.
@@ -474,9 +483,10 @@ mod tests {
         h.observe(Duration::from_millis(1));
         assert_eq!(h.count.load(Relaxed), 1);
         assert_eq!(h.sum_us.load(Relaxed), 1000);
-        // 1ms falls in bucket[0] (le=0.001), so bucket[0..=16] all get +1
+        // 1ms falls in bucket[0] (le=0.001) — non-cumulative, only bucket[0] incremented
         assert_eq!(h.buckets[0].load(Relaxed), 1);
-        assert_eq!(h.buckets[16].load(Relaxed), 1); // +Inf always cumulative
+        assert_eq!(h.buckets[1].load(Relaxed), 0); // not cumulative
+        assert_eq!(h.buckets[16].load(Relaxed), 0); // +Inf only if > 32s
     }
 
     #[test]
@@ -484,10 +494,10 @@ mod tests {
         let h = LatencyHistogram::new();
         h.observe(Duration::from_millis(500));
         assert_eq!(h.count.load(Relaxed), 1);
-        // 500ms = 500_000us → bucket bound 512_000us (index 9)
+        // 500ms = 500_000us → bucket bound 512_000us (index 9) — non-cumulative
         assert_eq!(h.buckets[8].load(Relaxed), 0); // le=0.256 → no
         assert_eq!(h.buckets[9].load(Relaxed), 1); // le=0.512 → yes
-        assert_eq!(h.buckets[16].load(Relaxed), 1);
+        assert_eq!(h.buckets[10].load(Relaxed), 0); // not cumulative
     }
 
     #[test]
@@ -502,22 +512,27 @@ mod tests {
     }
 
     #[test]
-    fn histogram_cumulative_multiple() {
+    fn histogram_differential_multiple() {
         let h = LatencyHistogram::new();
         h.observe(Duration::from_millis(1)); // 1000us <= 1000us → bucket 0
         h.observe(Duration::from_millis(10)); // 10000us: 8000 < 10000 <= 16000 → bucket 4
-        h.observe(Duration::from_millis(100)); // 100000us: 64000 < 100000 <= 128000 → bucket 6
+        h.observe(Duration::from_millis(100)); // 100000us: 64000 < 100000 <= 128000 → bucket 7
         assert_eq!(h.count.load(Relaxed), 3);
-        // Cumulative: observe increments from target bucket through +Inf
-        // 1ms → bucket[0..=16] all get +1
-        // 10ms → bucket[4..=16] all get +1
-        // 100ms → bucket[7..=16] all get +1  (100000us: 64000 < 100000 <= 128000 → bucket 7)
-        assert_eq!(h.buckets[0].load(Relaxed), 1); // only 1ms
-        assert_eq!(h.buckets[3].load(Relaxed), 1); // only 1ms (10ms is in bucket 4)
-        assert_eq!(h.buckets[4].load(Relaxed), 2); // 1ms + 10ms
-        assert_eq!(h.buckets[6].load(Relaxed), 2); // 1ms + 10ms (100ms is in bucket 7)
-        assert_eq!(h.buckets[7].load(Relaxed), 3); // all 3
-        assert_eq!(h.buckets[16].load(Relaxed), 3); // +Inf = all 3
+        // Non-cumulative: each bucket only counts its own range
+        assert_eq!(h.buckets[0].load(Relaxed), 1); // 1ms only
+        assert_eq!(h.buckets[4].load(Relaxed), 1); // 10ms only
+        assert_eq!(h.buckets[7].load(Relaxed), 1); // 100ms only
+        assert_eq!(h.buckets[16].load(Relaxed), 0); // no overflow
+        // Verify render() produces correct cumulative output
+        let mut buf = bytes::BytesMut::new();
+        h.render("test", "test", &mut buf);
+        let out = String::from_utf8(buf.to_vec()).unwrap();
+        // le=0.001 should be 1 (just 1ms)
+        assert!(out.contains("test_bucket{le=\"0.001\"} 1"));
+        // le=0.016 should be 2 (1ms + 10ms)
+        assert!(out.contains("test_bucket{le=\"0.016\"} 2"));
+        // le=+Inf should be 3 (all)
+        assert!(out.contains("test_bucket{le=\"+Inf\"} 3"));
     }
 
     #[test]

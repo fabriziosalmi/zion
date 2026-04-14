@@ -96,7 +96,7 @@ struct AppState {
     http_client: HttpClient,
     static_cache: cache::StaticCache,
     conn_limit: Arc<Semaphore>,
-    http_builder: AutoBuilder<TokioExecutor>,
+    http_builder: Arc<AutoBuilder<TokioExecutor>>,
     /// ACME HTTP-01 challenge tokens (empty when no challenge active).
     acme_challenges: acme::ChallengeStore,
     /// Per-IP rate limiter. 0 = disabled.
@@ -107,6 +107,10 @@ struct AppState {
     health_map: health::HealthMap,
     /// Trusted proxy CIDRs for X-Forwarded-For IP resolution.
     trusted_proxies: security::TrustedProxies,
+    /// Singleflight: coalesce concurrent cache misses for the same key.
+    /// First request fetches from upstream; subsequent requests for the same
+    /// key await the Notify and serve from the now-warm cache.
+    inflight: dashmap::DashMap<Arc<str>, Arc<tokio::sync::Notify>>,
 }
 
 // Pre-compiled constants — zero runtime cost.
@@ -248,15 +252,14 @@ async fn async_main(
         rate_map: Arc::new(dashmap::DashMap::new()),
         health_map: health_map.clone(),
         trusted_proxies,
-        http_builder: {
+        inflight: dashmap::DashMap::new(),
+        http_builder: Arc::new({
             let mut b = AutoBuilder::new(TokioExecutor::new());
-            // Limit header count and total header buffer size to prevent header bomb DoS.
-            // 16KB buffer is optimal for L1 CPU cache on micro-payloads (API/CSS).
             b.http1().max_headers(64).max_buf_size(16 * 1024);
             b.http1().preserve_header_case(false);
             b.http1().title_case_headers(false);
             b
-        },
+        }),
     });
 
     // 6. Spawn ACME auto-renewal task (if configured)
@@ -554,6 +557,8 @@ async fn async_main(
             // 0-RTT: Check if this connection accepted early data.
             // Only the first request on the connection can be early data.
             // We pass this flag to handle_https for method gating (425 Too Early).
+            // rustls ServerConnection::early_data() returns Some if 0-RTT was
+            // accepted during the handshake (was_accepted() flag persists).
             let is_early_data = tls_stream.get_mut().1.early_data().is_some();
             let early_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(is_early_data));
 
@@ -564,11 +569,11 @@ async fn async_main(
                 .peer_certificates()
                 .and_then(|certs| certs.first())
                 .and_then(|cert| {
-                    // Parse DER cert to extract subject DN
-                    // Use a hex fingerprint of the raw subject as a lightweight DN
+                    // Parse DER cert to extract a lightweight identifier.
+                    // XOR-fold of first 64 bytes — fast but NOT cryptographic.
+                    // Sufficient for logging/tracing, NOT for access control.
                     let raw = cert.as_ref();
                     if raw.len() > 20 {
-                        // SHA256 fingerprint of the full cert (first 16 hex chars)
                         use std::fmt::Write;
                         let mut hasher_out = [0u8; 8];
                         for (i, &b) in raw.iter().take(64).enumerate() {
@@ -586,24 +591,40 @@ async fn async_main(
             let client_dn = client_cert_dn.map(std::sync::Arc::new);
 
             let io = TokioIo::new(tls_stream);
-            // HTTP request timeout — kill connections that don't complete a request
+            // Connection-level idle timeout. Set high (1 hour) because this
+            // wraps the entire HTTP/2 mux / WebSocket / SSE connection, not
+            // individual requests. Per-request timeouts are in process_request.
             let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(3600),
                 builder.serve_connection_with_upgrades(
                     io,
-                    service_fn(move |mut req| {
-                        // Consume early_data flag on first request (subsequent requests are normal)
-                        let was_early =
-                            early_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
-                        // Inject client cert DN as header if mTLS authenticated
-                        if let Some(ref dn) = client_dn {
-                            if let Ok(val) = hyper::header::HeaderValue::from_str(dn) {
-                                req.headers_mut().insert("X-Client-Cert-DN", val);
+                    service_fn(move |mut req: Request<Incoming>| {
+                        let state = state.clone();
+                        let early_flag = early_flag.clone();
+                        let client_dn = client_dn.clone();
+                        async move {
+                            // Fast-path: health probes bypass the full pipeline (~1us vs ~5us)
+                            let path = req.uri().path();
+                            if path == "/healthz" {
+                                return Ok(text_response(StatusCode::OK, "ok"));
                             }
+                            if path == "/readyz" {
+                                return Ok(text_response(StatusCode::OK, "ready"));
+                            }
+
+                            // Consume early_data flag on first request
+                            let was_early =
+                                early_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
+                            // Inject client cert DN as header if mTLS authenticated
+                            if let Some(ref dn) = client_dn {
+                                if let Ok(val) = hyper::header::HeaderValue::from_str(dn) {
+                                    req.headers_mut().insert("X-Client-Cert-DN", val);
+                                }
+                            }
+                            use http_body_util::BodyExt;
+                            let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
+                            process_request(req_boxed, state, remote_addr, was_early).await
                         }
-                        use http_body_util::BodyExt;
-                        let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
-                        process_request(req_boxed, state.clone(), remote_addr, was_early)
                     }),
                 ),
             )
@@ -688,6 +709,19 @@ async fn handle_http(
     state: Arc<AppState>,
     remote_addr: SocketAddr,
 ) -> Result<Response<ZionBody>, hyper::Error> {
+    // Rate limit HTTP/80 to prevent DoS via redirect/ACME flood
+    if !check_rate_limit(&state, remote_addr.ip()) {
+        metrics::METRICS
+            .rate_limited
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(empty_response(StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    // URI length check (same as HTTPS handler)
+    if req.uri().path().len() > MAX_URI_LEN {
+        return Ok(empty_response(StatusCode::URI_TOO_LONG));
+    }
+
     let path = req.uri().path();
 
     // ACME HTTP-01 challenge — serve from in-memory store (auto-renewal)

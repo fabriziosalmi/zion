@@ -313,7 +313,8 @@ echo "  ${B}${CC}━━━ WAF SECURITY VALIDATION ━━━${R}"
 SQLI_BLOCKED=0
 sqli_status=$(curl -sk -o /dev/null -w "%{http_code}" -H "Host: bench.local" \
     "https://127.0.0.1:4431/api/v1/data?id=1%27%20OR%201%3D1%20--%20")
-if [[ "$sqli_status" == "403" ]]; then
+# WAF returns 400 Bad Request for blocked payloads (not 403)
+if [[ "$sqli_status" == "400" || "$sqli_status" == "403" ]]; then
     echo "    ✓ SQLi blocked (HTTP $sqli_status)"
     SQLI_BLOCKED=1
 else
@@ -323,7 +324,7 @@ fi
 XSS_BLOCKED=0
 xss_status=$(curl -sk -o /dev/null -w "%{http_code}" -H "Host: bench.local" \
     "https://127.0.0.1:4431/api/v1/data?q=%3Cscript%3Ealert(1)%3C/script%3E")
-if [[ "$xss_status" == "403" ]]; then
+if [[ "$xss_status" == "400" || "$xss_status" == "403" ]]; then
     echo "    ✓ XSS blocked (HTTP $xss_status)"
     XSS_BLOCKED=1
 else

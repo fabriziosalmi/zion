@@ -66,9 +66,17 @@ fn prepare_request<B>(
     *req.uri_mut() = new_uri;
     *req.version_mut() = Version::HTTP_11;
 
-    // Remove hop-by-hop headers
+    // Remove hop-by-hop headers (RFC 7230 §6.1).
+    // Forwarding Transfer-Encoding enables CL/TE request smuggling.
+    // Forwarding Proxy-Authorization leaks client credentials to upstream.
     req.headers_mut().remove(hyper::header::HOST);
     req.headers_mut().remove(hyper::header::CONNECTION);
+    req.headers_mut().remove(hyper::header::TRANSFER_ENCODING);
+    req.headers_mut().remove(hyper::header::TE);
+    req.headers_mut().remove(hyper::header::TRAILER);
+    req.headers_mut().remove(hyper::header::PROXY_AUTHORIZATION);
+    req.headers_mut().remove("Proxy-Connection");
+    req.headers_mut().remove("Keep-Alive");
 
     // Forwarding headers — append to X-Forwarded-For chain (preserves upstream proxies),
     // set X-Real-IP to the direct client IP.
@@ -263,13 +271,20 @@ pub async fn proxy_websocket(
     // HTTP/1.1 upgrade handshake — works on any AsyncRead+AsyncWrite stream.
     // For TLS upstreams, wrap in tokio-rustls connector first.
     if is_tls_upstream {
-        // Build TLS client config with embedded Mozilla CA roots
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
+        // Cached TLS client config — build once, reuse for all WS upgrades.
+        // Avoids re-parsing ~150 Mozilla CA roots on every WebSocket TLS connection.
+        static WS_TLS_CONFIG: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> =
+            std::sync::OnceLock::new();
+        let tls_config = WS_TLS_CONFIG.get_or_init(|| {
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            std::sync::Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth(),
+            )
+        });
+        let connector = tokio_rustls::TlsConnector::from(tls_config.clone());
 
         // SNI: use the hostname from the authority (without port)
         let server_name = rustls::pki_types::ServerName::try_from(authority.host().to_string())
@@ -343,6 +358,21 @@ async fn send_ws_upgrade(
         return Ok(Response::from_parts(parts, body.boxed()));
     }
 
+    // Capture Sec-WebSocket-Accept and other WS headers from upstream
+    // BEFORE consuming the response for upgrade IO (RFC 6455 §4.2.2).
+    let ws_accept = upstream_resp
+        .headers()
+        .get("Sec-WebSocket-Accept")
+        .cloned();
+    let ws_protocol = upstream_resp
+        .headers()
+        .get("Sec-WebSocket-Protocol")
+        .cloned();
+    let ws_extensions = upstream_resp
+        .headers()
+        .get("Sec-WebSocket-Extensions")
+        .cloned();
+
     // Get upgrade IO from upstream
     let upstream_upgraded = match hyper::upgrade::on(upstream_resp).await {
         Ok(u) => u,
@@ -352,11 +382,22 @@ async fn send_ws_upgrade(
         }
     };
 
-    // Build 101 response for client (will trigger client-side upgrade)
-    let resp = Response::builder()
+    // Build 101 response for client, forwarding upstream's WS handshake headers.
+    // Sec-WebSocket-Accept is mandatory (RFC 6455) — browsers reject without it.
+    let mut builder = Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header(hyper::header::UPGRADE, "websocket")
-        .header(hyper::header::CONNECTION, "Upgrade")
+        .header(hyper::header::CONNECTION, "Upgrade");
+    if let Some(accept) = ws_accept {
+        builder = builder.header("Sec-WebSocket-Accept", accept);
+    }
+    if let Some(proto) = ws_protocol {
+        builder = builder.header("Sec-WebSocket-Protocol", proto);
+    }
+    if let Some(ext) = ws_extensions {
+        builder = builder.header("Sec-WebSocket-Extensions", ext);
+    }
+    let resp = builder
         .body(
             Full::new(Bytes::new())
                 .map_err(|never| match never {})

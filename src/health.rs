@@ -20,14 +20,25 @@ pub struct UpstreamHealth {
 }
 
 impl UpstreamHealth {
-    /// Update latency using Exponentially Weighted Moving Average (alpha = 0.125)
+    /// Update latency using Exponentially Weighted Moving Average (alpha = 0.125).
+    /// Uses compare_exchange loop to prevent lost updates under concurrent access.
     pub fn update_latency(&self, new_lat: u64) {
-        let current = self.latency_us.load(Relaxed);
-        if current == 0 {
-            self.latency_us.store(new_lat, Relaxed);
-        } else {
-            let ewma = (new_lat + 7 * current) / 8;
-            self.latency_us.store(ewma, Relaxed);
+        loop {
+            let current = self.latency_us.load(Relaxed);
+            let ewma = if current == 0 {
+                new_lat
+            } else {
+                (new_lat + 7 * current) / 8
+            };
+            match self.latency_us.compare_exchange_weak(
+                current,
+                ewma,
+                Relaxed,
+                Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(_) => continue, // retry with fresh value
+            }
         }
     }
 }

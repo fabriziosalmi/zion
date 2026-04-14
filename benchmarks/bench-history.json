@@ -22,5 +22,101 @@
       "conns": 100,
       "method": "wrk, median of N runs, native binary"
     }
+  },
+  {
+    "commit": "a7ea0fd",
+    "branch": "claude/sad-cori",
+    "arch": "native",
+    "timestamp": "2026-04-14T19:21:08Z",
+    "tls_proxy_rps": 98992,
+    "html_rps": 212402,
+    "js_rps": 86305,
+    "png_rps": 73203,
+    "waf_post_rps": 100354,
+    "cache_hit_rps": 209694,
+    "font_rps": 67268,
+    "css_rps": 211038,
+    "sqli_blocked": 0,
+    "xss_blocked": 0,
+    "meta": {
+      "cpu": "Apple M4",
+      "os": "Darwin arm64",
+      "duration": 10,
+      "runs": 5,
+      "conns": 100,
+      "method": "wrk, median of N runs, native binary"
+    }
+  },
+  {
+    "commit": "551dc05",
+    "branch": "claude/sad-cori",
+    "arch": "native",
+    "timestamp": "2026-04-14T21:08:54Z",
+    "tls_proxy_rps": 94374,
+    "html_rps": 224821,
+    "js_rps": 76874,
+    "png_rps": 60524,
+    "waf_post_rps": 90979,
+    "cache_hit_rps": 208368,
+    "font_rps": 53650,
+    "css_rps": 177888,
+    "sqli_blocked": 1,
+    "xss_blocked": 1,
+    "meta": {
+      "cpu": "Apple M4",
+      "os": "Darwin arm64",
+      "duration": 10,
+      "runs": 5,
+      "conns": 100,
+      "method": "wrk, median of N runs, native binary"
+    }
+  },
+  {
+    "commit": "ab0867a",
+    "branch": "claude/sad-cori",
+    "arch": "native",
+    "timestamp": "2026-04-14T21:24:35Z",
+    "tls_proxy_rps": 93214,
+    "html_rps": 226930,
+    "js_rps": 75500,
+    "png_rps": 59537,
+    "waf_post_rps": 89963,
+    "cache_hit_rps": 207416,
+    "font_rps": 53087,
+    "css_rps": 183412,
+    "sqli_blocked": 1,
+    "xss_blocked": 1,
+    "meta": {
+      "cpu": "Apple M4",
+      "os": "Darwin arm64",
+      "duration": 10,
+      "runs": 5,
+      "conns": 100,
+      "method": "wrk, median of N runs, native binary"
+    }
+  },
+  {
+    "commit": "9c107f6",
+    "branch": "claude/sad-cori",
+    "arch": "native",
+    "timestamp": "2026-04-14T21:49:14Z",
+    "tls_proxy_rps": 93253,
+    "html_rps": 233341,
+    "js_rps": 81470,
+    "png_rps": 66753,
+    "waf_post_rps": 91893,
+    "cache_hit_rps": 209381,
+    "font_rps": 59262,
+    "css_rps": 191574,
+    "sqli_blocked": 1,
+    "xss_blocked": 1,
+    "meta": {
+      "cpu": "Apple M4",
+      "os": "Darwin arm64",
+      "duration": 10,
+      "runs": 5,
+      "conns": 100,
+      "method": "wrk, median of N runs, native binary"
+    }
   }
 ]
