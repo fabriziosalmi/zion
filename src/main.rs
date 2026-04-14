@@ -96,7 +96,7 @@ struct AppState {
     http_client: HttpClient,
     static_cache: cache::StaticCache,
     conn_limit: Arc<Semaphore>,
-    http_builder: AutoBuilder<TokioExecutor>,
+    http_builder: Arc<AutoBuilder<TokioExecutor>>,
     /// ACME HTTP-01 challenge tokens (empty when no challenge active).
     acme_challenges: acme::ChallengeStore,
     /// Per-IP rate limiter. 0 = disabled.
@@ -107,6 +107,10 @@ struct AppState {
     health_map: health::HealthMap,
     /// Trusted proxy CIDRs for X-Forwarded-For IP resolution.
     trusted_proxies: security::TrustedProxies,
+    /// Singleflight: coalesce concurrent cache misses for the same key.
+    /// First request fetches from upstream; subsequent requests for the same
+    /// key await the Notify and serve from the now-warm cache.
+    inflight: dashmap::DashMap<Arc<str>, Arc<tokio::sync::Notify>>,
 }
 
 // Pre-compiled constants — zero runtime cost.
@@ -248,15 +252,14 @@ async fn async_main(
         rate_map: Arc::new(dashmap::DashMap::new()),
         health_map: health_map.clone(),
         trusted_proxies,
-        http_builder: {
+        inflight: dashmap::DashMap::new(),
+        http_builder: Arc::new({
             let mut b = AutoBuilder::new(TokioExecutor::new());
-            // Limit header count and total header buffer size to prevent header bomb DoS.
-            // 16KB buffer is optimal for L1 CPU cache on micro-payloads (API/CSS).
             b.http1().max_headers(64).max_buf_size(16 * 1024);
             b.http1().preserve_header_case(false);
             b.http1().title_case_headers(false);
             b
-        },
+        }),
     });
 
     // 6. Spawn ACME auto-renewal task (if configured)

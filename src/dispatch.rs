@@ -553,6 +553,40 @@ async fn handle_static_cache(
     // Own cache key before consuming req — use Arc directly (cache stores Arc<str>)
     let path_owned: Arc<str> = Arc::from(cache_key);
 
+    // Singleflight: coalesce concurrent cache misses for the same key.
+    // If another request is already fetching, wait for it then serve from cache.
+    let existing_notify = state
+        .inflight
+        .get(&path_owned)
+        .map(|entry| entry.value().clone());
+
+    if let Some(n) = existing_notify {
+        n.notified().await;
+        // Re-check cache after coalesced fetch
+        if let Some(hit) = state.static_cache.get(path_owned.as_ref()) {
+            metrics::METRICS
+                .cache_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut builder = Response::builder()
+                .status(hit.meta.status)
+                .header("Cache-Control", CACHE_CONTROL_IMMUTABLE);
+            if let Some(ct) = &hit.meta.content_type {
+                builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
+            }
+            if let Some(ce) = &hit.meta.content_encoding {
+                builder = builder.header(hyper::header::CONTENT_ENCODING, ce.clone());
+            }
+            return Ok(builder
+                .body(Full::new(hit.body).map_err(|never| match never {}).boxed())
+                .unwrap());
+        }
+        // Cache miss even after wait — fall through to fetch from upstream
+    }
+
+    // Register as the inflight fetcher for this key
+    let notify = Arc::new(tokio::sync::Notify::new());
+    state.inflight.insert(path_owned.clone(), notify.clone());
+
     // RAM miss — fetch from upstream
     let resp = proxy::proxy_pass(
         &state.http_client,
@@ -590,6 +624,8 @@ async fn handle_static_cache(
 
         if has_unsafe_vary {
             // Stream the body straight to the client without dropping back to RAM allocation!
+            state.inflight.remove(&path_owned);
+            notify.notify_waiters();
             let resp = Response::from_parts(parts, body.map_err(hyper::Error::from).boxed());
             return Ok(resp);
         }
@@ -612,6 +648,7 @@ async fn handle_static_cache(
         let state_clone = state.clone();
         let path_clone = path_owned.clone();
         let meta_clone = meta.clone();
+        let notify_clone = notify.clone();
 
         let (cache_ttl, cache_max) = match &rule.cache {
             Some(cp) => (cp.ttl_seconds, cp.max_entries),
@@ -669,6 +706,9 @@ async fn handle_static_cache(
                     cache_max,
                 );
             }
+            // Singleflight: notify waiters and remove inflight entry
+            state_clone.inflight.remove(&path_clone);
+            notify_clone.notify_waiters();
         });
 
         let mut resp = Response::from_parts(parts, stream_body.boxed());
@@ -678,6 +718,10 @@ async fn handle_static_cache(
         );
         return Ok(resp);
     }
+
+    // Non-200 or non-cacheable: clean up inflight and notify waiters
+    state.inflight.remove(&path_owned);
+    notify.notify_waiters();
 
     Ok(resp)
 }
