@@ -75,6 +75,21 @@ fn tune_listener(socket: &socket2::Socket) {
             eprintln!("  warning: TCP_DEFER_ACCEPT unavailable (may be in restricted container)");
         }
 
+        // TCP_CORK: batch small writes into full MSS segments on listener.
+        // Accepted connections inherit this, reducing small-packet overhead.
+        // Combined with TCP_NODELAY set on accept, this gives optimal behavior:
+        // cork batches the TLS record + HTTP headers, nodelay flushes on write.
+        let cork: i32 = 1;
+        if libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CORK,
+            &cork as *const _ as *const libc::c_void,
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        ) != 0 {
+            eprintln!("  warning: TCP_CORK unavailable");
+        }
+
         // TCP_FASTOPEN: allow data in SYN for returning clients
         let tfo: i32 = 256;
         if libc::setsockopt(

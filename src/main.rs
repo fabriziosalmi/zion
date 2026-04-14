@@ -404,6 +404,37 @@ async fn async_main(
         });
     }
 
+    // 8b. Pre-warm upstream connection pool (first health check warms TLS + DNS)
+    // This eliminates cold-start latency on the first real request.
+    if !health_map.is_empty() {
+        let client = state.http_client.clone();
+        let hm = health_map.clone();
+        tokio::spawn(async move {
+            use http_body_util::BodyExt;
+            for (url, _) in hm.iter() {
+                let uri: hyper::Uri = match url.parse() {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let req = hyper::Request::builder()
+                    .uri(&uri)
+                    .header("Host", uri.authority().map(|a| a.as_str()).unwrap_or("localhost"))
+                    .body(
+                        http_body_util::Full::new(bytes::Bytes::new())
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    );
+                if let Ok(req) = req {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        client.request(req),
+                    ).await;
+                }
+            }
+            logging::info("pool", &format!("pre-warmed {} upstream connections", hm.len()));
+        });
+    }
+
     // 9. Spawn HTTP listener (port 80) — ACME challenges + HTTPS redirect
     let http_addr: SocketAddr = config.server.listen_http.parse()?;
     let state_http = state.clone();
