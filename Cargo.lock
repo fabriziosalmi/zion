@@ -672,6 +672,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
@@ -2693,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "zion"
-version = "0.1.1"
+version = "0.1.3"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -2706,6 +2707,7 @@ dependencies = [
  "h3-quinn",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "instant-acme",
  "io-uring",

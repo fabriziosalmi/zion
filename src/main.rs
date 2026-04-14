@@ -332,12 +332,12 @@ async fn async_main(
         // Start the background ping loop using the shared health_map
         // (already embedded in AppState, so routing sees updates immediately)
         let hm = health_map.clone();
+        let health_http_client = state.http_client.clone();
         tokio::spawn(async move {
-            let client =
-                hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-                    .pool_idle_timeout(std::time::Duration::from_secs(10))
-                    .pool_max_idle_per_host(1)
-                    .build_http();
+            // Reuse the shared HTTP client for health checks. This has two benefits:
+            // 1. HTTPS upstreams get TLS pre-warming (connections stay in pool)
+            // 2. HTTP/2 multiplexing for HTTPS health probes
+            let client = health_http_client;
             loop {
                 let mut upstreams_to_check: Vec<(String, Arc<health::UpstreamHealth>)> = Vec::new();
                 for (url, up) in hm.iter() {
@@ -349,6 +349,7 @@ async fn async_main(
                 for (url, up) in upstreams_to_check {
                     let client_clone = client.clone();
                     join_set.spawn(async move {
+                        use http_body_util::BodyExt;
                         let uri: hyper::Uri = match url.parse() {
                             Ok(u) => u,
                             Err(_) => return,
@@ -359,7 +360,11 @@ async fn async_main(
                                 "Host",
                                 uri.authority().map(|a| a.as_str()).unwrap_or("localhost"),
                             )
-                            .body(http_body_util::Full::new(bytes::Bytes::new()))
+                            .body(
+                                http_body_util::Full::new(bytes::Bytes::new())
+                                    .map_err(|never| match never {})
+                                    .boxed(),
+                            )
                         {
                             Ok(r) => r,
                             Err(_) => return,
@@ -396,6 +401,37 @@ async fn async_main(
                 while join_set.join_next().await.is_some() {}
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             }
+        });
+    }
+
+    // 8b. Pre-warm upstream connection pool (first health check warms TLS + DNS)
+    // This eliminates cold-start latency on the first real request.
+    if !health_map.is_empty() {
+        let client = state.http_client.clone();
+        let hm = health_map.clone();
+        tokio::spawn(async move {
+            use http_body_util::BodyExt;
+            for (url, _) in hm.iter() {
+                let uri: hyper::Uri = match url.parse() {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let req = hyper::Request::builder()
+                    .uri(&uri)
+                    .header("Host", uri.authority().map(|a| a.as_str()).unwrap_or("localhost"))
+                    .body(
+                        http_body_util::Full::new(bytes::Bytes::new())
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    );
+                if let Ok(req) = req {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        client.request(req),
+                    ).await;
+                }
+            }
+            logging::info("pool", &format!("pre-warmed {} upstream connections", hm.len()));
         });
     }
 
