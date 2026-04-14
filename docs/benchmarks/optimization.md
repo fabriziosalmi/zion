@@ -99,7 +99,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 
 | Change | Rationale |
 |---|---|
-| Aho-Corasick (no regex) | O(N) single-pass, no backtracking, 80+ patterns scanned simultaneously |
+| Aho-Corasick (no regex) | O(N) single-pass, no backtracking, 192 patterns scanned simultaneously |
 | Skip body inspection for GET/HEAD/OPTIONS | POST/PUT/PATCH/DELETE bodies are inspected |
 | Entropy check only for bodies >= 256 bytes | Short payloads lack sufficient data for meaningful entropy analysis |
 | `simd-json` for JSON validation | SIMD-accelerated JSON parsing where hardware supports it |

@@ -76,7 +76,7 @@ Client
   │  SIMD pre-filter: memchr3 fast-reject (clean → skip)│
   │  Gate 1: Body size enforcement (O(1))               │
   │  Gate 2: Content-Type validation (delimiter-aware)  │
-  │  Gate 3: Aho-Corasick injection scan (80+ patterns) │
+  │  Gate 3: Aho-Corasick injection scan (192 patterns) │
   │  Gate 4: Entropy analysis (Shannon, >=256 bytes)    │
   │  Gate 5: JSON structural validation (simd-json)     │
   │  Gate 6: Fixed-length profiling                     │
