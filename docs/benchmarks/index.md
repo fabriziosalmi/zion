@@ -2,9 +2,9 @@
 
 All benchmarks use [wrk](https://github.com/wg/wrk) with consistent methodology. Numbers represent requests per second (higher is better).
 
-## Native Benchmark (Apple M4, v0.1.3, Rust backend)
+## Native Benchmark (Apple M4, v0.1.4, Rust backend)
 
-Measured with `bench-native.sh` (5 runs x 10s, c=100, median reported). Includes all v0.1.3 security fixes and 25 performance optimizations. Rust backend (pure hyper, 194K raw req/s) eliminates the backend as a bottleneck.
+Measured with `bench-native.sh` (5 runs x 10s, c=100, median reported). Includes all v0.1.4 security fixes and 25 performance optimizations. Rust backend (pure hyper, 194K raw req/s) eliminates the backend as a bottleneck.
 
 | Endpoint | Median req/s | Best Run | CV% | Errors |
 |---|---|---|---|---|
@@ -50,7 +50,7 @@ Both Zion and nginx run in Docker containers with identical resource limits: **1
 |---|---|---|---|
 | API GET (TLS proxy) | 12,300 | 12,500 | Parity |
 | HTML page (TLS proxy) | 10,300 | 41,700 | **+303%** |
-| WAF POST (80+ patterns) | 11,900 | 11,600 | Parity |
+| WAF POST (192 patterns) | 11,900 | 11,600 | Parity |
 
 ## Methodology
 

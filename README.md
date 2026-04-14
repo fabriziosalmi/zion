@@ -83,7 +83,7 @@ Payload x concurrency grid -- measures end-to-end TLS throughput. These numbers 
 - Connection pool pre-warming at startup
 
 **WAF (Zero-Regex, O(N) Single-Pass)**
-- Aho-Corasick scanner: 80+ patterns (SQLi, XSS, CMDi, SSRF, Log4Shell)
+- Aho-Corasick scanner: 192 patterns, 14 categories (SQLi, XSS, CMDi, SSRF, NoSQL, deserialization, GraphQL, LDAP, XXE, SSTI, CRLF, Log4Shell)
 - Shannon entropy analysis (detect obfuscated payloads)
 - simd-json structural validation (depth + string length limits)
 - Content-Type strict validation with delimiter enforcement
@@ -169,7 +169,7 @@ See [zion.example.toml](zion.example.toml) for the full configuration reference.
 ```
 Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline -> Proxy/Cache -> Upstream
                          |                                |
-                    URI limit                  Aho-Corasick (80+ patterns)
+                    URI limit                  Aho-Corasick (192 patterns)
                     Method whitelist           Entropy analysis
                     Rate limiter              simd-json validation
                     CORS pre-flight           Depth/size limits

@@ -2,6 +2,29 @@
 
 All notable changes to Zion Edge Gateway are documented here.
 
+## [0.1.4] - 2026-04-15
+
+### WAF Pattern Expansion (88 -> 192, +104 patterns)
+
+14 attack categories, zero false positives, single O(N) Aho-Corasick pass.
+
+**New categories:**
+- XSS Event Handlers (+21): oninput=, onchange=, ondragstart=, ontouchstart=, onpointerover=, etc.
+- XSS Tags (+7): img src, body onload, video onerror, details ontoggle, math xlink
+- XSS JS Sinks (+7): confirm(, prompt(, window.location, innerHTML, outerHTML, srcdoc=
+- NoSQL Injection (+12): $gt, $ne, $regex, $where, .find({, .aggregate([
+- Deserialization/RCE (+16): Java (Runtime.getRuntime), Python (pickle.loads, os.system), PHP (unserialize, php://filter, phar://)
+- GraphQL Injection (+6): __schema, __type, introspection probes
+- LDAP Injection (+6): )(cn=*, ldap://, )(objectclass=*
+- XML/XXE (+8): <!ENTITY, SYSTEM "file://, <xsl:, data:text/html
+- SSTI (+6): #{7*7}, ${7*7}, {{7*7}}, <%=, {%import
+- CRLF/Header Injection (+4): %0d%0a, %0aSet-Cookie:, %0aLocation:
+- SSRF Cloud (+5): Azure IMDS, DigitalOcean, Oracle Cloud, Kubernetes, OpenStack
+- Windows Path Traversal (+3): C:\windows\, C:\inetpub\
+- Open Redirect (+2): /\evil, /%09/
+
+**Tests:** 177 passed (+23 vs v0.1.3), including false-positive safety checks.
+
 ## [0.1.3] - 2026-04-15
 
 ### Fixed (Copilot code review)
