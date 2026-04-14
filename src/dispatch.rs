@@ -386,17 +386,37 @@ pub(crate) async fn process_request(
     // Preserve incoming traceparent or generate a new one.
     // Forward to upstream for distributed tracing (Jaeger, Tempo, etc.)
     if !req.headers().contains_key("traceparent") {
-        // Generate: version-trace_id-parent_id-flags (00-{32hex}-{16hex}-01)
-        // Use SystemTime for entropy (not elapsed() which is ~0ns at this point)
+        // Generate: 00-{32hex trace_id}-{16hex span_id}-01
+        // Zero-alloc: stack buffer + hex lookup table (no format! calls).
         let ts_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
         let seq = REQUEST_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
-        let trace_id = format!("{:016x}{:016x}", ts_us, seq);
-        let span_id = format!("{:016x}", seq);
-        let traceparent = format!("00-{}-{}-01", trace_id, span_id);
-        if let Ok(val) = hyper::header::HeaderValue::from_str(&traceparent) {
+
+        let mut buf = [0u8; 55]; // "00-" + 32hex + "-" + 16hex + "-01"
+        buf[0..3].copy_from_slice(b"00-");
+        // trace_id: 16 hex from ts_us + 16 hex from seq = 32 hex
+        for i in 0..8 {
+            let b = (ts_us >> (56 - i * 8)) as u8;
+            buf[3 + i * 2] = crate::HEX_DIGITS[(b >> 4) as usize];
+            buf[3 + i * 2 + 1] = crate::HEX_DIGITS[(b & 0xF) as usize];
+        }
+        for i in 0..8 {
+            let b = (seq >> (56 - i * 8)) as u8;
+            buf[19 + i * 2] = crate::HEX_DIGITS[(b >> 4) as usize];
+            buf[19 + i * 2 + 1] = crate::HEX_DIGITS[(b & 0xF) as usize];
+        }
+        buf[35] = b'-';
+        // span_id: 16 hex from seq
+        for i in 0..8 {
+            let b = (seq >> (56 - i * 8)) as u8;
+            buf[36 + i * 2] = crate::HEX_DIGITS[(b >> 4) as usize];
+            buf[36 + i * 2 + 1] = crate::HEX_DIGITS[(b & 0xF) as usize];
+        }
+        buf[52..55].copy_from_slice(b"-01");
+        // SAFETY: all bytes are ASCII hex, '-', or '0'/'1'
+        if let Ok(val) = hyper::header::HeaderValue::from_bytes(&buf) {
             req.headers_mut().insert("traceparent", val);
         }
     }

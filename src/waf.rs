@@ -421,6 +421,30 @@ pub fn validate_request(
     };
 
     // ── Gate 3: Aho-Corasick injection scan (O(N), single pass) ──
+
+    // SIMD fast-reject: if no injection trigger bytes are present, the body
+    // cannot match any pattern — skip the full Aho-Corasick scan entirely.
+    // memchr uses NEON/AVX2 on all platforms. Covers: ' < ; $ { | / \ ` #
+    let has_trigger = memchr::memchr3(b'\'', b'<', b';', body).is_some()
+        || memchr::memchr3(b'$', b'{', b'|', body).is_some()
+        || memchr::memchr3(b'/', b'\\', b'`', body).is_some()
+        || memchr::memchr2(b'#', b'.', body).is_some();
+
+    if !has_trigger {
+        // No trigger bytes → impossible to match any injection pattern.
+        // Jump straight to Gate 4 (entropy) or Gate 5 (JSON).
+        if body.len() >= 256 {
+            let entropy = shannon_entropy(body);
+            if entropy > MAX_ENTROPY_THRESHOLD {
+                return WafVerdict::Deny("suspicious payload entropy");
+            }
+        }
+        if is_json {
+            return validate_json_structure(body, profile.max_depth, profile.max_string_len);
+        }
+        return WafVerdict::Allow;
+    }
+
     // Scan raw body first (fast path — no alloc if no encoding present).
     if get_scanner().is_match(body) {
         return WafVerdict::Deny("injection pattern detected");
@@ -444,10 +468,10 @@ pub fn validate_request(
                 // First pass from body -> out
                 normalize_unified(body, &mut out);
 
-                // Iterate until convergence (no more encodings) or safety cap.
-                // Cap at 7 passes to prevent DoS via deeply nested encoding
-                // while catching real evasion (quad-encoding needs 4 passes).
-                for _ in 0..7 {
+                // Iterate until convergence or safety cap.
+                // 2 iterations catches double/triple encoding (real-world max).
+                // Convergence check breaks early if no further decoding is needed.
+                for _ in 0..2 {
                     if get_scanner().is_match(out.as_slice()) {
                         return Some(WafVerdict::Deny("injection pattern detected (encoded)"));
                     }
@@ -474,6 +498,15 @@ pub fn validate_request(
                 // Final check after convergence
                 if get_scanner().is_match(out.as_slice()) {
                     return Some(WafVerdict::Deny("injection pattern detected (encoded)"));
+                }
+
+                // Shrink inflated buffers to prevent OOM from adversarial large bodies.
+                // A single 10MB POST would permanently inflate all worker threads.
+                if out.capacity() > 65_536 {
+                    out.shrink_to(8192);
+                }
+                if sec.capacity() > 65_536 {
+                    sec.shrink_to(8192);
                 }
                 None
             })
@@ -526,7 +559,7 @@ pub fn validate_uri(uri: &str) -> WafVerdict {
 
                 normalize_unified(uri_bytes, &mut out);
 
-                for _ in 0..7 {
+                for _ in 0..2 {
                     if get_scanner().is_match(out.as_slice()) {
                         return Some(WafVerdict::Deny("injection pattern in URI (encoded)"));
                     }

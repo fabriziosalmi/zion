@@ -229,17 +229,15 @@ pub fn check_rate_limit(
 // ============================================================================
 
 /// Validate Host header to prevent header injection in redirects.
+/// Single-pass byte scan instead of 8 separate contains() calls.
 #[inline]
 pub fn is_valid_host(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= 253
-        && !host.contains('/')
-        && !host.contains('\\')
-        && !host.contains('@')
-        && !host.contains('\n')
-        && !host.contains('\r')
-        && !host.contains('\0')
-        && !host.contains(' ')
+        && !host
+            .as_bytes()
+            .iter()
+            .any(|&b| matches!(b, b'/' | b'\\' | b'@' | b'\n' | b'\r' | b'\0' | b' '))
 }
 
 /// Check if an IP is internal (loopback, private RFC1918, link-local).

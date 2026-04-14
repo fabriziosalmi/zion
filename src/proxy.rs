@@ -271,13 +271,20 @@ pub async fn proxy_websocket(
     // HTTP/1.1 upgrade handshake — works on any AsyncRead+AsyncWrite stream.
     // For TLS upstreams, wrap in tokio-rustls connector first.
     if is_tls_upstream {
-        // Build TLS client config with embedded Mozilla CA roots
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
+        // Cached TLS client config — build once, reuse for all WS upgrades.
+        // Avoids re-parsing ~150 Mozilla CA roots on every WebSocket TLS connection.
+        static WS_TLS_CONFIG: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> =
+            std::sync::OnceLock::new();
+        let tls_config = WS_TLS_CONFIG.get_or_init(|| {
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            std::sync::Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth(),
+            )
+        });
+        let connector = tokio_rustls::TlsConnector::from(tls_config.clone());
 
         // SNI: use the hostname from the authority (without port)
         let server_name = rustls::pki_types::ServerName::try_from(authority.host().to_string())
