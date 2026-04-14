@@ -291,6 +291,7 @@ pub fn spawn_tls_watcher(
     let signal_clone = debounce_signal.clone();
 
     let watcher_cert_path = tls.cert_path.clone();
+    let sni_cert_paths: Vec<String> = tls.sni.iter().map(|s| s.cert_path.clone()).collect();
 
     let _watcher_handle = tokio::spawn(async move {
         let signal = signal_clone;
@@ -303,7 +304,7 @@ pub fn spawn_tls_watcher(
         })
         .expect("Failed to create filesystem watcher");
 
-        // Watch default cert dir + all SNI cert dirs
+        // Watch default cert dir
         let cert_dir = Path::new(&watcher_cert_path)
             .parent()
             .unwrap_or_else(|| Path::new("/etc/ssl/zion/"));
@@ -311,7 +312,20 @@ pub fn spawn_tls_watcher(
             .watch(cert_dir, RecursiveMode::NonRecursive)
             .unwrap_or_else(|e| panic!("Cannot watch {}: {}", cert_dir.display(), e));
 
-        eprintln!("  tls watcher active on {}", cert_dir.display());
+        // Watch all SNI cert directories (they may live in different paths)
+        let mut watched_dirs = std::collections::HashSet::new();
+        watched_dirs.insert(cert_dir.to_path_buf());
+        for sni_path in &sni_cert_paths {
+            if let Some(sni_dir) = Path::new(sni_path).parent() {
+                if watched_dirs.insert(sni_dir.to_path_buf()) {
+                    if let Err(e) = watcher.watch(sni_dir, RecursiveMode::NonRecursive) {
+                        eprintln!("  warning: cannot watch SNI dir {}: {}", sni_dir.display(), e);
+                    }
+                }
+            }
+        }
+
+        eprintln!("  tls watcher active on {} (+{} SNI dirs)", cert_dir.display(), watched_dirs.len() - 1);
         std::future::pending::<()>().await;
     });
 
@@ -384,21 +398,29 @@ pub fn spawn_cert_prewarm_task(acceptor_store: Arc<ArcSwap<TlsAcceptor>>, tls: T
 
             // Pre-warm when cert expires in <120 seconds
             if expiry > 0 && expiry <= 120 {
+                // Snapshot generation before building — if watcher reloads
+                // concurrently, we detect the race and skip our stale store.
+                let gen_before = CERT_GENERATION.load(Ordering::Acquire);
                 eprintln!("  tls: cert expires in {}s, pre-warming config...", expiry);
-                // Offload synchronous file I/O to the blocking thread pool.
                 let tls_clone = tls.clone();
                 let prewarm_result =
                     tokio::task::spawn_blocking(move || load_tls_config(&tls_clone)).await;
                 match prewarm_result {
                     Ok(Ok(new_config)) => {
-                        let new_acceptor = TlsAcceptor::from(Arc::new(new_config));
-                        acceptor_store.store(Arc::new(new_acceptor));
-                        CERT_GENERATION.fetch_add(1, Ordering::Release);
-                        issue_membarrier();
-                        eprintln!(
-                            "  tls: pre-warm complete (gen {})",
-                            CERT_GENERATION.load(Ordering::Relaxed)
-                        );
+                        // Only store if no concurrent reload happened
+                        let gen_after = CERT_GENERATION.load(Ordering::Acquire);
+                        if gen_before == gen_after {
+                            let new_acceptor = TlsAcceptor::from(Arc::new(new_config));
+                            acceptor_store.store(Arc::new(new_acceptor));
+                            CERT_GENERATION.fetch_add(1, Ordering::Release);
+                            issue_membarrier();
+                            eprintln!(
+                                "  tls: pre-warm complete (gen {})",
+                                CERT_GENERATION.load(Ordering::Relaxed)
+                            );
+                        } else {
+                            eprintln!("  tls: pre-warm skipped — watcher already reloaded (gen {} → {})", gen_before, gen_after);
+                        }
                     }
                     Ok(Err(e)) => {
                         eprintln!("  tls: pre-warm FAILED ({}), keeping previous config.", e);

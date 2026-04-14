@@ -588,9 +588,11 @@ async fn async_main(
             let client_dn = client_cert_dn.map(std::sync::Arc::new);
 
             let io = TokioIo::new(tls_stream);
-            // HTTP request timeout — kill connections that don't complete a request
+            // Connection-level idle timeout. Set high (1 hour) because this
+            // wraps the entire HTTP/2 mux / WebSocket / SSE connection, not
+            // individual requests. Per-request timeouts are in process_request.
             let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(3600),
                 builder.serve_connection_with_upgrades(
                     io,
                     service_fn(move |mut req| {

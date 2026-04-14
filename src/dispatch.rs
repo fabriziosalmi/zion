@@ -41,8 +41,15 @@ pub(crate) async fn process_request(
 
     // ── Pre-routing security gates (zero-cost, before any processing) ──
 
-    // Gate: URI length (reject oversized URIs before routing)
-    if req.uri().path().len() > MAX_URI_LEN {
+    // Gate: URI length (reject oversized URIs before routing).
+    // Check full path+query, not just path — an attacker could send a short
+    // path with an enormous query string to consume memory downstream.
+    let uri_len = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().len())
+        .unwrap_or_else(|| req.uri().path().len());
+    if uri_len > MAX_URI_LEN {
         return Ok(empty_response(StatusCode::URI_TOO_LONG));
     }
 

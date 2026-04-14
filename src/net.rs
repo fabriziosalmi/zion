@@ -64,26 +64,28 @@ fn tune_listener(socket: &socket2::Socket) {
     // valid, sizes are exact to socklen_t, and valid protocol/socket options are declared.
     unsafe {
         // TCP_DEFER_ACCEPT: wake process only when data arrives (not just SYN)
-        // Value = timeout in seconds to wait for data
         let defer: i32 = 5;
-        libc::setsockopt(
+        if libc::setsockopt(
             fd,
             libc::IPPROTO_TCP,
             libc::TCP_DEFER_ACCEPT,
             &defer as *const _ as *const libc::c_void,
             std::mem::size_of::<i32>() as libc::socklen_t,
-        );
+        ) != 0 {
+            eprintln!("  warning: TCP_DEFER_ACCEPT unavailable (may be in restricted container)");
+        }
 
         // TCP_FASTOPEN: allow data in SYN for returning clients
-        // Value = max pending TFO connections
         let tfo: i32 = 256;
-        libc::setsockopt(
+        if libc::setsockopt(
             fd,
             libc::IPPROTO_TCP,
             libc::TCP_FASTOPEN,
             &tfo as *const _ as *const libc::c_void,
             std::mem::size_of::<i32>() as libc::socklen_t,
-        );
+        ) != 0 {
+            eprintln!("  warning: TCP_FASTOPEN unavailable");
+        }
     }
 }
 

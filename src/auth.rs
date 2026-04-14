@@ -93,13 +93,20 @@ pub enum AuthError {
 }
 
 /// Extract Bearer token from Authorization header.
+/// Case-insensitive prefix per RFC 6750 §2.1.
 #[inline]
 pub fn extract_bearer(auth_header: &str) -> Option<&str> {
-    let stripped = auth_header.strip_prefix("Bearer ")?;
-    if stripped.is_empty() {
+    if auth_header.len() < 7 {
+        return None;
+    }
+    if !auth_header.as_bytes()[..7].eq_ignore_ascii_case(b"Bearer ") {
+        return None;
+    }
+    let token = &auth_header[7..];
+    if token.is_empty() {
         None
     } else {
-        Some(stripped)
+        Some(token)
     }
 }
 
@@ -181,19 +188,23 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> ResolvedAuthProfile {
         let url = jwks_url.clone();
         let key_store = jwk_set_arc.clone();
 
-        // Spawn background task to periodically fetch JWKS
+        // Spawn background task to periodically fetch JWKS.
+        // Uses exponential backoff on failure (5s → 10s → ... → 3600s).
         tokio::spawn(async move {
-            let client = match reqwest::Client::builder().build() {
-                Ok(c) => c,
-                Err(e) => {
-                    crate::logging::error(
-                        "auth",
-                        &format!("Failed to build JWKS HTTP client: {}", e),
-                    );
-                    return;
+            let client = loop {
+                match reqwest::Client::builder().build() {
+                    Ok(c) => break c,
+                    Err(e) => {
+                        crate::logging::error(
+                            "auth",
+                            &format!("Failed to build JWKS HTTP client: {}, retrying in 5s", e),
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
                 }
             };
 
+            let mut backoff_secs = 5u64;
             loop {
                 match client.get(&url).send().await {
                     Ok(resp) => match resp.json::<jsonwebtoken::jwk::JwkSet>().await {
@@ -203,20 +214,26 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> ResolvedAuthProfile {
                                 "auth",
                                 &format!("JWKS successfully loaded from {}", url),
                             );
+                            backoff_secs = 3600; // success: normal 1h refresh
                         }
-                        Err(e) => crate::logging::error(
-                            "auth",
-                            &format!("Failed to parse JWKS JSON: {}", e),
-                        ),
+                        Err(e) => {
+                            crate::logging::error(
+                                "auth",
+                                &format!("Failed to parse JWKS JSON: {}", e),
+                            );
+                            backoff_secs = (backoff_secs * 2).min(3600);
+                        }
                     },
-                    Err(e) => crate::logging::error(
-                        "auth",
-                        &format!("Failed to fetch JWKS from {}: {}", url, e),
-                    ),
+                    Err(e) => {
+                        crate::logging::error(
+                            "auth",
+                            &format!("Failed to fetch JWKS from {}: {}, retry in {}s", url, e, backoff_secs),
+                        );
+                        backoff_secs = (backoff_secs * 2).min(3600);
+                    }
                 }
 
-                // Refresh every 1 hour (Auth0/Okta standard)
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
             }
         });
     } else {

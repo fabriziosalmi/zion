@@ -63,11 +63,17 @@ impl CorsHeaders {
     }
 
     /// Check if origin is allowed. Returns the origin value to echo back.
+    /// Case-insensitive comparison per RFC 6454 §5 (scheme and host are
+    /// case-insensitive in origin serialization).
     pub fn check_origin(&self, origin: &str) -> Option<HeaderValue> {
         if self.allow_origin_wildcard {
             return Some(HeaderValue::from_static("*"));
         }
-        if self.allowed_origins.iter().any(|o| o == origin) {
+        if self
+            .allowed_origins
+            .iter()
+            .any(|o| o.eq_ignore_ascii_case(origin))
+        {
             return HeaderValue::from_str(origin).ok();
         }
         None

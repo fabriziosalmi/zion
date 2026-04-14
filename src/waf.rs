@@ -84,19 +84,31 @@ fn get_scanner() -> &'static AhoCorasick {
             "; rm ",
             "; wget ",
             "; curl ",
+            ";cat ",
+            ";ls ",
+            ";rm ",
+            ";wget ",
+            ";curl ",
             "| cat ",
             "| ls ",
             "| rm ",
+            "|cat ",
+            "|ls ",
+            "|rm ",
             "$(cat ",
             "$(ls ",
             "`cat ",
             "`ls ",
+            "\ncat ",      // newline injection
+            "\nls ",
+            "\nwget ",
+            "\ncurl ",
             "/etc/passwd",
             "/etc/shadow",
             "cmd.exe",
             "powershell",
             // ── Path Traversal ──
-            "../../../",
+            "../../",     // 2 levels (sufficient for most attacks)
             "..\\..\\",
             "%2e%2e%2f",
             "%2e%2e/",
@@ -377,9 +389,20 @@ pub fn validate_request(
     // ── Gate 2: Content-Type (zero-alloc case-insensitive) ──
     let is_json = match content_type {
         Some(ct) => {
+            // Prefix match with delimiter check: "application/json" must be
+            // followed by EOF, ';' (charset), or ' ' — not arbitrary chars.
+            // Without this, "application/jsonFOO" would be treated as allowed.
             let is_allowed = profile.allowed_content_types.iter().any(|allowed| {
-                ct.len() >= allowed.len()
-                    && ct.as_bytes()[..allowed.len()].eq_ignore_ascii_case(allowed.as_bytes())
+                if ct.len() < allowed.len() {
+                    return false;
+                }
+                if !ct.as_bytes()[..allowed.len()].eq_ignore_ascii_case(allowed.as_bytes()) {
+                    return false;
+                }
+                // Must be exact match or followed by a parameter delimiter
+                ct.len() == allowed.len()
+                    || ct.as_bytes()[allowed.len()] == b';'
+                    || ct.as_bytes()[allowed.len()] == b' '
             });
 
             if !is_allowed {

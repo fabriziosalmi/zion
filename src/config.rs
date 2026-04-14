@@ -461,6 +461,16 @@ fn validate_config(config: &ZionConfig, path: &str) -> Result<(), String> {
                 ));
             }
         }
+
+        // Auth profile reference must exist
+        if let Some(ref profile) = route.auth_profile {
+            if !config.auth_profile.contains_key(profile) {
+                errors.push(format!(
+                    "route '{}' references unknown auth_profile '{}'",
+                    route.path, profile
+                ));
+            }
+        }
     }
 
     // Upstream URLs must be valid
