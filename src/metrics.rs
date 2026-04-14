@@ -254,12 +254,14 @@ pub struct Metrics {
     pub upstream_duration: LatencyHistogram,
     pub tls_handshake_duration: LatencyHistogram,
 
-    // Caching for Prometheus Output (P2)
-    pub cached_render: std::sync::RwLock<(u64, bytes::Bytes)>,
+    // Caching for Prometheus Output — lock-free via ArcSwap.
+    // RwLock was a contention point under concurrent /metrics scrapes.
+    pub cached_render_ts: AtomicU64,
+    pub cached_render_buf: arc_swap::ArcSwap<bytes::Bytes>,
 }
 
 impl Metrics {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             requests_total: ShardedCounter::new(),
             requests_2xx: ShardedCounter::new(),
@@ -276,7 +278,8 @@ impl Metrics {
             request_duration: LatencyHistogram::new(),
             upstream_duration: LatencyHistogram::new(),
             tls_handshake_duration: LatencyHistogram::new(),
-            cached_render: std::sync::RwLock::new((0, bytes::Bytes::new())),
+            cached_render_ts: AtomicU64::new(0),
+            cached_render_buf: arc_swap::ArcSwap::from_pointee(bytes::Bytes::new()),
         }
     }
 
@@ -298,17 +301,16 @@ impl Metrics {
         }
     }
 
-    /// Render Prometheus text exposition format. Zero-alloc generation.
+    /// Render Prometheus text exposition format. Lock-free cached.
     pub fn render(&self) -> bytes::Bytes {
         let now_sec = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        if let Ok(guard) = self.cached_render.read() {
-            if guard.0 == now_sec {
-                return guard.1.clone();
-            }
+        // Lock-free cache check: load timestamp (Relaxed), compare, return cached if fresh
+        if self.cached_render_ts.load(Relaxed) == now_sec {
+            return self.cached_render_buf.load_full().as_ref().clone();
         }
 
         // Preallocate estimated capacity to avoid reallocations
@@ -437,17 +439,16 @@ impl Metrics {
 
         let b: bytes::Bytes = out.into();
 
-        if let Ok(mut guard) = self.cached_render.write() {
-            guard.0 = now_sec;
-            guard.1 = b.clone();
-        }
+        // Lock-free cache update
+        self.cached_render_buf.store(std::sync::Arc::new(b.clone()));
+        self.cached_render_ts.store(now_sec, Relaxed);
 
         b
     }
 }
 
 /// Global static metrics instance.
-pub static METRICS: Metrics = Metrics::new();
+pub static METRICS: std::sync::LazyLock<Metrics> = std::sync::LazyLock::new(Metrics::new);
 
 /// RAII guard for tracking active connections.
 /// Increments on creation, decrements on drop.

@@ -135,17 +135,23 @@ pub(crate) async fn process_request(
     };
 
     // ── CORS (Per-Route) ──
-    let req_origin: Option<String> = if rule.cors.is_some() {
-        req.headers()
-            .get(hyper::header::ORIGIN)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_owned())
+    // Clone origin HeaderValue (16 bytes, ref-counted) to release the
+    // immutable borrow on req before any mutations below.
+    let req_origin: Option<hyper::header::HeaderValue> = if rule.cors.is_some() {
+        req.headers().get(hyper::header::ORIGIN).cloned()
     } else {
         None
     };
 
+    // Pre-compute CORS allow origin for response injection later
+    let cors_allow_origin: Option<hyper::header::HeaderValue> = req_origin
+        .as_ref()
+        .and_then(|v| v.to_str().ok())
+        .and_then(|o| rule.cors.as_ref().and_then(|c| c.check_origin(o)));
+
     if let Some(ref cors) = rule.cors {
-        if let Some(ref origin_str) = req_origin {
+        if let Some(ref origin_val) = req_origin {
+            let origin_str = origin_val.to_str().unwrap_or("");
             if let Some(allow_origin) = cors.check_origin(origin_str) {
                 // Pre-flight OPTIONS — respond immediately without proxying
                 if *req.method() == hyper::Method::OPTIONS {
@@ -166,8 +172,6 @@ pub(crate) async fn process_request(
                 }
             } else {
                 // Origin not in allowed list — block state-changing methods AND preflight.
-                // Without blocking OPTIONS, upstream could return permissive CORS headers
-                // that bypass the proxy's CORS policy.
                 if *req.method() == hyper::Method::OPTIONS
                     || matches!(
                         *req.method(),
@@ -296,14 +300,14 @@ pub(crate) async fn process_request(
         }
 
         if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
-            // Extract content-type before consuming req
-            let ct_owned: Option<String> = req
-                .headers()
-                .get(hyper::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_owned());
-
             let (parts, body) = req.into_parts();
+
+            // Borrow content-type from parts.headers — no String allocation needed.
+            // The header lives in `parts` which is alive through this scope.
+            let ct: Option<&str> = parts
+                .headers
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok());
 
             let max_body_bytes = (waf_profile.max_body_mb * 1_048_576) as usize;
             let limited = Limited::new(body, max_body_bytes);
@@ -317,8 +321,7 @@ pub(crate) async fn process_request(
                 }
             };
 
-            let verdict =
-                waf::validate_request(method, ct_owned.as_deref(), &body_bytes, waf_profile);
+            let verdict = waf::validate_request(method, ct, &body_bytes, waf_profile);
             if let waf::WafVerdict::Deny(_) = verdict {
                 metrics::METRICS
                     .waf_denied
@@ -423,11 +426,6 @@ pub(crate) async fn process_request(
 
     // Pre-extract X-Request-ID for response echo (before req is consumed)
     let request_id_val = req.headers().get("X-Request-ID").cloned();
-
-    // Pre-compute CORS allow origin before state is consumed
-    let cors_allow_origin: Option<hyper::header::HeaderValue> = req_origin
-        .as_deref()
-        .and_then(|o| rule.cors.as_ref().and_then(|c| c.check_origin(o)));
 
     // --- Dispatch by mode ---
     let mut resp = if rule.cache.is_some() {
@@ -552,8 +550,8 @@ async fn handle_static_cache(
             .unwrap());
     }
 
-    // Need to own cache key before consuming req
-    let path_owned = cache_key.to_owned();
+    // Own cache key before consuming req — use Arc directly (cache stores Arc<str>)
+    let path_owned: Arc<str> = Arc::from(cache_key);
 
     // RAM miss — fetch from upstream
     let resp = proxy::proxy_pass(

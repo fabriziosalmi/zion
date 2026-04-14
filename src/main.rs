@@ -595,19 +595,33 @@ async fn async_main(
                 std::time::Duration::from_secs(3600),
                 builder.serve_connection_with_upgrades(
                     io,
-                    service_fn(move |mut req| {
-                        // Consume early_data flag on first request (subsequent requests are normal)
-                        let was_early =
-                            early_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
-                        // Inject client cert DN as header if mTLS authenticated
-                        if let Some(ref dn) = client_dn {
-                            if let Ok(val) = hyper::header::HeaderValue::from_str(dn) {
-                                req.headers_mut().insert("X-Client-Cert-DN", val);
+                    service_fn(move |mut req: Request<Incoming>| {
+                        let state = state.clone();
+                        let early_flag = early_flag.clone();
+                        let client_dn = client_dn.clone();
+                        async move {
+                            // Fast-path: health probes bypass the full pipeline (~1us vs ~5us)
+                            let path = req.uri().path();
+                            if path == "/healthz" {
+                                return Ok(text_response(StatusCode::OK, "ok"));
                             }
+                            if path == "/readyz" {
+                                return Ok(text_response(StatusCode::OK, "ready"));
+                            }
+
+                            // Consume early_data flag on first request
+                            let was_early =
+                                early_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
+                            // Inject client cert DN as header if mTLS authenticated
+                            if let Some(ref dn) = client_dn {
+                                if let Ok(val) = hyper::header::HeaderValue::from_str(dn) {
+                                    req.headers_mut().insert("X-Client-Cert-DN", val);
+                                }
+                            }
+                            use http_body_util::BodyExt;
+                            let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
+                            process_request(req_boxed, state, remote_addr, was_early).await
                         }
-                        use http_body_util::BodyExt;
-                        let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
-                        process_request(req_boxed, state.clone(), remote_addr, was_early)
                     }),
                 ),
             )
