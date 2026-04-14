@@ -97,7 +97,11 @@ impl ResolvesServerCert for SniResolver {
 
         // ── Thread-local cache with dual-generation check ──
         // Must match BOTH instance_gen (same resolver) AND global_gen (same cert version).
-        let global_gen = CERT_GENERATION.load(Ordering::Relaxed);
+        // Acquire ordering ensures the ArcSwap load below sees the map
+        // written by the Release store in the control plane (cert reload).
+        // Relaxed is insufficient on ARM — compiler can reorder this load
+        // past the ArcSwap read, serving stale certs after a reload.
+        let global_gen = CERT_GENERATION.load(Ordering::Acquire);
 
         let result = LOCAL_SNI_CACHE.with(|cache| {
             let mut snapshot = cache.borrow_mut();

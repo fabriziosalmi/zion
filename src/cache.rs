@@ -18,10 +18,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Cached response metadata — stored alongside the body so cache hits
-/// preserve upstream Content-Type, status, and other essential headers.
+/// preserve upstream Content-Type, Content-Encoding, status, and other
+/// essential headers.
 #[derive(Clone, Debug)]
 pub struct CachedMeta {
     pub content_type: Option<HeaderValue>,
+    pub content_encoding: Option<HeaderValue>,
     pub status: StatusCode,
 }
 
@@ -37,6 +39,8 @@ struct L1Entry {
     body: Bytes,
     meta: CachedMeta,
     expires_at: Instant,
+    /// Cache generation at promotion time — stale if < StaticCache.generation.
+    generation: u64,
 }
 
 /// L2 entry — with TTL.
@@ -78,11 +82,11 @@ impl L1Cache {
     }
 
     #[inline]
-    fn get(&mut self, path: &str) -> Option<CacheHit> {
+    fn get(&mut self, path: &str, current_gen: u64) -> Option<CacheHit> {
         // Check if entry exists
         let (body, meta, expired, key) = {
             let entry = self.map.get(path)?;
-            if Instant::now() >= entry.expires_at {
+            if Instant::now() >= entry.expires_at || entry.generation < current_gen {
                 (None, None, true, None)
             } else {
                 (
@@ -112,7 +116,7 @@ impl L1Cache {
     }
 
     #[inline]
-    fn insert(&mut self, path: Arc<str>, body: Bytes, meta: CachedMeta, expires_at: Instant) {
+    fn insert(&mut self, path: Arc<str>, body: Bytes, meta: CachedMeta, expires_at: Instant, generation: u64) {
         // If key already exists, update in place and move to back
         if self.map.contains_key(&path) {
             self.map.insert(
@@ -121,6 +125,7 @@ impl L1Cache {
                     body,
                     meta,
                     expires_at,
+                    generation,
                 },
             );
             self.touch(&path);
@@ -143,6 +148,7 @@ impl L1Cache {
                 body,
                 meta,
                 expires_at,
+                generation,
             },
         );
     }
@@ -172,6 +178,11 @@ thread_local! {
 pub struct StaticCache {
     l2: Option<DashMap<Arc<str>, L2Entry>>,
     l1_max_entries: usize,
+    /// Monotonic counter bumped on every L2 insert/update.
+    /// L1 caches store the generation at promotion time; on get, if the
+    /// global generation has advanced, the L1 entry is stale and re-fetched
+    /// from L2. This prevents serving stale data for the TTL duration.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl StaticCache {
@@ -191,6 +202,7 @@ impl StaticCache {
         Self {
             l2,
             l1_max_entries: l1_max,
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -235,11 +247,13 @@ impl StaticCache {
 
         let Some(l2_concurrent) = &self.l2 else { unreachable!() };
 
+        let current_gen = self.generation.load(std::sync::atomic::Ordering::Acquire);
+
         // L1: thread-local, zero contention
         let l1_hit = L1.with(|l1| {
             let mut l1 = l1.borrow_mut();
             let l1 = l1.get_or_insert_with(|| L1Cache::new(l1_max));
-            l1.get(path)
+            l1.get(path, current_gen)
         });
 
         if let Some(hit) = l1_hit {
@@ -265,11 +279,11 @@ impl StaticCache {
         let expires_at = entry.expires_at;
         drop(entry); // release DashMap read lock
 
-        // Promote to L1 with same TTL
+        // Promote to L1 with same TTL and current generation
         L1.with(|l1| {
             let mut l1 = l1.borrow_mut();
             let l1 = l1.get_or_insert_with(|| L1Cache::new(l1_max));
-            l1.insert(key, body.clone(), meta.clone(), expires_at);
+            l1.insert(key, body.clone(), meta.clone(), expires_at, current_gen);
         });
 
         crate::metrics::METRICS
@@ -370,6 +384,8 @@ impl StaticCache {
                 expires_at: Instant::now() + Duration::from_secs(ttl_seconds),
             },
         );
+        // Bump generation so L1 caches on other threads see the update
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     #[allow(dead_code)]
@@ -389,6 +405,7 @@ mod tests {
     fn default_meta() -> CachedMeta {
         CachedMeta {
             content_type: Some(HeaderValue::from_static("text/css")),
+            content_encoding: None,
             status: StatusCode::OK,
         }
     }
@@ -421,6 +438,7 @@ mod tests {
         cache.insert("/a.js", Bytes::from("v1"), default_meta(), 3600, 100);
         let meta2 = CachedMeta {
             content_type: Some(HeaderValue::from_static("application/javascript")),
+            content_encoding: None,
             status: StatusCode::OK,
         };
         cache.insert("/a.js", Bytes::from("v2"), meta2, 3600, 100);
@@ -530,6 +548,7 @@ mod tests {
         let cache = StaticCache::new();
         let meta = CachedMeta {
             content_type: None,
+            content_encoding: None,
             status: StatusCode::OK,
         };
         cache.insert("/no-ct", Bytes::from("data"), meta, 3600, 100);
@@ -542,6 +561,7 @@ mod tests {
         let cache = StaticCache::new();
         let meta = CachedMeta {
             content_type: None,
+            content_encoding: None,
             status: StatusCode::NOT_MODIFIED,
         };
         cache.insert("/304", Bytes::new(), meta, 3600, 100);

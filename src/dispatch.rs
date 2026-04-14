@@ -158,14 +158,18 @@ pub(crate) async fn process_request(
                     return Ok(resp);
                 }
             } else {
-                // Origin not in allowed list — block state-changing methods (CSRF prevention).
-                if matches!(
-                    *req.method(),
-                    hyper::Method::POST
-                        | hyper::Method::PUT
-                        | hyper::Method::PATCH
-                        | hyper::Method::DELETE
-                ) {
+                // Origin not in allowed list — block state-changing methods AND preflight.
+                // Without blocking OPTIONS, upstream could return permissive CORS headers
+                // that bypass the proxy's CORS policy.
+                if *req.method() == hyper::Method::OPTIONS
+                    || matches!(
+                        *req.method(),
+                        hyper::Method::POST
+                            | hyper::Method::PUT
+                            | hyper::Method::PATCH
+                            | hyper::Method::DELETE
+                    )
+                {
                     return Ok(empty_response(StatusCode::FORBIDDEN));
                 }
             }
@@ -284,7 +288,7 @@ pub(crate) async fn process_request(
             return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
         }
 
-        if matches!(method, "POST" | "PUT" | "PATCH") {
+        if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
             // Extract content-type before consuming req
             let ct_owned: Option<String> = req
                 .headers()
@@ -505,13 +509,16 @@ async fn handle_static_cache(
         .map(|pq| pq.as_str())
         .unwrap_or_else(|| req.uri().path());
 
-    // RAM hit — zero-copy serve with preserved Content-Type
+    // RAM hit — zero-copy serve with preserved Content-Type and Content-Encoding
     if let Some(hit) = state.static_cache.get(cache_key) {
         let mut builder = Response::builder()
             .status(hit.meta.status)
             .header("Cache-Control", CACHE_CONTROL_IMMUTABLE);
         if let Some(ct) = &hit.meta.content_type {
             builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
+        }
+        if let Some(ce) = &hit.meta.content_encoding {
+            builder = builder.header(hyper::header::CONTENT_ENCODING, ce.clone());
         }
         return Ok(builder
             .body(Full::new(hit.body).map_err(|never| match never {}).boxed())
@@ -562,10 +569,13 @@ async fn handle_static_cache(
             return Ok(resp);
         }
 
-        // Preserve Content-Type for cache (S-05 fix)
+        // Preserve Content-Type and Content-Encoding for cache (S-05 fix).
+        // Without Content-Encoding, gzip-compressed bodies are served garbled.
         let content_type = parts.headers.get(hyper::header::CONTENT_TYPE).cloned();
+        let content_encoding = parts.headers.get(hyper::header::CONTENT_ENCODING).cloned();
         let meta = cache::CachedMeta {
             content_type,
+            content_encoding,
             status: parts.status,
         };
 

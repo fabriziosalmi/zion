@@ -102,10 +102,15 @@ fn get_scanner() -> &'static AhoCorasick {
             "%2e%2e/",
             "....//",
             // ── SSRF ──
-            "http://169.254.169.254", // AWS metadata
-            "http://[::ffff:169.254", // IPv6-mapped
-            "http://metadata.google", // GCP metadata
-            "http://100.100.100.200", // Alibaba metadata
+            "http://169.254.169.254",  // AWS metadata (HTTP)
+            "https://169.254.169.254", // AWS metadata (HTTPS)
+            "http://[::ffff:169.254",  // IPv6-mapped
+            "http://metadata.google",  // GCP metadata (HTTP)
+            "https://metadata.google", // GCP metadata (HTTPS)
+            "http://100.100.100.200",  // Alibaba metadata
+            "http://0xA9FEA9FE",       // AWS hex IP
+            "http://2852039166",       // AWS decimal IP
+            "http://169.254.169.254.nip.io", // DNS rebinding
             // ── Log4Shell / JNDI ──
             "${jndi:",
             "${env:",
@@ -359,8 +364,9 @@ pub fn validate_request(
         return WafVerdict::Deny("body exceeds max size");
     }
 
-    // Methods without body semantics: skip body inspection
-    if !matches!(method, "POST" | "PUT" | "PATCH") {
+    // Methods without body semantics: skip body inspection.
+    // DELETE can carry a body (RFC 9110) — some APIs use it.
+    if !matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
         return WafVerdict::Allow;
     }
 

@@ -566,11 +566,11 @@ async fn async_main(
                 .peer_certificates()
                 .and_then(|certs| certs.first())
                 .and_then(|cert| {
-                    // Parse DER cert to extract subject DN
-                    // Use a hex fingerprint of the raw subject as a lightweight DN
+                    // Parse DER cert to extract a lightweight identifier.
+                    // XOR-fold of first 64 bytes — fast but NOT cryptographic.
+                    // Sufficient for logging/tracing, NOT for access control.
                     let raw = cert.as_ref();
                     if raw.len() > 20 {
-                        // SHA256 fingerprint of the full cert (first 16 hex chars)
                         use std::fmt::Write;
                         let mut hasher_out = [0u8; 8];
                         for (i, &b) in raw.iter().take(64).enumerate() {
