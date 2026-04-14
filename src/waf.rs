@@ -162,6 +162,19 @@ fn get_scanner() -> &'static AhoCorasick {
             "http://0xA9FEA9FE",       // AWS hex IP
             "http://2852039166",       // AWS decimal IP
             "http://169.254.169.254.nip.io", // DNS rebinding
+            // ── SSRF: Cloud Metadata (additional providers) ──
+            "169.254.169.254/metadata",  // Azure IMDS
+            "/metadata/v1",              // DigitalOcean metadata API
+            "http://192.0.0.192",        // Oracle Cloud IMDS
+            "kubernetes.default.svc",    // Kubernetes service account
+            "/openstack/latest",         // OpenStack metadata
+            // ── Windows Path Traversal ──
+            "c:\\windows\\",
+            "c:\\inetpub\\",
+            "..\\..\\..\\windows",
+            // ── Open Redirect ──
+            "/\\evil",                   // backslash normalization redirect
+            "/%09/",                     // tab-based redirect bypass
             // ── LDAP Injection ──
             ")(cn=*",
             ")(uid=*",
