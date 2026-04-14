@@ -162,6 +162,34 @@ fn get_scanner() -> &'static AhoCorasick {
             "http://0xA9FEA9FE",       // AWS hex IP
             "http://2852039166",       // AWS decimal IP
             "http://169.254.169.254.nip.io", // DNS rebinding
+            // ── LDAP Injection ──
+            ")(cn=*",
+            ")(uid=*",
+            ")(mail=*",
+            ")(objectclass=*",
+            "ldap://",
+            "ldaps://",
+            // ── XML/XXE ──
+            "<!entity",
+            "<!doctype",
+            "system \"file://",
+            "system \"http://",
+            "<xsl:",
+            "xmlns:xlink",
+            "<!attlist",
+            "data:text/html",
+            // ── SSTI (Server-Side Template Injection) ──
+            "#{7*7}",
+            "${7*7}",
+            "{{7*7}}",
+            "<%=",
+            "{%import",
+            "#{t(java",
+            // ── CRLF / Header Injection ──
+            "%0d%0a",
+            "%0aset-cookie:",
+            "%0alocation:",
+            "\r\nset-cookie:",
             // ── Log4Shell / JNDI ──
             "${jndi:",
             "${env:",
@@ -1450,6 +1478,71 @@ mod tests {
         assert_eq!(
             validate_request("POST", Some("application/json"), body, &strict_profile()),
             WafVerdict::Allow
+        );
+    }
+
+    // ── LDAP / XXE / SSTI / CRLF (v0.1.4b) ──
+
+    #[test]
+    fn denies_ldap_injection() {
+        let body = br#"{"filter":")(cn=*))"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_xxe_entity() {
+        let body = br#"{"xml":"<!ENTITY xxe SYSTEM \"file:///etc/passwd\">"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_ssti_jinja() {
+        let body = br#"{"name":"{{7*7}}"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_ssti_java() {
+        let body = b"{\"expr\":\"#{t(java.lang.Runtime).getRuntime()}\"}";
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_crlf_injection() {
+        let body = br#"{"header":"value%0d%0aSet-Cookie: admin=true"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_xxe_system_file() {
+        let body = br#"{"dtd":"SYSTEM \"file:///etc/shadow\""}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_xsl_injection() {
+        let body = br#"{"xml":"<xsl:stylesheet version=\"1.0\">"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
         );
     }
 }
