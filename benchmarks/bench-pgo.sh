@@ -28,8 +28,14 @@ echo "Phase 1: Building instrumented binary..."
 RUSTFLAGS="-Cprofile-generate=${PGO_DIR}" cargo build --release 2>&1 | tail -3
 
 echo "Phase 1: Running benchmark workload to collect profiles..."
-# Start Go backend
-(cd benchmarks/backend && go run test-server.go &)
+# Start backend (Rust preferred, Go fallback)
+RUST_BACKEND="benchmarks/backend/target/release/zion-bench-backend"
+if [[ -f "$RUST_BACKEND" ]]; then
+    "$RUST_BACKEND" &
+else
+    cd benchmarks/backend && go run test-server.go &
+    cd "$OLDPWD"
+fi
 BACKEND_PID=$!
 sleep 1
 

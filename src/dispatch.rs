@@ -587,8 +587,9 @@ async fn handle_static_cache(
     let notify = Arc::new(tokio::sync::Notify::new());
     state.inflight.insert(path_owned.clone(), notify.clone());
 
-    // RAM miss — fetch from upstream
-    let resp = proxy::proxy_pass(
+    // RAM miss — fetch from upstream.
+    // On error, clean up inflight entry before propagating (prevents waiter deadlock).
+    let resp = match proxy::proxy_pass(
         &state.http_client,
         req,
         dyn_scheme,
@@ -596,7 +597,15 @@ async fn handle_static_cache(
         Some(remote_addr),
         "https",
     )
-    .await?;
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            state.inflight.remove(&path_owned);
+            notify.notify_waiters();
+            return Err(e);
+        }
+    };
 
     // Only cache 200 OK responses
     if resp.status() == StatusCode::OK {
@@ -682,13 +691,17 @@ async fn handle_static_cache(
 
                         // Stream chunk directly to the client immediately
                         if sender.send(Ok(f)).await.is_err() {
-                            // Client disconnected abruptly. Abort buffering
+                            // Client disconnected — clean up inflight to unblock waiters
+                            state_clone.inflight.remove(&path_clone);
+                            notify_clone.notify_waiters();
                             return;
                         }
                     }
                     Some(Err(e)) => {
-                        // Upstream chunking failed, forward the error and bail out
+                        // Upstream chunking failed — clean up inflight
                         let _ = sender.send(Err(e)).await;
+                        state_clone.inflight.remove(&path_clone);
+                        notify_clone.notify_waiters();
                         return;
                     }
                     None => {

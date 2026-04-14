@@ -26,20 +26,20 @@ Payload × concurrency grid — measures end-to-end TLS throughput through the f
 | | 10 MB | 33,781 | 80,246 | 123,936 |
 | | 100 MB | 36,067 | 90,091 | 96,706 |
 
-**Peak**: 233K req/s HTML (5KB) · 209K cache hit · 92K WAF POST · 6.7 GB/s TLS throughput
+**Peak**: 233K req/s HTML (5KB) · 210K cache hit · 103K WAF POST · 107K API proxy
 
-### Native Benchmark (Apple M4, 5 runs x 10s, c=100)
+### Native Benchmark (Apple M4, Rust backend, 5 runs x 10s, c=100)
 
 | Endpoint | Median req/s | Best Run | CV% | Errors |
 |----------|-------------|----------|-----|--------|
-| HTML SSR 5KB | **233,341** | 236,755 | 2.0% | 0 |
-| Cache Hit JS 4KB (RAM) | **209,381** | 214,546 | 9.8% | 0 |
-| CSS 3KB (cached) | **191,574** | 203,969 | 4.5% | 0 |
-| TLS Proxy API GET 1KB | **93,253** | 97,019 | 3.0% | 0 |
-| WAF POST JSON | **91,893** | 93,415 | 3.1% | 0 |
-| JS 4KB (no cache) | **81,470** | 82,723 | 2.3% | 0 |
-| PNG 8KB (no cache) | **66,753** | 68,020 | 2.7% | 0 |
-| WOFF2 16KB (no cache) | **59,262** | 60,679 | 3.0% | 0 |
+| HTML SSR 5KB | **233,170** | 235,370 | 1.1% | 0 |
+| CSS 3KB (cached) | **209,573** | 215,408 | 3.4% | 0 |
+| Cache Hit JS 4KB (RAM) | **195,318** | 207,521 | 7.1% | 0 |
+| TLS Proxy API GET 1KB | **106,505** | 107,189 | 2.1% | 0 |
+| WAF POST JSON | **103,206** | 103,547 | 0.5% | 0 |
+| JS 4KB (no cache) | **102,892** | 104,135 | 1.3% | 0 |
+| PNG 8KB (no cache) | **99,496** | 101,290 | 1.7% | 0 |
+| WOFF2 16KB (no cache) | **83,870** | 86,242 | 2.5% | 0 |
 | SQLi blocked | Yes (400) | | | |
 | XSS blocked | Yes (400) | | | |
 
