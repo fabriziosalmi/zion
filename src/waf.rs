@@ -59,25 +59,64 @@ fn get_scanner() -> &'static AhoCorasick {
             "information_schema",
             "@@version",
             "char(0x",
-            // ── XSS ──
+            // ── XSS: Tags ──
             "<script",
             "</script",
-            "javascript:",
+            "<iframe",
+            "<object",
+            "<embed",
+            "<svg onload",
+            "<img src",
+            "<body onload",
+            "<input onfocus",
+            "<details ontoggle",
+            "<video onerror",
+            "<audio onerror",
+            "<marquee onstart",
+            "<math xlink",
+            // ── XSS: Event Handlers (high-value subset, =suffix prevents false positive) ──
             "onerror=",
             "onload=",
             "onfocus=",
             "onmouseover=",
             "onclick=",
-            "<iframe",
-            "<object",
-            "<embed",
-            "<svg onload",
+            "oninput=",
+            "onchange=",
+            "onsubmit=",
+            "onkeydown=",
+            "onkeyup=",
+            "onkeypress=",
+            "ondblclick=",
+            "oncontextmenu=",
+            "ondragstart=",
+            "ondrop=",
+            "onpaste=",
+            "ontouchstart=",
+            "onpointerover=",
+            "onanimationend=",
+            "ontransitionend=",
+            "onresize=",
+            "onscroll=",
+            "onwheel=",
+            "onmouseenter=",
+            "ontoggle=",
+            "onpageshow=",
+            // ── XSS: JS sinks ──
+            "javascript:",
             "expression(",
             "alert(",
+            "confirm(",
+            "prompt(",
             "document.cookie",
             "document.write",
+            "document.domain",
+            "window.location",
             "eval(",
             "fromcharcode",
+            "innerhtml",
+            "outerhtml",
+            "insertadjacenthtml",
+            "srcdoc=",
             // ── Command Injection ──
             "; cat ",
             "; ls ",
@@ -123,6 +162,34 @@ fn get_scanner() -> &'static AhoCorasick {
             "http://0xA9FEA9FE",       // AWS hex IP
             "http://2852039166",       // AWS decimal IP
             "http://169.254.169.254.nip.io", // DNS rebinding
+            // ── LDAP Injection ──
+            ")(cn=*",
+            ")(uid=*",
+            ")(mail=*",
+            ")(objectclass=*",
+            "ldap://",
+            "ldaps://",
+            // ── XML/XXE ──
+            "<!entity",
+            "<!doctype",
+            "system \"file://",
+            "system \"http://",
+            "<xsl:",
+            "xmlns:xlink",
+            "<!attlist",
+            "data:text/html",
+            // ── SSTI (Server-Side Template Injection) ──
+            "#{7*7}",
+            "${7*7}",
+            "{{7*7}}",
+            "<%=",
+            "{%import",
+            "#{t(java",
+            // ── CRLF / Header Injection ──
+            "%0d%0a",
+            "%0aset-cookie:",
+            "%0alocation:",
+            "\r\nset-cookie:",
             // ── Log4Shell / JNDI ──
             "${jndi:",
             "${env:",
@@ -132,6 +199,43 @@ fn get_scanner() -> &'static AhoCorasick {
             "{{.constructor",
             "__proto__",
             "constructor.prototype",
+            // ── NoSQL Injection (MongoDB/Redis/Elastic) ──
+            "$gt",             // MongoDB operator injection
+            "$ne",
+            "$regex",
+            "$where",
+            "$lookup",
+            "$unionwith",
+            "db.collection",   // MongoDB shell
+            ".find({",
+            ".findone({",
+            ".aggregate([",
+            ".mapreduce(",
+            "this.constructor",
+            // ── Deserialization / RCE ──
+            "runtime.getruntime",     // Java RCE
+            "processbuilder",
+            "objectinputstream",
+            "java.lang.runtime",
+            "javax.script.scriptengine",
+            "pickle.loads",           // Python deserialization
+            "__reduce__",
+            "__import__(",
+            "subprocess.call",
+            "subprocess.popen",
+            "os.system(",
+            "os.popen(",
+            "unserialize(",           // PHP deserialization
+            "php://input",
+            "php://filter",
+            "phar://",
+            // ── GraphQL Injection ──
+            "__schema",               // Introspection probe
+            "__type",
+            "mutation{",              // Mutation without space (automated tools)
+            "query{__",
+            "{__schema",
+            "{__type",
         ];
 
         AhoCorasick::builder()
@@ -1225,6 +1329,219 @@ mod tests {
         assert_eq!(
             validate_request("POST", Some("application/json"), body, &strict_profile()),
             WafVerdict::Deny("injection pattern detected (encoded)")
+        );
+    }
+
+    // ── New categories (v0.1.4) ──
+
+    #[test]
+    fn denies_xss_event_handler_oninput() {
+        let body = br#"{"html":"<div oninput=alert(1)>"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_xss_img_tag() {
+        let body = br#"{"html":"<img src=x onerror=alert(1)>"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_xss_srcdoc() {
+        let body = br#"{"html":"<iframe srcdoc=<script>alert(1)</script>>"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_xss_innerhtml() {
+        let body = br#"{"code":"element.innerHTML = userInput"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_nosql_injection_gt() {
+        let body = br#"{"username":{"$gt":""},"password":{"$gt":""}}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_nosql_injection_where() {
+        let body = br#"{"$where":"this.password == 'admin'"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_nosql_injection_regex() {
+        let body = br#"{"username":{"$regex":".*"}}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_java_deserialization() {
+        let body = br#"{"cmd":"Runtime.getRuntime().exec('id')"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_python_deserialization() {
+        let body = br#"{"data":"pickle.loads(base64.b64decode(payload))"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_python_os_system() {
+        let body = br#"{"cmd":"os.system('rm -rf /')"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_php_deserialization() {
+        let body = br#"{"data":"unserialize($_GET['data'])"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_php_filter_wrapper() {
+        let body = br#"{"file":"php://filter/convert.base64-encode/resource=config.php"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_graphql_introspection() {
+        let body = br#"{"query":"{ __schema { types { name } } }"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_graphql_type_probe() {
+        let body = br#"{"query":"{__type(name:\"User\"){fields{name}}}"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn allows_legitimate_json_with_dollar() {
+        // Legitimate JSON with $ in values (MongoDB query syntax in app code is fine)
+        let body = br#"{"price":42.99,"currency":"$USD","note":"item costs $5"}"#;
+        // $USD and $5 should NOT match $gt/$ne/$regex (those require exact prefix)
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn denies_ldap_injection() {
+        let body = br#"{"filter":")(cn=*))"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_xxe_entity() {
+        let body = br#"{"xml":"<!ENTITY xxe SYSTEM \"file:///etc/passwd\">"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_xxe_system_file() {
+        let body = br#"{"dtd":"SYSTEM \"file:///etc/shadow\""}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_ssti_jinja() {
+        let body = br#"{"name":"{{7*7}}"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_ssti_java() {
+        let body = b"{\"expr\":\"#{t(java.lang.Runtime).getRuntime()}\"}";
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_crlf_injection() {
+        let body = br#"{"header":"value%0d%0aSet-Cookie: admin=true"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn denies_crlf_location_redirect() {
+        let body = br#"{"url":"%0aLocation: http://evil.com"}"#;
+        // Matches on raw scan: "%0alocation:" is a literal pattern (case-insensitive)
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn allows_legitimate_graphql_query() {
+        // Normal GraphQL query without introspection
+        let body = br#"{"query":"{ users(limit: 10) { id name email } }"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Allow
         );
     }
 }
