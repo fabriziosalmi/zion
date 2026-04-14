@@ -5,5 +5,5 @@
 #
 # Note: binaries are NOT portable across CPU architectures.
 # For portable builds, remove this or use target-cpu=generic.
-[target.'cfg(any())']
+[build]
 rustflags = ["-C", "target-cpu=native"]

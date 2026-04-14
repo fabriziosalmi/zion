@@ -254,10 +254,10 @@ pub struct Metrics {
     pub upstream_duration: LatencyHistogram,
     pub tls_handshake_duration: LatencyHistogram,
 
-    // Caching for Prometheus Output — lock-free via ArcSwap.
-    // RwLock was a contention point under concurrent /metrics scrapes.
-    pub cached_render_ts: AtomicU64,
-    pub cached_render_buf: arc_swap::ArcSwap<bytes::Bytes>,
+    // Caching for Prometheus Output — single ArcSwap for atomicity.
+    // Stores (timestamp_secs, rendered_bytes) as one atomic unit to prevent
+    // readers seeing a fresh timestamp with a stale buffer.
+    pub cached_render: arc_swap::ArcSwap<(u64, bytes::Bytes)>,
 }
 
 impl Metrics {
@@ -278,8 +278,7 @@ impl Metrics {
             request_duration: LatencyHistogram::new(),
             upstream_duration: LatencyHistogram::new(),
             tls_handshake_duration: LatencyHistogram::new(),
-            cached_render_ts: AtomicU64::new(0),
-            cached_render_buf: arc_swap::ArcSwap::from_pointee(bytes::Bytes::new()),
+            cached_render: arc_swap::ArcSwap::from_pointee((0u64, bytes::Bytes::new())),
         }
     }
 
@@ -308,9 +307,10 @@ impl Metrics {
             .unwrap_or_default()
             .as_secs();
 
-        // Lock-free cache check: load timestamp (Relaxed), compare, return cached if fresh
-        if self.cached_render_ts.load(Relaxed) == now_sec {
-            return self.cached_render_buf.load_full().as_ref().clone();
+        // Lock-free cache check: single atomic load of (ts, bytes) for consistency
+        let cached = self.cached_render.load_full();
+        if cached.0 == now_sec {
+            return cached.1.clone();
         }
 
         // Preallocate estimated capacity to avoid reallocations
@@ -439,9 +439,8 @@ impl Metrics {
 
         let b: bytes::Bytes = out.into();
 
-        // Lock-free cache update
-        self.cached_render_buf.store(std::sync::Arc::new(b.clone()));
-        self.cached_render_ts.store(now_sec, Relaxed);
+        // Lock-free atomic cache update (ts + bytes as one unit)
+        self.cached_render.store(std::sync::Arc::new((now_sec, b.clone())));
 
         b
     }
