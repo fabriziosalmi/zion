@@ -2,6 +2,39 @@
 
 All notable changes to Zion Edge Gateway are documented here.
 
+## [0.1.3] - 2026-04-15
+
+### Fixed (Copilot code review)
+- Fix `.cargo/config.toml`: `cfg(any())` is always false, replaced with `[build]`
+- Fix singleflight: inflight entry cleaned up on proxy error, client disconnect, and upstream frame error (prevents waiter deadlock)
+- Fix WAF SIMD pre-filter: removed unsound fast-reject that skipped raw Aho-Corasick scan (patterns like `union select` have no trigger bytes)
+- Fix metrics ArcSwap: combined timestamp + buffer into single atomic `ArcSwap<(u64, Bytes)>` (prevents readers seeing stale buffer)
+- Fix JWKS backoff: failure after success resets to 5s (was stuck at 3600s), cap reduced to 300s
+- Fix bench-pgo.sh: PID capture was in subshell, now uses Rust backend
+- Fix PDF report: version strings updated to match release
+
+### Added
+- Rust benchmark backend (pure hyper, 194K raw req/s, replaces Go)
+- Apple-native docs homepage (custom CSS, dark mode, frosted glass nav)
+- docs/config/auth.md (JWT/OIDC configuration)
+- docs/config/http3.md (HTTP/3 QUIC support)
+
+### Changed
+- Architecture docs: 17 modules documented (was 11)
+- Benchmark numbers: Rust backend eliminates Go bottleneck (+14-61% on proxy paths)
+
+### Benchmark Results (Apple M4, Rust backend, v0.1.3)
+
+| Endpoint | req/s | CV% |
+|----------|------:|----:|
+| HTML SSR 5KB | 233,170 | 1.1% |
+| CSS 3KB (cached) | 209,573 | 3.4% |
+| TLS Proxy API 1KB | 106,505 | 2.1% |
+| WAF POST JSON | 103,206 | 0.5% |
+| JS 4KB (uncached) | 102,892 | 1.3% |
+| PNG 8KB (uncached) | 99,496 | 1.7% |
+| WOFF2 16KB (uncached) | 83,870 | 2.5% |
+
 ## [0.1.2] - 2026-04-14
 
 ### Security (28 bugs fixed)
