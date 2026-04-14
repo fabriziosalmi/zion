@@ -16,15 +16,24 @@ static PROTO_HTTP: HeaderValue = HeaderValue::from_static("http");
 /// BoxBody used throughout Zion — erases concrete body types.
 pub type ZionBody = BoxBody<Bytes, hyper::Error>;
 
-/// Shared HTTP client type.
-pub type HttpClient = Client<hyper_util::client::legacy::connect::HttpConnector, ZionBody>;
+/// Shared HTTP client type — supports both HTTP/1.1 and HTTP/2 to upstreams.
+/// Plain HTTP upstreams use HttpConnector; HTTPS upstreams negotiate H2 via ALPN.
+pub type HttpClient = Client<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, ZionBody>;
 
-/// Build the shared HTTP client with connection pooling.
+/// Build the shared HTTP client with connection pooling and H2 upstream support.
+/// HTTP/2 multiplexing eliminates head-of-line blocking for HTTPS upstreams.
 pub fn build_http_client() -> HttpClient {
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+
     Client::builder(TokioExecutor::new())
         .pool_idle_timeout(std::time::Duration::from_secs(30))
         .pool_max_idle_per_host(128)
-        .build_http()
+        .build(https)
 }
 
 #[inline]

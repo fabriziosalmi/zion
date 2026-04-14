@@ -27,3 +27,5 @@ zion-*
 .venv/
 __pycache__/
 *.pyc
+benchmarks/backend/target/
+benchmarks/backend/Cargo.lock

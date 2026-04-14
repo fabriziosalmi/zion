@@ -49,6 +49,9 @@ fnv = "1"
 # Upstream TLS root CAs (embedded Mozilla bundle — deterministic, no system dep)
 webpki-roots = "0.26"
 
+# Upstream HTTPS connector — enables HTTP/2 multiplexing to TLS upstreams
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "webpki-roots", "ring"], default-features = false }
+
 # WAF: SIMD-accelerated JSON validation (10x faster than serde_json for validation)
 simd-json = "0.14"
 itoa = "1.0.18"
