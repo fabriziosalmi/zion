@@ -554,6 +554,8 @@ async fn async_main(
             // 0-RTT: Check if this connection accepted early data.
             // Only the first request on the connection can be early data.
             // We pass this flag to handle_https for method gating (425 Too Early).
+            // rustls ServerConnection::early_data() returns Some if 0-RTT was
+            // accepted during the handshake (was_accepted() flag persists).
             let is_early_data = tls_stream.get_mut().1.early_data().is_some();
             let early_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(is_early_data));
 
@@ -688,6 +690,19 @@ async fn handle_http(
     state: Arc<AppState>,
     remote_addr: SocketAddr,
 ) -> Result<Response<ZionBody>, hyper::Error> {
+    // Rate limit HTTP/80 to prevent DoS via redirect/ACME flood
+    if !check_rate_limit(&state, remote_addr.ip()) {
+        metrics::METRICS
+            .rate_limited
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(empty_response(StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    // URI length check (same as HTTPS handler)
+    if req.uri().path().len() > MAX_URI_LEN {
+        return Ok(empty_response(StatusCode::URI_TOO_LONG));
+    }
+
     let path = req.uri().path();
 
     // ACME HTTP-01 challenge — serve from in-memory store (auto-renewal)

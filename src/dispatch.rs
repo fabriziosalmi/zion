@@ -316,32 +316,27 @@ pub(crate) async fn process_request(
                 return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
             }
 
-            let mut resp = proxy::proxy_pass_bytes(
-                &state.http_client,
-                parts,
-                body_bytes,
-                &dyn_scheme,
-                &dyn_authority,
-                remote_addr,
-                "https", // Always passed as "https" for the connection-level x-forwarded-proto, not the upstream target scheme
-            )
-            .await?;
-            inject_security_headers(&mut resp);
-            return Ok(resp);
-        }
-
-        // GET/HEAD/DELETE/OPTIONS — no body to validate
-        let ct = req
-            .headers()
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok());
-        let verdict = waf::validate_request(method, ct, &[], waf_profile);
-        if let waf::WafVerdict::Deny(_) = verdict {
-            metrics::METRICS
-                .waf_denied
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            metrics::METRICS.record_status(400);
-            return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
+            // Re-assemble request with validated body for dispatch below.
+            // Do NOT return early — fall through to post-response processing
+            // (CORS, metrics, request-ID, security headers).
+            let body: ZionBody = Full::new(body_bytes)
+                .map_err(|never| match never {})
+                .boxed();
+            req = Request::from_parts(parts, body);
+        } else {
+            // GET/HEAD/DELETE/OPTIONS — no body to validate
+            let ct = req
+                .headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok());
+            let verdict = waf::validate_request(method, ct, &[], waf_profile);
+            if let waf::WafVerdict::Deny(_) = verdict {
+                metrics::METRICS
+                    .waf_denied
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics::METRICS.record_status(400);
+                return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
+            }
         }
     }
 
@@ -502,10 +497,16 @@ async fn handle_static_cache(
     dyn_scheme: &hyper::http::uri::Scheme,
     dyn_authority: &hyper::http::uri::Authority,
 ) -> Result<Response<ZionBody>, hyper::Error> {
-    let path = req.uri().path();
+    // Use full path+query as cache key to prevent cache poisoning:
+    // /api?user=alice and /api?user=bob must NOT share a cache entry.
+    let cache_key = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| req.uri().path());
 
     // RAM hit — zero-copy serve with preserved Content-Type
-    if let Some(hit) = state.static_cache.get(path) {
+    if let Some(hit) = state.static_cache.get(cache_key) {
         let mut builder = Response::builder()
             .status(hit.meta.status)
             .header("Cache-Control", CACHE_CONTROL_IMMUTABLE);
@@ -517,8 +518,8 @@ async fn handle_static_cache(
             .unwrap());
     }
 
-    // Need to own path before consuming req
-    let path_owned = path.to_owned();
+    // Need to own cache key before consuming req
+    let path_owned = cache_key.to_owned();
 
     // RAM miss — fetch from upstream
     let resp = proxy::proxy_pass(
@@ -543,12 +544,15 @@ async fn handle_static_cache(
             .get(hyper::header::VARY)
             .and_then(|v| v.to_str().ok())
             .map(|v| {
+                // Check for content-negotiation headers that make path-only
+                // caching unsafe. Use exact token matching to avoid false positives:
+                // "Accept-Encoding" is safe (cache stores raw bytes), but "Accept"
+                // means the upstream varies on media type which IS unsafe.
                 let v_lower = v.to_ascii_lowercase();
-                v_lower.contains("accept")
-                    || v_lower.contains("negotiate")
-                    || v_lower.contains("authorization")
-                    || v_lower.contains("cookie")
-                    || v_lower == "*"
+                v_lower.split(',').any(|token| {
+                    let t = token.trim();
+                    t == "accept" || t == "negotiate" || t == "authorization" || t == "cookie"
+                }) || v_lower == "*"
             })
             .unwrap_or(false);
 

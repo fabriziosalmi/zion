@@ -411,30 +411,38 @@ pub fn validate_request(
             WAF_BUF_SEC.with(|buf2| {
                 let mut out = buf1.borrow_mut();
                 let mut sec = buf2.borrow_mut();
-                
+
                 // First pass from body -> out
                 normalize_unified(body, &mut out);
-                
-                for _ in 0..2 {
+
+                // Iterate until convergence (no more encodings) or safety cap.
+                // Cap at 7 passes to prevent DoS via deeply nested encoding
+                // while catching real evasion (quad-encoding needs 4 passes).
+                for _ in 0..7 {
                     if get_scanner().is_match(out.as_slice()) {
                         return Some(WafVerdict::Deny("injection pattern detected (encoded)"));
                     }
-                    
+
                     let still_needs_decode = memchr::memchr(b'%', &out).is_some() || memchr::memchr(b'+', &out).is_some();
                     let still_has_sql_comments = out.windows(2).any(|w| w == b"/*");
                     let still_has_unicode_esc = out.windows(2).any(|w| w == b"\\u");
-                    
+
                     if !still_needs_decode && !still_has_sql_comments && !still_has_unicode_esc {
                         break;
                     }
-                    
-                    // Recursive pass: out -> sec
+
+                    // Recursive pass: out -> sec, then swap
                     normalize_unified(&out, &mut sec);
-                    // Swap back: sec -> out
+
+                    // If output didn't change, we've converged — stop
+                    if *out == *sec {
+                        break;
+                    }
+
                     std::mem::swap(&mut *out, &mut *sec);
                 }
-                
-                // Final check
+
+                // Final check after convergence
                 if get_scanner().is_match(out.as_slice()) {
                     return Some(WafVerdict::Deny("injection pattern detected (encoded)"));
                 }
@@ -489,7 +497,7 @@ pub fn validate_uri(uri: &str) -> WafVerdict {
 
                 normalize_unified(uri_bytes, &mut out);
 
-                for _ in 0..2 {
+                for _ in 0..7 {
                     if get_scanner().is_match(out.as_slice()) {
                         return Some(WafVerdict::Deny("injection pattern in URI (encoded)"));
                     }
@@ -503,6 +511,9 @@ pub fn validate_uri(uri: &str) -> WafVerdict {
                     }
 
                     normalize_unified(&out, &mut sec);
+                    if *out == *sec {
+                        break;
+                    }
                     std::mem::swap(&mut *out, &mut *sec);
                 }
 
@@ -767,6 +778,29 @@ mod tests {
         assert_eq!(
             validate_request("POST", Some("application/json"), body, &strict_profile()),
             WafVerdict::Deny("injection pattern detected (encoded)")
+        );
+    }
+
+    #[test]
+    fn denies_triple_url_encoded_sqli() {
+        // %252527 → %2527 → %27 → ' (triple encoded)
+        let body = br#"{"user":"admin%252527 OR %2525271%252527=%2525271"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected (encoded)")
+        );
+    }
+
+    #[test]
+    fn denies_quadruple_url_encoded_xss() {
+        // %25253C → %253C → %3C → < (quadruple encoded)
+        // May match on raw scan (partial decode) or normalized scan
+        let body = br#"{"html":"%2525253Cscript%2525253Ealert(1)"}"#;
+        let result = validate_request("POST", Some("application/json"), body, &strict_profile());
+        assert!(
+            matches!(result, WafVerdict::Deny(_)),
+            "expected Deny, got {:?}",
+            result
         );
     }
 
