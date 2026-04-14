@@ -109,7 +109,7 @@ def header_footer(canvas_obj, doc):
     # Footer
     canvas_obj.setFont('Helvetica', 7.5)
     canvas_obj.setFillColor(GRAY)
-    canvas_obj.drawString(2 * cm, 1.2 * cm, "Zion Edge Gateway - Benchmark Report v0.1.2")
+    canvas_obj.drawString(2 * cm, 1.2 * cm, "Zion Edge Gateway - Benchmark Report v0.1.3")
     canvas_obj.drawRightString(A4[0] - 2 * cm, 1.2 * cm, f"Page {doc.page}")
     # Top line
     canvas_obj.setStrokeColor(ZION_BLUE)
@@ -154,7 +154,7 @@ def build():
     # ─── TITLE PAGE ───
     story.append(Spacer(1, 3 * cm))
     story.append(Paragraph("ZION EDGE GATEWAY", styles['DocTitle']))
-    story.append(Paragraph("Benchmark Report v0.1.2", ParagraphStyle(
+    story.append(Paragraph("Benchmark Report v0.1.3", ParagraphStyle(
         'BigSub', parent=styles['DocSubtitle'], fontSize=16, leading=22, textColor=ZION_BLUE
     )))
     story.append(Spacer(1, 8 * mm))
@@ -167,9 +167,9 @@ def build():
 
     # Key stats box
     stats = [
-        ["233,341 req/s", "Peak HTML throughput (TLS 1.3 e2e)"],
-        ["209,381 req/s", "Cache hit throughput (4KB JS from RAM)"],
-        ["91,893 req/s", "WAF POST throughput (70+ patterns)"],
+        ["233,170 req/s", "Peak HTML throughput (TLS 1.3 e2e)"],
+        ["209,573 req/s", "Cache hit throughput (CSS 3KB from RAM)"],
+        ["103,206 req/s", "WAF POST throughput (80+ patterns, CV 0.5%)"],
         ["28 bugs fixed", "Critical, High, Medium severity"],
         ["20 optimizations", "Applied across all hot paths"],
         ["0 errors", "Across all benchmark runs"],
@@ -193,7 +193,7 @@ def build():
         "Zion is a high-performance TLS reverse proxy with built-in Web Application Firewall (WAF), "
         "written entirely in Rust. This report covers the results of a comprehensive security audit "
         "(28 bugs fixed across 3 severity levels) and a performance optimization sprint (20 optimizations "
-        "applied) on the v0.1.2 codebase.", styles['Body']))
+        "applied) on the v0.1.3 codebase.", styles['Body']))
     story.append(Paragraph(
         "The codebase was audited across all 17 modules (~8,600 lines of Rust) with focus on "
         "request smuggling, cache poisoning, WAF bypass vectors, memory safety, concurrency correctness, "
@@ -208,14 +208,14 @@ def build():
 
     bench_headers = ["Endpoint", "Median req/s", "CV%", "Best Run", "Errors"]
     bench_rows = [
-        ["HTML SSR 5KB", "233,341", "2.0%", "236,755", "0"],
-        ["Cache Hit JS 4KB (RAM)", "209,381", "9.8%", "214,546", "0"],
-        ["CSS 3KB (cached)", "191,574", "4.5%", "203,969", "0"],
-        ["TLS Proxy API GET 1KB", "93,253", "3.0%", "97,019", "0"],
-        ["WAF POST JSON", "91,893", "3.1%", "93,415", "0"],
-        ["JS 4KB (no cache)", "81,470", "2.3%", "82,723", "0"],
-        ["PNG 8KB (no cache)", "66,753", "2.7%", "68,020", "0"],
-        ["WOFF2 16KB (no cache)", "59,262", "3.0%", "60,679", "0"],
+        ["HTML SSR 5KB", "233,170", "1.1%", "235,370", "0"],
+        ["CSS 3KB (cached)", "209,573", "3.4%", "215,408", "0"],
+        ["Cache Hit JS 4KB (RAM)", "195,318", "7.1%", "207,521", "0"],
+        ["TLS Proxy API GET 1KB", "106,505", "2.1%", "107,189", "0"],
+        ["WAF POST JSON", "103,206", "0.5%", "103,547", "0"],
+        ["JS 4KB (no cache)", "102,892", "1.3%", "104,135", "0"],
+        ["PNG 8KB (no cache)", "99,496", "1.7%", "101,290", "0"],
+        ["WOFF2 16KB (no cache)", "83,870", "2.5%", "86,242", "0"],
     ]
     story.append(make_table(bench_headers, bench_rows,
                             col_widths=[5.5 * cm, 3 * cm, 2 * cm, 2.8 * cm, 2 * cm]))

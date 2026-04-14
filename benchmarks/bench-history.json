@@ -118,5 +118,53 @@
       "conns": 100,
       "method": "wrk, median of N runs, native binary"
     }
+  },
+  {
+    "commit": "2b0831e",
+    "branch": "claude/sad-cori",
+    "arch": "native",
+    "timestamp": "2026-04-14T22:12:44Z",
+    "tls_proxy_rps": 106161,
+    "html_rps": 235155,
+    "js_rps": 99940,
+    "png_rps": 95700,
+    "waf_post_rps": 103221,
+    "cache_hit_rps": 210899,
+    "font_rps": 77719,
+    "css_rps": 197564,
+    "sqli_blocked": 1,
+    "xss_blocked": 1,
+    "meta": {
+      "cpu": "Apple M4",
+      "os": "Darwin arm64",
+      "duration": 10,
+      "runs": 5,
+      "conns": 100,
+      "method": "wrk, median of N runs, native binary"
+    }
+  },
+  {
+    "commit": "e0897b9",
+    "branch": "claude/sad-cori",
+    "arch": "native",
+    "timestamp": "2026-04-14T22:46:11Z",
+    "tls_proxy_rps": 106505,
+    "html_rps": 233170,
+    "js_rps": 102892,
+    "png_rps": 99496,
+    "waf_post_rps": 103206,
+    "cache_hit_rps": 195318,
+    "font_rps": 83870,
+    "css_rps": 209573,
+    "sqli_blocked": 1,
+    "xss_blocked": 1,
+    "meta": {
+      "cpu": "Apple M4",
+      "os": "Darwin arm64",
+      "duration": 10,
+      "runs": 5,
+      "conns": 100,
+      "method": "wrk, median of N runs, native binary"
+    }
   }
 ]

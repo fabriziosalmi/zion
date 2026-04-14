@@ -20,8 +20,8 @@ hero:
 
 features:
   - icon: "\u26A1"
-    title: 235K req/s
-    details: Peak throughput on Apple M4 with TLS 1.3 end-to-end. 106K req/s API proxy, 103K with full WAF pipeline active. Zero errors.
+    title: 233K req/s
+    details: Peak throughput on Apple M4 with TLS 1.3 end-to-end. 107K req/s API proxy, 103K with full WAF pipeline active (CV 0.5%). Zero errors.
   - icon: "\uD83D\uDEE1\uFE0F"
     title: Zero-Regex WAF
     details: 80+ injection patterns (SQLi, XSS, CMDi, SSRF, Log4Shell) scanned in a single O(N) Aho-Corasick pass. SIMD pre-filter skips clean traffic.
