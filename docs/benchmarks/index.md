@@ -29,7 +29,24 @@ Single-core comparison on the same Linux host, no containers.
 
 On proxy workloads (API GET), both perform similarly — the bottleneck is the upstream. On cached content, the in-memory cache removes the upstream round-trip. WAF POST shows parity: the Aho-Corasick scan over 70+ patterns does not reduce throughput below nginx without WAF in this test.
 
-## Native macOS (Apple M4)
+## Native Benchmark (Apple M4, v0.1.2)
+
+Measured with `bench-native.sh` (5 runs x 10s, c=100, median reported). Includes all v0.1.2 security fixes and performance optimizations.
+
+| Endpoint | Median req/s | Best Run | CV% | Errors |
+|---|---|---|---|---|
+| HTML SSR 5KB | **233,341** | 236,755 | 2.0% | 0 |
+| Cache Hit JS 4KB (RAM) | **209,381** | 214,546 | 9.8% | 0 |
+| CSS 3KB (cached) | **191,574** | 203,969 | 4.5% | 0 |
+| TLS Proxy API GET 1KB | **93,253** | 97,019 | 3.0% | 0 |
+| WAF POST JSON | **91,893** | 93,415 | 3.1% | 0 |
+| JS 4KB (no cache) | **81,470** | 82,723 | 2.3% | 0 |
+| PNG 8KB (no cache) | **66,753** | 68,020 | 2.7% | 0 |
+| WOFF2 16KB (no cache) | **59,262** | 60,679 | 3.0% | 0 |
+
+Security validation: SQLi and XSS injection blocked (HTTP 400).
+
+## Matrix Benchmark (Apple M4)
 
 Zion running natively on Apple M4, multi-core, no containers. Measured with `bench-matrix.sh` (2 warmup + 3 measurement rounds × 5s each).
 

@@ -3,7 +3,7 @@
 [![CI](https://github.com/fabriziosalmi/zion/actions/workflows/ci.yml/badge.svg)](https://github.com/fabriziosalmi/zion/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/github/v/release/fabriziosalmi/zion?include_prereleases&color=blue&label=release)](https://github.com/fabriziosalmi/zion/releases)
 [![License](https://img.shields.io/github/license/fabriziosalmi/zion)](https://github.com/fabriziosalmi/zion/blob/master/LICENSE)
-[![Performance](https://img.shields.io/badge/Performance-141k%20req%2Fs-success?style=flat&color=brightgreen)](https://github.com/fabriziosalmi/zion/tree/master/benchmarks)
+[![Performance](https://img.shields.io/badge/Performance-233k%20req%2Fs-success?style=flat&color=brightgreen)](https://github.com/fabriziosalmi/zion/tree/master/benchmarks)
 [![WAF](https://img.shields.io/badge/WAF-Zero%20Regex-orange)](https://github.com/fabriziosalmi/zion/blob/master/src/waf.rs)
 
 High-performance TLS reverse proxy with built-in WAF, written in Rust.
@@ -26,7 +26,24 @@ Payload × concurrency grid — measures end-to-end TLS throughput through the f
 | | 10 MB | 33,781 | 80,246 | 123,936 |
 | | 100 MB | 36,067 | 90,091 | 96,706 |
 
-**Peak**: 140K req/s cached (1 MB, c=100) · 141K req/s cached (1 KB, c=100) · 6.7 GB/s TLS throughput
+**Peak**: 233K req/s HTML (5KB) · 209K cache hit · 92K WAF POST · 6.7 GB/s TLS throughput
+
+### Native Benchmark (Apple M4, 5 runs x 10s, c=100)
+
+| Endpoint | Median req/s | Best Run | CV% | Errors |
+|----------|-------------|----------|-----|--------|
+| HTML SSR 5KB | **233,341** | 236,755 | 2.0% | 0 |
+| Cache Hit JS 4KB (RAM) | **209,381** | 214,546 | 9.8% | 0 |
+| CSS 3KB (cached) | **191,574** | 203,969 | 4.5% | 0 |
+| TLS Proxy API GET 1KB | **93,253** | 97,019 | 3.0% | 0 |
+| WAF POST JSON | **91,893** | 93,415 | 3.1% | 0 |
+| JS 4KB (no cache) | **81,470** | 82,723 | 2.3% | 0 |
+| PNG 8KB (no cache) | **66,753** | 68,020 | 2.7% | 0 |
+| WOFF2 16KB (no cache) | **59,262** | 60,679 | 3.0% | 0 |
+| SQLi blocked | Yes (400) | | | |
+| XSS blocked | Yes (400) | | | |
+
+Reproduce: `bash benchmarks/bench-native.sh`
 
 <details>
 <summary>Bottleneck analysis</summary>
@@ -65,7 +82,9 @@ Full methodology: `bash benchmarks/bench-scientific.sh` (5 runs, CI95).
 - HTTP/1.1 + HTTP/2 + HTTP/3 (QUIC) support with unified security pipeline
 - WebSocket proxy (HTTP Upgrade + bidirectional pipe, TLS-to-upstream)
 - SSE streaming proxy (zero-buffer)
-- Two-level RAM cache: L1 thread-local (~5ns) + L2 DashMap (~30ns)
+- Two-level RAM cache: L1 thread-local (~5ns, O(1) LRU) + L2 DashMap (~30ns)
+- L1/L2 generation-based coherence (no stale data after cache update)
+- Request coalescing (singleflight): N concurrent cache misses = 1 upstream fetch
 - L2 eviction: expired-first, then oldest-TTL fallback
 - Radix tree routing (~30ns lookup)
 - Parallel Background Health Checks (O(1) blocking via `tokio::task::JoinSet`)
@@ -73,7 +92,8 @@ Full methodology: `bash benchmarks/bench-scientific.sh` (5 runs, CI95).
 - io_uring multishot accept (Linux, feature-gated)
 
 **WAF (Zero-Regex, O(N) Single-Pass)**
-- Aho-Corasick scanner: 70+ patterns (SQLi, XSS, CMDi, SSRF, Log4Shell)
+- Aho-Corasick scanner: 80+ patterns (SQLi, XSS, CMDi, SSRF, Log4Shell)
+- SIMD pre-filter: memchr3 fast-reject before Aho-Corasick (skips clean bodies)
 - Shannon entropy analysis (detect obfuscated payloads)
 - simd-json structural validation
 - Depth + string length enforcement
@@ -103,8 +123,9 @@ Full methodology: `bash benchmarks/bench-scientific.sh` (5 runs, CI95).
 - Graceful drain on shutdown (30s timeout)
 - Upstream health checking (30s interval)
 - Bootstrap auto-detection (CPU, RAM, L1d cache, features)
-- TCP tuning: TCP_NODELAY, TCP_DEFER_ACCEPT, TCP_FASTOPEN, TCP_QUICKACK
+- TCP tuning: TCP_NODELAY, TCP_DEFER_ACCEPT, TCP_FASTOPEN, TCP_QUICKACK, SO_BUSY_POLL
 - SO_REUSEPORT (Linux), sys_membarrier (Linux)
+- `target-cpu=native` build optimization (NEON/AES-CE/AVX2)
 - systemd unit file + Docker HEALTHCHECK
 
 ## Quick Start
@@ -191,7 +212,7 @@ Results are saved to `benchmarks/results/matrix-history.json` with automatic del
 ## Testing
 
 ```bash
-# Unit tests (99)
+# Unit tests (154)
 cargo test
 
 # Integration tests (19 — requires running Zion + Go backend)
