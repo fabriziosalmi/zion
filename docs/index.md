@@ -19,29 +19,21 @@ hero:
       link: https://github.com/fabriziosalmi/zion
 
 features:
-  - icon: "\u26A1"
-    title: 233K req/s
+  - title: 233K req/s
     details: Peak throughput on Apple M4 with TLS 1.3 end-to-end. 107K req/s API proxy, 103K with full WAF pipeline active (CV 0.5%). Zero errors.
-  - icon: "\uD83D\uDEE1\uFE0F"
-    title: Zero-Regex WAF
+  - title: Zero-Regex WAF
     details: 80+ injection patterns (SQLi, XSS, CMDi, SSRF, Log4Shell) scanned in a single O(N) Aho-Corasick pass. SIMD pre-filter skips clean traffic.
-  - icon: "\uD83D\uDDC3\uFE0F"
-    title: Two-Level Cache
+  - title: Two-Level Cache
     details: "L1 thread-local (~5ns, O(1) LRU) + L2 shared DashMap (~30ns). Generation-based coherence. Singleflight coalescing prevents thundering herd."
-  - icon: "\uD83D\uDD12"
-    title: TLS 1.3 + Hot-Reload
+  - title: TLS 1.3 + Hot-Reload
     details: rustls + hardware crypto (AES-NI/NEON). Multi-SNI, session tickets, 0-RTT. Certificate hot-reload via ArcSwap with zero downtime.
-  - icon: "\uD83C\uDF10"
-    title: HTTP/1.1 + H2 + H3
-    details: Full protocol support including WebSocket proxy, SSE streaming, HTTP/3 QUIC (feature-gated). ACME auto-renewal for Let's Encrypt.
-  - icon: "\uD83D\uDCCA"
-    title: Prometheus Native
-    details: "/metrics, /healthz, /readyz built-in. Lock-free sharded counters, latency histograms. X-Request-ID + W3C traceparent propagation."
-  - icon: "\u2699\uFE0F"
-    title: Hardware-Aware
-    details: "Auto-detects CPU cores, L1d cache, AES-NI/NEON. Pins workers to cores. TCP_FASTOPEN, SO_REUSEPORT, io_uring multishot accept."
-  - icon: "\uD83D\uDCC4"
-    title: Single Binary, TOML Config
+  - title: HTTP/1.1 + H2 + H3
+    details: Full protocol support including HTTP/2 upstream multiplexing, WebSocket proxy, SSE streaming, HTTP/3 QUIC (feature-gated). ACME auto-renewal.
+  - title: Prometheus Native
+    details: "/metrics, /healthz, /readyz built-in. Lock-free sharded counters, differential latency histograms. X-Request-ID + W3C traceparent propagation."
+  - title: Hardware-Aware
+    details: "Auto-detects CPU cores, L1d cache, AES-NI/NEON. Pins workers to cores. TCP_FASTOPEN, TCP_CORK, SO_REUSEPORT, SO_BUSY_POLL, io_uring."
+  - title: Single Binary, TOML Config
     details: "No runtime dependencies. ~4MB release binary. Validates config at startup. Graceful shutdown with 30s drain. systemd + Docker ready."
 ---
 
@@ -51,15 +43,15 @@ features:
 
 <div class="stat-grid">
   <div class="stat-card">
-    <div class="number">235K</div>
+    <div class="number">233K</div>
     <div class="label">req/s HTML (TLS 1.3)</div>
   </div>
   <div class="stat-card">
-    <div class="number">211K</div>
+    <div class="number">210K</div>
     <div class="label">req/s cache hit</div>
   </div>
   <div class="stat-card">
-    <div class="number">106K</div>
+    <div class="number">107K</div>
     <div class="label">req/s API proxy</div>
   </div>
   <div class="stat-card">
@@ -68,23 +60,24 @@ features:
   </div>
 </div>
 
-Native benchmark on Apple M4, 5 runs x 10s, c=100. Rust backend. [Full results &rarr;](/benchmarks/)
+Native benchmark on Apple M4, v0.1.3, 5 runs x 10s, c=100. Rust backend. [Full results](/benchmarks/)
 
 </div>
 
 ## Why Zion?
 
-|  | nginx | Envoy | Traefik | **Zion** |
-|---|:---:|:---:|:---:|:---:|
-| Language | C | C++ | Go | **Rust** |
-| Memory safety | No | No | GC | **Compile-time** |
-| Built-in WAF | No | No | No | **80+ patterns** |
-| RAM cache | No | No | No | **L1+L2** |
-| TLS hot-reload | Signal | xDS | File watch | **ArcSwap** |
-| Config | Custom | YAML/xDS | YAML/API | **TOML** |
-| Binary size | ~1.5MB | ~40MB | ~100MB | **~4MB** |
-| Request coalescing | No | No | No | **Singleflight** |
-| HTTP/3 QUIC | Patch | Yes | Yes | **Feature-gated** |
+|  | nginx | HAProxy | Envoy | Caddy | Traefik | Pingora | **Zion** |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Language | C | C | C++ | Go | Go | Rust | **Rust** |
+| Memory safety | No | No | No | GC | GC | Yes | **Yes** |
+| Built-in WAF | No | No | No | No | No | No | **80+ patterns** |
+| RAM cache | No | Yes | No | No | No | No | **L1+L2** |
+| TLS hot-reload | Signal | Signal | xDS | Auto | File watch | Custom | **ArcSwap** |
+| Config format | Custom | Custom | YAML/xDS | JSON/API | YAML/API | Rust code | **TOML** |
+| Binary size | ~1.5MB | ~3MB | ~40MB | ~40MB | ~100MB | Library | **~4MB** |
+| Singleflight | No | No | No | No | No | No | **Yes** |
+| HTTP/3 QUIC | Patch | No | Yes | Yes | Yes | No | **Feature-gated** |
+| JWT/OIDC auth | No | No | Yes | Yes | Yes | No | **Feature-gated** |
 
 ## Quick Start
 
@@ -110,4 +103,4 @@ upstream = "backend"
 waf = true
 ```
 
-[Full configuration reference &rarr;](/config/)
+[Full configuration reference](/config/)
