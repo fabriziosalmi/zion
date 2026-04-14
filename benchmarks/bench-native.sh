@@ -198,11 +198,18 @@ cd "$PROJECT_DIR"
 cargo build --release 2>&1 | tail -3 || die "cargo build failed"
 log "Build complete ✓"
 
-# ── Step 2: Start Go backend ─────────────────────────────────────────────
-log "Starting Go test backend on :9090..."
-cd "$SCRIPT_DIR/backend"
-go run test-server.go >/dev/null 2>&1 &
-BACKEND_PID=$!
+# ── Step 2: Start backend (Rust preferred, Go fallback) ──────────────────
+RUST_BACKEND="$SCRIPT_DIR/backend/target/release/zion-bench-backend"
+if [[ -f "$RUST_BACKEND" ]] || (cd "$SCRIPT_DIR/backend" && cargo build --release >/dev/null 2>&1); then
+    log "Starting Rust backend on :9090..."
+    "$RUST_BACKEND" >/dev/null 2>&1 &
+    BACKEND_PID=$!
+else
+    log "Starting Go test backend on :9090..."
+    cd "$SCRIPT_DIR/backend"
+    go run test-server.go >/dev/null 2>&1 &
+    BACKEND_PID=$!
+fi
 wait_for_port 9090
 log "Backend ready ✓"
 

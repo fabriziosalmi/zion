@@ -1,0 +1,20 @@
+[package]
+name = "zion-bench-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "server", "server-auto"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+bytes = "1"
+rand = "0.9"
+mimalloc = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
