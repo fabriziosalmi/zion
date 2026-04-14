@@ -109,7 +109,7 @@ def header_footer(canvas_obj, doc):
     # Footer
     canvas_obj.setFont('Helvetica', 7.5)
     canvas_obj.setFillColor(GRAY)
-    canvas_obj.drawString(2 * cm, 1.2 * cm, "Zion Edge Gateway - Benchmark Report v0.1.1")
+    canvas_obj.drawString(2 * cm, 1.2 * cm, "Zion Edge Gateway - Benchmark Report v0.1.2")
     canvas_obj.drawRightString(A4[0] - 2 * cm, 1.2 * cm, f"Page {doc.page}")
     # Top line
     canvas_obj.setStrokeColor(ZION_BLUE)
@@ -154,7 +154,7 @@ def build():
     # ─── TITLE PAGE ───
     story.append(Spacer(1, 3 * cm))
     story.append(Paragraph("ZION EDGE GATEWAY", styles['DocTitle']))
-    story.append(Paragraph("Benchmark Report v0.1.1", ParagraphStyle(
+    story.append(Paragraph("Benchmark Report v0.1.2", ParagraphStyle(
         'BigSub', parent=styles['DocSubtitle'], fontSize=16, leading=22, textColor=ZION_BLUE
     )))
     story.append(Spacer(1, 8 * mm))
@@ -193,7 +193,7 @@ def build():
         "Zion is a high-performance TLS reverse proxy with built-in Web Application Firewall (WAF), "
         "written entirely in Rust. This report covers the results of a comprehensive security audit "
         "(28 bugs fixed across 3 severity levels) and a performance optimization sprint (20 optimizations "
-        "applied) on the v0.1.1 codebase.", styles['Body']))
+        "applied) on the v0.1.2 codebase.", styles['Body']))
     story.append(Paragraph(
         "The codebase was audited across all 17 modules (~8,600 lines of Rust) with focus on "
         "request smuggling, cache poisoning, WAF bypass vectors, memory safety, concurrency correctness, "

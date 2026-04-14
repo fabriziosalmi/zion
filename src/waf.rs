@@ -422,28 +422,10 @@ pub fn validate_request(
 
     // ── Gate 3: Aho-Corasick injection scan (O(N), single pass) ──
 
-    // SIMD fast-reject: if no injection trigger bytes are present, the body
-    // cannot match any pattern — skip the full Aho-Corasick scan entirely.
-    // memchr uses NEON/AVX2 on all platforms. Covers: ' < ; $ { | / \ ` #
-    let has_trigger = memchr::memchr3(b'\'', b'<', b';', body).is_some()
-        || memchr::memchr3(b'$', b'{', b'|', body).is_some()
-        || memchr::memchr3(b'/', b'\\', b'`', body).is_some()
-        || memchr::memchr2(b'#', b'.', body).is_some();
-
-    if !has_trigger {
-        // No trigger bytes → impossible to match any injection pattern.
-        // Jump straight to Gate 4 (entropy) or Gate 5 (JSON).
-        if body.len() >= 256 {
-            let entropy = shannon_entropy(body);
-            if entropy > MAX_ENTROPY_THRESHOLD {
-                return WafVerdict::Deny("suspicious payload entropy");
-            }
-        }
-        if is_json {
-            return validate_json_structure(body, profile.max_depth, profile.max_string_len);
-        }
-        return WafVerdict::Allow;
-    }
+    // Always run raw Aho-Corasick scan — patterns like "union select" and
+    // "powershell" contain only letters/spaces and can't be pre-filtered.
+    // The SIMD fast-reject is applied to the NORMALIZATION path only
+    // (which is the expensive part: URL-decode, SQL comment strip, etc.)
 
     // Scan raw body first (fast path — no alloc if no encoding present).
     if get_scanner().is_match(body) {
