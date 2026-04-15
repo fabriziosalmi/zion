@@ -38,7 +38,7 @@ Request Body
     ▼
 ┌─ Gate 3: Aho-Corasick Injection Scanner ─────────┐
 │  O(N) pass over body (N = body length)           │
-│  70+ patterns scanned simultaneously             │
+│  192 patterns scanned simultaneously             │
 │  Case-insensitive matching (ASCII)               │
 │  Built once via OnceLock on first request        │
 └──────────────────────────────────────────────────┘

@@ -36,7 +36,7 @@ Hyper is configured with reduced header limits compared to defaults:
 | Parameter | Zion | Hyper Default |
 |---|---|---|
 | Max header count | 64 | 100 |
-| Max header buffer | 32 KB | 400 KB |
+| Max header buffer | 16 KB | 400 KB |
 
 ## Rate Limiting
 
