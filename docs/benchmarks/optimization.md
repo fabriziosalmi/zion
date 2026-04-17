@@ -2,6 +2,16 @@
 
 Changes made to improve throughput and latency, with rationale. Throughput claims reference `wrk` benchmark results from `benchmarks/bench-native.sh`.
 
+## Architectural
+
+| Change | Rationale |
+|---|---|
+| HTTP/2 upstream multiplexing | `hyper-rustls` HttpsConnector with ALPN H2 negotiation for HTTPS upstreams |
+| TLS connection pre-warming | Health checks reuse shared HttpClient; startup pre-warm task fires GET to all upstreams |
+| `TCP_CORK` on listener (Linux) | Batches TLS record + HTTP headers into full MSS segments |
+| Connection pool pre-warming | Fires GET to all upstreams before accept loop starts |
+| Thread-local route lookup cache | FNV hash of path maps to cached `Arc<ResolvedRoute>` (~5ns vs ~30ns radix tree) |
+
 ## Compiler / Build
 
 | Change | Rationale |
@@ -23,25 +33,29 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | Change | Rationale |
 |---|---|
 | WebSocket TLS: `OnceLock<Arc<ClientConfig>>` | Builds root cert store once, not per WS upgrade |
-| Metrics render: `ArcSwap` replaces `RwLock` | Lock-free `/metrics` endpoint, eliminates contention |
-| Histogram: non-cumulative differential buckets | 3 atomic ops per observation instead of 17 |
+| Metrics render: `ArcSwap<(u64, Bytes)>` | Lock-free `/metrics` endpoint, atomic timestamp+buffer pair |
+| Histogram: non-cumulative differential buckets | 3 atomic ops per observation instead of 17; prefix sums at render time |
 | HTTP builder: `Arc<AutoBuilder>` | Per-connection clone is ref-count bump, not deep copy |
 
 ## Data Structures
 
 | Change | Rationale |
 |---|---|
-| L1 cache: O(1) LRU (doubly-linked list) | Replaces O(N) VecDeque linear scan on every cache hit |
+| L1 cache: O(1) LRU (index-based doubly-linked list) | Replaces O(N) VecDeque linear scan on every cache hit |
+| L1/L2 generation-based coherence | Atomic generation counter invalidates stale L1 entries after L2 update |
 | Host validation: single-pass byte scan | Replaces 8 separate `contains()` calls |
-| CORS origin: FNV hash set | O(1) lookup replaces `Vec` linear scan |
+| CORS origin: FNV hash set | O(1) lookup replaces `Vec` linear scan; case-insensitive via pre-lowercased storage |
 
 ## WAF Pipeline
 
 | Change | Rationale |
 |---|---|
-| SIMD pre-filter (`memchr3`) | Fast-reject before Aho-Corasick; skips scan for clean bodies (-200-500ns) |
-| Normalization: 2 iterations max | Down from 7; convergence check breaks early |
+| 192 patterns, 14 attack categories | SQLi, XSS (42), CMDi, path traversal, SSRF (14), NoSQL, deserialization, GraphQL, LDAP, XXE, SSTI, CRLF, Log4Shell |
+| Aho-Corasick (no regex) | O(N) single-pass, no backtracking, case-insensitive, ReDoS-immune by construction |
+| Normalization: iterative until convergence | URL-decode, SQL comment strip, JSON unicode; capped at 2 iterations |
 | Buffer shrink-to-fit (>64KB) | Prevents permanent memory inflation from adversarial large bodies |
+| DELETE body inspection | RFC 9110 allows bodies on DELETE; previously skipped |
+| Content-Type delimiter enforcement | Requires `;` or ` ` delimiter after type match |
 
 ## Innovative
 
@@ -67,7 +81,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | 0-RTT early data (16 KB max) | Clients can send data before handshake completes (idempotent methods only) |
 | Server cipher order enforced | `ignore_client_order = true` |
 | `send_half_rtt_data = true` | Server sends data before client Finished on resumed connections |
-| `FnvHashMap` for SNI map | Simpler hash function for short hostname keys |
+| `FnvHashMap` for SNI map | ~2x faster than SipHash for short hostname keys |
 | Thread-local SNI cache | Invalidated via dual-generation counter (instance + global) |
 | `Acquire`/`Release` ordering | Prevents stale cert serving on ARM (Graviton) after hot-reload |
 | `sys_membarrier` (Linux) | Ensures all threads observe new cert config after reload |
