@@ -22,7 +22,7 @@ features:
   - title: 233K req/s
     details: Peak throughput on Apple M4 with TLS 1.3 end-to-end. 107K req/s API proxy, 103K with full WAF pipeline active (CV 0.5%). Zero errors.
   - title: Zero-Regex WAF
-    details: 80+ injection patterns (SQLi, XSS, CMDi, SSRF, Log4Shell) scanned in a single O(N) Aho-Corasick pass. SIMD pre-filter skips clean traffic.
+    details: 192 patterns across 14 categories (SQLi, XSS, CMDi, SSRF, NoSQL, deserialization, GraphQL, LDAP, XXE, SSTI, CRLF, Log4Shell) in a single O(N) Aho-Corasick pass. Zero false positives.
   - title: Two-Level Cache
     details: "L1 thread-local (~5ns, O(1) LRU) + L2 shared DashMap (~30ns). Generation-based coherence. Singleflight coalescing prevents thundering herd."
   - title: TLS 1.3 + Hot-Reload
@@ -60,7 +60,7 @@ features:
   </div>
 </div>
 
-Native benchmark on Apple M4, v0.1.3, 5 runs x 10s, c=100. Rust backend. [Full results](/benchmarks/)
+Native benchmark on Apple M4, v0.1.4, 5 runs x 10s, c=100. Rust backend. [Full results](/benchmarks/)
 
 </div>
 
@@ -70,7 +70,7 @@ Native benchmark on Apple M4, v0.1.3, 5 runs x 10s, c=100. Rust backend. [Full r
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | Language | C | C | C++ | Go | Go | Rust | **Rust** |
 | Memory safety | No | No | No | GC | GC | Yes | **Yes** |
-| Built-in WAF | No | No | No | No | No | No | **80+ patterns** |
+| Built-in WAF | No | No | No | No | No | No | **192 patterns** |
 | RAM cache | No | Yes | No | No | No | No | **L1+L2** |
 | TLS hot-reload | Signal | Signal | xDS | Auto | File watch | Custom | **ArcSwap** |
 | Config format | Custom | Custom | YAML/xDS | JSON/API | YAML/API | Rust code | **TOML** |

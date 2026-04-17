@@ -31,7 +31,7 @@ export default defineConfig({
         ]
       },
       {
-        text: 'v0.1.3',
+        text: 'v0.1.4',
         items: [
           { text: 'Changelog', link: 'https://github.com/fabriziosalmi/zion/blob/master/CHANGELOG.md' },
           { text: 'Releases', link: 'https://github.com/fabriziosalmi/zion/releases' },

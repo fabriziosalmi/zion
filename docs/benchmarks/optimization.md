@@ -50,7 +50,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 
 | Change | Rationale |
 |---|---|
-| 192 patterns, 14 attack categories | SQLi, XSS (42), CMDi, path traversal, SSRF (14), NoSQL, deserialization, GraphQL, LDAP, XXE, SSTI, CRLF, Log4Shell |
+| 192 patterns, 14 attack categories | SQLi, XSS (55), CMDi, path traversal, SSRF (14), NoSQL, deserialization, GraphQL, LDAP, XXE, SSTI, CRLF, Log4Shell |
 | Aho-Corasick (no regex) | O(N) single-pass, no backtracking, case-insensitive, ReDoS-immune by construction |
 | Normalization: iterative until convergence | URL-decode, SQL comment strip, JSON unicode; capped at 2 iterations with equality check |
 | Buffer shrink-to-fit (>64KB) | Prevents permanent memory inflation from adversarial large bodies |
@@ -99,7 +99,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | `TCP_FASTOPEN` (256 queue) | Data in SYN packet for returning clients |
 | `TCP_QUICKACK` | Immediate ACK instead of delayed ACK timer |
 | `SO_BUSY_POLL` (50us) | Spin-poll NIC queue before sleeping; trades CPU for latency |
-| Listen backlog 1024 | Prevents SYN drops under burst load |
+| Listen backlog 8192 | Prevents SYN drops under burst load (1024 on non-Linux) |
 | io_uring multishot accept | Feature-gated: one syscall for N connections |
 
 ## Proxy
