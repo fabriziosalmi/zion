@@ -1,6 +1,6 @@
 # TLS & SNI
 
-Zion terminates TLS using [rustls](https://github.com/rustls/rustls) with the ring cryptography backend. No OpenSSL dependency.
+Zion terminates TLS using [rustls](https://github.com/rustls/rustls) with the aws-lc-rs cryptography backend. No OpenSSL dependency.
 
 ## Basic Configuration
 

@@ -2,7 +2,7 @@
 
 Changes made to improve throughput and latency, with rationale. Throughput claims reference `wrk` benchmark results from `benchmarks/bench-native.sh`.
 
-## Architectural (v0.1.3)
+## Architectural
 
 | Change | Rationale |
 |---|---|
@@ -12,14 +12,14 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | Connection pool pre-warming | Fires GET to all upstreams before accept loop starts |
 | Thread-local route lookup cache | FNV hash of path maps to cached `Arc<ResolvedRoute>` (~5ns vs ~30ns radix tree) |
 
-## Compiler / Build (v0.1.2)
+## Compiler / Build
 
 | Change | Rationale |
 |---|---|
 | `target-cpu=native` (.cargo/config.toml) | Unlocks NEON/AES-CE on Apple Silicon, AVX2/AES-NI on x86_64 |
 | PGO build script (`bench-pgo.sh`) | Two-phase profile-guided optimization for 10-20% additional throughput |
 
-## Hot Path Allocation Elimination (v0.1.2)
+## Hot Path Allocation Elimination
 
 | Change | Rationale |
 |---|---|
@@ -28,7 +28,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | WAF content-type: borrow from `parts.headers` | Eliminates `to_owned()` clone on POST/PUT/PATCH |
 | Cache key: `Arc::from()` direct | Skips intermediate `String` allocation on cache miss |
 
-## Lock / Contention Reduction (v0.1.2)
+## Lock / Contention Reduction
 
 | Change | Rationale |
 |---|---|
@@ -37,7 +37,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | Histogram: non-cumulative differential buckets | 3 atomic ops per observation instead of 17; prefix sums at render time |
 | HTTP builder: `Arc<AutoBuilder>` | Per-connection clone is ref-count bump, not deep copy |
 
-## Data Structures (v0.1.2)
+## Data Structures
 
 | Change | Rationale |
 |---|---|
@@ -46,7 +46,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | Host validation: single-pass byte scan | Replaces 8 separate `contains()` calls |
 | CORS origin: FNV hash set | O(1) lookup replaces `Vec` linear scan; case-insensitive via pre-lowercased storage |
 
-## WAF Pipeline (v0.1.2-v0.1.4)
+## WAF Pipeline
 
 | Change | Rationale |
 |---|---|
@@ -57,78 +57,92 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | DELETE body inspection | RFC 9110 allows bodies on DELETE; previously skipped |
 | Content-Type delimiter enforcement | Requires `;` or ` ` delimiter after type match |
 
-## Innovative (v0.1.2)
+## Innovative
 
 | Change | Rationale |
 |---|---|
 | Request coalescing (singleflight) | N concurrent cache misses = 1 upstream fetch (thundering herd protection) |
-| Health probe inline fast-path | `/healthz` responds in ~1us, bypasses full pipeline |
+| Health probe inline fast-path | `/healthz` responds in ~1us, bypasses full process_request pipeline |
 | `SO_BUSY_POLL` (Linux) | Spin-poll NIC queue 50us before sleeping; -5-15us p99 latency |
 
 ## Allocator
 
 | Change | Rationale |
 |---|---|
-| `mimalloc` global allocator | 2-3x faster than system malloc on small allocations |
+| `mimalloc` global allocator | Reduces allocation contention under concurrent load compared to system malloc |
 
 ## TLS
 
 | Change | Rationale |
 |---|---|
-| TLS 1.3 default | 1-RTT handshake instead of 2-RTT |
-| Session cache 16,384 entries | Resumed sessions avoid full ECDHE key exchange |
+| TLS 1.3 default | 1-RTT handshake instead of 2-RTT (TLS 1.2) |
+| Session cache 16,384 entries | More resumed sessions avoid full ECDHE key exchange |
 | Session tickets (Ticketer) | Stateless resumption, works across process restarts |
-| 0-RTT early data (16 KB max) | Clients send data before handshake completes (idempotent methods only) |
-| `send_half_rtt_data = true` | Server sends data before client Finished |
+| 0-RTT early data (16 KB max) | Clients can send data before handshake completes (idempotent methods only) |
+| Server cipher order enforced | `ignore_client_order = true` |
+| `send_half_rtt_data = true` | Server sends data before client Finished on resumed connections |
 | `FnvHashMap` for SNI map | ~2x faster than SipHash for short hostname keys |
 | Thread-local SNI cache | Invalidated via dual-generation counter (instance + global) |
-| `Acquire`/`Release` ordering | Prevents stale cert serving on ARM after hot-reload |
-| `sys_membarrier` (Linux) | Ensures all threads observe new cert config |
+| `Acquire`/`Release` ordering | Prevents stale cert serving on ARM (Graviton) after hot-reload |
+| `sys_membarrier` (Linux) | Ensures all threads observe new cert config after reload |
 | Cert pre-warming (120s) | Pre-builds `ServerConfig` before expiry; race-protected via generation check |
-| TLS handshake timeout (10s) | Drops stalled connections |
+| TLS handshake timeout (10s) | Drops connections that stall during handshake |
 
 ## Network (Linux)
 
 | Change | Rationale |
 |---|---|
-| `TCP_NODELAY` | Disables Nagle's algorithm |
-| `TCP_CORK` | Batches writes on listener; NODELAY on accept for flush |
-| `SO_REUSEPORT` | Kernel-level connection distribution |
-| `TCP_DEFER_ACCEPT` (5s) | Kernel holds connection until data arrives |
-| `TCP_FASTOPEN` (256 queue) | Data in SYN for returning clients |
-| `TCP_QUICKACK` | Immediate ACK |
-| `SO_BUSY_POLL` (50us) | Spin-poll before sleeping |
-| Listen backlog 1024 | Prevents SYN drops |
-| io_uring multishot accept | Feature-gated: batches N accepts per syscall |
+| `TCP_NODELAY` | Disables Nagle's algorithm on all connections |
+| `SO_REUSEPORT` | Kernel-level connection distribution across listeners |
+| `TCP_DEFER_ACCEPT` | Kernel holds connection until client sends data |
+| `TCP_FASTOPEN` | Data in SYN packet for returning clients (256 pending queue) |
+| `TCP_QUICKACK` | Immediate ACK instead of delayed ACK timer |
+| `TCP_CORK` | Batches writes on listener; combined with NODELAY on accept |
+| `SO_BUSY_POLL` (50us) | Spin-poll NIC queue before sleeping; trades CPU for latency |
+| Listen backlog 1024 | Prevents SYN drops under burst load |
+| io_uring multishot accept | Feature-gated: one syscall for N connections |
 
 ## Proxy
 
 | Change | Rationale |
 |---|---|
 | HTTP/2 upstream via hyper-rustls | ALPN H2 for HTTPS upstreams; eliminates head-of-line blocking |
-| Connection pooling (128 idle/host) | 30s idle timeout |
-| Hop-by-hop stripping (RFC 7230) | Transfer-Encoding, TE, Trailer, Proxy-Authorization, Keep-Alive |
-| SSE: no-buffer headers | `Cache-Control: no-cache`, `X-Accel-Buffering: no` |
-| WebSocket: OnceLock TLS config | Root cert store built once |
-| WebSocket: forward handshake headers | Sec-WebSocket-Accept, Protocol, Extensions |
+| Connection pooling (128 idle per host) | Reuse upstream TCP+TLS connections; 30s idle timeout |
+| Hop-by-hop header stripping (RFC 7230) | Transfer-Encoding, TE, Trailer, Proxy-Authorization, Keep-Alive |
+| SSE stream: no-buffer headers | `Cache-Control: no-cache`, `X-Accel-Buffering: no` |
+| WebSocket: OnceLock TLS config | Root cert store built once, not per WS TLS upgrade |
+| WebSocket: forward handshake headers | Sec-WebSocket-Accept, Protocol, Extensions from upstream 101 |
+
+## WAF
+
+| Change | Rationale |
+|---|---|
+| Aho-Corasick (no regex) | O(N) single-pass, no backtracking, 192 patterns scanned simultaneously |
+| Skip body inspection for GET/HEAD/OPTIONS | POST/PUT/PATCH/DELETE bodies are inspected |
+| Entropy check only for bodies >= 256 bytes | Short payloads lack sufficient data for meaningful entropy analysis |
+| `simd-json` for JSON validation | SIMD-accelerated JSON parsing where hardware supports it |
+| Byte-level content-type matching | No string allocation; case-insensitive byte prefix comparison |
 
 ## Cache
 
 | Change | Rationale |
 |---|---|
-| Two-level: L1 thread-local + L2 DashMap | L1 zero contention, L2 sharded locks |
-| L1 O(1) LRU (doubly-linked list) | Index-based nodes, free-list recycling |
-| L1 sized from L1d cache | 50% of detected L1d for hot entries |
-| L1/L2 generation coherence | Atomic counter; stale L1 entries detected on get |
-| Cache key includes query string | Prevents cache poisoning |
-| Content-Encoding preserved | Gzip responses served with correct header |
-| Singleflight coalescing | DashMap + Notify; cleanup on all exit paths |
-| L2 eviction: expired-first | TTL-expired before live entries |
+| Two-level: L1 thread-local + L2 DashMap | L1 zero contention (~5ns), L2 sharded locks (~30ns) |
+| L1 O(1) LRU via doubly-linked list | Index-based nodes in Vec with free-list recycling |
+| L1 sized from detected L1d cache | 50% of L1d for hot entries |
+| L1/L2 generation coherence | Atomic counter bumped on L2 insert; stale L1 entries detected on get |
+| Cache key includes query string | Prevents cache poisoning (/api?a=1 vs /api?a=2) |
+| Content-Encoding preserved | Gzip-compressed responses served with correct header |
+| Singleflight coalescing | DashMap + Notify; inflight cleanup on all exit paths |
+| L2 eviction: expired-first | TTL-expired before live entries; oldest-TTL fallback |
+| `Bytes` (reference-counted) | Cloning is Arc increment, not memcpy |
+| Thread-local route lookup cache | FNV hash of path (~5ns vs ~30ns radix tree) |
+| Connection pool pre-warming | Fires GET to all upstreams at startup |
 
 ## Hyper Tuning
 
 | Change | Rationale |
 |---|---|
-| Max headers: 64 | Reduces memory from malformed requests |
-| Max header buffer: 16 KB | Optimal for L1 CPU cache |
-| Connection timeout: 1 hour | Supports HTTP/2 mux, WebSocket, SSE |
+| Max headers: 64 (default: 100) | Reduces memory per connection from malformed requests |
+| Max header buffer: 16 KB | Limits memory consumption from oversized headers |
+| Connection timeout: 1 hour | Supports HTTP/2 mux, WebSocket, SSE long-lived connections |

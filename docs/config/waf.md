@@ -115,7 +115,7 @@ GET, HEAD, DELETE, and OPTIONS requests skip gates 2–6 (no body to inspect).
 
 Gate 3 uses an [Aho-Corasick](https://en.wikipedia.org/wiki/Aho%E2%80%93Corasick_algorithm) automaton — a single O(N) pass over the body that scans **all patterns simultaneously**. No regex, no backtracking, no ReDoS risk.
 
-**192 patterns in 14 categories:**
+**192 patterns documented below in 7 categories:**
 
 ### SQL Injection (19 patterns)
 ```
