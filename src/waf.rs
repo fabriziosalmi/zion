@@ -138,7 +138,7 @@ fn get_scanner() -> &'static AhoCorasick {
             "$(ls ",
             "`cat ",
             "`ls ",
-            "\ncat ",      // newline injection
+            "\ncat ", // newline injection
             "\nls ",
             "\nwget ",
             "\ncurl ",
@@ -147,34 +147,34 @@ fn get_scanner() -> &'static AhoCorasick {
             "cmd.exe",
             "powershell",
             // ── Path Traversal ──
-            "../../",     // 2 levels (sufficient for most attacks)
+            "../../", // 2 levels (sufficient for most attacks)
             "..\\..\\",
             "%2e%2e%2f",
             "%2e%2e/",
             "....//",
             // ── SSRF ──
-            "http://169.254.169.254",  // AWS metadata (HTTP)
-            "https://169.254.169.254", // AWS metadata (HTTPS)
-            "http://[::ffff:169.254",  // IPv6-mapped
-            "http://metadata.google",  // GCP metadata (HTTP)
-            "https://metadata.google", // GCP metadata (HTTPS)
-            "http://100.100.100.200",  // Alibaba metadata
-            "http://0xA9FEA9FE",       // AWS hex IP
-            "http://2852039166",       // AWS decimal IP
+            "http://169.254.169.254",        // AWS metadata (HTTP)
+            "https://169.254.169.254",       // AWS metadata (HTTPS)
+            "http://[::ffff:169.254",        // IPv6-mapped
+            "http://metadata.google",        // GCP metadata (HTTP)
+            "https://metadata.google",       // GCP metadata (HTTPS)
+            "http://100.100.100.200",        // Alibaba metadata
+            "http://0xA9FEA9FE",             // AWS hex IP
+            "http://2852039166",             // AWS decimal IP
             "http://169.254.169.254.nip.io", // DNS rebinding
             // ── SSRF: Cloud Metadata (additional providers) ──
-            "169.254.169.254/metadata",  // Azure IMDS
-            "/metadata/v1",              // DigitalOcean metadata API
-            "http://192.0.0.192",        // Oracle Cloud IMDS
-            "kubernetes.default.svc",    // Kubernetes service account
-            "/openstack/latest",         // OpenStack metadata
+            "169.254.169.254/metadata", // Azure IMDS
+            "/metadata/v1",             // DigitalOcean metadata API
+            "http://192.0.0.192",       // Oracle Cloud IMDS
+            "kubernetes.default.svc",   // Kubernetes service account
+            "/openstack/latest",        // OpenStack metadata
             // ── Windows Path Traversal ──
             "c:\\windows\\",
             "c:\\inetpub\\",
             "..\\..\\..\\windows",
             // ── Open Redirect ──
-            "/\\evil",                   // backslash normalization redirect
-            "/%09/",                     // tab-based redirect bypass
+            "/\\evil", // backslash normalization redirect
+            "/%09/",   // tab-based redirect bypass
             // ── LDAP Injection ──
             ")(cn=*",
             ")(uid=*",
@@ -213,39 +213,39 @@ fn get_scanner() -> &'static AhoCorasick {
             "__proto__",
             "constructor.prototype",
             // ── NoSQL Injection (MongoDB/Redis/Elastic) ──
-            "$gt",             // MongoDB operator injection
+            "$gt", // MongoDB operator injection
             "$ne",
             "$regex",
             "$where",
             "$lookup",
             "$unionwith",
-            "db.collection",   // MongoDB shell
+            "db.collection", // MongoDB shell
             ".find({",
             ".findone({",
             ".aggregate([",
             ".mapreduce(",
             "this.constructor",
             // ── Deserialization / RCE ──
-            "runtime.getruntime",     // Java RCE
+            "runtime.getruntime", // Java RCE
             "processbuilder",
             "objectinputstream",
             "java.lang.runtime",
             "javax.script.scriptengine",
-            "pickle.loads",           // Python deserialization
+            "pickle.loads", // Python deserialization
             "__reduce__",
             "__import__(",
             "subprocess.call",
             "subprocess.popen",
             "os.system(",
             "os.popen(",
-            "unserialize(",           // PHP deserialization
+            "unserialize(", // PHP deserialization
             "php://input",
             "php://filter",
             "phar://",
             // ── GraphQL Injection ──
-            "__schema",               // Introspection probe
+            "__schema", // Introspection probe
             "__type",
-            "mutation{",              // Mutation without space (automated tools)
+            "mutation{", // Mutation without space (automated tools)
             "query{__",
             "{__schema",
             "{__type",
@@ -575,7 +575,8 @@ pub fn validate_request(
                         return Some(WafVerdict::Deny("injection pattern detected (encoded)"));
                     }
 
-                    let still_needs_decode = memchr::memchr(b'%', &out).is_some() || memchr::memchr(b'+', &out).is_some();
+                    let still_needs_decode = memchr::memchr(b'%', &out).is_some()
+                        || memchr::memchr(b'+', &out).is_some();
                     let still_has_sql_comments = out.windows(2).any(|w| w == b"/*");
                     let still_has_unicode_esc = out.windows(2).any(|w| w == b"\\u");
 
@@ -663,7 +664,8 @@ pub fn validate_uri(uri: &str) -> WafVerdict {
                         return Some(WafVerdict::Deny("injection pattern in URI (encoded)"));
                     }
 
-                    let still_needs_decode = memchr::memchr(b'%', &out).is_some() || memchr::memchr(b'+', &out).is_some();
+                    let still_needs_decode = memchr::memchr(b'%', &out).is_some()
+                        || memchr::memchr(b'+', &out).is_some();
                     let still_has_sql_comments = out.windows(2).any(|w| w == b"/*");
                     let still_has_unicode_esc = out.windows(2).any(|w| w == b"\\u");
 

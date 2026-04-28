@@ -71,7 +71,8 @@ fn tune_listener(socket: &socket2::Socket) {
             libc::TCP_DEFER_ACCEPT,
             &defer as *const _ as *const libc::c_void,
             std::mem::size_of::<i32>() as libc::socklen_t,
-        ) != 0 {
+        ) != 0
+        {
             eprintln!("  warning: TCP_DEFER_ACCEPT unavailable (may be in restricted container)");
         }
 
@@ -86,7 +87,8 @@ fn tune_listener(socket: &socket2::Socket) {
             libc::TCP_CORK,
             &cork as *const _ as *const libc::c_void,
             std::mem::size_of::<i32>() as libc::socklen_t,
-        ) != 0 {
+        ) != 0
+        {
             eprintln!("  warning: TCP_CORK unavailable");
         }
 
@@ -98,7 +100,8 @@ fn tune_listener(socket: &socket2::Socket) {
             libc::TCP_FASTOPEN,
             &tfo as *const _ as *const libc::c_void,
             std::mem::size_of::<i32>() as libc::socklen_t,
-        ) != 0 {
+        ) != 0
+        {
             eprintln!("  warning: TCP_FASTOPEN unavailable");
         }
     }

@@ -30,12 +30,10 @@ impl UpstreamHealth {
             } else {
                 (new_lat + 7 * current) / 8
             };
-            match self.latency_us.compare_exchange_weak(
-                current,
-                ewma,
-                Relaxed,
-                Relaxed,
-            ) {
+            match self
+                .latency_us
+                .compare_exchange_weak(current, ewma, Relaxed, Relaxed)
+            {
                 Ok(_) => break,
                 Err(_) => continue, // retry with fresh value
             }

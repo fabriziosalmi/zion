@@ -462,7 +462,8 @@ impl Metrics {
         let b: bytes::Bytes = out.into();
 
         // Lock-free atomic cache update (ts + bytes as one unit)
-        self.cached_render.store(std::sync::Arc::new((now_sec, b.clone())));
+        self.cached_render
+            .store(std::sync::Arc::new((now_sec, b.clone())));
 
         b
     }
@@ -649,7 +650,7 @@ mod tests {
         assert_eq!(h.buckets[4].load(Relaxed), 1); // 10ms only
         assert_eq!(h.buckets[7].load(Relaxed), 1); // 100ms only
         assert_eq!(h.buckets[16].load(Relaxed), 0); // no overflow
-        // Verify render() produces correct cumulative output
+                                                    // Verify render() produces correct cumulative output
         let mut buf = bytes::BytesMut::new();
         h.render("test", "test", &mut buf);
         let out = String::from_utf8(buf.to_vec()).unwrap();

@@ -319,13 +319,21 @@ pub fn spawn_tls_watcher(
             if let Some(sni_dir) = Path::new(sni_path).parent() {
                 if watched_dirs.insert(sni_dir.to_path_buf()) {
                     if let Err(e) = watcher.watch(sni_dir, RecursiveMode::NonRecursive) {
-                        eprintln!("  warning: cannot watch SNI dir {}: {}", sni_dir.display(), e);
+                        eprintln!(
+                            "  warning: cannot watch SNI dir {}: {}",
+                            sni_dir.display(),
+                            e
+                        );
                     }
                 }
             }
         }
 
-        eprintln!("  tls watcher active on {} (+{} SNI dirs)", cert_dir.display(), watched_dirs.len() - 1);
+        eprintln!(
+            "  tls watcher active on {} (+{} SNI dirs)",
+            cert_dir.display(),
+            watched_dirs.len() - 1
+        );
         std::future::pending::<()>().await;
     });
 
@@ -419,7 +427,10 @@ pub fn spawn_cert_prewarm_task(acceptor_store: Arc<ArcSwap<TlsAcceptor>>, tls: T
                                 CERT_GENERATION.load(Ordering::Relaxed)
                             );
                         } else {
-                            eprintln!("  tls: pre-warm skipped — watcher already reloaded (gen {} → {})", gen_before, gen_after);
+                            eprintln!(
+                                "  tls: pre-warm skipped — watcher already reloaded (gen {} → {})",
+                                gen_before, gen_after
+                            );
                         }
                     }
                     Ok(Err(e)) => {

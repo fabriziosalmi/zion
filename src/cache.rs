@@ -93,11 +93,19 @@ impl L1Cache {
     #[inline]
     fn alloc_node(&mut self, key: Arc<str>) -> usize {
         if let Some(idx) = self.free.pop() {
-            self.nodes[idx] = LruNode { key, prev: NIL, next: NIL };
+            self.nodes[idx] = LruNode {
+                key,
+                prev: NIL,
+                next: NIL,
+            };
             idx
         } else {
             let idx = self.nodes.len();
-            self.nodes.push(LruNode { key, prev: NIL, next: NIL });
+            self.nodes.push(LruNode {
+                key,
+                prev: NIL,
+                next: NIL,
+            });
             idx
         }
     }
@@ -161,10 +169,22 @@ impl L1Cache {
     }
 
     #[inline]
-    fn insert(&mut self, path: Arc<str>, body: Bytes, meta: CachedMeta, expires_at: Instant, generation: u64) {
+    fn insert(
+        &mut self,
+        path: Arc<str>,
+        body: Bytes,
+        meta: CachedMeta,
+        expires_at: Instant,
+        generation: u64,
+    ) {
         // If key already exists, update in place and move to MRU
         if let Some((entry, node_idx)) = self.map.get_mut(path.as_ref()) {
-            *entry = L1Entry { body, meta, expires_at, generation };
+            *entry = L1Entry {
+                body,
+                meta,
+                expires_at,
+                generation,
+            };
             let idx = *node_idx;
             self.touch(idx);
             return;
@@ -181,7 +201,18 @@ impl L1Cache {
 
         let idx = self.alloc_node(path.clone());
         self.push_tail(idx);
-        self.map.insert(path, (L1Entry { body, meta, expires_at, generation }, idx));
+        self.map.insert(
+            path,
+            (
+                L1Entry {
+                    body,
+                    meta,
+                    expires_at,
+                    generation,
+                },
+                idx,
+            ),
+        );
     }
 }
 
@@ -420,7 +451,8 @@ impl StaticCache {
             },
         );
         // Bump generation so L1 caches on other threads see the update
-        self.generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     #[allow(dead_code)]

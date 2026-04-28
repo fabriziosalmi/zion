@@ -6,8 +6,8 @@ We supply security updates to the latest minor version release of Zion Edge Gate
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.0   | Yes       |
-| < 0.1.0 | No        |
+| 0.1.5   | Yes       |
+| < 0.1.5 | No        |
 
 ## Reporting a Vulnerability
 

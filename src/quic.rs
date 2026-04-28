@@ -6,8 +6,11 @@
 //!
 //! Security: shares the same security pipeline as the TCP path (URI check,
 //! method whitelist, rate limit, WAF, security headers).
-
-#![cfg(feature = "http3")]
+//!
+//! The module-level `#![cfg(feature = "http3")]` was removed in v0.1.5 — the
+//! caller already gates the module declaration with `#[cfg(feature = "http3")]
+//! mod quic;` in main.rs, so the inner attribute was redundant and triggered
+//! `clippy::duplicated_attributes`.
 
 use bytes::Buf;
 use bytes::Bytes;

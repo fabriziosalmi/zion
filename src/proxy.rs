@@ -18,7 +18,10 @@ pub type ZionBody = BoxBody<Bytes, hyper::Error>;
 
 /// Shared HTTP client type — supports both HTTP/1.1 and HTTP/2 to upstreams.
 /// Plain HTTP upstreams use HttpConnector; HTTPS upstreams negotiate H2 via ALPN.
-pub type HttpClient = Client<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, ZionBody>;
+pub type HttpClient = Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    ZionBody,
+>;
 
 /// Build the shared HTTP client with connection pooling and H2 upstream support.
 /// HTTP/2 multiplexing eliminates head-of-line blocking for HTTPS upstreams.
@@ -369,10 +372,7 @@ async fn send_ws_upgrade(
 
     // Capture Sec-WebSocket-Accept and other WS headers from upstream
     // BEFORE consuming the response for upgrade IO (RFC 6455 §4.2.2).
-    let ws_accept = upstream_resp
-        .headers()
-        .get("Sec-WebSocket-Accept")
-        .cloned();
+    let ws_accept = upstream_resp.headers().get("Sec-WebSocket-Accept").cloned();
     let ws_protocol = upstream_resp
         .headers()
         .get("Sec-WebSocket-Protocol")

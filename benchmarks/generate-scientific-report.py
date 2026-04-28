@@ -220,7 +220,7 @@ def create_pdf(data, rdir, pngs, outpath):
 
     # --- TITLE ---
     Story.append(Paragraph("ZION EDGE GATEWAY", styles['Title']))
-    Story.append(Paragraph(f"Official Scientific Benchmark Report v0.1.0 — {datetime.now().strftime('%d %b %Y')}", styles['SubTitle']))
+    Story.append(Paragraph(f"Official Scientific Benchmark Report v0.1.5 — {datetime.now().strftime('%d %b %Y')}", styles['SubTitle']))
     
     # --- ABSTRACT ---
     Story.append(Paragraph("1. Abstract & Rationale", styles['SectionLabel']))

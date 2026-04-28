@@ -221,7 +221,9 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> ResolvedAuthProfile {
                                 "auth",
                                 &format!("Failed to parse JWKS JSON: {}", e),
                             );
-                            if backoff_secs >= 3600 { backoff_secs = 5; }
+                            if backoff_secs >= 3600 {
+                                backoff_secs = 5;
+                            }
                             backoff_secs = (backoff_secs * 2).min(300);
                         }
                     },
@@ -232,7 +234,10 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> ResolvedAuthProfile {
                         }
                         crate::logging::error(
                             "auth",
-                            &format!("Failed to fetch JWKS from {}: {}, retry in {}s", url, e, backoff_secs),
+                            &format!(
+                                "Failed to fetch JWKS from {}: {}, retry in {}s",
+                                url, e, backoff_secs
+                            ),
                         );
                         backoff_secs = (backoff_secs * 2).min(300); // cap failure backoff at 5min
                     }

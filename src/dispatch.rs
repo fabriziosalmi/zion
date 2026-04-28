@@ -167,9 +167,7 @@ pub(crate) async fn process_request(
         };
 
         // Thread-local cache hit (~5ns)
-        let cached = ROUTE_CACHE.with(|cache| {
-            cache.borrow().get(&path_hash).cloned()
-        });
+        let cached = ROUTE_CACHE.with(|cache| cache.borrow().get(&path_hash).cloned());
 
         if let Some(route) = cached {
             route
