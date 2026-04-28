@@ -96,6 +96,7 @@ auth = ["jsonwebtoken", "reqwest"]
 http3 = ["quinn", "h3", "h3-quinn"]
 reqwest = ["dep:reqwest"]
 tui = ["ratatui", "crossterm"]
+init = ["rcgen"]
 
 [profile.release]
 opt-level = 3

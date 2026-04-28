@@ -11,7 +11,9 @@ mod bootstrap;
 mod cache;
 mod cli;
 mod config;
+mod doctor;
 mod health;
+mod init;
 mod logging;
 mod metrics;
 mod net;
@@ -183,6 +185,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 std::process::exit(2);
             }
+        }
+        cli::Command::Doctor => {
+            std::process::exit(doctor::run());
+        }
+        cli::Command::Init(opts) => {
+            std::process::exit(init::run(opts));
         }
     }
 

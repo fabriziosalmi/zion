@@ -19,6 +19,10 @@ pub enum Command {
     Daemon,
     /// Launch the live TUI dashboard.
     Top(TopOpts),
+    /// Run environment diagnostic checks and exit.
+    Doctor,
+    /// Generate a `zion.toml` from prompts (or flags) and optional certs.
+    Init(InitOpts),
     /// Print version and exit 0.
     Version,
     /// Print help and exit 0.
@@ -44,6 +48,50 @@ impl Default for TopOpts {
     }
 }
 
+/// Options for `zion init`. All flags are additive — the wizard fills in
+/// anything the operator didn't specify, prompting interactively unless
+/// `--non-interactive` is set.
+#[derive(Debug, Clone)]
+pub struct InitOpts {
+    /// Where to write the config file. Defaults to `./zion.toml`.
+    pub output: String,
+    /// Overwrite an existing config without prompting.
+    pub force: bool,
+    /// Skip all prompts and use defaults / detected values.
+    pub non_interactive: bool,
+    /// Hostname Zion will serve. None = "localhost" or prompt-driven.
+    pub hostname: Option<String>,
+    /// Pre-declared upstream services as `name=host:port`. Empty = scan
+    /// local ports and ask, or skip in non-interactive mode.
+    pub upstreams: Vec<(String, String)>,
+    /// HTTP listener port override. None = 80 default.
+    pub http_port: Option<u16>,
+    /// HTTPS listener port override. None = 443 default.
+    pub https_port: Option<u16>,
+    /// Generate a self-signed TLS certificate (requires `--features init`).
+    /// Defaults to true; flip with `--no-tls`.
+    pub with_tls: bool,
+    /// Add a WAF-enabled `/api/{*rest}` route when an upstream named "api"
+    /// or "backend" is configured. Flip with `--no-waf`.
+    pub with_waf: bool,
+}
+
+impl Default for InitOpts {
+    fn default() -> Self {
+        Self {
+            output: "zion.toml".to_string(),
+            force: false,
+            non_interactive: false,
+            hostname: None,
+            upstreams: Vec::new(),
+            http_port: None,
+            https_port: None,
+            with_tls: true,
+            with_waf: true,
+        }
+    }
+}
+
 /// Parse `std::env::args()`. Returns the resolved Command.
 pub fn parse() -> Command {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -58,6 +106,8 @@ pub(crate) fn parse_argv(args: &[String]) -> Command {
         "-h" | "--help" | "help" => Command::Help,
         "-V" | "--version" | "version" => Command::Version,
         "top" => Command::Top(parse_top_opts(&args[1..])),
+        "doctor" => Command::Doctor,
+        "init" => Command::Init(parse_init_opts(&args[1..])),
         other => {
             // Anything else: surface as Unknown — caller prints help and exits 1.
             // Note: legacy invocations passed nothing, so this only triggers on
@@ -65,6 +115,61 @@ pub(crate) fn parse_argv(args: &[String]) -> Command {
             Command::Unknown(other.to_string())
         }
     }
+}
+
+fn parse_init_opts(args: &[String]) -> InitOpts {
+    let mut opts = InitOpts::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--output" if i + 1 < args.len() => {
+                opts.output = args[i + 1].clone();
+                i += 2;
+            }
+            "-f" | "--force" => {
+                opts.force = true;
+                i += 1;
+            }
+            "-y" | "--non-interactive" => {
+                opts.non_interactive = true;
+                i += 1;
+            }
+            "--hostname" if i + 1 < args.len() => {
+                opts.hostname = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--upstream" if i + 1 < args.len() => {
+                // Format: name=host:port  e.g. "backend=127.0.0.1:8000"
+                if let Some((name, target)) = args[i + 1].split_once('=') {
+                    opts.upstreams
+                        .push((name.trim().to_string(), target.trim().to_string()));
+                }
+                i += 2;
+            }
+            "--http-port" if i + 1 < args.len() => {
+                if let Ok(p) = args[i + 1].parse::<u16>() {
+                    opts.http_port = Some(p);
+                }
+                i += 2;
+            }
+            "--https-port" if i + 1 < args.len() => {
+                if let Ok(p) = args[i + 1].parse::<u16>() {
+                    opts.https_port = Some(p);
+                }
+                i += 2;
+            }
+            "--no-tls" => {
+                opts.with_tls = false;
+                i += 1;
+            }
+            "--no-waf" => {
+                opts.with_waf = false;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    opts
 }
 
 fn parse_top_opts(args: &[String]) -> TopOpts {
@@ -107,12 +212,25 @@ pub fn print_help() {
         USAGE:\n  \
             {bin}                        run the gateway daemon (default)\n  \
             {bin} top [opts]             live TUI dashboard\n  \
+            {bin} init [opts]            generate zion.toml from prompts (or flags)\n  \
+            {bin} doctor                 run environment diagnostic checks\n  \
             {bin} --version              print version\n  \
             {bin} --help                 show this help\n\
         \n\
         TOP OPTIONS:\n  \
             -u, --url <URL>              snapshot endpoint (default http://127.0.0.1:80/_zion/snapshot.json)\n  \
             -i, --interval <MS>          poll interval in ms (default 500, range 100..10000)\n\
+        \n\
+        INIT OPTIONS:\n  \
+            -o, --output <PATH>          output config path (default zion.toml)\n  \
+            -f, --force                  overwrite an existing config\n  \
+            -y, --non-interactive        skip prompts; use defaults + flags\n  \
+                --hostname <H>           hostname Zion will serve\n  \
+                --upstream NAME=HOST:PORT  declare an upstream (multi-allowed)\n  \
+                --http-port <N>          override HTTP port (default 80)\n  \
+                --https-port <N>         override HTTPS port (default 443)\n  \
+                --no-tls                 skip self-signed cert generation\n  \
+                --no-waf                 skip WAF on /api/* routes\n\
         \n\
         ENVIRONMENT:\n  \
             ZION_CONFIG=zion.toml        config path for the daemon\n  \
@@ -191,6 +309,73 @@ mod tests {
     fn unknown_subcommand() {
         match parse_argv(&argv(&["nope"])) {
             Command::Unknown(s) => assert_eq!(s, "nope"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn doctor_subcommand() {
+        assert!(matches!(parse_argv(&argv(&["doctor"])), Command::Doctor));
+    }
+
+    #[test]
+    fn init_default_opts() {
+        match parse_argv(&argv(&["init"])) {
+            Command::Init(o) => {
+                assert_eq!(o.output, "zion.toml");
+                assert!(!o.force);
+                assert!(!o.non_interactive);
+                assert!(o.with_tls);
+                assert!(o.with_waf);
+                assert!(o.upstreams.is_empty());
+            }
+            _ => panic!("expected Init"),
+        }
+    }
+
+    #[test]
+    fn init_full_flags() {
+        let cmd = parse_argv(&argv(&[
+            "init",
+            "-o",
+            "custom.toml",
+            "-f",
+            "-y",
+            "--hostname",
+            "example.com",
+            "--upstream",
+            "backend=127.0.0.1:8000",
+            "--upstream",
+            "frontend=127.0.0.1:3000",
+            "--http-port",
+            "8080",
+            "--https-port",
+            "8443",
+            "--no-tls",
+            "--no-waf",
+        ]));
+        match cmd {
+            Command::Init(o) => {
+                assert_eq!(o.output, "custom.toml");
+                assert!(o.force);
+                assert!(o.non_interactive);
+                assert_eq!(o.hostname.as_deref(), Some("example.com"));
+                assert_eq!(o.upstreams.len(), 2);
+                assert_eq!(o.upstreams[0], ("backend".into(), "127.0.0.1:8000".into()));
+                assert_eq!(o.upstreams[1], ("frontend".into(), "127.0.0.1:3000".into()));
+                assert_eq!(o.http_port, Some(8080));
+                assert_eq!(o.https_port, Some(8443));
+                assert!(!o.with_tls);
+                assert!(!o.with_waf);
+            }
+            _ => panic!("expected Init"),
+        }
+    }
+
+    #[test]
+    fn init_malformed_upstream_skipped() {
+        match parse_argv(&argv(&["init", "--upstream", "no-equals-sign"])) {
+            Command::Init(o) => assert!(o.upstreams.is_empty()),
             _ => panic!(),
         }
     }

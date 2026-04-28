@@ -117,6 +117,8 @@ Payload x concurrency grid -- measures end-to-end TLS throughput. These numbers 
 - Bootstrap auto-detection (CPU cores, RAM, L1d cache, AES-NI/NEON, kernel features)
 - Performance Tier badge at boot (S/A/B/C with live AES-GCM calibration)
 - Live TUI dashboard (`zion top`, opt-in `--features tui`)
+- Interactive bootstrap wizard (`zion init`, opt-in `--features init`)
+- Environment diagnostic (`zion doctor`, always-on)
 - JSON snapshot endpoint (`/_zion/snapshot.json`, internal-only)
 - TCP tuning: TCP_NODELAY, TCP_DEFER_ACCEPT, TCP_FASTOPEN, TCP_QUICKACK, TCP_CORK, SO_BUSY_POLL
 - SO_REUSEPORT, sys_membarrier, io_uring multishot accept (Linux)
@@ -125,21 +127,33 @@ Payload x concurrency grid -- measures end-to-end TLS throughput. These numbers 
 
 ## Quick Start
 
+Zero config, 30 seconds to first request:
+
 ```bash
-# Build
-cargo build --release
+cargo build --release --features init,tui
+./target/release/zion init        # interactive wizard: detects local ports, generates zion.toml + self-signed cert
+./target/release/zion doctor      # environment check (fd limit, kernel, AES, port-bind perms)
+ZION_CONFIG=zion.toml ./target/release/zion        # run
+./target/release/zion top         # live dashboard (in another terminal)
+```
 
-# With optional features
-cargo build --release --features "acme,auth,http3"
+For automation / CI / container init, the wizard runs unattended:
 
-# Linux: io_uring multishot accept (kernel 5.19+)
-cargo build --release --features io-uring-accept
+```bash
+./zion init -y \
+    --hostname api.example.com \
+    --upstream backend=127.0.0.1:8000 \
+    --upstream frontend=127.0.0.1:3000
+```
 
-# With live TUI dashboard
-cargo build --release --features tui
+Build flavors:
 
-# Run
-ZION_CONFIG=zion.toml ./target/release/zion
+```bash
+cargo build --release                            # bare daemon, lean binary
+cargo build --release --features init            # + zion init wizard with cert generation
+cargo build --release --features tui             # + zion top live dashboard
+cargo build --release --features acme            # + Let's Encrypt auto-renewal
+cargo build --release --features io-uring-accept # Linux 5.19+: multishot accept
 ```
 
 ## Live Dashboard (`zion top`)
