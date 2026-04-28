@@ -1,9 +1,32 @@
-# Zion build optimization: use native CPU instruction set.
-# Unlocks NEON/AES-CE on Apple Silicon, AVX2/AES-NI on x86_64.
-# This enables auto-vectorization of loops (WAF, cache, metrics)
-# and hardware-accelerated TLS crypto (rustls + aws-lc-rs).
+# Zion build optimization — per-target CPU tuning.
 #
-# Note: binaries are NOT portable across CPU architectures.
-# For portable builds, remove this or use target-cpu=generic.
-[build]
+# The historical `[build] rustflags = ["-C", "target-cpu=native"]` global
+# default crashed rustc with SIGILL on the GitHub Actions Ubuntu runner
+# while expanding the `displaydoc` proc-macro (transitive via icu/idna).
+# That global was applied to *all* targets including the proc-macro host,
+# producing a binary that used CPU instructions the runner CPU couldn't
+# decode at expansion time.
+#
+# Fix: scope `native` to the developer host triples (Apple Silicon and
+# Intel macOS), and use the portable x86-64-v3 micro-architecture
+# baseline (Haswell+, 2013) elsewhere — that level still gives us AVX2,
+# AES-NI, BMI1/2, FMA, so the WAF / TLS / cache hot paths stay accelerated
+# while CI runners and Docker images stay portable.
+#
+# Override at build time with `RUSTFLAGS=-C target-cpu=...` if you want
+# something different for a specific deployment.
+
+[target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
+
+# Linux / *BSD / Windows x86_64 — portable but still hardware-accelerated.
+[target.'cfg(all(target_arch = "x86_64", not(target_os = "macos")))']
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# Linux / *BSD aarch64 — Graviton, RPi 4+, modern ARM servers all support
+# armv8.2-a (NEON, AES, SHA2, CRC32). Same baseline as Apple Silicon.
+[target.'cfg(all(target_arch = "aarch64", not(target_os = "macos")))']
+rustflags = ["-C", "target-cpu=neoverse-n1"]

@@ -194,7 +194,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 0. Bootstrap — detect hardware and auto-tune (BEFORE runtime starts)
+    // 0a. Install the default crypto provider for rustls.
+    //     The dep tree carries both aws-lc-rs (rustls default + our boot
+    //     AES-GCM calibration) and ring (pulled in by hyper-rustls 0.27 for
+    //     upstream HTTP/2). rustls 0.23 refuses to auto-pick when both are
+    //     present and panics on first TLS use. We explicitly pin to
+    //     aws-lc-rs so the runtime crypto provider matches the one we
+    //     calibrated in `bootstrap::detect()`.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    // 0b. Bootstrap — detect hardware and auto-tune (BEFORE runtime starts)
     metrics::record_start();
     let platform = bootstrap::detect();
 
