@@ -9,6 +9,7 @@ mod acme;
 mod auth;
 mod bootstrap;
 mod cache;
+mod cli;
 mod config;
 mod health;
 mod logging;
@@ -19,6 +20,8 @@ mod proxy;
 mod quic;
 mod security;
 mod tls;
+#[cfg(feature = "tui")]
+mod tui;
 #[cfg(all(target_os = "linux", feature = "io-uring-accept"))]
 mod uring;
 mod waf;
@@ -147,7 +150,44 @@ pub(crate) fn text_response(status: StatusCode, text: &'static str) -> Response<
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ── Subcommand dispatch ──
+    // Default (no args) → run the daemon, preserving every existing
+    // systemd / Docker invocation path. Subcommands like `top`, `--version`,
+    // and `--help` are additive.
+    match cli::parse() {
+        cli::Command::Daemon => {} // fall through to daemon below
+        cli::Command::Version => {
+            cli::print_version();
+            return Ok(());
+        }
+        cli::Command::Help => {
+            cli::print_help();
+            return Ok(());
+        }
+        cli::Command::Unknown(s) => {
+            eprintln!("zion: unknown subcommand '{}'\n", s);
+            cli::print_help();
+            std::process::exit(1);
+        }
+        cli::Command::Top(opts) => {
+            #[cfg(feature = "tui")]
+            {
+                return tui::run(opts);
+            }
+            #[cfg(not(feature = "tui"))]
+            {
+                let _ = opts;
+                eprintln!(
+                    "zion top requires the `tui` feature.\n\
+                     rebuild with: cargo build --release --features tui"
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
     // 0. Bootstrap — detect hardware and auto-tune (BEFORE runtime starts)
+    metrics::record_start();
     let platform = bootstrap::detect();
 
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
@@ -392,9 +432,18 @@ async fn async_main(
                             .healthy
                             .swap(healthy, std::sync::atomic::Ordering::Relaxed);
                         if was_healthy && !healthy {
-                            logging::warn("health", &format!("upstream {} is DOWN", url));
+                            logging::warn(
+                                "health",
+                                &format!(
+                                    "upstream {} is DOWN — requests to this upstream will return 503 until it recovers",
+                                    url
+                                ),
+                            );
                         } else if !was_healthy && healthy {
-                            logging::info("health", &format!("upstream {} is UP ({}us)", url, lat));
+                            logging::info(
+                                "health",
+                                &format!("upstream {} is UP ({}us)", url, lat),
+                            );
                         }
                     });
                 }
@@ -418,7 +467,10 @@ async fn async_main(
                 };
                 let req = hyper::Request::builder()
                     .uri(&uri)
-                    .header("Host", uri.authority().map(|a| a.as_str()).unwrap_or("localhost"))
+                    .header(
+                        "Host",
+                        uri.authority().map(|a| a.as_str()).unwrap_or("localhost"),
+                    )
                     .body(
                         http_body_util::Full::new(bytes::Bytes::new())
                             .map_err(|never| match never {})
@@ -428,60 +480,73 @@ async fn async_main(
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_secs(3),
                         client.request(req),
-                    ).await;
+                    )
+                    .await;
                 }
             }
-            logging::info("pool", &format!("pre-warmed {} upstream connections", hm.len()));
+            logging::info(
+                "pool",
+                &format!("pre-warmed {} upstream connections", hm.len()),
+            );
         });
     }
 
-    // 9. Spawn HTTP listener (port 80) — ACME challenges + HTTPS redirect
+    // 9. Bind HTTP listener (port 80) synchronously so the boot order is
+    // deterministic — HTTP "listening" is printed before HTTPS, before READY.
+    // If the bind fails (e.g. EACCES on :80 without privileges) we don't kill
+    // startup; HTTPS is the primary listener.
     let http_addr: SocketAddr = config.server.listen_http.parse()?;
-    let state_http = state.clone();
-    tokio::spawn(async move {
-        let listener = match net::bind_with_reuseport(http_addr) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!(
-                    "  warning: HTTP listener on {} unavailable: {}",
-                    http_addr, e
-                );
-                return;
-            }
-        };
-        eprintln!("  listening HTTP on {}", http_addr);
-
-        loop {
-            let (stream, addr) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    eprintln!("  http accept error: {}", e);
-                    continue;
-                }
-            };
-
-            let state = state_http.clone();
-            let builder = state.http_builder.clone();
-            tokio::spawn(async move {
-                let io = TokioIo::new(stream);
-                let _ = builder
-                    .serve_connection(
-                        io,
-                        service_fn(move |req| {
-                            use http_body_util::BodyExt;
-                            let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
-                            handle_http(req_boxed, state.clone(), addr)
-                        }),
-                    )
-                    .await;
-            });
+    let http_listener = match net::bind_with_reuseport(http_addr) {
+        Ok(l) => {
+            eprintln!("  listening HTTP  on {}", http_addr);
+            Some(l)
         }
-    });
+        Err(e) => {
+            eprintln!(
+                "  warning: HTTP listener on {} unavailable: {}",
+                http_addr, e
+            );
+            None
+        }
+    };
 
-    // 10. Main HTTPS listener (port 443) with graceful shutdown
+    // 10. Main HTTPS listener (port 443) — bind synchronously, log, then later
+    // enter the accept loop on the main task.
     let https_addr: SocketAddr = config.server.listen_https.parse()?;
     let listener = net::bind_with_reuseport(https_addr)?;
     eprintln!("  listening HTTPS on {}", https_addr);
+
+    // 11. Spawn the HTTP accept loop now that the listener is bound and logged.
+    if let Some(http_listener) = http_listener {
+        let state_http = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, addr) = match http_listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        eprintln!("  http accept error: {}", e);
+                        continue;
+                    }
+                };
+
+                let state = state_http.clone();
+                let builder = state.http_builder.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let _ = builder
+                        .serve_connection(
+                            io,
+                            service_fn(move |req| {
+                                use http_body_util::BodyExt;
+                                let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
+                                handle_http(req_boxed, state.clone(), addr)
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+    }
 
     // io_uring multishot accept on Linux (one syscall for N connections)
     #[cfg(all(target_os = "linux", feature = "io-uring-accept"))]
@@ -503,7 +568,7 @@ async fn async_main(
         quic::spawn_quic_listener(quic_addr, &config.tls, state.clone(), Some(quic_reload_rx));
     }
 
-    eprintln!("ZION ONLINE.");
+    bootstrap::print_ready_banner(&config.server.listen_http, &config.server.listen_https);
 
     let mut shutdown = std::pin::pin!(shutdown_signal());
 
@@ -759,6 +824,33 @@ async fn handle_http(
     }
 
     let path = req.uri().path();
+
+    // Live JSON snapshot — exposed on the plain-HTTP listener too so that
+    // `zion top` can connect from the same host without dragging in a TLS
+    // client. Same internal-IP gate as the HTTPS handler.
+    if path == "/_zion/snapshot.json" {
+        if !security::is_internal_ip(&remote_addr.ip()) {
+            return Ok(empty_response(StatusCode::FORBIDDEN));
+        }
+        let platform = bootstrap::detect();
+        let mut rows: Vec<metrics::UpstreamRow<'_>> = state
+            .health_map
+            .iter()
+            .map(|(url, h)| metrics::UpstreamRow {
+                url: url.as_str(),
+                healthy: h.healthy.load(std::sync::atomic::Ordering::Relaxed),
+                latency_us: h.latency_us.load(std::sync::atomic::Ordering::Relaxed),
+            })
+            .collect();
+        rows.sort_by(|a, b| a.url.cmp(b.url));
+        let body = metrics::snapshot_json(platform, &rows);
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json; charset=utf-8")
+            .header("Cache-Control", "no-store")
+            .body(Full::new(body).map_err(|never| match never {}).boxed())
+            .unwrap());
+    }
 
     // ACME HTTP-01 challenge — serve from in-memory store (auto-renewal)
     if path.starts_with("/.well-known/acme-challenge/") {

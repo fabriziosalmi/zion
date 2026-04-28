@@ -630,33 +630,218 @@ pub fn build_router(config: &ZionConfig) -> Router<Arc<ResolvedRoute>> {
         router
             .insert(route.path.clone(), resolved)
             .unwrap_or_else(|e| panic!("Bad route pattern '{}': {}", route.path, e));
-
-        eprintln!(
-            "  route {} -> {} [waf={}, cache={}, mode={:?}]",
-            route.path,
-            route.upstream,
-            route
-                .waf_profile
-                .as_deref()
-                .unwrap_or(if route.waf { "legacy" } else { "off" }),
-            route
-                .cache_profile
-                .as_deref()
-                .unwrap_or(if route.mode == RouteMode::StaticCache {
-                    "auto"
-                } else {
-                    "off"
-                }),
-            route.mode,
-        );
     }
 
+    print_routes_table(&config.route);
     router
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ROUTES MINI-TABLE (boot-time visualization)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Print the configured routes as a styled mini-table. Replaces the
+/// per-route `eprintln!("route ... [waf=, cache=, mode=]")` line with a
+/// scannable layout: aligned paths, dim arrow, cyan upstream, semantic
+/// tags (`waf`, `cache`, `sse`, `ws`, `static`, `internal`) colored by
+/// category. Falls back to plain ASCII when stderr is not a TTY or when
+/// `NO_COLOR` / `ZION_BOOT_PLAIN` is set.
+fn print_routes_table(routes: &[RouteConfig]) {
+    use std::io::IsTerminal;
+
+    let plain =
+        std::env::var_os("NO_COLOR").is_some() || std::env::var_os("ZION_BOOT_PLAIN").is_some();
+    let color = !plain && std::io::stderr().is_terminal();
+
+    // Cap path column at 40 chars so very long matchers don't blow up the
+    // layout. Truncate with an ellipsis when over.
+    const PATH_CAP: usize = 40;
+    let max_path_chars = routes
+        .iter()
+        .map(|r| r.path.chars().count().min(PATH_CAP))
+        .max()
+        .unwrap_or(0);
+
+    let header_dim = if color { "\x1b[2m" } else { "" };
+    let arrow_dim = if color { "\x1b[2m" } else { "" };
+    let cyan = if color { "\x1b[38;5;51m" } else { "" };
+    let reset = if color { "\x1b[0m" } else { "" };
+
+    eprintln!("  {}routes ({}){}", header_dim, routes.len(), reset);
+
+    for route in routes {
+        let path = truncate_chars(&route.path, PATH_CAP);
+        let pad = " ".repeat(max_path_chars.saturating_sub(path.chars().count()));
+        let tags = render_route_tags(route, color);
+        eprintln!(
+            "    {}{} {}→{} {}{}{}{}",
+            path,
+            pad,
+            arrow_dim,
+            reset,
+            cyan,
+            route.upstream,
+            reset,
+            if tags.is_empty() {
+                String::new()
+            } else {
+                format!("    {}", tags)
+            },
+        );
+    }
+}
+
+/// Build the tag suffix for a route: a `·`-joined list of colored chips
+/// (`waf`, `sse`, `ws`, `static`, `cache`, `internal`). Returns "" when
+/// the route is a plain pass-through with no special features.
+fn render_route_tags(route: &RouteConfig, color: bool) -> String {
+    let reset = if color { "\x1b[0m" } else { "" };
+    let dim_sep = if color { "\x1b[2m" } else { "" };
+    let green = if color { "\x1b[38;5;46m" } else { "" }; // security ON
+    let yellow = if color { "\x1b[38;5;220m" } else { "" }; // perf / restricted
+    let cyan = if color { "\x1b[38;5;51m" } else { "" }; // streaming / special
+
+    let mut tags: Vec<String> = Vec::new();
+
+    match route.mode {
+        RouteMode::SseStream => tags.push(format!("{cyan}sse{reset}")),
+        RouteMode::Websocket => tags.push(format!("{cyan}ws{reset}")),
+        RouteMode::StaticCache => tags.push(format!("{cyan}static{reset}")),
+        RouteMode::Standard => {}
+    }
+    if route.waf || route.waf_profile.is_some() {
+        tags.push(format!("{green}waf{reset}"));
+    }
+    if route.cache_profile.is_some() {
+        tags.push(format!("{yellow}cache{reset}"));
+    }
+    if route.internal_only {
+        tags.push(format!("{yellow}internal{reset}"));
+    }
+
+    if tags.is_empty() {
+        return String::new();
+    }
+    let sep = format!(" {dim_sep}·{reset} ");
+    tags.join(&sep)
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max - 1).collect();
+        out.push('…');
+        out
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn route(path: &str) -> RouteConfig {
+        RouteConfig {
+            path: path.into(),
+            upstream: "backend".into(),
+            mode: RouteMode::Standard,
+            internal_only: false,
+            waf_profile: None,
+            cache_profile: None,
+            csp: None,
+            auth_profile: None,
+            waf: false,
+            max_body_mb: None,
+            cors: None,
+        }
+    }
+
+    #[test]
+    fn route_tags_plain_passthrough_is_empty() {
+        let r = route("/static");
+        assert_eq!(render_route_tags(&r, false), "");
+    }
+
+    #[test]
+    fn route_tags_waf_only() {
+        let mut r = route("/api");
+        r.waf = true;
+        assert_eq!(render_route_tags(&r, false), "waf");
+    }
+
+    #[test]
+    fn route_tags_named_waf_profile_counts() {
+        let mut r = route("/api");
+        r.waf_profile = Some("strict".into());
+        assert_eq!(render_route_tags(&r, false), "waf");
+    }
+
+    #[test]
+    fn route_tags_static_with_cache() {
+        let mut r = route("/_next/static");
+        r.mode = RouteMode::StaticCache;
+        r.cache_profile = Some("immutable".into());
+        // Mode tag first, then perf tag
+        assert_eq!(render_route_tags(&r, false), "static · cache");
+    }
+
+    #[test]
+    fn route_tags_sse_stream() {
+        let mut r = route("/events");
+        r.mode = RouteMode::SseStream;
+        assert_eq!(render_route_tags(&r, false), "sse");
+    }
+
+    #[test]
+    fn route_tags_websocket() {
+        let mut r = route("/ws");
+        r.mode = RouteMode::Websocket;
+        assert_eq!(render_route_tags(&r, false), "ws");
+    }
+
+    #[test]
+    fn route_tags_internal_marked() {
+        let mut r = route("/metrics");
+        r.internal_only = true;
+        assert_eq!(render_route_tags(&r, false), "internal");
+    }
+
+    #[test]
+    fn route_tags_color_uses_ansi_per_category() {
+        let mut r = route("/api");
+        r.waf = true;
+        r.internal_only = true;
+        let tagged = render_route_tags(&r, true);
+        // Green for waf (security), amber for internal (restricted), dim
+        // separator between them.
+        assert!(tagged.contains("\x1b[38;5;46mwaf"), "got: {tagged}");
+        assert!(tagged.contains("\x1b[38;5;220minternal"), "got: {tagged}");
+        assert!(
+            tagged.contains("\x1b[2m·"),
+            "expected dim separator: {tagged}"
+        );
+    }
+
+    #[test]
+    fn truncate_chars_keeps_short_unchanged() {
+        assert_eq!(truncate_chars("/api", 40), "/api");
+    }
+
+    #[test]
+    fn truncate_chars_clips_long_with_ellipsis() {
+        let long = "/api/v1/very/long/nested/path/that/exceeds/the/cap/easily";
+        let out = truncate_chars(long, 20);
+        assert_eq!(out.chars().count(), 20);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_chars_handles_unicode() {
+        // Em-dashes and box characters count as 1 each
+        let s = "abc—def★ghi";
+        assert_eq!(truncate_chars(s, 5).chars().count(), 5);
+    }
 
     fn minimal_toml() -> &'static str {
         r#"

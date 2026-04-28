@@ -6,6 +6,10 @@
 [![Performance](https://img.shields.io/badge/Performance-233k%20req%2Fs-success?style=flat&color=brightgreen)](https://github.com/fabriziosalmi/zion/tree/master/benchmarks)
 [![WAF](https://img.shields.io/badge/WAF-Zero%20Regex-orange)](https://github.com/fabriziosalmi/zion/blob/master/src/waf.rs)
 
+<p align="center">
+  <img src="docs/img/boot.png" alt="Zion boot output: live AES-GCM calibration, performance tier badge, routes table, and ready banner" width="720">
+</p>
+
 High-performance TLS reverse proxy with built-in WAF, written in Rust.
 
 ## Performance
@@ -111,6 +115,9 @@ Payload x concurrency grid -- measures end-to-end TLS throughput. These numbers 
 - Graceful drain on shutdown (30s timeout, semaphore-tracked)
 - Upstream health checking (30s interval, EWMA latency, gray failure detection)
 - Bootstrap auto-detection (CPU cores, RAM, L1d cache, AES-NI/NEON, kernel features)
+- Performance Tier badge at boot (S/A/B/C with live AES-GCM calibration)
+- Live TUI dashboard (`zion top`, opt-in `--features tui`)
+- JSON snapshot endpoint (`/_zion/snapshot.json`, internal-only)
 - TCP tuning: TCP_NODELAY, TCP_DEFER_ACCEPT, TCP_FASTOPEN, TCP_QUICKACK, TCP_CORK, SO_BUSY_POLL
 - SO_REUSEPORT, sys_membarrier, io_uring multishot accept (Linux)
 - `target-cpu=native` build optimization, PGO build script included
@@ -128,9 +135,32 @@ cargo build --release --features "acme,auth,http3"
 # Linux: io_uring multishot accept (kernel 5.19+)
 cargo build --release --features io-uring-accept
 
+# With live TUI dashboard
+cargo build --release --features tui
+
 # Run
 ZION_CONFIG=zion.toml ./target/release/zion
 ```
+
+## Live Dashboard (`zion top`)
+
+Once a Zion daemon is running, `zion top` opens an htop-style TUI with traffic
+counters, latency quantiles (p50/p95/p99), status-class breakdown, cache hit
+rate, an RPS sparkline, and per-upstream health.
+
+```bash
+# Same host as the daemon (default URL is http://127.0.0.1:80/_zion/snapshot.json)
+zion top
+
+# Custom endpoint and poll interval
+zion top --url http://10.0.0.5:80/_zion/snapshot.json --interval 250
+```
+
+The dashboard polls `/_zion/snapshot.json`, an internal-only JSON endpoint that
+mirrors `/metrics` with quantiles + platform info. It's served on both the HTTP
+and HTTPS listeners for loopback consumers; non-internal IPs get 403.
+
+Keys: `q` quit · `p` pause · `r` redraw.
 
 ## Configuration
 

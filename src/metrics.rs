@@ -64,6 +64,28 @@ impl LatencyHistogram {
         }
     }
 
+    /// Approximate quantile in microseconds. Uses the cumulative power-of-2
+    /// buckets — resolution is 2x per step (1, 2, 4, 8, … 32 768 ms), so the
+    /// returned value is the upper bound of the bucket containing the q-th
+    /// observation. Good enough for live TUI display; not for SLO math.
+    /// Returns 0 when no observations have been recorded.
+    pub fn quantile_us(&self, q: f64) -> u64 {
+        let count = self.count.load(Relaxed);
+        if count == 0 {
+            return 0;
+        }
+        let q = q.clamp(0.0, 1.0);
+        let target = ((count as f64) * q).ceil().max(1.0) as u64;
+        for (i, b) in self.buckets.iter().take(16).enumerate() {
+            if b.load(Relaxed) >= target {
+                return BUCKET_BOUNDS_US[i];
+            }
+        }
+        // All target observations are in the +Inf bucket — return double the
+        // last finite bound so the TUI can show ">32s" without lying.
+        BUCKET_BOUNDS_US[15] * 2
+    }
+
     /// Record a duration observation. O(1), lock-free, zero-alloc.
     /// Only 3 atomic ops per observation (was 17 with cumulative buckets).
     #[inline]
@@ -448,6 +470,111 @@ impl Metrics {
 
 /// Global static metrics instance.
 pub static METRICS: std::sync::LazyLock<Metrics> = std::sync::LazyLock::new(Metrics::new);
+
+/// Process start time, captured by main() before the runtime starts.
+/// Used by the JSON snapshot endpoint to expose uptime.
+pub static START_INSTANT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+#[inline]
+pub fn record_start() {
+    let _ = START_INSTANT.get_or_init(std::time::Instant::now);
+}
+
+#[inline]
+pub fn uptime_secs() -> u64 {
+    START_INSTANT
+        .get()
+        .map(|i| i.elapsed().as_secs())
+        .unwrap_or(0)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// JSON SNAPSHOT (consumed by `zion top` and external tools)
+// ═══════════════════════════════════════════════════════════════════
+
+/// One row in the upstream health table — what the TUI shows per upstream.
+#[derive(serde::Serialize)]
+pub struct UpstreamRow<'a> {
+    pub url: &'a str,
+    pub healthy: bool,
+    pub latency_us: u64,
+}
+
+/// Build a JSON snapshot of the live state of Zion. Consumed by `zion top`,
+/// dashboards, and any external observability tool that wants something
+/// richer than the Prometheus text format.
+///
+/// Cost: one allocation for the output `Bytes`. Snapshot is built fresh on
+/// every call (no caching) since the TUI polls at sub-second cadence and we
+/// want to surface the live counter values, not a 1-second-old cached blob.
+pub fn snapshot_json(
+    platform: &crate::bootstrap::Platform,
+    upstreams: &[UpstreamRow<'_>],
+) -> bytes::Bytes {
+    use serde_json::json;
+
+    let m = &METRICS;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let payload = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "timestamp_ms": now_ms,
+        "uptime_secs": uptime_secs(),
+        "platform": {
+            "os": platform.os,
+            "arch": platform.arch,
+            "cores": platform.cpu_cores,
+            "ram_mb": platform.ram_mb,
+            "tier": platform.tier().label(),
+            "tier_score": platform.tier_score(),
+            "projected_kreqs_cached": platform.projected_kreqs_cached(),
+            "projected_kreqs_dynamic": platform.projected_kreqs_dynamic(),
+            // Live calibration: raw AES-128-GCM seal ops/sec/core, in K.
+            // None when ZION_BOOT_FAST=1 was set or aws-lc-rs failed.
+            "aes_kops_per_core": platform.aes_kops_per_core,
+            "aes_kops_total": platform.aes_kops_total(),
+            "calibration_us": platform.calibration_us,
+            "has_aes_ni": platform.has_aes_ni,
+            "has_sha256": platform.has_sha256,
+            "has_avx2": platform.has_avx2,
+            "has_neon": platform.has_neon,
+            "has_so_reuseport": platform.has_so_reuseport,
+            "has_tcp_fastopen": platform.has_tcp_fastopen,
+            "has_tcp_quickack": platform.has_tcp_quickack,
+            "worker_threads": platform.worker_threads,
+            "conn_limit": platform.conn_limit,
+        },
+        "metrics": {
+            "requests_total": m.requests_total.load(Relaxed),
+            "requests_2xx": m.requests_2xx.load(Relaxed),
+            "requests_4xx": m.requests_4xx.load(Relaxed),
+            "requests_5xx": m.requests_5xx.load(Relaxed),
+            "waf_denied": m.waf_denied.load(Relaxed),
+            "rate_limited": m.rate_limited.load(Relaxed),
+            "cache_hits": m.cache_hits.load(Relaxed),
+            "cache_misses": m.cache_misses.load(Relaxed),
+            "websocket_upgrades": m.websocket_upgrades.load(Relaxed),
+            "active_connections": m.active_connections.load(Relaxed),
+            "connections_total": m.connections_total.load(Relaxed),
+            "tls_handshake_errors": m.tls_handshake_errors.load(Relaxed),
+            "request_p50_us": m.request_duration.quantile_us(0.50),
+            "request_p95_us": m.request_duration.quantile_us(0.95),
+            "request_p99_us": m.request_duration.quantile_us(0.99),
+            "upstream_p50_us": m.upstream_duration.quantile_us(0.50),
+            "upstream_p95_us": m.upstream_duration.quantile_us(0.95),
+            "upstream_p99_us": m.upstream_duration.quantile_us(0.99),
+            "tls_p50_us": m.tls_handshake_duration.quantile_us(0.50),
+            "tls_p95_us": m.tls_handshake_duration.quantile_us(0.95),
+        },
+        "upstreams": upstreams,
+    });
+
+    let out = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+    bytes::Bytes::from(out)
+}
 
 /// RAII guard for tracking active connections.
 /// Increments on creation, decrements on drop.

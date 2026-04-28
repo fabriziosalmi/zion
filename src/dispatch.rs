@@ -116,11 +116,34 @@ pub(crate) async fn process_request(
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-                .body(
-                    Full::new(body)
-                        .map_err(|never| match never {})
-                        .boxed(),
-                )
+                .body(Full::new(body).map_err(|never| match never {}).boxed())
+                .unwrap());
+        }
+        // Live JSON snapshot — what `zion top` and dashboards consume.
+        // Same internal-only gate as /metrics: never expose to the world.
+        if path == "/_zion/snapshot.json" {
+            if !is_internal_ip(&client_ip) {
+                return Ok(empty_response(StatusCode::FORBIDDEN));
+            }
+            let platform = crate::bootstrap::detect();
+            let mut rows: Vec<metrics::UpstreamRow<'_>> = state
+                .health_map
+                .iter()
+                .map(|(url, h)| metrics::UpstreamRow {
+                    url: url.as_str(),
+                    healthy: h.healthy.load(std::sync::atomic::Ordering::Relaxed),
+                    latency_us: h.latency_us.load(std::sync::atomic::Ordering::Relaxed),
+                })
+                .collect();
+            // Stable order — keep the TUI from flickering as DashMap-style
+            // iteration drifts. URL is unique so this is total-order.
+            rows.sort_by(|a, b| a.url.cmp(b.url));
+            let body = metrics::snapshot_json(platform, &rows);
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json; charset=utf-8")
+                .header("Cache-Control", "no-store")
+                .body(Full::new(body).map_err(|never| match never {}).boxed())
                 .unwrap());
         }
     }
@@ -324,7 +347,11 @@ pub(crate) async fn process_request(
         };
 
         // Gate: WAF URI scan (catches SQLi/XSS in query parameters for ALL methods)
-        let uri_str = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or_else(|| req.uri().path());
+        let uri_str = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or_else(|| req.uri().path());
         if let waf::WafVerdict::Deny(reason) = waf::validate_uri(uri_str) {
             metrics::METRICS
                 .waf_denied

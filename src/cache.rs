@@ -276,7 +276,9 @@ impl StaticCache {
             return hit;
         }
 
-        let Some(l2_concurrent) = &self.l2 else { unreachable!() };
+        let Some(l2_concurrent) = &self.l2 else {
+            unreachable!()
+        };
 
         let current_gen = self.generation.load(std::sync::atomic::Ordering::Acquire);
 
@@ -370,7 +372,9 @@ impl StaticCache {
             return;
         }
 
-        let Some(l2_concurrent) = &self.l2 else { unreachable!() };
+        let Some(l2_concurrent) = &self.l2 else {
+            unreachable!()
+        };
 
         if max_entries > 0 && l2_concurrent.len() >= max_entries {
             let now = Instant::now();
