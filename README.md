@@ -118,7 +118,10 @@ Payload x concurrency grid -- measures end-to-end TLS throughput. These numbers 
 - Performance Tier badge at boot (S/A/B/C with live AES-GCM calibration)
 - Live TUI dashboard (`zion top`, opt-in `--features tui`)
 - Interactive bootstrap wizard (`zion init`, opt-in `--features init`)
+- One-shot dev mode (`zion auto --upstream :3000`, opt-in `--features init`)
 - Environment diagnostic (`zion doctor`, always-on)
+- Platform JSON dump for CI / automation (`zion bootstrap`)
+- WAF Shadow Mode (`waf_shadow = true`) — log + count, never block
 - JSON snapshot endpoint (`/_zion/snapshot.json`, internal-only)
 - TCP tuning: TCP_NODELAY, TCP_DEFER_ACCEPT, TCP_FASTOPEN, TCP_QUICKACK, TCP_CORK, SO_BUSY_POLL
 - SO_REUSEPORT, sys_membarrier, io_uring multishot accept (Linux)
@@ -127,12 +130,19 @@ Payload x concurrency grid -- measures end-to-end TLS throughput. These numbers 
 
 ## Quick Start
 
-Zero config, 30 seconds to first request:
+Fastest path — TLS proxy in front of a dev backend with one command:
 
 ```bash
 cargo build --release --features init,tui
+./target/release/zion auto --upstream :3000          # generates ephemeral cert + config, runs daemon
+```
+
+Zero config, 30 seconds to a tuned production-style setup:
+
+```bash
 ./target/release/zion init        # interactive wizard: detects local ports, generates zion.toml + self-signed cert
 ./target/release/zion doctor      # environment check (fd limit, kernel, AES, port-bind perms)
+./target/release/zion bootstrap   # dump detected platform as JSON (CI / Ansible / Terraform)
 ZION_CONFIG=zion.toml ./target/release/zion        # run
 ./target/release/zion top         # live dashboard (in another terminal)
 ```

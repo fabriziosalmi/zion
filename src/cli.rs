@@ -23,6 +23,16 @@ pub enum Command {
     Doctor,
     /// Generate a `zion.toml` from prompts (or flags) and optional certs.
     Init(InitOpts),
+    /// Print the detected platform capabilities as JSON to stdout and exit.
+    /// Shape matches the `platform` field of `/_zion/snapshot.json` so a
+    /// consumer can use the same schema for live runtime polling and
+    /// boot-time provisioning.
+    Bootstrap,
+    /// One-shot dev / demo mode: generate a self-signed cert + ephemeral
+    /// config in a temp dir and run the daemon, no `zion.toml` on disk.
+    /// `zion --auto --upstream=:3000` is the fastest path from "I have a
+    /// backend" to "TLS in front of it" with zero config files.
+    Auto(AutoOpts),
     /// Print version and exit 0.
     Version,
     /// Print help and exit 0.
@@ -76,6 +86,37 @@ pub struct InitOpts {
     pub with_waf: bool,
 }
 
+/// Options for `zion auto` (no-config dev mode). Bare minimum to point Zion
+/// at a backend and serve TLS in front of it. Defaults match a typical
+/// `npm run dev` style local environment.
+#[derive(Debug, Clone)]
+pub struct AutoOpts {
+    /// Backend to proxy to. Format: `host:port` (host defaults to 127.0.0.1
+    /// if just `:port` is given, e.g. `:3000`). No scheme — auto mode is
+    /// HTTP-to-upstream only by design.
+    pub upstream: String,
+    /// HTTP listener port. Default: 80 if running as root, else 8080.
+    pub http_port: u16,
+    /// HTTPS listener port. Default: 443 if running as root, else 8443.
+    pub https_port: u16,
+    /// SAN to bake into the self-signed cert. Default: `localhost`.
+    pub hostname: String,
+}
+
+impl Default for AutoOpts {
+    fn default() -> Self {
+        // Default to unprivileged ports — auto mode is for dev / demo /
+        // throwaway use, not production. A user with CAP_NET_BIND_SERVICE
+        // (or root) who wants :443 explicitly can pass --https-port=443.
+        Self {
+            upstream: "127.0.0.1:3000".to_string(),
+            http_port: 8080,
+            https_port: 8443,
+            hostname: "localhost".to_string(),
+        }
+    }
+}
+
 impl Default for InitOpts {
     fn default() -> Self {
         Self {
@@ -108,12 +149,55 @@ pub(crate) fn parse_argv(args: &[String]) -> Command {
         "top" => Command::Top(parse_top_opts(&args[1..])),
         "doctor" => Command::Doctor,
         "init" => Command::Init(parse_init_opts(&args[1..])),
+        "bootstrap" => Command::Bootstrap,
+        "auto" => Command::Auto(parse_auto_opts(&args[1..])),
         other => {
             // Anything else: surface as Unknown — caller prints help and exits 1.
             // Note: legacy invocations passed nothing, so this only triggers on
             // a genuine typo or new tool.
             Command::Unknown(other.to_string())
         }
+    }
+}
+
+fn parse_auto_opts(args: &[String]) -> AutoOpts {
+    let mut opts = AutoOpts::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-u" | "--upstream" if i + 1 < args.len() => {
+                opts.upstream = normalize_upstream(&args[i + 1]);
+                i += 2;
+            }
+            "--http-port" if i + 1 < args.len() => {
+                if let Ok(p) = args[i + 1].parse::<u16>() {
+                    opts.http_port = p;
+                }
+                i += 2;
+            }
+            "--https-port" if i + 1 < args.len() => {
+                if let Ok(p) = args[i + 1].parse::<u16>() {
+                    opts.https_port = p;
+                }
+                i += 2;
+            }
+            "--hostname" if i + 1 < args.len() => {
+                opts.hostname = args[i + 1].clone();
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    opts
+}
+
+/// Allow `--upstream=:3000` as shorthand for `127.0.0.1:3000` so the
+/// happy path (`zion auto --upstream=:3000`) is as terse as possible.
+fn normalize_upstream(s: &str) -> String {
+    if let Some(port_str) = s.strip_prefix(':') {
+        format!("127.0.0.1:{}", port_str)
+    } else {
+        s.to_string()
     }
 }
 
@@ -211,15 +295,23 @@ pub fn print_help() {
         \n\
         USAGE:\n  \
             {bin}                        run the gateway daemon (default)\n  \
+            {bin} auto --upstream :3000  one-shot dev mode: TLS in front of upstream, no config files\n  \
             {bin} top [opts]             live TUI dashboard\n  \
             {bin} init [opts]            generate zion.toml from prompts (or flags)\n  \
             {bin} doctor                 run environment diagnostic checks\n  \
+            {bin} bootstrap              dump detected platform as JSON (for CI / automation)\n  \
             {bin} --version              print version\n  \
             {bin} --help                 show this help\n\
         \n\
         TOP OPTIONS:\n  \
             -u, --url <URL>              snapshot endpoint (default http://127.0.0.1:80/_zion/snapshot.json)\n  \
             -i, --interval <MS>          poll interval in ms (default 500, range 100..10000)\n\
+        \n\
+        AUTO OPTIONS:\n  \
+            -u, --upstream HOST:PORT     backend to proxy to (`:3000` shorthand → 127.0.0.1:3000)\n  \
+                --http-port <N>          HTTP port (default 8080)\n  \
+                --https-port <N>         HTTPS port (default 8443)\n  \
+                --hostname <H>           SAN for the self-signed cert (default localhost)\n\
         \n\
         INIT OPTIONS:\n  \
             -o, --output <PATH>          output config path (default zion.toml)\n  \
@@ -316,6 +408,59 @@ mod tests {
     #[test]
     fn doctor_subcommand() {
         assert!(matches!(parse_argv(&argv(&["doctor"])), Command::Doctor));
+    }
+
+    #[test]
+    fn bootstrap_subcommand() {
+        assert!(matches!(
+            parse_argv(&argv(&["bootstrap"])),
+            Command::Bootstrap
+        ));
+    }
+
+    #[test]
+    fn auto_subcommand_defaults_to_unprivileged() {
+        match parse_argv(&argv(&["auto"])) {
+            Command::Auto(o) => {
+                assert_eq!(o.upstream, "127.0.0.1:3000");
+                assert_eq!(o.http_port, 8080);
+                assert_eq!(o.https_port, 8443);
+                assert_eq!(o.hostname, "localhost");
+            }
+            _ => panic!("expected Auto"),
+        }
+    }
+
+    #[test]
+    fn auto_upstream_short_form_normalized() {
+        // `:3000` → `127.0.0.1:3000` (the happy-path one-liner)
+        match parse_argv(&argv(&["auto", "--upstream", ":3000"])) {
+            Command::Auto(o) => assert_eq!(o.upstream, "127.0.0.1:3000"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn auto_full_flags() {
+        match parse_argv(&argv(&[
+            "auto",
+            "-u",
+            "10.0.0.5:8000",
+            "--http-port",
+            "80",
+            "--https-port",
+            "443",
+            "--hostname",
+            "dev.example.com",
+        ])) {
+            Command::Auto(o) => {
+                assert_eq!(o.upstream, "10.0.0.5:8000");
+                assert_eq!(o.http_port, 80);
+                assert_eq!(o.https_port, 443);
+                assert_eq!(o.hostname, "dev.example.com");
+            }
+            _ => panic!(),
+        }
     }
 
     #[test]

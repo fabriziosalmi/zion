@@ -259,6 +259,11 @@ pub struct Metrics {
     pub requests_4xx: ShardedCounter,
     pub requests_5xx: ShardedCounter,
     pub waf_denied: ShardedCounter,
+    /// WAF "would block" simulations: route was in `waf_shadow=true` mode,
+    /// the WAF matched a pattern, but we let the request through anyway.
+    /// Lets operators measure migration-from-nginx false-positive rate
+    /// without blocking real traffic. Increments alongside a `logging::warn`.
+    pub waf_shadow_would_block: ShardedCounter,
     pub rate_limited: ShardedCounter,
     pub cache_hits: ShardedCounter,
     pub cache_misses: ShardedCounter,
@@ -290,6 +295,7 @@ impl Metrics {
             requests_4xx: ShardedCounter::new(),
             requests_5xx: ShardedCounter::new(),
             waf_denied: ShardedCounter::new(),
+            waf_shadow_would_block: ShardedCounter::new(),
             rate_limited: ShardedCounter::new(),
             cache_hits: ShardedCounter::new(),
             cache_misses: ShardedCounter::new(),
@@ -369,6 +375,18 @@ impl Metrics {
                                 zion_waf_denied ",
         );
         out.extend_from_slice(itoa_buf.format(self.waf_denied.load(Relaxed)).as_bytes());
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_waf_shadow_would_block Requests the WAF would have denied if shadow mode were off.\n\
+                                # TYPE zion_waf_shadow_would_block counter\n\
+                                zion_waf_shadow_would_block ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.waf_shadow_would_block.load(Relaxed))
+                .as_bytes(),
+        );
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(
@@ -554,6 +572,7 @@ pub fn snapshot_json(
             "requests_4xx": m.requests_4xx.load(Relaxed),
             "requests_5xx": m.requests_5xx.load(Relaxed),
             "waf_denied": m.waf_denied.load(Relaxed),
+            "waf_shadow_would_block": m.waf_shadow_would_block.load(Relaxed),
             "rate_limited": m.rate_limited.load(Relaxed),
             "cache_hits": m.cache_hits.load(Relaxed),
             "cache_misses": m.cache_misses.load(Relaxed),

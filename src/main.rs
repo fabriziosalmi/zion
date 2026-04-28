@@ -158,6 +158,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // and `--help` are additive.
     match cli::parse() {
         cli::Command::Daemon => {} // fall through to daemon below
+        cli::Command::Auto(opts) => {
+            // Generate ephemeral cert + zion.toml in tmpdir, set
+            // ZION_CONFIG, then fall through to the daemon code path
+            // below. Same daemon, same boot ceremony — just no config
+            // files on the operator's disk.
+            match init::run_auto(opts) {
+                Ok(path) => {
+                    eprintln!("  zion auto-mode: ephemeral config at {}", path.display());
+                }
+                Err(e) => {
+                    eprintln!("zion auto: {}", e);
+                    std::process::exit(2);
+                }
+            }
+            // fall through to daemon
+        }
         cli::Command::Version => {
             cli::print_version();
             return Ok(());
@@ -191,6 +207,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         cli::Command::Init(opts) => {
             std::process::exit(init::run(opts));
+        }
+        cli::Command::Bootstrap => {
+            // CI / automation entry point: detect the platform (incl. live
+            // AES calibration unless ZION_BOOT_FAST=1) and dump JSON to
+            // stdout. No daemon, no TLS, no logs — pipe-friendly.
+            let p = bootstrap::detect();
+            println!("{}", bootstrap::dump_platform_json(p));
+            return Ok(());
         }
     }
 

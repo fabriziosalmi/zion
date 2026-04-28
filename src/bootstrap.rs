@@ -353,6 +353,50 @@ pub fn print_report(p: &Platform) {
     let _ = render(p, &style, &mut w);
 }
 
+/// Serialize the detected platform as pretty-printed JSON.
+///
+/// Schema mirrors the `platform` field of `/_zion/snapshot.json` so a
+/// CI / Ansible / Terraform consumer can use the same shape for both
+/// boot-time provisioning (this command) and live runtime polling (the
+/// snapshot endpoint). Includes the live AES-GCM calibration when not
+/// suppressed via `ZION_BOOT_FAST=1`.
+///
+/// The `version` and `tier` are derived (`zion` package version and the
+/// computed S/A/B/C tier) so a single consumer can branch on either.
+pub fn dump_platform_json(p: &Platform) -> String {
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "os": p.os,
+        "arch": p.arch,
+        "cores": p.cpu_cores,
+        "ram_mb": p.ram_mb,
+        "tier": p.tier().label(),
+        "tier_score": p.tier_score(),
+        "projected_kreqs_cached": p.projected_kreqs_cached(),
+        "projected_kreqs_dynamic": p.projected_kreqs_dynamic(),
+        "aes_kops_per_core": p.aes_kops_per_core,
+        "aes_kops_total": p.aes_kops_total(),
+        "calibration_us": p.calibration_us,
+        "probe_us": p.probe_us,
+        "has_aes_ni": p.has_aes_ni,
+        "has_sha256": p.has_sha256,
+        "has_avx2": p.has_avx2,
+        "has_neon": p.has_neon,
+        "has_so_reuseport": p.has_so_reuseport,
+        "has_tcp_fastopen": p.has_tcp_fastopen,
+        "has_tcp_quickack": p.has_tcp_quickack,
+        "cache_line_size": p.cache_line_size,
+        "l1d_cache_size": p.l1d_cache_size,
+        "l2_cache_size": p.l2_cache_size,
+        "l1_hot_entries": p.l1_hot_entries,
+        "worker_threads": p.worker_threads,
+        "conn_limit": p.conn_limit,
+        "backlog": p.backlog,
+        "send_buf": p.send_buf,
+    })
+    .to_string()
+}
+
 fn render<W: std::io::Write>(p: &Platform, s: &Style, w: &mut W) -> std::io::Result<()> {
     let tier = p.tier();
 
@@ -1708,6 +1752,39 @@ mod tests {
         let out = String::from_utf8(buf).unwrap();
         assert!(!out.contains('\r'));
         assert!(out.contains("\x1b[1;97mZION"));
+    }
+
+    #[test]
+    fn dump_platform_json_round_trips_essentials() {
+        // Synthetic platform with a measured AES throughput so we exercise
+        // both the present and absent branches of the calibration field.
+        let mut p = synthetic(8, 16_000, true, "linux");
+        p.aes_kops_per_core = Some(1234);
+        p.calibration_us = 80_000;
+        let json = dump_platform_json(&p);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["os"], "linux");
+        assert_eq!(v["arch"], "x86_64");
+        assert_eq!(v["cores"], 8);
+        assert_eq!(v["ram_mb"], 16_000);
+        assert_eq!(v["tier"], "A");
+        assert_eq!(v["aes_kops_per_core"], 1234);
+        assert_eq!(v["aes_kops_total"], 9872); // 1234 × 8
+        assert_eq!(v["calibration_us"], 80_000);
+        assert_eq!(v["worker_threads"], 8);
+        assert!(v["projected_kreqs_cached"].as_u64().unwrap() > 0);
+        // `version` is the package version — always non-empty.
+        assert!(!v["version"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dump_platform_json_handles_skipped_calibration() {
+        // Calibration off → field is null in JSON, aes_kops_total also null.
+        let p = synthetic(8, 16_000, true, "linux");
+        let json = dump_platform_json(&p);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["aes_kops_per_core"].is_null());
+        assert!(v["aes_kops_total"].is_null());
     }
 
     #[test]

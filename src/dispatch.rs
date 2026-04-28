@@ -351,12 +351,26 @@ pub(crate) async fn process_request(
             .map(|pq| pq.as_str())
             .unwrap_or_else(|| req.uri().path());
         if let waf::WafVerdict::Deny(reason) = waf::validate_uri(uri_str) {
-            metrics::METRICS
-                .waf_denied
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            metrics::METRICS.record_status(400);
-            logging::info("waf", &format!("URI denied: {} ({})", reason, uri_str));
-            return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
+            if rule.waf_shadow {
+                metrics::METRICS
+                    .waf_shadow_would_block
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                logging::warn(
+                    "waf_shadow",
+                    &format!(
+                        "would_block=true source=uri reason={} path={}",
+                        reason, uri_str
+                    ),
+                );
+                // Fall through — shadow mode never denies the request.
+            } else {
+                metrics::METRICS
+                    .waf_denied
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics::METRICS.record_status(400);
+                logging::info("waf", &format!("URI denied: {} ({})", reason, uri_str));
+                return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
+            }
         }
 
         if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
@@ -382,12 +396,28 @@ pub(crate) async fn process_request(
             };
 
             let verdict = waf::validate_request(method, ct, &body_bytes, waf_profile);
-            if let waf::WafVerdict::Deny(_) = verdict {
-                metrics::METRICS
-                    .waf_denied
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                metrics::METRICS.record_status(400);
-                return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
+            if let waf::WafVerdict::Deny(reason) = verdict {
+                if rule.waf_shadow {
+                    metrics::METRICS
+                        .waf_shadow_would_block
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    logging::warn(
+                        "waf_shadow",
+                        &format!(
+                            "would_block=true source=body method={} reason={} path={}",
+                            method,
+                            reason,
+                            parts.uri.path()
+                        ),
+                    );
+                    // Fall through — request body is reassembled below.
+                } else {
+                    metrics::METRICS
+                        .waf_denied
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics::METRICS.record_status(400);
+                    return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
+                }
             }
 
             // Re-assemble request with validated body for dispatch below.
@@ -404,12 +434,28 @@ pub(crate) async fn process_request(
                 .get(hyper::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok());
             let verdict = waf::validate_request(method, ct, &[], waf_profile);
-            if let waf::WafVerdict::Deny(_) = verdict {
-                metrics::METRICS
-                    .waf_denied
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                metrics::METRICS.record_status(400);
-                return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
+            if let waf::WafVerdict::Deny(reason) = verdict {
+                if rule.waf_shadow {
+                    metrics::METRICS
+                        .waf_shadow_would_block
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    logging::warn(
+                        "waf_shadow",
+                        &format!(
+                            "would_block=true source=headers method={} reason={} path={}",
+                            method,
+                            reason,
+                            req.uri().path()
+                        ),
+                    );
+                    // Fall through — shadow mode never denies the request.
+                } else {
+                    metrics::METRICS
+                        .waf_denied
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics::METRICS.record_status(400);
+                    return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
+                }
             }
         }
     }

@@ -15,10 +15,10 @@
 //! (which pulls `rcgen`). Without the feature, the wizard falls back to
 //! printing the equivalent `openssl` command for the operator to run.
 
-use crate::cli::InitOpts;
+use crate::cli::{AutoOpts, InitOpts};
 use std::io::{IsTerminal, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(80);
@@ -146,6 +146,94 @@ pub fn run(opts: InitOpts) -> i32 {
     );
     let _ = print_next_steps(&resolved, &style, &mut stderr);
     0
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// AUTO MODE — one-shot dev / demo with no config files on disk
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Prepare an ephemeral TLS cert + zion.toml in the OS temp dir, set
+/// `ZION_CONFIG` so the daemon entry point picks it up, and return the
+/// config path. Caller (main) falls through to the normal daemon code.
+///
+/// Cert + config live in `$TMPDIR/zion-auto-{pid}/` and are NOT cleaned up
+/// on shutdown — they're tiny, the OS will reclaim the tempdir, and
+/// keeping them lets the operator re-run `zion auto` quickly without
+/// regenerating certs.
+#[cfg(feature = "init")]
+pub fn run_auto(opts: AutoOpts) -> Result<PathBuf, String> {
+    use rcgen::generate_simple_self_signed;
+
+    let dir = std::env::temp_dir().join(format!("zion-auto-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {:?}: {}", dir, e))?;
+
+    let cert_path = dir.join("server.crt");
+    let key_path = dir.join("server.key");
+    let config_path = dir.join("zion.toml");
+
+    // Self-signed cert with both the user-chosen hostname and `localhost`
+    // as SANs so https://localhost:<port> works regardless of --hostname.
+    let mut sans = vec![opts.hostname.clone()];
+    if opts.hostname != "localhost" {
+        sans.push("localhost".to_string());
+    }
+    let cert = generate_simple_self_signed(sans).map_err(|e| format!("rcgen: {}", e))?;
+    std::fs::write(&cert_path, cert.cert.pem())
+        .map_err(|e| format!("write {:?}: {}", cert_path, e))?;
+    std::fs::write(&key_path, cert.signing_key.serialize_pem())
+        .map_err(|e| format!("write {:?}: {}", key_path, e))?;
+
+    let toml = format!(
+        "# zion auto-mode — generated for one-shot dev / demo use.\n\
+         # Tied to PID {pid}; regenerated on every `zion auto` invocation.\n\
+         \n\
+         [server]\n\
+         listen_http  = \"0.0.0.0:{http_port}\"\n\
+         listen_https = \"0.0.0.0:{https_port}\"\n\
+         \n\
+         [tls]\n\
+         cert_path = \"{cert}\"\n\
+         key_path  = \"{key}\"\n\
+         hot_reload  = false\n\
+         min_version = \"1.3\"\n\
+         alpn        = [\"h2\", \"http/1.1\"]\n\
+         \n\
+         [upstream.backend]\n\
+         url                = \"http://{upstream}\"\n\
+         connect_timeout_ms = 3000\n\
+         keepalive          = 32\n\
+         \n\
+         [[route]]\n\
+         path     = \"/{{*rest}}\"\n\
+         upstream = \"backend\"\n",
+        pid = std::process::id(),
+        http_port = opts.http_port,
+        https_port = opts.https_port,
+        cert = cert_path.display(),
+        key = key_path.display(),
+        upstream = opts.upstream,
+    );
+    std::fs::write(&config_path, &toml).map_err(|e| format!("write {:?}: {}", config_path, e))?;
+
+    // Set ZION_CONFIG so the existing daemon entry point picks it up
+    // verbatim — no refactor of async_main needed.
+    // SAFETY: process is single-threaded at this point (we run before the
+    // tokio runtime is built), so set_var is safe. Any future change that
+    // moves auto-mode prep behind multi-threaded code MUST revisit this.
+    unsafe {
+        std::env::set_var("ZION_CONFIG", &config_path);
+    }
+
+    Ok(config_path)
+}
+
+#[cfg(not(feature = "init"))]
+pub fn run_auto(_opts: AutoOpts) -> Result<PathBuf, String> {
+    Err(
+        "zion auto requires the `init` feature for self-signed cert generation.\n  \
+         rebuild with: cargo build --release --features init"
+            .to_string(),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────

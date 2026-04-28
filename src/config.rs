@@ -315,6 +315,15 @@ pub struct RouteConfig {
     pub waf: bool,
     pub max_body_mb: Option<u64>,
 
+    /// Shadow mode: run WAF checks but do NOT block on violation.
+    /// Each would-be denial is logged (`logging::warn`) with the matched
+    /// reason and counted in the `waf_shadow_would_block` metric. Lets
+    /// operators migrating from nginx/ModSecurity test their WAF profile
+    /// against real traffic for hours/days before flipping to enforce.
+    /// Has no effect when no WAF profile is attached to the route.
+    #[serde(default)]
+    pub waf_shadow: bool,
+
     /// Per-route CORS configuration. If unset, no CORS headers are injected.
     pub cors: Option<CorsConfig>,
 }
@@ -342,6 +351,8 @@ pub struct ResolvedRoute {
     pub upstream_authority: hyper::http::uri::Authority,
     pub mode: RouteMode,
     pub waf: Option<WafProfile>,
+    /// True iff the route is in WAF shadow mode (log + count, no block).
+    pub waf_shadow: bool,
     pub cache: Option<CacheProfile>,
     pub internal_only: bool,
     /// Per-route CSP header value (pre-parsed at startup, zero cost at runtime).
@@ -619,6 +630,7 @@ pub fn build_router(config: &ZionConfig) -> Router<Arc<ResolvedRoute>> {
             upstream_authority,
             mode: route.mode.clone(),
             waf,
+            waf_shadow: route.waf_shadow,
             cache,
             internal_only: route.internal_only,
             csp,
@@ -710,7 +722,13 @@ fn render_route_tags(route: &RouteConfig, color: bool) -> String {
         RouteMode::Standard => {}
     }
     if route.waf || route.waf_profile.is_some() {
-        tags.push(format!("{green}waf{reset}"));
+        if route.waf_shadow {
+            // Distinct tag — the operator must see at a glance which routes
+            // are simulating vs enforcing. Amber matches "warning" semantics.
+            tags.push(format!("{yellow}waf:shadow{reset}"));
+        } else {
+            tags.push(format!("{green}waf{reset}"));
+        }
     }
     if route.cache_profile.is_some() {
         tags.push(format!("{yellow}cache{reset}"));
@@ -753,6 +771,7 @@ mod tests {
             auth_profile: None,
             waf: false,
             max_body_mb: None,
+            waf_shadow: false,
             cors: None,
         }
     }
@@ -805,6 +824,36 @@ mod tests {
         let mut r = route("/metrics");
         r.internal_only = true;
         assert_eq!(render_route_tags(&r, false), "internal");
+    }
+
+    #[test]
+    fn route_tags_shadow_replaces_waf_tag() {
+        // waf=true alone → "waf"
+        let mut r = route("/api");
+        r.waf = true;
+        assert_eq!(render_route_tags(&r, false), "waf");
+        // waf=true + shadow → "waf:shadow" so the visual distinction is
+        // unmissable when scanning the boot output.
+        r.waf_shadow = true;
+        assert_eq!(render_route_tags(&r, false), "waf:shadow");
+    }
+
+    #[test]
+    fn route_tags_shadow_with_named_profile() {
+        let mut r = route("/api");
+        r.waf_profile = Some("strict".into());
+        r.waf_shadow = true;
+        assert_eq!(render_route_tags(&r, false), "waf:shadow");
+    }
+
+    #[test]
+    fn route_tags_shadow_no_waf_attached_no_tag() {
+        // Shadow without any WAF profile attached → no tag (logical no-op).
+        let mut r = route("/static");
+        r.waf_shadow = true;
+        // We still don't render anything because there's no WAF on the route.
+        // Treating shadow as a strict modifier of the waf tag.
+        assert_eq!(render_route_tags(&r, false), "");
     }
 
     #[test]

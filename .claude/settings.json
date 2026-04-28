@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo --version)",
+      "Bash(rustc --version)",
+      "Bash(bash /tmp/zion_render_demo.sh)",
+      "Bash(ZION_BOOT_PLAIN=1 ZION_CONFIG=/dev/null ./target/release/zion)",
+      "Bash(./target/release/zion --version)",
+      "Bash(./target/release/zion --help)",
+      "Bash(./target/release/zion bogusness *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(./target/release/zion bogus *)",
+      "Bash(git fetch *)",
+      "Bash(GIT_EDITOR=true git rebase --continue)",
+      "Bash(./target/release/zion bootstrap *)",
+      "Bash(ZION_BOOT_FAST=1 ./target/release/zion bootstrap)",
+      "Bash(./target/debug/zion auto *)",
+      "Bash(sed -i '' 's/^version = \"0.1.5\"/version = \"0.1.6\"/' Cargo.toml)",
+      "Bash(sed -i '' 's/0\\\\.1\\\\.5/0.1.6/g; s/v0\\\\.1\\\\.5/v0.1.6/g' SECURITY.md deploy/helm/zion/Chart.yaml deploy/helm/zion/values.yaml .github/ISSUE_TEMPLATE/bug_report.md benchmarks/generate-scientific-report.py)"
+    ]
+  }
+}
