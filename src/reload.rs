@@ -86,9 +86,15 @@ fn rebuild(new_config: &ZionConfig, previous: &ResolvedAppConfig) -> ResolvedApp
 
 /// Spawn the config-file watcher. Returns immediately; the actual
 /// watching runs on a tokio task and a debounce-and-reload task.
+///
+/// `change_notifier`, if provided, is `send`'d the new generation
+/// number after every successful swap. Phase 1.5 wires the listener
+/// supervisor to this channel so a `[server.listen_*]` change kicks
+/// in within the watcher's debounce window.
 pub(crate) fn spawn_config_watcher(
     config_path: PathBuf,
     state_config: Arc<ArcSwap<ResolvedAppConfig>>,
+    change_notifier: Option<tokio::sync::watch::Sender<u64>>,
 ) {
     let signal = Arc::new(Notify::new());
     let signal_for_watcher = signal.clone();
@@ -185,6 +191,14 @@ pub(crate) fn spawn_config_watcher(
                     let new_snapshot = rebuild(&new_config, &previous);
                     state_config.store(Arc::new(new_snapshot));
                     let gen = CONFIG_GENERATION.fetch_add(1, Ordering::Release) + 1;
+                    if let Some(tx) = change_notifier.as_ref() {
+                        // Best-effort: sending into a watch channel only
+                        // fails if there are no live receivers. We don't
+                        // care — the supervisor's missing receiver is the
+                        // operator's problem to debug, not a reason to
+                        // refuse the reload.
+                        let _ = tx.send(gen);
+                    }
                     logging::info(
                         "config_watcher",
                         &format!("reload OK (gen {} → {})", gen - 1, gen),

@@ -72,7 +72,7 @@ Payload x concurrency grid -- measures end-to-end TLS throughput. These numbers 
 - HTTP/2 upstream multiplexing (hyper-rustls ALPN negotiation)
 - Multi-SNI with per-domain certificates and FNV hash lookup
 - Zero-downtime TLS and QUIC hot-reload (ArcSwap + watch channels)
-- Zero-downtime config hot-reload — `zion.toml` changes (routes, upstreams, WAF profiles, CORS, rate-limit, XFF policy, trusted proxies) atomic-swap into the running process. Invalid configs are rejected; the previous snapshot survives. Generation counter exposed via Prometheus and `/_zion/snapshot.json`. See [`docs/deploy/hot-reload.md`](https://fabriziosalmi.github.io/zion/deploy/hot-reload).
+- Zero-downtime config hot-reload — `zion.toml` changes (routes, upstreams, WAF profiles, CORS, rate-limit, XFF policy, trusted proxies, **listen ports**) atomic-swap into the running process. Listener rebind: edit `[server.listen_*]`, save, the daemon binds the new address and drains the old one without dropping in-flight connections. Invalid configs and bind failures are rejected; the previous state survives. Generation counter exposed via Prometheus and `/_zion/snapshot.json`. See [`docs/deploy/hot-reload.md`](https://fabriziosalmi.github.io/zion/deploy/hot-reload).
 - Session tickets + 0-RTT early data with method gating (425 Too Early, RFC 8470)
 - ACME auto-renewal via `instant-acme` (HTTP-01, `--features acme`)
 - JWT/OIDC authentication gate (`--features auth`)
