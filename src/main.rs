@@ -28,6 +28,7 @@ mod net;
 mod proxy;
 #[cfg(feature = "http3")]
 mod quic;
+mod reload;
 mod security;
 mod tls;
 #[cfg(feature = "tui")]
@@ -115,22 +116,41 @@ use security::RateEntry;
 /// `Arc` in `ArcSwap` and wire the watcher.
 pub(crate) struct ResolvedAppConfig {
     /// Radix tree (matchit) of pre-resolved routes.
-    router: Router<Arc<ResolvedRoute>>,
+    pub(crate) router: Router<Arc<ResolvedRoute>>,
     /// Upstream URL → shared health/latency state. The `Arc<UpstreamHealth>`
     /// values are intentionally re-used across reloads when the URL is
     /// unchanged so the prober's accumulated state is preserved.
-    health_map: health::HealthMap,
+    pub(crate) health_map: health::HealthMap,
     /// Trusted proxy CIDRs for X-Forwarded-For IP resolution.
-    trusted_proxies: security::TrustedProxies,
+    pub(crate) trusted_proxies: security::TrustedProxies,
     /// Outbound XFF policy (append / rewrite / drop). See proxy::XffMode.
-    xff_mode: proxy::XffMode,
+    pub(crate) xff_mode: proxy::XffMode,
     /// Per-IP rate limiter target (RPS). 0 = disabled.
-    rate_limit_rps: u32,
+    pub(crate) rate_limit_rps: u32,
     /// Rate limiter window in seconds.
-    rate_limit_window: u64,
+    pub(crate) rate_limit_window: u64,
 }
 
 impl ResolvedAppConfig {
+    /// Test-only constructor that lets unit tests in `reload.rs`
+    /// fabricate a snapshot with a specific health map without going
+    /// through `build()` (which requires a full `ZionConfig`). Other
+    /// fields take harmless defaults — they're not exercised by the
+    /// rebuild() merge logic.
+    #[cfg(test)]
+    pub(crate) fn test_with_health(
+        health_map: health::HealthMap,
+    ) -> Self {
+        Self {
+            router: matchit::Router::new(),
+            health_map,
+            trusted_proxies: security::TrustedProxies::from_config(&[]),
+            xff_mode: proxy::XffMode::Append,
+            rate_limit_rps: 0,
+            rate_limit_window: 1,
+        }
+    }
+
     /// Build a snapshot from a parsed `ZionConfig`.
     ///
     /// This is the single entry point that turns the static TOML config
@@ -192,7 +212,11 @@ struct AppState {
     /// snapshot — even if a hot-reload swaps in a new one mid-flight.
     /// Old snapshots are reclaimed by ArcSwap's epoch-based GC once the
     /// last in-flight reader exits.
-    config: ArcSwap<ResolvedAppConfig>,
+    ///
+    /// Wrapped in `Arc<...>` so the config watcher (in `reload.rs`) can
+    /// hold its own clone for `store()` without a back-pointer to the
+    /// whole `AppState`.
+    pub(crate) config: Arc<ArcSwap<ResolvedAppConfig>>,
     tls_acceptor: Arc<ArcSwap<tokio_rustls::TlsAcceptor>>,
     http_client: HttpClient,
     static_cache: cache::StaticCache,
@@ -436,7 +460,7 @@ async fn async_main(
     let health_map = resolved.health_map.clone();
 
     let state = Arc::new(AppState {
-        config: ArcSwap::from_pointee(resolved),
+        config: Arc::new(ArcSwap::from_pointee(resolved)),
         tls_acceptor: tls_acceptor_store,
         http_client: proxy::build_http_client(),
         static_cache: cache::StaticCache::new(),
@@ -452,6 +476,16 @@ async fn async_main(
             b
         }),
     });
+
+    // 5b. Spawn the config-file hot-reload watcher. Watches `zion.toml`
+    // for Modify/Create events; on change, parses + validates the new
+    // config and atomic-swaps `state.config`. Invalid configs are
+    // rejected with a WARN log, the previous snapshot stays in place.
+    // TLS settings (cert paths, min_version, SNI) are not currently
+    // re-applied through this watcher — the existing `tls_watcher`
+    // covers cert/key file changes; pivoting `[tls]` paths is a
+    // separate hot-reload step beyond Phase 1.
+    reload::spawn_config_watcher(config_path.clone().into(), state.config.clone());
 
     // 6. Spawn ACME auto-renewal task (if configured)
     if let Some(ref acme_config) = config.tls.acme {

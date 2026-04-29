@@ -357,6 +357,21 @@ impl Metrics {
         );
         out.extend_from_slice(b"\n");
 
+        // Hot-reload generation. Bumped on every successful zion.toml
+        // reload; lets dashboards alert on "no recent reload" or detect
+        // unexpected reload storms.
+        out.extend_from_slice(
+            b"# HELP zion_config_generation Successful zion.toml hot-reloads since process start.\n\
+                                # TYPE zion_config_generation counter\n\
+                                zion_config_generation ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(crate::reload::current_generation())
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
         out.extend_from_slice(
             b"# HELP zion_requests_by_status Requests by status class.\n\
                                 # TYPE zion_requests_by_status counter\n\
@@ -542,6 +557,10 @@ pub fn snapshot_json(
         "version": env!("CARGO_PKG_VERSION"),
         "timestamp_ms": now_ms,
         "uptime_secs": uptime_secs(),
+        // Monotonic counter bumped once per successful zion.toml
+        // hot-reload. Lets the operator confirm a reload landed and
+        // see *which* snapshot a given request would currently use.
+        "config_generation": crate::reload::current_generation(),
         "platform": {
             "os": platform.os,
             "arch": platform.arch,
