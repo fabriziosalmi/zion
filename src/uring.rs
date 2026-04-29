@@ -157,9 +157,16 @@ mod inner {
     }
 }
 
-// Only `spawn_uring_accept` is consumed externally (by main.rs).
-// `AcceptedConn` is the channel item type — internal to this module —
-// and was previously re-exported but never used by any caller, so the
-// re-export was dead.
+// `spawn_uring_accept` is consumed externally (main.rs spawns the
+// uring accept thread). `AcceptedConn` re-export is required because
+// the cfg-gated `run_https_accept_loop` signature in main.rs names it
+// in its parameter list — without the re-export the type is reachable
+// only as `inner::AcceptedConn`, which is an inaccessible private path.
+//
+// (The re-export was removed once in v0.1.7 as suspected dead code;
+// Phase 1.5 reintroduced the dependency by giving the io_uring branch
+// an `Option<Receiver<AcceptedConn>>` parameter rather than hiding the
+// receiver inside a dyn-typed boundary. Re-exposing the type here is
+// the smallest fix.)
 #[cfg(all(target_os = "linux", feature = "io-uring-accept"))]
-pub use inner::spawn_uring_accept;
+pub use inner::{spawn_uring_accept, AcceptedConn};
