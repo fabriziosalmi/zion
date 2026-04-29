@@ -17,6 +17,7 @@ A change to *both* (e.g. swap to a new cert AND rewire routes in one editor save
 
 Everything below is re-applied at the next request after the swap. In-flight requests continue with the snapshot they loaded — see [Snapshot consistency](#snapshot-consistency).
 
+* `[server.listen_http]` / `[server.listen_https]` *(Phase 1.5)* — Zion binds the new address, spawns a fresh accept loop, and tells the previous listener to stop accepting. Connections already accepted by the old listener continue under the connection-limit semaphore until they finish. Bind failures (port in use, permission denied) log a structured WARN and **keep the existing listener** — a typo never strands the daemon. Caveats: see [Listener rebind caveats](#listener-rebind-caveats-phase-15).
 * `[server.rate_limit_rps]`, `[server.rate_limit_window_secs]`
 * `[server.trusted_proxies]`
 * `[server.xff_mode]` (`append` | `rewrite` | `drop`)
@@ -37,15 +38,27 @@ Independent of `zion.toml`, the TLS watcher fires on changes to:
 
 The `ServerConfig` is rebuilt from disk on the blocking thread pool (so file I/O does not stall the runtime), then atomic-swapped. ALPN, session tickets, 0-RTT settings, and mTLS verifier are reconstituted from the same `[tls]` section that is currently loaded.
 
-## Out of scope (Phase 1)
+## Listener rebind caveats (Phase 1.5)
+
+The supervisor that reconciles `listen_*` to live listeners is conservative on purpose. Three behaviours worth pinning explicitly:
+
+1. **Bind failure keeps the existing listener.** If the new address can't be bound — port already in use, no `CAP_NET_BIND_SERVICE` for `:80` / `:443`, malformed string, etc. — the supervisor logs a structured WARN and **does nothing else**. The previous listener keeps serving. There is no fallback, no retry loop; the next config reload (or a manual edit-and-save) gets another shot.
+
+2. **Removing `listen_http` is a no-op.** If `[server.listen_http]` is dropped or set to an empty string in the new config, the supervisor leaves the existing HTTP listener in place. The intent is conservatism — losing the ACME challenge proxy or the 301-to-HTTPS redirect by mistake is a worse outcome than ignoring a possibly-deliberate removal. To stop accepting on `:80`, restart the process. (`listen_https` is treated the same way: an empty/missing value never tears down the existing primary listener.)
+
+3. **`--features io-uring-accept`: HTTPS rebind is not supported.** The uring accept thread is bound to the listener's file descriptor at startup; rebinding would require tearing down and respawning the uring thread, which is out of scope for Phase 1.5. The supervisor logs `HTTPS rebind to X skipped: --features io-uring-accept is incompatible with rebind in Phase 1.5; restart required` and keeps the original listener. HTTP rebind continues to work in this build flavour. Operators who pivot HTTPS ports often should stay off the io_uring feature, or restart on each pivot.
+
+These three rules answer "what happens if I…" deterministically; nothing on the listener supervisor side ever silently degrades availability.
+
+## Out of scope (Phase 1 + Phase 1.5)
 
 These do not hot-reload — they require a process restart:
 
-* `[server.listen_http]` / `[server.listen_https]` — changing a bind address means rebinding sockets. Reserved for a future Phase 1.5; until then, edit, then `systemctl restart zion` (or equivalent).
 * The path of `[tls]` cert/key files in `zion.toml` itself — the cert *content* hot-reloads (TLS watcher reads the current path on each reload), but if you point `cert_path` at a brand-new file, the TLS watcher is still subscribed to the old directory until restart.
 * `[server.log_format]` — read once at startup by `logging::init`. Restart to switch between `text` and `json`.
-* HTTP/3 listener (`--features http3`) — currently rebuilds on TLS reload only; config-side QUIC settings are not hot-applied.
+* HTTP/3 listener (`--features http3`) — currently rebuilds on TLS reload only; config-side QUIC settings (incl. listen address) are not hot-applied.
 * `[tls.acme]` (with `--features acme`) — the renewal task is spawned at boot from the initial config; changing email / domains / state_dir requires restart.
+* `--features io-uring-accept`: HTTPS listener rebind. See caveat above.
 * Build-time toggles: cargo features, allocator, target-cpu.
 
 ## Snapshot consistency
