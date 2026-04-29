@@ -199,6 +199,10 @@ pub async fn proxy_pass(
 
 /// Forward a request whose body has already been collected (post-WAF path).
 #[allow(dead_code)] // retained for symmetric API; not currently called
+#[allow(clippy::too_many_arguments)] // 8/7 — the caller path here is
+// already a low-frequency post-WAF re-emit; collapsing into a struct
+// would force every (currently zero) caller to allocate or borrow it,
+// which is the wrong trade-off until at least one caller exists.
 #[inline]
 pub async fn proxy_pass_bytes(
     client: &HttpClient,

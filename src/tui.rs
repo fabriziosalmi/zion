@@ -56,6 +56,13 @@ struct Snapshot {
     upstreams: Vec<UpstreamSnap>,
 }
 
+/// Mirrors the `platform` object of `/_zion/snapshot.json`. Several
+/// fields are not consumed by the current renderer but must still be
+/// deserialised so the TUI degrades gracefully against future daemons
+/// that emit a richer payload (and so the field set documents the wire
+/// contract). One single struct-level `allow(dead_code)` is preferred
+/// over per-field annotations to keep the contract visually intact.
+#[allow(dead_code)]
 #[derive(Deserialize, Clone, Debug)]
 struct PlatformSnap {
     os: String,
@@ -67,11 +74,8 @@ struct PlatformSnap {
     projected_kreqs_cached: u64,
     projected_kreqs_dynamic: u64,
     has_aes_ni: bool,
-    #[allow(dead_code)]
     has_sha256: bool,
-    #[allow(dead_code)]
     has_avx2: bool,
-    #[allow(dead_code)]
     has_neon: bool,
     has_so_reuseport: bool,
     has_tcp_fastopen: bool,

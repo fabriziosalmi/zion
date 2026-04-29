@@ -12,16 +12,12 @@
 //! mod quic;` in main.rs, so the inner attribute was redundant and triggered
 //! `clippy::duplicated_attributes`.
 
-use bytes::Buf;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::config::TlsConfig;
 use crate::metrics;
-use crate::proxy::ZionBody;
-use crate::{logging, waf};
 
 /// Pre-built Alt-Svc header value for HTTP/3 advertisement.
 pub static ALT_SVC_H3: hyper::header::HeaderValue =
@@ -179,6 +175,14 @@ pub fn spawn_quic_listener(
 }
 
 /// Send an H3 error response.
+///
+/// Reserved for the QUIC error path; not currently called by the
+/// `quic.rs` request loop, which lets hyper translate WAF/router denials
+/// into HTTP responses on the H3 stream like any other status. Kept as a
+/// documented helper because reaching for it again is the natural fix
+/// the next time the H3 path needs to short-circuit before constructing
+/// a `Response`.
+#[allow(dead_code)]
 async fn h3_error_response<S>(
     stream: &mut h3::server::RequestStream<S, Bytes>,
     status: hyper::StatusCode,

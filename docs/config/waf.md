@@ -153,7 +153,7 @@ The current category breakdown is summarised below; consult the source for the e
 - **Command injection** — anchored on `;`, `|`, `$(`, backtick, newline followed by a binary name; `/etc/passwd`, `/etc/shadow`
 - **Path traversal** — `../../`, `..\..\`, `%2e%2e%2f`, `....//`, Windows variants
 - **SSRF / cloud metadata** — `169.254.169.254` (AWS, with hex/decimal/IPv6-mapped variants), GCP, Alibaba, Azure IMDS, DigitalOcean, Oracle, OpenStack, Kubernetes service host
-- **LDAP, XXE, SSTI** — parens-anchored LDAP filters, `<!entity`/`<!doctype`/`SYSTEM "file://"`, Jinja/JSP `{{7*7}}` markers
+- **LDAP, XXE, SSTI** — parens-anchored LDAP filters, `<!entity`/`<!doctype`/`SYSTEM "file://"`, Jinja/JSP <span v-pre>`{{7*7}}`</span> markers
 - **CRLF / header injection** — `%0d%0a`, `%0aset-cookie:`, `\r\nset-cookie:`
 - **Log4Shell / JNDI** — `${jndi:`, `${env:`, `${sys:`
 - **Prototype pollution** — `__proto__`, `constructor.prototype`

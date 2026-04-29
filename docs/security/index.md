@@ -75,10 +75,10 @@ The exact pattern lists are in [`src/waf.rs`](https://github.com/fabriziosalmi/z
 | Command injection | Anchored on `;`, `|`, `$(`, backtick, newline + binary; `/etc/passwd`, `/etc/shadow` | `cmd.exe`, `powershell` |
 | Path traversal | `../../`, `..\..\`, `%2e%2e%2f`, `....//`, Windows variants | — |
 | SSRF / cloud metadata | AWS, GCP, Alibaba, Azure IMDS, DigitalOcean, Oracle, OpenStack, Kubernetes service host (with hex/decimal/IPv6-mapped variants) | — |
-| LDAP / XXE / SSTI | Parens-anchored LDAP filters, `<!entity`, `SYSTEM "file://"`, Jinja/JSP `{{7*7}}` | — |
+| LDAP / XXE / SSTI | Parens-anchored LDAP filters, `<!entity`, `SYSTEM "file://"`, Jinja/JSP <span v-pre>`{{7*7}}`</span> | — |
 | CRLF / header injection | `%0d%0a`, `%0aset-cookie:`, `\r\nset-cookie:` | — |
 | Log4Shell / JNDI | `${jndi:`, `${env:`, `${sys:` | — |
-| Prototype pollution | `__proto__`, `constructor.prototype` | `{{constructor`, `{{.constructor`, `this.constructor` |
+| Prototype pollution | `__proto__`, `constructor.prototype` | <span v-pre>`{{constructor`, `{{.constructor`</span>, `this.constructor` |
 | PHP | `unserialize(`, `php://input`, `php://filter`, `phar://` | — |
 | GraphQL introspection | `{__schema`, `{__type`, `query{__` | Lone tokens `__schema`, `__type`, `mutation{` |
 | NoSQL operators | — | `$gt`, `$ne`, `$regex`, `$where`, `$lookup`, `db.collection`, `.find({` |
