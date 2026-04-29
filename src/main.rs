@@ -701,36 +701,20 @@ async fn async_main(
     let listener = net::bind_with_reuseport(https_addr)?;
     eprintln!("  listening HTTPS on {}", https_addr);
 
-    // 11. Spawn the HTTP accept loop now that the listener is bound and logged.
+    // 11. Spawn the HTTP accept loop. The loop is now a free function
+    // (`run_http_accept_loop`) so Phase 1.5 can spawn / drain / respawn it
+    // when `[server.listen_http]` changes — Phase 1 just spawns it once.
+    // A `watch::Receiver<bool>` is reserved for that future use; in this
+    // refactor we hold the sender for the lifetime of the process so the
+    // channel never closes (which would otherwise terminate the loop on
+    // its first poll of `changed()`).
+    let (accept_shutdown_tx, accept_shutdown_rx) = tokio::sync::watch::channel(false);
     if let Some(http_listener) = http_listener {
-        let state_http = state.clone();
-        tokio::spawn(async move {
-            loop {
-                let (stream, addr) = match http_listener.accept().await {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        eprintln!("  http accept error: {}", e);
-                        continue;
-                    }
-                };
-
-                let state = state_http.clone();
-                let builder = state.http_builder.clone();
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let _ = builder
-                        .serve_connection(
-                            io,
-                            service_fn(move |req| {
-                                use http_body_util::BodyExt;
-                                let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
-                                handle_http(req_boxed, state.clone(), addr)
-                            }),
-                        )
-                        .await;
-                });
-            }
-        });
+        tokio::spawn(run_http_accept_loop(
+            http_listener,
+            state.clone(),
+            accept_shutdown_rx.clone(),
+        ));
     }
 
     // io_uring multishot accept on Linux (one syscall for N connections)
@@ -755,171 +739,37 @@ async fn async_main(
 
     bootstrap::print_ready_banner(&config.server.listen_http, &config.server.listen_https);
 
-    let mut shutdown = std::pin::pin!(shutdown_signal());
-
-    loop {
-        // Accept path: io_uring on Linux, standard tokio everywhere else
-        let accepted: Option<(tokio::net::TcpStream, SocketAddr)>;
-
+    // Spawn the HTTPS accept loop on its own task — same shape as the HTTP
+    // loop above. The accept-loop functions stop on the next iteration when
+    // `accept_shutdown_tx` flips to `true`; we wait on `shutdown_signal()`
+    // here in the main task and then trigger it.
+    let https_handle = {
+        let state = state.clone();
+        let shutdown_rx = accept_shutdown_rx.clone();
         #[cfg(all(target_os = "linux", feature = "io-uring-accept"))]
         {
-            tokio::select! {
-                conn = uring_rx.recv() => {
-                    accepted = conn.map(|c| (c.stream, c.addr));
-                }
-                _ = &mut shutdown => {
-                    logging::info("shutdown", "signal received, draining in-flight connections...");
-                    break;
-                }
-            }
+            tokio::spawn(run_https_accept_loop(
+                listener,
+                state,
+                shutdown_rx,
+                Some(uring_rx),
+            ))
         }
-
         #[cfg(not(all(target_os = "linux", feature = "io-uring-accept")))]
         {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok(conn) => { accepted = Some(conn); }
-                        Err(e) => {
-                            eprintln!("  https accept error: {}", e);
-                            accepted = None;
-                        }
-                    }
-                }
-                _ = &mut shutdown => {
-                    logging::info("shutdown", "signal received, draining in-flight connections...");
-                    break;
-                }
-            }
+            tokio::spawn(run_https_accept_loop(listener, state, shutdown_rx))
         }
+    };
 
-        let Some((tcp_stream, remote_addr)) = accepted else {
-            continue;
-        };
-
-        // Connection limit — fast atomic check, no Arc clone
-        let permit = match state.conn_limit.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                drop(tcp_stream);
-                continue;
-            }
-        };
-
-        let state = state.clone();
-        let acceptor = state.tls_acceptor.load_full();
-        let builder = state.http_builder.clone();
-
-        tokio::spawn(async move {
-            let _permit = permit;
-            let _conn_guard = metrics::ConnectionGuard::new();
-            let _ = tcp_stream.set_nodelay(true);
-            net::tune_accepted(&tcp_stream);
-            metrics::METRICS
-                .connections_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-            let tls_start = std::time::Instant::now();
-            let mut tls_stream = match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                (*acceptor).accept(tcp_stream),
-            )
-            .await
-            {
-                Ok(Ok(s)) => {
-                    metrics::METRICS
-                        .tls_handshake_duration
-                        .observe(tls_start.elapsed());
-                    s
-                }
-                _ => {
-                    metrics::METRICS
-                        .tls_handshake_errors
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return;
-                }
-            };
-
-            // 0-RTT: Check if this connection accepted early data.
-            // Only the first request on the connection can be early data.
-            // We pass this flag to handle_https for method gating (425 Too Early).
-            // rustls ServerConnection::early_data() returns Some if 0-RTT was
-            // accepted during the handshake (was_accepted() flag persists).
-            let is_early_data = tls_stream.get_mut().1.early_data().is_some();
-            let early_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(is_early_data));
-
-            // mTLS: extract a stable, collision-resistant identifier for the
-            // peer certificate. SHA-256 of the leaf DER, hex-encoded with a
-            // `sha256:` prefix — same convention as openssl/nginx
-            // ($ssl_client_fingerprint) and CA tooling. Forwarded as
-            // `X-Client-Cert-Fingerprint`. Upstream apps can map fingerprint
-            // → identity via their own roster; Zion does NOT claim this is a
-            // Distinguished Name (the previous header `X-Client-Cert-DN` was
-            // a 64-bit XOR-fold and was removed because it implied semantics
-            // it could not provide and was unsafe for ACL use).
-            let client_cert_fingerprint: Option<String> = tls_stream
-                .get_ref()
-                .1
-                .peer_certificates()
-                .and_then(|certs| certs.first())
-                .map(|cert| {
-                    let der = cert.as_ref();
-                    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der);
-                    let bytes = digest.as_ref();
-                    let mut s = String::with_capacity(7 + bytes.len() * 2);
-                    s.push_str("sha256:");
-                    for &b in bytes {
-                        s.push(HEX_DIGITS[(b >> 4) as usize] as char);
-                        s.push(HEX_DIGITS[(b & 0xF) as usize] as char);
-                    }
-                    s
-                });
-            let client_fp = client_cert_fingerprint.map(std::sync::Arc::new);
-
-            let io = TokioIo::new(tls_stream);
-            // Connection-level idle timeout. Set high (1 hour) because this
-            // wraps the entire HTTP/2 mux / WebSocket / SSE connection, not
-            // individual requests. Per-request timeouts are in process_request.
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(3600),
-                builder.serve_connection_with_upgrades(
-                    io,
-                    service_fn(move |mut req: Request<Incoming>| {
-                        let state = state.clone();
-                        let early_flag = early_flag.clone();
-                        let client_fp = client_fp.clone();
-                        async move {
-                            // Fast-path: health probes bypass the full pipeline (~1us vs ~5us)
-                            let path = req.uri().path();
-                            if path == "/healthz" {
-                                return Ok(text_response(StatusCode::OK, "ok"));
-                            }
-                            if path == "/readyz" {
-                                return Ok(text_response(StatusCode::OK, "ready"));
-                            }
-
-                            // Consume early_data flag on first request
-                            let was_early =
-                                early_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
-                            // Inject client cert fingerprint if mTLS authenticated.
-                            // Format: "sha256:HEX..." (64 hex chars). All bytes are
-                            // ASCII, so HeaderValue::from_str cannot fail in practice;
-                            // we still handle the Result for safety.
-                            if let Some(ref fp) = client_fp {
-                                if let Ok(val) = hyper::header::HeaderValue::from_str(fp) {
-                                    req.headers_mut().insert("X-Client-Cert-Fingerprint", val);
-                                }
-                            }
-                            use http_body_util::BodyExt;
-                            let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
-                            process_request(req_boxed, state, remote_addr, was_early).await
-                        }
-                    }),
-                ),
-            )
-            .await;
-        });
-    }
+    shutdown_signal().await;
+    logging::info("shutdown", "signal received, draining in-flight connections...");
+    // Tell the accept loops to stop accepting new connections. Existing
+    // tasks (one per accepted connection) continue independently and are
+    // drained by the semaphore wait below.
+    let _ = accept_shutdown_tx.send(true);
+    // Best-effort wait on the HTTPS accept loop to exit cleanly. Bounded
+    // by the same drain timeout below — if it hangs we don't block forever.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), https_handle).await;
 
     // Graceful drain: wait for in-flight connections to complete.
     // conn_limit has MAX permits; available = MAX - in_flight.
@@ -965,6 +815,253 @@ async fn async_main(
 }
 
 // Network socket helpers (bind_with_reuseport, tune_accepted) are in net.rs.
+
+// ──────────────────────────────────────────────────────────────────────
+// Accept-loop functions
+//
+// Extracted as free functions in Phase 1.5 so that the listener
+// supervisor can spawn / drain / respawn them when `[server.listen_*]`
+// changes in `zion.toml`. Behaviour is identical to the previous
+// inline `tokio::spawn(async move { ... })` blocks; the only addition
+// is a `watch::Receiver<bool>` shutdown channel that lets the main
+// task tell the loops to stop accepting (existing connection tasks
+// continue independently).
+// ──────────────────────────────────────────────────────────────────────
+
+/// Run the plain-HTTP accept loop on the given listener until
+/// `shutdown_rx` flips to `true` or the channel closes. New incoming
+/// TCP connections are spawned as detached tasks; the loop never owns
+/// them, so terminating the loop does not interrupt active requests.
+async fn run_http_accept_loop(
+    http_listener: tokio::net::TcpListener,
+    state: Arc<AppState>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            res = shutdown_rx.changed() => {
+                // Either the sender flipped to `true` or the channel closed.
+                // In both cases we stop accepting; live connections continue.
+                if res.is_err() || *shutdown_rx.borrow() {
+                    return;
+                }
+            }
+            accept = http_listener.accept() => {
+                let (stream, addr) = match accept {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("  http accept error: {}", e);
+                        continue;
+                    }
+                };
+                let conn_state = state.clone();
+                let builder = state.http_builder.clone();
+                tokio::spawn(handle_http_connection(stream, addr, conn_state, builder));
+            }
+        }
+    }
+}
+
+/// Single HTTP/1.1 connection on port 80 — runs until the client closes.
+/// Extracted from the previous inline spawn; behaviour unchanged.
+async fn handle_http_connection(
+    stream: tokio::net::TcpStream,
+    addr: SocketAddr,
+    state: Arc<AppState>,
+    builder: Arc<AutoBuilder<TokioExecutor>>,
+) {
+    let io = TokioIo::new(stream);
+    let _ = builder
+        .serve_connection(
+            io,
+            service_fn(move |req| {
+                use http_body_util::BodyExt;
+                let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
+                handle_http(req_boxed, state.clone(), addr)
+            }),
+        )
+        .await;
+}
+
+/// Run the HTTPS / TLS accept loop. On non-Linux or without the
+/// `io-uring-accept` feature this is a plain `listener.accept()` loop;
+/// with `io-uring-accept` the accepted-connection stream is consumed
+/// from the kernel-batched receiver instead. The two paths are
+/// cfg-gated to avoid pulling io_uring symbols on platforms that
+/// don't have them.
+#[cfg(not(all(target_os = "linux", feature = "io-uring-accept")))]
+async fn run_https_accept_loop(
+    listener: tokio::net::TcpListener,
+    state: Arc<AppState>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            res = shutdown_rx.changed() => {
+                if res.is_err() || *shutdown_rx.borrow() {
+                    return;
+                }
+            }
+            accept = listener.accept() => {
+                let (tcp_stream, remote_addr) = match accept {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("  https accept error: {}", e);
+                        continue;
+                    }
+                };
+                spawn_https_handler(tcp_stream, remote_addr, state.clone());
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring-accept"))]
+async fn run_https_accept_loop(
+    _listener: tokio::net::TcpListener,
+    state: Arc<AppState>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut uring_rx: Option<tokio::sync::mpsc::Receiver<uring::AcceptedConn>>,
+) {
+    let Some(mut uring_rx) = uring_rx.take() else {
+        return;
+    };
+    loop {
+        tokio::select! {
+            biased;
+            res = shutdown_rx.changed() => {
+                if res.is_err() || *shutdown_rx.borrow() {
+                    return;
+                }
+            }
+            conn = uring_rx.recv() => {
+                let Some(conn) = conn else { return; };
+                spawn_https_handler(conn.stream, conn.addr, state.clone());
+            }
+        }
+    }
+}
+
+/// Common path for spawning a single HTTPS connection task: enforces
+/// the connection-limit semaphore, performs the TLS handshake, extracts
+/// 0-RTT and mTLS-fingerprint context, then drives `serve_connection_with_upgrades`.
+fn spawn_https_handler(
+    tcp_stream: tokio::net::TcpStream,
+    remote_addr: SocketAddr,
+    state: Arc<AppState>,
+) {
+    // Connection limit — fast atomic check, no Arc clone.
+    let permit = match state.conn_limit.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            drop(tcp_stream);
+            return;
+        }
+    };
+
+    let acceptor = state.tls_acceptor.load_full();
+    let builder = state.http_builder.clone();
+
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _conn_guard = metrics::ConnectionGuard::new();
+        let _ = tcp_stream.set_nodelay(true);
+        net::tune_accepted(&tcp_stream);
+        metrics::METRICS
+            .connections_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let tls_start = std::time::Instant::now();
+        let mut tls_stream = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            (*acceptor).accept(tcp_stream),
+        )
+        .await
+        {
+            Ok(Ok(s)) => {
+                metrics::METRICS
+                    .tls_handshake_duration
+                    .observe(tls_start.elapsed());
+                s
+            }
+            _ => {
+                metrics::METRICS
+                    .tls_handshake_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        };
+
+        // 0-RTT: Check if this connection accepted early data. Only the
+        // first request on the connection can be early data. We pass
+        // this flag to handle_https for method gating (425 Too Early).
+        let is_early_data = tls_stream.get_mut().1.early_data().is_some();
+        let early_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(is_early_data));
+
+        // mTLS: stable SHA-256 fingerprint of the leaf cert DER. See the
+        // module-level rationale in v0.1.7 — replaced the previous XOR
+        // pseudo-DN. Forwarded as `X-Client-Cert-Fingerprint`.
+        let client_cert_fingerprint: Option<String> = tls_stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|cert| {
+                let der = cert.as_ref();
+                let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der);
+                let bytes = digest.as_ref();
+                let mut s = String::with_capacity(7 + bytes.len() * 2);
+                s.push_str("sha256:");
+                for &b in bytes {
+                    s.push(HEX_DIGITS[(b >> 4) as usize] as char);
+                    s.push(HEX_DIGITS[(b & 0xF) as usize] as char);
+                }
+                s
+            });
+        let client_fp = client_cert_fingerprint.map(std::sync::Arc::new);
+
+        let io = TokioIo::new(tls_stream);
+        // Connection-level idle timeout. 1h to cover long-lived HTTP/2
+        // mux / WebSocket / SSE; per-request timeouts are in process_request.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            builder.serve_connection_with_upgrades(
+                io,
+                service_fn(move |mut req: Request<Incoming>| {
+                    let state = state.clone();
+                    let early_flag = early_flag.clone();
+                    let client_fp = client_fp.clone();
+                    async move {
+                        // Fast-path: health probes bypass the full pipeline (~1us vs ~5us).
+                        let path = req.uri().path();
+                        if path == "/healthz" {
+                            return Ok(text_response(StatusCode::OK, "ok"));
+                        }
+                        if path == "/readyz" {
+                            return Ok(text_response(StatusCode::OK, "ready"));
+                        }
+
+                        // Consume early_data flag on first request.
+                        let was_early =
+                            early_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
+                        // Inject mTLS fingerprint header if the peer presented a cert.
+                        if let Some(ref fp) = client_fp {
+                            if let Ok(val) = hyper::header::HeaderValue::from_str(fp) {
+                                req.headers_mut().insert("X-Client-Cert-Fingerprint", val);
+                            }
+                        }
+                        use http_body_util::BodyExt;
+                        let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
+                        process_request(req_boxed, state, remote_addr, was_early).await
+                    }
+                }),
+            ),
+        )
+        .await;
+    });
+}
 
 /// Wait for SIGINT (Ctrl+C) or SIGTERM.
 async fn shutdown_signal() {
