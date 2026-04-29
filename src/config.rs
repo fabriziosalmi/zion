@@ -50,6 +50,23 @@ pub struct ServerConfig {
     /// Example: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// X-Forwarded-For policy applied to outbound requests to upstreams.
+    ///
+    /// * `"append"` (default): preserve any inbound XFF chain and append
+    ///   the resolved client IP. Compatible with deployments where Zion
+    ///   sits behind a sanitising edge (CDN/ALB).
+    /// * `"rewrite"`: drop inbound XFF and emit a single trusted entry —
+    ///   the resolved client IP. Recommended when Zion is the front edge.
+    /// * `"drop"`: strip inbound XFF; emit nothing. Use when upstreams
+    ///   must not learn the client IP at all.
+    ///
+    /// Invalid values fall back to `"append"` with a startup warning.
+    #[serde(default = "default_xff_mode")]
+    pub xff_mode: String,
+}
+
+fn default_xff_mode() -> String {
+    "append".to_string()
 }
 
 fn default_log_format() -> String {
@@ -126,6 +143,10 @@ pub struct SniCert {
     pub key_path: String,
 }
 
+/// Always deserialized so users get a clear "unknown ACME field" error
+/// even on builds without `--features acme`. The fields below are only
+/// READ by acme.rs, which is feature-gated; hence the targeted allow.
+#[allow(dead_code)]
 #[derive(Deserialize, Clone, Debug)]
 pub struct AcmeConfig {
     /// Contact email for Let's Encrypt (required).
@@ -211,8 +232,32 @@ pub(crate) fn default_client_auth() -> String {
 // WAF PROFILES (layered, named, per-route)
 // ============================================================================
 
+/// WAF detection mode — selects which Aho-Corasick pattern set is scanned.
+///
+/// `Balanced` (default): high-precision patterns. SQLi/XSS tags/path traversal/
+/// SSRF/XXE/Log4Shell/CRLF/SSTI/most LDAP and PHP patterns. Tuned to keep the
+/// false-positive rate low for content-bearing APIs (comments, code paste,
+/// docs, payloads with base64).
+///
+/// `Aggressive`: balanced PLUS broad-substring patterns that catch more
+/// attacks but also flag legitimate developer/tooling content. Use this on
+/// strict admin paths, never on user-content APIs unless you've measured the
+/// FP rate. Examples added under aggressive: `alert(`, `eval(`,
+/// `document.cookie`, `innerhtml`, `os.system(`, `pickle.loads`,
+/// `Runtime.getRuntime`, `$gt`/`$ne`/`$regex` (unanchored MongoDB ops), and
+/// generic XSS event handlers like `onclick=`/`onmouseover=`.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WafMode {
+    #[default]
+    Balanced,
+    Aggressive,
+}
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct WafProfile {
+    #[serde(default)]
+    pub mode: WafMode,
     #[serde(default = "default_max_body_mb")]
     pub max_body_mb: u64,
     #[serde(default = "default_max_depth")]
@@ -223,6 +268,17 @@ pub struct WafProfile {
     pub deny_unknown_content_types: bool,
     #[serde(default = "default_allowed_content_types")]
     pub allowed_content_types: Vec<String>,
+    /// Run Shannon-entropy gate on bodies ≥256 bytes. When true, denies
+    /// requests whose entropy exceeds `entropy_threshold`. Default: true.
+    /// Disable on routes that legitimately accept high-entropy payloads
+    /// (binary uploads as JSON-base64, encrypted blobs, signed envelopes).
+    #[serde(default = "default_true")]
+    pub entropy_check: bool,
+    /// Entropy threshold in bits/byte. Default: 6.5 — leaves headroom above
+    /// pure base64 (6.0 theoretical max) so JWTs, signed URLs and base64
+    /// payloads are not flagged. Random/encrypted content sits at ~7.5–8.0.
+    #[serde(default = "default_entropy_threshold")]
+    pub entropy_threshold: f64,
 }
 
 fn default_max_body_mb() -> u64 {
@@ -240,15 +296,21 @@ fn default_allowed_content_types() -> Vec<String> {
         "multipart/form-data".to_string(),
     ]
 }
+fn default_entropy_threshold() -> f64 {
+    6.5
+}
 
 impl Default for WafProfile {
     fn default() -> Self {
         Self {
+            mode: WafMode::default(),
             max_body_mb: default_max_body_mb(),
             max_depth: default_max_depth(),
             max_string_len: default_max_string_len(),
             deny_unknown_content_types: true,
             allowed_content_types: default_allowed_content_types(),
+            entropy_check: true,
+            entropy_threshold: default_entropy_threshold(),
         }
     }
 }

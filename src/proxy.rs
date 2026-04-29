@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
-use hyper::body::Incoming;
 use hyper::header::HeaderValue;
 use hyper::{Request, Response, StatusCode, Version};
 use hyper_util::client::legacy::Client;
@@ -8,6 +7,44 @@ use hyper_util::rt::TokioExecutor;
 #[allow(unused_imports)]
 use std::fmt::Write;
 use std::net::SocketAddr;
+
+/// How Zion treats the inbound `X-Forwarded-For` header before forwarding.
+///
+/// * `Append` (default): preserve the inbound chain, append the resolved
+///   client IP. Compatible with the prior behaviour and correct when Zion
+///   sits behind a sanitising edge (Cloudflare, ALB, etc.) AND the
+///   downstream app reads the *rightmost-trusted* hop. Vulnerable to
+///   client-side spoofing of the leftmost entry when Zion is the front
+///   edge — apps that read XFF[0] would consume an attacker-controlled IP.
+/// * `Rewrite` (recommended for front-edge): drop any inbound XFF and
+///   replace with a single trusted entry — the IP returned by
+///   `TrustedProxies::resolve_client_ip`. Downstream apps see a clean,
+///   one-hop chain regardless of what the client tried to inject.
+/// * `Drop`: strip inbound XFF and add nothing. Use when upstreams must
+///   not learn the original client IP at all.
+///
+/// `X-Real-IP` is always set to the resolved client IP (no inbound trust).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum XffMode {
+    #[default]
+    Append,
+    Rewrite,
+    Drop,
+}
+
+impl XffMode {
+    /// Parse from config string (lowercase). Unknown values fall back to
+    /// `Append` so a typo doesn't degrade security silently — but the
+    /// caller is expected to validate and warn.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "append" => Some(Self::Append),
+            "rewrite" => Some(Self::Rewrite),
+            "drop" => Some(Self::Drop),
+            _ => None,
+        }
+    }
+}
 
 // Pre-parsed static header values — zero cost at runtime.
 static PROTO_HTTPS: HeaderValue = HeaderValue::from_static("https");
@@ -60,6 +97,7 @@ fn prepare_request<B>(
     authority: &hyper::http::uri::Authority,
     remote_addr: Option<SocketAddr>,
     proto: &str,
+    xff_mode: XffMode,
 ) -> Option<Request<B>> {
     let path_and_query = req
         .uri()
@@ -90,8 +128,17 @@ fn prepare_request<B>(
     req.headers_mut().remove("Proxy-Connection");
     req.headers_mut().remove("Keep-Alive");
 
-    // Forwarding headers — append to X-Forwarded-For chain (preserves upstream proxies),
-    // set X-Real-IP to the direct client IP.
+    // ── X-Forwarded-For policy ──
+    // For Rewrite/Drop modes we MUST strip any inbound XFF first, otherwise
+    // an attacker-controlled leftmost entry survives to upstream apps that
+    // read XFF[0] for ACL/audit. For Append we keep the inbound chain.
+    if matches!(xff_mode, XffMode::Rewrite | XffMode::Drop) {
+        req.headers_mut().remove("X-Forwarded-For");
+    }
+
+    // X-Real-IP: always set to the resolved client IP (caller passes the
+    // already-resolved address). Inbound X-Real-IP is never trusted —
+    // overwrite unconditionally.
     if let Some(addr) = remote_addr {
         thread_local! {
             static IP_BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(45));
@@ -101,10 +148,20 @@ fn prepare_request<B>(
             buf.clear();
             let _ = write!(buf, "{}", addr.ip());
             if let Ok(val) = HeaderValue::from_str(&buf) {
-                // X-Forwarded-For: append to existing chain (proxy1, proxy2, client)
-                // so upstream sees the full trust chain when Zion is behind an LB.
-                req.headers_mut().append("X-Forwarded-For", val.clone());
-                // X-Real-IP: always the direct connection IP (last hop)
+                match xff_mode {
+                    XffMode::Append => {
+                        // Preserve inbound chain, append our resolved IP.
+                        req.headers_mut().append("X-Forwarded-For", val.clone());
+                    }
+                    XffMode::Rewrite => {
+                        // Single-entry chain; insert (not append) to overwrite
+                        // anything that survived the strip above (defensive).
+                        req.headers_mut().insert("X-Forwarded-For", val.clone());
+                    }
+                    XffMode::Drop => {
+                        // No XFF emitted at all.
+                    }
+                }
                 req.headers_mut().insert("X-Real-IP", val);
             }
         });
@@ -130,8 +187,9 @@ pub async fn proxy_pass(
     authority: &hyper::http::uri::Authority,
     remote_addr: Option<SocketAddr>,
     proto: &str,
+    xff_mode: XffMode,
 ) -> Result<Response<ZionBody>, hyper::Error> {
-    let Some(req) = prepare_request(req, scheme, authority, remote_addr, proto) else {
+    let Some(req) = prepare_request(req, scheme, authority, remote_addr, proto, xff_mode) else {
         return Ok(bad_gateway());
     };
     let (parts, body) = req.into_parts();
@@ -140,6 +198,7 @@ pub async fn proxy_pass(
 }
 
 /// Forward a request whose body has already been collected (post-WAF path).
+#[allow(dead_code)] // retained for symmetric API; not currently called
 #[inline]
 pub async fn proxy_pass_bytes(
     client: &HttpClient,
@@ -149,12 +208,14 @@ pub async fn proxy_pass_bytes(
     authority: &hyper::http::uri::Authority,
     remote_addr: SocketAddr,
     proto: &str,
+    xff_mode: XffMode,
 ) -> Result<Response<ZionBody>, hyper::Error> {
     let body: ZionBody = Full::new(body_bytes)
         .map_err(|never| match never {})
         .boxed();
     let req = Request::from_parts(parts, body);
-    let Some(req) = prepare_request(req, scheme, authority, Some(remote_addr), proto) else {
+    let Some(req) = prepare_request(req, scheme, authority, Some(remote_addr), proto, xff_mode)
+    else {
         return Ok(bad_gateway());
     };
     send_request(client, req).await
@@ -169,8 +230,9 @@ pub async fn proxy_pass_stream(
     authority: &hyper::http::uri::Authority,
     remote_addr: Option<SocketAddr>,
     proto: &str,
+    xff_mode: XffMode,
 ) -> Result<Response<ZionBody>, hyper::Error> {
-    let Some(req) = prepare_request(req, scheme, authority, remote_addr, proto) else {
+    let Some(req) = prepare_request(req, scheme, authority, remote_addr, proto, xff_mode) else {
         return Ok(bad_gateway());
     };
     let (parts, body) = req.into_parts();
@@ -459,7 +521,7 @@ mod tests {
     #[test]
     fn prepare_rewrites_uri() {
         let req = make_request("GET", "/api/v1/users?page=2");
-        let req = prepare_request(req, &scheme(), &authority(), None, "https").unwrap();
+        let req = prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).unwrap();
         assert_eq!(
             req.uri().to_string(),
             "http://127.0.0.1:8000/api/v1/users?page=2"
@@ -469,7 +531,7 @@ mod tests {
     #[test]
     fn prepare_sets_http11() {
         let req = make_request("GET", "/test");
-        let req = prepare_request(req, &scheme(), &authority(), None, "https").unwrap();
+        let req = prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).unwrap();
         assert_eq!(req.version(), Version::HTTP_11);
     }
 
@@ -482,7 +544,7 @@ mod tests {
             .header(hyper::header::CONNECTION, "keep-alive")
             .body(())
             .unwrap();
-        let req = prepare_request(req, &scheme(), &authority(), None, "https").unwrap();
+        let req = prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).unwrap();
         assert!(req.headers().get(hyper::header::HOST).is_none());
         assert!(req.headers().get(hyper::header::CONNECTION).is_none());
     }
@@ -491,7 +553,7 @@ mod tests {
     fn prepare_adds_forwarding_headers() {
         let req = make_request("GET", "/test");
         let addr: SocketAddr = "1.2.3.4:5678".parse().unwrap();
-        let req = prepare_request(req, &scheme(), &authority(), Some(addr), "https").unwrap();
+        let req = prepare_request(req, &scheme(), &authority(), Some(addr), "https", XffMode::Append).unwrap();
         assert_eq!(req.headers().get("X-Forwarded-For").unwrap(), "1.2.3.4");
         assert_eq!(req.headers().get("X-Real-IP").unwrap(), "1.2.3.4");
         assert_eq!(req.headers().get("X-Forwarded-Proto").unwrap(), "https");
@@ -500,14 +562,14 @@ mod tests {
     #[test]
     fn prepare_http_proto() {
         let req = make_request("GET", "/test");
-        let req = prepare_request(req, &scheme(), &authority(), None, "http").unwrap();
+        let req = prepare_request(req, &scheme(), &authority(), None, "http", XffMode::Append).unwrap();
         assert_eq!(req.headers().get("X-Forwarded-Proto").unwrap(), "http");
     }
 
     #[test]
     fn prepare_no_forwarding_without_addr() {
         let req = make_request("GET", "/test");
-        let req = prepare_request(req, &scheme(), &authority(), None, "https").unwrap();
+        let req = prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).unwrap();
         assert!(req.headers().get("X-Forwarded-For").is_none());
         assert!(req.headers().get("X-Real-IP").is_none());
     }
@@ -516,14 +578,14 @@ mod tests {
     fn prepare_ipv6_forwarding() {
         let req = make_request("GET", "/test");
         let addr: SocketAddr = "[::1]:1234".parse().unwrap();
-        let req = prepare_request(req, &scheme(), &authority(), Some(addr), "https").unwrap();
+        let req = prepare_request(req, &scheme(), &authority(), Some(addr), "https", XffMode::Append).unwrap();
         assert_eq!(req.headers().get("X-Forwarded-For").unwrap(), "::1");
     }
 
     #[test]
     fn prepare_preserves_query_string() {
         let req = make_request("GET", "/search?q=hello&page=1");
-        let req = prepare_request(req, &scheme(), &authority2(), None, "https").unwrap();
+        let req = prepare_request(req, &scheme(), &authority2(), None, "https", XffMode::Append).unwrap();
         assert_eq!(
             req.uri().to_string(),
             "http://127.0.0.1:3000/search?q=hello&page=1"
@@ -537,12 +599,147 @@ mod tests {
             .uri("http://example.com")
             .body(())
             .unwrap();
-        assert!(prepare_request(req, &scheme(), &authority(), None, "https").is_some());
+        assert!(prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).is_some());
     }
 
     #[test]
     fn bad_gateway_returns_502() {
         assert_eq!(bad_gateway().status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // ── XffMode policy tests ──
+    //
+    // These pin the contract that motivated the policy:
+    //   * Append (legacy): keep inbound chain, append our IP. A spoofed
+    //     leftmost survives — caller must trust the inbound edge.
+    //   * Rewrite: drop inbound, emit a single trusted entry. Spoofed
+    //     leftmost gets erased; downstream apps reading XFF[0] are safe.
+    //   * Drop: emit no XFF at all.
+
+    /// Helper: build a request that already carries an attacker-controlled
+    /// X-Forwarded-For header, simulating a client trying to spoof their IP.
+    fn req_with_spoofed_xff(spoofed: &str) -> Request<()> {
+        Request::builder()
+            .method("GET")
+            .uri("/test")
+            .header("X-Forwarded-For", spoofed)
+            .body(())
+            .unwrap()
+    }
+
+    fn xff_values(req: &Request<()>) -> Vec<String> {
+        req.headers()
+            .get_all("X-Forwarded-For")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn xff_append_preserves_inbound_chain() {
+        let req = req_with_spoofed_xff("9.9.9.9");
+        let addr: SocketAddr = "1.2.3.4:5000".parse().unwrap();
+        let req =
+            prepare_request(req, &scheme(), &authority(), Some(addr), "https", XffMode::Append)
+                .unwrap();
+        // Append: spoofed value is preserved as a separate header value;
+        // our resolved IP is appended. Downstream reading XFF[0] would see
+        // 9.9.9.9 — this is the documented foot-gun of `append` mode.
+        let vals = xff_values(&req);
+        assert_eq!(vals, vec!["9.9.9.9".to_string(), "1.2.3.4".to_string()]);
+        assert_eq!(req.headers().get("X-Real-IP").unwrap(), "1.2.3.4");
+    }
+
+    #[test]
+    fn xff_rewrite_strips_spoofed_and_emits_single_entry() {
+        let req = req_with_spoofed_xff("9.9.9.9");
+        let addr: SocketAddr = "1.2.3.4:5000".parse().unwrap();
+        let req =
+            prepare_request(req, &scheme(), &authority(), Some(addr), "https", XffMode::Rewrite)
+                .unwrap();
+        // Rewrite: only ONE XFF entry, equal to the resolved IP. The
+        // spoofed leftmost is gone — downstream apps cannot be tricked
+        // into trusting attacker-controlled XFF[0].
+        let vals = xff_values(&req);
+        assert_eq!(vals, vec!["1.2.3.4".to_string()]);
+        assert_eq!(req.headers().get("X-Real-IP").unwrap(), "1.2.3.4");
+    }
+
+    #[test]
+    fn xff_rewrite_strips_multi_hop_spoofed_chain() {
+        let req = req_with_spoofed_xff("evil1, evil2, evil3");
+        let addr: SocketAddr = "203.0.113.7:443".parse().unwrap();
+        let req =
+            prepare_request(req, &scheme(), &authority(), Some(addr), "https", XffMode::Rewrite)
+                .unwrap();
+        let vals = xff_values(&req);
+        assert_eq!(vals, vec!["203.0.113.7".to_string()]);
+    }
+
+    #[test]
+    fn xff_drop_emits_no_xff() {
+        let req = req_with_spoofed_xff("9.9.9.9");
+        let addr: SocketAddr = "1.2.3.4:5000".parse().unwrap();
+        let req =
+            prepare_request(req, &scheme(), &authority(), Some(addr), "https", XffMode::Drop)
+                .unwrap();
+        // Drop: no XFF at all. X-Real-IP is still set so internal
+        // deployments that rely on it for logging continue to work.
+        assert!(req.headers().get("X-Forwarded-For").is_none());
+        assert_eq!(req.headers().get("X-Real-IP").unwrap(), "1.2.3.4");
+    }
+
+    #[test]
+    fn xff_drop_strips_spoofed_even_without_remote_addr() {
+        // No remote_addr: nothing to add, but inbound XFF still gets
+        // stripped under Drop. (Defensive against downstream misuse.)
+        let req = req_with_spoofed_xff("9.9.9.9");
+        let req =
+            prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Drop).unwrap();
+        assert!(req.headers().get("X-Forwarded-For").is_none());
+        assert!(req.headers().get("X-Real-IP").is_none());
+    }
+
+    #[test]
+    fn xff_real_ip_is_never_trusted_from_inbound() {
+        // X-Real-IP must always be set from the resolved client IP, never
+        // copied from an inbound header. Verify under Append mode (the one
+        // most likely to leak inbound state).
+        let req = Request::builder()
+            .method("GET")
+            .uri("/test")
+            .header("X-Real-IP", "9.9.9.9") // attacker-supplied
+            .body(())
+            .unwrap();
+        let addr: SocketAddr = "1.2.3.4:5000".parse().unwrap();
+        let req =
+            prepare_request(req, &scheme(), &authority(), Some(addr), "https", XffMode::Append)
+                .unwrap();
+        // The X-Real-IP value must be the resolved IP, not the spoofed one.
+        let real_ip = req.headers().get("X-Real-IP").unwrap();
+        assert_eq!(real_ip, "1.2.3.4");
+    }
+
+    #[test]
+    fn xff_mode_parse_known_values() {
+        assert_eq!(XffMode::parse("append"), Some(XffMode::Append));
+        assert_eq!(XffMode::parse("rewrite"), Some(XffMode::Rewrite));
+        assert_eq!(XffMode::parse("drop"), Some(XffMode::Drop));
+    }
+
+    #[test]
+    fn xff_mode_parse_rejects_unknown() {
+        assert_eq!(XffMode::parse("APPEND"), None); // case-sensitive
+        assert_eq!(XffMode::parse("strip"), None);
+        assert_eq!(XffMode::parse(""), None);
+    }
+
+    #[test]
+    fn xff_mode_default_is_append() {
+        // The default must remain Append for zero-impact upgrades from
+        // earlier Zion versions, even at the cost of accepting the spoof
+        // foot-gun for users who don't opt in.
+        assert_eq!(XffMode::default(), XffMode::Append);
     }
 
     // ── WebSocket TLS-to-Upstream Tests ──

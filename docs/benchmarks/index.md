@@ -50,7 +50,7 @@ Both Zion and nginx run in Docker containers with identical resource limits: **1
 |---|---|---|---|
 | API GET (TLS proxy) | 12,300 | 12,500 | Parity |
 | HTML page (TLS proxy) | 10,300 | 41,700 | **+303%** |
-| WAF POST (192 patterns) | 11,900 | 11,600 | Parity |
+| WAF POST (Aho-Corasick) | 11,900 | 11,600 | Parity |
 
 ## Methodology
 

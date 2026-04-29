@@ -80,19 +80,23 @@ Payload x concurrency grid -- measures end-to-end TLS throughput. These numbers 
 - SSE streaming proxy (zero-buffer)
 
 **Cache**
-- Two-level RAM cache: L1 thread-local (~5ns, O(1) LRU) + L2 DashMap (~30ns)
+- Two-level RAM cache: L1 thread-local (O(1) LRU, intrusive linked list) + L2 DashMap
 - L1/L2 generation-based coherence (no stale data after update)
-- Request coalescing (singleflight): N concurrent cache misses = 1 upstream fetch
-- Thread-local route lookup cache (FNV hash, ~5ns hot path)
+- Request coalescing (singleflight): N concurrent cache misses → 1 upstream fetch (`tokio::sync::watch`-based, race-free even when the fetcher completes between subscribe and await)
+- Thread-local route LRU (FNV hash, O(1) get/insert/evict — capacity 256 entries per worker)
 - Connection pool pre-warming at startup
 
 **WAF (Zero-Regex, O(N) Single-Pass)**
-- Aho-Corasick scanner: 192 patterns, 14 categories (SQLi, XSS, CMDi, SSRF, NoSQL, deserialization, GraphQL, LDAP, XXE, SSTI, CRLF, Log4Shell)
-- Shannon entropy analysis (detect obfuscated payloads)
+- Aho-Corasick scanner with two pattern sets:
+  - `balanced` (default): ~120 high-precision patterns — anchored SQLi/XSS/CMDi, specific SSRF endpoints, CVE-class strings (Log4Shell, XXE)
+  - `aggressive` (opt-in via `mode = "aggressive"`): adds ~70 broad-substring patterns (`alert(`, `eval(`, `$gt`, `os.system(`, generic event handlers) for higher recall on admin/internal routes
+- Shannon entropy analysis (default 6.5 bits/byte; for JSON, computed on string literals only). Configurable threshold + kill-switch per profile.
 - simd-json structural validation (depth + string length limits)
 - Content-Type strict validation with delimiter enforcement
 - Body size enforcement, DELETE body inspection
-- Iterative normalization (URL-decode, SQL comments, JSON unicode)
+- Iterative normalization (URL-decode, SQL comments, JSON unicode escape)
+- mTLS forward header: `X-Client-Cert-Fingerprint: sha256:HEX` (SHA-256 of leaf DER)
+- Outbound `X-Forwarded-For` policy: `append` (default), `rewrite` (single trusted entry), `drop`
 
 **Security**
 - HSTS (2-year, includeSubDomains, preload), X-Content-Type-Options, X-Frame-Options
@@ -192,6 +196,10 @@ Keys: `q` quit · `p` pause · `r` redraw.
 [server]
 listen_http = "0.0.0.0:80"
 listen_https = "0.0.0.0:443"
+# Outbound X-Forwarded-For policy: "append" (default), "rewrite", "drop".
+# Use "rewrite" when Zion is the front edge — it strips inbound XFF and
+# emits a single trusted entry (the resolved client IP).
+xff_mode = "append"
 
 [tls]
 cert_path = "/etc/ssl/zion/tls.crt"
@@ -201,10 +209,19 @@ key_path = "/etc/ssl/zion/tls.key"
 backend = "http://127.0.0.1:8000"
 frontend = "http://127.0.0.1:3000"
 
+# WAF profile (named, assignable per route). Mode "balanced" is the
+# high-precision default; "aggressive" adds broad-substring patterns
+# for higher recall (and higher false-positive rate).
+[waf_profile.api]
+mode = "balanced"
+max_body_mb = 10
+entropy_check = true
+entropy_threshold = 6.5
+
 [[route]]
 path = "/api/{*rest}"
 upstream = "backend"
-waf = true
+waf_profile = "api"
 
 [[route]]
 path = "/_next/static/{*rest}"
@@ -221,15 +238,16 @@ See [zion.example.toml](zion.example.toml) for the full configuration reference.
 ## Architecture
 
 ```
-Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline -> Proxy/Cache -> Upstream
+Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) -> Proxy/Cache -> Upstream
                          |                                |
-                    URI limit                  Aho-Corasick (192 patterns)
-                    Method whitelist           Entropy analysis
+                    URI limit                  Aho-Corasick (~120 balanced / ~190 aggressive)
+                    Method whitelist           Entropy analysis (JSON-string-only)
                     Rate limiter              simd-json validation
                     CORS pre-flight           Depth/size limits
 ```
 
-17 modules, ~8,600 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+<!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
+21 modules, ~15,900 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Benchmarking
 
@@ -255,7 +273,7 @@ Results saved to `benchmarks/bench-history.json` with automatic delta comparison
 ## Testing
 
 ```bash
-# Unit tests (154)
+# Unit tests (300) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
 cargo test
 
 # Integration tests (19 -- requires running Zion + backend)

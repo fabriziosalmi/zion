@@ -2,6 +2,117 @@
 
 All notable changes to Zion Edge Gateway are documented here.
 
+## [0.1.7] - 2026-04-29
+
+Hardening pass: closes one concurrency bug, removes one foot-gun, replaces
+two stale defaults, and aligns README + docs 1:1 with the code.
+
+### Fixed (correctness)
+- **Singleflight cache miss could hang waiters until client timeout.** The
+  previous `tokio::sync::Notify`-based coalesce had a race: if the fetcher
+  completed between the waiter's `inflight.get()` and its `.notified().await`,
+  the wake was missed because `notify_waiters()` does not store a permit.
+  Replaced with `tokio::sync::watch::Sender<bool>`; `Receiver::wait_for`
+  inspects the current value at first poll, so a late subscriber still
+  observes completion. Verified with a deterministic test that pins the
+  post-completion subscribe path. (`src/dispatch.rs`, `src/main.rs`)
+- **`X-Client-Cert-DN` was a 64-bit XOR-fold of the leaf DER.** The header
+  name implied a Distinguished Name but the value had massive collision
+  classes (any two certs whose first 64 bytes XOR-equal collide) and no
+  cryptographic property. Replaced with `X-Client-Cert-Fingerprint:
+  sha256:HEX` (SHA-256 of the leaf DER, openssl/nginx convention). Tests
+  pin the format and the NIST SHA-256 vector.
+  **Breaking:** consumers reading `X-Client-Cert-DN` must migrate.
+  (`src/main.rs`, `src/tls.rs`)
+- **Thread-local route cache stopped accepting inserts at 256 entries.**
+  Was `if c.len() < 256 { insert }` — a flood of distinct paths could
+  permanently lock out subsequent hot-route promotion. Replaced with a real
+  O(1) LRU (intrusive doubly-linked list backed by a Vec, free-list for
+  index recycling). Adversarial-flood test pins the fix. (`src/dispatch.rs`)
+- **WAF Gate 6 was advertised but not implemented.** The module header and
+  several doc pages described a sixth "fixed-length profiling" gate that
+  did not exist in `validate_request`. Removed the advertisement; the WAF
+  is now described as 5 gates (its real shape) everywhere.
+
+### Changed (defaults)
+- **WAF detection modes.** New `WafProfile.mode = "balanced" | "aggressive"`.
+  `balanced` is the default (high precision: ~120 anchored / CVE-class
+  patterns). `aggressive` is opt-in (~190 patterns total: balanced plus
+  ~70 broad-substring patterns including `alert(`, `eval(`, `confirm(`,
+  `document.cookie`, `innerhtml`, `$gt`, `$ne`, `$regex`, `os.system(`,
+  `pickle.loads`, `Runtime.getRuntime`, generic event handlers like
+  `onclick=`/`onmouseover=`/…). The previous monolithic 192-pattern set
+  flagged a long list of legitimate developer-tool / educational / log-
+  shipping payloads — those patterns are now opt-in via aggressive mode.
+  - **Breaking for users who relied on those patterns:** add
+    `mode = "aggressive"` to the relevant `[waf_profile.X]`.
+- **Entropy gate threshold raised from 5.5 to 6.5 bits/byte** (now
+  per-profile via `entropy_threshold`). The old default flagged any
+  base64 / JWT / signed URL of meaningful length — pure base64 has a
+  theoretical max entropy of 6.0, so 5.5 was below it. The new default
+  sits clearly above 6.0 and still flags random/encrypted blobs (~7.5–8.0).
+  Per-profile kill-switch via `entropy_check = false`.
+- **JSON-aware entropy.** For `application/json` content-types, the gate
+  now computes Shannon entropy only on bytes inside string literals,
+  skipping structural punctuation and numeric tokens that would otherwise
+  dilute the signal. Skipped entirely if string-content < 128 bytes.
+- **`bootstrap.calibration_us` is now `Option<u64>`.** Previously the
+  field reported the few microseconds spent in the `ZION_BOOT_FAST=1`
+  env-var check as if it were a real measurement; CI/Ansible consumers
+  could not distinguish "calibrated in 80 ms" from "skipped, here's
+  21 µs of overhead." JSON snapshot serialises `null` when skipped.
+
+### Added
+- **`server.xff_mode = "append" | "rewrite" | "drop"`** outbound XFF
+  policy. `append` (default) preserves the previous behaviour (safe
+  behind a sanitising edge). `rewrite` strips inbound XFF and emits a
+  single trusted entry — recommended when Zion is the front edge,
+  closes the spoofing foot-gun where attacker-controlled `XFF[0]`
+  reached upstream apps. `drop` strips inbound and emits nothing.
+  `X-Real-IP` is now always sourced from the resolved client IP and
+  never trusted from an inbound header. (`src/proxy.rs`, `src/config.rs`,
+  `src/dispatch.rs`, `src/main.rs`)
+- `scripts/update-readme-stats.sh`: rewrites README badges (modules /
+  lines / unit-test count) from authoritative sources, with a `--check`
+  mode for CI.
+
+### Operations
+- **`bench-native.sh` now tracks `Non-2xx or 3xx responses`** and aborts
+  the run if any non-success response was returned. The previous script
+  honoured the "Zero-error tolerance" claim only for socket errors —
+  503-flood scenarios produced clean-looking output.
+- **Removed crate-level `#![allow(dead_code)]`, `#![allow(unused_imports)]`,
+  `#![allow(unused_variables)]`** from `src/main.rs`. The 17 warnings that
+  surfaced are all addressed: unused imports removed, true dead code
+  deleted, feature-gated symbols annotated puntually with comments.
+  `cargo build --release` now emits 0 warnings; CI can pin this with
+  `RUSTFLAGS='-D warnings'`.
+
+### Tests
+- 261 → **300** unit tests passing. New tests cover: 4× singleflight
+  primitive (incl. the post-completion subscribe path), 4× SHA-256 mTLS
+  fingerprint (format / NIST vector / determinism / diffusion), 8× route
+  LRU (incl. adversarial flood), ~30× WAF balanced-vs-aggressive contract
+  (`balanced_allows_*` + `aggressive_denies_*`) + 5× entropy gate
+  (base64 passes, random blocks, kill-switch, configurable threshold,
+  JSON-string-only function), 11× XFF policy (append preserves spoofed,
+  rewrite strips multi-hop, drop emits nothing, X-Real-IP never trusted).
+- `tests/integration.rs`: 19 integration tests unchanged.
+
+### Documentation
+- Full audit of `README.md` and `docs/`. Removed: `192 patterns / 14
+  categories` claim (replaced with mode-aware description), `6-gate
+  pipeline` (5 gates was always the truth), `SIMD pre-filter (memchr3)`
+  (never existed), `Zero false positives` (was AI-slop marketing,
+  contradicts the WAF reality), `~8,600 lines / 17 modules` (now
+  ~15,900 / 21, kept in sync by the script), stale version strings,
+  the false claim that Zion "rejects requests on detection of double
+  encoding" (it actually re-scans after each decode pass, up to 3).
+  Added: `Detection Modes` section (`docs/config/waf.md`),
+  `X-Forwarded-For Policy` and `mTLS Client Certificate Forwarding`
+  sections (`docs/security/hardening.md`), updated `zion.example.toml`
+  with all new fields.
+
 ## [0.1.4] - 2026-04-15
 
 ### WAF Pattern Expansion (88 -> 192, +104 patterns)

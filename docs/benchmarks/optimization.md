@@ -50,11 +50,12 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 
 | Change | Rationale |
 |---|---|
-| 192 patterns, 14 attack categories | SQLi, XSS (42), CMDi, path traversal, SSRF (14), NoSQL, deserialization, GraphQL, LDAP, XXE, SSTI, CRLF, Log4Shell |
+| Two pattern sets selected per profile via `mode` | `balanced` (default, ~120 high-precision patterns) or `aggressive` (~190, broader recall). Categories: SQLi, XSS, CMDi, path traversal, SSRF/cloud-metadata, LDAP, XXE, SSTI, CRLF, Log4Shell, prototype pollution; NoSQL, deserialization, generic XSS handlers, JS API sinks live in aggressive |
 | Aho-Corasick (no regex) | O(N) single-pass, no backtracking, case-insensitive, ReDoS-immune by construction |
-| Normalization: iterative until convergence | URL-decode, SQL comment strip, JSON unicode; capped at 2 iterations |
+| Normalisation: iterative re-scan | URL-decode (`%XX`, `+`), SQL comment strip (`/* … */`), JSON unicode (`\uXXXX`); decode loop runs up to 3 passes (catches single, double, triple encoding) and re-scans after each pass |
 | Buffer shrink-to-fit (>64KB) | Prevents permanent memory inflation from adversarial large bodies |
-| DELETE body inspection | RFC 9110 allows bodies on DELETE; previously skipped |
+| Entropy gate: JSON-string-aware (default 6.5 bits/byte) | For application/json, computed only on bytes inside string literals so structural punctuation doesn't dilute the signal. Threshold leaves base64/JWT through; per-profile threshold + kill-switch |
+| DELETE body inspection | RFC 9110 allows bodies on DELETE |
 | Content-Type delimiter enforcement | Requires `;` or ` ` delimiter after type match |
 
 ## Innovative
@@ -117,7 +118,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 
 | Change | Rationale |
 |---|---|
-| Aho-Corasick (no regex) | O(N) single-pass, no backtracking, 192 patterns scanned simultaneously |
+| Aho-Corasick (no regex) | O(N) single-pass, no backtracking; all patterns of the active mode scanned simultaneously |
 | Skip body inspection for GET/HEAD/OPTIONS | POST/PUT/PATCH/DELETE bodies are inspected |
 | Entropy check only for bodies >= 256 bytes | Short payloads lack sufficient data for meaningful entropy analysis |
 | `simd-json` for JSON validation | SIMD-accelerated JSON parsing where hardware supports it |
@@ -133,10 +134,10 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | L1/L2 generation coherence | Atomic counter bumped on L2 insert; stale L1 entries detected on get |
 | Cache key includes query string | Prevents cache poisoning (/api?a=1 vs /api?a=2) |
 | Content-Encoding preserved | Gzip-compressed responses served with correct header |
-| Singleflight coalescing | DashMap + Notify; inflight cleanup on all exit paths |
+| Singleflight coalescing | DashMap + `tokio::sync::watch`; `wait_for` inspects current value at first poll, so a waiter that subscribes after the fetcher has already published `true` still observes it (race-free). Inflight entry is cleaned up on all exit paths. |
 | L2 eviction: expired-first | TTL-expired before live entries; oldest-TTL fallback |
 | `Bytes` (reference-counted) | Cloning is Arc increment, not memcpy |
-| Thread-local route lookup cache | FNV hash of path (~5ns vs ~30ns radix tree) |
+| Thread-local route LRU | FNV hash of path; O(1) get/insert/evict via intrusive doubly-linked list (capacity 256 per worker). Replaces a previous "first 256 then no more inserts" map that could be locked out by a flood of distinct paths. |
 | Connection pool pre-warming | Fires GET to all upstreams at startup |
 
 ## Hyper Tuning

@@ -1,6 +1,14 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
+// Crate-level lint hygiene.
+//
+// We deliberately do NOT silence dead_code / unused_imports / unused_variables
+// here — they're a leading indicator of code rot and belong to the warnings
+// surface. When a warning is genuinely intentional (feature-gated reserved
+// hooks, future-feature scaffolding) it gets a *targeted* `#[allow(...)]`
+// with a comment explaining the why, so the next reader can re-evaluate it.
+//
+// The clippy stylistic lints below are kept silenced: they are taste, not
+// correctness, and re-running them is cheap when the project decides to
+// adopt a uniform style.
 #![allow(clippy::let_and_return)]
 #![allow(clippy::explicit_auto_deref)]
 #![allow(clippy::needless_borrow)]
@@ -37,7 +45,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use config::ResolvedRoute;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -53,8 +61,8 @@ use tokio_rustls::TlsAcceptor;
 mod dispatch;
 pub(crate) use dispatch::process_request;
 
-/// Max response body size we'll cache in RAM (50 MB).
-const MAX_CACHEABLE_BODY: usize = 50 * 1024 * 1024;
+// (Cache size limit lives in dispatch::MAX_CACHEABLE_BODY where it is
+//  actually consumed by the static-cache pipeline.)
 
 /// Atomic request counter for generating unique request IDs.
 /// Format: {timestamp_hex}-{counter_hex} — unique, sortable.
@@ -92,7 +100,7 @@ pub(crate) fn generate_request_id() -> [u8; 21] {
 }
 
 // Re-export security types used in AppState and handlers.
-use security::{CorsHeaders, RateEntry};
+use security::RateEntry;
 
 /// Global shared state — lock-free reads via Arc + ArcSwap.
 struct AppState {
@@ -112,16 +120,23 @@ struct AppState {
     health_map: health::HealthMap,
     /// Trusted proxy CIDRs for X-Forwarded-For IP resolution.
     trusted_proxies: security::TrustedProxies,
+    /// Outbound XFF policy (append / rewrite / drop). See proxy::XffMode.
+    xff_mode: proxy::XffMode,
     /// Singleflight: coalesce concurrent cache misses for the same key.
-    /// First request fetches from upstream; subsequent requests for the same
-    /// key await the Notify and serve from the now-warm cache.
-    inflight: dashmap::DashMap<Arc<str>, Arc<tokio::sync::Notify>>,
+    /// First request fetches from upstream and inserts a watch::Sender<bool>;
+    /// subsequent requests subscribe and await `true`. Watch (vs Notify) is
+    /// race-free: `wait_for` inspects the current value at first poll, so
+    /// even if the fetcher completes between our get() and our .await we
+    /// still observe the wake instead of hanging until the client times out.
+    /// Sender drop without sending `true` (fetch aborted) yields Err on the
+    /// receiver side and waiters fall through to re-check the cache.
+    inflight: dashmap::DashMap<Arc<str>, tokio::sync::watch::Sender<bool>>,
 }
 
 // Pre-compiled constants — zero runtime cost.
+// (CACHE_CONTROL_IMMUTABLE moved to dispatch::CACHE_CONTROL_IMMUTABLE where
+//  the static-cache path consumes it. Keeping a duplicate here was dead.)
 static EMPTY_BYTES: Bytes = Bytes::new();
-static CACHE_CONTROL_IMMUTABLE: hyper::header::HeaderValue =
-    hyper::header::HeaderValue::from_static("public, max-age=31536000, immutable");
 
 // Security headers, rate limiter constants, and validators are in security.rs.
 
@@ -276,8 +291,12 @@ async fn async_main(
         config.tls.min_version, config.tls.alpn
     );
 
-    // 4. Start TLS hot-reload watcher (rebuilds acceptor on cert change)
-    let (quic_reload_tx, quic_reload_rx) = tokio::sync::watch::channel(None);
+    // 4. Start TLS hot-reload watcher (rebuilds acceptor on cert change).
+    // The QUIC listener consumes the receiver to reload its server config in
+    // sync with the TCP listener. Without the http3 feature there is no QUIC
+    // listener, so the receiver is intentionally unused; the underscore-prefix
+    // tells rustc this is by design.
+    let (quic_reload_tx, _quic_reload_rx) = tokio::sync::watch::channel(None);
     if config.tls.hot_reload {
         tls::spawn_tls_watcher(
             tls_acceptor_store.clone(),
@@ -321,6 +340,24 @@ async fn async_main(
         );
     }
 
+    // Parse the configured XFF policy. Unknown values fall back to Append
+    // and emit a warning — silent fallback would hide a config typo that
+    // weakens upstream IP integrity.
+    let xff_mode = match proxy::XffMode::parse(&config.server.xff_mode) {
+        Some(m) => m,
+        None => {
+            logging::warn(
+                "config",
+                &format!(
+                    "unknown server.xff_mode '{}', falling back to 'append' (valid: append/rewrite/drop)",
+                    config.server.xff_mode
+                ),
+            );
+            proxy::XffMode::Append
+        }
+    };
+    logging::info("proxy", &format!("xff_mode: {:?}", xff_mode));
+
     let state = Arc::new(AppState {
         router,
         tls_acceptor: tls_acceptor_store,
@@ -333,6 +370,7 @@ async fn async_main(
         rate_map: Arc::new(dashmap::DashMap::new()),
         health_map: health_map.clone(),
         trusted_proxies,
+        xff_mode,
         inflight: dashmap::DashMap::new(),
         http_builder: Arc::new({
             let mut b = AutoBuilder::new(TokioExecutor::new());
@@ -606,7 +644,7 @@ async fn async_main(
             .listen_https
             .parse()
             .expect("Invalid HTTPS address for QUIC binding");
-        quic::spawn_quic_listener(quic_addr, &config.tls, state.clone(), Some(quic_reload_rx));
+        quic::spawn_quic_listener(quic_addr, &config.tls, state.clone(), Some(_quic_reload_rx));
     }
 
     bootstrap::print_ready_banner(&config.server.listen_http, &config.server.listen_https);
@@ -704,33 +742,33 @@ async fn async_main(
             let is_early_data = tls_stream.get_mut().1.early_data().is_some();
             let early_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(is_early_data));
 
-            // mTLS: extract client certificate DN if present
-            let client_cert_dn: Option<String> = tls_stream
+            // mTLS: extract a stable, collision-resistant identifier for the
+            // peer certificate. SHA-256 of the leaf DER, hex-encoded with a
+            // `sha256:` prefix — same convention as openssl/nginx
+            // ($ssl_client_fingerprint) and CA tooling. Forwarded as
+            // `X-Client-Cert-Fingerprint`. Upstream apps can map fingerprint
+            // → identity via their own roster; Zion does NOT claim this is a
+            // Distinguished Name (the previous header `X-Client-Cert-DN` was
+            // a 64-bit XOR-fold and was removed because it implied semantics
+            // it could not provide and was unsafe for ACL use).
+            let client_cert_fingerprint: Option<String> = tls_stream
                 .get_ref()
                 .1
                 .peer_certificates()
                 .and_then(|certs| certs.first())
-                .and_then(|cert| {
-                    // Parse DER cert to extract a lightweight identifier.
-                    // XOR-fold of first 64 bytes — fast but NOT cryptographic.
-                    // Sufficient for logging/tracing, NOT for access control.
-                    let raw = cert.as_ref();
-                    if raw.len() > 20 {
-                        use std::fmt::Write;
-                        let mut hasher_out = [0u8; 8];
-                        for (i, &b) in raw.iter().take(64).enumerate() {
-                            hasher_out[i % 8] ^= b;
-                        }
-                        let mut s = String::with_capacity(16);
-                        for b in &hasher_out {
-                            let _ = write!(s, "{:02x}", b);
-                        }
-                        Some(format!("cert:{}", s))
-                    } else {
-                        None
+                .map(|cert| {
+                    let der = cert.as_ref();
+                    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der);
+                    let bytes = digest.as_ref();
+                    let mut s = String::with_capacity(7 + bytes.len() * 2);
+                    s.push_str("sha256:");
+                    for &b in bytes {
+                        s.push(HEX_DIGITS[(b >> 4) as usize] as char);
+                        s.push(HEX_DIGITS[(b & 0xF) as usize] as char);
                     }
+                    s
                 });
-            let client_dn = client_cert_dn.map(std::sync::Arc::new);
+            let client_fp = client_cert_fingerprint.map(std::sync::Arc::new);
 
             let io = TokioIo::new(tls_stream);
             // Connection-level idle timeout. Set high (1 hour) because this
@@ -743,7 +781,7 @@ async fn async_main(
                     service_fn(move |mut req: Request<Incoming>| {
                         let state = state.clone();
                         let early_flag = early_flag.clone();
-                        let client_dn = client_dn.clone();
+                        let client_fp = client_fp.clone();
                         async move {
                             // Fast-path: health probes bypass the full pipeline (~1us vs ~5us)
                             let path = req.uri().path();
@@ -757,10 +795,13 @@ async fn async_main(
                             // Consume early_data flag on first request
                             let was_early =
                                 early_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
-                            // Inject client cert DN as header if mTLS authenticated
-                            if let Some(ref dn) = client_dn {
-                                if let Ok(val) = hyper::header::HeaderValue::from_str(dn) {
-                                    req.headers_mut().insert("X-Client-Cert-DN", val);
+                            // Inject client cert fingerprint if mTLS authenticated.
+                            // Format: "sha256:HEX..." (64 hex chars). All bytes are
+                            // ASCII, so HeaderValue::from_str cannot fail in practice;
+                            // we still handle the Result for safety.
+                            if let Some(ref fp) = client_fp {
+                                if let Ok(val) = hyper::header::HeaderValue::from_str(fp) {
+                                    req.headers_mut().insert("X-Client-Cert-Fingerprint", val);
                                 }
                             }
                             use http_body_util::BodyExt;
@@ -916,6 +957,7 @@ async fn handle_http(
                 &rule.upstream_authority,
                 Some(remote_addr),
                 "http",
+                state.xff_mode,
             )
             .await;
         }

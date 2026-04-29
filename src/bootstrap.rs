@@ -65,8 +65,13 @@ pub struct Platform {
     /// estimate (still extrapolated from M-series benchmarks).
     pub aes_kops_per_core: Option<u32>,
     /// Wall-time spent on the AES-GCM calibration microbench, in
-    /// microseconds. Shown in the boot output as a credibility tag.
-    pub calibration_us: u64,
+    /// microseconds. `None` when the calibration was skipped
+    /// (`ZION_BOOT_FAST=1`) or returned no result — the previous
+    /// implementation always reported the wall-clock around the skip
+    /// branch (~20 µs of just-the-env-check overhead), which CI/Ansible
+    /// consumers were treating as a real measurement. JSON-serialised as
+    /// `null` when absent.
+    pub calibration_us: Option<u64>,
 }
 
 static PLATFORM: OnceLock<Platform> = OnceLock::new();
@@ -93,13 +98,18 @@ pub fn detect() -> &'static Platform {
         // ── Live AES-GCM calibration ──
         // 80 ms microbench on a single core. Skippable for fast-boot
         // environments (CI, k8s init containers, healthcheck probes).
-        let calibration_start = Instant::now();
-        let aes_kops_per_core = if std::env::var_os("ZION_BOOT_FAST").is_some() {
-            None
-        } else {
-            calibrate_aes_gcm_kreqs()
-        };
-        let calibration_us = calibration_start.elapsed().as_micros() as u64;
+        // When skipped we leave `calibration_us` as None; reporting the
+        // few microseconds spent in the env-var check would be a
+        // misleading "we calibrated quickly" signal.
+        let (aes_kops_per_core, calibration_us) =
+            if std::env::var_os("ZION_BOOT_FAST").is_some() {
+                (None, None)
+            } else {
+                let calibration_start = Instant::now();
+                let kops = calibrate_aes_gcm_kreqs();
+                let us = calibration_start.elapsed().as_micros() as u64;
+                (kops, Some(us))
+            };
 
         let platform = Platform {
             os: std::env::consts::OS,
@@ -510,13 +520,20 @@ fn render<W: std::io::Write>(p: &Platform, s: &Style, w: &mut W) -> std::io::Res
     // chance to nudge the operator toward the next useful step.
     writeln!(w, "  {}hint{}  {}", s.dim(), s.reset(), upgrade_hint(p))?;
 
-    let footer = match p.aes_kops_per_core {
-        Some(_) => format!(
+    let footer = match (p.aes_kops_per_core, p.calibration_us) {
+        // Both Some: real measurement → show the timing.
+        (Some(_), Some(us)) => format!(
             "probed in {}μs · calibrated in {}ms · ZION_BOOT_PLAIN=1 / ZION_BOOT_FAST=1 to override",
             p.probe_us,
-            (p.calibration_us / 1000).max(1),
+            (us / 1000).max(1),
         ),
-        None => format!(
+        // Calibrated but no timing recorded — defensive: shouldn't happen
+        // since the two are written together, but pick the safer message.
+        (Some(_), None) => format!(
+            "probed in {}μs · calibrated · ZION_BOOT_PLAIN=1 / ZION_BOOT_FAST=1 to override",
+            p.probe_us,
+        ),
+        _ => format!(
             "probed in {}μs · calibration skipped · ZION_BOOT_PLAIN=1 to disable colors",
             p.probe_us,
         ),
@@ -653,13 +670,17 @@ fn render_tier_badge<W: std::io::Write>(
     )?;
 
     // ── AES line — what we actually measured ──
-    let aes_line = match p.aes_kops_per_core {
-        Some(per_core) => format!(
+    let aes_line = match (p.aes_kops_per_core, p.calibration_us) {
+        (Some(per_core), Some(us)) => format!(
             "  AES-128-GCM  {} seal/s/core  (measured {}ms)",
             fmt_aes_rate(per_core),
-            (p.calibration_us / 1000).max(1),
+            (us / 1000).max(1),
         ),
-        None => "  AES-128-GCM  — calibration skipped".to_string(),
+        (Some(per_core), None) => format!(
+            "  AES-128-GCM  {} seal/s/core",
+            fmt_aes_rate(per_core),
+        ),
+        _ => "  AES-128-GCM  — calibration skipped".to_string(),
     };
     let aes_padded = pad_right(&aes_line, BADGE_INNER);
     writeln!(
@@ -1386,7 +1407,7 @@ mod tests {
             send_buf: 65536,
             probe_us: 0,
             aes_kops_per_core: None,
-            calibration_us: 0,
+            calibration_us: None,
         }
     }
 
@@ -1757,10 +1778,10 @@ mod tests {
     #[test]
     fn dump_platform_json_round_trips_essentials() {
         // Synthetic platform with a measured AES throughput so we exercise
-        // both the present and absent branches of the calibration field.
+        // the present branch of the calibration field.
         let mut p = synthetic(8, 16_000, true, "linux");
         p.aes_kops_per_core = Some(1234);
-        p.calibration_us = 80_000;
+        p.calibration_us = Some(80_000);
         let json = dump_platform_json(&p);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["os"], "linux");
@@ -1775,6 +1796,28 @@ mod tests {
         assert!(v["projected_kreqs_cached"].as_u64().unwrap() > 0);
         // `version` is the package version — always non-empty.
         assert!(!v["version"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dump_platform_json_emits_null_when_calibration_skipped() {
+        // ZION_BOOT_FAST=1 path: aes_kops_per_core and calibration_us are
+        // both None. JSON must serialise as `null`, not 0 or a bogus
+        // few-microseconds value (the previous behaviour).
+        let p = synthetic(8, 16_000, true, "linux");
+        // Defensive sanity: synthetic() leaves these as None.
+        assert!(p.aes_kops_per_core.is_none());
+        assert!(p.calibration_us.is_none());
+
+        let json = dump_platform_json(&p);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v["calibration_us"].is_null(),
+            "calibration_us must be null when skipped, got {:?}",
+            v["calibration_us"]
+        );
+        assert!(v["aes_kops_per_core"].is_null());
+        // aes_kops_total derives from aes_kops_per_core; null in → null out.
+        assert!(v["aes_kops_total"].is_null());
     }
 
     #[test]

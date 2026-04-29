@@ -47,6 +47,14 @@ pub type HealthMap = Arc<FnvHashMap<String, Arc<UpstreamHealth>>>;
 
 /// Check if a specific upstream URL is healthy.
 /// Returns true if the upstream is not tracked (conservative: allow traffic).
+///
+/// Currently the dispatch pipeline calls `select_best_upstream` which
+/// implicitly checks health while picking a candidate, so this single-URL
+/// helper has no callers in production code. Kept as a documented building
+/// block of the health module — the unit tests below pin its semantics, and
+/// removing it would force the next caller to reimplement the same fallback
+/// (untracked → healthy) by hand.
+#[allow(dead_code)]
 #[inline]
 pub fn is_healthy(health_map: &HealthMap, upstream_url: &str) -> bool {
     match health_map.get(upstream_url) {

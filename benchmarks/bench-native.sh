@@ -80,6 +80,11 @@ wait_for_https() {
 }
 
 # ── wrk runner ────────────────────────────────────────────────────────────
+# Returns "rps|sock_errors|non2xx" — tracking Non-2xx/3xx is essential:
+# without it, an upstream that 503s everything would still report high RPS
+# with zero errors (wrk's default error counter is socket-only). The
+# script header advertises "Zero-error tolerance"; honouring that means
+# treating non-success status as a benchmark failure.
 run_wrk() {
     local url=$1 method=${2:-GET} out
     out=$(mktemp)
@@ -96,12 +101,19 @@ LUA
         wrk -t"$THREADS" -c"$CONNS" -d"${DUR}s" -H "Host: bench.local" --latency "$url" > "$out" 2>&1
     fi
 
-    local rps=$(grep "Requests/sec:" "$out" | awk '{printf "%.1f", $2}')
-    local errors=$(grep "Socket errors" "$out" | awk '{print $4+$6+$8+$10}' || echo "0")
-    [[ -z "$errors" ]] && errors=0
+    local rps sock_errors non2xx
+    rps=$(grep "Requests/sec:" "$out" | awk '{printf "%.1f", $2}')
+    # Socket errors line: "Socket errors: connect N, read N, write N, timeout N"
+    sock_errors=$(grep "Socket errors" "$out" | awk '{print $4+$6+$8+$10}' || echo "0")
+    [[ -z "$sock_errors" ]] && sock_errors=0
+    # Non-2xx/3xx: emitted by wrk only when at least one such response
+    # occurs. Format: "  Non-2xx or 3xx responses: N"
+    # Columns:                $1     $2 $3   $4        $5
+    non2xx=$(grep "Non-2xx" "$out" | awk '{print $5}' || echo "0")
+    [[ -z "$non2xx" ]] && non2xx=0
 
     rm -f "$out"
-    echo "${rps:-0}|${errors}"
+    echo "${rps:-0}|${sock_errors}|${non2xx}"
 }
 
 # ── Statistical analysis (python) ────────────────────────────────────────
@@ -134,20 +146,32 @@ else:
 # ── Benchmark one endpoint ────────────────────────────────────────────────
 bench_endpoint() {
     local label=$1 url=$2 method=${3:-GET}
-    local rps_values="" total_errors=0
+    local rps_values="" total_sock=0 total_non2xx=0
 
     # Warmup
     wrk -t1 -c10 -d"${WARMUP_SECS}s" -H "Host: bench.local" "$url" >/dev/null 2>&1 || true
 
     for run in $(seq 1 $RUNS); do
         result=$(run_wrk "$url" "$method")
-        rps=$(echo "$result" | cut -d'|' -f1)
-        errs=$(echo "$result" | cut -d'|' -f2)
+        rps=$(echo "$result"     | cut -d'|' -f1)
+        sock=$(echo "$result"    | cut -d'|' -f2)
+        non2xx=$(echo "$result"  | cut -d'|' -f3)
         rps_values="$rps_values $rps"
-        total_errors=$((total_errors + ${errs:-0}))
+        total_sock=$((total_sock + ${sock:-0}))
+        total_non2xx=$((total_non2xx + ${non2xx:-0}))
 
-        printf "    run %d/%d: %10s req/s  errors=%s\n" "$run" "$RUNS" "$rps" "$errs"
+        printf "    run %d/%d: %10s req/s  sock_err=%s  non2xx=%s\n" \
+            "$run" "$RUNS" "$rps" "$sock" "$non2xx"
     done
+
+    local total_errors=$((total_sock + total_non2xx))
+
+    # Zero-error tolerance (per script header). A single non-2xx response
+    # invalidates the run: we'd be measuring how fast we can return errors.
+    # Abort here so the operator notices instead of silently reporting.
+    if [[ "$total_errors" -gt 0 ]]; then
+        die "$label: $total_sock socket errors + $total_non2xx non-2xx/3xx responses across $RUNS runs (zero-error tolerance violated; benchmark aborted)"
+    fi
 
     # Stats
     stats=$(compute_stats "$rps_values")
@@ -161,8 +185,8 @@ bench_endpoint() {
     local cv_flag=""
     [[ $(echo "$cv > 15" | bc -l 2>/dev/null || echo "0") == "1" ]] && cv_flag=" ⚠ HIGH VARIANCE"
 
-    printf "    ${B}→ median: %s req/s  ±%s (CI95)  σ=%s  CV=%.1f%%  [%s–%s]  errors=%d%s${R}\n" \
-        "$median" "$ci95" "$stdev" "$cv" "$min_v" "$max_v" "$total_errors" "$cv_flag"
+    printf "    ${B}→ median: %s req/s  ±%s (CI95)  σ=%s  CV=%.1f%%  [%s–%s]  errors=0%s${R}\n" \
+        "$median" "$ci95" "$stdev" "$cv" "$min_v" "$max_v" "$cv_flag"
 
     # Return median via global var (bash compat)
     _BENCH_RESULT="$median"

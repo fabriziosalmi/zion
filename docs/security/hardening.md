@@ -114,6 +114,35 @@ Connection, Keep-Alive, Proxy-Authenticate, Proxy-Authorization,
 TE, Trailer, Transfer-Encoding, Upgrade
 ```
 
+## X-Forwarded-For Policy (`xff_mode`)
+
+Outbound XFF behaviour is configured at `[server]` level. The default (`append`) preserves the prior behaviour and is correct when Zion sits behind a sanitising edge (CDN/ALB) that has already vetted the inbound chain. When Zion is the **front edge**, the default is unsafe: a client can send `X-Forwarded-For: 1.2.3.4` and the leftmost entry in the chain forwarded to your upstream will be that attacker-controlled value. Downstream apps that read `XFF[0]` for ACL or audit will be tricked.
+
+```toml
+[server]
+xff_mode = "rewrite"   # one of: "append" | "rewrite" | "drop"
+```
+
+| Mode | Inbound XFF | Outbound XFF | Use when |
+|---|---|---|---|
+| `append` (default) | preserved | inbound chain + resolved client IP appended | Zion is behind a trusted edge that already strips/normalises XFF |
+| `rewrite` | dropped | single entry: the resolved client IP | Zion is the front edge — guarantees a clean one-hop chain regardless of what the client sent |
+| `drop` | dropped | not emitted | Upstreams must not learn the client IP at all |
+
+`X-Real-IP` is **always** set from the resolved client IP and never trusted from inbound headers, regardless of `xff_mode`. The "resolved client IP" is the output of `TrustedProxies::resolve_client_ip`: the rightmost X-Forwarded-For entry that is not a trusted-proxy CIDR, or the TCP peer IP when no proxies are configured.
+
+## mTLS Client Certificate Forwarding
+
+When the TLS listener is configured with client-certificate verification (`client_ca_path` set, `client_auth = "required"` or `"optional"`), Zion extracts a stable identifier from the leaf peer certificate and forwards it to upstreams as:
+
+```
+X-Client-Cert-Fingerprint: sha256:<64 hex chars>
+```
+
+The value is the SHA-256 of the leaf DER, hex-encoded with a `sha256:` prefix — the same convention used by openssl and nginx (`$ssl_client_fingerprint`). It is collision-resistant and stable across re-issuance only when the cert bytes themselves are stable; rotating a cert produces a new fingerprint.
+
+Earlier Zion versions emitted `X-Client-Cert-DN`, computed as a 64-bit XOR-fold of the first 64 DER bytes. That value was advertised as a "DN" but was neither a Distinguished Name nor collision-resistant; it has been removed. If your upstream still expects the old header, map it at the upstream side from `X-Client-Cert-Fingerprint` (note: the new value is a fingerprint, not a DN, and downstream identity mapping must be done via your roster).
+
 ## Content-Security-Policy
 
 Per-route CSP headers can be configured. See [Routing → Content-Security-Policy](../config/routing.md#content-security-policy-per-route).

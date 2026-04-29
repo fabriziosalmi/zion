@@ -33,7 +33,6 @@ pub const MAX_RATE_MAP_ENTRIES: usize = 100_000;
 /// Uses FNV hash set for O(1) origin lookup (case-insensitive via lowercased storage).
 #[derive(Debug)]
 pub struct CorsHeaders {
-    pub enabled: bool,
     pub allow_origin_wildcard: bool,
     /// Lowercased origins for O(1) case-insensitive lookup.
     allowed_origins_set: fnv::FnvHashSet<String>,
@@ -44,7 +43,9 @@ pub struct CorsHeaders {
 
 impl CorsHeaders {
     pub fn from_config(cors: &crate::config::CorsConfig) -> Self {
-        let enabled = !cors.allowed_origins.is_empty();
+        // (Was `enabled: !allowed_origins.is_empty()` — never read by any
+        //  caller. Whether CORS is active is derived at the caller side
+        //  by checking `route.cors.is_some()`.)
         let wildcard = cors.allowed_origins.iter().any(|o| o == "*");
 
         let methods = HeaderValue::from_static("GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS");
@@ -62,7 +63,6 @@ impl CorsHeaders {
             .collect();
 
         Self {
-            enabled,
             allow_origin_wildcard: wildcard,
             allowed_origins_set,
             allow_methods: methods,

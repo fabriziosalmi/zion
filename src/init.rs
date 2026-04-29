@@ -556,6 +556,11 @@ fn ymd_today() -> String {
 // CERT GENERATION (gated behind `init` feature)
 // ─────────────────────────────────────────────────────────────────────────
 
+/// `Generated` and `Failed` are constructed only by `generate_tls_cert`,
+/// which is `#[cfg(feature = "init")]`. Without the feature the enum is
+/// still defined (the dispatch in `run_init` handles it shape-stable) but
+/// only `FeatureMissing` is reachable.
+#[allow(dead_code)]
 enum CertOutcome {
     Generated,
     FeatureMissing,

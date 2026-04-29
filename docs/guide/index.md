@@ -8,7 +8,7 @@ Zion is a TLS reverse proxy with a built-in WAF, written in Rust. One binary, on
 |---|---|
 | TLS termination | rustls (aws-lc-rs crypto backend), TLS 1.2/1.3, ALPN, SNI |
 | Routing | Radix tree via `matchit` crate |
-| WAF | 6-gate pipeline: body size, content-type, Aho-Corasick pattern match, entropy, simd-json validation, payload profiling |
+| WAF | 5-gate pipeline: body size, content-type, Aho-Corasick (balanced or aggressive mode), Shannon entropy, simd-json structural validation |
 | Caching | In-memory two-level cache: thread-local L1 + shared DashMap L2, TTL + max-entry eviction |
 | WebSocket | Bidirectional proxy via HTTP Upgrade |
 | SSE streaming | Dedicated proxy mode with buffer-disabling headers |

@@ -3,7 +3,7 @@ use crate::{cache, config, health, logging, metrics, proxy, security, waf, AppSt
 use crate::{
     empty_response, generate_request_id, inject_security_headers, text_response, REQUEST_COUNTER,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
 use std::net::SocketAddr;
@@ -13,7 +13,6 @@ use std::sync::Arc;
 use crate::auth;
 
 use crate::config::ResolvedRoute;
-use http_body_util::combinators::BoxBody;
 use http_body_util::Limited;
 
 const MAX_URI_LEN: usize = 8192;
@@ -86,6 +85,12 @@ pub(crate) async fn process_request(
             .get("X-Forwarded-For")
             .and_then(|v| v.to_str().ok()),
     );
+    // SocketAddr wrapper for proxy::proxy_pass*, which extracts only the IP.
+    // The port is irrelevant for forwarding headers — using 0 is safe.
+    // We intentionally pass the *resolved* client IP (not the TCP peer)
+    // so XffMode::Rewrite emits the trusted real-client value rather than
+    // the upstream proxy's address.
+    let forward_addr = SocketAddr::new(client_ip, 0);
 
     // Gate: per-IP rate limit (zero cost when disabled)
     // Placed BEFORE health endpoints so /healthz can't bypass rate limiting for DDoS.
@@ -148,12 +153,17 @@ pub(crate) async fn process_request(
         }
     }
 
-    // ── Route lookup (thread-local cache + radix tree fallback) ──
-    // Hot routes (API root, health, static prefix) hit the thread-local cache
-    // in ~5ns. Cache misses fall through to radix tree (~30ns).
+    // ── Route lookup (thread-local LRU + radix tree fallback) ──
+    // Hot routes hit the thread-local cache in ~5ns. Cache misses fall through
+    // to the radix tree (~30ns) and are promoted to MRU. The cache is a true
+    // O(1) LRU bounded at ROUTE_CACHE_CAP entries: when full, the LRU entry is
+    // evicted on insert. The earlier "if len < 256 { insert }" stopped
+    // promoting any new path once the cap was reached, so a client hitting
+    // 256 distinct paths first (cache-busted CDN paths, scanners) permanently
+    // locked out subsequent hot routes for the worker thread.
     thread_local! {
-        static ROUTE_CACHE: std::cell::RefCell<fnv::FnvHashMap<u64, Arc<ResolvedRoute>>> =
-            std::cell::RefCell::new(fnv::FnvHashMap::default());
+        static ROUTE_CACHE: std::cell::RefCell<route_cache::RouteCache<Arc<ResolvedRoute>>> =
+            std::cell::RefCell::new(route_cache::RouteCache::new(route_cache::ROUTE_CACHE_CAP));
     }
 
     let rule = {
@@ -166,8 +176,8 @@ pub(crate) async fn process_request(
             h.finish()
         };
 
-        // Thread-local cache hit (~5ns)
-        let cached = ROUTE_CACHE.with(|cache| cache.borrow().get(&path_hash).cloned());
+        // Thread-local cache hit (~5ns) — touch promotes to MRU
+        let cached = ROUTE_CACHE.with(|cache| cache.borrow_mut().get(path_hash));
 
         if let Some(route) = cached {
             route
@@ -176,12 +186,8 @@ pub(crate) async fn process_request(
             match state.router.at(path) {
                 Ok(m) => {
                     let route = m.value.clone();
-                    // Promote to thread-local cache (bounded to 256 entries)
                     ROUTE_CACHE.with(|cache| {
-                        let mut c = cache.borrow_mut();
-                        if c.len() < 256 {
-                            c.insert(path_hash, route.clone());
-                        }
+                        cache.borrow_mut().insert(path_hash, route.clone());
                     });
                     route
                 }
@@ -350,7 +356,7 @@ pub(crate) async fn process_request(
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or_else(|| req.uri().path());
-        if let waf::WafVerdict::Deny(reason) = waf::validate_uri(uri_str) {
+        if let waf::WafVerdict::Deny(reason) = waf::validate_uri(uri_str, waf_profile.mode) {
             if rule.waf_shadow {
                 metrics::METRICS
                     .waf_shadow_would_block
@@ -539,7 +545,7 @@ pub(crate) async fn process_request(
             req,
             state.clone(),
             &rule,
-            remote_addr,
+            forward_addr,
             &dyn_scheme,
             &dyn_authority,
         )
@@ -563,8 +569,9 @@ pub(crate) async fn process_request(
                     req,
                     &dyn_scheme,
                     &dyn_authority,
-                    Some(remote_addr),
+                    Some(forward_addr),
                     "https",
+                    state.xff_mode,
                 )
                 .await?
             }
@@ -574,8 +581,9 @@ pub(crate) async fn process_request(
                     req,
                     &dyn_scheme,
                     &dyn_authority,
-                    Some(remote_addr),
+                    Some(forward_addr),
                     "https",
+                    state.xff_mode,
                 )
                 .await?
             }
@@ -660,15 +668,21 @@ async fn handle_static_cache(
     let path_owned: Arc<str> = Arc::from(cache_key);
 
     // Singleflight: coalesce concurrent cache misses for the same key.
-    // If another request is already fetching, wait for it then serve from cache.
-    let existing_notify = state
+    // If another request is already fetching, subscribe to its watch channel
+    // and wait for completion. We use watch (not Notify) because
+    // `Receiver::wait_for` inspects the current value at first poll: if the
+    // fetcher already sent `true` between our get() and our .await, we still
+    // observe it and return immediately instead of hanging.
+    let waiter = state
         .inflight
         .get(&path_owned)
-        .map(|entry| entry.value().clone());
+        .map(|entry| entry.value().subscribe());
 
-    if let Some(n) = existing_notify {
-        n.notified().await;
-        // Re-check cache after coalesced fetch
+    if let Some(mut rx) = waiter {
+        // Err = sender dropped without sending true (fetch aborted/errored).
+        // In both Ok and Err cases we re-check the cache; on miss we fall
+        // through to fetch ourselves.
+        let _ = rx.wait_for(|v| *v).await;
         if let Some(hit) = state.static_cache.get(path_owned.as_ref()) {
             metrics::METRICS
                 .cache_hits
@@ -689,12 +703,16 @@ async fn handle_static_cache(
         // Cache miss even after wait — fall through to fetch from upstream
     }
 
-    // Register as the inflight fetcher for this key
-    let notify = Arc::new(tokio::sync::Notify::new());
-    state.inflight.insert(path_owned.clone(), notify.clone());
+    // Register as the inflight fetcher for this key.
+    // Initial value `false` = "fetch in progress"; we publish `true` once the
+    // cache is populated. Drop without sending `true` signals abort to waiters.
+    let (tx, _) = tokio::sync::watch::channel(false);
+    state.inflight.insert(path_owned.clone(), tx.clone());
 
     // RAM miss — fetch from upstream.
-    // On error, clean up inflight entry before propagating (prevents waiter deadlock).
+    // On error, drop the inflight sender. Waiters' wait_for() returns Err
+    // (channel closed without receiving `true`), they re-check the cache,
+    // miss, and fall through to fetch themselves.
     let resp = match proxy::proxy_pass(
         &state.http_client,
         req,
@@ -702,13 +720,14 @@ async fn handle_static_cache(
         dyn_authority,
         Some(remote_addr),
         "https",
+        state.xff_mode,
     )
     .await
     {
         Ok(r) => r,
         Err(e) => {
             state.inflight.remove(&path_owned);
-            notify.notify_waiters();
+            // tx drops at end of scope → channel closed → waiters get Err
             return Err(e);
         }
     };
@@ -738,9 +757,10 @@ async fn handle_static_cache(
             .unwrap_or(false);
 
         if has_unsafe_vary {
-            // Stream the body straight to the client without dropping back to RAM allocation!
+            // Stream the body straight to the client without caching.
+            // Drop the inflight sender (no `true` sent): waiters fall through
+            // to a fresh fetch, since cache will not be populated for this key.
             state.inflight.remove(&path_owned);
-            notify.notify_waiters();
             let resp = Response::from_parts(parts, body.map_err(hyper::Error::from).boxed());
             return Ok(resp);
         }
@@ -763,7 +783,7 @@ async fn handle_static_cache(
         let state_clone = state.clone();
         let path_clone = path_owned.clone();
         let meta_clone = meta.clone();
-        let notify_clone = notify.clone();
+        let tx_clone = tx.clone();
 
         let (cache_ttl, cache_max) = match &rule.cache {
             Some(cp) => (cp.ttl_seconds, cp.max_entries),
@@ -797,17 +817,17 @@ async fn handle_static_cache(
 
                         // Stream chunk directly to the client immediately
                         if sender.send(Ok(f)).await.is_err() {
-                            // Client disconnected — clean up inflight to unblock waiters
+                            // Client disconnected mid-stream. Drop inflight without
+                            // signaling completion: cache buffer is partial/aborted.
+                            // Waiters' wait_for returns Err and they re-fetch.
                             state_clone.inflight.remove(&path_clone);
-                            notify_clone.notify_waiters();
                             return;
                         }
                     }
                     Some(Err(e)) => {
-                        // Upstream chunking failed — clean up inflight
+                        // Upstream chunking failed — drop inflight (abort signal).
                         let _ = sender.send(Err(e)).await;
                         state_clone.inflight.remove(&path_clone);
-                        notify_clone.notify_waiters();
                         return;
                     }
                     None => {
@@ -824,10 +844,15 @@ async fn handle_static_cache(
                     cache_ttl,
                     cache_max,
                 );
+                // Cache populated: signal `true` so waiters' wait_for resolves
+                // immediately at the next poll, even if they hadn't subscribed
+                // before this point. Send before remove so the value is the
+                // last-observed state when the sender drops.
+                let _ = tx_clone.send(true);
             }
-            // Singleflight: notify waiters and remove inflight entry
+            // (else cache_aborted — body exceeded MAX_CACHEABLE_BODY: don't
+            //  signal completion; waiters re-fetch through normal miss path.)
             state_clone.inflight.remove(&path_clone);
-            notify_clone.notify_waiters();
         });
 
         let mut resp = Response::from_parts(parts, stream_body.boxed());
@@ -838,9 +863,9 @@ async fn handle_static_cache(
         return Ok(resp);
     }
 
-    // Non-200 or non-cacheable: clean up inflight and notify waiters
+    // Non-200 or non-cacheable: drop inflight without signaling completion.
+    // Waiters re-check the cache (miss) and fall through to fetch themselves.
     state.inflight.remove(&path_owned);
-    notify.notify_waiters();
 
     Ok(resp)
 }
@@ -849,6 +874,154 @@ async fn handle_static_cache(
 #[inline]
 fn is_internal_ip(ip: &std::net::IpAddr) -> bool {
     security::is_internal_ip(ip)
+}
+
+// ==========================================================================
+// Thread-local route LRU
+// --------------------------------------------------------------------------
+// O(1) get/insert/evict via an intrusive doubly-linked list backed by a Vec.
+// Same primitive as cache::L1Cache but stripped to what the route cache needs:
+// no TTL (routes are immutable for the lifetime of the daemon — they come
+// from the static config) and no generation counter. The cache key is the
+// FNV hash of the request path (already computed at the call site).
+// ==========================================================================
+mod route_cache {
+    pub(super) const ROUTE_CACHE_CAP: usize = 256;
+    const NIL: usize = usize::MAX;
+
+    struct Node {
+        key: u64,
+        prev: usize,
+        next: usize,
+    }
+
+    /// Generic on V so tests can drive the LRU with a trivial value type
+    /// (e.g. u32) without needing to construct a fully populated
+    /// ResolvedRoute. Monomorphises to the same code at the call site.
+    pub(super) struct RouteCache<V: Clone> {
+        map: fnv::FnvHashMap<u64, (V, usize)>,
+        nodes: Vec<Node>,
+        free: Vec<usize>,
+        head: usize, // LRU — evicted first
+        tail: usize, // MRU
+        cap: usize,
+    }
+
+    impl<V: Clone> RouteCache<V> {
+        pub(super) fn new(cap: usize) -> Self {
+            Self {
+                map: fnv::FnvHashMap::with_capacity_and_hasher(cap, Default::default()),
+                nodes: Vec::with_capacity(cap),
+                free: Vec::new(),
+                head: NIL,
+                tail: NIL,
+                cap,
+            }
+        }
+
+        #[inline]
+        fn unlink(&mut self, idx: usize) {
+            let prev = self.nodes[idx].prev;
+            let next = self.nodes[idx].next;
+            if prev != NIL {
+                self.nodes[prev].next = next;
+            } else {
+                self.head = next;
+            }
+            if next != NIL {
+                self.nodes[next].prev = prev;
+            } else {
+                self.tail = prev;
+            }
+            self.nodes[idx].prev = NIL;
+            self.nodes[idx].next = NIL;
+        }
+
+        #[inline]
+        fn push_tail(&mut self, idx: usize) {
+            self.nodes[idx].prev = self.tail;
+            self.nodes[idx].next = NIL;
+            if self.tail != NIL {
+                self.nodes[self.tail].next = idx;
+            } else {
+                self.head = idx;
+            }
+            self.tail = idx;
+        }
+
+        #[inline]
+        fn alloc_node(&mut self, key: u64) -> usize {
+            if let Some(idx) = self.free.pop() {
+                self.nodes[idx] = Node {
+                    key,
+                    prev: NIL,
+                    next: NIL,
+                };
+                idx
+            } else {
+                let idx = self.nodes.len();
+                self.nodes.push(Node {
+                    key,
+                    prev: NIL,
+                    next: NIL,
+                });
+                idx
+            }
+        }
+
+        /// Lookup with MRU promotion. Returns a clone of the value (for
+        /// `Arc<T>` this is just an atomic refcount bump).
+        pub(super) fn get(&mut self, key: u64) -> Option<V> {
+            let (value, idx) = self.map.get(&key)?;
+            let value = value.clone();
+            let idx = *idx;
+            self.unlink(idx);
+            self.push_tail(idx);
+            Some(value)
+        }
+
+        /// Insert or update. On capacity full, evicts the LRU entry. Always
+        /// places the inserted/updated key at MRU.
+        pub(super) fn insert(&mut self, key: u64, value: V) {
+            if let Some((existing, idx)) = self.map.get_mut(&key) {
+                *existing = value;
+                let idx = *idx;
+                self.unlink(idx);
+                self.push_tail(idx);
+                return;
+            }
+            // Evict LRU if at capacity (must run BEFORE allocating, otherwise
+            // a single-shot of cap+1 distinct keys would never reclaim space).
+            while self.map.len() >= self.cap && self.head != NIL {
+                let lru_idx = self.head;
+                let lru_key = self.nodes[lru_idx].key;
+                self.unlink(lru_idx);
+                self.free.push(lru_idx);
+                self.map.remove(&lru_key);
+            }
+            let idx = self.alloc_node(key);
+            self.push_tail(idx);
+            self.map.insert(key, (value, idx));
+        }
+
+        #[cfg(test)]
+        pub(super) fn len(&self) -> usize {
+            self.map.len()
+        }
+
+        /// Returns keys in LRU→MRU order. Test-only helper that walks the
+        /// intrusive list, so it also implicitly verifies link integrity.
+        #[cfg(test)]
+        pub(super) fn order(&self) -> Vec<u64> {
+            let mut out = Vec::with_capacity(self.map.len());
+            let mut cur = self.head;
+            while cur != NIL {
+                out.push(self.nodes[cur].key);
+                cur = self.nodes[cur].next;
+            }
+            out
+        }
+    }
 }
 
 // ==========================================================================
@@ -887,5 +1060,213 @@ mod tests {
     fn test_is_internal_ip_link_local() {
         let ip: std::net::IpAddr = "169.254.0.1".parse().unwrap();
         assert!(is_internal_ip(&ip));
+    }
+
+    // ── Singleflight primitive (race fix) ──
+    //
+    // These tests exercise the watch-channel semantics that replaced the
+    // earlier `Notify`-based singleflight. They model the fetcher/waiter
+    // interaction in isolation (no HTTP stack, no cache) so the property
+    // we fixed — "wait_for resolves immediately if completion already
+    // happened, even if the waiter hadn't subscribed yet" — is verifiable
+    // deterministically without timing assumptions.
+
+    #[tokio::test]
+    async fn singleflight_waiter_subscribes_before_completion() {
+        // Standard happy path: subscribe → fetcher completes → waiter wakes.
+        let (tx, _) = tokio::sync::watch::channel(false);
+        let mut rx = tx.subscribe();
+        let fetcher = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let _ = tx.send(true);
+        });
+        rx.wait_for(|v| *v).await.expect("must observe completion");
+        fetcher.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn singleflight_waiter_subscribes_after_completion() {
+        // The race the original Notify-based code could not handle:
+        // the fetcher publishes completion AND drops the sender BEFORE
+        // the waiter polls wait_for. With watch, wait_for inspects the
+        // current value at first poll, so we still observe `true`.
+        let (tx, _) = tokio::sync::watch::channel(false);
+        let rx = tx.subscribe();
+
+        // Drive the fetcher to completion before we touch the receiver.
+        let _ = tx.send(true);
+        drop(tx); // sender gone; channel "closed" but last value retained
+
+        let mut rx = rx;
+        rx.wait_for(|v| *v)
+            .await
+            .expect("watch must surface the retained `true` even after sender drop");
+    }
+
+    #[tokio::test]
+    async fn singleflight_aborted_fetcher_yields_err_to_waiters() {
+        // Aborted fetch: sender drops without sending `true`. wait_for
+        // must return Err so the waiter falls through to a fresh fetch
+        // instead of hanging.
+        let (tx, _) = tokio::sync::watch::channel(false);
+        let mut rx = tx.subscribe();
+        drop(tx);
+
+        let result = rx.wait_for(|v| *v).await;
+        assert!(
+            result.is_err(),
+            "dropped sender without `true` must yield Err to waiters"
+        );
+    }
+
+    // ── Route LRU (replacement for the "len < 256 then nothing" bug) ──
+    //
+    // The replaced code accepted inserts only while `len < 256`. After the
+    // first 256 distinct path hashes, all subsequent paths fell through to
+    // the radix tree forever for that worker thread. These tests pin the
+    // new behaviour: O(1) insert with LRU eviction, and — crucially —
+    // adversarial path flooding does NOT lock out subsequent hot routes.
+
+    #[test]
+    fn route_lru_get_returns_inserted_value() {
+        let mut c = route_cache::RouteCache::<u32>::new(4);
+        c.insert(1, 100);
+        assert_eq!(c.get(1), Some(100));
+        assert_eq!(c.get(2), None);
+    }
+
+    #[test]
+    fn route_lru_get_promotes_to_mru() {
+        let mut c = route_cache::RouteCache::<u32>::new(4);
+        c.insert(1, 10);
+        c.insert(2, 20);
+        c.insert(3, 30);
+        // Order LRU→MRU: 1, 2, 3
+        assert_eq!(c.order(), vec![1, 2, 3]);
+        // Touch key 1: it should move to MRU.
+        let _ = c.get(1);
+        assert_eq!(c.order(), vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn route_lru_insert_existing_key_updates_and_promotes() {
+        let mut c = route_cache::RouteCache::<u32>::new(4);
+        c.insert(1, 10);
+        c.insert(2, 20);
+        c.insert(1, 11); // update + promote to MRU
+        assert_eq!(c.get(1), Some(11));
+        assert_eq!(c.order(), vec![2, 1]);
+        assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn route_lru_evicts_lru_at_capacity() {
+        let mut c = route_cache::RouteCache::<u32>::new(3);
+        c.insert(1, 10);
+        c.insert(2, 20);
+        c.insert(3, 30);
+        c.insert(4, 40); // forces eviction of 1 (LRU)
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.get(1), None, "1 should have been evicted");
+        assert_eq!(c.order(), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn route_lru_recency_preserved_under_mixed_access() {
+        // Touch promotes; new insert evicts the genuinely least-recently-used.
+        let mut c = route_cache::RouteCache::<u32>::new(3);
+        c.insert(1, 10);
+        c.insert(2, 20);
+        c.insert(3, 30);
+        let _ = c.get(1); // 1 → MRU; LRU order now: 2, 3, 1
+        c.insert(4, 40); // evict LRU=2
+        assert_eq!(c.get(2), None);
+        assert_eq!(c.order(), vec![3, 1, 4]);
+    }
+
+    #[test]
+    fn route_lru_adversarial_flood_does_not_lock_out_hot_routes() {
+        // The exact scenario that motivated the fix:
+        // 1. An attacker (or a CDN with cache-busted hashes) hits the cache
+        //    with `cap` distinct cold path hashes.
+        // 2. A legitimate hot path is requested afterwards.
+        // The OLD `if len < cap { insert }` would silently DROP the hot path
+        // promotion forever. The new LRU evicts a cold entry instead.
+        let cap = 8;
+        let mut c = route_cache::RouteCache::<u32>::new(cap);
+        for k in 0..(cap as u64) {
+            c.insert(k, k as u32);
+        }
+        assert_eq!(c.len(), cap);
+        // A new hot path arrives:
+        c.insert(9999, 0xBEEF);
+        assert_eq!(c.get(9999), Some(0xBEEF), "hot path must be cacheable");
+        assert_eq!(c.len(), cap, "capacity bound must hold");
+        // The LRU (key 0) is the one that was evicted, not the new one.
+        assert_eq!(c.get(0), None);
+    }
+
+    #[test]
+    fn route_lru_capacity_bound_holds_under_heavy_insert() {
+        let cap = 16;
+        let mut c = route_cache::RouteCache::<u32>::new(cap);
+        for k in 0..1024u64 {
+            c.insert(k, k as u32);
+            assert!(c.len() <= cap, "capacity must never be exceeded");
+        }
+        // The most recently inserted `cap` keys must all be present.
+        for k in (1024 - cap as u64)..1024 {
+            assert_eq!(c.get(k), Some(k as u32));
+        }
+    }
+
+    #[test]
+    fn route_lru_node_recycling_stays_bounded() {
+        // Repeated insert-then-evict cycles must not grow `nodes` unbounded.
+        // The free-list recycles indices; this test exercises that path.
+        let cap = 4;
+        let mut c = route_cache::RouteCache::<u32>::new(cap);
+        for k in 0..1000u64 {
+            c.insert(k, k as u32);
+        }
+        assert_eq!(c.len(), cap);
+        // Last 4 inserts must be the survivors, in MRU order.
+        assert_eq!(c.order(), vec![996, 997, 998, 999]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn singleflight_concurrent_waiters_all_observe_completion() {
+        // Many waiters subscribe at varying times; some before send, some
+        // after. None must hang.
+        let (tx, _) = tokio::sync::watch::channel(false);
+        let mut tasks = Vec::new();
+        for i in 0..32 {
+            let mut rx = tx.subscribe();
+            tasks.push(tokio::spawn(async move {
+                // Stagger subscription/poll order to exercise both pre- and
+                // post-completion subscribers on a multi-thread runtime.
+                for _ in 0..(i % 4) {
+                    tokio::task::yield_now().await;
+                }
+                rx.wait_for(|v| *v).await.expect("waiter must observe completion");
+            }));
+        }
+        // Yield a few times so some waiters have polled and parked, while
+        // others have not yet subscribed.
+        for _ in 0..2 {
+            tokio::task::yield_now().await;
+        }
+        let _ = tx.send(true);
+
+        // Bounded join: if any waiter hangs, the test times out. Without
+        // the watch fix, the post-send subscribers would never resolve.
+        let join_all = async {
+            for t in tasks {
+                t.await.unwrap();
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), join_all)
+            .await
+            .expect("no waiter must hang");
     }
 }

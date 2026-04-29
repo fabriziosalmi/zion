@@ -16,7 +16,22 @@
       "Bash(ZION_BOOT_FAST=1 ./target/release/zion bootstrap)",
       "Bash(./target/debug/zion auto *)",
       "Bash(sed -i '' 's/^version = \"0.1.5\"/version = \"0.1.6\"/' Cargo.toml)",
-      "Bash(sed -i '' 's/0\\\\.1\\\\.5/0.1.6/g; s/v0\\\\.1\\\\.5/v0.1.6/g' SECURITY.md deploy/helm/zion/Chart.yaml deploy/helm/zion/values.yaml .github/ISSUE_TEMPLATE/bug_report.md benchmarks/generate-scientific-report.py)"
+      "Bash(sed -i '' 's/0\\\\.1\\\\.5/0.1.6/g; s/v0\\\\.1\\\\.5/v0.1.6/g' SECURITY.md deploy/helm/zion/Chart.yaml deploy/helm/zion/values.yaml .github/ISSUE_TEMPLATE/bug_report.md benchmarks/generate-scientific-report.py)",
+      "Bash(awk '/let patterns = &\\\\[/,/\\\\];$/' /Users/fab/Documents/git/zion/src/waf.rs)",
+      "Bash(./target/release/zion doctor *)",
+      "Bash(git -c color.ui=never diff --stat src/main.rs src/dispatch.rs)",
+      "Bash(git -c color.ui=never diff src/main.rs)",
+      "Bash(git -c color.ui=never diff src/dispatch.rs)",
+      "Bash(RUSTFLAGS='-D warnings' cargo build --release)",
+      "Bash(git -c color.ui=never diff --stat src/main.rs src/proxy.rs src/dispatch.rs src/auth.rs src/config.rs src/health.rs src/init.rs src/security.rs)",
+      "Bash(awk '{print $4+$6+$8+$10}')",
+      "Bash(awk '{print $4}')",
+      "Bash(awk '{printf \"%.1f\", $2}')",
+      "Bash(awk '{print $5}')",
+      "Bash(awk '/^run_wrk\\\\\\(\\\\\\)/,/^}$/{print} /^bench_endpoint\\\\\\(\\\\\\)/,/^}$/{print} /^compute_stats\\\\\\(\\\\\\)/,/^}$/{print}' /Users/fab/Documents/git/zion/benchmarks/bench-native.sh)",
+      "Bash(awk '{print $1}')",
+      "Bash(bash scripts/update-readme-stats.sh)",
+      "Bash(bash scripts/update-readme-stats.sh --check)"
     ]
   }
 }

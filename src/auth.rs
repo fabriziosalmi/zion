@@ -12,9 +12,15 @@
 #[cfg(feature = "auth")]
 use jsonwebtoken::{decode, Algorithm, DecodingKey, TokenData, Validation};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "auth")]
 use std::sync::Arc;
 
 /// Standard JWT claims (subset — we only validate what matters for a proxy).
+///
+/// The struct is always defined (it appears in `validate_token`'s signature
+/// when the `auth` feature is on) but its fields are only read by code
+/// behind `#[cfg(feature = "auth")]`. Hence the targeted allow.
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
     /// Subject (user ID)
@@ -32,6 +38,12 @@ pub struct Claims {
 }
 
 /// Auth profile configuration (from TOML).
+///
+/// `AuthProfileConfig` is always deserialized (config.rs references it
+/// outside any feature gate so users get clear "unknown auth_profile"
+/// validation errors at startup regardless of build flavour). The fields
+/// are only consumed by code under `#[cfg(feature = "auth")]`.
+#[allow(dead_code)]
 #[derive(Deserialize, Clone, Debug)]
 pub struct AuthProfileConfig {
     /// Expected issuer (validated against token's `iss` claim).
@@ -82,6 +94,8 @@ impl std::fmt::Debug for ResolvedAuthProfile {
 }
 
 /// Auth error — returned when validation fails.
+/// Reachable only via `validate_token`, which is `#[cfg(feature = "auth")]`.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum AuthError {
     /// No Authorization header present
@@ -94,6 +108,8 @@ pub enum AuthError {
 
 /// Extract Bearer token from Authorization header.
 /// Case-insensitive prefix per RFC 6750 §2.1.
+/// Called only by the auth gate, which is `#[cfg(feature = "auth")]`.
+#[allow(dead_code)]
 #[inline]
 pub fn extract_bearer(auth_header: &str) -> Option<&str> {
     if auth_header.len() < 7 {

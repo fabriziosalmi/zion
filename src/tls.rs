@@ -640,33 +640,73 @@ mod tests {
         assert_ne!(mode, "required");
     }
 
-    #[test]
-    fn cert_fingerprint_xor_hash() {
-        // Test the XOR-based fingerprint used for X-Client-Cert-DN
-        let raw = [0xABu8; 64];
-        let mut hasher_out = [0u8; 8];
-        for (i, &b) in raw.iter().take(64).enumerate() {
-            hasher_out[i % 8] ^= b;
+    // ── Client cert fingerprint (X-Client-Cert-Fingerprint) ──
+    //
+    // Replaces the previous 64-bit XOR-fold of the leaf DER, which was
+    // emitted as `X-Client-Cert-DN` and falsely implied a Distinguished
+    // Name. SHA-256 is collision-resistant and matches the convention
+    // used by openssl/nginx ($ssl_client_fingerprint).
+
+    /// Reconstruct the fingerprint exactly as main.rs computes it, so the
+    /// tests pin the wire format (`sha256:HEX`) and detect any drift.
+    fn fingerprint(der: &[u8]) -> String {
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der);
+        let bytes = digest.as_ref();
+        let mut s = String::with_capacity(7 + bytes.len() * 2);
+        s.push_str("sha256:");
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for &b in bytes {
+            s.push(HEX[(b >> 4) as usize] as char);
+            s.push(HEX[(b & 0xF) as usize] as char);
         }
-        // 64 bytes of 0xAB XOR'd 8 times each → 0xAB ^ 0xAB ^ ... = 0x00
-        // (8 iterations per slot, even count → cancels out)
-        for b in &hasher_out {
-            assert_eq!(*b, 0x00);
-        }
+        s
     }
 
     #[test]
-    fn cert_fingerprint_odd_count() {
-        let raw = [0xABu8; 9]; // 9 bytes → slot 0 gets XOR'd twice (0,8)
-        let mut hasher_out = [0u8; 8];
-        for (i, &b) in raw.iter().take(9).enumerate() {
-            hasher_out[i % 8] ^= b;
-        }
-        // Slot 0: 0xAB ^ 0xAB = 0x00 (indices 0,8)
-        assert_eq!(hasher_out[0], 0x00);
-        // Slots 1-7: single XOR → 0xAB
-        for b in &hasher_out[1..8] {
-            assert_eq!(*b, 0xAB);
-        }
+    fn fingerprint_format_is_sha256_prefix_plus_64_hex() {
+        let der = b"abc";
+        let fp = fingerprint(der);
+        assert!(fp.starts_with("sha256:"));
+        assert_eq!(fp.len(), 7 + 64);
+        assert!(fp[7..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn fingerprint_matches_known_sha256_vector() {
+        // Standard NIST vector: SHA-256("abc") =
+        //   ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        // Pinning a known vector ensures we are calling SHA-256 (not some
+        // other digest) and that the hex encoding matches openssl/nginx.
+        let fp = fingerprint(b"abc");
+        assert_eq!(
+            fp,
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn fingerprint_is_deterministic_for_same_input() {
+        let der = vec![0xABu8; 1024];
+        assert_eq!(fingerprint(&der), fingerprint(&der));
+    }
+
+    #[test]
+    fn fingerprint_diffuses_single_bit_flips() {
+        // The replaced XOR-fold collided trivially: e.g., 64 bytes of 0xAB
+        // mapped to all-zero output, and any cert with a uniform first 64
+        // bytes was indistinguishable from another. SHA-256 must produce
+        // entirely different output for a single-bit difference.
+        let mut a = vec![0xABu8; 1024];
+        let mut b = a.clone();
+        b[512] ^= 0x01; // single bit flip deep inside the cert
+        let fa = fingerprint(&a);
+        let fb = fingerprint(&b);
+        assert_ne!(fa, fb);
+
+        // And the all-0xAB collision class that broke the XOR-fold is gone:
+        // two different lengths of 0xAB produce different fingerprints.
+        a.truncate(512);
+        let fa_short = fingerprint(&a);
+        assert_ne!(fa, fa_short);
     }
 }

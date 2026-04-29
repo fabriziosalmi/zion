@@ -22,9 +22,9 @@ features:
   - title: 233K req/s
     details: Peak throughput on Apple M4 with TLS 1.3 end-to-end. 107K req/s API proxy, 103K with full WAF pipeline active (CV 0.5%). Zero errors.
   - title: Zero-Regex WAF
-    details: 192 patterns across 14 categories (SQLi, XSS, CMDi, SSRF, NoSQL, deserialization, GraphQL, LDAP, XXE, SSTI, CRLF, Log4Shell) in a single O(N) Aho-Corasick pass. Zero false positives.
+    details: Aho-Corasick automaton in a single O(N) pass over the body. Two pattern sets — balanced (default, ~120 high-precision patterns) and aggressive (opt-in, +~70 broad-substring patterns). Per-profile entropy gate (default 6.5 bits/byte, JSON-string-aware).
   - title: Two-Level Cache
-    details: "L1 thread-local (~5ns, O(1) LRU) + L2 shared DashMap (~30ns). Generation-based coherence. Singleflight coalescing prevents thundering herd."
+    details: "L1 thread-local with O(1) LRU (intrusive doubly-linked list) + L2 shared DashMap. Generation-based coherence. Watch-channel singleflight (race-free even when the fetcher completes between subscribe and await)."
   - title: TLS 1.3 + Hot-Reload
     details: rustls + hardware crypto (AES-NI/NEON). Multi-SNI, session tickets, 0-RTT. Certificate hot-reload via ArcSwap with zero downtime.
   - title: HTTP/1.1 + H2 + H3
@@ -60,7 +60,7 @@ features:
   </div>
 </div>
 
-Native benchmark on Apple M4, v0.1.4, 5 runs x 10s, c=100. Rust backend. [Full results](/benchmarks/)
+Native benchmark on Apple M4, 5 runs x 10s, c=100. Rust backend. Tracked per-commit in [bench-history.json](https://github.com/fabriziosalmi/zion/blob/master/benchmarks/bench-history.json). [Full results](/benchmarks/)
 
 </div>
 
@@ -70,7 +70,7 @@ Native benchmark on Apple M4, v0.1.4, 5 runs x 10s, c=100. Rust backend. [Full r
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | Language | C | C | C++ | Go | Go | Rust | **Rust** |
 | Memory safety | No | No | No | GC | GC | Yes | **Yes** |
-| Built-in WAF | No | No | No | No | No | No | **192 patterns** |
+| Built-in WAF | No | No | No | No | No | No | **Aho-Corasick, dual-mode** |
 | RAM cache | No | Yes | No | No | No | No | **L1+L2** |
 | TLS hot-reload | Signal | Signal | xDS | Auto | File watch | Custom | **ArcSwap** |
 | Config format | Custom | Custom | YAML/xDS | JSON/API | YAML/API | Rust code | **TOML** |
