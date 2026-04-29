@@ -322,4 +322,195 @@ mod tests {
         // is enough; we don't assert a numeric value to keep the test
         // order-independent).
     }
+
+    // ── End-to-end atomic-swap behaviour ──
+    //
+    // These tests exercise the property that gives Phase 1 its
+    // correctness contract: a reader that has loaded a snapshot
+    // continues to see THAT snapshot for the remainder of its work,
+    // even if a hot-reload swaps in a new one mid-flight. The
+    // filesystem watcher is not exercised here (its job is purely
+    // "translate a write event into one of these calls"); these
+    // tests target the underlying primitive directly.
+
+    /// Build a tiny `ZionConfig` from inline TOML, bypassing
+    /// `config::load_config` so we don't need cert/key files on disk.
+    fn parse_inline(toml_text: &str) -> ZionConfig {
+        toml::from_str(toml_text).expect("inline test config must parse")
+    }
+
+    const TOML_V1: &str = r#"
+        [server]
+        listen_http = "0.0.0.0:8080"
+        listen_https = "0.0.0.0:8443"
+
+        [tls]
+        cert_path = "/tmp/zion-test.crt"
+        key_path  = "/tmp/zion-test.key"
+
+        [upstreams]
+        api = "http://api:8000"
+
+        [[route]]
+        path = "/api/{*rest}"
+        upstream = "api"
+    "#;
+
+    const TOML_V2: &str = r#"
+        [server]
+        listen_http = "0.0.0.0:8080"
+        listen_https = "0.0.0.0:8443"
+
+        [tls]
+        cert_path = "/tmp/zion-test.crt"
+        key_path  = "/tmp/zion-test.key"
+
+        [upstreams]
+        api = "http://api:8000"
+        billing = "http://billing:9000"
+
+        [[route]]
+        path = "/api/{*rest}"
+        upstream = "api"
+
+        [[route]]
+        path = "/billing/{*rest}"
+        upstream = "billing"
+    "#;
+
+    #[test]
+    fn atomic_swap_preserves_old_snapshot_for_inflight_readers() {
+        // Initial snapshot, exposed only via `/api/...`.
+        let v1 = parse_inline(TOML_V1);
+        let snap_v1 = ResolvedAppConfig::build(&v1);
+        let store = ArcSwap::from_pointee(snap_v1);
+
+        // Reader A grabs an Arc clone *before* the swap. This models a
+        // request that has already loaded its config snapshot and is
+        // about to dispatch — it must not see a different routing
+        // table mid-flight.
+        let reader_a = store.load_full();
+
+        // Hot-reload: build v2 (adds /billing) and swap.
+        let v2 = parse_inline(TOML_V2);
+        let snap_v2 = rebuild(&v2, &reader_a);
+        store.store(Arc::new(snap_v2));
+
+        // Reader A sees the old routing table (route /api works,
+        // /billing must not exist).
+        assert!(reader_a.router.at("/api/users").is_ok());
+        assert!(
+            reader_a.router.at("/billing/invoice").is_err(),
+            "in-flight reader must NOT see post-swap routes"
+        );
+
+        // A new reader (B) grabs the post-swap snapshot and sees both.
+        let reader_b = store.load_full();
+        assert!(reader_b.router.at("/api/users").is_ok());
+        assert!(
+            reader_b.router.at("/billing/invoice").is_ok(),
+            "new reader must see the post-swap routing table"
+        );
+
+        // The two snapshots are distinct Arcs.
+        assert!(
+            !Arc::ptr_eq(&reader_a, &reader_b),
+            "swap must produce a fresh Arc"
+        );
+
+        // Reader A is still alive after B has loaded its snapshot —
+        // ArcSwap's epoch GC does not yank a snapshot from under an
+        // active reader.
+        assert!(reader_a.router.at("/api/users").is_ok());
+    }
+
+    #[test]
+    fn empty_routing_table_still_swappable() {
+        // Edge case: the OLD snapshot has zero routes. The new one
+        // adds one. This pins that the rebuild path doesn't assume
+        // a non-empty router (a fresh deploy might start with an
+        // empty `[[route]]` section before the first edit).
+        let mut empty = parse_inline(TOML_V1);
+        empty.route.clear();
+        let snap_empty = ResolvedAppConfig::build(&empty);
+        let store = ArcSwap::from_pointee(snap_empty);
+
+        let v1 = parse_inline(TOML_V1);
+        let prev = store.load_full();
+        let snap_v1 = rebuild(&v1, &prev);
+        store.store(Arc::new(snap_v1));
+
+        let after = store.load_full();
+        assert!(after.router.at("/api/users").is_ok());
+        assert!(prev.router.at("/api/users").is_err()); // old snapshot still empty
+    }
+
+    #[test]
+    fn generation_counter_is_monotonic() {
+        // The counter is a process-global static. We can't reset it
+        // between tests, but we can pin its monotonicity property:
+        // a fetch_add followed by a load is never less than the
+        // fetched value. (Acquire/Release ordering is what the
+        // watcher loop relies on for cross-thread visibility.)
+        let before = CONFIG_GENERATION.fetch_add(1, Ordering::Release);
+        let after = CONFIG_GENERATION.load(Ordering::Acquire);
+        assert!(
+            after > before,
+            "generation must be strictly increasing across a successful reload"
+        );
+    }
+
+    #[test]
+    fn invalid_config_path_returns_err() {
+        // The watcher's reload loop is structured as:
+        //
+        //   match config::load_config(...) {
+        //       Ok(new) => { build(); store(); fetch_add(); }
+        //       Err(_)  => { log!("REJECTED"); /* no swap */ }
+        //   }
+        //
+        // We can't easily test the spawned task without running a
+        // tokio runtime + filesystem, so we exercise the part that
+        // gates the `store()` call: that `load_config` on an
+        // unreachable path returns `Err`. As long as the type is
+        // `Result`, the match arm in the watcher never falls through
+        // to `store()` on bad input.
+        let r = crate::config::load_config("/nonexistent/zion-test-zzz.toml");
+        assert!(r.is_err());
+        // We don't pin the exact error message — error formatting is
+        // intentionally cosmetic — but the prefix is documented as
+        // "Cannot read <path>" or "Invalid TOML in <path>".
+        let msg = r.err().expect("Err expected");
+        assert!(
+            msg.contains("Cannot read") || msg.contains("Invalid TOML"),
+            "unexpected error message: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn invalid_toml_content_returns_err() {
+        // Same gate, different failure mode: a file that exists but
+        // contains malformed TOML. The watcher must NOT swap.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "zion-reload-test-invalid-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"this is = not [[ valid TOML").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+        let r = crate::config::load_config(&path_str);
+        let _ = std::fs::remove_file(&path);
+
+        let msg = r.err().expect("Err expected");
+        assert!(
+            msg.contains("Invalid TOML"),
+            "malformed TOML should produce a parse-error message, got: {}",
+            msg
+        );
+    }
 }
