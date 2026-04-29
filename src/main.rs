@@ -22,6 +22,7 @@ mod config;
 mod doctor;
 mod health;
 mod init;
+mod listener;
 mod logging;
 mod metrics;
 mod net;
@@ -129,6 +130,14 @@ pub(crate) struct ResolvedAppConfig {
     pub(crate) rate_limit_rps: u32,
     /// Rate limiter window in seconds.
     pub(crate) rate_limit_window: u64,
+    /// Pre-parsed listen address for plain HTTP. `None` if the config
+    /// string is malformed; the listener supervisor logs the parse error
+    /// at reload time and keeps the previously-bound listener.
+    pub(crate) listen_http: Option<SocketAddr>,
+    /// Pre-parsed listen address for HTTPS. `None` only if the string is
+    /// malformed; the supervisor refuses to drop the existing listener
+    /// in that case (the previous valid bind survives the reload).
+    pub(crate) listen_https: Option<SocketAddr>,
 }
 
 impl ResolvedAppConfig {
@@ -148,6 +157,8 @@ impl ResolvedAppConfig {
             xff_mode: proxy::XffMode::Append,
             rate_limit_rps: 0,
             rate_limit_window: 1,
+            listen_http: None,
+            listen_https: None,
         }
     }
 
@@ -192,6 +203,39 @@ impl ResolvedAppConfig {
         // redundant — we just take the parsed value.
         let xff_mode = proxy::XffMode::parse(&config.server.xff_mode).unwrap_or_default();
 
+        // Parse listen addresses once at build time. A malformed string
+        // logs a structured warning and yields `None`; the listener
+        // supervisor refuses to drop the existing listener in that case,
+        // so a typo in zion.toml never strands the daemon offline.
+        let listen_http = config
+            .server
+            .listen_http
+            .parse::<SocketAddr>()
+            .map_err(|e| {
+                logging::warn(
+                    "config",
+                    &format!(
+                        "server.listen_http '{}' is not a valid socket address: {}",
+                        config.server.listen_http, e
+                    ),
+                );
+            })
+            .ok();
+        let listen_https = config
+            .server
+            .listen_https
+            .parse::<SocketAddr>()
+            .map_err(|e| {
+                logging::warn(
+                    "config",
+                    &format!(
+                        "server.listen_https '{}' is not a valid socket address: {}",
+                        config.server.listen_https, e
+                    ),
+                );
+            })
+            .ok();
+
         Self {
             router,
             health_map,
@@ -199,6 +243,8 @@ impl ResolvedAppConfig {
             xff_mode,
             rate_limit_rps: config.server.rate_limit_rps,
             rate_limit_window: config.server.rate_limit_window_secs,
+            listen_http,
+            listen_https,
         }
     }
 }
@@ -477,7 +523,16 @@ async fn async_main(
         }),
     });
 
-    // 5b. Spawn the config-file hot-reload watcher. Watches `zion.toml`
+    // 5b. Phase 1.5 channels.
+    //  * `config_change_*` is bumped by the config watcher after every
+    //    successful swap; the listener supervisor (built later) uses it
+    //    to know when to reconcile bind addresses.
+    //  * `super_shutdown_*` is flipped to `true` on SIGINT/SIGTERM by
+    //    the main task and tells the supervisor to retire all listeners.
+    let (config_change_tx, config_change_rx) = tokio::sync::watch::channel(0u64);
+    let (super_shutdown_tx, super_shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // 5c. Spawn the config-file hot-reload watcher. Watches `zion.toml`
     // for Modify/Create events; on change, parses + validates the new
     // config and atomic-swaps `state.config`. Invalid configs are
     // rejected with a WARN log, the previous snapshot stays in place.
@@ -485,7 +540,11 @@ async fn async_main(
     // re-applied through this watcher — the existing `tls_watcher`
     // covers cert/key file changes; pivoting `[tls]` paths is a
     // separate hot-reload step beyond Phase 1.
-    reload::spawn_config_watcher(config_path.clone().into(), state.config.clone());
+    reload::spawn_config_watcher(
+        config_path.clone().into(),
+        state.config.clone(),
+        Some(config_change_tx),
+    );
 
     // 6. Spawn ACME auto-renewal task (if configured)
     if let Some(ref acme_config) = config.tls.acme {
@@ -676,57 +735,61 @@ async fn async_main(
         });
     }
 
-    // 9. Bind HTTP listener (port 80) synchronously so the boot order is
-    // deterministic — HTTP "listening" is printed before HTTPS, before READY.
-    // If the bind fails (e.g. EACCES on :80 without privileges) we don't kill
-    // startup; HTTPS is the primary listener.
+    // 9. Initial bind: HTTP (port 80, optional) + HTTPS (port 443, primary).
+    // HTTP bind failures are non-fatal (no CAP_NET_BIND_SERVICE on a
+    // dev machine, port already in use, etc.); the listener supervisor
+    // will retry on the next config reload. HTTPS bind failure at boot
+    // is a hard error — there is nothing useful to do without it.
     let http_addr: SocketAddr = config.server.listen_http.parse()?;
-    let http_listener = match net::bind_with_reuseport(http_addr) {
-        Ok(l) => {
-            eprintln!("  listening HTTP  on {}", http_addr);
-            Some(l)
-        }
-        Err(e) => {
-            eprintln!(
-                "  warning: HTTP listener on {} unavailable: {}",
-                http_addr, e
-            );
-            None
-        }
-    };
+    let http_initial: Option<(SocketAddr, tokio::net::TcpListener)> =
+        match net::bind_with_reuseport(http_addr) {
+            Ok(l) => {
+                eprintln!("  listening HTTP  on {}", http_addr);
+                Some((http_addr, l))
+            }
+            Err(e) => {
+                eprintln!(
+                    "  warning: HTTP listener on {} unavailable: {}",
+                    http_addr, e
+                );
+                None
+            }
+        };
 
-    // 10. Main HTTPS listener (port 443) — bind synchronously, log, then later
-    // enter the accept loop on the main task.
     let https_addr: SocketAddr = config.server.listen_https.parse()?;
-    let listener = net::bind_with_reuseport(https_addr)?;
+    let https_listener = net::bind_with_reuseport(https_addr)?;
     eprintln!("  listening HTTPS on {}", https_addr);
 
-    // 11. Spawn the HTTP accept loop. The loop is now a free function
-    // (`run_http_accept_loop`) so Phase 1.5 can spawn / drain / respawn it
-    // when `[server.listen_http]` changes — Phase 1 just spawns it once.
-    // A `watch::Receiver<bool>` is reserved for that future use; in this
-    // refactor we hold the sender for the lifetime of the process so the
-    // channel never closes (which would otherwise terminate the loop on
-    // its first poll of `changed()`).
-    let (accept_shutdown_tx, accept_shutdown_rx) = tokio::sync::watch::channel(false);
-    if let Some(http_listener) = http_listener {
-        tokio::spawn(run_http_accept_loop(
-            http_listener,
-            state.clone(),
-            accept_shutdown_rx.clone(),
-        ));
-    }
-
-    // io_uring multishot accept on Linux (one syscall for N connections)
+    // io_uring multishot accept on Linux (one syscall for N connections).
+    // The uring task is bound to the listener's fd at spawn time and the
+    // listener supervisor explicitly does NOT manage HTTPS rebind in this
+    // build flavour — that limitation is documented in `listener.rs`.
+    // Operators using io_uring keep the v0.1.7 behaviour for `listen_https`
+    // (restart required for port changes).
     #[cfg(all(target_os = "linux", feature = "io-uring-accept"))]
-    let mut uring_rx = {
+    let https_initial: Option<(SocketAddr, tokio::net::TcpListener)> = {
         use std::os::unix::io::AsRawFd;
-        let fd = listener.as_raw_fd();
+        let fd = https_listener.as_raw_fd();
         eprintln!("  io_uring multishot accept enabled");
-        uring::spawn_uring_accept(fd, 4096)
+        let uring_rx = uring::spawn_uring_accept(fd, 4096);
+        // Spawn the accept loop ourselves; pass `https_initial = None`
+        // to the supervisor so it tracks no HTTPS slot.
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let _ = tx; // sender held by main task lifetime; supervisor doesn't touch this loop
+        tokio::spawn(run_https_accept_loop(
+            https_listener,
+            state.clone(),
+            rx,
+            Some(uring_rx),
+        ));
+        None
     };
+    #[cfg(not(all(target_os = "linux", feature = "io-uring-accept")))]
+    let https_initial: Option<(SocketAddr, tokio::net::TcpListener)> =
+        Some((https_addr, https_listener));
 
-    // 10b. Spawn HTTP/3 (QUIC) listener on same port (UDP)
+    // 10. HTTP/3 (QUIC) listener on UDP — independent of the supervisor.
+    // QUIC listen-port hot-reload is out of scope for Phase 1.5.
     #[cfg(feature = "http3")]
     {
         let quic_addr: SocketAddr = config
@@ -739,37 +802,28 @@ async fn async_main(
 
     bootstrap::print_ready_banner(&config.server.listen_http, &config.server.listen_https);
 
-    // Spawn the HTTPS accept loop on its own task — same shape as the HTTP
-    // loop above. The accept-loop functions stop on the next iteration when
-    // `accept_shutdown_tx` flips to `true`; we wait on `shutdown_signal()`
-    // here in the main task and then trigger it.
-    let https_handle = {
-        let state = state.clone();
-        let shutdown_rx = accept_shutdown_rx.clone();
-        #[cfg(all(target_os = "linux", feature = "io-uring-accept"))]
-        {
-            tokio::spawn(run_https_accept_loop(
-                listener,
-                state,
-                shutdown_rx,
-                Some(uring_rx),
-            ))
-        }
-        #[cfg(not(all(target_os = "linux", feature = "io-uring-accept")))]
-        {
-            tokio::spawn(run_https_accept_loop(listener, state, shutdown_rx))
-        }
-    };
+    // 11. Build the listener supervisor. It owns the HTTP/HTTPS accept
+    // loops and reconciles them when `state.config` is hot-swapped to a
+    // new snapshot whose `listen_*` differs. On io_uring the supervisor
+    // is `https_initial = None`: it will log a WARN and refuse to rebind
+    // HTTPS (the uring task above already drives the accept loop on the
+    // initial listener for the lifetime of the process).
+    let supervisor = listener::ListenerSupervisor::new(state.clone(), http_initial, https_initial);
+    let supervisor_handle = supervisor.spawn_reconciler(
+        state.config.clone(),
+        config_change_rx,
+        super_shutdown_rx,
+    );
 
     shutdown_signal().await;
     logging::info("shutdown", "signal received, draining in-flight connections...");
-    // Tell the accept loops to stop accepting new connections. Existing
-    // tasks (one per accepted connection) continue independently and are
-    // drained by the semaphore wait below.
-    let _ = accept_shutdown_tx.send(true);
-    // Best-effort wait on the HTTPS accept loop to exit cleanly. Bounded
-    // by the same drain timeout below — if it hangs we don't block forever.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), https_handle).await;
+    // Tell the supervisor to retire all listeners. Its accept loops stop
+    // on the next iteration; spawned per-connection tasks continue and
+    // are drained by the semaphore wait below.
+    let _ = super_shutdown_tx.send(true);
+    // Best-effort wait on the supervisor to exit cleanly. Bounded by 2s
+    // so a stuck reconcile does not block process shutdown.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), supervisor_handle).await;
 
     // Graceful drain: wait for in-flight connections to complete.
     // conn_limit has MAX permits; available = MAX - in_flight.

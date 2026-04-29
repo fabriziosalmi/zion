@@ -32,6 +32,9 @@
       "Bash(awk '{print $1}')",
       "Bash(bash scripts/update-readme-stats.sh)",
       "Bash(bash scripts/update-readme-stats.sh --check)"
+    ],
+    "additionalDirectories": [
+      "/Users/fab/Documents/git/zion/target/release/deps"
     ]
   }
 }
