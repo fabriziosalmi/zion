@@ -10,7 +10,7 @@
 mod inner {
     use io_uring::{opcode, types, IoUring};
     use std::net::SocketAddr;
-    use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::io::{FromRawFd, RawFd};
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
 
@@ -157,5 +157,9 @@ mod inner {
     }
 }
 
+// Only `spawn_uring_accept` is consumed externally (by main.rs).
+// `AcceptedConn` is the channel item type — internal to this module —
+// and was previously re-exported but never used by any caller, so the
+// re-export was dead.
 #[cfg(all(target_os = "linux", feature = "io-uring-accept"))]
-pub use inner::{spawn_uring_accept, AcceptedConn};
+pub use inner::spawn_uring_accept;
