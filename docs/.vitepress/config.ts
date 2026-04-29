@@ -79,6 +79,7 @@ export default defineConfig({
         items: [
           { text: 'Deployment', link: '/deploy/' },
           { text: 'Observability', link: '/deploy/observability' },
+          { text: 'Hot-reload', link: '/deploy/hot-reload' },
         ]
       }
     ],

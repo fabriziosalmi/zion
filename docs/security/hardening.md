@@ -143,6 +143,12 @@ The value is the SHA-256 of the leaf DER, hex-encoded with a `sha256:` prefix �
 
 Earlier Zion versions emitted `X-Client-Cert-DN`, computed as a 64-bit XOR-fold of the first 64 DER bytes. That value was advertised as a "DN" but was neither a Distinguished Name nor collision-resistant; it has been removed. If your upstream still expects the old header, map it at the upstream side from `X-Client-Cert-Fingerprint` (note: the new value is a fingerprint, not a DN, and downstream identity mapping must be done via your roster).
 
+## Hot-reload
+
+Zion applies changes to `zion.toml` and to the certificate files referenced by `[tls]` without restarting the process. An invalid config is rejected and the previous snapshot keeps serving traffic, so the only way a config edit can break production is if it is a *valid* config that does the wrong thing.
+
+The full contract — what reloads, what is left to a restart, how to verify a reload landed — is in [Operations → Hot-reload](../deploy/hot-reload.md).
+
 ## Content-Security-Policy
 
 Per-route CSP headers can be configured. See [Routing → Content-Security-Policy](../config/routing.md#content-security-policy-per-route).
