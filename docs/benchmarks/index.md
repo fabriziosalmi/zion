@@ -2,9 +2,9 @@
 
 All benchmarks use [wrk](https://github.com/wg/wrk) with consistent methodology. Numbers represent requests per second (higher is better).
 
-## Native Benchmark (Apple M4, v0.1.4, Rust backend)
+## Native Benchmark (Apple M4, Rust backend)
 
-Measured with `bench-native.sh` (5 runs x 10s, c=100, median reported). Includes all v0.1.4 security fixes and 25 performance optimizations. Rust backend (pure hyper, 194K raw req/s) eliminates the backend as a bottleneck.
+Measured with `bench-native.sh` (5 runs x 10s, c=100, median reported). Rust backend (pure hyper, 194K raw req/s) eliminates the backend as a bottleneck. Numbers below were captured on a v0.1.4 build; the latest per-commit history (including any deltas under v0.1.7) lives in [`benchmarks/bench-history.json`](https://github.com/fabriziosalmi/zion/blob/master/benchmarks/bench-history.json) and is the source of truth.
 
 | Endpoint | Median req/s | Best Run | CV% | Errors |
 |---|---|---|---|---|

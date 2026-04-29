@@ -31,7 +31,7 @@ export default defineConfig({
         ]
       },
       {
-        text: 'v0.1.4',
+        text: 'v0.1.7',
         items: [
           { text: 'Changelog', link: 'https://github.com/fabriziosalmi/zion/blob/master/CHANGELOG.md' },
           { text: 'Releases', link: 'https://github.com/fabriziosalmi/zion/releases' },
@@ -79,6 +79,7 @@ export default defineConfig({
         items: [
           { text: 'Deployment', link: '/deploy/' },
           { text: 'Observability', link: '/deploy/observability' },
+          { text: 'Hot-reload', link: '/deploy/hot-reload' },
         ]
       }
     ],

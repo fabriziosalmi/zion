@@ -28,6 +28,7 @@ mod net;
 mod proxy;
 #[cfg(feature = "http3")]
 mod quic;
+mod reload;
 mod security;
 mod tls;
 #[cfg(feature = "tui")]
@@ -102,9 +103,120 @@ pub(crate) fn generate_request_id() -> [u8; 21] {
 // Re-export security types used in AppState and handlers.
 use security::RateEntry;
 
+/// Snapshot of config-derived state. Everything in here is rebuilt from
+/// `config::ZionConfig` and is intentionally independent of long-lived
+/// runtime state (HTTP client pool, RAM caches, rate-limit IP map,
+/// inflight singleflight, etc.) so that the whole snapshot can be
+/// atomically swapped on hot-reload without disturbing in-flight
+/// connections or warm caches.
+///
+/// In Phase 1 (this commit) the snapshot is held as a plain `Arc<...>`
+/// in `AppState` — there is no swap yet, the contents are still built
+/// once at boot from `zion.toml`. The follow-up commit will wrap the
+/// `Arc` in `ArcSwap` and wire the watcher.
+pub(crate) struct ResolvedAppConfig {
+    /// Radix tree (matchit) of pre-resolved routes.
+    pub(crate) router: Router<Arc<ResolvedRoute>>,
+    /// Upstream URL → shared health/latency state. The `Arc<UpstreamHealth>`
+    /// values are intentionally re-used across reloads when the URL is
+    /// unchanged so the prober's accumulated state is preserved.
+    pub(crate) health_map: health::HealthMap,
+    /// Trusted proxy CIDRs for X-Forwarded-For IP resolution.
+    pub(crate) trusted_proxies: security::TrustedProxies,
+    /// Outbound XFF policy (append / rewrite / drop). See proxy::XffMode.
+    pub(crate) xff_mode: proxy::XffMode,
+    /// Per-IP rate limiter target (RPS). 0 = disabled.
+    pub(crate) rate_limit_rps: u32,
+    /// Rate limiter window in seconds.
+    pub(crate) rate_limit_window: u64,
+}
+
+impl ResolvedAppConfig {
+    /// Test-only constructor that lets unit tests in `reload.rs`
+    /// fabricate a snapshot with a specific health map without going
+    /// through `build()` (which requires a full `ZionConfig`). Other
+    /// fields take harmless defaults — they're not exercised by the
+    /// rebuild() merge logic.
+    #[cfg(test)]
+    pub(crate) fn test_with_health(
+        health_map: health::HealthMap,
+    ) -> Self {
+        Self {
+            router: matchit::Router::new(),
+            health_map,
+            trusted_proxies: security::TrustedProxies::from_config(&[]),
+            xff_mode: proxy::XffMode::Append,
+            rate_limit_rps: 0,
+            rate_limit_window: 1,
+        }
+    }
+
+    /// Build a snapshot from a parsed `ZionConfig`.
+    ///
+    /// This is the single entry point that turns the static TOML config
+    /// into the runtime-shaped state the request pipeline reads. Phase 1
+    /// uses it once at boot; subsequent phases call it again on every
+    /// hot-reload and atomic-swap the result.
+    fn build(config: &config::ZionConfig) -> Self {
+        let router = config::build_router(config);
+
+        // Health map: one entry per upstream URL referenced by any route.
+        // The same URL can appear in many routes — dedup via FnvHashMap.
+        let mut map = fnv::FnvHashMap::default();
+        for route in &config.route {
+            let urls = if let Some(up) = config.upstream.get(&route.upstream) {
+                up.get_urls()
+            } else if let Some(url) = config.upstreams.get(&route.upstream) {
+                vec![url.clone()]
+            } else {
+                continue;
+            };
+            for url in urls {
+                map.entry(url.clone()).or_insert_with(|| {
+                    Arc::new(health::UpstreamHealth {
+                        healthy: std::sync::atomic::AtomicBool::new(true),
+                        latency_us: std::sync::atomic::AtomicU64::new(0),
+                    })
+                });
+            }
+        }
+        let health_map = Arc::new(map);
+
+        let trusted_proxies =
+            security::TrustedProxies::from_config(&config.server.trusted_proxies);
+
+        // Parse the configured XFF policy. Unknown values fall back to
+        // Append (silent fallback would weaken upstream IP integrity).
+        // The boot path in async_main already emits a structured warning
+        // when it sees an unknown value, so a second log here would be
+        // redundant — we just take the parsed value.
+        let xff_mode = proxy::XffMode::parse(&config.server.xff_mode).unwrap_or_default();
+
+        Self {
+            router,
+            health_map,
+            trusted_proxies,
+            xff_mode,
+            rate_limit_rps: config.server.rate_limit_rps,
+            rate_limit_window: config.server.rate_limit_window_secs,
+        }
+    }
+}
+
 /// Global shared state — lock-free reads via Arc + ArcSwap.
 struct AppState {
-    router: Router<Arc<ResolvedRoute>>,
+    /// Config-derived snapshot, atomically swappable. The hot path reads
+    /// it via `AppState::cfg()` (`load_full`, ~5 ns: Acquire load + Arc
+    /// refcount bump). The returned `Arc` is held for the duration of
+    /// the request so a single request always sees a consistent
+    /// snapshot — even if a hot-reload swaps in a new one mid-flight.
+    /// Old snapshots are reclaimed by ArcSwap's epoch-based GC once the
+    /// last in-flight reader exits.
+    ///
+    /// Wrapped in `Arc<...>` so the config watcher (in `reload.rs`) can
+    /// hold its own clone for `store()` without a back-pointer to the
+    /// whole `AppState`.
+    pub(crate) config: Arc<ArcSwap<ResolvedAppConfig>>,
     tls_acceptor: Arc<ArcSwap<tokio_rustls::TlsAcceptor>>,
     http_client: HttpClient,
     static_cache: cache::StaticCache,
@@ -112,16 +224,9 @@ struct AppState {
     http_builder: Arc<AutoBuilder<TokioExecutor>>,
     /// ACME HTTP-01 challenge tokens (empty when no challenge active).
     acme_challenges: acme::ChallengeStore,
-    /// Per-IP rate limiter. 0 = disabled.
-    rate_limit_rps: u32,
-    rate_limit_window: u64,
+    /// Per-IP rate limiter map. Persists across config reloads — the IP
+    /// counters are about the IP's behaviour, not about the config.
     rate_map: Arc<dashmap::DashMap<std::net::IpAddr, RateEntry>>,
-    /// Shared upstream health state — checked before dispatching to prevent 502 cascades.
-    health_map: health::HealthMap,
-    /// Trusted proxy CIDRs for X-Forwarded-For IP resolution.
-    trusted_proxies: security::TrustedProxies,
-    /// Outbound XFF policy (append / rewrite / drop). See proxy::XffMode.
-    xff_mode: proxy::XffMode,
     /// Singleflight: coalesce concurrent cache misses for the same key.
     /// First request fetches from upstream and inserts a watch::Sender<bool>;
     /// subsequent requests subscribe and await `true`. Watch (vs Notify) is
@@ -131,6 +236,18 @@ struct AppState {
     /// Sender drop without sending `true` (fetch aborted) yields Err on the
     /// receiver side and waiters fall through to re-check the cache.
     inflight: dashmap::DashMap<Arc<str>, tokio::sync::watch::Sender<bool>>,
+}
+
+impl AppState {
+    /// Snapshot the current config-derived state. Cheap: one atomic
+    /// Acquire load + Arc refcount bump, ~5 ns. The returned `Arc` keeps
+    /// the snapshot alive across `await` points without pinning the
+    /// ArcSwap epoch — so it is safe to hold for the lifetime of a
+    /// request, unlike a raw `load()` Guard.
+    #[inline]
+    pub(crate) fn cfg(&self) -> Arc<ResolvedAppConfig> {
+        self.config.load_full()
+    }
 }
 
 // Pre-compiled constants — zero runtime cost.
@@ -279,8 +396,9 @@ async fn async_main(
     logging::init(&config.server.log_format);
     logging::info("config", &format!("loaded from {}", config_path));
 
-    // 2. Build radix tree router
-    let router = config::build_router(&config);
+    // 2. (config-derived state is now built later via ResolvedAppConfig::build —
+    //  the standalone `let router = …` step was removed in favour of a single
+    //  build entry point.)
 
     // 3. Load initial TLS — build acceptor once, cache via ArcSwap
     let initial_tls = tls::load_tls_config(&config.tls).map_err(|e| format!("FATAL: {}", e))?;
@@ -308,69 +426,47 @@ async fn async_main(
     // 4b. Predictive TTL pre-warming: pre-build TLS config before cert expires
     tls::spawn_cert_prewarm_task(tls_acceptor_store.clone(), config.tls.clone());
 
-    // 5. Build shared state — conn_limit computed from available RAM
-    // 5b. Build health map (before Arc — so it's directly embedded in AppState)
-    let health_map = {
-        let mut map = fnv::FnvHashMap::default();
-        for route in &config.route {
-            let urls = if let Some(up) = config.upstream.get(&route.upstream) {
-                up.get_urls()
-            } else if let Some(url) = config.upstreams.get(&route.upstream) {
-                vec![url.clone()]
-            } else {
-                continue;
-            };
-            for url in urls {
-                map.entry(url.clone()).or_insert_with(|| {
-                    Arc::new(health::UpstreamHealth {
-                        healthy: std::sync::atomic::AtomicBool::new(true),
-                        latency_us: std::sync::atomic::AtomicU64::new(0),
-                    })
-                });
-            }
-        }
-        Arc::new(map)
-    };
+    // 5. Build the config-derived snapshot (router, health map, trusted
+    // proxies, XFF policy, rate-limit settings — everything that follows
+    // from `zion.toml`). This is the single entry point that future
+    // hot-reload phases will re-invoke and atomic-swap.
+    let resolved = ResolvedAppConfig::build(&config);
 
-    let trusted_proxies = security::TrustedProxies::from_config(&config.server.trusted_proxies);
-    if !trusted_proxies.is_empty() {
+    // Boot-time visibility: structured logs for the bits operators
+    // commonly check at startup. (Validation of `xff_mode` happens
+    // inside `ResolvedAppConfig::build`, but it falls back silently on
+    // an unknown value; we log explicitly here so a typo in the config
+    // surfaces without grep-ing the source.)
+    if !resolved.trusted_proxies.is_empty() {
         logging::info(
             "proxy",
             &format!("trusted proxies: {:?}", config.server.trusted_proxies),
         );
     }
+    if proxy::XffMode::parse(&config.server.xff_mode).is_none() {
+        logging::warn(
+            "config",
+            &format!(
+                "unknown server.xff_mode '{}', falling back to 'append' (valid: append/rewrite/drop)",
+                config.server.xff_mode
+            ),
+        );
+    }
+    logging::info("proxy", &format!("xff_mode: {:?}", resolved.xff_mode));
 
-    // Parse the configured XFF policy. Unknown values fall back to Append
-    // and emit a warning — silent fallback would hide a config typo that
-    // weakens upstream IP integrity.
-    let xff_mode = match proxy::XffMode::parse(&config.server.xff_mode) {
-        Some(m) => m,
-        None => {
-            logging::warn(
-                "config",
-                &format!(
-                    "unknown server.xff_mode '{}', falling back to 'append' (valid: append/rewrite/drop)",
-                    config.server.xff_mode
-                ),
-            );
-            proxy::XffMode::Append
-        }
-    };
-    logging::info("proxy", &format!("xff_mode: {:?}", xff_mode));
+    // Hold a clone for the background tasks below (health prober,
+    // connection pool pre-warm) that spawn before the AppState `Arc` is
+    // constructed and need the upstream URL → health map.
+    let health_map = resolved.health_map.clone();
 
     let state = Arc::new(AppState {
-        router,
+        config: Arc::new(ArcSwap::from_pointee(resolved)),
         tls_acceptor: tls_acceptor_store,
         http_client: proxy::build_http_client(),
         static_cache: cache::StaticCache::new(),
         conn_limit: Arc::new(Semaphore::new(platform.conn_limit)),
         acme_challenges: acme::new_challenge_store(),
-        rate_limit_rps: config.server.rate_limit_rps,
-        rate_limit_window: config.server.rate_limit_window_secs,
         rate_map: Arc::new(dashmap::DashMap::new()),
-        health_map: health_map.clone(),
-        trusted_proxies,
-        xff_mode,
         inflight: dashmap::DashMap::new(),
         http_builder: Arc::new({
             let mut b = AutoBuilder::new(TokioExecutor::new());
@@ -380,6 +476,16 @@ async fn async_main(
             b
         }),
     });
+
+    // 5b. Spawn the config-file hot-reload watcher. Watches `zion.toml`
+    // for Modify/Create events; on change, parses + validates the new
+    // config and atomic-swaps `state.config`. Invalid configs are
+    // rejected with a WARN log, the previous snapshot stays in place.
+    // TLS settings (cert paths, min_version, SNI) are not currently
+    // re-applied through this watcher — the existing `tls_watcher`
+    // covers cert/key file changes; pivoting `[tls]` paths is a
+    // separate hot-reload step beyond Phase 1.
+    reload::spawn_config_watcher(config_path.clone().into(), state.config.clone());
 
     // 6. Spawn ACME auto-renewal task (if configured)
     if let Some(ref acme_config) = config.tls.acme {
@@ -915,7 +1021,8 @@ async fn handle_http(
             return Ok(empty_response(StatusCode::FORBIDDEN));
         }
         let platform = bootstrap::detect();
-        let mut rows: Vec<metrics::UpstreamRow<'_>> = state
+        let cfg = state.cfg();
+        let mut rows: Vec<metrics::UpstreamRow<'_>> = cfg
             .health_map
             .iter()
             .map(|(url, h)| metrics::UpstreamRow {
@@ -948,7 +1055,8 @@ async fn handle_http(
                 .unwrap());
         }
         // Fallback: proxy to upstream (for external ACME clients like certbot)
-        if let Ok(m) = state.router.at(path) {
+        let cfg = state.cfg();
+        if let Ok(m) = cfg.router.at(path) {
             let rule = m.value;
             return proxy::proxy_pass(
                 &state.http_client,
@@ -957,7 +1065,7 @@ async fn handle_http(
                 &rule.upstream_authority,
                 Some(remote_addr),
                 "http",
-                state.xff_mode,
+                cfg.xff_mode,
             )
             .await;
         }
@@ -1000,12 +1108,8 @@ async fn handle_http(
 
 /// Lock-free per-IP rate limiter — delegates to security module.
 fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
-    security::check_rate_limit(
-        state.rate_limit_rps,
-        state.rate_limit_window,
-        &state.rate_map,
-        ip,
-    )
+    let cfg = state.cfg();
+    security::check_rate_limit(cfg.rate_limit_rps, cfg.rate_limit_window, &state.rate_map, ip)
 }
 
 /// Inject security headers — delegates to security module.
