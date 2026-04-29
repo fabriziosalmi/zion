@@ -185,9 +185,14 @@ impl ResolvedAppConfig {
 
 /// Global shared state — lock-free reads via Arc + ArcSwap.
 struct AppState {
-    /// Config-derived snapshot. Phase 1: plain Arc, immutable for the
-    /// process lifetime. Subsequent phases: `ArcSwap<Arc<ResolvedAppConfig>>`.
-    config: Arc<ResolvedAppConfig>,
+    /// Config-derived snapshot, atomically swappable. The hot path reads
+    /// it via `AppState::cfg()` (`load_full`, ~5 ns: Acquire load + Arc
+    /// refcount bump). The returned `Arc` is held for the duration of
+    /// the request so a single request always sees a consistent
+    /// snapshot — even if a hot-reload swaps in a new one mid-flight.
+    /// Old snapshots are reclaimed by ArcSwap's epoch-based GC once the
+    /// last in-flight reader exits.
+    config: ArcSwap<ResolvedAppConfig>,
     tls_acceptor: Arc<ArcSwap<tokio_rustls::TlsAcceptor>>,
     http_client: HttpClient,
     static_cache: cache::StaticCache,
@@ -207,6 +212,18 @@ struct AppState {
     /// Sender drop without sending `true` (fetch aborted) yields Err on the
     /// receiver side and waiters fall through to re-check the cache.
     inflight: dashmap::DashMap<Arc<str>, tokio::sync::watch::Sender<bool>>,
+}
+
+impl AppState {
+    /// Snapshot the current config-derived state. Cheap: one atomic
+    /// Acquire load + Arc refcount bump, ~5 ns. The returned `Arc` keeps
+    /// the snapshot alive across `await` points without pinning the
+    /// ArcSwap epoch — so it is safe to hold for the lifetime of a
+    /// request, unlike a raw `load()` Guard.
+    #[inline]
+    pub(crate) fn cfg(&self) -> Arc<ResolvedAppConfig> {
+        self.config.load_full()
+    }
 }
 
 // Pre-compiled constants — zero runtime cost.
@@ -419,7 +436,7 @@ async fn async_main(
     let health_map = resolved.health_map.clone();
 
     let state = Arc::new(AppState {
-        config: Arc::new(resolved),
+        config: ArcSwap::from_pointee(resolved),
         tls_acceptor: tls_acceptor_store,
         http_client: proxy::build_http_client(),
         static_cache: cache::StaticCache::new(),
@@ -970,8 +987,8 @@ async fn handle_http(
             return Ok(empty_response(StatusCode::FORBIDDEN));
         }
         let platform = bootstrap::detect();
-        let mut rows: Vec<metrics::UpstreamRow<'_>> = state
-            .config
+        let cfg = state.cfg();
+        let mut rows: Vec<metrics::UpstreamRow<'_>> = cfg
             .health_map
             .iter()
             .map(|(url, h)| metrics::UpstreamRow {
@@ -1004,7 +1021,8 @@ async fn handle_http(
                 .unwrap());
         }
         // Fallback: proxy to upstream (for external ACME clients like certbot)
-        if let Ok(m) = state.config.router.at(path) {
+        let cfg = state.cfg();
+        if let Ok(m) = cfg.router.at(path) {
             let rule = m.value;
             return proxy::proxy_pass(
                 &state.http_client,
@@ -1013,7 +1031,7 @@ async fn handle_http(
                 &rule.upstream_authority,
                 Some(remote_addr),
                 "http",
-                state.config.xff_mode,
+                cfg.xff_mode,
             )
             .await;
         }
@@ -1056,12 +1074,8 @@ async fn handle_http(
 
 /// Lock-free per-IP rate limiter — delegates to security module.
 fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
-    security::check_rate_limit(
-        state.config.rate_limit_rps,
-        state.config.rate_limit_window,
-        &state.rate_map,
-        ip,
-    )
+    let cfg = state.cfg();
+    security::check_rate_limit(cfg.rate_limit_rps, cfg.rate_limit_window, &state.rate_map, ip)
 }
 
 /// Inject security headers — delegates to security module.

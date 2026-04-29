@@ -22,12 +22,8 @@ const CACHE_CONTROL_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
 #[inline]
 fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
-    security::check_rate_limit(
-        state.config.rate_limit_rps,
-        state.config.rate_limit_window,
-        &state.rate_map,
-        ip,
-    )
+    let cfg = state.cfg();
+    security::check_rate_limit(cfg.rate_limit_rps, cfg.rate_limit_window, &state.rate_map, ip)
 }
 
 pub(crate) async fn process_request(
@@ -37,6 +33,13 @@ pub(crate) async fn process_request(
     is_early_data: bool,
 ) -> Result<Response<ZionBody>, hyper::Error> {
     let request_start = std::time::Instant::now();
+
+    // Snapshot the config once. The same `Arc<ResolvedAppConfig>` is
+    // used throughout this request, so route lookup, WAF gating, and
+    // upstream selection all see the same generation even if a
+    // hot-reload swaps in a new snapshot mid-flight. Cost: ~5 ns
+    // (Acquire load + Arc refcount bump).
+    let cfg = state.cfg();
 
     // ── Pre-routing security gates (zero-cost, before any processing) ──
 
@@ -79,7 +82,7 @@ pub(crate) async fn process_request(
     // X-Forwarded-For using the rightmost-untrusted-hop algorithm.
     // This prevents rate limit bypass and internal-only gate evasion when
     // Zion is behind ALB/Cloudflare/nginx.
-    let client_ip = state.config.trusted_proxies.resolve_client_ip(
+    let client_ip = cfg.trusted_proxies.resolve_client_ip(
         remote_addr.ip(),
         req.headers()
             .get("X-Forwarded-For")
@@ -131,8 +134,7 @@ pub(crate) async fn process_request(
                 return Ok(empty_response(StatusCode::FORBIDDEN));
             }
             let platform = crate::bootstrap::detect();
-            let mut rows: Vec<metrics::UpstreamRow<'_>> = state
-                .config
+            let mut rows: Vec<metrics::UpstreamRow<'_>> = cfg
                 .health_map
                 .iter()
                 .map(|(url, h)| metrics::UpstreamRow {
@@ -184,7 +186,7 @@ pub(crate) async fn process_request(
             route
         } else {
             // Radix tree fallback (~30ns)
-            match state.config.router.at(path) {
+            match cfg.router.at(path) {
                 Ok(m) => {
                     let route = m.value.clone();
                     ROUTE_CACHE.with(|cache| {
@@ -258,7 +260,7 @@ pub(crate) async fn process_request(
     // --- Gate: Upstream health check + Latency Routing (B-04) ---
     // Select the healthy upstream with the lowest latency.
     let target_upstream_url =
-        match health::select_best_upstream(&state.config.health_map, &rule.upstream_url) {
+        match health::select_best_upstream(&cfg.health_map, &rule.upstream_url) {
             Some(url) => url,
             None => {
                 metrics::METRICS.record_status(503);
@@ -549,6 +551,7 @@ pub(crate) async fn process_request(
             forward_addr,
             &dyn_scheme,
             &dyn_authority,
+            cfg.xff_mode,
         )
         .await?
     } else {
@@ -561,6 +564,7 @@ pub(crate) async fn process_request(
                     remote_addr,
                     &dyn_scheme,
                     &dyn_authority,
+                    cfg.xff_mode,
                 )
                 .await?
             }
@@ -572,7 +576,7 @@ pub(crate) async fn process_request(
                     &dyn_authority,
                     Some(forward_addr),
                     "https",
-                    state.config.xff_mode,
+                    cfg.xff_mode,
                 )
                 .await?
             }
@@ -584,7 +588,7 @@ pub(crate) async fn process_request(
                     &dyn_authority,
                     Some(forward_addr),
                     "https",
-                    state.config.xff_mode,
+                    cfg.xff_mode,
                 )
                 .await?
             }
@@ -640,6 +644,7 @@ async fn handle_static_cache(
     remote_addr: SocketAddr,
     dyn_scheme: &hyper::http::uri::Scheme,
     dyn_authority: &hyper::http::uri::Authority,
+    xff_mode: proxy::XffMode,
 ) -> Result<Response<ZionBody>, hyper::Error> {
     // Use full path+query as cache key to prevent cache poisoning:
     // /api?user=alice and /api?user=bob must NOT share a cache entry.
@@ -721,7 +726,7 @@ async fn handle_static_cache(
         dyn_authority,
         Some(remote_addr),
         "https",
-        state.config.xff_mode,
+        xff_mode,
     )
     .await
     {
