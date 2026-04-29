@@ -23,8 +23,8 @@ const CACHE_CONTROL_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 #[inline]
 fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
     security::check_rate_limit(
-        state.rate_limit_rps,
-        state.rate_limit_window,
+        state.config.rate_limit_rps,
+        state.config.rate_limit_window,
         &state.rate_map,
         ip,
     )
@@ -79,7 +79,7 @@ pub(crate) async fn process_request(
     // X-Forwarded-For using the rightmost-untrusted-hop algorithm.
     // This prevents rate limit bypass and internal-only gate evasion when
     // Zion is behind ALB/Cloudflare/nginx.
-    let client_ip = state.trusted_proxies.resolve_client_ip(
+    let client_ip = state.config.trusted_proxies.resolve_client_ip(
         remote_addr.ip(),
         req.headers()
             .get("X-Forwarded-For")
@@ -132,6 +132,7 @@ pub(crate) async fn process_request(
             }
             let platform = crate::bootstrap::detect();
             let mut rows: Vec<metrics::UpstreamRow<'_>> = state
+                .config
                 .health_map
                 .iter()
                 .map(|(url, h)| metrics::UpstreamRow {
@@ -183,7 +184,7 @@ pub(crate) async fn process_request(
             route
         } else {
             // Radix tree fallback (~30ns)
-            match state.router.at(path) {
+            match state.config.router.at(path) {
                 Ok(m) => {
                     let route = m.value.clone();
                     ROUTE_CACHE.with(|cache| {
@@ -257,7 +258,7 @@ pub(crate) async fn process_request(
     // --- Gate: Upstream health check + Latency Routing (B-04) ---
     // Select the healthy upstream with the lowest latency.
     let target_upstream_url =
-        match health::select_best_upstream(&state.health_map, &rule.upstream_url) {
+        match health::select_best_upstream(&state.config.health_map, &rule.upstream_url) {
             Some(url) => url,
             None => {
                 metrics::METRICS.record_status(503);
@@ -571,7 +572,7 @@ pub(crate) async fn process_request(
                     &dyn_authority,
                     Some(forward_addr),
                     "https",
-                    state.xff_mode,
+                    state.config.xff_mode,
                 )
                 .await?
             }
@@ -583,7 +584,7 @@ pub(crate) async fn process_request(
                     &dyn_authority,
                     Some(forward_addr),
                     "https",
-                    state.xff_mode,
+                    state.config.xff_mode,
                 )
                 .await?
             }
@@ -720,7 +721,7 @@ async fn handle_static_cache(
         dyn_authority,
         Some(remote_addr),
         "https",
-        state.xff_mode,
+        state.config.xff_mode,
     )
     .await
     {
