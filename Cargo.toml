@@ -97,6 +97,10 @@ http3 = ["quinn", "h3", "h3-quinn"]
 reqwest = ["dep:reqwest"]
 tui = ["ratatui", "crossterm"]
 init = ["rcgen"]
+# Sovereign Edge Intelligence — bake regional ASN/CIDR data into the binary
+geo-ita = []                       # 🇮🇹 Italian ASN + gov + ISP ranges
+geo-eu  = ["geo-ita"]              # 🇪🇺 EU superset (includes geo-ita)
+sovereign-signals = []             # Gossip mesh for signal sharing (Phase 3)
 
 [profile.release]
 opt-level = 3

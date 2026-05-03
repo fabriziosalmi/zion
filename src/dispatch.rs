@@ -104,6 +104,23 @@ pub(crate) async fn process_request(
         return Ok(empty_response(StatusCode::TOO_MANY_REQUESTS));
     }
 
+    // ── Sovereign Edge: IP classification (zero cost when feature is off or disabled) ──
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    {
+        use crate::sovereign;
+        if cfg.sovereign_enabled {
+            let ip_class = sovereign::classify(client_ip);
+            // Store classification as request extension for downstream logging
+            req.extensions_mut().insert(ip_class);
+            if cfg.sovereign_log_classification && ip_class != sovereign::IpClass::Unknown {
+                logging::info(
+                    "sovereign",
+                    &format!("ip={} class={}", client_ip, ip_class),
+                );
+            }
+        }
+    }
+
     // ── Built-in health endpoints (no routing, no upstream) ──
     {
         let path = req.uri().path();

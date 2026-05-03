@@ -37,6 +37,8 @@ mod tui;
 #[cfg(all(target_os = "linux", feature = "io-uring-accept"))]
 mod uring;
 mod waf;
+#[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+mod sovereign;
 
 // ── Global allocator: mimalloc ──────────────────────────────────
 // ~2-3x faster than system malloc on small allocations.
@@ -138,6 +140,13 @@ pub(crate) struct ResolvedAppConfig {
     /// malformed; the supervisor refuses to drop the existing listener
     /// in that case (the previous valid bind survives the reload).
     pub(crate) listen_https: Option<SocketAddr>,
+    /// Sovereign Edge Intelligence: whether IP classification is active.
+    /// Pre-resolved at build time; the hot path checks only this bool.
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    pub(crate) sovereign_enabled: bool,
+    /// Whether to include ip_class in structured request logs.
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    pub(crate) sovereign_log_classification: bool,
 }
 
 impl ResolvedAppConfig {
@@ -159,6 +168,10 @@ impl ResolvedAppConfig {
             rate_limit_window: 1,
             listen_http: None,
             listen_https: None,
+            #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+            sovereign_enabled: false,
+            #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+            sovereign_log_classification: false,
         }
     }
 
@@ -241,6 +254,23 @@ impl ResolvedAppConfig {
             })
             .ok();
 
+        // Sovereign Edge Intelligence (feature-gated)
+        #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+        let (sovereign_enabled, sovereign_log_classification) = {
+            let sov = &config.sovereign;
+            if sov.enabled {
+                let region_label = if cfg!(feature = "geo-eu") { "eu" } else { "ita" };
+                logging::info(
+                    "sovereign",
+                    &format!(
+                        "Sovereign Edge active (region={}, log_classification={})",
+                        region_label, sov.log_classification
+                    ),
+                );
+            }
+            (sov.enabled, sov.log_classification)
+        };
+
         Self {
             router,
             health_map,
@@ -250,6 +280,10 @@ impl ResolvedAppConfig {
             rate_limit_window: config.server.rate_limit_window_secs,
             listen_http,
             listen_https,
+            #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+            sovereign_enabled,
+            #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+            sovereign_log_classification,
         }
     }
 }

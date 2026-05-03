@@ -23,6 +23,11 @@ pub struct ZionConfig {
     #[serde(default)]
     pub auth_profile: HashMap<String, crate::auth::AuthProfileConfig>,
 
+    /// Sovereign Edge Intelligence config (feature: geo-ita / geo-eu).
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    #[serde(default)]
+    pub sovereign: crate::sovereign::SovereignConfig,
+
     // Legacy compat: flat upstreams map (just URLs)
     #[serde(default)]
     pub upstreams: HashMap<String, String>,

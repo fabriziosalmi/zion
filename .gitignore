@@ -29,3 +29,7 @@ __pycache__/
 *.pyc
 benchmarks/backend/target/
 benchmarks/backend/Cargo.lock
+
+# Sovereign Edge — local review files (authoritative data is in src/sovereign/)
+sovereign-*-ranges.txt
+.sovereign-data/
