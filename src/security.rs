@@ -162,6 +162,12 @@ impl RateEntry {
 /// Lock-free per-IP rate limiter.
 /// Uses a single AtomicU64 per IP with packed window+count for atomic resets.
 /// Eliminates the CAS-store gap that could lose counts during window transitions.
+///
+/// **Saturation policy: fail-CLOSED.** When the map hits `MAX_RATE_MAP_ENTRIES`,
+/// we attempt to evict stale entries (expired windows) in a bounded probe.
+/// If eviction yields space, the new IP is tracked normally. If the map is
+/// genuinely full of active IPs (e.g. botnet), the request is denied —
+/// the safe default for a security gate.
 #[inline]
 pub fn check_rate_limit(
     rate_limit_rps: u32,
@@ -214,13 +220,77 @@ pub fn check_rate_limit(
         }
     }
 
-    // First request from this IP — cap total tracked IPs to prevent memory exhaustion
+    // First request from this IP — cap total tracked IPs to prevent memory exhaustion.
+    // Fail-CLOSED: if we can't make room, deny rather than bypass the limiter.
     if rate_map.len() >= MAX_RATE_MAP_ENTRIES {
-        // At capacity: allow the request but don't track (fail-open under extreme load)
-        return true;
+        // Attempt to evict stale entries in a bounded probe (up to 8 random samples).
+        // DashMap iteration is shard-sequential — we take the first stale entry.
+        if !try_evict_stale(rate_map, current_window) {
+            // Map is genuinely full of active-window entries (botnet-scale).
+            // Fail CLOSED: deny the request rather than allowing unlimited bypass.
+            return false;
+        }
     }
     rate_map.insert(ip, RateEntry::new(current_window));
     true
+}
+
+/// Attempt to evict one stale entry (expired window) from the rate map.
+/// Probes up to `EVICT_PROBE_LIMIT` entries to bound worst-case latency.
+/// Returns `true` if an entry was evicted, `false` if all probed entries
+/// belong to the current window.
+fn try_evict_stale(
+    rate_map: &dashmap::DashMap<std::net::IpAddr, RateEntry>,
+    current_window: u32,
+) -> bool {
+    const EVICT_PROBE_LIMIT: usize = 16;
+    let mut probed = 0;
+    // DashMap::iter() walks shards sequentially. We iterate and remove
+    // the first stale entry we find, bounded by EVICT_PROBE_LIMIT.
+    for entry in rate_map.iter() {
+        if probed >= EVICT_PROBE_LIMIT {
+            break;
+        }
+        probed += 1;
+        let val = entry.value().packed.load(std::sync::atomic::Ordering::Relaxed);
+        if RateEntry::window(val) != current_window {
+            let ip = *entry.key();
+            drop(entry); // release shard lock before remove
+            rate_map.remove(&ip);
+            return true;
+        }
+    }
+    false
+}
+
+/// Scavenge stale entries from the rate map. Designed to be called
+/// periodically by a background task (e.g. every 60s) to prevent
+/// unbounded growth from one-shot visitors that never return.
+///
+/// Removes all entries whose window is older than `current_window`.
+/// Returns the number of entries removed.
+pub fn scavenge_rate_map(
+    rate_map: &dashmap::DashMap<std::net::IpAddr, RateEntry>,
+    rate_limit_window: u64,
+) -> usize {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let current_window = (now / rate_limit_window) as u32;
+
+    let mut stale_ips = Vec::new();
+    for entry in rate_map.iter() {
+        let val = entry.value().packed.load(std::sync::atomic::Ordering::Relaxed);
+        if RateEntry::window(val) != current_window {
+            stale_ips.push(*entry.key());
+        }
+    }
+    let removed = stale_ips.len();
+    for ip in stale_ips {
+        rate_map.remove(&ip);
+    }
+    removed
 }
 
 // ============================================================================

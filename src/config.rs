@@ -577,26 +577,32 @@ fn validate_config(config: &ZionConfig, path: &str) -> Result<(), String> {
 }
 
 /// Resolve upstream name to URLs. Checks new [upstream.X] first, then legacy [upstreams].
-fn resolve_upstream(config: &ZionConfig, name: &str) -> Vec<String> {
+/// Returns Err if the upstream name is not defined — callers propagate the
+/// error to reject the config rather than panicking (important during hot-reload).
+fn resolve_upstream(config: &ZionConfig, name: &str) -> Result<Vec<String>, String> {
     if let Some(up) = config.upstream.get(name) {
-        return up.get_urls();
+        return Ok(up.get_urls());
     }
     if let Some(url) = config.upstreams.get(name) {
-        return vec![url.clone()];
+        return Ok(vec![url.clone()]);
     }
-    panic!(
+    Err(format!(
         "Unknown upstream '{}' — define it in [upstream.{}] or [upstreams]",
         name, name
-    );
+    ))
 }
 
 /// Build a radix tree from config routes, pre-resolving all references.
 /// Routes are wrapped in Arc for zero-allocation cloning on the hot path.
-pub fn build_router(config: &ZionConfig) -> Router<Arc<ResolvedRoute>> {
+///
+/// Returns `Err` if any route references an unknown upstream, profile, or
+/// contains an invalid pattern. The caller (boot path or hot-reload) decides
+/// whether to abort or log-and-keep the previous snapshot.
+pub fn build_router(config: &ZionConfig) -> Result<Router<Arc<ResolvedRoute>>, String> {
     let mut router = Router::new();
 
     for route in &config.route {
-        let upstream_url = resolve_upstream(config, &route.upstream);
+        let upstream_url = resolve_upstream(config, &route.upstream)?;
 
         // Resolve WAF: named profile > legacy bool flag
         let waf = if let Some(ref profile_name) = route.waf_profile {
@@ -604,12 +610,12 @@ pub fn build_router(config: &ZionConfig) -> Router<Arc<ResolvedRoute>> {
                 config
                     .waf_profile
                     .get(profile_name)
-                    .unwrap_or_else(|| {
-                        panic!(
+                    .ok_or_else(|| {
+                        format!(
                             "Unknown waf_profile '{}' in route {}",
                             profile_name, route.path
                         )
-                    })
+                    })?
                     .clone(),
             )
         } else if route.waf {
@@ -628,12 +634,12 @@ pub fn build_router(config: &ZionConfig) -> Router<Arc<ResolvedRoute>> {
                 config
                     .cache_profile
                     .get(profile_name)
-                    .unwrap_or_else(|| {
-                        panic!(
+                    .ok_or_else(|| {
+                        format!(
                             "Unknown cache_profile '{}' in route {}",
                             profile_name, route.path
                         )
-                    })
+                    })?
                     .clone(),
             )
         } else if route.mode == RouteMode::StaticCache {
@@ -651,7 +657,7 @@ pub fn build_router(config: &ZionConfig) -> Router<Arc<ResolvedRoute>> {
         // In a true clustered setup with latency routing, we use the first to get the scheme.
         let upstream_uri: hyper::Uri = upstream_url[0]
             .parse()
-            .unwrap_or_else(|e| panic!("Invalid upstream URL '{}': {}", upstream_url[0], e));
+            .map_err(|e| format!("Invalid upstream URL '{}': {}", upstream_url[0], e))?;
         let upstream_scheme = upstream_uri
             .scheme()
             .cloned()
@@ -659,27 +665,33 @@ pub fn build_router(config: &ZionConfig) -> Router<Arc<ResolvedRoute>> {
         let upstream_authority = upstream_uri
             .authority()
             .cloned()
-            .unwrap_or_else(|| panic!("Upstream '{}' has no authority", upstream_url[0]));
+            .ok_or_else(|| format!("Upstream '{}' has no authority", upstream_url[0]))?;
 
         // Pre-parse CSP at startup for zero-cost injection at runtime
-        let csp = route.csp.as_ref().map(|s| {
-            hyper::header::HeaderValue::from_str(s)
-                .unwrap_or_else(|e| panic!("Invalid CSP in route '{}': {}", route.path, e))
-        });
+        let csp = match route.csp.as_ref() {
+            Some(s) => Some(
+                hyper::header::HeaderValue::from_str(s)
+                    .map_err(|e| format!("Invalid CSP in route '{}': {}", route.path, e))?,
+            ),
+            None => None,
+        };
 
         // Resolve auth profile at startup (feature-gated)
         #[cfg(feature = "auth")]
-        let auth = route.auth_profile.as_ref().map(|name| {
-            let profile_config = config.auth_profile.get(name).unwrap_or_else(|| {
-                panic!("Auth profile '{}' not found (route '{}')", name, route.path)
-            });
-            let resolved = crate::auth::resolve_auth_profile(profile_config);
-            eprintln!(
-                "  auth: route {} → profile '{}' (alg={})",
-                route.path, name, profile_config.algorithm
-            );
-            resolved
-        });
+        let auth = match route.auth_profile.as_ref() {
+            Some(name) => {
+                let profile_config = config.auth_profile.get(name).ok_or_else(|| {
+                    format!("Auth profile '{}' not found (route '{}')", name, route.path)
+                })?;
+                let resolved = crate::auth::resolve_auth_profile(profile_config);
+                eprintln!(
+                    "  auth: route {} → profile '{}' (alg={})",
+                    route.path, name, profile_config.algorithm
+                );
+                Some(resolved)
+            }
+            None => None,
+        };
 
         let cors = route
             .cors
@@ -703,11 +715,11 @@ pub fn build_router(config: &ZionConfig) -> Router<Arc<ResolvedRoute>> {
 
         router
             .insert(route.path.clone(), resolved)
-            .unwrap_or_else(|e| panic!("Bad route pattern '{}': {}", route.path, e));
+            .map_err(|e| format!("Bad route pattern '{}': {}", route.path, e))?;
     }
 
     print_routes_table(&config.route);
-    router
+    Ok(router)
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1091,7 +1103,7 @@ upstream = "frontend"
     #[test]
     fn build_router_with_legacy_upstreams() {
         let config: ZionConfig = toml::from_str(minimal_toml()).unwrap();
-        let router = build_router(&config);
+        let router = build_router(&config).unwrap();
         let matched = router.at("/api/v1/users").unwrap();
         assert_eq!(matched.value.upstream_url[0], "http://127.0.0.1:8000");
         assert!(matched.value.waf.is_some()); // legacy waf=true
@@ -1101,7 +1113,7 @@ upstream = "frontend"
     #[test]
     fn build_router_with_named_profiles() {
         let config: ZionConfig = toml::from_str(profile_toml()).unwrap();
-        let router = build_router(&config);
+        let router = build_router(&config).unwrap();
 
         // API route with strict WAF
         let api = router.at("/api/v1/test").unwrap();
@@ -1146,7 +1158,7 @@ waf = true
 max_body_mb = 500
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
-        let router = build_router(&config);
+        let router = build_router(&config).unwrap();
         let route = router.at("/upload").unwrap();
         assert_eq!(route.value.waf.as_ref().unwrap().max_body_mb, 500);
     }
@@ -1168,7 +1180,7 @@ upstream = "fe"
 mode = "static_cache"
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
-        let router = build_router(&config);
+        let router = build_router(&config).unwrap();
         let route = router.at("/_next/static/chunk.js").unwrap();
         assert!(route.value.cache.is_some());
         assert_eq!(route.value.cache.as_ref().unwrap().ttl_seconds, 31_536_000);
@@ -1191,7 +1203,7 @@ upstream = "backend"
 internal_only = true
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
-        let router = build_router(&config);
+        let router = build_router(&config).unwrap();
         let route = router.at("/metrics").unwrap();
         assert!(route.value.internal_only);
     }
@@ -1213,7 +1225,7 @@ upstream = "backend"
 mode = "sse_stream"
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
-        let router = build_router(&config);
+        let router = build_router(&config).unwrap();
         let route = router.at("/events").unwrap();
         assert_eq!(route.value.mode, RouteMode::SseStream);
     }
@@ -1251,8 +1263,7 @@ be = "http://127.0.0.1:8000"
     }
 
     #[test]
-    #[should_panic(expected = "Unknown upstream")]
-    fn panics_on_unknown_upstream() {
+    fn err_on_unknown_upstream() {
         let toml_str = r#"
 [server]
 listen_http = "0.0.0.0:80"
@@ -1265,12 +1276,12 @@ path = "/test"
 upstream = "nonexistent"
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
-        build_router(&config);
+        let err = build_router(&config).unwrap_err();
+        assert!(err.contains("Unknown upstream"), "got: {}", err);
     }
 
     #[test]
-    #[should_panic(expected = "Unknown waf_profile")]
-    fn panics_on_unknown_waf_profile() {
+    fn err_on_unknown_waf_profile() {
         let toml_str = r#"
 [server]
 listen_http = "0.0.0.0:80"
@@ -1286,12 +1297,12 @@ upstream = "be"
 waf_profile = "nonexistent"
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
-        build_router(&config);
+        let err = build_router(&config).unwrap_err();
+        assert!(err.contains("Unknown waf_profile"), "got: {}", err);
     }
 
     #[test]
-    #[should_panic(expected = "Unknown cache_profile")]
-    fn panics_on_unknown_cache_profile() {
+    fn err_on_unknown_cache_profile() {
         let toml_str = r#"
 [server]
 listen_http = "0.0.0.0:80"
@@ -1307,7 +1318,8 @@ upstream = "be"
 cache_profile = "nonexistent"
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
-        build_router(&config);
+        let err = build_router(&config).unwrap_err();
+        assert!(err.contains("Unknown cache_profile"), "got: {}", err);
     }
 
     #[test]
@@ -1341,7 +1353,7 @@ path = "/test"
 upstream = "api"
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
-        let router = build_router(&config);
+        let router = build_router(&config).unwrap();
         let route = router.at("/test").unwrap();
         // New [upstream.X] takes precedence over [upstreams] legacy
         assert_eq!(route.value.upstream_url[0], "http://new:9000");

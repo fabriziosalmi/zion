@@ -168,8 +168,13 @@ impl ResolvedAppConfig {
     /// into the runtime-shaped state the request pipeline reads. Phase 1
     /// uses it once at boot; subsequent phases call it again on every
     /// hot-reload and atomic-swap the result.
+    ///
+    /// Panics at boot if the router cannot be built (bad patterns, unknown
+    /// profiles). During hot-reload, `rebuild()` calls `try_build()` which
+    /// propagates the error cleanly.
     fn build(config: &config::ZionConfig) -> Self {
-        let router = config::build_router(config);
+        let router = config::build_router(config)
+            .unwrap_or_else(|e| panic!("fatal: cannot build router at boot: {}", e));
 
         // Health map: one entry per upstream URL referenced by any route.
         // The same URL can appear in many routes — dedup via FnvHashMap.
@@ -544,6 +549,8 @@ async fn async_main(
         config_path.clone().into(),
         state.config.clone(),
         Some(config_change_tx),
+        Some(config.tls.cert_path.clone()),
+        Some(config.tls.key_path.clone()),
     );
 
     // 6. Spawn ACME auto-renewal task (if configured)
@@ -563,42 +570,23 @@ async fn async_main(
         );
     }
 
-    // 7. Spawn rate limit cleanup (remove stale IPs every 5 minutes)
+    // 7. Spawn rate limit cleanup (scavenge stale IPs every 60s).
+    // This prevents the rate map from reaching MAX_RATE_MAP_ENTRIES
+    // with dead entries, which would trigger the fail-closed path
+    // for legitimate new IPs.
     if config.server.rate_limit_rps > 0 {
         let rate_map = state.rate_map.clone();
         let window = config.server.rate_limit_window_secs;
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let current_window = (now / window) as u32;
-                // Sampled cleanup: scan at most 1024 entries to avoid locking all shards.
-                // DashMap::retain() would lock every shard sequentially, causing latency
-                // spikes under high load. Instead, we collect stale keys from a sample
-                // and remove them individually (each removal locks only one shard).
-                let mut stale_keys: Vec<std::net::IpAddr> = Vec::new();
-                for (i, entry) in rate_map.iter().enumerate() {
-                    if i >= 1024 {
-                        break;
-                    }
-                    let packed = entry.packed.load(std::sync::atomic::Ordering::Relaxed);
-                    let entry_window = (packed >> 32) as u32;
-                    if entry_window < current_window.saturating_sub(2) {
-                        stale_keys.push(*entry.key());
-                    }
-                }
-                for key in &stale_keys {
-                    rate_map.remove(key);
-                }
-                if !stale_keys.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let removed = security::scavenge_rate_map(&rate_map, window);
+                if removed > 0 {
                     logging::info(
                         "rate_limit",
                         &format!(
-                            "cleaned {} stale IPs ({} tracked)",
-                            stale_keys.len(),
+                            "scavenged {} stale IPs ({} tracked)",
+                            removed,
                             rate_map.len()
                         ),
                     );
@@ -891,6 +879,9 @@ async fn run_http_accept_loop(
     state: Arc<AppState>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    // Rate-limit accept error logging to avoid serializing the accept loop
+    // under SYN floods (stderr lock + format! per error).
+    let mut last_err_log = std::time::Instant::now() - std::time::Duration::from_secs(2);
     loop {
         tokio::select! {
             biased;
@@ -905,7 +896,11 @@ async fn run_http_accept_loop(
                 let (stream, addr) = match accept {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("  http accept error: {}", e);
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_err_log).as_secs() >= 1 {
+                            eprintln!("  http accept error: {}", e);
+                            last_err_log = now;
+                        }
                         continue;
                     }
                 };
@@ -950,6 +945,8 @@ async fn run_https_accept_loop(
     state: Arc<AppState>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    // Rate-limit accept error logging (same rationale as run_http_accept_loop).
+    let mut last_err_log = std::time::Instant::now() - std::time::Duration::from_secs(2);
     loop {
         tokio::select! {
             biased;
@@ -962,7 +959,11 @@ async fn run_https_accept_loop(
                 let (tcp_stream, remote_addr) = match accept {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("  https accept error: {}", e);
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_err_log).as_secs() >= 1 {
+                            eprintln!("  https accept error: {}", e);
+                            last_err_log = now;
+                        }
                         continue;
                     }
                 };

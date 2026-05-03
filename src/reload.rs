@@ -91,10 +91,16 @@ fn rebuild(new_config: &ZionConfig, previous: &ResolvedAppConfig) -> ResolvedApp
 /// number after every successful swap. Phase 1.5 wires the listener
 /// supervisor to this channel so a `[server.listen_*]` change kicks
 /// in within the watcher's debounce window.
+///
+/// `boot_tls_cert_path` / `boot_tls_key_path` are the TLS paths
+/// resolved at boot. If a reload changes them, a WARN is emitted
+/// because the TLS file-watcher is still pointed at the old paths.
 pub(crate) fn spawn_config_watcher(
     config_path: PathBuf,
     state_config: Arc<ArcSwap<ResolvedAppConfig>>,
     change_notifier: Option<tokio::sync::watch::Sender<u64>>,
+    boot_tls_cert_path: Option<String>,
+    boot_tls_key_path: Option<String>,
 ) {
     let signal = Arc::new(Notify::new());
     let signal_for_watcher = signal.clone();
@@ -187,8 +193,23 @@ pub(crate) fn spawn_config_watcher(
                     // Rebuild on the current thread (fast: matchit
                     // construction is microseconds, Aho-Corasick is
                     // already cached per-mode in OnceLock).
+                    // Wrapped in catch_unwind as defense-in-depth: if
+                    // build_router encounters an edge case that validate_config
+                    // missed, the debounce task stays alive instead of dying.
                     let previous = state_config.load_full();
-                    let new_snapshot = rebuild(&new_config, &previous);
+                    let rebuild_result = std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| rebuild(&new_config, &previous))
+                    );
+                    let new_snapshot = match rebuild_result {
+                        Ok(snap) => snap,
+                        Err(_) => {
+                            logging::warn(
+                                "config_watcher",
+                                "rebuild panicked (router construction failed), keeping previous snapshot",
+                            );
+                            continue;
+                        }
+                    };
                     state_config.store(Arc::new(new_snapshot));
                     let gen = CONFIG_GENERATION.fetch_add(1, Ordering::Release) + 1;
                     if let Some(tx) = change_notifier.as_ref() {
@@ -203,6 +224,32 @@ pub(crate) fn spawn_config_watcher(
                         "config_watcher",
                         &format!("reload OK (gen {} → {})", gen - 1, gen),
                     );
+                    // Warn if TLS paths changed — the TLS file-watcher is
+                    // still monitoring the boot-time paths. Changing
+                    // [tls] cert_path/key_path in zion.toml does NOT
+                    // re-point the watcher; a restart is required.
+                    if let Some(ref boot_cert) = boot_tls_cert_path {
+                        if new_config.tls.cert_path != *boot_cert {
+                            logging::warn(
+                                "config_watcher",
+                                &format!(
+                                    "tls.cert_path changed ({} → {}) — restart required for TLS watcher to use new path",
+                                    boot_cert, new_config.tls.cert_path
+                                ),
+                            );
+                        }
+                    }
+                    if let Some(ref boot_key) = boot_tls_key_path {
+                        if new_config.tls.key_path != *boot_key {
+                            logging::warn(
+                                "config_watcher",
+                                &format!(
+                                    "tls.key_path changed ({} → {}) — restart required for TLS watcher to use new path",
+                                    boot_key, new_config.tls.key_path
+                                ),
+                            );
+                        }
+                    }
                 }
                 Ok(Err(e)) => {
                     logging::warn(

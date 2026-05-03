@@ -53,8 +53,16 @@ mod inner {
         ring.submit().expect("io_uring submit failed");
 
         loop {
-            // Wait for completions
-            ring.submit_and_wait(1).expect("io_uring wait failed");
+            // Wait for completions — retry on EINTR (signal handler fired)
+            // instead of panicking, which would silently kill the accept thread.
+            match ring.submit_and_wait(1) {
+                Ok(_) => {}
+                Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => {
+                    eprintln!("  io_uring fatal submit_and_wait error: {}", e);
+                    return;
+                }
+            }
 
             // Extract CQEs into a separate buffer to drop the mutable borrow on `ring`
             let mut completions = Vec::new();

@@ -247,10 +247,10 @@ pub async fn proxy_pass_stream(
             let (mut parts, body) = resp.into_parts();
             parts
                 .headers
-                .insert("Cache-Control", "no-cache".parse().unwrap());
+                .insert("Cache-Control", hyper::header::HeaderValue::from_static("no-cache"));
             parts
                 .headers
-                .insert("X-Accel-Buffering", "no".parse().unwrap());
+                .insert("X-Accel-Buffering", hyper::header::HeaderValue::from_static("no"));
             Ok(Response::from_parts(parts, body.boxed()))
         }
         Err(e) => {
@@ -480,23 +480,47 @@ async fn send_ws_upgrade(
         )
         .unwrap();
 
-    // Spawn bidirectional pipe with idle timeout.
-    // Unlike the previous hard 30-minute wall-clock limit, this uses
-    // activity-aware idle detection: the connection stays alive as long as
-    // either side sends data within the idle window. Also caps total session
-    // at 24 hours as a safety valve against resource exhaustion.
+    // Spawn bidirectional pipe with activity-aware idle timeout.
+    // - Idle timeout: 5 minutes of zero traffic in either direction.
+    // - Max session:  24 hours wall-clock as a safety valve.
+    // The previous implementation only had the 24h cap, allowing idle
+    // connections to hold resources indefinitely (Slowloris-style exhaustion).
     tokio::spawn(async move {
         if let Ok(client_upgraded) = on_client_upgrade.await {
             let mut c = hyper_util::rt::TokioIo::new(client_upgraded);
             let mut u = hyper_util::rt::TokioIo::new(upstream_upgraded);
 
-            // Cap total session at 24 hours as a safety valve against resource exhaustion.
-            // (Idle timeouts deferred to TCP keepalives to prevent copy_bidirectional blocking complexity)
             let max_session = std::time::Duration::from_secs(24 * 60 * 60);
+            let idle_timeout = std::time::Duration::from_secs(5 * 60);
 
-            let _ =
-                tokio::time::timeout(max_session, tokio::io::copy_bidirectional(&mut c, &mut u))
-                    .await;
+            let session_deadline = tokio::time::Instant::now() + max_session;
+
+            let ws_pipe = async {
+                // Activity-aware idle loop: copy_bidirectional runs until either
+                // side closes or an error occurs. We wrap it in an idle timeout
+                // so completely silent sessions are torn down promptly.
+                loop {
+                    match tokio::time::timeout(
+                        idle_timeout,
+                        tokio::io::copy_bidirectional(&mut c, &mut u),
+                    )
+                    .await
+                    {
+                        Ok(_result) => {
+                            // copy_bidirectional returned (peer closed or error)
+                            break;
+                        }
+                        Err(_elapsed) => {
+                            // Idle timeout fired — no data in either direction
+                            // for `idle_timeout`. Tear down the session.
+                            break;
+                        }
+                    }
+                }
+            };
+
+            // Cap total session at the absolute deadline.
+            let _ = tokio::time::timeout_at(session_deadline, ws_pipe).await;
         }
     });
 

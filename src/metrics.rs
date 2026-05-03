@@ -64,11 +64,15 @@ impl LatencyHistogram {
         }
     }
 
-    /// Approximate quantile in microseconds. Uses the cumulative power-of-2
+    /// Approximate quantile in microseconds. Uses the non-cumulative power-of-2
     /// buckets — resolution is 2x per step (1, 2, 4, 8, … 32 768 ms), so the
     /// returned value is the upper bound of the bucket containing the q-th
     /// observation. Good enough for live TUI display; not for SLO math.
     /// Returns 0 when no observations have been recorded.
+    ///
+    /// Accumulates bucket counts on the fly since buckets are stored
+    /// differentially (each only counts its own range). This runs at
+    /// TUI/scrape cadence (~1/sec), never on the hot path.
     pub fn quantile_us(&self, q: f64) -> u64 {
         let count = self.count.load(Relaxed);
         if count == 0 {
@@ -76,8 +80,10 @@ impl LatencyHistogram {
         }
         let q = q.clamp(0.0, 1.0);
         let target = ((count as f64) * q).ceil().max(1.0) as u64;
+        let mut cumulative = 0u64;
         for (i, b) in self.buckets.iter().take(16).enumerate() {
-            if b.load(Relaxed) >= target {
+            cumulative += b.load(Relaxed);
+            if cumulative >= target {
                 return BUCKET_BOUNDS_US[i];
             }
         }
