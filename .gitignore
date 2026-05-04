@@ -33,3 +33,17 @@ benchmarks/backend/Cargo.lock
 # Sovereign Edge — local review files (authoritative data is in src/sovereign/)
 sovereign-*-ranges.txt
 .sovereign-data/
+
+# Claude Code local workspace state (per-developer, not for public repo)
+.claude/
+
+# Editor backups and swap files
+*.bak
+*.swp
+*~
+
+# Benchmark TLS material — generate on demand via benchmarks/certs/generate.sh
+benchmarks/certs/*.key
+benchmarks/certs/*.crt
+benchmarks/certs/*.pem
+

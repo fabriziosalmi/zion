@@ -38,9 +38,11 @@ pub enum IpClass {
     GovEu,
     /// EU residential (major ISPs per country)
     #[cfg(feature = "geo-eu")]
+    #[allow(dead_code)] // reserved for Phase 2 — data_eu.rs expansion pending
     ResidentialEu,
     /// EU datacenter / cloud
     #[cfg(feature = "geo-eu")]
+    #[allow(dead_code)] // reserved for Phase 2 — data_eu.rs expansion pending
     DatacenterEu,
     /// Unclassified — not in any baked-in dataset
     Unknown,
@@ -168,6 +170,7 @@ fn lookup(ip: u32, ranges: &[CidrEntry]) -> IpClass {
 /// Configuration for the `[sovereign]` section in zion.toml.
 /// Parsed at boot and on hot-reload. When `enabled = false` (default),
 /// the sovereign gate is never invoked — zero overhead.
+#[allow(dead_code)] // region/signals/signal_listen reserved for Phase 2/3
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SovereignConfig {
     /// Master switch. Default: false.
