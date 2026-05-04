@@ -2,6 +2,11 @@
 name = "zion"
 version = "0.1.8"
 edition = "2021"
+license = "Apache-2.0"
+description = "High-performance Rust TLS reverse proxy with built-in WAF and sovereign edge intelligence."
+repository = "https://github.com/fabriziosalmi/zion"
+authors = ["Fabrizio Salmi"]
+readme = "README.md"
 
 [dependencies]
 # Async runtime

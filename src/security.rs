@@ -244,14 +244,9 @@ fn try_evict_stale(
     current_window: u32,
 ) -> bool {
     const EVICT_PROBE_LIMIT: usize = 16;
-    let mut probed = 0;
     // DashMap::iter() walks shards sequentially. We iterate and remove
     // the first stale entry we find, bounded by EVICT_PROBE_LIMIT.
-    for entry in rate_map.iter() {
-        if probed >= EVICT_PROBE_LIMIT {
-            break;
-        }
-        probed += 1;
+    for entry in rate_map.iter().take(EVICT_PROBE_LIMIT) {
         let val = entry.value().packed.load(std::sync::atomic::Ordering::Relaxed);
         if RateEntry::window(val) != current_window {
             let ip = *entry.key();

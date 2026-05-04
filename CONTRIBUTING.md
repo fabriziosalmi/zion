@@ -44,8 +44,34 @@ Before spending time on a large PR, we strongly suggest opening a feature reques
 - Avoid allocating memory (e.g., `String`, `Vec`) in request/response processing unless necessary. Use `std::borrow::Cow` or `bytes::BytesMut` instead.
 - If `unsafe` is used, it must be accompanied by `// SAFETY:` explanatory comments.
 
+## Developer Certificate of Origin (DCO)
+
+All commits must be signed off per the [Developer Certificate of Origin](https://developercertificate.org/). This certifies that you wrote the contribution or otherwise have the right to submit it under the project's license.
+
+Sign your commits by adding a `Signed-off-by` trailer:
+
+```bash
+git commit -s -m "Your commit message"
+```
+
+The trailer is a single line at the end of the commit message:
+
+```
+Signed-off-by: Your Name <your.email@example.com>
+```
+
+The CI workflow at `.github/workflows/dco.yml` rejects pull requests with any commit missing the sign-off. To fix existing commits in a branch:
+
+```bash
+git rebase --signoff <base-branch>
+git push --force-with-lease
+```
+
+No CLA is required — DCO is sufficient. Project license is Apache 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
 ## Pull Request Process
 
 1. Provide a clear description explaining the changes.
 2. Link related GitHub Issues.
-3. Wait for the CI pipeline to pass.
+3. Ensure every commit is signed off (DCO).
+4. Wait for the CI pipeline to pass.

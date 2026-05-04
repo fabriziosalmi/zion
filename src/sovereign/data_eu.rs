@@ -14,14 +14,13 @@ pub static RANGES: &[CidrEntry] = &[
     // ═══════════════════════════════════════════════════════════════
     // EU INSTITUTIONAL (seed — Phase 2 will expand)
     // ═══════════════════════════════════════════════════════════════
+    // GÉANT (European Research Network)
+    cr(62, 40, 96, 0, 19, IpClass::GovEu),        // 62.40.96.0/19 — GÉANT backbone
 
     // European Commission / EU Council (Brussels)
     cr(147, 67, 0, 0, 16, IpClass::GovEu),        // 147.67.0.0/16 — EU institutions
     cr(158, 167, 0, 0, 16, IpClass::GovEu),       // 158.167.0.0/16 — European Commission
     cr(158, 169, 0, 0, 16, IpClass::GovEu),       // 158.169.0.0/16 — EU Parliament
-
-    // GÉANT (European Research Network)
-    cr(62, 40, 96, 0, 19, IpClass::GovEu),        // 62.40.96.0/19 — GÉANT backbone
 ];
 
 /// Const constructor for CidrEntry.

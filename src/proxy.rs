@@ -496,27 +496,13 @@ async fn send_ws_upgrade(
             let session_deadline = tokio::time::Instant::now() + max_session;
 
             let ws_pipe = async {
-                // Activity-aware idle loop: copy_bidirectional runs until either
-                // side closes or an error occurs. We wrap it in an idle timeout
-                // so completely silent sessions are torn down promptly.
-                loop {
-                    match tokio::time::timeout(
-                        idle_timeout,
-                        tokio::io::copy_bidirectional(&mut c, &mut u),
-                    )
-                    .await
-                    {
-                        Ok(_result) => {
-                            // copy_bidirectional returned (peer closed or error)
-                            break;
-                        }
-                        Err(_elapsed) => {
-                            // Idle timeout fired — no data in either direction
-                            // for `idle_timeout`. Tear down the session.
-                            break;
-                        }
-                    }
-                }
+                // copy_bidirectional runs until either side closes or errors.
+                // The idle timeout tears down completely silent sessions.
+                let _ = tokio::time::timeout(
+                    idle_timeout,
+                    tokio::io::copy_bidirectional(&mut c, &mut u),
+                )
+                .await;
             };
 
             // Cap total session at the absolute deadline.
