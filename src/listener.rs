@@ -253,8 +253,7 @@ impl ListenerSupervisor {
                     crate::logging::warn(
                         "listener",
                         &format!(
-                            "HTTPS rebind to {} skipped: --features io-uring-accept is incompatible with rebind in Phase 1.5; restart required",
-                            want
+                            "HTTPS rebind to {want} skipped: --features io-uring-accept is incompatible with rebind in Phase 1.5; restart required"
                         ),
                     );
                     return;

@@ -59,7 +59,7 @@ mod inner {
                 Ok(_) => {}
                 Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
                 Err(e) => {
-                    eprintln!("  io_uring fatal submit_and_wait error: {}", e);
+                    eprintln!("  io_uring fatal submit_and_wait error: {e}");
                     return;
                 }
             }
@@ -78,7 +78,7 @@ mod inner {
                         continue;
                     }
                     // Permanent error — re-submit multishot
-                    eprintln!("  io_uring accept error: errno {}", errno);
+                    eprintln!("  io_uring accept error: errno {errno}");
                     let accept_e = opcode::AcceptMulti::new(types::Fd(listener_fd))
                         .build()
                         .user_data(0x01);
