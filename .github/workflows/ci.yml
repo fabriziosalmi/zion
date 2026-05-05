@@ -158,7 +158,12 @@ jobs:
           sudo apt-get install -y cmake pkg-config build-essential libssl-dev
       # Don't run lints here — clippy on a pinned old toolchain produces noise
       # unrelated to MSRV. We just need to know the project still *compiles*.
-      - run: cargo check --locked --no-default-features --all-targets
+      # Note: NO `--all-targets` on this step. The MSRV contract covers the
+      # production binary; dev-dependencies (proptest, criterion, etc.) are
+      # free to track a faster-moving toolchain. `cargo check` without
+      # `--all-targets` skips test/bench/example targets and therefore the
+      # dev-dep graph, matching the contract documented in Cargo.toml.
+      - run: cargo check --locked --no-default-features
 
   # ── 6. Docs build — fail on broken intra-doc links. ───────────────────────
   doc:

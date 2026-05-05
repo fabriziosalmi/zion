@@ -47,6 +47,9 @@ impl Check {
             fix: Some(fix.into()),
         }
     }
+    // `fail` is only called from `#[cfg(unix)]` blocks (fd-limit check).
+    // Windows builds don't reach a call site, so dead_code fires there.
+    #[allow(dead_code)]
     fn fail(name: &'static str, detail: impl Into<String>, fix: impl Into<String>) -> Self {
         Self {
             name,
@@ -183,7 +186,7 @@ fn check_somaxconn() -> Check {
         match std::fs::read_to_string("/proc/sys/net/core/somaxconn") {
             Ok(s) => {
                 let v: u32 = s.trim().parse().unwrap_or(0);
-                let detail = format!("{}", v);
+                let detail = format!("{v}");
                 if v < 1024 {
                     Check::warn(
                         "somaxconn",
@@ -221,14 +224,13 @@ fn check_kernel_version() -> Check {
         let mut parts = v_str.split('.');
         let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let detail = format!("{}.{}", major, minor);
+        let detail = format!("{major}.{minor}");
         let supports_io_uring_multishot = major > 5 || (major == 5 && minor >= 19);
         if supports_io_uring_multishot {
             Check::ok(
                 "kernel version",
                 format!(
-                    "{} (io_uring multishot supported — try `--features io-uring-accept`)",
-                    detail
+                    "{detail} (io_uring multishot supported — try `--features io-uring-accept`)"
                 ),
             )
         } else if major >= 5 {
