@@ -38,26 +38,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Rust: CodeQL's Rust extractor uses `build-mode: none` and runs
+          # its own extraction step — `manual` is no longer accepted as of
+          # CodeQL 2.25:
+          #   "Rust does not support the manual build mode. Please try
+          #    using one of the following build modes instead: none."
           - language: rust
-            build-mode: manual
+            build-mode: none
           - language: actions
             build-mode: none
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install build deps (Rust)
-        if: matrix.language == 'rust'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
-
-      - uses: dtolnay/rust-toolchain@stable
-        if: matrix.language == 'rust'
-
-      - uses: Swatinem/rust-cache@v2
-        if: matrix.language == 'rust'
-        with:
-          shared-key: codeql-rust
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
@@ -65,11 +56,6 @@ jobs:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
           queries: security-and-quality
-
-      - name: Build (Rust)
-        if: matrix.language == 'rust'
-        # Match what we ship — all-features so CodeQL sees acme/auth/http3/tui code paths.
-        run: cargo build --locked --all-features
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3

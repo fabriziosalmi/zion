@@ -183,7 +183,15 @@ jobs:
         with:
           results_file: scorecard.sarif
           results_format: sarif
-          publish_results: true
+          # `publish_results` requires the workflow to be "minimal" by
+          # the scorecard webapp's standards (no global `env:` or
+          # `defaults:`). Our supply-chain.yml has `env: CARGO_TERM_COLOR`
+          # at the top, so the publish step rejects with HTTP 400. The
+          # SARIF still uploads to GitHub's Security tab below — that's
+          # the consumer-facing surface we care about. The public badge
+          # at scorecard.dev is a follow-up: split scorecard into its own
+          # global-env-free workflow file.
+          publish_results: false
       - name: Upload scorecard SARIF
         uses: github/codeql-action/upload-sarif@v3
         with:
