@@ -64,6 +64,72 @@ impl IpClass {
             Self::Unknown => "unknown",
         }
     }
+
+    /// Stable index into [`CLASS_COUNTERS`]. Hand-rolled instead of
+    /// `enum_iterator` so this stays a `const fn` and the enum stays
+    /// `#[derive(Copy)]`-able. Update both sides if a new variant lands.
+    #[inline]
+    const fn index(self) -> usize {
+        match self {
+            Self::GovIta => 0,
+            Self::ResidentialIta => 1,
+            Self::DatacenterIta => 2,
+            #[cfg(feature = "geo-eu")]
+            Self::GovEu => 3,
+            #[cfg(feature = "geo-eu")]
+            Self::ResidentialEu => 4,
+            #[cfg(feature = "geo-eu")]
+            Self::DatacenterEu => 5,
+            Self::Unknown => CLASS_COUNTERS.len() - 1,
+        }
+    }
+}
+
+/// Per-class request counters. Bumped on every classification result by
+/// `record_classification`. Exposed on `/metrics` as
+/// `zion_sovereign_classifications_total{class="..."}`.
+///
+/// We use a fixed-size array instead of a HashMap because the enum is
+/// closed: each slot is a single atomic u64, the lookup is O(1) by
+/// `IpClass::index`, and the layout is a single cache line on every
+/// architecture we ship to.
+pub static CLASS_COUNTERS: [std::sync::atomic::AtomicU64; CLASS_COUNT] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; CLASS_COUNT];
+
+#[cfg(feature = "geo-eu")]
+const CLASS_COUNT: usize = 7; // 6 named + Unknown
+
+#[cfg(not(feature = "geo-eu"))]
+const CLASS_COUNT: usize = 4; // GovIta, ResidentialIta, DatacenterIta, Unknown
+
+/// Bump the per-class counter. Inline-able to a single `fetch_add`.
+#[inline]
+pub fn record_classification(class: IpClass) {
+    CLASS_COUNTERS[class.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Iterate `(class_label, count)` pairs for the metrics renderer.
+/// Returns one entry per known class (cheap — bounded constant).
+pub fn classification_counts() -> impl Iterator<Item = (&'static str, u64)> {
+    [
+        IpClass::GovIta,
+        IpClass::ResidentialIta,
+        IpClass::DatacenterIta,
+        #[cfg(feature = "geo-eu")]
+        IpClass::GovEu,
+        #[cfg(feature = "geo-eu")]
+        IpClass::ResidentialEu,
+        #[cfg(feature = "geo-eu")]
+        IpClass::DatacenterEu,
+        IpClass::Unknown,
+    ]
+    .into_iter()
+    .map(|c| {
+        (
+            c.as_str(),
+            CLASS_COUNTERS[c.index()].load(std::sync::atomic::Ordering::Relaxed),
+        )
+    })
 }
 
 impl std::fmt::Display for IpClass {

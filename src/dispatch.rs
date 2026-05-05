@@ -156,15 +156,34 @@ pub(crate) async fn process_request(
     }
 
     // ── Sovereign Edge: IP classification (zero cost when feature is off or disabled) ──
+    //
+    // Track D fix: previously this branch did `format!("ip=… class=…")` once
+    // per *every* request when `sovereign_log_classification` was on — that's
+    // a heap allocation on the hot path with no opt-out. We now:
+    //
+    //   1. Always bump a per-class atomic counter (4 ns) so /metrics carries
+    //      `zion_sovereign_classifications_total{class="…"}` whether the
+    //      operator opted into logging or not.
+    //   2. When `log_classification = true`, emit a zero-alloc
+    //      `tracing::info!()` event using the class's `&'static str` label
+    //      and `Display` impl for the IP. The event is a no-op when no
+    //      subscriber consumes it; with the JSON subscriber attached it
+    //      still beats `format!` because the formatter writes directly to
+    //      the subscriber's buffer instead of materialising a `String`.
     #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
     {
         use crate::sovereign;
         if cfg.sovereign_enabled {
             let ip_class = sovereign::classify(client_ip);
-            // Store classification as request extension for downstream logging
+            sovereign::record_classification(ip_class);
             req.extensions_mut().insert(ip_class);
             if cfg.sovereign_log_classification && ip_class != sovereign::IpClass::Unknown {
-                logging::info("sovereign", &format!("ip={client_ip} class={ip_class}"));
+                tracing::info!(
+                    target: "sovereign",
+                    ip = %client_ip,
+                    class = ip_class.as_str(),
+                    "classified",
+                );
             }
         }
     }

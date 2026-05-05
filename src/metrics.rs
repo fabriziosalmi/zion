@@ -624,6 +624,24 @@ impl Metrics {
         // tracing internals.
         crate::observability::render_counters(&mut out);
 
+        // Sovereign per-class classification counters (Track D — replaces
+        // the previous per-request `format!` call site in dispatch.rs).
+        // Only rendered when the feature is compiled in.
+        #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+        {
+            out.extend_from_slice(
+                b"# HELP zion_sovereign_classifications_total Per-class IP \
+classifications since process start.\n# TYPE zion_sovereign_classifications_total counter\n",
+            );
+            for (label, count) in crate::sovereign::classification_counts() {
+                out.extend_from_slice(b"zion_sovereign_classifications_total{class=\"");
+                out.extend_from_slice(label.as_bytes());
+                out.extend_from_slice(b"\"} ");
+                out.extend_from_slice(itoa_buf.format(count).as_bytes());
+                out.extend_from_slice(b"\n");
+            }
+        }
+
         let b: bytes::Bytes = out.into();
 
         // Lock-free atomic cache update (ts + bytes as one unit)

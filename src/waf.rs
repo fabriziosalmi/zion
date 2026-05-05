@@ -316,6 +316,118 @@ fn scanner_for(mode: WafMode) -> &'static AhoCorasick {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Streaming scan (Track D — opt-in path).
+//
+// `validate_request` buffers the entire body before scanning. That's optimal
+// for small JSON / form payloads but pays peak-memory cost equal to the body
+// size, and pays the full scan cost even when the offending pattern is in
+// the first 64 bytes. The streaming variant solves both:
+//
+//   * early-exit ⇒ a payload whose first chunk contains `union select`
+//     denies as soon as the first chunk is scanned, regardless of total
+//     body size;
+//   * peak memory ⇒ at most one chunk plus an overlap buffer of
+//     `MAX_PATTERN_LEN - 1` bytes is held at a time, vs the whole body.
+//
+// The catch is that a pattern can straddle two chunks. We solve that by
+// keeping the last `MAX_PATTERN_LEN - 1` bytes of each chunk and prepending
+// them to the next. As long as no pattern is longer than `MAX_PATTERN_LEN`,
+// nothing is missed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Upper bound on the length of any pattern shipped in BALANCED or
+/// AGGRESSIVE. Verified by the `pattern_lengths_fit_max` test.
+/// Bumping this is cheap (a few bytes of overlap per chunk); shrinking it
+/// requires re-checking every pattern.
+//
+// `#[allow(dead_code)]`: the streaming-scan API is shipped now and is
+// covered by unit tests; the dispatch wiring lands in the next Track D
+// commit (see docs/perf/roadmap.md "Streaming WAF dispatch integration").
+// Until then the binary doesn't reach for these items, but they're
+// public so external consumers and the follow-up PR can land cleanly.
+#[allow(dead_code)]
+pub const MAX_PATTERN_LEN: usize = 64;
+
+/// Verdict from a streaming scan. `Allow` means *every chunk consumed so
+/// far* was clean — the caller is expected to keep feeding chunks until
+/// the body is exhausted. `Deny` is terminal: drop the connection / 400.
+#[allow(dead_code)] // see MAX_PATTERN_LEN note
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamVerdict {
+    Allow,
+    Deny(&'static str),
+}
+
+/// Stateful streaming scanner. One per request — created cheaply at the
+/// start of the body validation path. Holds:
+///   * a reference to the shared `AhoCorasick` automaton (no copy);
+///   * a small overlap buffer carrying the last (MAX_PATTERN_LEN - 1)
+///     bytes from the previous chunk, so a pattern straddling a chunk
+///     boundary is still matched on the next call;
+///   * a hard cap on total bytes consumed (mirrors `max_body_mb`),
+///     enforced incrementally so an oversized body is rejected early.
+#[allow(dead_code)] // see MAX_PATTERN_LEN note
+pub struct StreamingScanner {
+    scanner: &'static AhoCorasick,
+    overlap: Vec<u8>,
+    bytes_seen: u64,
+    max_bytes: u64,
+}
+
+#[allow(dead_code)] // see MAX_PATTERN_LEN note
+impl StreamingScanner {
+    /// New scanner targeting the given profile. `max_body_bytes` mirrors
+    /// `WafProfile::max_body_mb * 1_048_576`.
+    pub fn new(mode: WafMode, max_body_bytes: u64) -> Self {
+        Self {
+            scanner: scanner_for(mode),
+            overlap: Vec::with_capacity(MAX_PATTERN_LEN),
+            bytes_seen: 0,
+            max_bytes: max_body_bytes,
+        }
+    }
+
+    /// Feed the next body chunk. Returns immediately on first match.
+    /// Calling `feed` after a previous `Deny` result is allowed but
+    /// useless — the verdict cannot un-deny.
+    pub fn feed(&mut self, chunk: &[u8]) -> StreamVerdict {
+        // Body-size gate, incremental.
+        self.bytes_seen = self.bytes_seen.saturating_add(chunk.len() as u64);
+        if self.bytes_seen > self.max_bytes {
+            return StreamVerdict::Deny("body exceeds max size");
+        }
+
+        // Build the search window: the previous overlap + this chunk.
+        // For typical chunk sizes (8K-64K) this is one short copy; we
+        // could avoid the copy by using `aho-corasick::AhoCorasick::stream_find_iter`
+        // on a `Read` adapter, but that requires an io::Read trait object
+        // with extra plumbing — measurable wins should come first.
+        let mut window = Vec::with_capacity(self.overlap.len() + chunk.len());
+        window.extend_from_slice(&self.overlap);
+        window.extend_from_slice(chunk);
+
+        if self.scanner.is_match(&window) {
+            return StreamVerdict::Deny("injection pattern detected");
+        }
+
+        // Save the trailing (MAX_PATTERN_LEN - 1) bytes for the next call.
+        let keep = (MAX_PATTERN_LEN - 1).min(window.len());
+        self.overlap.clear();
+        self.overlap
+            .extend_from_slice(&window[window.len() - keep..]);
+
+        StreamVerdict::Allow
+    }
+
+    /// Total bytes consumed so far. Useful for emitting metrics from the
+    /// caller without exposing internal state.
+    #[allow(dead_code)] // wired by dispatch when the streaming path lands
+    pub fn bytes_seen(&self) -> u64 {
+        self.bytes_seen
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // GATE 4: Entropy Analysis
 // Shannon entropy is a heuristic for "this body looks like obfuscated /
@@ -843,6 +955,83 @@ pub fn validate_uri(uri: &str, mode: WafMode) -> WafVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Streaming scanner (Track D) ──
+
+    #[test]
+    fn pattern_lengths_fit_max() {
+        // Invariant the streaming overlap relies on. If a new pattern
+        // longer than MAX_PATTERN_LEN lands in BALANCED / AGGRESSIVE,
+        // the overlap buffer would no longer guarantee match correctness
+        // for boundary-spanning matches, and this test catches it.
+        for p in BALANCED_PATTERNS
+            .iter()
+            .chain(AGGRESSIVE_EXTRA_PATTERNS.iter())
+        {
+            assert!(
+                p.len() < MAX_PATTERN_LEN,
+                "pattern {p:?} ({}) >= MAX_PATTERN_LEN ({})",
+                p.len(),
+                MAX_PATTERN_LEN,
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_clean_chunks_allow_all() {
+        let mut s = StreamingScanner::new(WafMode::Balanced, 10 * 1_048_576);
+        for chunk in [
+            b"hello ".as_slice(),
+            b"world ".as_slice(),
+            b"\xff\x00\x01".as_slice(),
+        ] {
+            assert_eq!(s.feed(chunk), StreamVerdict::Allow);
+        }
+    }
+
+    #[test]
+    fn streaming_denies_pattern_in_first_chunk_early_exit() {
+        let mut s = StreamingScanner::new(WafMode::Balanced, 10 * 1_048_576);
+        // SQLi token in first chunk — the second chunk should not even be needed.
+        let v = s.feed(b"foo bar union select 1,2,3 baz");
+        assert!(matches!(v, StreamVerdict::Deny(_)), "got {v:?}");
+    }
+
+    #[test]
+    fn streaming_catches_pattern_split_across_chunks() {
+        // The pattern 'union select' (12 bytes) is split exactly at the
+        // chunk boundary. Without an overlap buffer this would be missed.
+        let mut s = StreamingScanner::new(WafMode::Balanced, 10 * 1_048_576);
+        assert_eq!(s.feed(b"prefix union sel"), StreamVerdict::Allow);
+        let v = s.feed(b"ect 1 from t");
+        assert!(matches!(v, StreamVerdict::Deny(_)), "got {v:?}");
+    }
+
+    #[test]
+    fn streaming_overflows_max_body() {
+        let mut s = StreamingScanner::new(WafMode::Balanced, 8); // tiny limit
+        assert_eq!(s.feed(b"abcd"), StreamVerdict::Allow);
+        let v = s.feed(b"efghij"); // 4 + 6 = 10 > 8
+        assert!(matches!(v, StreamVerdict::Deny(_)), "got {v:?}");
+    }
+
+    #[test]
+    fn streaming_overlap_size_is_bounded() {
+        // Feed many chunks; the internal overlap must never grow
+        // beyond MAX_PATTERN_LEN bytes.
+        let mut s = StreamingScanner::new(WafMode::Balanced, 1_048_576);
+        for _ in 0..100 {
+            assert_eq!(s.feed(&[b'a'; 4096]), StreamVerdict::Allow);
+        }
+        assert!(
+            s.overlap.len() < MAX_PATTERN_LEN,
+            "overlap grew unbounded: {} bytes",
+            s.overlap.len()
+        );
+        assert!(s.bytes_seen() == 100 * 4096);
+    }
+
+    // ── End streaming-scanner tests ──
 
     fn url_decode(input: std::borrow::Cow<[u8]>) -> std::borrow::Cow<[u8]> {
         let mut out = Vec::new();

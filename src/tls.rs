@@ -241,8 +241,22 @@ pub fn load_tls_config(tls: &TlsConfig) -> Result<ServerConfig, String> {
     // the server decrypts it — no server-side storage lookup needed.
     // This also enables horizontal scaling: any server with the same
     // ticket key can resume any session.
-    config.ticketer =
-        rustls::crypto::aws_lc_rs::Ticketer::new().expect("Failed to create TLS session ticketer");
+    //
+    // **Key rotation**: today the ticket key is generated once at config
+    // load time and lives for the duration of the resulting `ServerConfig`.
+    // Cert hot-reload also rotates the ticket key (each `load_tls_config`
+    // call freshly seeds a new `Ticketer`). For deployments that demand
+    // periodic rotation independent of cert renewal, the operator can
+    // touch the cert file on a cron — `notify` will trigger a reload and
+    // produce a new key. A finer-grained ArcSwap-based ticket-key
+    // rotation is tracked in docs/perf/roadmap.md.
+    //
+    // The `Ticketer::new()` call only fails if the platform's CSPRNG
+    // refuses to deliver entropy at boot — catastrophic for any TLS
+    // server, so we surface the error to `ZionError::Tls` rather than
+    // panicking.
+    config.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new()
+        .map_err(|e| format!("create TLS session ticketer (CSPRNG): {e}"))?;
 
     // Send 4 TLS 1.3 tickets per connection (default: 2).
     // More tickets = better resumption rate for clients that open
