@@ -21,20 +21,27 @@ Before spending time on a large PR, we strongly suggest opening a feature reques
 ## Development Workflow
 
 1. Fork the repository and create a branch from `master`.
-2. Build the project natively:
+2. Install the project git hooks once per clone:
+   ```bash
+   bash scripts/install-hooks.sh
+   ```
+   This sets `core.hooksPath` to `.githooks/`, which auto-injects the DCO
+   `Signed-off-by` trailer, runs `cargo check` + `cargo test` on commit,
+   and verifies version SSOT on push. See [Developer Certificate of Origin](#developer-certificate-of-origin-dco).
+3. Build the project natively:
    ```bash
    cargo build
    ```
-3. Run the test suite:
+4. Run the test suite:
    ```bash
    cargo test
    ```
-4. Ensure no warnings are reported:
+5. Ensure no warnings are reported:
    ```bash
    cargo clippy -- -D warnings
    cargo fmt --all -- --check
    ```
-5. If your PR touches the request processing path (`src/dispatch.rs`, `src/waf.rs`, `src/proxy.rs`), please run the benchmarks:
+6. If your PR touches the request processing path (`src/dispatch.rs`, `src/waf.rs`, `src/proxy.rs`), please run the benchmarks:
    ```bash
    bash benchmarks/bench-matrix.sh
    ```
@@ -48,7 +55,7 @@ Before spending time on a large PR, we strongly suggest opening a feature reques
 
 All commits must be signed off per the [Developer Certificate of Origin](https://developercertificate.org/). This certifies that you wrote the contribution or otherwise have the right to submit it under the project's license.
 
-Sign your commits by adding a `Signed-off-by` trailer:
+If you ran `scripts/install-hooks.sh`, the `prepare-commit-msg` hook adds the trailer for you and `commit-msg` rejects any commit that ends up without one. Otherwise, sign manually:
 
 ```bash
 git commit -s -m "Your commit message"
@@ -68,6 +75,26 @@ git push --force-with-lease
 ```
 
 No CLA is required — DCO is sufficient. Project license is Apache 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+## Version SSOT (maintainers)
+
+`Cargo.toml` is the single source of truth for the project version. Every other version reference (`Cargo.lock`, `deploy/helm/zion/Chart.yaml` `appVersion`, `vX.Y.Z` mentions in `README.md` and `docs/security/supply-chain.md`) must match it.
+
+To cut a release:
+
+```bash
+scripts/bump-version.sh 0.1.11   # propagate the bump to every site
+# add a CHANGELOG.md entry for 0.1.11
+git commit -s -m "chore(release): v0.1.11"
+git tag -s v0.1.11 -m "v0.1.11"
+git push && git push --tags
+```
+
+The `pre-push` hook and `.github/workflows/version-sync.yml` will refuse any drift. To verify by hand:
+
+```bash
+scripts/check-version-sync.sh
+```
 
 ## Pull Request Process
 

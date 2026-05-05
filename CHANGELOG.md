@@ -2,6 +2,45 @@
 
 All notable changes to Zion Edge Gateway are documented here.
 
+## [0.1.11] - 2026-05-06
+
+Process hardening — version becomes single-source-of-truth, DCO sign-off
+becomes draconian. Closes the two CI failure modes seen on recent PRs
+(`uninlined_format_args` on Windows + MSRV `--all-targets`, missing
+`Signed-off-by` trailer) at the source.
+
+### Added
+- **Version SSOT enforcement.** `Cargo.toml` is the canonical version;
+  drift across `Cargo.lock`, `deploy/helm/zion/Chart.yaml`,
+  `README.md`, and `docs/security/supply-chain.md` is now a hard error.
+  - `scripts/check-version-sync.sh` — verify (run by `pre-push` and CI).
+  - `scripts/bump-version.sh X.Y.Z` — atomic bump propagated to every site.
+  - `.github/workflows/version-sync.yml` — server-side guard on PRs to
+    `master` and on every push.
+- **Mandatory DCO sign-off via local hooks.**
+  - `.githooks/prepare-commit-msg` auto-injects the `Signed-off-by` trailer
+    (idempotent, `git interpret-trailers --if-exists addIfDifferent`).
+  - `.githooks/commit-msg` refuses commits without a valid trailer.
+  - `scripts/install-hooks.sh` switched from copying into `.git/hooks/` to
+    `git config core.hooksPath .githooks` — hooks are now version-controlled
+    and update on `git pull`.
+
+### Changed
+- **CI lint fixes** (already landed post-0.1.10, recorded here for
+  release notes): `uninlined_format_args` resolved in `src/doctor.rs`,
+  `src/listener.rs`, `src/uring.rs`; MSRV job relaxed for `--all-targets`;
+  CodeQL Rust build-mode and Scorecard `publish_results` corrected.
+- **Helm chart appVersion** bumped to 0.1.11 (chart `version` unchanged).
+
+### Verification
+
+```text
+scripts/check-version-sync.sh                      # OK
+cargo check                                        # OK
+cargo test                                         # 77 tests, all passing
+.githooks/prepare-commit-msg + commit-msg          # idempotent + rejects unsigned
+```
+
 ## [0.1.10] - 2026-05-05
 
 Supply-chain hardening — closes 3 of the 4 OSSF Scorecard gaps surfaced
