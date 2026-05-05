@@ -128,20 +128,19 @@ impl ResolvesServerCert for SniResolver {
 /// can handle failures gracefully by keeping the previous config.
 fn load_certified_key(cert_path: &str, key_path: &str) -> Result<Arc<CertifiedKey>, String> {
     let cert_file =
-        std::fs::File::open(cert_path).map_err(|e| format!("TLS cert {}: {}", cert_path, e))?;
-    let key_file =
-        std::fs::File::open(key_path).map_err(|e| format!("TLS key {}: {}", key_path, e))?;
+        std::fs::File::open(cert_path).map_err(|e| format!("TLS cert {cert_path}: {e}"))?;
+    let key_file = std::fs::File::open(key_path).map_err(|e| format!("TLS key {key_path}: {e}"))?;
 
     let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("Failed to parse TLS certificate PEM: {}", e))?;
+        .map_err(|e| format!("Failed to parse TLS certificate PEM: {e}"))?;
 
     let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .map_err(|e| format!("Failed to parse TLS key PEM: {}", e))?
+        .map_err(|e| format!("Failed to parse TLS key PEM: {e}"))?
         .ok_or_else(|| "No private key found in PEM file".to_string())?;
 
     let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
-        .map_err(|e| format!("Failed to create signing key from PEM: {}", e))?;
+        .map_err(|e| format!("Failed to create signing key from PEM: {e}"))?;
 
     Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
 }
@@ -188,15 +187,15 @@ pub fn load_tls_config(tls: &TlsConfig) -> Result<ServerConfig, String> {
     let client_auth_mode = tls.client_auth.as_str();
     let mut config = if let Some(ref ca_path) = tls.client_ca_path {
         if client_auth_mode != "none" {
-            let ca_file = std::fs::File::open(ca_path)
-                .map_err(|e| format!("Client CA {}: {}", ca_path, e))?;
+            let ca_file =
+                std::fs::File::open(ca_path).map_err(|e| format!("Client CA {ca_path}: {e}"))?;
             let mut ca_reader = BufReader::new(ca_file);
             let mut root_store = rustls::RootCertStore::empty();
             for cert in rustls_pemfile::certs(&mut ca_reader) {
-                let cert = cert.map_err(|e| format!("Failed to parse client CA PEM: {}", e))?;
+                let cert = cert.map_err(|e| format!("Failed to parse client CA PEM: {e}"))?;
                 root_store
                     .add(cert)
-                    .map_err(|e| format!("Failed to add client CA cert: {}", e))?;
+                    .map_err(|e| format!("Failed to add client CA cert: {e}"))?;
             }
 
             let verifier_builder =
@@ -207,9 +206,9 @@ pub fn load_tls_config(tls: &TlsConfig) -> Result<ServerConfig, String> {
             } else {
                 verifier_builder.build()
             }
-            .map_err(|e| format!("Failed to build client cert verifier: {}", e))?;
+            .map_err(|e| format!("Failed to build client cert verifier: {e}"))?;
 
-            eprintln!("  mtls: client auth={}, ca={}", client_auth_mode, ca_path);
+            eprintln!("  mtls: client auth={client_auth_mode}, ca={ca_path}");
 
             ServerConfig::builder_with_protocol_versions(&versions)
                 .with_client_cert_verifier(verifier)
@@ -367,13 +366,10 @@ pub fn spawn_tls_watcher(
                     );
                 }
                 Ok(Err(e)) => {
-                    eprintln!("  tls: reload FAILED ({}), keeping previous config.", e);
+                    eprintln!("  tls: reload FAILED ({e}), keeping previous config.");
                 }
                 Err(e) => {
-                    eprintln!(
-                        "  tls: reload task panicked: {}, keeping previous config.",
-                        e
-                    );
+                    eprintln!("  tls: reload task panicked: {e}, keeping previous config.");
                 }
             }
         }
@@ -409,7 +405,7 @@ pub fn spawn_cert_prewarm_task(acceptor_store: Arc<ArcSwap<TlsAcceptor>>, tls: T
                 // Snapshot generation before building — if watcher reloads
                 // concurrently, we detect the race and skip our stale store.
                 let gen_before = CERT_GENERATION.load(Ordering::Acquire);
-                eprintln!("  tls: cert expires in {}s, pre-warming config...", expiry);
+                eprintln!("  tls: cert expires in {expiry}s, pre-warming config...");
                 let tls_clone = tls.clone();
                 let prewarm_result =
                     tokio::task::spawn_blocking(move || load_tls_config(&tls_clone)).await;
@@ -428,16 +424,15 @@ pub fn spawn_cert_prewarm_task(acceptor_store: Arc<ArcSwap<TlsAcceptor>>, tls: T
                             );
                         } else {
                             eprintln!(
-                                "  tls: pre-warm skipped — watcher already reloaded (gen {} → {})",
-                                gen_before, gen_after
+                                "  tls: pre-warm skipped — watcher already reloaded (gen {gen_before} → {gen_after})"
                             );
                         }
                     }
                     Ok(Err(e)) => {
-                        eprintln!("  tls: pre-warm FAILED ({}), keeping previous config.", e);
+                        eprintln!("  tls: pre-warm FAILED ({e}), keeping previous config.");
                     }
                     Err(e) => {
-                        eprintln!("  tls: pre-warm task panicked: {}", e);
+                        eprintln!("  tls: pre-warm task panicked: {e}");
                     }
                 }
             }
@@ -668,7 +663,9 @@ mod tests {
         let fp = fingerprint(der);
         assert!(fp.starts_with("sha256:"));
         assert_eq!(fp.len(), 7 + 64);
-        assert!(fp[7..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(fp[7..]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]

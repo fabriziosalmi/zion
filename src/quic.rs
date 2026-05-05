@@ -88,9 +88,9 @@ pub fn spawn_quic_listener(
     let server_config = build_quinn_server_config(tls);
 
     let endpoint = quinn::Endpoint::server(server_config, addr)
-        .unwrap_or_else(|e| panic!("Failed to bind QUIC on {}: {}", addr, e));
+        .unwrap_or_else(|e| panic!("Failed to bind QUIC on {addr}: {e}"));
 
-    eprintln!("  listening HTTP/3 (QUIC) on {}", addr);
+    eprintln!("  listening HTTP/3 (QUIC) on {addr}");
 
     if let Some(mut rx) = reload_rx {
         let endpoint_clone = endpoint.clone();
@@ -122,7 +122,7 @@ pub fn spawn_quic_listener(
                 let conn = match incoming.await {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("  quic accept error: {}", e);
+                        eprintln!("  quic accept error: {e}");
                         return;
                     }
                 };
@@ -138,7 +138,7 @@ pub fn spawn_quic_listener(
                 let mut h3_conn = match h3_conn {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("  h3 connection error: {}", e);
+                        eprintln!("  h3 connection error: {e}");
                         return;
                     }
                 };
@@ -153,18 +153,18 @@ pub fn spawn_quic_listener(
                                         if let Err(e) =
                                             handle_h3_request(req, stream, state, remote_addr).await
                                         {
-                                            eprintln!("  h3 request error: {}", e);
+                                            eprintln!("  h3 request error: {e}");
                                         }
                                     }
                                     Err(e) => {
-                                        eprintln!("  h3 resolve error: {}", e);
+                                        eprintln!("  h3 resolve error: {e}");
                                     }
                                 }
                             });
                         }
                         Ok(None) => break,
                         Err(e) => {
-                            eprintln!("  h3 accept error: {}", e);
+                            eprintln!("  h3 accept error: {e}");
                             break;
                         }
                     }

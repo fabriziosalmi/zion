@@ -2,11 +2,30 @@
 name = "zion"
 version = "0.1.8"
 edition = "2021"
+# MSRV is the *core* default-features build (TLS proxy + WAF + cache + metrics).
+# Opt-in features (acme, auth, init, http3) pull crypto/i18n crates that have
+# their own, faster-moving MSRV (currently 1.88 — `time`, `darling`, `icu_*`).
+# The CI MSRV job enforces this 1.82 floor against `--no-default-features` only.
+rust-version = "1.82"
 license = "Apache-2.0"
 description = "High-performance Rust TLS reverse proxy with built-in WAF and sovereign edge intelligence."
 repository = "https://github.com/fabriziosalmi/zion"
+homepage = "https://fabriziosalmi.github.io/zion"
+documentation = "https://fabriziosalmi.github.io/zion"
 authors = ["Fabrizio Salmi"]
 readme = "README.md"
+keywords = ["proxy", "tls", "waf", "http3", "reverse-proxy"]
+categories = ["network-programming", "web-programming::http-server"]
+exclude = [
+    ".github/**",
+    ".gitlab-ci.yml",
+    "benchmarks/**",
+    "docs/**",
+    "deploy/**",
+    "tests/**",
+    "scripts/**",
+    "examples/**",
+]
 
 [dependencies]
 # Async runtime

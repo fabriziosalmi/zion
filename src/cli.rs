@@ -195,7 +195,7 @@ fn parse_auto_opts(args: &[String]) -> AutoOpts {
 /// happy path (`zion auto --upstream=:3000`) is as terse as possible.
 fn normalize_upstream(s: &str) -> String {
     if let Some(port_str) = s.strip_prefix(':') {
-        format!("127.0.0.1:{}", port_str)
+        format!("127.0.0.1:{port_str}")
     } else {
         s.to_string()
     }

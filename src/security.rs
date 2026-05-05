@@ -139,7 +139,7 @@ impl RateEntry {
     #[inline]
     fn new(window: u32) -> Self {
         Self {
-            packed: std::sync::atomic::AtomicU64::new((window as u64) << 32 | 1),
+            packed: std::sync::atomic::AtomicU64::new(((window as u64) << 32) | 1),
         }
     }
 
@@ -155,7 +155,7 @@ impl RateEntry {
 
     #[inline]
     fn pack(window: u32, count: u32) -> u64 {
-        (window as u64) << 32 | count as u64
+        ((window as u64) << 32) | (count as u64)
     }
 }
 
@@ -247,7 +247,10 @@ fn try_evict_stale(
     // DashMap::iter() walks shards sequentially. We iterate and remove
     // the first stale entry we find, bounded by EVICT_PROBE_LIMIT.
     for entry in rate_map.iter().take(EVICT_PROBE_LIMIT) {
-        let val = entry.value().packed.load(std::sync::atomic::Ordering::Relaxed);
+        let val = entry
+            .value()
+            .packed
+            .load(std::sync::atomic::Ordering::Relaxed);
         if RateEntry::window(val) != current_window {
             let ip = *entry.key();
             drop(entry); // release shard lock before remove
@@ -276,7 +279,10 @@ pub fn scavenge_rate_map(
 
     let mut stale_ips = Vec::new();
     for entry in rate_map.iter() {
-        let val = entry.value().packed.load(std::sync::atomic::Ordering::Relaxed);
+        let val = entry
+            .value()
+            .packed
+            .load(std::sync::atomic::Ordering::Relaxed);
         if RateEntry::window(val) != current_window {
             stale_ips.push(*entry.key());
         }
@@ -413,7 +419,7 @@ impl TrustedProxies {
         for s in cidrs {
             match CidrRange::parse(s) {
                 Some(cidr) => parsed.push(cidr),
-                None => eprintln!("  warning: invalid trusted_proxy CIDR '{}', skipping", s),
+                None => eprintln!("  warning: invalid trusted_proxy CIDR '{s}', skipping"),
             }
         }
         Self { cidrs: parsed }

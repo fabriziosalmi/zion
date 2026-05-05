@@ -1,7 +1,12 @@
 # Zion Edge Gateway
 
 [![CI](https://github.com/fabriziosalmi/zion/actions/workflows/ci.yml/badge.svg)](https://github.com/fabriziosalmi/zion/actions/workflows/ci.yml)
+[![Supply chain](https://github.com/fabriziosalmi/zion/actions/workflows/supply-chain.yml/badge.svg)](https://github.com/fabriziosalmi/zion/actions/workflows/supply-chain.yml)
+[![CodeQL](https://github.com/fabriziosalmi/zion/actions/workflows/codeql.yml/badge.svg)](https://github.com/fabriziosalmi/zion/actions/workflows/codeql.yml)
+[![OSSF Scorecard](https://api.scorecard.dev/projects/github.com/fabriziosalmi/zion/badge)](https://scorecard.dev/viewer/?uri=github.com/fabriziosalmi/zion)
+[![SLSA Level 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev/spec/v1.0/levels#build-l3)
 [![Version](https://img.shields.io/github/v/release/fabriziosalmi/zion?include_prereleases&color=blue&label=release)](https://github.com/fabriziosalmi/zion/releases)
+[![MSRV](https://img.shields.io/badge/MSRV-1.82%20core%20%2F%201.88%20full-blue.svg)](Cargo.toml)
 [![License](https://img.shields.io/github/license/fabriziosalmi/zion)](https://github.com/fabriziosalmi/zion/blob/master/LICENSE)
 [![Performance](https://img.shields.io/badge/Performance-233k%20req%2Fs-success?style=flat&color=brightgreen)](https://github.com/fabriziosalmi/zion/tree/master/benchmarks)
 [![WAF](https://img.shields.io/badge/WAF-Zero%20Regex-orange)](https://github.com/fabriziosalmi/zion/blob/master/src/waf.rs)
@@ -284,10 +289,28 @@ cargo test
 cargo test --test integration -- --ignored --test-threads=1
 ```
 
+## Verifying a Release
+
+Every release is signed and carries SLSA v1.0 build provenance. See
+[Supply Chain Security](docs/security/supply-chain.md) for the verification
+commands. The short version:
+
+```bash
+# Binary release (Sigstore-backed provenance via gh CLI)
+gh release download v0.1.8 -R fabriziosalmi/zion -p '*x86_64-unknown-linux-musl*' -p 'SHA256SUMS'
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify zion-v0.1.8-x86_64-unknown-linux-musl.tar.gz --owner fabriziosalmi
+
+# Container image (cosign keyless)
+cosign verify ghcr.io/fabriziosalmi/zion:v0.1.8 \
+    --certificate-identity-regexp "^https://github.com/fabriziosalmi/zion/\\.github/workflows/release\\.yml@refs/tags/v" \
+    --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+```
+
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## License
 
-MIT
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

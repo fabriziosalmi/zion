@@ -1,0 +1,403 @@
+# Release — cross-compiled binaries + signed multi-arch container,
+# with SLSA Level 3 provenance and CycloneDX SBOM attestation.
+#
+# Triggered by:
+#   - push of a tag matching v*  (canonical release path)
+#   - manual workflow_dispatch   (dry-runs and re-runs)
+#
+# The pipeline produces, per release tag:
+#   1. Statically-linked binaries for 7 targets:
+#        x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl,
+#        aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl,
+#        x86_64-apple-darwin, aarch64-apple-darwin,
+#        x86_64-pc-windows-msvc
+#   2. SHA256SUMS file (GNU coreutils format) over every artifact.
+#   3. CycloneDX SBOM (zion-sbom.cdx.json) covering the dependency closure.
+#   4. SLSA v1.0 build provenance (in-toto attestation) for every binary
+#      via `actions/attest-build-provenance` (GitHub-hosted Sigstore + Rekor).
+#   5. Multi-arch (amd64 + arm64) OCI image pushed to GHCR, keyless-signed
+#      with cosign (Fulcio cert + Rekor inclusion proof) plus SBOM
+#      attestation bound to the image digest.
+#
+# Verification steps for downstream users live in docs/security/supply-chain.md.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to release (tag or sha). Required for dry-runs."
+        required: true
+        default: "master"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════
+  # 1. Build cross-compiled binaries.
+  #    - linux-gnu/musl x86_64+aarch64 via cargo-zigbuild (handles aws-lc-rs
+  #      cross-compilation via Zig's toolchain — no QEMU, no Docker cross).
+  #    - macOS x86_64+aarch64 native on the macos runners.
+  #    - Windows x86_64 native via MSVC.
+  # ════════════════════════════════════════════════════════════════════════
+  build:
+    name: build (${{ matrix.target }})
+    permissions:
+      contents: read
+      id-token: write          # Sigstore OIDC for attestation step (below)
+      attestations: write      # actions/attest-build-provenance writes here
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux glibc
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: zig
+            artifact: zion
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: zig
+            artifact: zion
+          # Linux musl (fully static — runs on Alpine, distroless, scratch)
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: zig
+            artifact: zion
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: zig
+            artifact: zion
+          # macOS — native runners; one Intel, one Apple Silicon.
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            cross: native
+            artifact: zion
+          - target: aarch64-apple-darwin
+            os: macos-15
+            cross: native
+            artifact: zion
+          # Windows
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: native
+            artifact: zion.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout (tag or dispatch ref)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          # We don't need history for the build, but provenance needs the
+          # exact tag commit. Default fetch-depth=1 already provides it.
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          # Prefer the actual tag name; fall back to the dispatch input,
+          # finally to a synthetic dev tag so dry-runs always have a version.
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            v="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "${{ github.event.inputs.ref }}" ]]; then
+            v="dev-$(git rev-parse --short HEAD)"
+          else
+            v="dev-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=${v}" >> "$GITHUB_OUTPUT"
+          echo "Building Zion ${v} for ${{ matrix.target }}"
+
+      - name: Reproducible-build epoch
+        id: epoch
+        shell: bash
+        # SOURCE_DATE_EPOCH = commit timestamp. Tools that respect it (the Rust
+        # compiler, strip, archivers, OCI image builders) will emit identical
+        # output bit-for-bit across rebuilds of the same commit.
+        run: |
+          ts=$(git log -1 --pretty=%ct)
+          echo "SOURCE_DATE_EPOCH=${ts}" >> "$GITHUB_ENV"
+          echo "epoch=${ts}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      # ── Cross-compile path: zigbuild handles musl + aarch64 + aws-lc-rs ──
+      - name: Setup zigbuild
+        if: matrix.cross == 'zig'
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.cross == 'zig'
+        run: cargo install --locked cargo-zigbuild
+
+      # ── Native build deps ──
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config build-essential
+
+      - name: Install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake
+
+      # ── Build ──
+      - name: Build (zigbuild)
+        if: matrix.cross == 'zig'
+        shell: bash
+        run: |
+          cargo zigbuild --release --locked --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: matrix.cross == 'native'
+        shell: bash
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      # ── Strip + stage artifact ──
+      - name: Stage artifact
+        id: stage
+        shell: bash
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+          MATRIX_ARTIFACT: ${{ matrix.artifact }}
+          STAGE_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          name="zion-${STAGE_VERSION}-${MATRIX_TARGET}"
+          src="target/${MATRIX_TARGET}/release/${MATRIX_ARTIFACT}"
+
+          # Strip on platforms where we have a strip in PATH that targets the
+          # right ABI. Skip on Windows (no PE strip) and on macOS cross.
+          case "$MATRIX_TARGET" in
+            *windows*) ;;
+            *apple-darwin) strip "$src" || true ;;
+            *) strip "$src" || true ;;
+          esac
+
+          if [[ "$MATRIX_TARGET" == *windows* ]]; then
+            archive="${name}.zip"
+            7z a "dist/${archive}" "$src" >/dev/null
+          else
+            archive="${name}.tar.gz"
+            tar --owner=0 --group=0 --numeric-owner \
+                --mtime="@${SOURCE_DATE_EPOCH}" \
+                --sort=name \
+                -czf "dist/${archive}" \
+                -C "$(dirname "$src")" "$(basename "$src")"
+          fi
+
+          ( cd dist && sha256sum "${archive}" > "${archive}.sha256" )
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
+      # ── Provenance: bind the cryptographic hash of every archive to the
+      # workflow run identity (GitHub OIDC -> Fulcio -> Rekor). SLSA v1.0 L3.
+      - name: Generate SLSA build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/${{ steps.stage.outputs.archive }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zion-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # ════════════════════════════════════════════════════════════════════════
+  # 2. Aggregate SHA256SUMS + SBOM, push the GitHub release.
+  # ════════════════════════════════════════════════════════════════════════
+  publish:
+    name: publish release
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # to create the release + upload assets
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sbom-release
+
+      - name: Install build deps (for SBOM crate metadata resolution)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          cargo cyclonedx --all --format json --override-filename zion-sbom
+          mv zion-sbom.cdx.json dist/zion-sbom.cdx.json
+
+      - name: Compose top-level SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # Collapse the per-archive .sha256 files into one canonical SUMS file,
+          # then sign that one too — single source of truth for verifiers.
+          rm -f SHA256SUMS
+          for f in ./*.sha256; do
+            [ -e "$f" ] || continue
+            cat "$f" >> SHA256SUMS
+          done
+          # Re-hash the SBOM and append.
+          sha256sum zion-sbom.cdx.json >> SHA256SUMS
+          # Drop the per-archive sums file — SHA256SUMS is the canonical source.
+          rm -f -- ./*.sha256
+          sort -k 2 -o SHA256SUMS SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest SHA256SUMS + SBOM
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/SHA256SUMS
+            dist/zion-sbom.cdx.json
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+
+  # ════════════════════════════════════════════════════════════════════════
+  # 3. Multi-arch container image — keyless-signed + SBOM-attested.
+  # ════════════════════════════════════════════════════════════════════════
+  container:
+    name: container (multi-arch + cosign)
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write          # push to GHCR
+      id-token: write          # cosign keyless OIDC
+      attestations: write
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reproducible-build epoch
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          labels: |
+            org.opencontainers.image.title=Zion Edge Gateway
+            org.opencontainers.image.description=High-performance Rust TLS reverse proxy with WAF
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.documentation=https://fabriziosalmi.github.io/zion
+
+      - name: Build & push (linux/amd64,arm64)
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless, Sigstore)
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          # Sign every tag@digest pair. Each signature is uploaded to Rekor
+          # and verifiable via:
+          #   cosign verify --certificate-identity-regexp ... ghcr.io/.../zion@sha256:...
+          for tag in $TAGS; do
+            cosign sign --yes "${tag}@${DIGEST}"
+          done
+
+      - name: Generate CycloneDX SBOM (image)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          format: cyclonedx-json
+          output-file: image-sbom.cdx.json
+
+      - name: Attest SBOM to image
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: image-sbom.cdx.json
+          push-to-registry: true
+
+      - name: Attest container provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

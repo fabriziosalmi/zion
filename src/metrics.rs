@@ -677,7 +677,7 @@ mod tests {
         h.observe(Duration::from_secs(60)); // 60s > 32.768s
                                             // Should only be in +Inf bucket
         for i in 0..16 {
-            assert_eq!(h.buckets[i].load(Relaxed), 0, "bucket {} should be 0", i);
+            assert_eq!(h.buckets[i].load(Relaxed), 0, "bucket {i} should be 0");
         }
         assert_eq!(h.buckets[16].load(Relaxed), 1);
     }

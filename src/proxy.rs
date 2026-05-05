@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 ///   sits behind a sanitising edge (Cloudflare, ALB, etc.) AND the
 ///   downstream app reads the *rightmost-trusted* hop. Vulnerable to
 ///   client-side spoofing of the leftmost entry when Zion is the front
-///   edge — apps that read XFF[0] would consume an attacker-controlled IP.
+///   edge — apps that read XFF\[0\] would consume an attacker-controlled IP.
 /// * `Rewrite` (recommended for front-edge): drop any inbound XFF and
 ///   replace with a single trusted entry — the IP returned by
 ///   `TrustedProxies::resolve_client_ip`. Downstream apps see a clean,
@@ -199,7 +199,8 @@ pub async fn proxy_pass(
 
 /// Forward a request whose body has already been collected (post-WAF path).
 #[allow(dead_code)] // retained for symmetric API; not currently called
-#[allow(clippy::too_many_arguments)] // 8/7 — the caller path here is
+#[allow(clippy::too_many_arguments)]
+// 8/7 — the caller path here is
 // already a low-frequency post-WAF re-emit; collapsing into a struct
 // would force every (currently zero) caller to allocate or borrow it,
 // which is the wrong trade-off until at least one caller exists.
@@ -245,16 +246,18 @@ pub async fn proxy_pass_stream(
     match client.request(req).await {
         Ok(resp) => {
             let (mut parts, body) = resp.into_parts();
-            parts
-                .headers
-                .insert("Cache-Control", hyper::header::HeaderValue::from_static("no-cache"));
-            parts
-                .headers
-                .insert("X-Accel-Buffering", hyper::header::HeaderValue::from_static("no"));
+            parts.headers.insert(
+                "Cache-Control",
+                hyper::header::HeaderValue::from_static("no-cache"),
+            );
+            parts.headers.insert(
+                "X-Accel-Buffering",
+                hyper::header::HeaderValue::from_static("no"),
+            );
             Ok(Response::from_parts(parts, body.boxed()))
         }
         Err(e) => {
-            eprintln!("  stream proxy error: {}", e);
+            eprintln!("  stream proxy error: {e}");
             Ok(Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .header("Content-Type", "text/event-stream")
@@ -287,7 +290,7 @@ async fn send_request(
             crate::metrics::METRICS
                 .upstream_duration
                 .observe(upstream_start.elapsed());
-            eprintln!("  proxy error: {}", e);
+            eprintln!("  proxy error: {e}");
             Ok(bad_gateway())
         }
     }
@@ -327,14 +330,14 @@ pub async fn proxy_websocket(
         host.to_string()
     } else {
         let default_port = if is_tls_upstream { 443 } else { 80 };
-        format!("{}:{}", host, default_port)
+        format!("{host}:{default_port}")
     };
 
     // Connect to upstream via raw TCP (not the pooled client — WebSocket is long-lived)
     let tcp_stream = match tokio::net::TcpStream::connect(&connect_target).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("  ws upstream connect failed ({}): {}", connect_target, e);
+            eprintln!("  ws upstream connect failed ({connect_target}): {e}");
             return Ok(bad_gateway());
         }
     };
@@ -373,10 +376,7 @@ pub async fn proxy_websocket(
         let tls_stream = match connector.connect(server_name, tcp_stream).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!(
-                    "  ws upstream TLS handshake failed ({}): {}",
-                    connect_target, e
-                );
+                eprintln!("  ws upstream TLS handshake failed ({connect_target}): {e}");
                 return Ok(bad_gateway());
             }
         };
@@ -385,7 +385,7 @@ pub async fn proxy_websocket(
         let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("  ws upstream handshake failed: {}", e);
+                eprintln!("  ws upstream handshake failed: {e}");
                 return Ok(bad_gateway());
             }
         };
@@ -401,7 +401,7 @@ pub async fn proxy_websocket(
     let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("  ws upstream handshake failed: {}", e);
+            eprintln!("  ws upstream handshake failed: {e}");
             return Ok(bad_gateway());
         }
     };
@@ -425,7 +425,7 @@ async fn send_ws_upgrade(
     let upstream_resp = match sender.send_request(req).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("  ws upstream request failed: {}", e);
+            eprintln!("  ws upstream request failed: {e}");
             return Ok(bad_gateway());
         }
     };
@@ -452,7 +452,7 @@ async fn send_ws_upgrade(
     let upstream_upgraded = match hyper::upgrade::on(upstream_resp).await {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("  ws upstream upgrade failed: {}", e);
+            eprintln!("  ws upstream upgrade failed: {e}");
             return Ok(bad_gateway());
         }
     };
@@ -535,7 +535,8 @@ mod tests {
     #[test]
     fn prepare_rewrites_uri() {
         let req = make_request("GET", "/api/v1/users?page=2");
-        let req = prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).unwrap();
+        let req =
+            prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).unwrap();
         assert_eq!(
             req.uri().to_string(),
             "http://127.0.0.1:8000/api/v1/users?page=2"
@@ -545,7 +546,8 @@ mod tests {
     #[test]
     fn prepare_sets_http11() {
         let req = make_request("GET", "/test");
-        let req = prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).unwrap();
+        let req =
+            prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).unwrap();
         assert_eq!(req.version(), Version::HTTP_11);
     }
 
@@ -558,7 +560,8 @@ mod tests {
             .header(hyper::header::CONNECTION, "keep-alive")
             .body(())
             .unwrap();
-        let req = prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).unwrap();
+        let req =
+            prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).unwrap();
         assert!(req.headers().get(hyper::header::HOST).is_none());
         assert!(req.headers().get(hyper::header::CONNECTION).is_none());
     }
@@ -567,7 +570,15 @@ mod tests {
     fn prepare_adds_forwarding_headers() {
         let req = make_request("GET", "/test");
         let addr: SocketAddr = "1.2.3.4:5678".parse().unwrap();
-        let req = prepare_request(req, &scheme(), &authority(), Some(addr), "https", XffMode::Append).unwrap();
+        let req = prepare_request(
+            req,
+            &scheme(),
+            &authority(),
+            Some(addr),
+            "https",
+            XffMode::Append,
+        )
+        .unwrap();
         assert_eq!(req.headers().get("X-Forwarded-For").unwrap(), "1.2.3.4");
         assert_eq!(req.headers().get("X-Real-IP").unwrap(), "1.2.3.4");
         assert_eq!(req.headers().get("X-Forwarded-Proto").unwrap(), "https");
@@ -576,14 +587,16 @@ mod tests {
     #[test]
     fn prepare_http_proto() {
         let req = make_request("GET", "/test");
-        let req = prepare_request(req, &scheme(), &authority(), None, "http", XffMode::Append).unwrap();
+        let req =
+            prepare_request(req, &scheme(), &authority(), None, "http", XffMode::Append).unwrap();
         assert_eq!(req.headers().get("X-Forwarded-Proto").unwrap(), "http");
     }
 
     #[test]
     fn prepare_no_forwarding_without_addr() {
         let req = make_request("GET", "/test");
-        let req = prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).unwrap();
+        let req =
+            prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).unwrap();
         assert!(req.headers().get("X-Forwarded-For").is_none());
         assert!(req.headers().get("X-Real-IP").is_none());
     }
@@ -592,14 +605,30 @@ mod tests {
     fn prepare_ipv6_forwarding() {
         let req = make_request("GET", "/test");
         let addr: SocketAddr = "[::1]:1234".parse().unwrap();
-        let req = prepare_request(req, &scheme(), &authority(), Some(addr), "https", XffMode::Append).unwrap();
+        let req = prepare_request(
+            req,
+            &scheme(),
+            &authority(),
+            Some(addr),
+            "https",
+            XffMode::Append,
+        )
+        .unwrap();
         assert_eq!(req.headers().get("X-Forwarded-For").unwrap(), "::1");
     }
 
     #[test]
     fn prepare_preserves_query_string() {
         let req = make_request("GET", "/search?q=hello&page=1");
-        let req = prepare_request(req, &scheme(), &authority2(), None, "https", XffMode::Append).unwrap();
+        let req = prepare_request(
+            req,
+            &scheme(),
+            &authority2(),
+            None,
+            "https",
+            XffMode::Append,
+        )
+        .unwrap();
         assert_eq!(
             req.uri().to_string(),
             "http://127.0.0.1:3000/search?q=hello&page=1"
@@ -613,7 +642,9 @@ mod tests {
             .uri("http://example.com")
             .body(())
             .unwrap();
-        assert!(prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).is_some());
+        assert!(
+            prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).is_some()
+        );
     }
 
     #[test]
@@ -653,9 +684,15 @@ mod tests {
     fn xff_append_preserves_inbound_chain() {
         let req = req_with_spoofed_xff("9.9.9.9");
         let addr: SocketAddr = "1.2.3.4:5000".parse().unwrap();
-        let req =
-            prepare_request(req, &scheme(), &authority(), Some(addr), "https", XffMode::Append)
-                .unwrap();
+        let req = prepare_request(
+            req,
+            &scheme(),
+            &authority(),
+            Some(addr),
+            "https",
+            XffMode::Append,
+        )
+        .unwrap();
         // Append: spoofed value is preserved as a separate header value;
         // our resolved IP is appended. Downstream reading XFF[0] would see
         // 9.9.9.9 — this is the documented foot-gun of `append` mode.
@@ -668,9 +705,15 @@ mod tests {
     fn xff_rewrite_strips_spoofed_and_emits_single_entry() {
         let req = req_with_spoofed_xff("9.9.9.9");
         let addr: SocketAddr = "1.2.3.4:5000".parse().unwrap();
-        let req =
-            prepare_request(req, &scheme(), &authority(), Some(addr), "https", XffMode::Rewrite)
-                .unwrap();
+        let req = prepare_request(
+            req,
+            &scheme(),
+            &authority(),
+            Some(addr),
+            "https",
+            XffMode::Rewrite,
+        )
+        .unwrap();
         // Rewrite: only ONE XFF entry, equal to the resolved IP. The
         // spoofed leftmost is gone — downstream apps cannot be tricked
         // into trusting attacker-controlled XFF[0].
@@ -683,9 +726,15 @@ mod tests {
     fn xff_rewrite_strips_multi_hop_spoofed_chain() {
         let req = req_with_spoofed_xff("evil1, evil2, evil3");
         let addr: SocketAddr = "203.0.113.7:443".parse().unwrap();
-        let req =
-            prepare_request(req, &scheme(), &authority(), Some(addr), "https", XffMode::Rewrite)
-                .unwrap();
+        let req = prepare_request(
+            req,
+            &scheme(),
+            &authority(),
+            Some(addr),
+            "https",
+            XffMode::Rewrite,
+        )
+        .unwrap();
         let vals = xff_values(&req);
         assert_eq!(vals, vec!["203.0.113.7".to_string()]);
     }
@@ -694,9 +743,15 @@ mod tests {
     fn xff_drop_emits_no_xff() {
         let req = req_with_spoofed_xff("9.9.9.9");
         let addr: SocketAddr = "1.2.3.4:5000".parse().unwrap();
-        let req =
-            prepare_request(req, &scheme(), &authority(), Some(addr), "https", XffMode::Drop)
-                .unwrap();
+        let req = prepare_request(
+            req,
+            &scheme(),
+            &authority(),
+            Some(addr),
+            "https",
+            XffMode::Drop,
+        )
+        .unwrap();
         // Drop: no XFF at all. X-Real-IP is still set so internal
         // deployments that rely on it for logging continue to work.
         assert!(req.headers().get("X-Forwarded-For").is_none());
@@ -726,9 +781,15 @@ mod tests {
             .body(())
             .unwrap();
         let addr: SocketAddr = "1.2.3.4:5000".parse().unwrap();
-        let req =
-            prepare_request(req, &scheme(), &authority(), Some(addr), "https", XffMode::Append)
-                .unwrap();
+        let req = prepare_request(
+            req,
+            &scheme(),
+            &authority(),
+            Some(addr),
+            "https",
+            XffMode::Append,
+        )
+        .unwrap();
         // The X-Real-IP value must be the resolved IP, not the spoofed one.
         let real_ip = req.headers().get("X-Real-IP").unwrap();
         assert_eq!(real_ip, "1.2.3.4");

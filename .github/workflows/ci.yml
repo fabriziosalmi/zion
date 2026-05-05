@@ -1,35 +1,198 @@
+# CI — fast feedback loop on every push/PR.
+#
+# Scope: format, lint, build, test, doc, MSRV. Cross-compile and supply-chain
+# scans live in dedicated workflows (release.yml, supply-chain.yml, codeql.yml)
+# so each surface fails independently and surfaces a clean status check.
+#
+# Hardening principles applied:
+#   - `--locked` everywhere — no silent Cargo.lock regeneration in CI.
+#   - Top-level `permissions: contents: read` (least privilege; jobs grant more).
+#   - Step actions pinned to major versions maintained by their owners
+#     (dtolnay, Swatinem) plus first-party `actions/*`. Renovate keeps these
+#     fresh (.github/dependabot.yml).
+#   - Concurrency cancels superseded runs on the same ref.
+
 name: CI
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [master]
   pull_request:
-    branches: [ "master" ]
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  RUSTDOCFLAGS: "-D warnings"
+  RUSTFLAGS: "-D warnings"
 
 jobs:
-  build:
+  # ── 1. Format — cheapest gate, runs first. ────────────────────────────────
+  fmt:
+    name: rustfmt
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake pkg-config build-essential libssl-dev
-        
-    - name: Setup Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        components: clippy, rustfmt
-        
-    - name: Rust Cache
-      uses: Swatinem/rust-cache@v2
-      
-    - name: Check Warnings (Clippy)
-      run: cargo clippy --all-targets --all-features -- -D warnings
-      
-    - name: Run Tests
-      run: cargo test --all-features
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # ── 2. Clippy across the feature matrix. Each combo can fail on its own. ──
+  clippy:
+    name: clippy (${{ matrix.flavor }})
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: default
+            features: ""
+          - flavor: all-features
+            features: "--all-features"
+          - flavor: acme
+            features: "--features acme"
+          - flavor: auth
+            features: "--features auth"
+          - flavor: http3
+            features: "--features http3"
+          - flavor: tui
+            features: "--features tui"
+          - flavor: init
+            features: "--features init"
+          - flavor: geo-eu
+            features: "--features geo-eu"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy-${{ matrix.flavor }}
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+      - name: clippy
+        run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
+
+  # ── 3. Tests, default + all features. Locked, deterministic. ──────────────
+  test:
+    name: test (${{ matrix.flavor }})
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: default
+            features: ""
+          - flavor: all-features
+            features: "--all-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.flavor }}
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+      - run: cargo test --locked ${{ matrix.features }} --no-fail-fast
+
+  # ── 4. Tests across host OS (smoke matrix — catches Win/Mac drift early). ─
+  test-os:
+    name: test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: [fmt]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.os }}
+      - name: Install cmake (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake
+      - run: cargo test --locked --no-fail-fast
+
+  # ── 5. MSRV — pinned to Cargo.toml `rust-version`. Independent toolchain. ─
+  # The MSRV is 1.82 for the *core* binary (default features). Opt-in features
+  # (acme, auth, init, http3) transitively pull `edition2024` crates that need
+  # Rust 1.85+; that is the documented contract in Cargo.toml. We verify the
+  # 1.82 floor against the no-default-features build only — feature builds are
+  # exercised by the regular clippy/test matrix on stable.
+  msrv:
+    name: MSRV (1.82.0, no-default-features)
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82.0
+      - name: Override rust-toolchain.toml for this job
+        # rust-toolchain.toml pins the *dev* compiler to 1.85; the dtolnay
+        # action only sets a default toolchain, so we drop the file for this
+        # one job to keep cargo from re-installing 1.85 on us.
+        run: rm -f rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+      # Don't run lints here — clippy on a pinned old toolchain produces noise
+      # unrelated to MSRV. We just need to know the project still *compiles*.
+      - run: cargo check --locked --no-default-features --all-targets
+
+  # ── 6. Docs build — fail on broken intra-doc links. ───────────────────────
+  doc:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: doc
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+      - run: cargo doc --locked --all-features --no-deps --document-private-items
+
+  # ── 7. Roll-up — single required check for branch protection. ─────────────
+  ci-success:
+    name: CI Success
+    if: ${{ always() }}
+    needs: [fmt, clippy, test, test-os, msrv, doc]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all jobs succeeded
+        run: |
+          if [[ "${{ needs.fmt.result }}"     != "success" ]] || \
+             [[ "${{ needs.clippy.result }}"  != "success" ]] || \
+             [[ "${{ needs.test.result }}"    != "success" ]] || \
+             [[ "${{ needs.test-os.result }}" != "success" ]] || \
+             [[ "${{ needs.msrv.result }}"    != "success" ]] || \
+             [[ "${{ needs.doc.result }}"     != "success" ]]; then
+            echo "::error::One or more CI jobs failed."
+            exit 1
+          fi
+          echo "All CI jobs passed."

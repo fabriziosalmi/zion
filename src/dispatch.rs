@@ -23,7 +23,12 @@ const CACHE_CONTROL_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 #[inline]
 fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
     let cfg = state.cfg();
-    security::check_rate_limit(cfg.rate_limit_rps, cfg.rate_limit_window, &state.rate_map, ip)
+    security::check_rate_limit(
+        cfg.rate_limit_rps,
+        cfg.rate_limit_window,
+        &state.rate_map,
+        ip,
+    )
 }
 
 pub(crate) async fn process_request(
@@ -113,10 +118,7 @@ pub(crate) async fn process_request(
             // Store classification as request extension for downstream logging
             req.extensions_mut().insert(ip_class);
             if cfg.sovereign_log_classification && ip_class != sovereign::IpClass::Unknown {
-                logging::info(
-                    "sovereign",
-                    &format!("ip={} class={}", client_ip, ip_class),
-                );
+                logging::info("sovereign", &format!("ip={client_ip} class={ip_class}"));
             }
         }
     }
@@ -383,10 +385,7 @@ pub(crate) async fn process_request(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 logging::warn(
                     "waf_shadow",
-                    &format!(
-                        "would_block=true source=uri reason={} path={}",
-                        reason, uri_str
-                    ),
+                    &format!("would_block=true source=uri reason={reason} path={uri_str}"),
                 );
                 // Fall through — shadow mode never denies the request.
             } else {
@@ -394,7 +393,7 @@ pub(crate) async fn process_request(
                     .waf_denied
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 metrics::METRICS.record_status(400);
-                logging::info("waf", &format!("URI denied: {} ({})", reason, uri_str));
+                logging::info("waf", &format!("URI denied: {reason} ({uri_str})"));
                 return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
             }
         }
@@ -1271,7 +1270,9 @@ mod tests {
                 for _ in 0..(i % 4) {
                     tokio::task::yield_now().await;
                 }
-                rx.wait_for(|v| *v).await.expect("waiter must observe completion");
+                rx.wait_for(|v| *v)
+                    .await
+                    .expect("waiter must observe completion");
             }));
         }
         // Yield a few times so some waiters have polled and parked, while

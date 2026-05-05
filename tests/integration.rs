@@ -69,7 +69,7 @@ fn get(path: &str) -> (u16, String, String) {
     curl(&[
         "-H",
         "Host: bench.local",
-        &format!("https://127.0.0.1:4433{}", path),
+        &format!("https://127.0.0.1:4433{path}"),
     ])
 }
 
@@ -84,7 +84,7 @@ fn post_json(path: &str, body: &str) -> (u16, String, String) {
         "Content-Type: application/json",
         "-d",
         body,
-        &format!("https://127.0.0.1:4433{}", path),
+        &format!("https://127.0.0.1:4433{path}"),
     ])
 }
 
@@ -239,8 +239,8 @@ integration_test!(t13_large_response_512kb, {
 
 integration_test!(t14_error_codes_forwarded, {
     for code in [200u16, 201, 400, 404, 500, 503] {
-        let (status, _, _) = get(&format!("/api/v1/status/{}", code));
-        assert_eq!(status, code, "upstream {} should be forwarded", code);
+        let (status, _, _) = get(&format!("/api/v1/status/{code}"));
+        assert_eq!(status, code, "upstream {code} should be forwarded");
     }
 });
 

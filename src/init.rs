@@ -83,7 +83,7 @@ pub fn run(opts: InitOpts) -> i32 {
         match build_interactive(opts, &detected, &style, &mut stderr) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("init: {}", e);
+                eprintln!("init: {e}");
                 return 2;
             }
         }
@@ -165,7 +165,7 @@ pub fn run_auto(opts: AutoOpts) -> Result<PathBuf, String> {
     use rcgen::generate_simple_self_signed;
 
     let dir = std::env::temp_dir().join(format!("zion-auto-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {:?}: {}", dir, e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {dir:?}: {e}"))?;
 
     let cert_path = dir.join("server.crt");
     let key_path = dir.join("server.key");
@@ -177,11 +177,10 @@ pub fn run_auto(opts: AutoOpts) -> Result<PathBuf, String> {
     if opts.hostname != "localhost" {
         sans.push("localhost".to_string());
     }
-    let cert = generate_simple_self_signed(sans).map_err(|e| format!("rcgen: {}", e))?;
-    std::fs::write(&cert_path, cert.cert.pem())
-        .map_err(|e| format!("write {:?}: {}", cert_path, e))?;
+    let cert = generate_simple_self_signed(sans).map_err(|e| format!("rcgen: {e}"))?;
+    std::fs::write(&cert_path, cert.cert.pem()).map_err(|e| format!("write {cert_path:?}: {e}"))?;
     std::fs::write(&key_path, cert.signing_key.serialize_pem())
-        .map_err(|e| format!("write {:?}: {}", key_path, e))?;
+        .map_err(|e| format!("write {key_path:?}: {e}"))?;
 
     let toml = format!(
         "# zion auto-mode — generated for one-shot dev / demo use.\n\
@@ -213,7 +212,7 @@ pub fn run_auto(opts: AutoOpts) -> Result<PathBuf, String> {
         key = key_path.display(),
         upstream = opts.upstream,
     );
-    std::fs::write(&config_path, &toml).map_err(|e| format!("write {:?}: {}", config_path, e))?;
+    std::fs::write(&config_path, &toml).map_err(|e| format!("write {config_path:?}: {e}"))?;
 
     // Set ZION_CONFIG so the existing daemon entry point picks it up
     // verbatim — no refactor of async_main needed.
@@ -403,7 +402,7 @@ fn unique_name(existing: &[(String, String)], proposed: &str) -> String {
         return proposed.to_string();
     }
     for i in 2..100 {
-        let candidate = format!("{}{}", proposed, i);
+        let candidate = format!("{proposed}{i}");
         if !existing.iter().any(|(n, _)| n == &candidate) {
             return candidate;
         }
@@ -424,7 +423,7 @@ fn port_default(opt: Option<u16>, fallback: u16) -> String {
 // ─────────────────────────────────────────────────────────────────────────
 
 fn prompt(label: &str, default: &str) -> std::io::Result<String> {
-    print!("  {} [{}]: ", label, default);
+    print!("  {label} [{default}]: ");
     std::io::stdout().flush().ok();
     let mut buf = String::new();
     std::io::stdin().read_line(&mut buf)?;
@@ -438,7 +437,7 @@ fn prompt(label: &str, default: &str) -> std::io::Result<String> {
 
 fn prompt_yn(label: &str, default_yes: bool) -> std::io::Result<bool> {
     let suffix = if default_yes { "Y/n" } else { "y/N" };
-    print!("  {} [{}]: ", label, suffix);
+    print!("  {label} [{suffix}]: ");
     std::io::stdout().flush().ok();
     let mut buf = String::new();
     std::io::stdin().read_line(&mut buf)?;
@@ -480,8 +479,7 @@ fn render_toml(r: &ResolvedInit) -> String {
     out.push_str("# ── Upstreams ────────────────────────────────────────────\n");
     for (name, target) in &r.upstreams {
         out.push_str(&format!(
-            "[upstream.{}]\nurl                = \"http://{}\"\nconnect_timeout_ms = 3000\nkeepalive          = 32\n\n",
-            name, target
+            "[upstream.{name}]\nurl                = \"http://{target}\"\nconnect_timeout_ms = 3000\nkeepalive          = 32\n\n"
         ));
     }
 
@@ -517,8 +515,7 @@ fn render_toml(r: &ResolvedInit) -> String {
     if split_api {
         let (api_name, _) = api_upstream.unwrap();
         out.push_str(&format!(
-            "[[route]]\npath     = \"/api/{{*rest}}\"\nupstream = \"{}\"\n",
-            api_name
+            "[[route]]\npath     = \"/api/{{*rest}}\"\nupstream = \"{api_name}\"\n"
         ));
         if waf_attaches {
             out.push_str("waf_profile = \"strict\"\n");
@@ -549,7 +546,7 @@ fn ymd_today() -> String {
     let d_val = doy - (153 * mp + 2) / 5 + 1;
     let m_val = if mp < 10 { mp + 3 } else { mp - 9 };
     let y_val = if m_val <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02}", y_val, m_val, d_val)
+    format!("{y_val:04}-{m_val:02}-{d_val:02}")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -578,13 +575,13 @@ fn generate_tls_cert(r: &ResolvedInit) -> CertOutcome {
 
     let cert = match generate_simple_self_signed(sans) {
         Ok(c) => c,
-        Err(e) => return CertOutcome::Failed(format!("rcgen: {}", e)),
+        Err(e) => return CertOutcome::Failed(format!("rcgen: {e}")),
     };
 
     // Ensure parent dir exists for both files.
     if let Some(parent) = Path::new(&r.cert_path).parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            return CertOutcome::Failed(format!("mkdir {:?}: {}", parent, e));
+            return CertOutcome::Failed(format!("mkdir {parent:?}: {e}"));
         }
     }
     if let Some(parent) = Path::new(&r.key_path).parent() {

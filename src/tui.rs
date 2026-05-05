@@ -575,7 +575,7 @@ fn draw_cache(f: &mut Frame, area: Rect, snap: &Snapshot) {
         )
         .gauge_style(Style::default().fg(Color::Green).bg(Color::Black))
         .percent(hit_ratio.min(100))
-        .label(format!("{}%", hit_ratio));
+        .label(format!("{hit_ratio}%"));
     f.render_widget(gauge, inner[1]);
 }
 
@@ -700,20 +700,14 @@ fn panel_titled(title: &str) -> Block<'_> {
 
 fn kv(key: &str, val: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!(" {:<14}", key),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!(" {key:<14}"), Style::default().fg(Color::DarkGray)),
         Span::raw(val.to_string()),
     ])
 }
 
 fn kv_styled(key: &str, val: &str, color: Color) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!(" {:<14}", key),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!(" {key:<14}"), Style::default().fg(Color::DarkGray)),
         Span::styled(
             val.to_string(),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -726,13 +720,10 @@ fn bar_line(label: &str, pct: u16, n: u64, color: Color) -> Line<'static> {
     let spark = "█".repeat(bars);
     let pad = " ".repeat(20 - bars);
     Line::from(vec![
-        Span::styled(
-            format!(" {:<5}", label),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!(" {label:<5}"), Style::default().fg(Color::DarkGray)),
         Span::styled(spark, Style::default().fg(color)),
         Span::raw(pad),
-        Span::raw(format!(" {:>3}%  ", pct)),
+        Span::raw(format!(" {pct:>3}%  ")),
         Span::styled(fmt_int(n), Style::default().fg(Color::DarkGray)),
     ])
 }
@@ -773,7 +764,7 @@ fn fmt_us(us: u64) -> String {
     } else if us >= 1_000 {
         format!("{:.1} ms", us as f64 / 1_000.0)
     } else {
-        format!("{} μs", us)
+        format!("{us} μs")
     }
 }
 
@@ -782,11 +773,11 @@ fn fmt_uptime(secs: u64) -> String {
     let m = (secs % 3600) / 60;
     let s = secs % 60;
     if h > 0 {
-        format!("{}h {:02}m", h, m)
+        format!("{h}h {m:02}m")
     } else if m > 0 {
-        format!("{}m {:02}s", m, s)
+        format!("{m}m {s:02}s")
     } else {
-        format!("{}s", s)
+        format!("{s}s")
     }
 }
 

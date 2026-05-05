@@ -235,11 +235,9 @@ impl ListenerSupervisor {
         // Bind succeeded. Spawn the new accept loop on the new listener.
         let (tx, rx) = watch::channel(false);
         let new_join = match kind {
-            ListenerKind::Http => tokio::spawn(run_http_accept_loop(
-                new_listener,
-                self.state.clone(),
-                rx,
-            )),
+            ListenerKind::Http => {
+                tokio::spawn(run_http_accept_loop(new_listener, self.state.clone(), rx))
+            }
             ListenerKind::Https => {
                 #[cfg(not(all(target_os = "linux", feature = "io-uring-accept")))]
                 {
@@ -330,10 +328,7 @@ impl ListenerKind {
 /// straight-line), but having it as a free function pins the contract
 /// in tests so a future refactor cannot silently regress it.
 #[cfg(test)]
-pub(crate) fn diff(
-    current: Option<SocketAddr>,
-    desired: Option<SocketAddr>,
-) -> ListenerDiff {
+pub(crate) fn diff(current: Option<SocketAddr>, desired: Option<SocketAddr>) -> ListenerDiff {
     match (current, desired) {
         (None, None) => ListenerDiff::Same,
         (Some(c), Some(d)) if c == d => ListenerDiff::Same,

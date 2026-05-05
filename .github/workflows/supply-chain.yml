@@ -1,0 +1,180 @@
+# Supply-chain — vulnerability, license, provenance, and unsafe-surface audit.
+#
+# Runs:
+#   - on every PR (advisory + license + bans)
+#   - daily at 06:00 UTC (catches NEW advisories on already-merged code —
+#     yesterday's clean lock-file is today's CVE)
+#   - on every release tag (full rebuild + SBOM upload to the release)
+#
+# Each job is independent and surfaces its own status check, so a license
+# regression and a new CVE produce *separate* signals — not one giant red.
+
+name: supply-chain
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC daily — catch newly-published advisories
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && !startsWith(github.ref, 'refs/tags/v') }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── 1. RustSec advisories — scheduled + on-PR. ────────────────────────────
+  audit:
+    name: cargo-audit (advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: audit
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+      - name: Run cargo-audit
+        # Fail on any unfixed advisory + any yanked crate.
+        run: cargo audit --deny warnings --deny unmaintained --deny unsound --deny yanked
+
+  # ── 2. cargo-deny: advisories+licenses+bans+sources, all in one. ──────────
+  deny:
+    name: cargo-deny (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        checks:
+          - advisories
+          - bans
+          - licenses
+          - sources
+    steps:
+      - uses: actions/checkout@v4
+      # The cargo-deny action does the install + cache for us, with the
+      # check name driving deny.toml's section filter.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
+          arguments: --all-features
+
+  # ── 3. cargo-vet — supply-chain trust audit (runs in advisory mode). ─────
+  # `vet` requires a one-time `cargo vet init` to populate supply-chain/
+  # config files. Until that lands, we run in `--locked` mode and treat the
+  # job as informational (continue-on-error). Promote to required once the
+  # audit baseline exists in supply-chain/.
+  vet:
+    name: cargo-vet
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: vet
+      - name: Install cargo-vet
+        run: cargo install --locked cargo-vet
+      - name: Check vet baseline exists
+        id: baseline
+        run: |
+          if [ -f supply-chain/config.toml ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No supply-chain/config.toml yet — run 'cargo vet init' to bootstrap."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run cargo-vet
+        if: steps.baseline.outputs.exists == 'true'
+        run: cargo vet --locked
+
+  # ── 4. cargo-geiger — quantify unsafe surface (informational signal). ────
+  geiger:
+    name: cargo-geiger (unsafe surface)
+    runs-on: ubuntu-latest
+    continue-on-error: true   # geiger is a *report*, not a gate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: geiger
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+      - name: Install cargo-geiger
+        run: cargo install --locked cargo-geiger
+      - name: Geiger report
+        run: cargo geiger --all-features --output-format Json > geiger.json || true
+      - name: Upload geiger report
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-geiger-report
+          path: geiger.json
+          retention-days: 30
+
+  # ── 5. CycloneDX SBOM — on master + release tags. Attached to releases. ──
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sbom
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx
+      - name: Generate SBOM (JSON, all features)
+        run: |
+          cargo cyclonedx --all --format json --override-filename zion-sbom
+          # Sanity check — the file must exist and be non-empty.
+          test -s zion-sbom.cdx.json
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: "*.cdx.json"
+          retention-days: 90
+
+  # ── 6. OSSF Scorecard — repo-level supply-chain posture grade. ───────────
+  scorecard:
+    name: OSSF Scorecard
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write          # for SARIF + signed results upload
+      security-events: write   # to publish results to the Security tab
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: true
+      - name: Upload scorecard SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: scorecard.sarif

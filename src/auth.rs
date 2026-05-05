@@ -151,9 +151,9 @@ pub fn validate_token(token: &str, profile: &ResolvedAuthProfile) -> Result<Clai
 
         let jwk = jwk_set
             .find(&kid)
-            .ok_or_else(|| AuthError::InvalidToken(format!("Key ID {} not found in JWKS", kid)))?;
+            .ok_or_else(|| AuthError::InvalidToken(format!("Key ID {kid} not found in JWKS")))?;
         decoding_key_owned = DecodingKey::from_jwk(jwk)
-            .map_err(|e| AuthError::InvalidToken(format!("Failed to parse JWK: {}", e)))?;
+            .map_err(|e| AuthError::InvalidToken(format!("Failed to parse JWK: {e}")))?;
         &decoding_key_owned
     } else {
         return Err(AuthError::InvalidToken(
@@ -192,7 +192,7 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> ResolvedAuthProfile {
         "RS512" => Algorithm::RS512,
         "ES256" => Algorithm::ES256,
         "ES384" => Algorithm::ES384,
-        other => panic!("Unsupported JWT algorithm: {}", other),
+        other => panic!("Unsupported JWT algorithm: {other}"),
     };
 
     let mut decoding_key = None;
@@ -213,7 +213,7 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> ResolvedAuthProfile {
                     Err(e) => {
                         crate::logging::error(
                             "auth",
-                            &format!("Failed to build JWKS HTTP client: {}, retrying in 5s", e),
+                            &format!("Failed to build JWKS HTTP client: {e}, retrying in 5s"),
                         );
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     }
@@ -228,14 +228,14 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> ResolvedAuthProfile {
                             key_store.store(Some(Arc::new(jwks)));
                             crate::logging::info(
                                 "auth",
-                                &format!("JWKS successfully loaded from {}", url),
+                                &format!("JWKS successfully loaded from {url}"),
                             );
                             backoff_secs = 3600; // success: normal 1h refresh cycle
                         }
                         Err(e) => {
                             crate::logging::error(
                                 "auth",
-                                &format!("Failed to parse JWKS JSON: {}", e),
+                                &format!("Failed to parse JWKS JSON: {e}"),
                             );
                             if backoff_secs >= 3600 {
                                 backoff_secs = 5;
@@ -251,8 +251,7 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> ResolvedAuthProfile {
                         crate::logging::error(
                             "auth",
                             &format!(
-                                "Failed to fetch JWKS from {}: {}, retry in {}s",
-                                url, e, backoff_secs
+                                "Failed to fetch JWKS from {url}: {e}, retry in {backoff_secs}s"
                             ),
                         );
                         backoff_secs = (backoff_secs * 2).min(300); // cap failure backoff at 5min

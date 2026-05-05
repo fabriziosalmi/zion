@@ -1,0 +1,14 @@
+# Pinned toolchain for reproducible local + CI builds.
+#
+# - `channel` is the *recommended dev/CI* compiler — the one we actually build
+#   with by default. Bumped deliberately (never floating).
+# - MSRV (the *minimum* supported, declared in Cargo.toml `rust-version`)
+#   is 1.82 for the core binary (default features). Opt-in features (acme,
+#   auth, init, http3) currently require Rust 1.88+ because of transitive
+#   dependencies (`time`, `darling`, `icu_*`) that bumped their own MSRV.
+#   A dedicated CI job (.github/workflows/ci.yml :: msrv) verifies the 1.82
+#   floor against `--no-default-features`. The two floors evolve independently.
+[toolchain]
+channel = "1.88.0"
+components = ["rustfmt", "clippy", "rust-src"]
+profile = "minimal"

@@ -118,7 +118,7 @@ fn check_fd_limit() -> Check {
         }
         let soft = lim.rlim_cur;
         let hard = lim.rlim_max;
-        let detail = format!("soft={} hard={}", soft, hard);
+        let detail = format!("soft={soft} hard={hard}");
         if soft < 1024 {
             Check::fail(
                 "fd limit",
@@ -149,16 +149,16 @@ fn check_privileged_port_443() -> Check {
 }
 
 fn check_can_bind(port: u16, name: &'static str) -> Check {
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
     match TcpListener::bind(&addr) {
         Ok(l) => {
             // Drop immediately so we don't keep the port reserved.
             drop(l);
-            Check::ok(name, format!("can bind {}", addr))
+            Check::ok(name, format!("can bind {addr}"))
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Check::warn(
             name,
-            format!("cannot bind {}: permission denied", addr),
+            format!("cannot bind {addr}: permission denied"),
             "run as root, or `setcap cap_net_bind_service+ep ./zion` (Linux)",
         ),
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
@@ -166,11 +166,11 @@ fn check_can_bind(port: u16, name: &'static str) -> Check {
             // but worth noting.
             Check::warn(
                 name,
-                format!("{} is already in use", addr),
+                format!("{addr} is already in use"),
                 "stop the conflicting service or pick a different port",
             )
         }
-        Err(e) => Check::warn(name, format!("bind error: {}", e), "investigate"),
+        Err(e) => Check::warn(name, format!("bind error: {e}"), "investigate"),
     }
 }
 
@@ -288,7 +288,7 @@ fn check_aes_calibration(p: &crate::bootstrap::Platform) -> Check {
         ),
         Some(kops) if kops < 50 => Check::warn(
             "aes calibration",
-            format!("{} K seal/s/core — implausibly low", kops),
+            format!("{kops} K seal/s/core — implausibly low"),
             "investigate aws-lc-rs build; expected ≥ 100 K/s/core on commodity hardware",
         ),
         Some(kops) => Check::ok(

@@ -1,0 +1,23 @@
+# cargo-audit policy. Mirror of the `[advisories]` section in deny.toml —
+# both tools must agree, otherwise a config drift would let an advisory slip
+# through one gate and not the other. Update both files together.
+#
+# Run locally:
+#   cargo install --locked cargo-audit
+#   cargo audit --deny warnings --deny unmaintained --deny unsound --deny yanked
+
+[advisories]
+ignore = [
+    # ── Unmaintained transitive deps (no safe upgrade currently available) ──
+    "RUSTSEC-2024-0384",  # `instant` unmaintained (transitive only) — review by 2026-09-01
+    "RUSTSEC-2024-0436",  # `paste` unmaintained (proc-macro, no runtime surface) — review by 2026-09-01
+    # ── Direct dep needing API migration ──
+    "RUSTSEC-2025-0134",  # `rustls-pemfile` archived; migrate to rustls-pki-types::pem — review by 2026-08-01
+    # ── Soundness issue in transitive dep (TUI feature only) ──
+    "RUSTSEC-2026-0002",  # `lru` IterMut Stacked Borrows; tracked via `ratatui` upstream — review by 2026-08-01
+]
+
+# `informational` advisories (notice/unmaintained) are surfaced as warnings.
+# `severity = "low"` would let lows through silently; we want every signal.
+informational_warnings = ["unmaintained", "unsound", "notice"]
+severity_threshold = "none"

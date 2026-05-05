@@ -89,7 +89,7 @@ fn default_rate_window() -> u64 {
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct CorsConfig {
     /// Allowed origins. Empty = CORS disabled (default).
-    /// Use ["*"] for any origin, or ["https://app.example.com"]
+    /// Use `["*"]` for any origin, or `["https://app.example.com"]`.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
     /// Additional allowed headers beyond the CORS safelisted ones.
@@ -436,9 +436,9 @@ pub struct ResolvedRoute {
 // ============================================================================
 
 pub fn load_config(path: &str) -> Result<ZionConfig, String> {
-    let raw = fs::read_to_string(path).map_err(|e| format!("Cannot read {}: {}", path, e))?;
+    let raw = fs::read_to_string(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
     let config: ZionConfig =
-        toml::from_str(&raw).map_err(|e| format!("Invalid TOML in {}: {}", path, e))?;
+        toml::from_str(&raw).map_err(|e| format!("Invalid TOML in {path}: {e}"))?;
     validate_config(&config, path)?;
     Ok(config)
 }
@@ -500,7 +500,7 @@ fn validate_config(config: &ZionConfig, path: &str) -> Result<(), String> {
             ));
         }
         if sni.server_name.is_empty() {
-            errors.push(format!("tls.sni[{}] server_name is empty", i));
+            errors.push(format!("tls.sni[{i}] server_name is empty"));
         }
     }
 
@@ -555,17 +555,17 @@ fn validate_config(config: &ZionConfig, path: &str) -> Result<(), String> {
     for (name, up) in &config.upstream {
         let all_urls = up.get_urls();
         if all_urls.is_empty() {
-            errors.push(format!("upstream '{}' must have at least one url", name));
+            errors.push(format!("upstream '{name}' must have at least one url"));
         }
         for u in all_urls {
             if u.parse::<hyper::Uri>().is_err() {
-                errors.push(format!("upstream.{}.url '{}' is not a valid URL", name, u));
+                errors.push(format!("upstream.{name}.url '{u}' is not a valid URL"));
             }
         }
     }
     for (name, url) in &config.upstreams {
         if url.parse::<hyper::Uri>().is_err() {
-            errors.push(format!("upstreams.{} '{}' is not a valid URL", name, url));
+            errors.push(format!("upstreams.{name} '{url}' is not a valid URL"));
         }
     }
 
@@ -581,7 +581,7 @@ fn validate_config(config: &ZionConfig, path: &str) -> Result<(), String> {
     }
 }
 
-/// Resolve upstream name to URLs. Checks new [upstream.X] first, then legacy [upstreams].
+/// Resolve upstream name to URLs. Checks new `[upstream.X]` first, then legacy `[upstreams]`.
 /// Returns Err if the upstream name is not defined — callers propagate the
 /// error to reject the config rather than panicking (important during hot-reload).
 fn resolve_upstream(config: &ZionConfig, name: &str) -> Result<Vec<String>, String> {
@@ -592,8 +592,7 @@ fn resolve_upstream(config: &ZionConfig, name: &str) -> Result<Vec<String>, Stri
         return Ok(vec![url.clone()]);
     }
     Err(format!(
-        "Unknown upstream '{}' — define it in [upstream.{}] or [upstreams]",
-        name, name
+        "Unknown upstream '{name}' — define it in [upstream.{name}] or [upstreams]"
     ))
 }
 
@@ -776,7 +775,7 @@ fn print_routes_table(routes: &[RouteConfig]) {
             if tags.is_empty() {
                 String::new()
             } else {
-                format!("    {}", tags)
+                format!("    {tags}")
             },
         );
     }
@@ -1282,7 +1281,7 @@ upstream = "nonexistent"
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
         let err = build_router(&config).unwrap_err();
-        assert!(err.contains("Unknown upstream"), "got: {}", err);
+        assert!(err.contains("Unknown upstream"), "got: {err}");
     }
 
     #[test]
@@ -1303,7 +1302,7 @@ waf_profile = "nonexistent"
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
         let err = build_router(&config).unwrap_err();
-        assert!(err.contains("Unknown waf_profile"), "got: {}", err);
+        assert!(err.contains("Unknown waf_profile"), "got: {err}");
     }
 
     #[test]
@@ -1324,7 +1323,7 @@ cache_profile = "nonexistent"
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
         let err = build_router(&config).unwrap_err();
-        assert!(err.contains("Unknown cache_profile"), "got: {}", err);
+        assert!(err.contains("Unknown cache_profile"), "got: {err}");
     }
 
     #[test]

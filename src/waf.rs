@@ -300,9 +300,8 @@ fn balanced_scanner() -> &'static AhoCorasick {
 
 fn aggressive_scanner() -> &'static AhoCorasick {
     AGGRESSIVE_SCANNER.get_or_init(|| {
-        let mut all: Vec<&str> = Vec::with_capacity(
-            BALANCED_PATTERNS.len() + AGGRESSIVE_EXTRA_PATTERNS.len(),
-        );
+        let mut all: Vec<&str> =
+            Vec::with_capacity(BALANCED_PATTERNS.len() + AGGRESSIVE_EXTRA_PATTERNS.len());
         all.extend_from_slice(BALANCED_PATTERNS);
         all.extend_from_slice(AGGRESSIVE_EXTRA_PATTERNS);
         build_scanner(&all)
@@ -1121,11 +1120,15 @@ mod tests {
         // that aggressive mode picks it up; balanced will not (covered by
         // `balanced_allows_quadruple_url_encoded_xss` below).
         let body = br#"{"html":"%2525253Cscript%2525253Ealert(1)"}"#;
-        let result = validate_request("POST", Some("application/json"), body, &aggressive_profile());
+        let result = validate_request(
+            "POST",
+            Some("application/json"),
+            body,
+            &aggressive_profile(),
+        );
         assert!(
             matches!(result, WafVerdict::Deny(_)),
-            "expected Deny, got {:?}",
-            result
+            "expected Deny, got {result:?}"
         );
     }
 
@@ -1186,7 +1189,10 @@ mod tests {
     fn uri_denies_encoded_traversal_pct() {
         // %2e%2e%2f is literally in the pattern list, so matches on raw scan
         assert_eq!(
-            validate_uri("/api/files?path=%2e%2e%2f%2e%2e%2f%2e%2e%2fvar/log", WafMode::Balanced),
+            validate_uri(
+                "/api/files?path=%2e%2e%2f%2e%2e%2f%2e%2e%2fvar/log",
+                WafMode::Balanced
+            ),
             WafVerdict::Deny("injection pattern in URI")
         );
     }
@@ -1245,7 +1251,7 @@ mod tests {
     fn allows_at_exact_max_depth() {
         let mut json = String::from("1");
         for _ in 0..10 {
-            json = format!(r#"{{"a":{}}}"#, json);
+            json = format!(r#"{{"a":{json}}}"#);
         }
         assert_eq!(
             validate_request(
@@ -1262,7 +1268,7 @@ mod tests {
     fn denies_one_past_max_depth() {
         let mut json = String::from("1");
         for _ in 0..11 {
-            json = format!(r#"{{"a":{}}}"#, json);
+            json = format!(r#"{{"a":{json}}}"#);
         }
         assert_eq!(
             validate_request(
@@ -1278,7 +1284,7 @@ mod tests {
     #[test]
     fn denies_long_string_value() {
         let long = "x".repeat(1_048_577);
-        let body = format!(r#"{{"key":"{}"}}"#, long);
+        let body = format!(r#"{{"key":"{long}"}}"#);
         assert_eq!(
             validate_request(
                 "POST",
@@ -1293,7 +1299,7 @@ mod tests {
     #[test]
     fn denies_long_key_name() {
         let long_key = "k".repeat(1_048_577);
-        let body = format!(r#"{{"{}":"value"}}"#, long_key);
+        let body = format!(r#"{{"{long_key}":"value"}}"#);
         assert_eq!(
             validate_request(
                 "POST",
@@ -1309,7 +1315,7 @@ mod tests {
     fn denies_deeply_nested_array() {
         let mut json = String::from("1");
         for _ in 0..12 {
-            json = format!("[{}]", json);
+            json = format!("[{json}]");
         }
         assert_eq!(
             validate_request(
@@ -1431,7 +1437,7 @@ mod tests {
         let data =
             b"This is a normal English text with reasonable entropy levels for testing purposes.";
         let e = shannon_entropy(data);
-        assert!(e > 3.0 && e < 5.5, "entropy was {}", e);
+        assert!(e > 3.0 && e < 5.5, "entropy was {e}");
     }
 
     // ── Plus-to-space evasion ──
@@ -1545,7 +1551,12 @@ mod tests {
         // any code-bearing payload). Test pinned under aggressive mode.
         let body = br#"{"html":"<div oninput=alert(1)>"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny("injection pattern detected")
         );
     }
@@ -1574,7 +1585,12 @@ mod tests {
         // doc snippets, code-paste APIs).
         let body = br#"{"code":"element.innerHTML = userInput"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny("injection pattern detected")
         );
     }
@@ -1585,7 +1601,12 @@ mod tests {
         // legit strings like `"$gt-23"`. Aggressive mode pins the catch.
         let body = br#"{"username":{"$gt":""},"password":{"$gt":""}}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny("injection pattern detected")
         );
     }
@@ -1594,7 +1615,12 @@ mod tests {
     fn aggressive_denies_nosql_injection_where() {
         let body = br#"{"$where":"this.password == 'admin'"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny("injection pattern detected")
         );
     }
@@ -1603,7 +1629,12 @@ mod tests {
     fn aggressive_denies_nosql_injection_regex() {
         let body = br#"{"username":{"$regex":".*"}}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny("injection pattern detected")
         );
     }
@@ -1614,7 +1645,12 @@ mod tests {
         // also appear verbatim in any JVM stack trace forwarded by APMs.
         let body = br#"{"cmd":"Runtime.getRuntime().exec('id')"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny("injection pattern detected")
         );
     }
@@ -1623,7 +1659,12 @@ mod tests {
     fn aggressive_denies_python_deserialization() {
         let body = br#"{"data":"pickle.loads(base64.b64decode(payload))"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny("injection pattern detected")
         );
     }
@@ -1632,7 +1673,12 @@ mod tests {
     fn aggressive_denies_python_os_system() {
         let body = br#"{"cmd":"os.system('rm -rf /')"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny("injection pattern detected")
         );
     }
@@ -1663,7 +1709,12 @@ mod tests {
         // what fires, and that lives in AGGRESSIVE.
         let body = br#"{"query":"{ __schema { types { name } } }"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny("injection pattern detected")
         );
     }
@@ -1789,7 +1840,8 @@ mod tests {
     fn balanced_allows_eval_and_documentcookie_in_docs() {
         // MDN-style snippet posted to a docs API — would have been blocked
         // by `eval(` and `document.cookie`, both now aggressive-only.
-        let body = br#"{"snippet":"never trust eval(input) and never read document.cookie directly"}"#;
+        let body =
+            br#"{"snippet":"never trust eval(input) and never read document.cookie directly"}"#;
         assert_eq!(
             validate_request("POST", Some("application/json"), body, &strict_profile()),
             WafVerdict::Allow
@@ -1812,7 +1864,12 @@ mod tests {
         // Inverse of above — confirms aggressive mode keeps detection.
         let body = br#"{"username":{"$gt":""}}"#;
         assert!(matches!(
-            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny(_)
         ));
     }
@@ -1927,8 +1984,7 @@ mod tests {
         assert_eq!(
             v,
             WafVerdict::Deny("suspicious payload entropy"),
-            "balanced 6.5 threshold must flag near-random payloads, got {:?}",
-            v
+            "balanced 6.5 threshold must flag near-random payloads, got {v:?}"
         );
     }
 
@@ -1973,7 +2029,7 @@ mod tests {
             if i > 0 {
                 body.push(b',');
             }
-            body.extend_from_slice(format!("{}", i).as_bytes());
+            body.extend_from_slice(format!("{i}").as_bytes());
         }
         body.extend_from_slice(b"]}");
         // Pad to >= 256 bytes with zero-entropy structural junk OUTSIDE
@@ -1999,8 +2055,7 @@ mod tests {
         let e_b64 = shannon_entropy_json_strings(&base64_body, 128).unwrap();
         assert!(
             e_b64 < 6.5,
-            "base64 entropy should be below 6.5 (got {})",
-            e_b64
+            "base64 entropy should be below 6.5 (got {e_b64})"
         );
 
         let random = pseudo_random(1024, 0x1234_5678);
@@ -2012,8 +2067,7 @@ mod tests {
         let e_rand = shannon_entropy_json_strings(&rand_body, 128).unwrap();
         assert!(
             e_rand > 7.0,
-            "random-byte entropy should be above 7.0 (got {})",
-            e_rand
+            "random-byte entropy should be above 7.0 (got {e_rand})"
         );
     }
 

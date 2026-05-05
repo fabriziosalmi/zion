@@ -6,7 +6,7 @@
 //!
 //! Layout: same as data_ita.rs — sorted CidrEntry array.
 
-use super::{CidrEntry, IpClass, cidr_range};
+use super::{cidr_range, CidrEntry, IpClass};
 
 /// EU CIDR ranges — sorted by start IP (ascending).
 /// Phase 2: will be populated by CI from RIPE NCC data.
@@ -15,12 +15,11 @@ pub static RANGES: &[CidrEntry] = &[
     // EU INSTITUTIONAL (seed — Phase 2 will expand)
     // ═══════════════════════════════════════════════════════════════
     // GÉANT (European Research Network)
-    cr(62, 40, 96, 0, 19, IpClass::GovEu),        // 62.40.96.0/19 — GÉANT backbone
-
+    cr(62, 40, 96, 0, 19, IpClass::GovEu), // 62.40.96.0/19 — GÉANT backbone
     // European Commission / EU Council (Brussels)
-    cr(147, 67, 0, 0, 16, IpClass::GovEu),        // 147.67.0.0/16 — EU institutions
-    cr(158, 167, 0, 0, 16, IpClass::GovEu),       // 158.167.0.0/16 — European Commission
-    cr(158, 169, 0, 0, 16, IpClass::GovEu),       // 158.169.0.0/16 — EU Parliament
+    cr(147, 67, 0, 0, 16, IpClass::GovEu), // 147.67.0.0/16 — EU institutions
+    cr(158, 167, 0, 0, 16, IpClass::GovEu), // 158.167.0.0/16 — European Commission
+    cr(158, 169, 0, 0, 16, IpClass::GovEu), // 158.169.0.0/16 — EU Parliament
 ];
 
 /// Const constructor for CidrEntry.

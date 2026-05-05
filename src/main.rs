@@ -31,14 +31,14 @@ mod proxy;
 mod quic;
 mod reload;
 mod security;
+#[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+mod sovereign;
 mod tls;
 #[cfg(feature = "tui")]
 mod tui;
 #[cfg(all(target_os = "linux", feature = "io-uring-accept"))]
 mod uring;
 mod waf;
-#[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
-mod sovereign;
 
 // ── Global allocator: mimalloc ──────────────────────────────────
 // ~2-3x faster than system malloc on small allocations.
@@ -156,9 +156,7 @@ impl ResolvedAppConfig {
     /// fields take harmless defaults — they're not exercised by the
     /// rebuild() merge logic.
     #[cfg(test)]
-    pub(crate) fn test_with_health(
-        health_map: health::HealthMap,
-    ) -> Self {
+    pub(crate) fn test_with_health(health_map: health::HealthMap) -> Self {
         Self {
             router: matchit::Router::new(),
             health_map,
@@ -187,7 +185,7 @@ impl ResolvedAppConfig {
     /// propagates the error cleanly.
     fn build(config: &config::ZionConfig) -> Self {
         let router = config::build_router(config)
-            .unwrap_or_else(|e| panic!("fatal: cannot build router at boot: {}", e));
+            .unwrap_or_else(|e| panic!("fatal: cannot build router at boot: {e}"));
 
         // Health map: one entry per upstream URL referenced by any route.
         // The same URL can appear in many routes — dedup via FnvHashMap.
@@ -211,8 +209,7 @@ impl ResolvedAppConfig {
         }
         let health_map = Arc::new(map);
 
-        let trusted_proxies =
-            security::TrustedProxies::from_config(&config.server.trusted_proxies);
+        let trusted_proxies = security::TrustedProxies::from_config(&config.server.trusted_proxies);
 
         // Parse the configured XFF policy. Unknown values fall back to
         // Append (silent fallback would weaken upstream IP integrity).
@@ -259,7 +256,11 @@ impl ResolvedAppConfig {
         let (sovereign_enabled, sovereign_log_classification) = {
             let sov = &config.sovereign;
             if sov.enabled {
-                let region_label = if cfg!(feature = "geo-eu") { "eu" } else { "ita" };
+                let region_label = if cfg!(feature = "geo-eu") {
+                    "eu"
+                } else {
+                    "ita"
+                };
                 logging::info(
                     "sovereign",
                     &format!(
@@ -313,7 +314,7 @@ struct AppState {
     /// counters are about the IP's behaviour, not about the config.
     rate_map: Arc<dashmap::DashMap<std::net::IpAddr, RateEntry>>,
     /// Singleflight: coalesce concurrent cache misses for the same key.
-    /// First request fetches from upstream and inserts a watch::Sender<bool>;
+    /// First request fetches from upstream and inserts a `watch::Sender<bool>`;
     /// subsequent requests subscribe and await `true`. Watch (vs Notify) is
     /// race-free: `wait_for` inspects the current value at first poll, so
     /// even if the fetcher completes between our get() and our .await we
@@ -385,7 +386,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("  zion auto-mode: ephemeral config at {}", path.display());
                 }
                 Err(e) => {
-                    eprintln!("zion auto: {}", e);
+                    eprintln!("zion auto: {e}");
                     std::process::exit(2);
                 }
             }
@@ -400,7 +401,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         cli::Command::Unknown(s) => {
-            eprintln!("zion: unknown subcommand '{}'\n", s);
+            eprintln!("zion: unknown subcommand '{s}'\n");
             cli::print_help();
             std::process::exit(1);
         }
@@ -477,16 +478,16 @@ async fn async_main(
 
     // 1. Load configuration
     let config_path = std::env::var("ZION_CONFIG").unwrap_or_else(|_| "zion.toml".to_string());
-    let config = config::load_config(&config_path).map_err(|e| format!("FATAL: {}", e))?;
+    let config = config::load_config(&config_path).map_err(|e| format!("FATAL: {e}"))?;
     logging::init(&config.server.log_format);
-    logging::info("config", &format!("loaded from {}", config_path));
+    logging::info("config", &format!("loaded from {config_path}"));
 
     // 2. (config-derived state is now built later via ResolvedAppConfig::build —
     //  the standalone `let router = …` step was removed in favour of a single
     //  build entry point.)
 
     // 3. Load initial TLS — build acceptor once, cache via ArcSwap
-    let initial_tls = tls::load_tls_config(&config.tls).map_err(|e| format!("FATAL: {}", e))?;
+    let initial_tls = tls::load_tls_config(&config.tls).map_err(|e| format!("FATAL: {e}"))?;
     let acceptor = TlsAcceptor::from(Arc::new(initial_tls));
     let tls_acceptor_store = Arc::new(ArcSwap::from_pointee(acceptor));
     eprintln!(
@@ -701,14 +702,13 @@ async fn async_main(
                             logging::warn(
                                 "health",
                                 &format!(
-                                    "upstream {} is DOWN — requests to this upstream will return 503 until it recovers",
-                                    url
+                                    "upstream {url} is DOWN — requests to this upstream will return 503 until it recovers"
                                 ),
                             );
                         } else if !was_healthy && healthy {
                             logging::info(
                                 "health",
-                                &format!("upstream {} is UP ({}us)", url, lat),
+                                &format!("upstream {url} is UP ({lat}us)"),
                             );
                         }
                     });
@@ -766,21 +766,18 @@ async fn async_main(
     let http_initial: Option<(SocketAddr, tokio::net::TcpListener)> =
         match net::bind_with_reuseport(http_addr) {
             Ok(l) => {
-                eprintln!("  listening HTTP  on {}", http_addr);
+                eprintln!("  listening HTTP  on {http_addr}");
                 Some((http_addr, l))
             }
             Err(e) => {
-                eprintln!(
-                    "  warning: HTTP listener on {} unavailable: {}",
-                    http_addr, e
-                );
+                eprintln!("  warning: HTTP listener on {http_addr} unavailable: {e}");
                 None
             }
         };
 
     let https_addr: SocketAddr = config.server.listen_https.parse()?;
     let https_listener = net::bind_with_reuseport(https_addr)?;
-    eprintln!("  listening HTTPS on {}", https_addr);
+    eprintln!("  listening HTTPS on {https_addr}");
 
     // io_uring multishot accept on Linux (one syscall for N connections).
     // The uring task is bound to the listener's fd at spawn time and the
@@ -831,14 +828,14 @@ async fn async_main(
     // HTTPS (the uring task above already drives the accept loop on the
     // initial listener for the lifetime of the process).
     let supervisor = listener::ListenerSupervisor::new(state.clone(), http_initial, https_initial);
-    let supervisor_handle = supervisor.spawn_reconciler(
-        state.config.clone(),
-        config_change_rx,
-        super_shutdown_rx,
-    );
+    let supervisor_handle =
+        supervisor.spawn_reconciler(state.config.clone(), config_change_rx, super_shutdown_rx);
 
     shutdown_signal().await;
-    logging::info("shutdown", "signal received, draining in-flight connections...");
+    logging::info(
+        "shutdown",
+        "signal received, draining in-flight connections...",
+    );
     // Tell the supervisor to retire all listeners. Its accept loops stop
     // on the next iteration; spawned per-connection tasks continue and
     // are drained by the semaphore wait below.
@@ -932,7 +929,7 @@ async fn run_http_accept_loop(
                     Err(e) => {
                         let now = std::time::Instant::now();
                         if now.duration_since(last_err_log).as_secs() >= 1 {
-                            eprintln!("  http accept error: {}", e);
+                            eprintln!("  http accept error: {e}");
                             last_err_log = now;
                         }
                         continue;
@@ -995,7 +992,7 @@ async fn run_https_accept_loop(
                     Err(e) => {
                         let now = std::time::Instant::now();
                         if now.duration_since(last_err_log).as_secs() >= 1 {
-                            eprintln!("  https accept error: {}", e);
+                            eprintln!("  https accept error: {e}");
                             last_err_log = now;
                         }
                         continue;
@@ -1280,7 +1277,7 @@ async fn handle_http(
         path_and_query
     };
 
-    let redirect_uri = format!("https://{}{}", host, safe_path);
+    let redirect_uri = format!("https://{host}{safe_path}");
     Ok(Response::builder()
         .status(StatusCode::MOVED_PERMANENTLY)
         .header(hyper::header::LOCATION, redirect_uri)
@@ -1295,7 +1292,12 @@ async fn handle_http(
 /// Lock-free per-IP rate limiter — delegates to security module.
 fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
     let cfg = state.cfg();
-    security::check_rate_limit(cfg.rate_limit_rps, cfg.rate_limit_window, &state.rate_map, ip)
+    security::check_rate_limit(
+        cfg.rate_limit_rps,
+        cfg.rate_limit_window,
+        &state.rate_map,
+        ip,
+    )
 }
 
 /// Inject security headers — delegates to security module.

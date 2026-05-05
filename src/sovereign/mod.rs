@@ -255,13 +255,11 @@ mod tests {
 
     #[test]
     fn lookup_match() {
-        let ranges = &[
-            CidrEntry {
-                start: 0x0A000000,
-                end: 0x0AFFFFFF,
-                class: IpClass::ResidentialIta,
-            },
-        ];
+        let ranges = &[CidrEntry {
+            start: 0x0A000000,
+            end: 0x0AFFFFFF,
+            class: IpClass::ResidentialIta,
+        }];
         assert_eq!(lookup(0x0A000001, ranges), IpClass::ResidentialIta);
         assert_eq!(lookup(0x0AFFFFFF, ranges), IpClass::ResidentialIta);
         assert_eq!(lookup(0x0B000000, ranges), IpClass::Unknown);

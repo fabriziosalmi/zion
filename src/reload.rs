@@ -158,7 +158,7 @@ pub(crate) fn spawn_config_watcher(
             Err(e) => {
                 logging::warn(
                     "config_watcher",
-                    &format!("filesystem watcher unavailable: {}", e),
+                    &format!("filesystem watcher unavailable: {e}"),
                 );
                 return;
             }
@@ -183,10 +183,9 @@ pub(crate) fn spawn_config_watcher(
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             let path = config_path.clone();
-            let parsed = tokio::task::spawn_blocking(move || {
-                config::load_config(&path.to_string_lossy())
-            })
-            .await;
+            let parsed =
+                tokio::task::spawn_blocking(move || config::load_config(&path.to_string_lossy()))
+                    .await;
 
             match parsed {
                 Ok(Ok(new_config)) => {
@@ -197,9 +196,10 @@ pub(crate) fn spawn_config_watcher(
                     // build_router encounters an edge case that validate_config
                     // missed, the debounce task stays alive instead of dying.
                     let previous = state_config.load_full();
-                    let rebuild_result = std::panic::catch_unwind(
-                        std::panic::AssertUnwindSafe(|| rebuild(&new_config, &previous))
-                    );
+                    let rebuild_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            rebuild(&new_config, &previous)
+                        }));
                     let new_snapshot = match rebuild_result {
                         Ok(snap) => snap,
                         Err(_) => {
@@ -254,16 +254,13 @@ pub(crate) fn spawn_config_watcher(
                 Ok(Err(e)) => {
                     logging::warn(
                         "config_watcher",
-                        &format!("reload REJECTED ({}), keeping previous snapshot", e),
+                        &format!("reload REJECTED ({e}), keeping previous snapshot"),
                     );
                 }
                 Err(join_err) => {
                     logging::warn(
                         "config_watcher",
-                        &format!(
-                            "reload task panicked: {}, keeping previous snapshot",
-                            join_err
-                        ),
+                        &format!("reload task panicked: {join_err}, keeping previous snapshot"),
                     );
                 }
             }
@@ -544,8 +541,7 @@ mod tests {
         let msg = r.err().expect("Err expected");
         assert!(
             msg.contains("Cannot read") || msg.contains("Invalid TOML"),
-            "unexpected error message: {}",
-            msg
+            "unexpected error message: {msg}"
         );
     }
 
@@ -570,8 +566,7 @@ mod tests {
         let msg = r.err().expect("Err expected");
         assert!(
             msg.contains("Invalid TOML"),
-            "malformed TOML should produce a parse-error message, got: {}",
-            msg
+            "malformed TOML should produce a parse-error message, got: {msg}"
         );
     }
 }

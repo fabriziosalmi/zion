@@ -93,13 +93,13 @@ pub fn spawn_renewal_task(
                             Err(e) => {
                                 crate::logging::error(
                                     "acme",
-                                    &format!("failed to load renewed certificate: {}", e),
+                                    &format!("failed to load renewed certificate: {e}"),
                                 );
                             }
                         }
                     }
                     Err(e) => {
-                        crate::logging::error("acme", &format!("renewal failed: {}", e));
+                        crate::logging::error("acme", &format!("renewal failed: {e}"));
                     }
                 }
             }
@@ -168,14 +168,14 @@ async fn do_renewal_native(
     // --- Step 1: Load or create ACME account ---
     let account = if creds_path.exists() {
         let creds_json = std::fs::read_to_string(&creds_path)
-            .map_err(|e| format!("cannot read account.json: {}", e))?;
-        let creds: instant_acme::AccountCredentials = serde_json::from_str(&creds_json)
-            .map_err(|e| format!("invalid account.json: {}", e))?;
+            .map_err(|e| format!("cannot read account.json: {e}"))?;
+        let creds: instant_acme::AccountCredentials =
+            serde_json::from_str(&creds_json).map_err(|e| format!("invalid account.json: {e}"))?;
         Account::builder()
-            .map_err(|e| format!("cannot build ACME client: {}", e))?
+            .map_err(|e| format!("cannot build ACME client: {e}"))?
             .from_credentials(creds)
             .await
-            .map_err(|e| format!("cannot restore ACME account: {}", e))?
+            .map_err(|e| format!("cannot restore ACME account: {e}"))?
     } else {
         let contact = if config.email.is_empty() {
             vec![]
@@ -184,7 +184,7 @@ async fn do_renewal_native(
         };
         let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
         let (account, credentials) = Account::builder()
-            .map_err(|e| format!("cannot build ACME client: {}", e))?
+            .map_err(|e| format!("cannot build ACME client: {e}"))?
             .create(
                 &NewAccount {
                     contact: &contact_refs,
@@ -195,13 +195,13 @@ async fn do_renewal_native(
                 None,
             )
             .await
-            .map_err(|e| format!("ACME account creation failed: {}", e))?;
+            .map_err(|e| format!("ACME account creation failed: {e}"))?;
 
         // Persist credentials for future runs
         let creds_json = serde_json::to_string_pretty(&credentials)
-            .map_err(|e| format!("cannot serialize credentials: {}", e))?;
+            .map_err(|e| format!("cannot serialize credentials: {e}"))?;
         std::fs::write(&creds_path, creds_json)
-            .map_err(|e| format!("cannot write account.json: {}", e))?;
+            .map_err(|e| format!("cannot write account.json: {e}"))?;
 
         crate::logging::info("acme", "ACME account created and persisted");
         account
@@ -216,7 +216,7 @@ async fn do_renewal_native(
     let mut order = account
         .new_order(&NewOrder::new(&identifiers))
         .await
-        .map_err(|e| format!("ACME new_order failed: {}", e))?;
+        .map_err(|e| format!("ACME new_order failed: {e}"))?;
 
     crate::logging::info(
         "acme",
@@ -229,11 +229,11 @@ async fn do_renewal_native(
     let mut pending_tokens: Vec<String> = Vec::new();
     let mut authorizations = order.authorizations();
     while let Some(result) = authorizations.next().await {
-        let mut authz = result.map_err(|e| format!("ACME authorization failed: {}", e))?;
+        let mut authz = result.map_err(|e| format!("ACME authorization failed: {e}"))?;
         match authz.status {
             AuthorizationStatus::Valid => continue,
             AuthorizationStatus::Pending => {}
-            other => return Err(format!("unexpected authorization status: {:?}", other)),
+            other => return Err(format!("unexpected authorization status: {other:?}")),
         }
 
         let mut challenge = authz
@@ -259,7 +259,7 @@ async fn do_renewal_native(
         challenge
             .set_ready()
             .await
-            .map_err(|e| format!("challenge set_ready failed: {}", e))?;
+            .map_err(|e| format!("challenge set_ready failed: {e}"))?;
     }
 
     // Phase 2: Poll ALL authorizations in parallel using JoinSet.
@@ -275,22 +275,22 @@ async fn do_renewal_native(
     let status = order
         .poll_ready(&RetryPolicy::default())
         .await
-        .map_err(|e| format!("poll_ready failed: {}", e))?;
+        .map_err(|e| format!("poll_ready failed: {e}"))?;
 
     if status != OrderStatus::Ready {
-        return Err(format!("unexpected order status after poll: {:?}", status));
+        return Err(format!("unexpected order status after poll: {status:?}"));
     }
 
     // --- Step 5: Finalize — generate key + CSR and get certificate ---
     let private_key_pem = order
         .finalize()
         .await
-        .map_err(|e| format!("finalize failed: {}", e))?;
+        .map_err(|e| format!("finalize failed: {e}"))?;
 
     let cert_chain_pem = order
         .poll_certificate(&RetryPolicy::default())
         .await
-        .map_err(|e| format!("poll_certificate failed: {}", e))?;
+        .map_err(|e| format!("poll_certificate failed: {e}"))?;
 
     // --- Step 6: Write to disk ---
     std::fs::write(&tls_config.cert_path, cert_chain_pem.as_bytes())
@@ -329,8 +329,7 @@ async fn do_renewal_script(config: &crate::config::AcmeConfig) -> Result<(), Str
     }
 
     // Validate: script must be a regular file (not symlink to elsewhere)
-    let metadata =
-        std::fs::metadata(&script).map_err(|e| format!("cannot stat renew.sh: {}", e))?;
+    let metadata = std::fs::metadata(&script).map_err(|e| format!("cannot stat renew.sh: {e}"))?;
 
     if !metadata.is_file() {
         return Err("renew.sh is not a regular file".to_string());
@@ -343,13 +342,12 @@ async fn do_renewal_script(config: &crate::config::AcmeConfig) -> Result<(), Str
         let mode = metadata.permissions().mode();
         if mode & 0o002 != 0 {
             return Err(format!(
-                "renew.sh is world-writable (mode {:o}) — refusing to execute for security",
-                mode
+                "renew.sh is world-writable (mode {mode:o}) — refusing to execute for security"
             ));
         }
     }
 
-    crate::logging::info("acme", &format!("running renewal script: {}", script));
+    crate::logging::info("acme", &format!("running renewal script: {script}"));
     let output = tokio::process::Command::new("bash")
         .arg(&script)
         // Restrict environment to prevent injection via env vars
@@ -358,11 +356,11 @@ async fn do_renewal_script(config: &crate::config::AcmeConfig) -> Result<(), Str
         .env("HOME", &config.state_dir)
         .output()
         .await
-        .map_err(|e| format!("failed to run renew.sh: {}", e))?;
+        .map_err(|e| format!("failed to run renew.sh: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("renew.sh failed: {}", stderr));
+        return Err(format!("renew.sh failed: {stderr}"));
     }
     Ok(())
 }

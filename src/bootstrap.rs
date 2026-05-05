@@ -101,15 +101,14 @@ pub fn detect() -> &'static Platform {
         // When skipped we leave `calibration_us` as None; reporting the
         // few microseconds spent in the env-var check would be a
         // misleading "we calibrated quickly" signal.
-        let (aes_kops_per_core, calibration_us) =
-            if std::env::var_os("ZION_BOOT_FAST").is_some() {
-                (None, None)
-            } else {
-                let calibration_start = Instant::now();
-                let kops = calibrate_aes_gcm_kreqs();
-                let us = calibration_start.elapsed().as_micros() as u64;
-                (kops, Some(us))
-            };
+        let (aes_kops_per_core, calibration_us) = if std::env::var_os("ZION_BOOT_FAST").is_some() {
+            (None, None)
+        } else {
+            let calibration_start = Instant::now();
+            let kops = calibrate_aes_gcm_kreqs();
+            let us = calibration_start.elapsed().as_micros() as u64;
+            (kops, Some(us))
+        };
 
         let platform = Platform {
             os: std::env::consts::OS,
@@ -642,9 +641,9 @@ fn render_tier_badge<W: std::io::Write>(
     } else {
         left.clone()
     };
-    let right = format!("score {:>3}/125", score);
+    let right = format!("score {score:>3}/125");
     let right_styled = if s.color {
-        format!("{}{}{}", dim, right, reset_raw)
+        format!("{dim}{right}{reset_raw}")
     } else {
         right.clone()
     };
@@ -665,8 +664,7 @@ fn render_tier_badge<W: std::io::Write>(
     let motto = pad_right(tier.motto(), BADGE_INNER);
     writeln!(
         w,
-        "  {}║{} {}{}{} {}║{}",
-        border, reset, dim, motto, reset_raw, border, reset
+        "  {border}║{reset} {dim}{motto}{reset_raw} {border}║{reset}"
     )?;
 
     // ── AES line — what we actually measured ──
@@ -676,27 +674,16 @@ fn render_tier_badge<W: std::io::Write>(
             fmt_aes_rate(per_core),
             (us / 1000).max(1),
         ),
-        (Some(per_core), None) => format!(
-            "  AES-128-GCM  {} seal/s/core",
-            fmt_aes_rate(per_core),
-        ),
+        (Some(per_core), None) => format!("  AES-128-GCM  {} seal/s/core", fmt_aes_rate(per_core),),
         _ => "  AES-128-GCM  — calibration skipped".to_string(),
     };
     let aes_padded = pad_right(&aes_line, BADGE_INNER);
-    writeln!(
-        w,
-        "  {}║{} {} {}║{}",
-        border, reset, aes_padded, border, reset
-    )?;
+    writeln!(w, "  {border}║{reset} {aes_padded} {border}║{reset}")?;
 
     // ── Proxy line — labeled estimate, no false promises ──
-    let proxy_inner = format!("  proxy est.   ~{}K cached · ~{}K dynamic", cached, dynamic);
+    let proxy_inner = format!("  proxy est.   ~{cached}K cached · ~{dynamic}K dynamic");
     let proxy_padded = pad_right(&proxy_inner, BADGE_INNER);
-    writeln!(
-        w,
-        "  {}║{} {} {}║{}",
-        border, reset, proxy_padded, border, reset
-    )?;
+    writeln!(w, "  {border}║{reset} {proxy_padded} {border}║{reset}")?;
 
     // Bottom border
     writeln!(w, "  {}╚{}╝{}", border, "═".repeat(BADGE_INNER + 2), reset)?;
@@ -745,18 +732,15 @@ fn render_ready<W: std::io::Write>(
     writeln!(w)?;
     writeln!(
         w,
-        "  {}▶ READY{}  {}{} (https) · {} (http){}",
-        bold_green, reset, dim, https_addr, http_addr, reset,
+        "  {bold_green}▶ READY{reset}  {dim}{https_addr} (https) · {http_addr} (http){reset}",
     )?;
     writeln!(
         w,
-        "  {}live dashboard:{}  {}zion top --url http://{}/_zion/snapshot.json{}",
-        dim, reset, cyan, loopback_http, reset,
+        "  {dim}live dashboard:{reset}  {cyan}zion top --url http://{loopback_http}/_zion/snapshot.json{reset}",
     )?;
     writeln!(
         w,
-        "  {}health:{}         {}http://{}/healthz{}",
-        dim, reset, cyan, loopback_http, reset,
+        "  {dim}health:{reset}         {cyan}http://{loopback_http}/healthz{reset}",
     )?;
     writeln!(w)?;
     Ok(())
@@ -799,7 +783,7 @@ fn render_synthesis<W: std::io::Write>(p: &Platform, s: &Style, w: &mut W) -> st
             reset
         ),
     ];
-    let sep = format!(" {}·{} ", dim, reset);
+    let sep = format!(" {dim}·{reset} ");
     writeln!(w, "  {}", parts.join(&sep))?;
     Ok(())
 }
@@ -825,7 +809,7 @@ fn fmt_aes_rate(kops: u32) -> String {
     if kops >= 1_000 {
         format!("{:.1}M", kops as f64 / 1_000.0)
     } else {
-        format!("{}K", kops)
+        format!("{kops}K")
     }
 }
 
@@ -973,7 +957,7 @@ enum Mark {
 
 impl Mark {
     /// Visible width (for alignment): 1 char in TTY mode (a colored dot),
-    /// 4 chars in plain mode ("[ok]" / "[ !]" / "    " for none).
+    /// 4 chars in plain mode (`[ok]` / `[ !]` / `    ` for none).
     fn glyph(self, s: &Style) -> String {
         if !s.color {
             return match self {
@@ -1082,7 +1066,7 @@ fn fmt_bytes(n: u64) -> String {
     } else if n >= K {
         format!("{} KB", n / K)
     } else {
-        format!("{} B", n)
+        format!("{n} B")
     }
 }
 
@@ -1332,7 +1316,7 @@ fn sysctl_usize(name: &[u8]) -> Option<usize> {
 }
 
 /// Compute max L1 hot cache entries from L1d size.
-/// Each entry is ~200 bytes (key Arc<str> + Bytes + metadata).
+/// Each entry is ~200 bytes (key `Arc<str>` + `Bytes` + metadata).
 /// Use 50% of L1d to leave room for stack + code.
 fn compute_l1_entries(l1d_size: usize) -> usize {
     let usable = l1d_size / 2; // 50% of L1d
@@ -1424,7 +1408,7 @@ mod tests {
         // 8 cores, 16 GB, hw crypto, linux → strong
         let p = synthetic(8, 16_000, true, "linux");
         let s = p.tier_score();
-        assert!((55..=79).contains(&s), "score = {}", s);
+        assert!((55..=79).contains(&s), "score = {s}");
         assert_eq!(p.tier(), Tier::A);
     }
 
@@ -1433,7 +1417,7 @@ mod tests {
         // 1 core, 1 GB, no hw crypto, freebsd → minimal
         let p = synthetic(1, 1024, false, "freebsd");
         let s = p.tier_score();
-        assert!(s < 30, "score = {}", s);
+        assert!(s < 30, "score = {s}");
         assert_eq!(p.tier(), Tier::C);
     }
 
@@ -1536,7 +1520,7 @@ mod tests {
         ] {
             let p = synthetic(cores, ram, aes, os);
             let hint = upgrade_hint(&p);
-            assert!(!hint.is_empty(), "empty hint for {:?}", p);
+            assert!(!hint.is_empty(), "empty hint for {p:?}");
             // Hints are sentences — at least 20 chars of substance
             assert!(hint.len() > 20, "trivially-short hint: {hint}");
         }

@@ -1,0 +1,103 @@
+# Dependabot — automated dependency updates with grouping for sane review load.
+#
+# Strategy:
+#   - Cargo:  daily security, weekly minor/patch (grouped), manual majors.
+#   - Actions: weekly, with explicit rebase strategy.
+#   - Docker:  weekly base-image refresh.
+#   - npm (docs/): weekly for the VitePress site.
+#
+# All PRs land with the standard reviewers/labels so the supply-chain
+# pipeline (.github/workflows/supply-chain.yml) re-runs cargo-audit/deny
+# before merge — Dependabot never bypasses policy.
+
+version: 2
+updates:
+  # ── Rust crates ───────────────────────────────────────────────────────────
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "06:00"
+      timezone: "Europe/Rome"
+    open-pull-requests-limit: 10
+    labels: ["dependencies", "rust"]
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    rebase-strategy: "auto"
+    # Group routine bumps so the queue stays readable. Majors stay individual
+    # so they get scrutinized.
+    groups:
+      rust-patch:
+        applies-to: "version-updates"
+        update-types: ["patch"]
+      rust-minor:
+        applies-to: "version-updates"
+        update-types: ["minor"]
+      rust-security:
+        applies-to: "security-updates"
+        update-types: ["patch", "minor", "major"]
+    ignore:
+      # Pin major-version bumps for the cryptographic / network core — those
+      # need a manual security review (release notes, advisory diff) before merge.
+      - dependency-name: "rustls"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "tokio"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "hyper"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "aws-lc-rs"
+        update-types: ["version-update:semver-major"]
+
+  # Benchmarks workspace has its own Cargo.toml — keep it on the same cadence.
+  - package-ecosystem: "cargo"
+    directory: "/benchmarks/backend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels: ["dependencies", "rust", "benchmarks"]
+    commit-message:
+      prefix: "deps(bench)"
+      include: "scope"
+    open-pull-requests-limit: 5
+
+  # ── GitHub Actions ────────────────────────────────────────────────────────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        applies-to: "version-updates"
+        update-types: ["minor", "patch"]
+
+  # ── Docker base image ─────────────────────────────────────────────────────
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels: ["dependencies", "docker"]
+    commit-message:
+      prefix: "docker"
+      include: "scope"
+    open-pull-requests-limit: 5
+
+  # ── VitePress docs site ───────────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/docs"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels: ["dependencies", "docs"]
+    commit-message:
+      prefix: "docs"
+      include: "scope"
+    open-pull-requests-limit: 3
+    versioning-strategy: "increase-if-necessary"

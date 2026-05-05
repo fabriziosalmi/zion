@@ -1,0 +1,77 @@
+# CodeQL — semantic SAST.
+#
+# We scan two languages here:
+#   - rust    : the daemon source (CodeQL Rust support is GA).
+#   - actions : the workflow definitions in this very directory (catches
+#               unpinned actions, script injection, untrusted env input).
+#
+# Findings land in the Security tab and gate PRs on critical severity.
+
+name: codeql
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    # Weekly run picks up newly-shipped query packs even when the code is idle.
+    - cron: "30 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  analyze:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: manual
+          - language: actions
+            build-mode: none
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps (Rust)
+        if: matrix.language == 'rust'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.language == 'rust'
+
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.language == 'rust'
+        with:
+          shared-key: codeql-rust
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-and-quality
+
+      - name: Build (Rust)
+        if: matrix.language == 'rust'
+        # Match what we ship — all-features so CodeQL sees acme/auth/http3/tui code paths.
+        run: cargo build --locked --all-features
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

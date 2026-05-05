@@ -587,8 +587,8 @@ mod tests {
         for i in 0..10 {
             let c = cache.clone();
             handles.push(thread::spawn(move || {
-                let key = format!("/item/{}", i);
-                let val = Bytes::from(format!("value-{}", i));
+                let key = format!("/item/{i}");
+                let val = Bytes::from(format!("value-{i}"));
                 c.insert(&key, val, default_meta(), 3600, 1000);
             }));
         }
@@ -597,7 +597,7 @@ mod tests {
             let c = cache.clone();
             handles.push(thread::spawn(move || {
                 for i in 0..10 {
-                    let key = format!("/item/{}", i);
+                    let key = format!("/item/{i}");
                     let _ = c.get(&key);
                 }
             }));
