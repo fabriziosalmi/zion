@@ -2,6 +2,43 @@
 
 All notable changes to Zion Edge Gateway are documented here.
 
+## [0.1.10] - 2026-05-05
+
+Supply-chain hardening — closes 3 of the 4 OSSF Scorecard gaps surfaced
+on the v0.1.9 release. No code changes; CI / Helm / Dockerfile only.
+
+### Added
+- **Branch protection on `master`** (10 required status checks: CI Success,
+  cargo-deny ×4, cargo-audit, SBOM CycloneDX, CodeQL ×2, DCO; linear
+  history; force-push and delete disabled; conversation resolution
+  required).
+
+### Changed
+- **All 71 GitHub Action references** across 8 workflow files pinned by
+  40-char commit SHA (with `# vX` comment for human readability and
+  Dependabot SHA-aware bumping). Resolved via `gh api repos/<o>/<r>/commits/<ref>`.
+- **All 6 Docker base images** pinned by digest (`Dockerfile`,
+  `benchmarks/Dockerfile.zion`, `benchmarks/backend/Dockerfile`).
+- **Token-Permissions** scoped to least-privilege:
+  - `dco.yml`: explicit `contents: read` (top + job).
+  - `sovereign-data.yml`: top-level `contents: read`; `contents: write`
+    + `pull-requests: write` only on the `refresh-ita` job.
+- **Helm chart** bumped to 0.2.2 (appVersion 0.1.10).
+
+### Verification
+
+```text
+cargo fmt --all -- --check                          # OK
+cargo clippy --locked --all-targets --all-features -- -D warnings   # OK
+cargo test  --locked --all-features    →  463 passed
+cargo deny  --all-features check       →  advisories ok, bans ok, licenses ok, sources ok
+helm lint deploy/helm/zion                          # OK
+actionlint .github/workflows/*.yml                  # OK
+```
+
+OSSF Scorecard sub-checks moved from 0/10 to 10/10:
+Token-Permissions, Pinned-Dependencies, Branch-Protection.
+
 ## [0.1.9] - 2026-05-05
 
 Five-track quality pass: Trust & supply chain, Observability, Robustness
