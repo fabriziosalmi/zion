@@ -297,9 +297,13 @@ jobs:
         run: cargo install --locked cargo-cyclonedx
 
       - name: Generate CycloneDX SBOM
+        # `cargo-cyclonedx --override-filename FOO --format json` writes
+        # `FOO.json` in the manifest dir (no `.cdx.` infix). We rename to
+        # the CycloneDX-conventional `<name>.cdx.json` for the release asset.
         run: |
           cargo cyclonedx --all --format json --override-filename zion-sbom
-          mv zion-sbom.cdx.json dist/zion-sbom.cdx.json
+          test -s zion-sbom.json
+          mv zion-sbom.json dist/zion-sbom.cdx.json
 
       - name: Compose top-level SHA256SUMS
         working-directory: dist

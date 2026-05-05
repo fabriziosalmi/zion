@@ -145,15 +145,18 @@ jobs:
       - name: Install cargo-cyclonedx
         run: cargo install --locked cargo-cyclonedx
       - name: Generate SBOM (JSON, all features)
+        # `cargo-cyclonedx --override-filename FOO --format json` writes
+        # `FOO.json` in the manifest dir (no `.cdx.` infix). Rename to the
+        # CycloneDX-conventional filename for downstream consumers.
         run: |
           cargo cyclonedx --all --format json --override-filename zion-sbom
-          # Sanity check — the file must exist and be non-empty.
-          test -s zion-sbom.cdx.json
+          test -s zion-sbom.json
+          mv zion-sbom.json zion-sbom.cdx.json
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4
         with:
           name: sbom-cyclonedx
-          path: "*.cdx.json"
+          path: "zion-sbom.cdx.json"
           retention-days: 90
 
   # ── 6. OSSF Scorecard — repo-level supply-chain posture grade. ───────────
