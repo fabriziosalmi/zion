@@ -429,6 +429,13 @@ jobs:
           image: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
           format: cyclonedx-json
           output-file: image-sbom.cdx.json
+          # The image SBOM is bound to the digest via cosign attestation
+          # in the next step. Don't double-attach it to the GitHub Release —
+          # that would (a) require `contents: write` here (this job is
+          # otherwise read-only) and (b) duplicate the binary SBOM that the
+          # `publish` job already attaches.
+          upload-release-assets: false
+          upload-artifact: false
 
       - name: Attest SBOM to image
         uses: actions/attest-sbom@v2
