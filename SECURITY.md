@@ -80,3 +80,14 @@ Informational signals (do not block, but are reviewed):
 
 For deployment hardening (TLS posture, header policies, sandboxing, kernel
 tunables) see [docs/security/hardening.md](docs/security/hardening.md).
+
+## Compliance documentation
+
+| Document | Purpose |
+|---|---|
+| [docs/security/threat-model.md](docs/security/threat-model.md) | STRIDE per surface, mitigation + residual risk |
+| [docs/security/asvs.md](docs/security/asvs.md) | OWASP ASVS L2 mapping, control → file → test |
+| [docs/security/fips.md](docs/security/fips.md) | FIPS 140-3 build (`--features fips`), conformance posture |
+| [docs/security/tls-conformance.md](docs/security/tls-conformance.md) | BoGo / RFC 8446 verification recipes |
+| [docs/security/supply-chain.md](docs/security/supply-chain.md) | SLSA L3 + cosign + SBOM verification |
+| [docs/adr/](docs/adr/) | Architecture Decision Records |

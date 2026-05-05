@@ -669,6 +669,16 @@ pub(crate) async fn process_request(
     // Pre-extract X-Request-ID for response echo (before req is consumed)
     let request_id_val = req.headers().get("X-Request-ID").cloned();
 
+    // Capture method + path-and-query *before* the request is consumed by
+    // the proxy / cache pipeline. Used by the access-log emission below.
+    // `Method` and `String` are cheap to materialise once per request.
+    let log_method = req.method().clone();
+    let log_path_query: String = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+
     // --- Dispatch by mode ---
     let mut resp = if rule.cache.is_some() {
         handle_static_cache(
@@ -735,12 +745,47 @@ pub(crate) async fn process_request(
     // Record metrics (atomic increment, ~2ns)
     metrics::METRICS.record_status(resp.status().as_u16());
 
+    let request_elapsed = request_start.elapsed();
+
     // Record request duration histogram, attaching the request's trace ID
     // as an OpenMetrics exemplar so /metrics consumers can jump straight
     // from a slow-bucket count to the matching trace in Tempo/Jaeger.
     metrics::METRICS
         .request_duration
-        .observe_with_trace(request_start.elapsed(), trace_id_bytes);
+        .observe_with_trace(request_elapsed, trace_id_bytes);
+
+    // GDPR-aware access log (Track E). One structured event per request:
+    //   * status, method, latency_us — per-request metric data, no PII;
+    //   * path with the query string redacted via state.redact (the same
+    //     compiled policy used by audit::emit_waf_block);
+    //   * remote_ip — necessary for forensics, classified under GDPR
+    //     Art. 6(1)(f) "legitimate interest" of operating the service.
+    //
+    // The event is a no-op when no tracing subscriber consumes it. With
+    // the JSON subscriber attached, fields are written directly to the
+    // subscriber's buffer — no `format!` allocation, redaction is the
+    // only owned-`String` produced.
+    {
+        // Redact the query string per the operator's [redact] policy.
+        // Path itself is rarely sensitive and the auditor needs it; we
+        // only rewrite the part after the first `?`.
+        let path_safe: std::borrow::Cow<'_, str> = match log_path_query.split_once('?') {
+            Some((p, q)) => {
+                let q_redacted = state.redact.redact_query_string(q);
+                std::borrow::Cow::Owned(format!("{p}?{q_redacted}"))
+            }
+            None => std::borrow::Cow::Borrowed(log_path_query.as_str()),
+        };
+        tracing::info!(
+            target: "access",
+            status = resp.status().as_u16(),
+            latency_us = request_elapsed.as_micros() as u64,
+            method = %log_method,
+            path = %path_safe,
+            remote_ip = %remote_addr.ip(),
+            "request",
+        );
+    }
 
     // CORS: add Access-Control-Allow-Origin on actual requests
     if let Some(allow) = cors_allow_origin {

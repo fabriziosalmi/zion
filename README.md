@@ -5,6 +5,8 @@
 [![CodeQL](https://github.com/fabriziosalmi/zion/actions/workflows/codeql.yml/badge.svg)](https://github.com/fabriziosalmi/zion/actions/workflows/codeql.yml)
 [![OSSF Scorecard](https://api.scorecard.dev/projects/github.com/fabriziosalmi/zion/badge)](https://scorecard.dev/viewer/?uri=github.com/fabriziosalmi/zion)
 [![SLSA Level 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev/spec/v1.0/levels#build-l3)
+[![FIPS-ready](https://img.shields.io/badge/FIPS_140--3-ready_(--features_fips)-success.svg)](docs/security/fips.md)
+[![ASVS L2](https://img.shields.io/badge/OWASP_ASVS-L2_mapped-blue.svg)](docs/security/asvs.md)
 [![Version](https://img.shields.io/github/v/release/fabriziosalmi/zion?include_prereleases&color=blue&label=release)](https://github.com/fabriziosalmi/zion/releases)
 [![MSRV](https://img.shields.io/badge/MSRV-1.82%20core%20%2F%201.88%20full-blue.svg)](Cargo.toml)
 [![License](https://img.shields.io/github/license/fabriziosalmi/zion)](https://github.com/fabriziosalmi/zion/blob/master/LICENSE)
@@ -288,6 +290,15 @@ cargo test
 # 3. Run:
 cargo test --test integration -- --ignored --test-threads=1
 ```
+
+## Compliance
+
+- [Threat model (STRIDE)](docs/security/threat-model.md) — surfaces, mitigations, residual risk.
+- [OWASP ASVS L2 mapping](docs/security/asvs.md) — control → implementation site → test/evidence.
+- [FIPS 140-3 build](docs/security/fips.md) — `cargo build --features fips` for the FIPS-validated AWS-LC backend.
+- [TLS conformance](docs/security/tls-conformance.md) — BoGo / RFC 8446 / SSL Labs verification recipes.
+- [Supply chain](docs/security/supply-chain.md) — SLSA L3 provenance, cosign, SBOM verification.
+- [Architecture Decision Records](docs/adr/) — the load-bearing engineering choices, in writing.
 
 ## Verifying a Release
 

@@ -141,6 +141,14 @@ init = ["rcgen"]
 # Datadog Agent, etc). The base `tracing` integration is always-on; this
 # feature only enables the network exporter.
 otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "opentelemetry-semantic-conventions", "tracing-opentelemetry"]
+# FIPS 140-3 mode (Track E). Switches the aws-lc-rs backend to its
+# FIPS-validated build (aws-lc-fips-sys). Requires:
+#   * a CMake + clang toolchain capable of building the FIPS module from
+#     source (the build script verifies the integrity hash at compile time);
+#   * the FIPS module's algorithm restrictions (no ChaCha20-Poly1305 for
+#     TLS 1.2 record-layer, etc.) — TLS 1.3 ciphers are unaffected.
+# See docs/security/fips.md for the full conformance posture.
+fips = ["aws-lc-rs/fips"]
 # Sovereign Edge Intelligence — bake regional ASN/CIDR data into the binary
 geo-ita = []                       # 🇮🇹 Italian ASN + gov + ISP ranges
 geo-eu  = ["geo-ita"]              # 🇪🇺 EU superset (includes geo-ita)
