@@ -12,8 +12,9 @@
 //!      *dropped* and `zion_audit_events_dropped_total` is bumped — never
 //!      blocking the request path is the design choice. This is documented.
 //!   3. **PII redaction.** Header values and query parameters listed in
-//!      [`RedactConfig`] are replaced with `<redacted:N>` (N = original
-//!      byte length, useful for downstream sizing analysis) before signing.
+//!      [`RedactConfig`](crate::audit::RedactConfig) are replaced with
+//!      `<redacted:N>` (N = original byte length, useful for downstream
+//!      sizing analysis) before signing.
 //!      Redaction happens at construction time, not at write time, so the
 //!      chain hash is computed over the already-redacted record.
 //!
@@ -677,5 +678,101 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Property-based tests: redaction must be idempotent, must preserve the
+// pair count, and must never expose the secret value when the key matches.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // Idempotence: redacting an already-redacted query string twice
+        // produces the same result as redacting it once. (The redactor
+        // replaces values, not keys; a second pass re-finds the keys but
+        // the values now spell `<redacted:N>` where the *new* N is the
+        // length of the literal `<redacted:K>` token from the prior pass.
+        // The property we want is structural-stability: pair count and
+        // key set are preserved across passes.)
+        #[test]
+        fn redact_query_string_preserves_pair_count(
+            keys in proptest::collection::vec("[a-z]{1,8}", 0..8),
+            redact_set in proptest::collection::vec("[a-z]{1,8}", 0..4),
+        ) {
+            let r = RedactConfig {
+                headers: vec![],
+                query_params: redact_set,
+            }
+            .compile();
+            let original = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| format!("{k}=value{i}"))
+                .collect::<Vec<_>>()
+                .join("&");
+            let pairs_in = original.split('&').filter(|s| !s.is_empty()).count();
+            let redacted = r.redact_query_string(&original);
+            let pairs_out = redacted.split('&').filter(|s| !s.is_empty()).count();
+            prop_assert_eq!(pairs_in, pairs_out);
+        }
+
+        // The redactor must never panic on arbitrary input — it sees client
+        // query strings, which are attacker-controlled.
+        #[test]
+        fn redact_query_string_never_panics(q in ".*") {
+            let r = RedactConfig {
+                headers: vec![],
+                query_params: vec!["secret".into()],
+            }
+            .compile();
+            let _ = r.redact_query_string(&q);
+        }
+
+        // For any key in the redact list, the redacted output must NOT
+        // contain the secret value as a substring.
+        #[test]
+        fn redact_drops_secret_values(
+            secret in "[a-zA-Z0-9]{16,64}",
+        ) {
+            let r = RedactConfig {
+                headers: vec![],
+                query_params: vec!["token".into()],
+            }
+            .compile();
+            let q = format!("foo=bar&token={secret}&baz=qux");
+            let out = r.redact_query_string(&q);
+            prop_assert!(!out.contains(&*secret), "secret leaked: {out}");
+            prop_assert!(out.contains("foo=bar"), "non-redacted pair preserved");
+            prop_assert!(out.contains("baz=qux"), "non-redacted pair preserved");
+        }
+
+        // HMAC chain integrity: signing the same event twice with the same
+        // key + prev_hash yields the same hmac. Determinism is the load-
+        // bearing assumption every external verifier relies on.
+        #[test]
+        fn hmac_signing_is_deterministic(
+            seq in 0u64..=u64::MAX,
+            detail in "[ -~]{0,64}",
+        ) {
+            let key = hmac::Key::new(hmac::HMAC_SHA256, b"this-is-a-32-byte-test-secret!ab");
+            let prev = genesis_hash(&key);
+            let event = AuditEvent {
+                seq,
+                ts: "2026-05-05T08:00:00.000000Z".into(),
+                kind: "test",
+                trace_id: None,
+                remote_ip: None,
+                method: None,
+                path: None,
+                detail: Some(detail),
+            };
+            let (s1, _) = sign_event(&key, event.clone(), prev.clone()).unwrap();
+            let (s2, _) = sign_event(&key, event, prev).unwrap();
+            prop_assert_eq!(s1.hmac, s2.hmac);
+        }
     }
 }

@@ -146,6 +146,10 @@ geo-ita = []                       # 🇮🇹 Italian ASN + gov + ISP ranges
 geo-eu  = ["geo-ita"]              # 🇪🇺 EU superset (includes geo-ita)
 sovereign-signals = []             # Gossip mesh for signal sharing (Phase 3)
 
+# Track C — property-based testing (proptest) only used by `cargo test`.
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
 [profile.release]
 opt-level = 3
 lto = "fat"

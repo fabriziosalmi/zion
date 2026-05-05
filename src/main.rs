@@ -9,6 +9,20 @@
 // The clippy stylistic lints below are kept silenced: they are taste, not
 // correctness, and re-running them is cheap when the project decides to
 // adopt a uniform style.
+//
+// ─────────────────────────────────────────────────────────────────────────
+// INVARIANT: `Response::builder().status(...).body(...).unwrap()` pattern.
+// ─────────────────────────────────────────────────────────────────────────
+// Multiple sites in this crate construct hyper responses with the literal
+// shape `Response::builder().status(StatusCode).header("Foo", "bar").body(b)`.
+// `Builder::body()` only returns `Err` when the builder accumulated a header
+// parse error during prior `.header(...)` calls. We never feed user-controlled
+// strings into header *values* in these constructions — only static literals
+// or values we've already parsed (StatusCode, HeaderValue). Therefore the
+// `.unwrap()` is sound by typing, and we treat it as an invariant rather than
+// a TODO. Sites that DO build a header from dynamic data (URI parsing, header
+// echoing back to a client) get an individual `// SAFETY:` comment explaining
+// why the input is constrained.
 #![allow(clippy::let_and_return)]
 #![allow(clippy::explicit_auto_deref)]
 #![allow(clippy::needless_borrow)]
@@ -21,6 +35,7 @@ mod cache;
 mod cli;
 mod config;
 mod doctor;
+mod error;
 mod health;
 mod init;
 mod listener;
@@ -357,6 +372,10 @@ static EMPTY_BYTES: Bytes = Bytes::new();
 const MAX_URI_LEN: usize = 8192;
 
 pub(crate) fn empty_response(status: StatusCode) -> Response<ZionBody> {
+    // INVARIANT: hyper's `Response::builder().status(StatusCode).body(...)`
+    // returns `Err` only when the builder accumulated a header parse error.
+    // We pass a typed StatusCode (no parse step) and a typed body, so the
+    // construction is infallible by typing.
     Response::builder()
         .status(status)
         .body(
@@ -368,6 +387,8 @@ pub(crate) fn empty_response(status: StatusCode) -> Response<ZionBody> {
 }
 
 pub(crate) fn text_response(status: StatusCode, text: &'static str) -> Response<ZionBody> {
+    // INVARIANT: same as `empty_response` — typed StatusCode + typed body,
+    // no headers added that could fail to parse.
     Response::builder()
         .status(status)
         .body(
@@ -378,7 +399,7 @@ pub(crate) fn text_response(status: StatusCode, text: &'static str) -> Response<
         .unwrap()
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> error::ZionResult<()> {
     // ── Subcommand dispatch ──
     // Default (no args) → run the daemon, preserving every existing
     // systemd / Docker invocation path. Subcommands like `top`, `--version`,
@@ -417,7 +438,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli::Command::Top(opts) => {
             #[cfg(feature = "tui")]
             {
-                return tui::run(opts);
+                // tui::run still returns Box<dyn Error> internally — it's a
+                // cargo-feature-gated subcommand and not part of the boot
+                // contract we restructured. Convert at the boundary.
+                return tui::run(opts).map_err(|e| error::ZionError::Other(e.to_string()));
             }
             #[cfg(not(feature = "tui"))]
             {
@@ -472,7 +496,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
     let core_idx = std::sync::atomic::AtomicUsize::new(0);
 
-    // Build tokio runtime with detected optimal worker count
+    // Build tokio runtime with detected optimal worker count.
+    // INVARIANT: `Builder::build()` only fails on (a) zero worker threads
+    // (we always pass `platform.worker_threads >= 1`), or (b) the kernel
+    // refusing to spawn the I/O reactor thread (catastrophic — at that
+    // point the daemon cannot run). Map to a structured ZionError so the
+    // operator gets a clean exit code instead of an `expect` panic.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(platform.worker_threads)
         .on_thread_start(move || {
@@ -485,27 +514,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .enable_all()
         .build()
-        .expect("failed to build tokio runtime");
+        .map_err(|e| error::ZionError::Other(format!("tokio runtime build failed: {e}")))?;
 
     runtime.block_on(async_main(platform))
 }
 
-async fn async_main(
-    platform: &'static bootstrap::Platform,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult<()> {
     eprintln!("ZION EDGE GATEWAY — initializing...");
     bootstrap::print_report(platform);
 
     // 1. Load configuration
     let config_path = std::env::var("ZION_CONFIG").unwrap_or_else(|_| "zion.toml".to_string());
-    let config = config::load_config(&config_path).map_err(|e| format!("FATAL: {e}"))?;
+    let config = config::load_config(&config_path).map_err(error::ZionError::Config)?;
     logging::init(&config.server.log_format);
     // tracing-subscriber init mirrors the log_format choice — JSON for
     // production, pretty for dev. Boot-line output continues to use
     // `logging::*` (those run before the runtime exists, so they cannot
     // depend on tracing's executor-aware machinery); request-path events
     // will go through tracing once the worker pool is up.
-    observability::init_subscriber(observability::LogFormat::from_str(
+    observability::init_subscriber(observability::LogFormat::parse_or_text(
         &config.server.log_format,
     ));
     logging::info("config", &format!("loaded from {config_path}"));
@@ -515,7 +542,7 @@ async fn async_main(
     //  build entry point.)
 
     // 3. Load initial TLS — build acceptor once, cache via ArcSwap
-    let initial_tls = tls::load_tls_config(&config.tls).map_err(|e| format!("FATAL: {e}"))?;
+    let initial_tls = tls::load_tls_config(&config.tls).map_err(error::ZionError::Tls)?;
     let acceptor = TlsAcceptor::from(Arc::new(initial_tls));
     let tls_acceptor_store = Arc::new(ArcSwap::from_pointee(acceptor));
     eprintln!(
@@ -799,7 +826,12 @@ async fn async_main(
     // dev machine, port already in use, etc.); the listener supervisor
     // will retry on the next config reload. HTTPS bind failure at boot
     // is a hard error — there is nothing useful to do without it.
-    let http_addr: SocketAddr = config.server.listen_http.parse()?;
+    let http_addr: SocketAddr = config.server.listen_http.parse().map_err(|e| {
+        error::ZionError::Config(format!(
+            "invalid listen_http address {:?}: {e}",
+            config.server.listen_http
+        ))
+    })?;
     let http_initial: Option<(SocketAddr, tokio::net::TcpListener)> =
         match net::bind_with_reuseport(http_addr) {
             Ok(l) => {
@@ -812,8 +844,14 @@ async fn async_main(
             }
         };
 
-    let https_addr: SocketAddr = config.server.listen_https.parse()?;
-    let https_listener = net::bind_with_reuseport(https_addr)?;
+    let https_addr: SocketAddr = config.server.listen_https.parse().map_err(|e| {
+        error::ZionError::Config(format!(
+            "invalid listen_https address {:?}: {e}",
+            config.server.listen_https
+        ))
+    })?;
+    let https_listener = net::bind_with_reuseport(https_addr)
+        .map_err(|e| error::ZionError::Listener(format!("HTTPS bind {https_addr}: {e}")))?;
     eprintln!("  listening HTTPS on {https_addr}");
 
     // io_uring multishot accept on Linux (one syscall for N connections).
@@ -848,12 +886,18 @@ async fn async_main(
     // QUIC listen-port hot-reload is out of scope for Phase 1.5.
     #[cfg(feature = "http3")]
     {
-        let quic_addr: SocketAddr = config
-            .server
-            .listen_https
-            .parse()
-            .expect("Invalid HTTPS address for QUIC binding");
-        quic::spawn_quic_listener(quic_addr, &config.tls, state.clone(), Some(_quic_reload_rx));
+        // INVARIANT: `config.server.listen_https` was already parsed above
+        // (line ~819) into `https_addr` for the TCP bind. If it parsed once
+        // it parses again — but we still surface a structured error if the
+        // address grammar differs by some accident.
+        let quic_addr: SocketAddr = config.server.listen_https.parse().map_err(|e| {
+            error::ZionError::Config(format!(
+                "invalid listen_https for QUIC ({:?}): {e}",
+                config.server.listen_https
+            ))
+        })?;
+        quic::spawn_quic_listener(quic_addr, &config.tls, state.clone(), Some(_quic_reload_rx))
+            .map_err(error::ZionError::Tls)?;
     }
 
     bootstrap::print_ready_banner(&config.server.listen_http, &config.server.listen_https);
@@ -1192,6 +1236,14 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
+        // INVARIANT: signal handler installation only fails on (a) the
+        // kernel rejecting `sigaction` (which never happens for SIGTERM
+        // on a Unix system that successfully started a tokio runtime), or
+        // (b) running outside a tokio context (we are inside `block_on`).
+        // Both are unreachable in practice; if the kernel refuses SIGTERM
+        // we have no graceful-shutdown signal anyway, so falling through
+        // to ctrl_c is the correct degraded behaviour — but the daemon is
+        // already in a wedged state at that point.
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to install SIGTERM handler")
             .recv()

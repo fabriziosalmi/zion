@@ -25,32 +25,35 @@ pub static ALT_SVC_H3: hyper::header::HeaderValue =
 
 /// Build a quinn ServerConfig from Zion's TLS config.
 /// QUIC mandates TLS 1.3 — we reuse the same cert/key as the TCP listener.
-pub fn build_quinn_server_config(tls: &TlsConfig) -> quinn::ServerConfig {
+///
+/// Returns a `String` error on every failure mode (file open, PEM parse,
+/// rustls build, quinn config conversion) so the caller can surface a
+/// `ZionError::Tls` to the operator instead of aborting the daemon.
+pub fn build_quinn_server_config(tls: &TlsConfig) -> Result<quinn::ServerConfig, String> {
     let cert_file = std::fs::File::open(&tls.cert_path)
-        .unwrap_or_else(|e| panic!("QUIC cert {}: {}", tls.cert_path, e));
+        .map_err(|e| format!("QUIC cert {}: {e}", tls.cert_path))?;
     let key_file = std::fs::File::open(&tls.key_path)
-        .unwrap_or_else(|e| panic!("QUIC key {}: {}", tls.key_path, e));
+        .map_err(|e| format!("QUIC key {}: {e}", tls.key_path))?;
 
     let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
         .collect::<Result<Vec<_>, _>>()
-        .expect("Failed to parse QUIC cert PEM");
+        .map_err(|e| format!("parse QUIC cert PEM: {e}"))?;
 
     let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))
-        .expect("Failed to parse QUIC key PEM")
-        .expect("No private key in PEM");
+        .map_err(|e| format!("parse QUIC key PEM: {e}"))?
+        .ok_or_else(|| "no private key in PEM".to_string())?;
 
     let mut tls_config =
         rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .expect("Failed to build QUIC TLS config");
+            .map_err(|e| format!("build QUIC TLS config: {e}"))?;
 
     tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
-            .expect("Failed to create QUIC server config"),
-    ));
+    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
+        .map_err(|e| format!("create QUIC server config: {e}"))?;
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
 
     // Transport config tuning
     let mut transport = quinn::TransportConfig::default();
@@ -58,37 +61,38 @@ pub fn build_quinn_server_config(tls: &TlsConfig) -> quinn::ServerConfig {
     transport.max_concurrent_uni_streams(64u32.into());
     server_config.transport_config(Arc::new(transport));
 
-    server_config
+    Ok(server_config)
 }
 
 pub fn quinn_server_config_from_rustls(
     arc_config: Arc<rustls::ServerConfig>,
-) -> quinn::ServerConfig {
+) -> Result<quinn::ServerConfig, String> {
     let mut cloned = (*arc_config).clone();
     cloned.alpn_protocols = vec![b"h3".to_vec()];
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(cloned)
-            .expect("Failed to convert rustls config to QUIC config"),
-    ));
+    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(cloned)
+        .map_err(|e| format!("convert rustls config to QUIC config: {e}"))?;
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(256u32.into());
     transport.max_concurrent_uni_streams(64u32.into());
     server_config.transport_config(Arc::new(transport));
-    server_config
+    Ok(server_config)
 }
 
 /// Spawn the QUIC listener on the given address.
 /// Runs in a background tokio task, accepting connections forever.
+/// Returns a `String` error on configuration / bind failures so the caller
+/// can surface a `ZionError::{Tls,Listener}` instead of aborting the daemon.
 pub fn spawn_quic_listener(
     addr: SocketAddr,
     tls: &TlsConfig,
     state: Arc<crate::AppState>,
     reload_rx: Option<tokio::sync::watch::Receiver<Option<Arc<rustls::ServerConfig>>>>,
-) {
-    let server_config = build_quinn_server_config(tls);
+) -> Result<(), String> {
+    let server_config = build_quinn_server_config(tls)?;
 
     let endpoint = quinn::Endpoint::server(server_config, addr)
-        .unwrap_or_else(|e| panic!("Failed to bind QUIC on {addr}: {e}"));
+        .map_err(|e| format!("bind QUIC on {addr}: {e}"))?;
 
     eprintln!("  listening HTTP/3 (QUIC) on {addr}");
 
@@ -97,9 +101,19 @@ pub fn spawn_quic_listener(
         tokio::spawn(async move {
             while rx.changed().await.is_ok() {
                 if let Some(arc_config) = rx.borrow().clone() {
-                    let new_quinn_cfg = quinn_server_config_from_rustls(arc_config);
-                    endpoint_clone.set_server_config(Some(new_quinn_cfg));
-                    eprintln!("  h3: certificates hot-reloaded.");
+                    match quinn_server_config_from_rustls(arc_config) {
+                        Ok(new_quinn_cfg) => {
+                            endpoint_clone.set_server_config(Some(new_quinn_cfg));
+                            eprintln!("  h3: certificates hot-reloaded.");
+                        }
+                        Err(e) => {
+                            // Non-fatal — keep the previous config running.
+                            crate::logging::warn(
+                                "quic",
+                                &format!("hot-reload rejected: {e}; keeping previous config"),
+                            );
+                        }
+                    }
                 }
             }
         });
@@ -172,6 +186,8 @@ pub fn spawn_quic_listener(
             });
         }
     });
+
+    Ok(())
 }
 
 /// Send an H3 error response.
@@ -190,6 +206,10 @@ async fn h3_error_response<S>(
 where
     S: h3::quic::BidiStream<Bytes>,
 {
+    // INVARIANT: a fresh `Response::builder()` configured only with a
+    // valid `StatusCode` and a unit body never fails to build — `body()`
+    // returns `Err` only when the builder accumulated a header parse
+    // error, which we don't introduce here.
     let resp = hyper::Response::builder().status(status).body(()).unwrap();
     stream.send_response(resp).await?;
     stream.finish().await?;
@@ -256,6 +276,8 @@ where
         Err(_) => {
             // Fail safe on generic HTTP internal pipeline errors
             crate::metrics::METRICS.record_status(500);
+            // INVARIANT: builder configured with a single static StatusCode and
+            // a unit body never fails — same rationale as the helper above.
             let err_resp = hyper::Response::builder()
                 .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
                 .body(())
@@ -286,6 +308,8 @@ where
         }
     }
 
+    // INVARIANT: hop-by-hop headers were filtered above; remaining headers
+    // came from a successfully-built `Response`, so `body(())` cannot fail.
     let h3_resp = h3_resp_builder.body(()).unwrap();
     send_stream.send_response(h3_resp).await?;
 

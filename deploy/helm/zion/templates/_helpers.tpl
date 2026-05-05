@@ -47,3 +47,16 @@ Selector labels
 app.kubernetes.io/name: {{ include "zion.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+
+{{/*
+Service account name to use. Honours .Values.serviceAccount.name when
+explicitly set; otherwise derives from the release name. The default
+chart auto-creates the SA so you don't need a separate manifest.
+*/}}
+{{- define "zion.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create -}}
+{{- default (include "zion.fullname" .) .Values.serviceAccount.name -}}
+{{- else -}}
+{{- default "default" .Values.serviceAccount.name -}}
+{{- end -}}
+{{- end }}

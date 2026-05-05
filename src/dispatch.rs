@@ -122,6 +122,9 @@ pub(crate) async fn process_request(
     // methods (GET/HEAD) are safe — state-changing methods could be replayed
     // by a network adversary capturing the ClientHello + early data.
     if is_early_data && !matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD) {
+        // SAFETY: 425 "Too Early" (RFC 8470) is a valid HTTP status code in
+        // the 100..1000 range that hyper accepts. The literal `425` is a
+        // compile-time constant; `from_u16` rejects only out-of-range u16s.
         return Ok(empty_response(StatusCode::from_u16(425).unwrap()));
     }
 
@@ -333,6 +336,11 @@ pub(crate) async fn process_request(
             }
         };
 
+    // SAFETY (inner unwrap): "/" is a compile-time-constant single-char URI
+    // that always parses successfully. Used as a defensive fallback when the
+    // configured upstream URL fails to parse — a config-validation error
+    // that should have been caught at boot, but keeping this as a runtime
+    // soft fallback prevents a panic if a hot-reload sneaks in a bad URL.
     let target_uri: hyper::Uri = target_upstream_url
         .parse()
         .unwrap_or_else(|_| "/".parse().unwrap());

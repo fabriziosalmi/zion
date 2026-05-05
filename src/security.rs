@@ -547,3 +547,83 @@ mod proxy_tests {
         assert_eq!(tp.resolve_client_ip(socket, Some("8.8.8.8")), expected);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Property-based tests (Track C). Drive the rate-limiter and the trusted-
+// proxy resolver with arbitrary inputs to surface invariants the hand-rolled
+// tests above might miss. Kept in a dedicated module so a CI failure here
+// is visibly distinct from a unit-test failure.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    proptest! {
+        // The rate-limiter must never permit more than `rps` admits within
+        // a single one-second window for the same IP, regardless of how many
+        // requests we throw at it. The packed `(window, count)` u64 makes
+        // window-flip races particularly tricky to reason about; this
+        // property exercises the boundary repeatedly.
+        #[test]
+        fn rate_limiter_caps_at_rps_within_window(
+            rps in 1u32..=100,
+            burst in 1usize..=500,
+        ) {
+            let map = dashmap::DashMap::new();
+            let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
+            let mut allowed = 0;
+            for _ in 0..burst {
+                if check_rate_limit(rps, 1, &map, ip) {
+                    allowed += 1;
+                }
+            }
+            // Within a single 1-second window we cannot admit more than
+            // `rps` requests. We allow equality (exactly rps admits), never
+            // strictly more — that would be a counter race.
+            prop_assert!(
+                allowed <= rps as usize,
+                "rps={rps}, burst={burst}, allowed={allowed}"
+            );
+        }
+
+        // With rps = 0 (disabled) every request must be admitted, regardless
+        // of burst size — the gate is documented as zero-overhead when off.
+        #[test]
+        fn rate_limiter_disabled_admits_everything(burst in 1usize..=10_000) {
+            let map = dashmap::DashMap::new();
+            let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 2).into();
+            for _ in 0..burst {
+                prop_assert!(check_rate_limit(0, 1, &map, ip));
+            }
+        }
+
+        // Distinct IPs MUST be counted independently. Saturating one IP
+        // never affects another. (This is the "noisy neighbour" property.)
+        #[test]
+        fn rate_limiter_isolates_ips(
+            rps in 1u32..=20,
+            burst_a in 1usize..=200,
+            burst_b in 1usize..=200,
+        ) {
+            let map = dashmap::DashMap::new();
+            let ip_a: IpAddr = Ipv4Addr::new(10, 0, 0, 3).into();
+            let ip_b: IpAddr = Ipv4Addr::new(10, 0, 0, 4).into();
+            let mut allowed_a = 0;
+            let mut allowed_b = 0;
+            for _ in 0..burst_a {
+                if check_rate_limit(rps, 1, &map, ip_a) {
+                    allowed_a += 1;
+                }
+            }
+            for _ in 0..burst_b {
+                if check_rate_limit(rps, 1, &map, ip_b) {
+                    allowed_b += 1;
+                }
+            }
+            prop_assert!(allowed_a <= rps as usize);
+            prop_assert!(allowed_b <= rps as usize);
+        }
+    }
+}

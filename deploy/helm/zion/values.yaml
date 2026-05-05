@@ -1,9 +1,23 @@
+# Zion Edge Gateway — Helm values.
+#
+# Defaults are conservative-secure:
+#   - Distroless image @ UID/GID 65532, no shell, no SUID.
+#   - readOnlyRootFilesystem with an emptyDir for /var/lib/zion (ACME state).
+#   - All Linux capabilities dropped; seccomp = RuntimeDefault.
+#   - automountServiceAccountToken disabled (no Kubernetes API access from the pod).
+#   - PodDisruptionBudget protecting at least one replica during voluntary disruptions.
+#   - NetworkPolicy in default-deny mode for both ingress and egress; the chart
+#     opens 80/443 on ingress and the named upstream egress block on egress.
+#
+# Override anything in this file via `helm install -f my-values.yaml`.
+
 replicaCount: 2
 
 image:
-  repository: fabriziosalmi/zion
+  repository: ghcr.io/fabriziosalmi/zion
   pullPolicy: IfNotPresent
-  tag: "v0.1.6"
+  # Empty = inherit Chart.appVersion (kept in sync by CI).
+  tag: ""
 
 imagePullSecrets: []
 nameOverride: ""
@@ -11,24 +25,53 @@ fullnameOverride: ""
 
 serviceAccount:
   create: true
+  # Pods do not need K8s API access. Disabling the automount removes the
+  # token from the pod filesystem entirely (CIS K8s 5.1.5).
+  automountServiceAccountToken: false
   annotations: {}
   name: ""
 
-podAnnotations: {}
-podSecurityContext: {}
+# Pod-level security context. Mirrors the distroless image's UID/GID and
+# pins fsGroup so emptyDir / projected volumes are owned by the same user
+# the binary runs as. seccompProfile = RuntimeDefault enables the kernel's
+# stock syscall filter without requiring a custom profile.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
 
+# Container-level security context. Distroless already satisfies most of
+# this, but K8s admission webhooks (PSA / OPA / Kyverno) generally check
+# the explicit fields here.
 securityContext:
-  capabilities:
-    drop:
-    - ALL
+  allowPrivilegeEscalation: false
   readOnlyRootFilesystem: true
   runAsNonRoot: true
-  runAsUser: 1000
+  runAsUser: 65532
+  runAsGroup: 65532
+  capabilities:
+    drop:
+      - ALL
+    # Uncomment ONE of these only if you actually bind 80/443 (< 1024)
+    # without an upstream LB doing it for you. Most production setups
+    # terminate the privileged port at the LB and target an unprivileged
+    # containerPort here, so this stays empty.
+    # add:
+    #   - NET_BIND_SERVICE
+
+podAnnotations: {}
+podLabels: {}
 
 service:
   type: LoadBalancer
   portHttp: 80
   portHttps: 443
+  # Annotations for cloud LB (e.g. NLB on AWS, GCLB on GCP). Empty by default.
+  annotations: {}
 
 ingress:
   enabled: false
@@ -41,12 +84,14 @@ ingress:
           pathType: ImplementationSpecific
   tls: []
 
+# Tight enough to spot regressions, loose enough to absorb load spikes.
+# Override per environment.
 resources:
   requests:
     cpu: 250m
     memory: 256Mi
   limits:
-    cpu: 1000m
+    cpu: "1"
     memory: 512Mi
 
 autoscaling:
@@ -56,11 +101,80 @@ autoscaling:
   targetCPUUtilizationPercentage: 80
   targetMemoryUtilizationPercentage: 80
 
+# Schedule replicas across zones (or hostnames if zones aren't labeled).
+# `whenUnsatisfiable: ScheduleAnyway` keeps the pods schedulable on
+# clusters that don't expose a topology label.
+topologySpread:
+  enabled: true
+  topologyKey: topology.kubernetes.io/zone
+  maxSkew: 1
+  whenUnsatisfiable: ScheduleAnyway
+
+# Voluntary-disruption budget. With replicaCount >= 2 (the default) at
+# least one pod is always available during rolling drains.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+  # If you prefer percentages: set `maxUnavailable: 50%` and unset minAvailable.
+  maxUnavailable: ""
+
+# Default-deny NetworkPolicy. Override `egress.upstreams` to match the
+# CIDRs / namespaces / labels of the services Zion proxies to. Egress
+# DNS (kube-system / 53) is allowed by default so cluster-internal DNS
+# resolution still works.
+networkPolicy:
+  enabled: true
+  # Pod selector for ingress sources. Empty = allow from anywhere on
+  # the listed ports (typical for an edge proxy).
+  ingress:
+    fromAll: true
+    fromNamespaces: []
+    fromPodSelectors: []
+  egress:
+    # By default we only allow DNS (kube-system :53) and explicit
+    # upstream blocks below. Add CIDRs / namespace selectors here.
+    upstreams: []
+    # CIDRs for off-cluster upstreams (e.g. SaaS APIs).
+    cidrs: []
+
+# Probe tuning. Conservative defaults — bump initial / failure thresholds
+# if the daemon is slow to start because of ACME bootstrap.
+probes:
+  startup:
+    enabled: true
+    httpGet:
+      path: /healthz
+      port: http
+    failureThreshold: 30
+    periodSeconds: 1
+  liveness:
+    httpGet:
+      path: /healthz
+      port: http
+    initialDelaySeconds: 2
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    httpGet:
+      path: /readyz
+      port: http
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+
 nodeSelector: {}
 tolerations: []
 affinity: {}
 
-# Zion Configuration
+# Volumes. /var/lib/zion is created as an emptyDir so the ACME renewal
+# subsystem (which writes account.json + cert.pem) works under
+# readOnlyRootFilesystem: true. Size is small — ACME state is bytes.
+varlib:
+  sizeLimit: 16Mi
+
+# Zion configuration — projected as a ConfigMap and mounted at /etc/zion.
 config:
   listen_http: "0.0.0.0:80"
   listen_https: "0.0.0.0:443"
@@ -69,3 +183,12 @@ config:
   # key_path: "/etc/ssl/zion/tls.key"
   upstreams: {}
   routes: []
+
+# Optional: seal the audit-log HMAC key into a Kubernetes Secret. The
+# chart sets ZION_AUDIT_HMAC_KEY from this secret when `audit.enabled`.
+audit:
+  enabled: false
+  # Secret name + key. Operator creates the Secret out of band.
+  hmacKey:
+    secretName: ""
+    secretKey: hmac-key

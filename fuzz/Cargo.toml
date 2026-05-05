@@ -1,0 +1,57 @@
+[package]
+name = "zion-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Cargo-fuzz integration. This is a *workspace member-style* sibling crate
+# (the `[workspace]` block at repo root excludes it because cargo-fuzz wants
+# its own resolver). To run a fuzz target locally:
+#
+#   rustup install nightly                      # cargo-fuzz needs nightly
+#   cargo install --locked cargo-fuzz
+#   cd fuzz
+#   cargo +nightly fuzz run traceparent_parser  # or any other target name
+#
+# CI does NOT run the fuzzers — it only builds them
+# (.github/workflows/fuzz.yml) so a regression to the harness itself fails
+# fast. Long-running fuzz campaigns happen on a dedicated runner and out
+# of band, with crash artifacts persisted to `fuzz/artifacts/`.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Re-used by the audit_chain_verify target — the parent crate already
+# pulls these in transitively, but cargo-fuzz needs them as direct deps.
+aws-lc-rs = "1"
+serde_json = "1"
+
+# Bring in the public Zion library surface (defined in `src/lib.rs`).
+# Path-only dep — fuzz harnesses never reach for the binary's private
+# dispatch / hyper plumbing.
+[dependencies.zion]
+path = ".."
+default-features = false
+
+[[bin]]
+name = "traceparent_parser"
+path = "fuzz_targets/traceparent_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_query_string"
+path = "fuzz_targets/redact_query_string.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_chain_verify"
+path = "fuzz_targets/audit_chain_verify.rs"
+test = false
+doc = false
+bench = false

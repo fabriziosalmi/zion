@@ -1,6 +1,34 @@
 apiVersion: v2
 name: zion
-description: A Helm chart for Zion Edge Gateway, the Zero-Alloc TLS Reverse Proxy
+description: Zion Edge Gateway — high-performance Rust TLS reverse proxy with WAF
 type: application
-version: 0.1.6
-appVersion: "0.1.6"
+version: 0.2.0
+appVersion: "0.1.8"
+home: https://fabriziosalmi.github.io/zion
+sources:
+  - https://github.com/fabriziosalmi/zion
+maintainers:
+  - name: Fabrizio Salmi
+keywords:
+  - proxy
+  - tls
+  - waf
+  - reverse-proxy
+  - http3
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/changes: |
+    - kind: changed
+      description: Bump appVersion to 0.1.8 (matches the binary)
+    - kind: added
+      description: PodDisruptionBudget (minAvailable: 1)
+    - kind: added
+      description: Default-deny NetworkPolicy with explicit ingress + egress allowlists
+    - kind: added
+      description: Strict pod-level securityContext (seccomp RuntimeDefault, no NET_RAW, no SYS_ADMIN)
+    - kind: added
+      description: Tighter probe semantics (startupProbe + tunable timeouts)
+    - kind: added
+      description: emptyDir volume for /var/lib/zion (ACME state) — works with readOnlyRootFilesystem
+    - kind: added
+      description: topologySpreadConstraints + dedicated ServiceAccount (no automount)

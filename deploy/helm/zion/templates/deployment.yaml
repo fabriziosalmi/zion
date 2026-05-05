@@ -11,11 +11,41 @@ spec:
   selector:
     matchLabels:
       {{- include "zion.selectorLabels" . | nindent 6 }}
+  strategy:
+    # Keep at least one pod serving during a rolling restart.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   template:
     metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       labels:
         {{- include "zion.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
+      serviceAccountName: {{ include "zion.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken | default false }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.topologySpread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.topologySpread.maxSkew }}
+          topologyKey: {{ .Values.topologySpread.topologyKey }}
+          whenUnsatisfiable: {{ .Values.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "zion.selectorLabels" . | nindent 14 }}
+      {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
@@ -25,6 +55,15 @@ spec:
           env:
             - name: ZION_CONFIG
               value: /etc/zion/zion.toml
+            {{- if and .Values.audit.enabled .Values.audit.hmacKey.secretName }}
+            - name: ZION_AUDIT_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.audit.hmacKey.secretName }}
+                  key: {{ .Values.audit.hmacKey.secretKey }}
+            {{- end }}
+            - name: ZION_LAST_GASP_PATH
+              value: /var/lib/zion/last_panic.jsonl
           ports:
             - name: http
               containerPort: 80
@@ -35,27 +74,38 @@ spec:
             - name: quic
               containerPort: 443
               protocol: UDP
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            {{- toYaml (omit .Values.probes.startup "enabled") | nindent 12 }}
+          {{- end }}
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: http
-            initialDelaySeconds: 2
-            periodSeconds: 10
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
           readinessProbe:
-            httpGet:
-              path: /readyz
-              port: http
-            initialDelaySeconds: 2
-            periodSeconds: 10
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
             - name: config-volume
               mountPath: /etc/zion
+              readOnly: true
+            # /var/lib/zion holds ACME state + the panic last-gasp file.
+            # Required as a writable mount because the rest of the FS is
+            # read-only (.Values.securityContext.readOnlyRootFilesystem).
+            - name: zion-state
+              mountPath: /var/lib/zion
+            # /tmp may be needed by transient buffers; keep small.
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: config-volume
           configMap:
             name: {{ include "zion.fullname" . }}
+        - name: zion-state
+          emptyDir:
+            sizeLimit: {{ .Values.varlib.sizeLimit }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

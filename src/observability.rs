@@ -214,7 +214,11 @@ pub enum LogFormat {
 }
 
 impl LogFormat {
-    pub fn from_str(s: &str) -> Self {
+    /// Parse the `[server.log_format]` config string. Renamed from
+    /// `from_str` to avoid colliding with `std::str::FromStr` (which
+    /// would force `Result` semantics we don't want — bad input
+    /// silently falls back to `Text` rather than refusing to start).
+    pub fn parse_or_text(s: &str) -> Self {
         match s {
             "json" => Self::Json,
             _ => Self::Text,
@@ -568,5 +572,75 @@ mod tests {
         assert!(text.contains("zion_audit_events_dropped_total"));
         assert!(text.contains("zion_traces_emitted_total"));
         assert!(text.contains("zion_traces_invalid_total"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Property-based tests: the W3C parser must never panic on arbitrary bytes,
+// and a generate→parse roundtrip must be the identity for any valid input.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // Anti-panic: the parser is exposed to client-supplied header bytes
+        // on the request hot path. It must return Some(...) or None for
+        // every input — never panic, never deadlock.
+        #[test]
+        fn parse_traceparent_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
+            let _ = parse_traceparent(&bytes);
+        }
+
+        // Roundtrip: hex-encode a non-zero trace ID and span ID, build a
+        // canonical traceparent, parse it back. The bytes must match.
+        #[test]
+        fn roundtrip_canonical_traceparent(
+            trace in any::<[u8; 16]>(),
+            span in any::<[u8; 8]>(),
+            flags in any::<u8>(),
+        ) {
+            // Skip degenerate inputs the spec rejects.
+            prop_assume!(trace.iter().any(|&b| b != 0));
+            prop_assume!(span.iter().any(|&b| b != 0));
+
+            const LUT: &[u8; 16] = b"0123456789abcdef";
+            let mut buf = Vec::with_capacity(55);
+            buf.extend_from_slice(b"00-");
+            for &b in &trace {
+                buf.push(LUT[(b >> 4) as usize]);
+                buf.push(LUT[(b & 0xF) as usize]);
+            }
+            buf.push(b'-');
+            for &b in &span {
+                buf.push(LUT[(b >> 4) as usize]);
+                buf.push(LUT[(b & 0xF) as usize]);
+            }
+            buf.push(b'-');
+            buf.push(LUT[(flags >> 4) as usize]);
+            buf.push(LUT[(flags & 0xF) as usize]);
+
+            let parsed = parse_traceparent(&buf).expect("canonical encoding must parse");
+            prop_assert_eq!(parsed.trace_id, trace);
+            prop_assert_eq!(parsed.span_id, span);
+            prop_assert_eq!(parsed.flags, flags);
+            prop_assert_eq!(parsed.is_sampled(), flags & 0x01 != 0);
+        }
+
+        // No panic when the JSON-escape helper meets arbitrary Unicode.
+        #[test]
+        fn json_escape_never_panics(s in ".*") {
+            let _ = json_escape(&s);
+        }
+
+        // Idempotence: escaping an already-escaped string further-escapes
+        // backslashes and quotes. Specifically: the *length* never decreases.
+        #[test]
+        fn json_escape_monotonic_in_length(s in "[ -~]{0,64}") {
+            let once = json_escape(&s);
+            let twice = json_escape(&once);
+            prop_assert!(twice.len() >= once.len());
+        }
     }
 }

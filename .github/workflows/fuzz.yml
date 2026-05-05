@@ -1,0 +1,70 @@
+# Fuzz — build-only verification of the cargo-fuzz harnesses.
+#
+# This workflow does NOT run actual fuzzing campaigns. Long-running fuzz
+# is out of scope for PR / push CI; we run it on a dedicated runner with a
+# persistent corpus volume. What we DO want to catch in CI is the harness
+# bit-rotting against the public Zion library surface — a renamed function
+# or removed pub item should fail this job.
+#
+# To run a target locally:
+#   rustup install nightly
+#   cargo install --locked cargo-fuzz
+#   cd fuzz && cargo +nightly fuzz run traceparent_parser
+#
+# Targets:
+#   - traceparent_parser: W3C parser, panic & invariant checks
+#   - redact_query_string: PII redactor, panic & pair-count check
+#   - audit_chain_verify : HMAC signing determinism
+
+name: fuzz
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "fuzz/**"
+      - "src/observability.rs"
+      - "src/audit.rs"
+      - "src/lib.rs"
+      - ".github/workflows/fuzz.yml"
+  pull_request:
+    branches: [master]
+    paths:
+      - "fuzz/**"
+      - "src/observability.rs"
+      - "src/audit.rs"
+      - "src/lib.rs"
+      - ".github/workflows/fuzz.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  build:
+    name: cargo-fuzz build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # cargo-fuzz requires nightly because libfuzzer-sys uses unstable
+      # rustc internals for its #[no_main] runtime. We don't run fuzz
+      # campaigns here — only verify the harness compiles.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz
+          workspaces: "fuzz -> target"
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+      - name: Build all fuzz targets
+        # `cargo fuzz build` compiles every `[[bin]]` in fuzz/Cargo.toml
+        # under the libfuzzer sanitizer. A signature drift in the public
+        # zion library breaks this step.
+        run: cargo +nightly fuzz build --fuzz-dir fuzz

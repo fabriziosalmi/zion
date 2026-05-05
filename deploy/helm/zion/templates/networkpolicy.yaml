@@ -1,0 +1,77 @@
+{{- if .Values.networkPolicy.enabled -}}
+# Default-deny + explicit allowlists. Without this NetworkPolicy a Zion
+# pod can reach anything in the cluster and on the internet — that's
+# fine for a dev cluster but not for production. Override
+# `networkPolicy.egress.upstreams` and `networkPolicy.egress.cidrs` to
+# match your routes.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "zion.fullname" . }}
+  labels:
+    {{- include "zion.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "zion.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - {{- if .Values.networkPolicy.ingress.fromAll }}
+      # Edge proxy: ingress from anywhere on the published ports. Override
+      # `networkPolicy.ingress.fromAll: false` and supply selectors below
+      # for east-west-only deployments.
+      from: []
+      {{- else }}
+      from:
+        {{- with .Values.networkPolicy.ingress.fromNamespaces }}
+        {{- range . }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+        {{- end }}
+        {{- end }}
+        {{- with .Values.networkPolicy.ingress.fromPodSelectors }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+        - protocol: UDP
+          port: 443
+  egress:
+    # DNS — required for upstream hostname resolution.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- with .Values.networkPolicy.egress.upstreams }}
+    # Cluster-internal upstreams. Each item is a {namespaceSelector,
+    # podSelector, ports} triple expressed as a NetworkPolicyEgressRule.
+    {{- range . }}
+    - {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- end }}
+    {{- with .Values.networkPolicy.egress.cidrs }}
+    # Off-cluster upstreams (SaaS APIs, ACME servers).
+    - to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+    {{- end }}
+{{- end }}

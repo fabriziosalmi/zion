@@ -367,7 +367,12 @@ pub async fn proxy_websocket(
         });
         let connector = tokio_rustls::TlsConnector::from(tls_config.clone());
 
-        // SNI: use the hostname from the authority (without port)
+        // SNI: use the hostname from the authority (without port).
+        // SAFETY (inner unwrap): `"localhost"` is a compile-time-constant
+        // valid DNS name accepted by `ServerName::try_from`. The inner
+        // unwrap can only trip if rustls' DNS-name validator changes its
+        // grammar to reject a literal we've shipped for the last decade —
+        // which would be a downstream API break, not a runtime concern.
         let server_name = rustls::pki_types::ServerName::try_from(authority.host().to_string())
             .unwrap_or_else(|_| {
                 rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
