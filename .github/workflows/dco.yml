@@ -4,11 +4,18 @@ on:
   pull_request:
     branches: [master]
 
+# Default token gets read-only access to repository contents. The job below
+# only needs git history to walk commits and check for sign-off — no writes.
+permissions:
+  contents: read
+
 jobs:
   dco-check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 

@@ -19,7 +19,7 @@
 # Pinned to match rust-toolchain.toml. MSRV (Cargo.toml rust-version=1.82)
 # only applies to the no-default-features build; this image bakes a full
 # default-features binary so we need the same compiler we ship with.
-FROM --platform=$BUILDPLATFORM rust:1.88-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
 
 # Build arg flowed through by `docker buildx build --platform=...`.
 # Lets us cross-compile on the native runner architecture.
@@ -72,7 +72,7 @@ RUN mkdir -p /out/var/lib/zion && \
 # `nonroot` (UID 65532). For a fully static binary use a separate target
 # (linux-musl) and ship via gcr.io/distroless/static — that path is taken
 # by the CI release workflow when building from the precompiled musl artifact.
-FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:e2d29aec8061843706b7e484c444f78fafb05bfe47745505252b1769a05d14f1 AS runtime
 
 # Re-declare so labels can interpolate it.
 ARG SOURCE_DATE_EPOCH=0

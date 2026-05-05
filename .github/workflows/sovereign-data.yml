@@ -7,15 +7,21 @@ on:
   workflow_dispatch:
     # Manual trigger for immediate refresh
 
+# Top-level: read-only by default. Write scopes are granted per-job
+# below (only `refresh-ita` actually needs them, and only to push a
+# branch + open a PR). Scopes any future job we add will start at
+# read-only and have to opt in.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   refresh-ita:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write       # push the auto-generated branch
+      pull-requests: write  # open the refresh PR
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
     - name: Download RIPE NCC RIS dump (IT country)
       run: |
