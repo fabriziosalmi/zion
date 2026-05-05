@@ -13,12 +13,27 @@ use std::time::Duration;
 ///
 /// Bucket boundaries (ms): 1, 2, 4, 8, 16, 32, 64, 128, 256, 512,
 ///                         1024, 2048, 4096, 8192, 16384, 32768, +Inf
+///
+/// **Exemplars (OpenMetrics).** Each bucket optionally carries the *latest*
+/// observation seen as an OpenMetrics exemplar — the trace ID, the observed
+/// value, and the wall-clock timestamp. Stored as a `[AtomicU64; 4]` per
+/// bucket: `[trace_id_hi, trace_id_lo, value_us, ts_ms]`. A zero trace_id
+/// means "no exemplar" and the renderer omits the line.
+///
+/// We update *unconditionally* on each observe, not at a sample rate — the
+/// cost is 4 relaxed stores (already cache-warm from the bucket increment),
+/// and overwriting always-keeps-latest is exactly the OpenMetrics
+/// recommended behaviour for "the most recent slow request" use case.
 pub struct LatencyHistogram {
     /// 16 non-cumulative (differential) buckets + overflow.
     /// Each bucket stores only the count for that exact range.
     /// Cumulative sums are computed in render() (1x/sec, not 200K/sec).
     /// This reduces observe() from 17 atomics to 3.
     buckets: [AtomicU64; 17],
+    /// Per-bucket latest exemplar.
+    ///   [trace_id_hi, trace_id_lo, value_us, ts_ms]
+    /// trace_id_hi == 0 && trace_id_lo == 0  ⇒  no exemplar.
+    exemplars: [[AtomicU64; 4]; 17],
     /// Running sum in microseconds (for computing mean)
     sum_us: AtomicU64,
     /// Total observation count
@@ -39,26 +54,18 @@ const BUCKET_BOUNDS_SEC: [f64; 16] = [
 
 impl LatencyHistogram {
     pub const fn new() -> Self {
+        // Both arrays are length 17. Rust does not yet const-init [T; N] from
+        // a closure, but `[const { ... }; 17]` works for AtomicU64.
         Self {
-            buckets: [
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0), // +Inf
-            ],
+            buckets: [const { AtomicU64::new(0) }; 17],
+            exemplars: [const {
+                [
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                ]
+            }; 17],
             sum_us: AtomicU64::new(0),
             count: AtomicU64::new(0),
         }
@@ -96,6 +103,32 @@ impl LatencyHistogram {
     /// Only 3 atomic ops per observation (was 17 with cumulative buckets).
     #[inline]
     pub fn observe(&self, duration: Duration) {
+        self.observe_inner(duration, None);
+    }
+
+    /// Record an observation and bind it to an OpenMetrics exemplar (the
+    /// 16-byte trace ID of the request that produced it). The bucket the
+    /// observation falls into stores the trace ID + value + wall-clock
+    /// timestamp, atomically overwriting whatever was there before. Exposed
+    /// at scrape time as `# {trace_id="..."} value timestamp`.
+    ///
+    /// Always-write (vs sampled) is intentional: the marginal cost is 4
+    /// relaxed stores already on a cache line we just touched, and
+    /// "latest slow request per bucket" is the workflow this is built for.
+    #[inline]
+    pub fn observe_with_trace(&self, duration: Duration, trace_id: [u8; 16]) {
+        // Treat all-zero trace ID as "no exemplar available" so we don't
+        // emit garbage when the trace context is invalid/missing.
+        let opt = if trace_id.iter().all(|&b| b == 0) {
+            None
+        } else {
+            Some(trace_id)
+        };
+        self.observe_inner(duration, opt);
+    }
+
+    #[inline]
+    fn observe_inner(&self, duration: Duration, trace_id: Option<[u8; 16]>) {
         let us = duration.as_micros() as u64;
         self.sum_us.fetch_add(us, Relaxed);
         self.count.fetch_add(1, Relaxed);
@@ -109,6 +142,31 @@ impl LatencyHistogram {
         // Non-cumulative: increment only the target bucket.
         // Cumulative sums computed in render() (once per scrape, not per request).
         self.buckets[idx].fetch_add(1, Relaxed);
+
+        if let Some(tid) = trace_id {
+            // Pack the 16-byte trace ID into two u64s (big-endian — matches
+            // the on-the-wire hex serialization order).
+            let hi = u64::from_be_bytes([
+                tid[0], tid[1], tid[2], tid[3], tid[4], tid[5], tid[6], tid[7],
+            ]);
+            let lo = u64::from_be_bytes([
+                tid[8], tid[9], tid[10], tid[11], tid[12], tid[13], tid[14], tid[15],
+            ]);
+            let ts_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            // Order matters for readers: write trace_id atoms first, value
+            // and ts last. A scraper racing with a writer can at worst
+            // observe a stale (trace, value, ts) triple, never a torn ID.
+            // We accept the unlikely race — exemplars are observability,
+            // not invariants.
+            let slot = &self.exemplars[idx];
+            slot[0].store(hi, Relaxed);
+            slot[1].store(lo, Relaxed);
+            slot[2].store(us, Relaxed);
+            slot[3].store(ts_ms, Relaxed);
+        }
     }
 
     /// Render Prometheus histogram lines. Zero-alloc using BytesMut/itoa/ryu.
@@ -134,6 +192,10 @@ impl LatencyHistogram {
             out.extend_from_slice(ryu_buf.format(bound).as_bytes());
             out.extend_from_slice(b"\"} ");
             out.extend_from_slice(itoa_buf.format(cumulative).as_bytes());
+            // OpenMetrics exemplar: only emit when the slot is populated.
+            // The trailing newline goes after the optional exemplar so a
+            // single bucket line is one logical record.
+            self.render_exemplar(i, &mut itoa_buf, &mut ryu_buf, out);
             out.extend_from_slice(b"\n");
         }
 
@@ -141,6 +203,7 @@ impl LatencyHistogram {
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(b"_bucket{le=\"+Inf\"} ");
         out.extend_from_slice(itoa_buf.format(cumulative).as_bytes());
+        self.render_exemplar(16, &mut itoa_buf, &mut ryu_buf, out);
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(name.as_bytes());
@@ -156,6 +219,64 @@ impl LatencyHistogram {
         out.extend_from_slice(b"_count ");
         out.extend_from_slice(itoa_buf.format(self.count.load(Relaxed)).as_bytes());
         out.extend_from_slice(b"\n");
+    }
+
+    /// Append the OpenMetrics exemplar suffix for `bucket_idx`, or nothing
+    /// if the slot is empty. Format (without leading space):
+    ///   `# {trace_id="<hex>"} <value_seconds> <unix_seconds_with_ms>`
+    /// per OpenMetrics §3.3 "Exemplars".
+    fn render_exemplar(
+        &self,
+        bucket_idx: usize,
+        itoa_buf: &mut itoa::Buffer,
+        ryu_buf: &mut ryu::Buffer,
+        out: &mut bytes::BytesMut,
+    ) {
+        let slot = &self.exemplars[bucket_idx];
+        let hi = slot[0].load(Relaxed);
+        let lo = slot[1].load(Relaxed);
+        if hi == 0 && lo == 0 {
+            return; // no exemplar recorded
+        }
+        let value_us = slot[2].load(Relaxed);
+        let ts_ms = slot[3].load(Relaxed);
+
+        // Render trace_id as 32 lowercase hex digits.
+        out.extend_from_slice(b" # {trace_id=\"");
+        let mut hex = [0u8; 32];
+        write_hex_u64_be(hi, &mut hex[0..16]);
+        write_hex_u64_be(lo, &mut hex[16..32]);
+        out.extend_from_slice(&hex);
+        out.extend_from_slice(b"\"} ");
+        // Value in seconds (ryu always emits a finite f64).
+        out.extend_from_slice(ryu_buf.format(value_us as f64 / 1_000_000.0).as_bytes());
+        out.extend_from_slice(b" ");
+        // Unix timestamp in seconds with millisecond precision.
+        // OpenMetrics expects a single decimal number — render as integer.fractional.
+        let secs = ts_ms / 1_000;
+        let ms = ts_ms % 1_000;
+        out.extend_from_slice(itoa_buf.format(secs).as_bytes());
+        out.extend_from_slice(b".");
+        // Pad to 3 digits.
+        if ms < 10 {
+            out.extend_from_slice(b"00");
+        } else if ms < 100 {
+            out.extend_from_slice(b"0");
+        }
+        out.extend_from_slice(itoa_buf.format(ms).as_bytes());
+    }
+}
+
+/// Render a `u64` as 16 lowercase hex chars (big-endian). Caller-owned
+/// buffer; `dst.len() == 16` is the invariant.
+#[inline]
+fn write_hex_u64_be(v: u64, dst: &mut [u8]) {
+    debug_assert_eq!(dst.len(), 16);
+    const LUT: &[u8; 16] = b"0123456789abcdef";
+    for i in 0..8 {
+        let b = (v >> (56 - i * 8)) as u8;
+        dst[i * 2] = LUT[(b >> 4) as usize];
+        dst[i * 2 + 1] = LUT[(b & 0x0F) as usize];
     }
 }
 
@@ -498,6 +619,11 @@ impl Metrics {
             &mut out,
         );
 
+        // Observability counters (panics, audit events, trace stats) live
+        // in their own module to avoid coupling the metrics renderer to
+        // tracing internals.
+        crate::observability::render_counters(&mut out);
+
         let b: bytes::Bytes = out.into();
 
         // Lock-free atomic cache update (ts + bytes as one unit)
@@ -725,6 +851,95 @@ mod tests {
         h.observe(Duration::from_micros(1500)); // 1.5ms
         h.observe(Duration::from_micros(2500)); // 2.5ms
         assert_eq!(h.sum_us.load(Relaxed), 4000); // 4ms total
+    }
+
+    #[test]
+    fn exemplar_emitted_when_observed_with_trace() {
+        let h = LatencyHistogram::new();
+        let trace_id = [
+            0x0a, 0xf7, 0x65, 0x19, 0x16, 0xcd, 0x43, 0xdd, 0x84, 0x48, 0xeb, 0x21, 0x1c, 0x80,
+            0x31, 0x9c,
+        ];
+        h.observe_with_trace(Duration::from_micros(1500), trace_id);
+        let mut buf = bytes::BytesMut::new();
+        h.render("xm", "exemplar test", &mut buf);
+        let out = String::from_utf8(buf.to_vec()).unwrap();
+        // The 1.5ms observation lands in the le="0.002" bucket.
+        // OpenMetrics format: bucket value + " # {trace_id=\"…\"} <s> <ts>".
+        assert!(
+            out.contains(r#"# {trace_id="0af7651916cd43dd8448eb211c80319c"}"#),
+            "expected exemplar with hex-encoded trace ID, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn exemplar_omitted_when_no_trace_provided() {
+        let h = LatencyHistogram::new();
+        h.observe(Duration::from_millis(5));
+        let mut buf = bytes::BytesMut::new();
+        h.render("xm", "no exemplar test", &mut buf);
+        let out = String::from_utf8(buf.to_vec()).unwrap();
+        assert!(
+            !out.contains("trace_id="),
+            "rendered no-exemplar bucket should not contain trace_id, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn exemplar_zero_trace_id_treated_as_none() {
+        let h = LatencyHistogram::new();
+        h.observe_with_trace(Duration::from_millis(5), [0u8; 16]);
+        let mut buf = bytes::BytesMut::new();
+        h.render("xm", "zero trace test", &mut buf);
+        let out = String::from_utf8(buf.to_vec()).unwrap();
+        assert!(
+            !out.contains("trace_id="),
+            "all-zero trace ID is invalid per W3C; must not be emitted as exemplar"
+        );
+    }
+
+    #[test]
+    fn exemplar_overwrites_with_latest() {
+        let h = LatencyHistogram::new();
+        let mut tid_a = [0u8; 16];
+        tid_a[0] = 0xaa;
+        let mut tid_b = [0u8; 16];
+        tid_b[0] = 0xbb;
+        h.observe_with_trace(Duration::from_micros(1500), tid_a);
+        h.observe_with_trace(Duration::from_micros(1500), tid_b); // same bucket
+        let mut buf = bytes::BytesMut::new();
+        h.render("xm", "overwrite test", &mut buf);
+        let out = String::from_utf8(buf.to_vec()).unwrap();
+        assert!(
+            out.contains("trace_id=\"bb"),
+            "newer exemplar must overwrite older one in the same bucket, got:\n{out}"
+        );
+        assert!(!out.contains("trace_id=\"aa"));
+    }
+
+    #[test]
+    fn exemplar_hex_lowercase_only() {
+        let h = LatencyHistogram::new();
+        let trace_id = [
+            0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22,
+            0x11, 0x00,
+        ];
+        h.observe_with_trace(Duration::from_micros(1500), trace_id);
+        let mut buf = bytes::BytesMut::new();
+        h.render("xm", "lowercase test", &mut buf);
+        let out = String::from_utf8(buf.to_vec()).unwrap();
+        assert!(out.contains(r#"trace_id="ffeeddccbbaa99887766554433221100""#));
+        // Sanity: no uppercase hex letters anywhere in the trace_id label.
+        let trace_section = &out[out.find("trace_id=\"").unwrap()..];
+        let end = trace_section.find('"').unwrap()
+            + 1
+            + trace_section[trace_section.find('"').unwrap() + 1..]
+                .find('"')
+                .unwrap();
+        let label = &trace_section[..=end];
+        for c in "ABCDEF".chars() {
+            assert!(!label.contains(c), "uppercase hex in {label}");
+        }
     }
 
     #[test]

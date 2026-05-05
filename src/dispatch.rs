@@ -1,5 +1,8 @@
+use crate::audit::AuditEvent;
 use crate::proxy::ZionBody;
-use crate::{cache, config, health, logging, metrics, proxy, security, waf, AppState};
+use crate::{
+    cache, config, health, logging, metrics, observability, proxy, security, waf, AppState,
+};
 use crate::{
     empty_response, generate_request_id, inject_security_headers, text_response, REQUEST_COUNTER,
 };
@@ -29,6 +32,46 @@ fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
         &state.rate_map,
         ip,
     )
+}
+
+/// Emit a `request_blocked` audit event when a WAF gate denies a request.
+/// Cheap: when the audit subsystem is disabled, the underlying
+/// `AuditHandle::emit` is a no-op and the only cost is a single Arc deref
+/// + a redact lookup.
+///
+/// Source labels:
+///   * `"uri"`     — pre-routing URI scan denied the path/query.
+///   * `"body"`    — body-bearing method (POST/PUT/PATCH/DELETE) failed validation.
+///   * `"headers"` — idempotent method (GET/HEAD/DELETE/OPTIONS) failed header validation.
+fn emit_waf_block(
+    state: &AppState,
+    remote_addr: &SocketAddr,
+    method: &str,
+    path: &str,
+    source: &'static str,
+    reason: &str,
+) {
+    // Apply path redaction — query params can carry secrets (auth=…, token=…).
+    // We only redact the query string; the path itself is rarely sensitive
+    // and an auditor needs it to investigate the rule firing.
+    let path_safe: String = match path.split_once('?') {
+        Some((p, q)) => {
+            let q_redacted = state.redact.redact_query_string(q);
+            format!("{p}?{q_redacted}")
+        }
+        None => path.to_string(),
+    };
+
+    state.audit.emit(AuditEvent {
+        seq: 0, // assigned by the writer task
+        ts: String::new(),
+        kind: "request_blocked",
+        trace_id: None,
+        remote_ip: Some(remote_addr.ip().to_string()),
+        method: Some(method.to_string()),
+        path: Some(path_safe),
+        detail: Some(format!("waf:{source}:{reason}")),
+    });
 }
 
 pub(crate) async fn process_request(
@@ -394,6 +437,7 @@ pub(crate) async fn process_request(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 metrics::METRICS.record_status(400);
                 logging::info("waf", &format!("URI denied: {reason} ({uri_str})"));
+                emit_waf_block(&state, &remote_addr, method, uri_str, "uri", &reason);
                 return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
             }
         }
@@ -441,6 +485,14 @@ pub(crate) async fn process_request(
                         .waf_denied
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     metrics::METRICS.record_status(400);
+                    emit_waf_block(
+                        &state,
+                        &remote_addr,
+                        method,
+                        parts.uri.path(),
+                        "body",
+                        &reason,
+                    );
                     return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
                 }
             }
@@ -479,6 +531,14 @@ pub(crate) async fn process_request(
                         .waf_denied
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     metrics::METRICS.record_status(400);
+                    emit_waf_block(
+                        &state,
+                        &remote_addr,
+                        method,
+                        req.uri().path(),
+                        "headers",
+                        &reason,
+                    );
                     return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
                 }
             }
@@ -517,9 +577,31 @@ pub(crate) async fn process_request(
     }
 
     // ── W3C Trace Context propagation ──
-    // Preserve incoming traceparent or generate a new one.
-    // Forward to upstream for distributed tracing (Jaeger, Tempo, etc.)
-    if !req.headers().contains_key("traceparent") {
+    // 1. If the client sent `traceparent`, validate it. A valid header is
+    //    propagated unchanged so end-to-end traces stitch in Tempo/Jaeger.
+    //    A malformed header is dropped (we replace with a freshly-generated
+    //    one) and `zion_traces_invalid_total` is bumped — we never forward
+    //    junk to upstreams.
+    // 2. If absent (or invalid), generate one with the same zero-alloc
+    //    stack-buffer scheme used historically.
+    //
+    // The 16-byte trace ID is captured into `trace_id_bytes` regardless,
+    // so the latency histogram can attach it as an OpenMetrics exemplar.
+    let trace_id_bytes: [u8; 16];
+    let inbound_valid = req
+        .headers()
+        .get("traceparent")
+        .and_then(|v| observability::parse_traceparent(v.as_bytes()));
+
+    if let Some(ctx) = inbound_valid {
+        trace_id_bytes = ctx.trace_id;
+    } else {
+        // Either no header, or the value was malformed. Bump the invalid
+        // counter only when a header was actually present.
+        if req.headers().contains_key("traceparent") {
+            observability::TRACES_INVALID_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // Generate: 00-{32hex trace_id}-{16hex span_id}-01
         // Zero-alloc: stack buffer + hex lookup table (no format! calls).
         let ts_us = std::time::SystemTime::now()
@@ -528,25 +610,26 @@ pub(crate) async fn process_request(
             .as_micros() as u64;
         let seq = REQUEST_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
 
+        // Build the trace ID once, in raw bytes — we both stringify it for
+        // the header and keep it for the exemplar.
+        let mut tid = [0u8; 16];
+        tid[0..8].copy_from_slice(&ts_us.to_be_bytes());
+        tid[8..16].copy_from_slice(&seq.to_be_bytes());
+        trace_id_bytes = tid;
+
         let mut buf = [0u8; 55]; // "00-" + 32hex + "-" + 16hex + "-01"
         buf[0..3].copy_from_slice(b"00-");
-        // trace_id: 16 hex from ts_us + 16 hex from seq = 32 hex
-        for i in 0..8 {
-            let b = (ts_us >> (56 - i * 8)) as u8;
-            buf[3 + i * 2] = crate::HEX_DIGITS[(b >> 4) as usize];
-            buf[3 + i * 2 + 1] = crate::HEX_DIGITS[(b & 0xF) as usize];
-        }
-        for i in 0..8 {
-            let b = (seq >> (56 - i * 8)) as u8;
-            buf[19 + i * 2] = crate::HEX_DIGITS[(b >> 4) as usize];
-            buf[19 + i * 2 + 1] = crate::HEX_DIGITS[(b & 0xF) as usize];
+        for (i, &byte) in tid.iter().enumerate() {
+            buf[3 + i * 2] = crate::HEX_DIGITS[(byte >> 4) as usize];
+            buf[3 + i * 2 + 1] = crate::HEX_DIGITS[(byte & 0xF) as usize];
         }
         buf[35] = b'-';
-        // span_id: 16 hex from seq
+        // span_id: same 8 trailing bytes — sequence is unique within a process
+        // for the lifetime of `REQUEST_COUNTER`. A future change can split
+        // span IDs from request IDs; for now they coincide.
         for i in 0..8 {
-            let b = (seq >> (56 - i * 8)) as u8;
-            buf[36 + i * 2] = crate::HEX_DIGITS[(b >> 4) as usize];
-            buf[36 + i * 2 + 1] = crate::HEX_DIGITS[(b & 0xF) as usize];
+            buf[36 + i * 2] = crate::HEX_DIGITS[(tid[8 + i] >> 4) as usize];
+            buf[36 + i * 2 + 1] = crate::HEX_DIGITS[(tid[8 + i] & 0xF) as usize];
         }
         buf[52..55].copy_from_slice(b"-01");
         // SAFETY: all bytes are ASCII hex, '-', or '0'/'1'
@@ -554,6 +637,7 @@ pub(crate) async fn process_request(
             req.headers_mut().insert("traceparent", val);
         }
     }
+    observability::TRACES_EMITTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Pre-extract X-Request-ID for response echo (before req is consumed)
     let request_id_val = req.headers().get("X-Request-ID").cloned();
@@ -624,10 +708,12 @@ pub(crate) async fn process_request(
     // Record metrics (atomic increment, ~2ns)
     metrics::METRICS.record_status(resp.status().as_u16());
 
-    // Record request duration histogram
+    // Record request duration histogram, attaching the request's trace ID
+    // as an OpenMetrics exemplar so /metrics consumers can jump straight
+    // from a slow-bucket count to the matching trace in Tempo/Jaeger.
     metrics::METRICS
         .request_duration
-        .observe(request_start.elapsed());
+        .observe_with_trace(request_start.elapsed(), trace_id_bytes);
 
     // CORS: add Access-Control-Allow-Origin on actual requests
     if let Some(allow) = cors_allow_origin {

@@ -28,6 +28,18 @@ pub struct ZionConfig {
     #[serde(default)]
     pub sovereign: crate::sovereign::SovereignConfig,
 
+    /// HMAC-chained audit log (Track B). When `enabled = true` Zion writes
+    /// one signed JSON event per security-relevant action to the configured
+    /// path. Every event carries a `prev_hash` field so any tamper breaks
+    /// the chain at the next verification.
+    #[serde(default)]
+    pub audit: crate::audit::AuditConfig,
+
+    /// PII redaction policy applied to access logs and audit events
+    /// (Track B). Empty = no redaction (default — back-compat).
+    #[serde(default)]
+    pub redact: crate::audit::RedactConfig,
+
     // Legacy compat: flat upstreams map (just URLs)
     #[serde(default)]
     pub upstreams: HashMap<String, String>,

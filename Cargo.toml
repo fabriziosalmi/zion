@@ -105,6 +105,22 @@ h3-quinn = { version = "0.0.10", optional = true }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
 
+# ── Observability (Track B) ────────────────────────────────────────────
+# `tracing` is always-on: it gives us spans + structured events with
+# zero runtime cost when no subscriber is attached. The default subscriber
+# (built in observability.rs) renders JSON to stderr and is always linked.
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing-core = { version = "0.1", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "json", "env-filter", "registry", "ansi"] }
+
+# OTLP gRPC export — opt-in. Pulls in tonic/prost; we keep it gated so the
+# default binary stays lean. Enable with `--features otel`.
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["grpc-tonic", "trace"], optional = true }
+opentelemetry-semantic-conventions = { version = "0.27", optional = true }
+tracing-opentelemetry = { version = "0.28", default-features = false, optional = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 io-uring = { version = "0.7", optional = true }
@@ -121,6 +137,10 @@ http3 = ["quinn", "h3", "h3-quinn"]
 reqwest = ["dep:reqwest"]
 tui = ["ratatui", "crossterm"]
 init = ["rcgen"]
+# Distributed tracing export to an OTLP collector (Tempo, Jaeger, Honeycomb,
+# Datadog Agent, etc). The base `tracing` integration is always-on; this
+# feature only enables the network exporter.
+otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "opentelemetry-semantic-conventions", "tracing-opentelemetry"]
 # Sovereign Edge Intelligence — bake regional ASN/CIDR data into the binary
 geo-ita = []                       # 🇮🇹 Italian ASN + gov + ISP ranges
 geo-eu  = ["geo-ita"]              # 🇪🇺 EU superset (includes geo-ita)

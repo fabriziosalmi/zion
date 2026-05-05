@@ -14,6 +14,7 @@
 #![allow(clippy::needless_borrow)]
 
 mod acme;
+mod audit;
 mod auth;
 mod bootstrap;
 mod cache;
@@ -26,6 +27,7 @@ mod listener;
 mod logging;
 mod metrics;
 mod net;
+mod observability;
 mod proxy;
 #[cfg(feature = "http3")]
 mod quic;
@@ -322,6 +324,13 @@ struct AppState {
     /// Sender drop without sending `true` (fetch aborted) yields Err on the
     /// receiver side and waiters fall through to re-check the cache.
     inflight: dashmap::DashMap<Arc<str>, tokio::sync::watch::Sender<bool>>,
+    /// HMAC-chained audit log handle. `noop()` when audit is disabled.
+    /// Cloned per request handler; `emit()` is non-blocking.
+    pub(crate) audit: audit::AuditHandle,
+    /// Compiled PII redaction policy. Applied at audit-event construction
+    /// time. Cheap to clone (`Vec<String>`); held by Arc for ABI stability
+    /// across hot-reloads of `[redact]`.
+    pub(crate) redact: Arc<audit::CompiledRedaction>,
 }
 
 impl AppState {
@@ -436,6 +445,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // 0a-pre. Install the panic hook BEFORE any worker thread is spawned so
+    //         every panic — boot, async worker, anywhere — emits a structured
+    //         JSON record to stderr and to a last-gasp file (so a sidecar /
+    //         next-boot probe can self-report the previous death). The
+    //         release profile is `panic = "abort"`; this runs once before
+    //         abort. The path is overridable via ZION_LAST_GASP_PATH.
+    let last_gasp = std::env::var_os("ZION_LAST_GASP_PATH")
+        .map(std::path::PathBuf::from)
+        .or_else(|| Some(std::path::PathBuf::from("/var/lib/zion/last_panic.jsonl")));
+    observability::install_panic_hook(last_gasp);
+
     // 0a. Install the default crypto provider for rustls.
     //     The dep tree carries both aws-lc-rs (rustls default + our boot
     //     AES-GCM calibration) and ring (pulled in by hyper-rustls 0.27 for
@@ -480,6 +500,14 @@ async fn async_main(
     let config_path = std::env::var("ZION_CONFIG").unwrap_or_else(|_| "zion.toml".to_string());
     let config = config::load_config(&config_path).map_err(|e| format!("FATAL: {e}"))?;
     logging::init(&config.server.log_format);
+    // tracing-subscriber init mirrors the log_format choice — JSON for
+    // production, pretty for dev. Boot-line output continues to use
+    // `logging::*` (those run before the runtime exists, so they cannot
+    // depend on tracing's executor-aware machinery); request-path events
+    // will go through tracing once the worker pool is up.
+    observability::init_subscriber(observability::LogFormat::from_str(
+        &config.server.log_format,
+    ));
     logging::info("config", &format!("loaded from {config_path}"));
 
     // 2. (config-derived state is now built later via ResolvedAppConfig::build —
@@ -545,6 +573,13 @@ async fn async_main(
     // constructed and need the upstream URL → health map.
     let health_map = resolved.health_map.clone();
 
+    // Track B observability handles. The audit writer is a tokio task
+    // spawned now; its handle clones into AppState. Both are cheap to
+    // clone — `AuditHandle` wraps an `mpsc::Sender`, `CompiledRedaction`
+    // is two small `Vec<String>`.
+    let audit_handle = audit::spawn_writer(&config.audit);
+    let compiled_redact = Arc::new(config.redact.compile());
+
     let state = Arc::new(AppState {
         config: Arc::new(ArcSwap::from_pointee(resolved)),
         tls_acceptor: tls_acceptor_store,
@@ -554,6 +589,8 @@ async fn async_main(
         acme_challenges: acme::new_challenge_store(),
         rate_map: Arc::new(dashmap::DashMap::new()),
         inflight: dashmap::DashMap::new(),
+        audit: audit_handle,
+        redact: compiled_redact,
         http_builder: Arc::new({
             let mut b = AutoBuilder::new(TokioExecutor::new());
             b.http1().max_headers(64).max_buf_size(16 * 1024);
