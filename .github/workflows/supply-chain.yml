@@ -162,7 +162,14 @@ jobs:
   # ── 6. OSSF Scorecard — repo-level supply-chain posture grade. ───────────
   scorecard:
     name: OSSF Scorecard
-    if: github.event_name != 'pull_request'
+    # Scorecard only runs against the default branch — it errors out
+    # immediately on tag pushes ("only default branch is supported"). So
+    # we gate to: push on master, scheduled cron, and manual dispatch.
+    # PRs and tag pushes are excluded.
+    if: |
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/master')
     runs-on: ubuntu-latest
     permissions:
       contents: read
