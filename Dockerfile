@@ -19,7 +19,7 @@
 # Pinned to match rust-toolchain.toml. MSRV (Cargo.toml rust-version=1.82)
 # only applies to the no-default-features build; this image bakes a full
 # default-features binary so we need the same compiler we ship with.
-FROM --platform=$BUILDPLATFORM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
+FROM --platform=$BUILDPLATFORM rust:1.95-bookworm@sha256:adab7941580c74513aa3347f2d2a1f975498280743d29ec62978ba12e3540d3a AS builder
 
 # Build arg flowed through by `docker buildx build --platform=...`.
 # Lets us cross-compile on the native runner architecture.
