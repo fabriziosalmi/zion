@@ -183,7 +183,10 @@ jobs:
 
       - name: Install build deps (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake
+        # `gnu-tar` provides `gtar`, used by the Stage step below — the
+        # macOS default `/usr/bin/tar` is bsdtar which doesn't accept
+        # `--mtime=@<epoch>` (GNU syntax) or `--sort=name`.
+        run: brew install cmake gnu-tar
 
       # ── Build ──
       - name: Build (zigbuild)
@@ -220,12 +223,20 @@ jobs:
             *) strip "$src" || true ;;
           esac
 
+          # macOS default tar is bsdtar, which doesn't grok the GNU
+          # extensions we need for reproducible-archive metadata.
+          # Pick the GNU tar installed by `brew install gnu-tar` instead.
+          case "$MATRIX_TARGET" in
+            *apple-darwin) TAR=gtar ;;
+            *) TAR=tar ;;
+          esac
+
           if [[ "$MATRIX_TARGET" == *windows* ]]; then
             archive="${name}.zip"
             7z a "dist/${archive}" "$src" >/dev/null
           else
             archive="${name}.tar.gz"
-            tar --owner=0 --group=0 --numeric-owner \
+            "$TAR" --owner=0 --group=0 --numeric-owner \
                 --mtime="@${SOURCE_DATE_EPOCH}" \
                 --sort=name \
                 -czf "dist/${archive}" \
