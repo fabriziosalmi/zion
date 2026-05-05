@@ -127,13 +127,41 @@ jobs:
           echo "SOURCE_DATE_EPOCH=${ts}" >> "$GITHUB_ENV"
           echo "epoch=${ts}" >> "$GITHUB_OUTPUT"
 
+      # rust-toolchain.toml in the repo root pins the dev compiler to 1.88.
+      # On a release tag we want the toolchain dtolnay/rust-toolchain installs
+      # (latest stable) instead, AND we need it to install the matrix target.
+      # When rust-toolchain.toml is present, dtolnay's `targets:` is ignored
+      # by `rustup`, so we drop the file for this job and add the target
+      # explicitly. The dev override resumes for non-release builds.
+      - name: Drop dev toolchain pin for release builds
+        shell: bash
+        run: rm -f rust-toolchain.toml
+
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+
+      - name: Install matrix target
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-${{ matrix.target }}
+
+      # ring 0.17 sanity-checks static target_features at compile time and
+      # fails on `target-cpu=native` runners where the host's feature set
+      # disagrees with ring's MIN_STATIC_FEATURES baseline. The repo's
+      # .cargo/config.toml sets `target-cpu=native` for Apple Silicon for
+      # local dev speed; for redistributable release binaries we override
+      # with the M1 baseline (always present on every Apple Silicon shipped
+      # since 2020) so the resulting binary runs on every M-series chip.
+      - name: Pin RUSTFLAGS for redistributable Apple Silicon binary
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: echo "RUSTFLAGS=-C target-cpu=apple-m1" >> "$GITHUB_ENV"
+      - name: Pin RUSTFLAGS for redistributable Intel macOS binary
+        if: matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        run: echo "RUSTFLAGS=-C target-cpu=x86-64-v3" >> "$GITHUB_ENV"
 
       # ── Cross-compile path: zigbuild handles musl + aarch64 + aws-lc-rs ──
       - name: Setup zigbuild
