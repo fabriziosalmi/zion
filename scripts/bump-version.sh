@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Bump the project version in every place it is allowed to appear.
+# Cargo.toml is the canonical source; everything else is rewritten to match.
+# CHANGELOG.md is left untouched — add the new section by hand.
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: $(basename "$0") <new-version>" >&2
+  echo "  example: $(basename "$0") 0.1.11" >&2
+  exit 2
+fi
+
+NEW="$1"
+if ! [[ "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+  echo "error: '$NEW' is not a valid semver" >&2
+  exit 2
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+OLD=$(awk '
+  /^\[package\]/ { in_pkg = 1; next }
+  /^\[/          { in_pkg = 0 }
+  in_pkg && /^version[[:space:]]*=/ {
+    gsub(/[" ]/, "", $3); print $3; exit
+  }
+' Cargo.toml)
+
+if [[ -z "$OLD" ]]; then
+  echo "error: could not read current version from Cargo.toml" >&2
+  exit 2
+fi
+
+if [[ "$OLD" == "$NEW" ]]; then
+  echo "version already $NEW — nothing to bump"
+  exec scripts/check-version-sync.sh
+fi
+
+echo "Bumping $OLD → $NEW"
+
+# Portable in-place sed (works on both BSD/macOS and GNU).
+sedi() {
+  local script="$1"; shift
+  for f in "$@"; do
+    sed -i.bak -E "$script" "$f" && rm -f "$f.bak"
+  done
+}
+
+# 1. Cargo.toml [package] version
+sedi "/^\[package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*\"$OLD\"/version = \"$NEW\"/" Cargo.toml
+
+# 2. Helm chart appVersion (chart `version:` is independent and not touched)
+if [[ -f deploy/helm/zion/Chart.yaml ]]; then
+  sedi "s/^appVersion:[[:space:]]*\"$OLD\"/appVersion: \"$NEW\"/" deploy/helm/zion/Chart.yaml
+fi
+
+# 3. README + docs — rewrite vX.Y.Z occurrences of the OLD version only.
+REF_FILES=(
+  "README.md"
+  "docs/security/supply-chain.md"
+)
+for f in "${REF_FILES[@]}"; do
+  [[ -f "$f" ]] || continue
+  sedi "s/v$OLD/v$NEW/g" "$f"
+done
+
+# 4. Refresh Cargo.lock so the workspace package entry matches.
+# Prefer offline to avoid network during a release bump; fall back if that fails.
+if cargo check --offline --quiet >/dev/null 2>&1; then
+  :
+elif cargo check --quiet >/dev/null 2>&1; then
+  :
+else
+  echo "warning: cargo check failed — Cargo.lock may need a manual refresh" >&2
+fi
+
+# 5. Verify SSOT
+scripts/check-version-sync.sh
+
+cat <<EOF
+
+bumped: $OLD → $NEW
+next steps:
+  1. add a CHANGELOG.md entry for $NEW
+  2. git add -A && git commit -m "chore(release): v$NEW"
+  3. git tag -s v$NEW -m "v$NEW"   (or unsigned: git tag v$NEW)
+  4. git push && git push --tags
+EOF

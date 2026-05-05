@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Catch version drift locally before it reaches CI.
+set -euo pipefail
+
+if [[ "${ZION_SKIP_HOOK:-0}" == "1" ]]; then
+  echo "── zion pre-push skipped (ZION_SKIP_HOOK=1) ──"
+  exit 0
+fi
+
+exec "$(git rev-parse --show-toplevel)/scripts/check-version-sync.sh"

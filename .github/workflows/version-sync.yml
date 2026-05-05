@@ -1,0 +1,24 @@
+name: version-sync
+
+# Cargo.toml is the single source of truth for the project version.
+# Every PR is checked against the SSOT script: any drift between Cargo.toml,
+# Cargo.lock, the Helm chart, README, and docs/security must be fixed before
+# merge.
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Verify version SSOT
+        run: ./scripts/check-version-sync.sh

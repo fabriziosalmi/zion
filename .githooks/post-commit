@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Optional smoke benchmark — opt-in with ZION_BENCH=1.
+# Results are tracked in benchmarks/bench-history.json.
+
+if [[ "${ZION_BENCH:-0}" == "1" ]]; then
+  echo ""
+  echo "── zion post-commit benchmark ──"
+  bash benchmarks/bench-smoke.sh
+  echo "── benchmark complete ──"
+fi

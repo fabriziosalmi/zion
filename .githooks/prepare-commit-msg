@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Auto-inject the DCO Signed-off-by trailer so every commit is signed off
+# without the developer having to remember `-s`. Idempotent: if a matching
+# trailer is already present, the file is left unchanged.
+set -euo pipefail
+
+COMMIT_MSG_FILE="$1"
+COMMIT_SOURCE="${2:-}"
+
+# Skip auto-signing for merges and squashes — those carry their own trailers
+# from the source commits and editing here can corrupt the merge message.
+case "$COMMIT_SOURCE" in
+  merge|squash) exit 0 ;;
+esac
+
+NAME=$(git config user.name || true)
+EMAIL=$(git config user.email || true)
+if [[ -z "$NAME" || -z "$EMAIL" ]]; then
+  echo "DCO: git user.name and user.email must both be set" >&2
+  echo "  git config user.name 'Your Name'" >&2
+  echo "  git config user.email 'you@example.com'" >&2
+  exit 1
+fi
+
+SIGNOFF="Signed-off-by: $NAME <$EMAIL>"
+
+# `interpret-trailers` understands the trailer block, the comment block git
+# appends below it, and existing trailers — `addIfDifferent` is idempotent
+# against the exact same Signed-off-by line.
+git interpret-trailers --in-place \
+  --trailer "$SIGNOFF" --if-exists addIfDifferent \
+  "$COMMIT_MSG_FILE"
