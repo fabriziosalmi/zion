@@ -37,6 +37,9 @@ sovereign-*-ranges.txt
 # Claude Code local workspace state (per-developer, not for public repo)
 .claude/
 
+# Internal design notes / working drafts (private until publicly released)
+docs/internal/
+
 # Editor backups and swap files
 *.bak
 *.swp

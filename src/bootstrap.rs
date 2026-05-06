@@ -47,8 +47,6 @@ pub struct Platform {
     pub worker_threads: usize, // tokio worker count
     pub conn_limit: usize,     // max concurrent connections
     pub backlog: i32,          // listen backlog
-    #[allow(dead_code)]
-    pub recv_buf: usize, // TCP recv buffer
     pub send_buf: usize,       // TCP send buffer
 
     // ── Probe timings (microseconds) ──
@@ -139,7 +137,6 @@ pub fn detect() -> &'static Platform {
             worker_threads: compute_workers(cpu_cores),
             conn_limit: compute_conn_limit(ram_mb),
             backlog: compute_backlog(),
-            recv_buf: compute_buf_size(ram_mb),
             send_buf: compute_buf_size(ram_mb),
 
             probe_us,
@@ -1325,41 +1322,6 @@ fn compute_l1_entries(l1d_size: usize) -> usize {
     (usable / entry_size).clamp(32, 512)
 }
 
-// ── Socket tuning (applied per-connection) ───────────────────────
-
-/// Apply optimal TCP settings to an accepted connection.
-/// Called before TLS handshake for minimum latency.
-#[inline]
-#[allow(dead_code)]
-pub fn tune_accepted_socket(stream: &tokio::net::TcpStream, platform: &Platform) {
-    let _ = stream.set_nodelay(true); // TCP_NODELAY — always
-
-    let sock = socket2::SockRef::from(stream);
-    let _ = sock.set_send_buffer_size(platform.send_buf);
-    let _ = sock.set_recv_buffer_size(platform.recv_buf);
-
-    // Keepalive: detect dead peers
-    let keepalive = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(30));
-    let _ = sock.set_tcp_keepalive(&keepalive);
-
-    // Note: TCP_QUICKACK (Linux) would need raw setsockopt via libc.
-    // Omitted for cross-platform compatibility. Add libc dep when targeting Linux.
-}
-
-/// Apply SO_REUSEPORT to a listener socket (before bind).
-/// Allows multiple listeners on the same port for kernel-level load balancing.
-#[allow(dead_code)]
-pub fn tune_listener_socket(sock: &socket2::Socket) {
-    let _ = sock.set_reuse_address(true);
-    // SO_REUSEPORT and TFO are Linux-specific via socket2
-    #[cfg(target_os = "linux")]
-    {
-        // These may not be available on all socket2 versions
-        // let _ = sock.set_reuse_port(true);
-        // let _ = sock.set_tcp_fastopen(256);
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════
 // TESTS
 // ═══════════════════════════════════════════════════════════════════
@@ -1388,7 +1350,6 @@ mod tests {
             worker_threads: cores,
             conn_limit: 10_000,
             backlog: 1024,
-            recv_buf: 65536,
             send_buf: 65536,
             probe_us: 0,
             aes_kops_per_core: None,
