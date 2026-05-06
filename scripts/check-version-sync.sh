@@ -62,8 +62,8 @@ if [[ -f "$CHART_FILE" ]]; then
 fi
 
 # ── 4. Files that reference vX.Y.Z must use the current tag ────────────────
-# CHANGELOG, RELEASE_NOTES, ADRs, and perf/roadmap reference past versions
-# on purpose (historical record) — excluded from this check.
+# CHANGELOG, ADRs, and perf/roadmap reference past versions on purpose
+# (historical record) — excluded from this check.
 REF_FILES=(
   "README.md"
   "docs/security/supply-chain.md"
