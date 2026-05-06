@@ -1,0 +1,33 @@
+name: readme-stats-sync
+
+# README headline numbers (module count, LoC, unit-test count) must stay
+# in sync with the codebase. scripts/update-readme-stats.sh is the SSOT
+# for how they are computed; this workflow runs it in --check mode on
+# every PR and on every push to master. Drift = build red.
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Verify README stats SSOT
+        run: bash scripts/update-readme-stats.sh --check
