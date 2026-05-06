@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Tiny zero-dep CLI dispatcher.
 //!
 //! Zion historically took zero positional arguments — everything was env-driven

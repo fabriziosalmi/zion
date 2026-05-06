@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Audit log — HMAC-SHA256-chained, JSON-line events for compliance.
 //!
 //! Goals (in priority order):

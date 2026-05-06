@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Configuration loading, validation, and router construction.
 //!
 //! Parses `zion.toml` into typed structs (`ZionConfig`), validates the

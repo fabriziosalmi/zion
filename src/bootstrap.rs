@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Zion Bootstrap — hardware detection, auto-tuning, performance tier.
 //!
 //! At startup, probes the OS and hardware to enable the best available

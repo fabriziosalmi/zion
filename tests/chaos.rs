@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Chaos integration tests — failure-mode coverage that the unit test
 //! suite alone can't reach.
 //!

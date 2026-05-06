@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Zion WAF — 5-gate request inspection pipeline (Aho-Corasick, entropy, simd-json).
 //!
 //! Architecture: 5-gate pipeline, fail-fast, zero-regex.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Upstream HTTP client + request/response forwarding.
 //!
 //! Wraps `hyper-util`'s legacy connection pool with the proxy's own

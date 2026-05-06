@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Security primitives — CORS, rate limiting, validation, and response hardening.
 //!
 //! Extracted from main.rs (C-01) to reduce monolith complexity.

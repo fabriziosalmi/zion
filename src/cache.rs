@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Two-level cache: L1 thread-local + L2 shared DashMap.
 //!
 //! L1: per-thread, zero contention, ~5ns lookup. LRU eviction.

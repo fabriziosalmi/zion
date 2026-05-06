@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Zion HTTP/3 (QUIC) listener — feature-gated via `--features http3`.
 //!
 //! Architecture: runs alongside the TCP TLS listener on the same port (UDP :443).

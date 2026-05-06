@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Zion Auth Gate — JWT/OIDC validation middleware.
 //!
 //! Feature-gated: compile with `--features auth` to enable.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Observability — distributed tracing, W3C Trace Context, OTLP export.
 //!
 //! Two layers:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Zion Edge Gateway — binary entry point.
 //!
 //! Boots the daemon: parses CLI flags (`zion`, `zion init`, `zion top`,

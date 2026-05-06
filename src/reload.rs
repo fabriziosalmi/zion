@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Config hot-reload — Phase 1 of the dynamic-config plan.
 //!
 //! Watches `zion.toml` (or whatever `ZION_CONFIG` points at) for

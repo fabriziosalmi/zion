@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Unified error type — `ZionError`.
 //!
 //! Replaces the historical `Box<dyn std::error::Error>` returned by `main`

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! TLS termination — config loading, hot-reload, SNI cert resolver.
 //!
 //! Loads PEM cert/key pairs from disk, builds a `rustls::ServerConfig`

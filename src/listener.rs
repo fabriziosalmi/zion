@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Listener supervisor — Phase 1.5 of the dynamic-config plan.
 //!
 //! Watches `state.config` (an `ArcSwap<ResolvedAppConfig>`) for changes

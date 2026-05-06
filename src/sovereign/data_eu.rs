@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Baked-in EU CIDR ranges for sovereign edge classification.
 //!
 //! This is a stub for Phase 2. The full EU dataset will be generated
