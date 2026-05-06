@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zion doctor` — environment diagnostic.
 //!
 //! Runs a checklist of common production gotchas (fd limit, privileged

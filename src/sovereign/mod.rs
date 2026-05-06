@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Zion Sovereign Edge — IP classification and regional intelligence.
 //!
 //! Compile with `--features geo-ita` to bake Italian ASN/CIDR data into

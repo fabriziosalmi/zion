@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zion init` — interactive zion.toml wizard.
 //!
 //! From zero to a running daemon in 30 seconds. The wizard:

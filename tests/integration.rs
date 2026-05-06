@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Zion Edge Gateway — Integration Tests
 //!
 //! Validates the full proxy stack end-to-end:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `zion top` — live TUI dashboard.
 //!
 //! Polls `/_zion/snapshot.json` from a running Zion instance and renders a

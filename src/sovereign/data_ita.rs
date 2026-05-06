@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Baked-in Italian CIDR ranges for sovereign edge classification.
 //!
 //! Data sources (all public, verifiable):

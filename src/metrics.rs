@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Zion metrics — lock-free atomic counters + latency histograms, Prometheus text format.
 //! Zero-dependency, zero-alloc on the hot path (only atomic increments).
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Network socket tuning and listener management.
 //!
 //! Platform-specific TCP optimizations extracted from main.rs for clarity.
@@ -117,6 +118,10 @@ fn tune_listener(_socket: &socket2::Socket) {}
 pub fn tune_accepted(stream: &tokio::net::TcpStream) {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
+    // SAFETY: FFI setsockopt for TCP_QUICKACK and SO_BUSY_POLL is sound because `fd` is
+    // obtained from a live `&TcpStream` (so it remains open for the duration of this call),
+    // both option values are stack-local `i32`s with `socklen_t = sizeof::<i32>()`, and the
+    // kernel silently no-ops unsupported options instead of corrupting state.
     unsafe {
         // TCP_QUICKACK: send ACK immediately (don't wait for delayed ACK timer)
         let val: i32 = 1;

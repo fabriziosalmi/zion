@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! io_uring-accelerated accept loop for Linux.
 //!
 //! Uses multishot accept: one SQE yields multiple CQEs, so the kernel batches

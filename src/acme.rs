@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! ACME auto-renewal — handles HTTP-01 challenges and certificate renewal.
 //!
 //! Flow:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Public library surface for testing / fuzzing / external tooling.
 //!
 //! Zion ships as a single binary (`src/main.rs`); 99% of its modules are

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Request dispatch — the per-request state machine.
 //!
 //! Sits between the TLS listener and the upstream/cache. For each

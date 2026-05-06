@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Upstream health checking — types and query function.
 //!
 //! Health state is shared with the request path via `HealthMap`
