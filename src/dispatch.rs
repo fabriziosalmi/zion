@@ -1,3 +1,21 @@
+//! Request dispatch — the per-request state machine.
+//!
+//! Sits between the TLS listener and the upstream/cache. For each
+//! accepted request it walks the pipeline:
+//!
+//!   1. inline fast-path (`/healthz`, `/readyz`, `/metrics`,
+//!      `/_zion/snapshot.json`)
+//!   2. security gates (URI length, method whitelist, rate limiter,
+//!      CORS pre-flight)
+//!   3. radix routing → `Arc<ResolvedRoute>`
+//!   4. WAF pipeline (content-type, size, structural validation,
+//!      entropy, Aho-Corasick scan)
+//!   5. cache lookup or upstream proxy
+//!   6. response hardening (security headers, hop-by-hop strip)
+//!
+//! Hot path: zero allocation in the common case. Everything that turns
+//! a `Request` into a `Response` lives here or is called from here.
+
 use crate::audit::AuditEvent;
 use crate::proxy::ZionBody;
 use crate::{

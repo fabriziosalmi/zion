@@ -68,8 +68,11 @@ pub(crate) fn current_generation() -> u64 {
 /// "healthy + latency unknown" defaults; removed URLs are simply
 /// dropped (the old `Arc` will be reclaimed when the last reader
 /// exits, including any in-flight prober iteration).
-fn rebuild(new_config: &ZionConfig, previous: &ResolvedAppConfig) -> ResolvedAppConfig {
-    let mut snap = ResolvedAppConfig::build(new_config);
+fn rebuild(
+    new_config: &ZionConfig,
+    previous: &ResolvedAppConfig,
+) -> Result<ResolvedAppConfig, crate::error::ZionError> {
+    let mut snap = ResolvedAppConfig::try_build(new_config)?;
     let mut merged: fnv::FnvHashMap<String, Arc<health::UpstreamHealth>> =
         fnv::FnvHashMap::default();
     for (url, fresh) in snap.health_map.iter() {
@@ -81,7 +84,7 @@ fn rebuild(new_config: &ZionConfig, previous: &ResolvedAppConfig) -> ResolvedApp
         merged.insert(url.clone(), entry);
     }
     snap.health_map = Arc::new(merged);
-    snap
+    Ok(snap)
 }
 
 /// Spawn the config-file watcher. Returns immediately; the actual
@@ -192,16 +195,26 @@ pub(crate) fn spawn_config_watcher(
                     // Rebuild on the current thread (fast: matchit
                     // construction is microseconds, Aho-Corasick is
                     // already cached per-mode in OnceLock).
-                    // Wrapped in catch_unwind as defense-in-depth: if
-                    // build_router encounters an edge case that validate_config
-                    // missed, the debounce task stays alive instead of dying.
+                    // `try_build` returns a structured error for routine
+                    // failures (bad pattern, unknown profile). The
+                    // catch_unwind around it stays as defense-in-depth
+                    // against any deeper panic that escapes validation.
                     let previous = state_config.load_full();
                     let rebuild_result =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             rebuild(&new_config, &previous)
                         }));
                     let new_snapshot = match rebuild_result {
-                        Ok(snap) => snap,
+                        Ok(Ok(snap)) => snap,
+                        Ok(Err(e)) => {
+                            logging::warn(
+                                "config_watcher",
+                                &format!(
+                                    "rebuild rejected new config ({e}), keeping previous snapshot"
+                                ),
+                            );
+                            continue;
+                        }
                         Err(_) => {
                             logging::warn(
                                 "config_watcher",
@@ -311,7 +324,7 @@ mod tests {
         // Bypass disk validation by parsing TOML directly — we only
         // test the rebuild() merging logic, not file I/O.
         let parsed: ZionConfig = toml::from_str(config_toml).unwrap();
-        let merged = rebuild(&parsed, &previous);
+        let merged = rebuild(&parsed, &previous).expect("test config rebuilds");
 
         let merged_arc = merged
             .health_map
@@ -356,7 +369,7 @@ mod tests {
             upstream = "billing"
         "#;
         let parsed: ZionConfig = toml::from_str(config_toml).unwrap();
-        let merged = rebuild(&parsed, &previous);
+        let merged = rebuild(&parsed, &previous).expect("test config rebuilds");
 
         // Old upstream gone, new one present, with default state
         // ("healthy = true, latency = 0", per ResolvedAppConfig::build).
@@ -440,7 +453,7 @@ mod tests {
     fn atomic_swap_preserves_old_snapshot_for_inflight_readers() {
         // Initial snapshot, exposed only via `/api/...`.
         let v1 = parse_inline(TOML_V1);
-        let snap_v1 = ResolvedAppConfig::build(&v1);
+        let snap_v1 = ResolvedAppConfig::try_build(&v1).expect("test config builds");
         let store = ArcSwap::from_pointee(snap_v1);
 
         // Reader A grabs an Arc clone *before* the swap. This models a
@@ -451,7 +464,7 @@ mod tests {
 
         // Hot-reload: build v2 (adds /billing) and swap.
         let v2 = parse_inline(TOML_V2);
-        let snap_v2 = rebuild(&v2, &reader_a);
+        let snap_v2 = rebuild(&v2, &reader_a).expect("test config rebuilds");
         store.store(Arc::new(snap_v2));
 
         // Reader A sees the old routing table (route /api works,
@@ -490,12 +503,12 @@ mod tests {
         // empty `[[route]]` section before the first edit).
         let mut empty = parse_inline(TOML_V1);
         empty.route.clear();
-        let snap_empty = ResolvedAppConfig::build(&empty);
+        let snap_empty = ResolvedAppConfig::try_build(&empty).expect("test config builds");
         let store = ArcSwap::from_pointee(snap_empty);
 
         let v1 = parse_inline(TOML_V1);
         let prev = store.load_full();
-        let snap_v1 = rebuild(&v1, &prev);
+        let snap_v1 = rebuild(&v1, &prev).expect("test config rebuilds");
         store.store(Arc::new(snap_v1));
 
         let after = store.load_full();

@@ -1,3 +1,14 @@
+//! Upstream HTTP client + request/response forwarding.
+//!
+//! Wraps `hyper-util`'s legacy connection pool with the proxy's own
+//! `XffMode` policy, header rewrites (hop-by-hop strip per RFC 7230,
+//! `X-Request-ID` injection, `X-Forwarded-{For,Host,Proto}`), and the
+//! body type used by every response Zion emits — `ZionBody` aliases
+//! `BoxBody<Bytes, hyper::Error>`.
+//!
+//! HTTP/2 upstream multiplexing is opportunistic via ALPN. Pre-warming
+//! of the connection pool happens at boot in `build_http_client`.
+
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::header::HeaderValue;

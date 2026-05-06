@@ -1,3 +1,13 @@
+//! Configuration loading, validation, and router construction.
+//!
+//! Parses `zion.toml` into typed structs (`ZionConfig`), validates the
+//! result (every WAF/auth/cache profile referenced by a route must
+//! exist; CIDRs parse; xff_mode is a known string), and builds the
+//! `matchit::Router<Arc<ResolvedRoute>>` consumed by `dispatch.rs`.
+//!
+//! `build_router` is the single fallible entry point; everything that
+//! turns static TOML into runtime state flows through it.
+
 use matchit::Router;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -699,7 +709,9 @@ pub fn build_router(config: &ZionConfig) -> Result<Router<Arc<ResolvedRoute>>, S
                 let profile_config = config.auth_profile.get(name).ok_or_else(|| {
                     format!("Auth profile '{}' not found (route '{}')", name, route.path)
                 })?;
-                let resolved = crate::auth::resolve_auth_profile(profile_config);
+                let resolved = crate::auth::resolve_auth_profile(profile_config).map_err(|e| {
+                    format!("Auth profile '{}' (route '{}'): {}", name, route.path, e)
+                })?;
                 eprintln!(
                     "  auth: route {} → profile '{}' (alg={})",
                     route.path, name, profile_config.algorithm
