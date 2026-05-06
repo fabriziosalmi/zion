@@ -709,10 +709,9 @@ pub fn build_router(config: &ZionConfig) -> Result<Router<Arc<ResolvedRoute>>, S
                 let profile_config = config.auth_profile.get(name).ok_or_else(|| {
                     format!("Auth profile '{}' not found (route '{}')", name, route.path)
                 })?;
-                let resolved =
-                    crate::auth::resolve_auth_profile(profile_config).map_err(|e| {
-                        format!("Auth profile '{}' (route '{}'): {}", name, route.path, e)
-                    })?;
+                let resolved = crate::auth::resolve_auth_profile(profile_config).map_err(|e| {
+                    format!("Auth profile '{}' (route '{}'): {}", name, route.path, e)
+                })?;
                 eprintln!(
                     "  auth: route {} → profile '{}' (alg={})",
                     route.path, name, profile_config.algorithm
