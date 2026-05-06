@@ -174,8 +174,19 @@ Build flavors:
 cargo build --release                            # bare daemon, lean binary
 cargo build --release --features init            # + zion init wizard with cert generation
 cargo build --release --features tui             # + zion top live dashboard
-cargo build --release --features acme            # + Let's Encrypt auto-renewal
+cargo build --release --features acme            # + Let's Encrypt auto-renewal (HTTP-01)
+cargo build --release --features auth            # + JWT/OIDC authentication gate
+cargo build --release --features http3           # + HTTP/3 QUIC listener
+cargo build --release --features otel            # + OpenTelemetry tracing + OTLP export
+cargo build --release --features fips            # + FIPS 140-3 build (aws-lc-rs validated backend)
+cargo build --release --features geo-ita         # + Italian ASN/gov/ISP ranges (sovereign edge)
 cargo build --release --features io-uring-accept # Linux 5.19+: multishot accept
+```
+
+Stack flavors for a "max" build:
+
+```bash
+cargo build --release --features init,tui,acme,auth,http3,otel
 ```
 
 ## Live Dashboard (`zion top`)
@@ -255,7 +266,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 ```
 
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-21 modules, ~15,900 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+30 modules, ~20,600 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Benchmarking
 
@@ -281,7 +292,7 @@ Results saved to `benchmarks/bench-history.json` with automatic delta comparison
 ## Testing
 
 ```bash
-# Unit tests (300) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
+# Unit tests (421) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
 cargo test
 
 # Integration tests (19 -- requires running Zion + backend)

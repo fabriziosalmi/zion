@@ -2,18 +2,20 @@
 # update-readme-stats.sh — keep README badges in sync with the codebase.
 #
 # Three numbers drift fastest in this repo and burn credibility when stale:
-#   * module count    — how many `src/*.rs` files there are
-#   * line count      — total Rust LoC in `src/`
-#   * unit-test count — what `cargo test --release --bin zion` reports
+#   * module count    — every `*.rs` file under `src/` (recursive)
+#   * line count      — total Rust LoC under `src/` (recursive)
+#   * unit-test count — sum across lib + main bin + chaos suites (the
+#                       integration suite is reported separately in the
+#                       README and is excluded here on purpose)
 #
 # This script is the single source of truth for how those numbers are
 # computed. It rewrites three lines in README.md, anchored on HTML
 # marker comments so it's robust to surrounding-text edits:
 #
-#     21 modules, ~15,800 lines of Rust. See [arch ...]
+#     30 modules, ~20,600 lines of Rust. See [arch ...]
 #     <!-- zion-stats:modules-lines (kept in sync ...) -->
 #
-#     # Unit tests (300) <!-- zion-stats:test-count ... -->
+#     # Unit tests (421) <!-- zion-stats:test-count ... -->
 #
 # Usage:
 #   bash scripts/update-readme-stats.sh             # rewrite README in place
@@ -37,23 +39,29 @@ if [[ "${1:-}" == "--check" ]]; then
 fi
 
 # ── compute counts ──────────────────────────────────────────────────────
-modules=$(find src -maxdepth 1 -name '*.rs' -type f | wc -l | awk '{print $1}')
+# Recurse — `src/sovereign/` and any future submodule directory must be
+# counted. The previous depth=1 implementation silently undercounted.
+modules=$(find src -name '*.rs' -type f | wc -l | awk '{print $1}')
 
-lines_total=$(wc -l src/*.rs | tail -1 | awk '{print $1}')
+lines_total=$(find src -name '*.rs' -type f -exec cat {} + | wc -l | awk '{print $1}')
 # Round to nearest 100 for the README — the precise count fluctuates with
 # every edit and the headline number doesn't need that resolution.
 # Thousands-separator formatting is done in Python below (BSD printf on
 # macOS does not honour `%'d` outside specific locales).
 lines_rounded=$(( (lines_total + 50) / 100 * 100 ))
 
-# Unit-test count: parse the canonical wrap-up line. We accept the first
-# successful run only; a 0-count or failing run aborts so we never paste
-# bad numbers into the README.
-test_output=$(cargo test --release --bin zion --quiet 2>&1 || true)
+# Unit-test count: aggregate across every "test result: ok. N passed"
+# line cargo emits for lib + main bin + chaos. Integration tests live in
+# tests/integration.rs and are #[ignore]d by default — they are reported
+# separately in the README and excluded here.
+#
+# Cargo is ground truth: a static `grep '#[test]'` undercounts because
+# proptest! macros expand into runtime test cases that share a single
+# attribute in source.
+test_output=$(cargo test --release --lib --bin zion --test chaos --quiet 2>&1 || true)
 tests=$(printf "%s" "$test_output" \
     | grep -E '^test result: ok\. [0-9]+ passed' \
-    | head -1 \
-    | awk '{print $4}')
+    | awk '{s+=$4} END {print s}')
 if [[ -z "${tests:-}" || "$tests" == "0" ]]; then
     echo "FATAL: could not extract a non-zero test count from cargo test output" >&2
     echo "       (last 20 lines follow)" >&2
