@@ -176,8 +176,13 @@ pub fn validate_token(token: &str, profile: &ResolvedAuthProfile) -> Result<Clai
 
 /// Build a resolved auth profile from config.
 /// Called once at startup — pre-computes DecodingKey and Validation.
+///
+/// Returns `Err` if the algorithm is unrecognised or if the profile
+/// configures neither `secret` (HMAC) nor `jwks_url` (OIDC). The error
+/// is a String so the caller (`config::build_router`) can wrap it with
+/// the route/profile name in its own error format.
 #[cfg(feature = "auth")]
-pub fn resolve_auth_profile(config: &AuthProfileConfig) -> ResolvedAuthProfile {
+pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthProfile, String> {
     let mut alg_str = config.algorithm.clone();
     if alg_str == "HS256" && config.jwks_url.is_some() && config.secret.is_none() {
         alg_str = "RS256".to_string(); // Default to RS256 for asymmetric OIDC profiles
@@ -192,7 +197,7 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> ResolvedAuthProfile {
         "RS512" => Algorithm::RS512,
         "ES256" => Algorithm::ES256,
         "ES384" => Algorithm::ES384,
-        other => panic!("Unsupported JWT algorithm: {other}"),
+        other => return Err(format!("unsupported JWT algorithm: {other}")),
     };
 
     let mut decoding_key = None;
@@ -262,8 +267,10 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> ResolvedAuthProfile {
             }
         });
     } else {
-        eprintln!("FATAL: auth profile requires either 'secret' (HMAC) or 'jwks_url' (OIDC). Neither is set.");
-        std::process::exit(1);
+        return Err(
+            "auth profile requires either 'secret' (HMAC) or 'jwks_url' (OIDC); neither is set"
+                .to_string(),
+        );
     };
 
     let mut validation = Validation::new(algorithm);
@@ -280,13 +287,13 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> ResolvedAuthProfile {
     // Allow 30s clock skew for distributed systems
     validation.leeway = 30;
 
-    ResolvedAuthProfile {
+    Ok(ResolvedAuthProfile {
         jwks_url: config.jwks_url.clone(),
         decoding_key,
         jwk_set: jwk_set_arc,
         validation: Arc::new(validation),
         forward_claims: config.forward_claims,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -347,7 +354,7 @@ mod tests {
             forward_claims: true,
         };
 
-        let profile = resolve_auth_profile(&config);
+        let profile = resolve_auth_profile(&config).expect("valid test profile");
         let result = validate_token(&token, &profile);
         assert!(result.is_ok());
         let decoded = result.unwrap();
@@ -385,7 +392,7 @@ mod tests {
             forward_claims: true,
         };
 
-        let profile = resolve_auth_profile(&config);
+        let profile = resolve_auth_profile(&config).expect("valid test profile");
         let result = validate_token(&token, &profile);
         assert!(result.is_err());
     }
@@ -420,7 +427,7 @@ mod tests {
             forward_claims: true,
         };
 
-        let profile = resolve_auth_profile(&config);
+        let profile = resolve_auth_profile(&config).expect("valid test profile");
         let result = validate_token(&token, &profile);
         assert!(matches!(result, Err(AuthError::Expired)));
     }

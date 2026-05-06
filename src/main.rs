@@ -1,3 +1,16 @@
+//! Zion Edge Gateway — binary entry point.
+//!
+//! Boots the daemon: parses CLI flags (`zion`, `zion init`, `zion top`,
+//! `zion doctor`, `zion bootstrap`, `zion auto`), loads `zion.toml`,
+//! builds the resolved runtime config (`ResolvedAppConfig::try_build`),
+//! starts the TLS acceptor + listeners (HTTP/HTTPS, optional QUIC),
+//! spawns the cert-watcher, the config-reload watcher, the cache prober
+//! and the audit writer, and finally hands every accepted connection to
+//! `dispatch::handle_request`.
+//!
+//! `main()` returns `error::ZionResult<()>` so any boot-time failure
+//! propagates with a structured exit code instead of panicking.
+
 // Crate-level lint hygiene.
 //
 // We deliberately do NOT silence dead_code / unused_imports / unused_variables
@@ -197,12 +210,13 @@ impl ResolvedAppConfig {
     /// uses it once at boot; subsequent phases call it again on every
     /// hot-reload and atomic-swap the result.
     ///
-    /// Panics at boot if the router cannot be built (bad patterns, unknown
-    /// profiles). During hot-reload, `rebuild()` calls `try_build()` which
-    /// propagates the error cleanly.
-    fn build(config: &config::ZionConfig) -> Self {
-        let router = config::build_router(config)
-            .unwrap_or_else(|e| panic!("fatal: cannot build router at boot: {e}"));
+    /// Returns `Err(ZionError::Config)` if the router cannot be built
+    /// (bad patterns, unknown profiles). At boot the error propagates to
+    /// `main()` and the process exits with the structured ZionResult code;
+    /// during hot-reload the existing snapshot stays in place and the
+    /// new config is rejected with a logged WARN.
+    pub(crate) fn try_build(config: &config::ZionConfig) -> error::ZionResult<Self> {
+        let router = config::build_router(config).map_err(error::ZionError::Config)?;
 
         // Health map: one entry per upstream URL referenced by any route.
         // The same URL can appear in many routes — dedup via FnvHashMap.
@@ -289,7 +303,7 @@ impl ResolvedAppConfig {
             (sov.enabled, sov.log_classification)
         };
 
-        Self {
+        Ok(Self {
             router,
             health_map,
             trusted_proxies,
@@ -302,7 +316,7 @@ impl ResolvedAppConfig {
             sovereign_enabled,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             sovereign_log_classification,
-        }
+        })
     }
 }
 
@@ -561,7 +575,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
             tls_acceptor_store.clone(),
             config.tls.clone(),
             Some(quic_reload_tx),
-        );
+        )?;
     }
 
     // 4b. Predictive TTL pre-warming: pre-build TLS config before cert expires
@@ -571,7 +585,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     // proxies, XFF policy, rate-limit settings — everything that follows
     // from `zion.toml`). This is the single entry point that future
     // hot-reload phases will re-invoke and atomic-swap.
-    let resolved = ResolvedAppConfig::build(&config);
+    let resolved = ResolvedAppConfig::try_build(&config)?;
 
     // Boot-time visibility: structured logs for the bits operators
     // commonly check at startup. (Validation of `xff_mode` happens

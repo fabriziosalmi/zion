@@ -1,3 +1,17 @@
+//! TLS termination — config loading, hot-reload, SNI cert resolver.
+//!
+//! Loads PEM cert/key pairs from disk, builds a `rustls::ServerConfig`
+//! with the project's tuning (TLS 1.3 only, server cipher order, 0-RTT
+//! eligibility, 16k-entry session cache) and wraps it in a
+//! `tokio_rustls::TlsAcceptor`. SNI per-domain certificates resolve via
+//! an `FnvHashMap` lookup with a default fallback.
+//!
+//! Hot-reload runs as two tasks: a `notify` filesystem watcher debounced
+//! over 2 s, and a reload loop that rebuilds the entire `TlsAcceptor`
+//! and atomically swaps it via `ArcSwap`. The watcher is set up
+//! synchronously before the spawn so a bad cert path fails at boot
+//! with `ZionError::Tls(...)` instead of dying silently in a task.
+
 use arc_swap::ArcSwap;
 use fnv::FnvHashMap;
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -14,6 +28,7 @@ use tokio::sync::Notify;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::TlsConfig;
+use crate::error::ZionError;
 
 // ═══════════════════════════════════════════════════════════════════
 // GENERATION COUNTER
@@ -295,58 +310,69 @@ pub fn load_tls_config(tls: &TlsConfig) -> Result<ServerConfig, String> {
 /// and hot-swaps the entire TlsAcceptor (with new certs) via ArcSwap.
 /// Atomic swap: new connections get new certs, in-flight connections
 /// continue with old certs until they close. Zero downtime.
+///
+/// Watcher creation and the initial cert-dir watch happen synchronously
+/// before the async task is spawned, so a misconfigured cert path fails
+/// at boot with a structured `ZionError::Tls(...)` instead of dying
+/// silently inside a tokio task.
 pub fn spawn_tls_watcher(
     acceptor_store: Arc<ArcSwap<TlsAcceptor>>,
     tls: TlsConfig,
     quic_reload_tx: Option<tokio::sync::watch::Sender<Option<Arc<rustls::ServerConfig>>>>,
-) {
+) -> Result<(), ZionError> {
     let debounce_signal = Arc::new(Notify::new());
     let signal_clone = debounce_signal.clone();
 
     let watcher_cert_path = tls.cert_path.clone();
     let sni_cert_paths: Vec<String> = tls.sni.iter().map(|s| s.cert_path.clone()).collect();
 
-    let _watcher_handle = tokio::spawn(async move {
-        let signal = signal_clone;
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res {
-                if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
-                    signal.notify_one();
-                }
+    // Set up the watcher up front so the daemon refuses to boot on a bad
+    // cert path. Inside a spawned task this would have crashed only the
+    // watcher (silently), leaving the daemon with no hot-reload.
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res {
+            if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                signal_clone.notify_one();
             }
-        })
-        .expect("Failed to create filesystem watcher");
+        }
+    })
+    .map_err(|e| ZionError::Tls(format!("cannot create filesystem watcher: {e}")))?;
 
-        // Watch default cert dir
-        let cert_dir = Path::new(&watcher_cert_path)
-            .parent()
-            .unwrap_or_else(|| Path::new("/etc/ssl/zion/"));
-        watcher
-            .watch(cert_dir, RecursiveMode::NonRecursive)
-            .unwrap_or_else(|e| panic!("Cannot watch {}: {}", cert_dir.display(), e));
+    let cert_dir = Path::new(&watcher_cert_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("/etc/ssl/zion/"))
+        .to_path_buf();
+    watcher
+        .watch(&cert_dir, RecursiveMode::NonRecursive)
+        .map_err(|e| ZionError::Tls(format!("cannot watch {}: {e}", cert_dir.display())))?;
 
-        // Watch all SNI cert directories (they may live in different paths)
-        let mut watched_dirs = std::collections::HashSet::new();
-        watched_dirs.insert(cert_dir.to_path_buf());
-        for sni_path in &sni_cert_paths {
-            if let Some(sni_dir) = Path::new(sni_path).parent() {
-                if watched_dirs.insert(sni_dir.to_path_buf()) {
-                    if let Err(e) = watcher.watch(sni_dir, RecursiveMode::NonRecursive) {
-                        eprintln!(
-                            "  warning: cannot watch SNI dir {}: {}",
-                            sni_dir.display(),
-                            e
-                        );
-                    }
+    // SNI dirs are best-effort — log on failure but don't fail boot.
+    let mut watched_dirs = std::collections::HashSet::new();
+    watched_dirs.insert(cert_dir.clone());
+    for sni_path in &sni_cert_paths {
+        if let Some(sni_dir) = Path::new(sni_path).parent() {
+            if watched_dirs.insert(sni_dir.to_path_buf()) {
+                if let Err(e) = watcher.watch(sni_dir, RecursiveMode::NonRecursive) {
+                    eprintln!(
+                        "  warning: cannot watch SNI dir {}: {}",
+                        sni_dir.display(),
+                        e
+                    );
                 }
             }
         }
+    }
 
-        eprintln!(
-            "  tls watcher active on {} (+{} SNI dirs)",
-            cert_dir.display(),
-            watched_dirs.len() - 1
-        );
+    eprintln!(
+        "  tls watcher active on {} (+{} SNI dirs)",
+        cert_dir.display(),
+        watched_dirs.len() - 1
+    );
+
+    // Move the watcher into the spawn so `Drop` on the watcher (which
+    // unregisters all paths) only happens when the daemon exits.
+    let _watcher_handle = tokio::spawn(async move {
+        let _watcher = watcher;
         std::future::pending::<()>().await;
     });
 
@@ -388,6 +414,8 @@ pub fn spawn_tls_watcher(
             }
         }
     });
+
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════
