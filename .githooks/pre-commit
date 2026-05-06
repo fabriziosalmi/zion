@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Fast local checks that catch the things CI catches first.
+#   - cargo check : type errors, borrow issues
+#   - cargo test  : unit tests
+# Set ZION_SKIP_HOOK=1 to bypass in an emergency.
+set -euo pipefail
+
+if [[ "${ZION_SKIP_HOOK:-0}" == "1" ]]; then
+  echo "── zion pre-commit skipped (ZION_SKIP_HOOK=1) ──"
+  exit 0
+fi
+
+echo "── zion pre-commit ──"
+
+echo -n "  cargo check... "
+if ! cargo check --quiet 2>&1; then
+  echo "FAILED"
+  echo "Fix compilation errors before committing."
+  exit 1
+fi
+echo "ok"
+
+echo -n "  cargo test... "
+if ! cargo test --quiet 2>&1; then
+  echo "FAILED"
+  echo "Fix failing tests before committing."
+  exit 1
+fi
+echo "ok"
+
+echo "── pre-commit passed ──"

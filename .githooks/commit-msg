@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Belt-and-suspenders DCO check: if prepare-commit-msg was bypassed (or the
+# user edited the trailer out), refuse the commit rather than letting the
+# server-side check fail later.
+set -euo pipefail
+
+COMMIT_MSG_FILE="$1"
+
+if ! grep -qE '^Signed-off-by: .+ <[^>]+@[^>]+>[[:space:]]*$' "$COMMIT_MSG_FILE"; then
+  echo "error: commit message is missing a valid 'Signed-off-by' trailer (DCO)." >&2
+  echo "  fix: add '-s' to your commit (or run scripts/install-hooks.sh once)." >&2
+  exit 1
+fi
