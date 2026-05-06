@@ -221,18 +221,6 @@ thread_local! {
     static L1: RefCell<Option<L1Cache>> = const { RefCell::new(None) };
 }
 
-/// Initialize thread-local L1 cache with detected capacity.
-/// Called lazily on first access per thread.
-#[allow(dead_code)]
-fn ensure_l1(max_entries: usize) {
-    L1.with(|l1| {
-        let mut l1 = l1.borrow_mut();
-        if l1.is_none() {
-            *l1 = Some(L1Cache::new(max_entries));
-        }
-    });
-}
-
 thread_local! {
     static LOCAL_L2: RefCell<HashMap<Arc<str>, L2Entry>> = RefCell::new(HashMap::new());
 }

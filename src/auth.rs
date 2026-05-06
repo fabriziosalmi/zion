@@ -99,8 +99,6 @@ impl std::fmt::Debug for ResolvedAuthProfile {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum AuthError {
-    /// No Authorization header present
-    MissingToken,
     /// Token is malformed or signature invalid
     InvalidToken(String),
     /// Token has expired
