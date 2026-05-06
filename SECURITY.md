@@ -8,7 +8,7 @@ from their containing minor — i.e. the latest `0.1.x` is always patched.
 | Version | Supported |
 | ------- | --------- |
 | 0.1.x (latest minor) | Yes |
-| < 0.1.7 | No |
+| < 0.1.11 | No |
 
 ## Reporting a Vulnerability
 

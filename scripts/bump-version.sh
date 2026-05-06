@@ -64,6 +64,13 @@ for f in "${REF_FILES[@]}"; do
   sedi "s/v$OLD/v$NEW/g" "$f"
 done
 
+# 3b. Tailored single-line replacements where the version appears in a
+# fixed context without the `v` prefix (SECURITY table, JSON examples,
+# issue templates). Mirrors the PATTERN_CHECKS in check-version-sync.sh.
+[[ -f SECURITY.md ]] && sedi "s/^\| < $OLD \| No \|/| < $NEW | No |/" SECURITY.md
+[[ -f docs/deploy/hot-reload.md ]] && sedi "s/(\"version\":[[:space:]]*\")$OLD(\")/\1$NEW\2/" docs/deploy/hot-reload.md
+[[ -f .github/ISSUE_TEMPLATE/bug_report.md ]] && sedi "s/(Zion Version: \[e\.g\.) $OLD(\])/\1 $NEW\2/" .github/ISSUE_TEMPLATE/bug_report.md
+
 # 4. Refresh Cargo.lock so the workspace package entry matches.
 # Prefer offline to avoid network during a release bump; fall back if that fails.
 if cargo check --offline --quiet >/dev/null 2>&1; then

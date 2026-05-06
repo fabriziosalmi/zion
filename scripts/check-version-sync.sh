@@ -61,9 +61,9 @@ if [[ -f "$CHART_FILE" ]]; then
   fi
 fi
 
-# ── 4. README and docs must reference only the current vX.Y.Z tag ──────────
-# CHANGELOG is intentionally excluded — it is append-only and references
-# every prior release.
+# ── 4. Files that reference vX.Y.Z must use the current tag ────────────────
+# CHANGELOG, RELEASE_NOTES, ADRs, and perf/roadmap reference past versions
+# on purpose (historical record) — excluded from this check.
 REF_FILES=(
   "README.md"
   "docs/security/supply-chain.md"
@@ -78,6 +78,26 @@ for f in "${REF_FILES[@]}"; do
       note_drift "$f references $v (expected $EXPECTED_TAG):"
       echo "$occurrences"
     done <<< "$bad_versions"
+  fi
+done
+
+# ── 5. Tailored single-line checks ─────────────────────────────────────────
+# Files where the version appears in a fixed context — we extract the value
+# and compare it directly. Cheaper and more precise than a generic regex.
+#
+# Each entry: "label|file|extractor regex"
+# The extractor is a sed -E expression returning ONLY the version.
+PATTERN_CHECKS=(
+  "SECURITY supported-versions|SECURITY.md|s/^\| < ([0-9]+\.[0-9]+\.[0-9]+) \| No \|.*/\1/p"
+  "hot-reload.md snapshot example|docs/deploy/hot-reload.md|s/.*\"version\":[[:space:]]*\"([0-9]+\.[0-9]+\.[0-9]+)\".*/\1/p"
+  "bug_report.md template default|.github/ISSUE_TEMPLATE/bug_report.md|s/.*Zion Version: \[e\.g\. ([0-9]+\.[0-9]+\.[0-9]+)\].*/\1/p"
+)
+for entry in "${PATTERN_CHECKS[@]}"; do
+  IFS='|' read -r label file extractor <<< "$entry"
+  [[ -f "$file" ]] || continue
+  found=$(sed -nE "$extractor" "$file" | head -1)
+  if [[ -n "$found" && "$found" != "$PACKAGE_VERSION_CORE" ]]; then
+    note_drift "$file ($label) references $found (expected $PACKAGE_VERSION_CORE)"
   fi
 done
 
