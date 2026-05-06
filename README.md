@@ -1,15 +1,22 @@
 # Zion Edge Gateway
 
+<!-- Build status -->
 [![CI](https://github.com/fabriziosalmi/zion/actions/workflows/ci.yml/badge.svg)](https://github.com/fabriziosalmi/zion/actions/workflows/ci.yml)
 [![Supply chain](https://github.com/fabriziosalmi/zion/actions/workflows/supply-chain.yml/badge.svg)](https://github.com/fabriziosalmi/zion/actions/workflows/supply-chain.yml)
 [![CodeQL](https://github.com/fabriziosalmi/zion/actions/workflows/codeql.yml/badge.svg)](https://github.com/fabriziosalmi/zion/actions/workflows/codeql.yml)
-[![OSSF Scorecard](https://api.scorecard.dev/projects/github.com/fabriziosalmi/zion/badge)](https://scorecard.dev/viewer/?uri=github.com/fabriziosalmi/zion)
+
+<!-- Security & compliance certifications -->
 [![SLSA Level 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev/spec/v1.0/levels#build-l3)
+[![OpenSSF Baseline](https://www.bestpractices.dev/projects/12756/baseline)](https://www.bestpractices.dev/projects/12756)
 [![FIPS-ready](https://img.shields.io/badge/FIPS_140--3-ready_(--features_fips)-success.svg)](docs/security/fips.md)
 [![ASVS L2](https://img.shields.io/badge/OWASP_ASVS-L2_mapped-blue.svg)](docs/security/asvs.md)
+
+<!-- Project metadata -->
 [![Version](https://img.shields.io/github/v/release/fabriziosalmi/zion?include_prereleases&color=blue&label=release)](https://github.com/fabriziosalmi/zion/releases)
 [![MSRV](https://img.shields.io/badge/MSRV-1.82%20core%20%2F%201.88%20full-blue.svg)](Cargo.toml)
 [![License](https://img.shields.io/github/license/fabriziosalmi/zion)](https://github.com/fabriziosalmi/zion/blob/master/LICENSE)
+
+<!-- Capabilities -->
 [![Performance](https://img.shields.io/badge/Performance-233k%20req%2Fs-success?style=flat&color=brightgreen)](https://github.com/fabriziosalmi/zion/tree/master/benchmarks)
 [![WAF](https://img.shields.io/badge/WAF-Zero%20Regex-orange)](https://github.com/fabriziosalmi/zion/blob/master/src/waf.rs)
 
