@@ -104,9 +104,12 @@ fn zion_is_running() -> bool {
 integration_test!(t01_get_root_returns_200, {
     let (status, body, _) = get("/");
     assert_eq!(status, 200, "GET / should return 200");
+    // Both the Go and Rust test backends serve a "Dashboard" HTML stub.
+    // The earlier "Zion Test Backend" string was stale (no backend ever
+    // emitted it) and only survived because the test was #[ignore]d.
     assert!(
-        body.contains("<h1>Zion Test Backend</h1>"),
-        "should contain test backend HTML"
+        body.contains("<h1>Dashboard</h1>"),
+        "should contain backend dashboard HTML, got: {body}"
     );
 });
 

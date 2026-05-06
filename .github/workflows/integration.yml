@@ -1,0 +1,107 @@
+name: integration
+
+# End-to-end tests against a real Zion daemon + a real backend.
+# tests/integration.rs holds 19 #[ignore]d tests that exercise the full
+# pipeline (TLS termination, WAF, cache, SSE, security headers, …) over
+# real sockets. Without this workflow they only run when a developer
+# manually spins up both processes — i.e. effectively never. This job
+# brings them back into the safety net.
+#
+# Layout:
+#   1. Generate a self-signed cert (CN=bench.local, SAN incl. localhost + 127.0.0.1)
+#   2. Build the Rust test backend (benchmarks/backend) and start it on :9090
+#   3. Build zion (release) and start it with tests/zion-test.toml on :8080 / :4433
+#   4. Wait until both answer their health endpoints
+#   5. Run `cargo test --test integration -- --ignored --test-threads=1`
+#   6. On failure dump both daemons' logs; always tear them down at the end.
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  integration:
+    name: integration tests (zion + backend on real sockets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Two crates compiled in this job; share a key so cache hits.
+          shared-key: integration
+
+      - name: Generate self-signed cert
+        run: bash benchmarks/certs/generate.sh
+
+      - name: Build zion (release)
+        run: cargo build --release --bin zion
+
+      - name: Build test backend (release)
+        run: cargo build --release --manifest-path benchmarks/backend/Cargo.toml
+
+      - name: Start backend
+        run: |
+          ./benchmarks/backend/target/release/zion-bench-backend > backend.log 2>&1 &
+          echo $! > backend.pid
+
+      - name: Start zion
+        env:
+          ZION_CONFIG: tests/zion-test.toml
+        run: |
+          ./target/release/zion > zion.log 2>&1 &
+          echo $! > zion.pid
+
+      - name: Wait for both daemons to be ready
+        run: |
+          # Backend on :9090 (HTTP) and Zion on :4433 (HTTPS, self-signed).
+          # 30s × 1s ≈ generous enough on cold-start; failure here is real.
+          for i in $(seq 1 30); do
+            backend_ok=0
+            zion_ok=0
+            curl -s --max-time 1 http://127.0.0.1:9090/api/v1/health \
+              > /dev/null 2>&1 && backend_ok=1
+            curl -sk --max-time 1 -H "Host: bench.local" \
+              https://127.0.0.1:4433/healthz > /dev/null 2>&1 && zion_ok=1
+            if [ "$backend_ok" = 1 ] && [ "$zion_ok" = 1 ]; then
+              echo "ready after ${i}s (backend=:9090, zion=:4433)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::backend and/or zion did not become ready in 30s"
+          echo "--- backend.log ---"; cat backend.log || true
+          echo "--- zion.log ---"; cat zion.log || true
+          exit 1
+
+      - name: Run integration tests
+        run: cargo test --release --test integration -- --ignored --test-threads=1
+
+      - name: Dump daemon logs on failure
+        if: failure()
+        run: |
+          echo "::group::zion.log"; cat zion.log || true; echo "::endgroup::"
+          echo "::group::backend.log"; cat backend.log || true; echo "::endgroup::"
+
+      - name: Tear down daemons
+        if: always()
+        run: |
+          [ -f zion.pid ] && kill "$(cat zion.pid)" 2>/dev/null || true
+          [ -f backend.pid ] && kill "$(cat backend.pid)" 2>/dev/null || true

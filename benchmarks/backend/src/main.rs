@@ -176,11 +176,32 @@ async fn handle(req: Request<Incoming>) -> Result<Resp, std::convert::Infallible
                 .and_then(|v| v.to_str().ok()).unwrap_or("");
             let xrip = req.headers().get("X-Real-IP")
                 .and_then(|v| v.to_str().ok()).unwrap_or("");
+            let xfp = req.headers().get("X-Forwarded-Proto")
+                .and_then(|v| v.to_str().ok()).unwrap_or("");
+            let query = req.uri().query().unwrap_or("");
             let body = format!(
-                r#"{{"method":"{}","path":"{}","x_forwarded_for":"{}","x_real_ip":"{}"}}"#,
-                req.method(), path, xff, xrip
+                r#"{{"method":"{}","path":"{}","query":"{}","x_forwarded_for":"{}","x_real_ip":"{}","x_forwarded_proto":"{}"}}"#,
+                req.method(), path, query, xff, xrip, xfp
             );
             ok("application/json", Bytes::from(body))
+        }
+
+        // Server-Sent Events. Integration tests inspect body content
+        // (`event: tick`, `"seq":...`), not real-time delivery, so we ship
+        // the full event sequence in one Full<Bytes> rather than pull in a
+        // streaming-body dep. SSE semantics are the proxy's responsibility
+        // (route mode = "sse_stream").
+        "/api/v1/events/stream" => {
+            let mut body = String::with_capacity(96);
+            for i in 0..3 {
+                body.push_str(&format!("event: tick\ndata: {{\"seq\":{i}}}\n\n"));
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/event-stream")
+                .header("Cache-Control", "no-cache")
+                .body(Full::new(Bytes::from(body)))
+                .unwrap()
         }
 
         "/api/v1/users" => {
