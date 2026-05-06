@@ -2,6 +2,102 @@
 
 All notable changes to Zion Edge Gateway are documented here.
 
+## [0.1.12] - 2026-05-06
+
+Quality + security release. Closes one Dependabot security alert (medium)
+on the `--features auth` build path, removes the boot-time panic surface,
+extends the SSOT version guard to every documented version reference,
+and brings the `#[ignore]`d integration suite under CI guard so it stops
+rotting silently.
+
+### Security
+
+- **`jsonwebtoken` 9.3.1 → 10.3.0**: closes the GHSA Type Confusion that
+  could lead to authorization bypass on the `--features auth` JWT
+  validator. v10 enforces an explicit choice of CryptoProvider; pinned
+  to `aws_lc_rs` to stay aligned with rustls's backend (and the FIPS
+  build path). (#43)
+
+### Reliability
+
+- **3 boot-time `panic!` / `exit(1)` sites → structured `ZionError`**
+  propagation in `src/main.rs` (router build), `src/auth.rs` (JWT
+  algorithm + missing secret/jwks_url), `src/tls.rs` (cert-dir watcher
+  setup hoisted out of the spawned task). Hot-reload also benefits via
+  the new `try_build` returning `Result`. (#78)
+- **Flaky `rate_limiter_caps_at_rps_within_window` proptest fixed**:
+  invariant relaxed to `<= 2 * rps as usize` to honour the wall-clock
+  window flip the limiter exposes (`SystemTime::now()`-keyed window),
+  with the cross-window scenario explained in a comment. (#77)
+
+### Hardening / Process
+
+- **`Cargo.toml` becomes the version SSOT** for the project. `Cargo.lock`,
+  `deploy/helm/zion/Chart.yaml`, README, `docs/security/supply-chain.md`,
+  `SECURITY.md`, `docs/deploy/hot-reload.md`, and the bug-report issue
+  template are now CI-checked against canonical (#75, #80).
+  `scripts/bump-version.sh X.Y.Z` propagates to all 7 sites atomically.
+- **DCO sign-off enforced locally** via `.githooks/prepare-commit-msg`
+  (auto-injects the trailer) and `commit-msg` (refuses commits without
+  one). `scripts/install-hooks.sh` switched to
+  `git config core.hooksPath .githooks` so hooks update on `git pull`. (#75)
+- **README headline numbers (modules / LoC / tests) become an SSOT**
+  produced by `scripts/update-readme-stats.sh`; CI fails on drift.
+  Underlying script bug fixed: previously did `find -maxdepth 1` and
+  `wc -l src/*.rs`, missing `src/sovereign/`. (#76)
+
+### Quality / Polish
+
+- **SPDX `Apache-2.0` header on every Rust file** (32 files in `src/` +
+  `tests/`) so the licence is machine-readable for SBOM scanners. (#79)
+- **Complete `unsafe` SAFETY audit**: 11/11 unsafe blocks now carry a
+  `// SAFETY:` note; added the missing one on `src/net.rs::tune_accepted`. (#79)
+- **Module-level docstrings** added on the five files that lacked them:
+  `config.rs`, `dispatch.rs`, `main.rs`, `proxy.rs`, `tls.rs`. (#78)
+- **Dead-code cleanup**: 5 unreachable items removed
+  (`cache.rs::ensure_l1`, `bootstrap.rs::tune_accepted_socket`,
+  `tune_listener_socket`, `Platform.recv_buf`, `auth.rs::AuthError::MissingToken`).
+  The remaining ~45 `#[allow(dead_code)]` annotations are intentional
+  (feature-gated, future-API hooks, deser-only struct fields, test
+  helpers) and already documented. (#81)
+- **Stale `RELEASE_NOTES.md` removed**: it was a v0.1.6-specific
+  announcement that nobody refreshed; `CHANGELOG.md` + GitHub Releases
+  cover the role. (#83)
+- **README OpenSSF Baseline badge** in place of the broken Scorecard
+  badge (publish_results was disabled in v0.1.10 to satisfy the
+  Scorecard webapp constraint, which in turn broke the badge endpoint). (#74)
+
+### CI
+
+- **New `integration` workflow**: spins up the test backend on `:9090`
+  and zion on `:4433` (with a self-signed cert via
+  `benchmarks/certs/generate.sh`) and runs the 19 `#[ignore]`d
+  integration tests. They were rotting silently — now load-bearing on
+  every PR. (#82)
+  - Two pieces of rot the unrun tests had hidden are also fixed in this
+    release: `tests/integration.rs::t01` asserted `<h1>Zion Test Backend</h1>`
+    (no backend ever served this string), and the Rust test backend
+    lacked the `query` / `x_forwarded_proto` echo fields and the
+    `/api/v1/events/stream` SSE endpoint that the tests rely on.
+- **New `version-sync` and `readme-stats-sync` workflows** wire the SSOT
+  scripts above into per-PR enforcement. (#75, #76)
+- **Branch protection cleaned**: dropped `SBOM (CycloneDX)` from
+  required status checks (release-only, was never green on PRs and made
+  every PR `mergeStateStatus: BLOCKED`); fixed `DCO` → `dco-check` name
+  mismatch.
+
+### Verification
+
+```text
+cargo fmt --all -- --check                          # OK
+cargo clippy --locked --all-targets --all-features -- -D warnings   # OK
+cargo test  --release                  → 421 passed (lib + main bin + chaos)
+cargo test  --release --all-features   → 463 passed
+integration tests (CI)                 → 19 passed
+scripts/check-version-sync.sh          # OK across 7 reference sites
+scripts/update-readme-stats.sh --check # in sync
+```
+
 ## [0.1.11] - 2026-05-06
 
 Process hardening — version becomes single-source-of-truth, DCO sign-off
