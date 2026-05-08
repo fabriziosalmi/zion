@@ -401,6 +401,29 @@ pub struct Metrics {
     pub connections_total: AtomicU64,
     pub tls_handshake_errors: AtomicU64,
 
+    // ── Mesh observability (issue #69) ──────────────────────────────
+    // Always-on counters (zero on builds without `--features
+    // sovereign-aimp`, so operators can grep for the same metric name
+    // regardless of which build their distro produced).
+    /// Successful local emits — bumped in `aimp_cp::publish_block`.
+    pub mesh_claims_emitted: AtomicU64,
+    /// Inbound envelopes that *passed* the merge policy gates.
+    pub mesh_claims_received: AtomicU64,
+    /// Inbound envelopes rejected on signature verification.
+    pub mesh_claims_dropped_signature: AtomicU64,
+    /// Inbound envelopes rejected as duplicates (seen-sig replay filter).
+    pub mesh_claims_dropped_replay: AtomicU64,
+    /// Inbound envelopes rejected for other reasons (ts skew,
+    /// malformed, revocation by non-original source). Generic bucket
+    /// — `cargo run --release -- doctor` exposes a finer split.
+    pub mesh_claims_dropped_other: AtomicU64,
+    /// Dispatcher hits that found a mesh score for the client IP.
+    pub mesh_score_lookups: AtomicU64,
+    /// Total bytes received on the gossip socket (decoded or not).
+    pub mesh_gossip_bytes_in: AtomicU64,
+    /// Total bytes sent on the gossip socket.
+    pub mesh_gossip_bytes_out: AtomicU64,
+
     // Gauges
     pub active_connections: AtomicI64,
 
@@ -430,6 +453,14 @@ impl Metrics {
             websocket_upgrades: AtomicU64::new(0),
             connections_total: AtomicU64::new(0),
             tls_handshake_errors: AtomicU64::new(0),
+            mesh_claims_emitted: AtomicU64::new(0),
+            mesh_claims_received: AtomicU64::new(0),
+            mesh_claims_dropped_signature: AtomicU64::new(0),
+            mesh_claims_dropped_replay: AtomicU64::new(0),
+            mesh_claims_dropped_other: AtomicU64::new(0),
+            mesh_score_lookups: AtomicU64::new(0),
+            mesh_gossip_bytes_in: AtomicU64::new(0),
+            mesh_gossip_bytes_out: AtomicU64::new(0),
             active_connections: AtomicI64::new(0),
             request_duration: LatencyHistogram::new(),
             upstream_duration: LatencyHistogram::new(),
@@ -600,6 +631,94 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.active_connections.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        // ── Mesh observability (issue #69) ──
+        // Always rendered so operators can `grep zion_mesh_` regardless
+        // of build features. Counters are zero on builds without
+        // `--features sovereign-aimp` — same posture as the WAF
+        // counters on routes that don't have a WAF profile.
+        out.extend_from_slice(
+            b"# HELP zion_mesh_claims_emitted_total Mesh claims published from this node.\n\
+                                # TYPE zion_mesh_claims_emitted_total counter\n\
+                                zion_mesh_claims_emitted_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.mesh_claims_emitted.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_mesh_claims_received_total Mesh claims received and merged into local state.\n\
+                                # TYPE zion_mesh_claims_received_total counter\n\
+                                zion_mesh_claims_received_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.mesh_claims_received.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_mesh_claims_dropped_total Inbound mesh envelopes rejected, by reason.\n\
+                                # TYPE zion_mesh_claims_dropped_total counter\nzion_mesh_claims_dropped_total{reason=\"signature\"} ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.mesh_claims_dropped_signature.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\nzion_mesh_claims_dropped_total{reason=\"replay\"} ");
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.mesh_claims_dropped_replay.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\nzion_mesh_claims_dropped_total{reason=\"other\"} ");
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.mesh_claims_dropped_other.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_mesh_score_lookups_total Dispatcher hits that found a mesh score for the client IP.\n\
+                                # TYPE zion_mesh_score_lookups_total counter\n\
+                                zion_mesh_score_lookups_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.mesh_score_lookups.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_mesh_gossip_bytes_in_total Total bytes received on the gossip socket.\n\
+                                # TYPE zion_mesh_gossip_bytes_in_total counter\n\
+                                zion_mesh_gossip_bytes_in_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.mesh_gossip_bytes_in.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_mesh_gossip_bytes_out_total Total bytes sent on the gossip socket.\n\
+                                # TYPE zion_mesh_gossip_bytes_out_total counter\n\
+                                zion_mesh_gossip_bytes_out_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.mesh_gossip_bytes_out.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");

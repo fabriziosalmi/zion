@@ -237,6 +237,14 @@ pub(crate) async fn process_request(
     #[cfg(feature = "sovereign-aimp")]
     if let Some(cp) = state.aimp_cp.as_ref() {
         if let Some(rep) = cp.lookup(&client_ip) {
+            // Issue #69: count score-lookup hits. Bumped on the
+            // *positive* path only — the bare `cp.is_some()` is not
+            // a useful signal because every request takes that
+            // branch when the feature is on; the operator wants to
+            // see the rate of mesh-influenced requests.
+            metrics::METRICS
+                .mesh_score_lookups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // 3 decimals so log/grep humans see a stable string;
             // upstreams parse as f32 and tolerate any precision.
             let formatted = format!("{:.3}", rep.score);

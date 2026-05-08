@@ -165,6 +165,47 @@ impl CompiledRedaction {
 //    actionable for an auditor.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Canonical audit-event kind names. Using string constants (not an
+/// enum) keeps `AuditEvent.kind` zero-cost (`&'static str`) and lets
+/// callsites read like the on-disk format. Auditors grep on these
+/// values; treat them like a wire format and add new ones additively.
+///
+/// `#[allow(dead_code)]` at module level: callsites today still pass
+/// the kind name as a string literal (`kind: "auth_failure"`); these
+/// constants are the reference list for new callsites. Migrating the
+/// existing literals to these constants is a follow-up — the value of
+/// landing the canonical surface now is that the new mesh / quorum /
+/// peer-state callsites added over the v0.4 mesh slice can reference
+/// `audit::kind::MESH_*` instead of inventing parallel literals.
+#[allow(dead_code)]
+pub mod kind {
+    /// Successful authentication (`--features auth`).
+    pub const AUTH_SUCCESS: &str = "auth_success";
+    /// Failed authentication.
+    pub const AUTH_FAILURE: &str = "auth_failure";
+    /// `zion.toml` reload (success or rejection — see `detail`).
+    pub const CONFIG_RELOAD: &str = "config_reload";
+    /// WAF / rate-limit / mTLS gate denied a request.
+    pub const REQUEST_BLOCKED: &str = "request_blocked";
+    /// Internal endpoint (`/metrics`, `/_zion/*`) accessed.
+    pub const ADMIN_ACCESS: &str = "admin_access";
+    /// Worker thread panicked; panic hook captured the trace.
+    pub const PANIC: &str = "panic";
+    /// Mesh claim published to the gossip mesh (#69 / #70).
+    pub const MESH_PUBLISH: &str = "mesh_publish";
+    /// Mesh claim received from a peer and merged into local state.
+    pub const MESH_RECEIVE: &str = "mesh_receive";
+    /// Reserved for future mesh-side events. Defined here as the
+    /// canonical strings so callsites added in follow-up PRs reference
+    /// `audit::kind::MESH_PEER_JOINED` instead of hand-typing literals.
+    #[allow(dead_code)] // wired by the mesh peer-state tracker (#68 follow-up)
+    pub const MESH_PEER_JOINED: &str = "mesh_peer_joined";
+    #[allow(dead_code)] // wired by the mesh peer-state tracker (#68 follow-up)
+    pub const MESH_PEER_DROPPED: &str = "mesh_peer_dropped";
+    #[allow(dead_code)] // wired by the mesh quorum aggregator (#66/#67 follow-up)
+    pub const MESH_QUORUM_DECISION: &str = "mesh_quorum_decision";
+}
+
 /// One audit event before signing. Fields are lowercase to match wire format.
 #[derive(Serialize, Clone, Debug)]
 pub struct AuditEvent {
@@ -172,9 +213,7 @@ pub struct AuditEvent {
     pub seq: u64,
     /// RFC 3339 / ISO 8601 timestamp.
     pub ts: String,
-    /// Event type — `auth_success`, `auth_failure`, `config_reload`,
-    /// `request_blocked`, `admin_access`, `panic`. Free-form string;
-    /// auditors filter on it.
+    /// Event type — see [`kind`] for the canonical name set.
     pub kind: &'static str,
     /// Optional 32-char hex trace ID linking to the originating request.
     #[serde(skip_serializing_if = "Option::is_none")]
