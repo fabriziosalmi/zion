@@ -404,3 +404,73 @@ integration_test!(t19_http_redirects_to_https, {
         "should redirect to https://"
     );
 });
+
+// ── Unified-port co-existence (issue #53) ──────────────────────────────────
+//
+// The `bpf-demux` track (issue #53) requires TCP HTTPS and UDP QUIC to
+// coexist on the same port without conflict. This is a kernel-level
+// invariant — TCP and UDP are independent L4 protocols and the kernel
+// demuxes them before port routing — but the test pins the *Zion-side*
+// half: the daemon binds both listeners cleanly and TCP requests
+// continue to work even when the QUIC listener is also active.
+//
+// The test is intentionally weak about the QUIC side: a real
+// end-to-end QUIC client requires `--features http3` on the binary
+// AND an h3-capable curl in the runner, neither of which the
+// integration workflow ships today. What the test DOES prove:
+//
+//   * TCP HTTPS on :4433 works (a real GET reaches upstream).
+//   * Probing UDP :4433: when zion was built with `--features http3`,
+//     the local-bind probe trips `EADDRINUSE` (the QUIC listener
+//     occupies the port). The test logs the observed mode so a CI
+//     log shows the operator which path was exercised; the assertion
+//     itself is OS-portable and tolerates either outcome.
+//
+// Closing the QUIC end-to-end gap is tracked as a follow-up: enable
+// `--features http3` in `.github/workflows/integration.yml` and use
+// an h3-capable client.
+
+integration_test!(t30_unified_port_tcp_works_with_or_without_quic, {
+    use std::net::UdpSocket;
+
+    // 1. TCP path: must succeed regardless of the http3 feature.
+    let (status, body, _) = get("/api/v1/data");
+    assert_eq!(status, 200, "TCP HTTPS path must work on :4433");
+    assert!(
+        body.contains("\"status\":\"ok\""),
+        "API should return 200/ok"
+    );
+
+    // 2. UDP probe: try to bind UDP on :4433 ourselves. The two
+    //    legitimate outcomes:
+    //
+    //      a) `EADDRINUSE` — zion's QUIC listener already holds the
+    //         port. Confirms TCP+UDP coexistence is observable.
+    //      b) `Ok(_)` — no UDP listener. Means the binary under test
+    //         was compiled without `--features http3` (current CI
+    //         default). The TCP-only assertion above is the
+    //         meaningful signal in this mode.
+    //
+    //    Anything else (PermissionDenied, AddrNotAvailable on the
+    //    address itself) is a setup error worth flagging.
+    match UdpSocket::bind("127.0.0.1:4433") {
+        Ok(sock) => {
+            // No QUIC listener observable. Drop the socket immediately
+            // so we don't lock the port for the rest of the suite.
+            drop(sock);
+            eprintln!(
+                "t30: UDP :4433 was free — zion compiled without `--features http3`. \
+                 TCP-only mode validated."
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!(
+                "t30: UDP :4433 reports EADDRINUSE — zion's QUIC listener active. \
+                 TCP+UDP unified-port co-existence validated."
+            );
+        }
+        Err(other) => {
+            panic!("t30: unexpected UDP-bind error on :4433: {other:?}");
+        }
+    }
+});
