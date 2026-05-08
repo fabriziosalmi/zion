@@ -6,6 +6,31 @@
 //! on other platforms or when the feature is disabled.
 //!
 //! Enabled with: `cargo build --features io-uring-accept`
+//!
+//! ## Known issue (v0.2.0 — under investigation)
+//!
+//! Under load on Proxmox 9.1 LXC + kernel 6.17, AcceptMulti CQEs start
+//! returning `res = -88 (ENOTSOCK)` continuously after the first burst
+//! of connections. The same kernel + container privilege bracket is
+//! independently verified to handle:
+//!   * raw-syscall `IORING_OP_ACCEPT` with the multishot bit (works);
+//!   * `io-uring` 0.7.11's `AcceptMulti` against a plain TCP listener
+//!     (works, sustained);
+//!   * the same crate against a listener tuned with the same flags
+//!     zion sets (TCP_DEFER_ACCEPT / TCP_FASTOPEN / TCP_NODELAY,
+//!     non-blocking — works, sustained).
+//!
+//! The error only surfaces under real bench load against zion. The
+//! likely root cause is a race between TCP_FASTOPEN / TCP_DEFER_ACCEPT
+//! and multishot's persistent SQE — consumed connections appear to
+//! transition the listener fd into a state io_uring rejects, after
+//! which every subsequent CQE on that SQE re-emits ENOTSOCK.
+//!
+//! Workaround: switch to single-shot `opcode::Accept` and resubmit on
+//! each CQE. Costs a few hundred nanoseconds per accept (one extra
+//! SQE push) but is robust. Defer until a load-faithful reproducer
+//! lands; current production deployments stay on the tokio accept
+//! loop until then.
 
 #[cfg(all(target_os = "linux", feature = "io-uring-accept"))]
 mod inner {

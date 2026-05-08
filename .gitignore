@@ -19,8 +19,10 @@ TODO.md
 zion.toml
 GEMINI_IMPRO.md
 
-# Build outputs
-zion-*
+# Build outputs (release tarballs at repo root only — we use a top-level
+# `zion-*` glob so it does NOT match the eBPF source crate at
+# `xdp/zion-xdp-prog/`).
+/zion-*
 *.tar.gz
 
 # Python
@@ -50,3 +52,9 @@ benchmarks/certs/*.key
 benchmarks/certs/*.crt
 benchmarks/certs/*.pem
 
+
+# Workspace settings - 2026-05-07
+tmp/
+
+# Internal notes — never published.
+docs/internal/

@@ -1,0 +1,21 @@
+# Cargo config pinning the eBPF build target and linker.
+#
+# The eBPF program is compiled to `bpfel-unknown-none` (little-endian
+# bytecode, no OS, no std). `bpf-linker` (installed via
+# `cargo install bpf-linker`) rewrites the LLVM IR into something the
+# kernel verifier accepts.
+
+[build]
+target = "bpfel-unknown-none"
+
+[unstable]
+build-std = ["core"]
+
+[target.bpfel-unknown-none]
+linker = "bpf-linker"
+rustflags = [
+    # Aya guidance: emit code at the same opt level as release for the
+    # verifier to accept it (the dev profile alone isn't enough).
+    "-C", "debuginfo=0",
+    "-C", "panic=abort",
+]
