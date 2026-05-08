@@ -146,13 +146,66 @@ merge / release if:
 - `cargo deny check licenses` finds a license outside the SPDX allowlist
 - `cargo deny check bans` resolves a denylisted or wildcard-versioned crate
 - `cargo deny check sources` resolves a crate from anywhere except `crates.io`
+- `cargo vet --locked` finds a transitive crate without an audit verdict in `supply-chain/audits.toml`, an imported feed, OR an explicit `[[exemptions.X]]` row in `supply-chain/config.toml`
 - CodeQL ([codeql.yml](https://github.com/fabriziosalmi/zion/blob/master/.github/workflows/codeql.yml)) raises a critical finding on Rust or Actions code
 
 Informational signals (do not block, but produce artifacts you can review):
 
 - `cargo geiger` — quantifies the unsafe surface across the dep graph
-- `cargo vet` — supply-chain trust audit (warm-up; gated once `supply-chain/` is populated)
 - `OSSF Scorecard` — overall repo posture grade, published to the Security tab
+
+## Updating the cargo-vet baseline
+
+`supply-chain/` is the cargo-vet baseline. It contains:
+
+- `config.toml` — imported audit feeds (mozilla, google, embark,
+  bytecode-alliance, isrg, zcash) plus `[[exemptions.X]]` rows
+  for crates not yet covered by an audit. Exemptions are explicit:
+  the auditor can read the file and see exactly which crates the
+  project has chosen to accept without an upstream verdict.
+- `audits.toml` — Zion-local audits (`cargo vet certify <crate>`).
+  Empty at v0 baseline; populate as crates get reviewed.
+- `imports.lock` — the resolver's cache of the imported feeds.
+  Refreshed on every `cargo vet` run that omits `--locked`.
+
+When dependencies change (Cargo.lock update, new crate added, etc.):
+
+```bash
+# Refresh the imports cache and let cargo-vet apply the new
+# transitive set against the baseline.
+cargo vet
+
+# If a new crate has no audit and no exemption, the run fails with
+# a "missing audit" diagnostic. Two paths to resolve:
+#
+#   (a) An imported feed audits the crate but the baseline doesn't
+#       know yet — `cargo vet` will write the import to imports.lock.
+#       Just commit the updated supply-chain/imports.lock.
+#
+#   (b) Genuinely new crate that's not in any feed — review the
+#       crate yourself and certify:
+cargo vet certify <crate-name> <version>
+#       This walks the file diff, lets you mark `safe-to-deploy` /
+#       `safe-to-run`, and writes the audit to supply-chain/audits.toml.
+#
+#   (c) Pragmatic exemption (you've reviewed informally and want to
+#       defer the formal certify) — add to supply-chain/config.toml:
+#         [[exemptions.<crate-name>]]
+#         version = "X.Y.Z"
+#         criteria = "safe-to-deploy"
+
+# Periodically prune redundant exemptions: a crate that started as
+# an exemption is now covered by an imported feed.
+cargo vet prune
+
+# Final check before commit — must pass under --locked.
+cargo vet --locked
+```
+
+The CI job (`cargo-vet` in `supply-chain.yml`) runs `cargo vet --locked`
+on every PR. A red `cargo-vet` check means a transitive change
+introduced a crate that fails this gate; the PR author resolves via
+one of the three paths above.
 
 ## Reporting a supply-chain issue
 
