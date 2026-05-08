@@ -220,7 +220,13 @@ sovereign-signals = []             # Gossip mesh for signal sharing (Phase 3)
 xdp = ["dep:aya", "dep:aya-log"]
 # Track A — kTLS post-handshake offload. Linux >= 5.10 + CONFIG_TLS.
 # Switches established rustls server connections to in-kernel TLS_TX/RX.
-ktls = ["dep:ktls"]
+#
+# Now depends on `io-uring-rw` per the issue #52 spec — the io_uring rw
+# adapter is the natural buddy for sendfile-style zero-copy on
+# cacheable static responses. The runtime adapter itself is deferred
+# (see #51 Deferred), but the dependency keeps the feature graph
+# honest: enabling kTLS implies opting into the io_uring rw track.
+ktls = ["io-uring-rw", "dep:ktls"]
 # v0.2 perf-ceiling — NUMA-aware DashMap sharding (issue #50).
 # Splits `rate_map` and `inflight` into per-node shards, routed by the
 # calling thread's NUMA node. Single-socket / non-Linux: transparent

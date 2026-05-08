@@ -83,6 +83,12 @@ mod xdp;
 // Track A — kTLS post-handshake offload (Linux >= 5.10 + CONFIG_TLS).
 #[cfg(all(target_os = "linux", feature = "ktls"))]
 mod ktls;
+// Track A — memfd-backed cache entries (issue #52 building block).
+// Compiles on Linux only; consumed by the future sendfile dispatch
+// path. Gated on `--features ktls` so today's bin builds without it
+// don't carry an unused module.
+#[cfg(all(target_os = "linux", feature = "ktls"))]
+mod memfd;
 // Track C — ML-augmented WAF scoring (ONNX via tract).
 #[cfg(feature = "ml-waf")]
 mod waf_ml;
@@ -667,6 +673,26 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
             logging::warn(
                 "io_uring_rw",
                 "kernel does NOT support vectored rw (need >= 5.19) — feature compiled in but auto-disabled",
+            );
+        }
+    }
+
+    // kTLS post-handshake offload boot probe (issue #52). Surfaced
+    // unconditionally when the feature is on so a deployment can
+    // confirm the kernel + module set is ready for in-kernel record
+    // framing + the future sendfile path. The probe itself is one
+    // socket() + setsockopt(TCP_ULP, "tls") + close — cheap.
+    #[cfg(all(target_os = "linux", feature = "ktls"))]
+    {
+        if crate::ktls::probe_kernel_support() {
+            logging::info(
+                "ktls",
+                "kernel supports kTLS (TCP_ULP=tls) — handshake corker active, sendfile path pending follow-up",
+            );
+        } else {
+            logging::warn(
+                "ktls",
+                "kernel does NOT advertise kTLS support — try_upgrade will fail and the connection will close",
             );
         }
     }

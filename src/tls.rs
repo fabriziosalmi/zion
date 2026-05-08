@@ -243,6 +243,29 @@ pub fn load_tls_config(tls: &TlsConfig) -> Result<ServerConfig, String> {
     config.alpn_protocols = tls.alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
 
     // ═══════════════════════════════════════════════════════════════
+    // kTLS SECRET EXTRACTION (issue #52 acceptance #1)
+    // ═══════════════════════════════════════════════════════════════
+    //
+    // rustls 0.23's `ServerConfig.enable_secret_extraction` defaults
+    // to `false`. The `ktls` crate's `config_ktls_server` (called from
+    // `crate::ktls::try_upgrade`) requires the post-handshake
+    // ServerConnection to expose its TLS 1.3 traffic secrets so the
+    // kernel can be configured via `setsockopt(SOL_TLS, TLS_TX, ...)`.
+    // Without this flag the upgrade fails, the connection is closed,
+    // and the operator never sees the kTLS speedup they opted into.
+    //
+    // Gated on `--features ktls` so the secret-extraction surface
+    // isn't enabled on builds that don't need it. The fields exists
+    // unconditionally on `ServerConfig` (rustls doesn't feature-gate
+    // the field), so the assignment line itself compiles on any
+    // target — the cfg gate is purely a "don't enable surface we're
+    // not consuming" hygiene measure.
+    #[cfg(all(target_os = "linux", feature = "ktls"))]
+    {
+        config.enable_secret_extraction = true;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // SESSION RESUMPTION & 0-RTT (Techniques 12, 14, 15)
     // Layered strategy to minimize handshake crypto cost:
     //   1. Ticket-based resumption (stateless, scales horizontally)

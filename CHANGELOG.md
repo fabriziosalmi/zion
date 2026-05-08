@@ -6,6 +6,22 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **kTLS secret-extraction fix + boot probe + `Memfd` cache helper**
+  (partial — see Deferred). Three pieces:
+    - `tls.rs` now sets `ServerConfig.enable_secret_extraction = true`
+      under `--features ktls` (Linux). The existing `try_upgrade` path
+      that wraps the post-handshake stream in `KtlsStream` requires
+      this to be true; without it `config_ktls_server` fails and the
+      connection is closed. This was a real bug on the kTLS path.
+    - Boot log line `ktls=enabled|disabled: <reason>` emitted at
+      startup when the feature is on, populated by the existing
+      `probe_kernel_support` helper.
+    - New `src/memfd.rs` module wrapping `memfd_create(2)` —
+      `Memfd::from_bytes(label, &[u8])` produces a kernel-tmpfs-backed
+      file handle. `MIN_MEMFD_THRESHOLD = 64 KB`. The dispatch-side
+      sendfile path that consumes this is the deferred piece. (#52
+      partial — see Deferred)
+  `ktls` feature now depends on `io-uring-rw` per the issue spec.
 - **io_uring rw capability probe + `io-uring-rw` feature gate**
   (partial — see Deferred). New `bootstrap::Platform.has_io_uring_rw_kernel`
   bool, populated at boot via `uname(2)` parsed against the 5.19+
@@ -66,6 +82,18 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Deferred
 
+- **kTLS sendfile dispatch path (issue #52)** — the static-cache hot
+  path that detects "memfd-backed entry + kTLS-upgraded connection"
+  and routes the response through `sendfile(target_socket_fd, memfd,
+  ...)` instead of hyper's body machinery is tracked separately. It
+  requires (a) plumbing the connection's raw fd through dispatch (a
+  layer hyper deliberately abstracts), (b) sidestepping hyper's
+  AsyncWrite-driven body-send to avoid double-encoding the payload,
+  and (c) a 100 KB+ benchmark to validate the issue's "≥30%
+  throughput" target — none of which we ship a half-working version
+  of. The `Memfd` helper (`src/memfd.rs`) and the secret-extraction
+  fix mean the next PR can focus purely on (a) + (b) + (c) without
+  re-litigating the kTLS plumbing.
 - **`IoUringStream<R, W>` runtime adapter (issue #51)** — the
   `io_uring_prep_readv` / `writev` integration that replaces tokio's
   read/write half of accepted connections is tracked separately. The
