@@ -214,6 +214,10 @@ pub(crate) struct ResolvedAppConfig {
     /// Whether to include ip_class in structured request logs.
     #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
     pub(crate) sovereign_log_classification: bool,
+    /// Access-log emission policy (issue #60). Snapshot of
+    /// `ZionConfig.access_log` with header names already lowercased
+    /// at config-load time.
+    pub(crate) access_log: config::AccessLogConfig,
 }
 
 impl ResolvedAppConfig {
@@ -237,6 +241,7 @@ impl ResolvedAppConfig {
             sovereign_enabled: false,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             sovereign_log_classification: false,
+            access_log: config::AccessLogConfig::default(),
         }
     }
 
@@ -353,6 +358,7 @@ impl ResolvedAppConfig {
             sovereign_enabled,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             sovereign_log_classification,
+            access_log: config.access_log.clone(),
         })
     }
 }

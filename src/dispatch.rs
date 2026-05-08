@@ -17,6 +17,7 @@
 //! Hot path: zero allocation in the common case. Everything that turns
 //! a `Request` into a `Response` lives here or is called from here.
 
+use crate::audit;
 use crate::audit::AuditEvent;
 use crate::proxy::ZionBody;
 use crate::{
@@ -887,6 +888,50 @@ pub(crate) async fn process_request(
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| req.uri().path().to_string());
 
+    // Issue #60: snapshot configured headers (redacted) BEFORE the
+    // request is consumed by the proxy / cache pipeline. Emitted
+    // below as a single `headers` field carrying a JSON object —
+    // tracing's macro requires field names to be string literals,
+    // so dynamic header lists go through one structured value.
+    //
+    // mTLS fingerprint is captured separately so the access-log
+    // event can put it on a dedicated `mtls_fp` field (the value is
+    // a SHA-256 hash, never redacted).
+    //
+    // Empty/absent by default — the operator opts in via
+    // `[access_log] include_headers = [...]`.
+    let log_headers_json: Option<String> = if cfg.access_log.include_headers.is_empty() {
+        None
+    } else {
+        let pairs: std::collections::BTreeMap<&str, String> = cfg
+            .access_log
+            .include_headers
+            .iter()
+            .filter_map(|name_lc| {
+                let value = req
+                    .headers()
+                    .get(name_lc.as_str())
+                    .and_then(|v| v.to_str().ok())?;
+                let redacted = state.redact.redact_header_value(name_lc, value);
+                Some((name_lc.as_str(), redacted.into_owned()))
+            })
+            .collect();
+        if pairs.is_empty() {
+            None
+        } else {
+            // serde_json on a BTreeMap of plain types can't fail.
+            serde_json::to_string(&pairs).ok()
+        }
+    };
+    let log_mtls_fp: Option<String> = if cfg.access_log.mtls_fingerprint {
+        req.headers()
+            .get("x-client-cert-fingerprint")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
+
     // --- Dispatch by mode ---
     let mut resp = if rule.cache.is_some() {
         handle_static_cache(
@@ -991,8 +1036,48 @@ pub(crate) async fn process_request(
             method = %log_method,
             path = %path_safe,
             remote_ip = %remote_addr.ip(),
+            // Issue #60: configured request headers, redacted via the
+            // [redact.headers] policy, packed into one JSON object so
+            // dynamic field names don't fight the tracing macro.
+            // `tracing::field::Empty` collapses absent fields to no-op.
+            headers = log_headers_json.as_deref().unwrap_or(""),
+            // mTLS fingerprint (SHA-256 hex; never redacted — already a hash).
+            mtls_fp = log_mtls_fp.as_deref().unwrap_or(""),
             "request",
         );
+
+        // Issue #60: when the audit log is enabled, emit a parallel
+        // `request_completed` event so compliance reviewers have a
+        // signed, HMAC-chained record alongside the unsigned tracing
+        // line. Same field set; the audit handle's `try_send` is
+        // non-blocking, so a saturated audit queue silently drops
+        // (counted via `zion_audit_events_dropped_total`).
+        if !cfg.access_log.include_headers.is_empty() || cfg.access_log.mtls_fingerprint {
+            // Compose the detail string out-of-band — keeps the audit
+            // event small and lets the operator filter by kind.
+            let mut detail_parts: Vec<String> = Vec::with_capacity(3);
+            detail_parts.push(format!(
+                "status={} latency_us={}",
+                resp.status().as_u16(),
+                request_elapsed.as_micros()
+            ));
+            if let Some(ref h) = log_headers_json {
+                detail_parts.push(format!("headers={h}"));
+            }
+            if let Some(ref fp) = log_mtls_fp {
+                detail_parts.push(format!("mtls_fp={fp}"));
+            }
+            let _ = state.audit.emit(audit::AuditEvent {
+                seq: 0,
+                ts: String::new(),
+                kind: audit::kind::REQUEST_COMPLETED,
+                trace_id: None,
+                remote_ip: Some(remote_addr.ip().to_string()),
+                method: Some(log_method.to_string()),
+                path: Some(path_safe.to_string()),
+                detail: Some(detail_parts.join(" ")),
+            });
+        }
     }
 
     // CORS: add Access-Control-Allow-Origin on actual requests

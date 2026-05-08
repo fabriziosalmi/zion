@@ -6,6 +6,25 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **`[access_log]` config block — PII redaction on the access-log
+  path** ([`src/config.rs`](src/config.rs),
+  [`src/dispatch.rs`](src/dispatch.rs),
+  [`docs/guide/observability.md`](docs/guide/observability.md)).
+  New `include_headers: Vec<String>` (default empty, lowercased on
+  parse) and `mtls_fingerprint: bool` (default true). Configured
+  headers are pulled from the request before dispatch consumes it,
+  passed through the existing
+  `audit::CompiledRedaction::redact_header_value` policy
+  (`[redact.headers]`), packed into a single JSON `headers` field
+  on the `tracing::info!(target: "access", ...)` event. The mTLS
+  leaf-cert SHA-256 fingerprint surfaces on a dedicated `mtls_fp`
+  field — never redacted (it's already a hash). When the audit log
+  is enabled and `[access_log]` opts in, a parallel
+  `kind = "request_completed"` audit event mirrors the same field
+  set with HMAC-chain coverage. New proptest pin
+  (`redacted_header_json_never_contains_secret_value`) verifies the
+  rendered JSON never leaks a redacted-list header value as a
+  substring, for any input. (#60)
 - **SOC 2 + FedRAMP control-mapping document**
   ([docs/security/compliance-mapping.md](docs/security/compliance-mapping.md))
   — TSC (CC + A + C + PI) tables and NIST 800-53 rev5 (AC, AU, CM,

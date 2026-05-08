@@ -191,6 +191,11 @@ pub mod kind {
     pub const ADMIN_ACCESS: &str = "admin_access";
     /// Worker thread panicked; panic hook captured the trace.
     pub const PANIC: &str = "panic";
+    /// Request completed — emitted alongside the access log when
+    /// `[access_log]` opts into headers / mTLS fingerprint (#60).
+    /// Carries `status`, `latency_us`, the redacted-header JSON
+    /// blob, and the mTLS fingerprint in `detail`.
+    pub const REQUEST_COMPLETED: &str = "request_completed";
     /// Mesh claim published to the gossip mesh (#69 / #70).
     pub const MESH_PUBLISH: &str = "mesh_publish";
     /// Mesh claim received from a peer and merged into local state.
@@ -788,6 +793,57 @@ mod proptests {
             prop_assert!(!out.contains(&*secret), "secret leaked: {out}");
             prop_assert!(out.contains("foo=bar"), "non-redacted pair preserved");
             prop_assert!(out.contains("baz=qux"), "non-redacted pair preserved");
+        }
+
+        // Issue #60 acceptance — the access-log path packs configured
+        // headers into a JSON object via `redact_header_value` before
+        // emission. Property: for any header in the redact list and
+        // any value, the rendered JSON never contains the value as a
+        // substring. The dispatcher composes this exact JSON via
+        // `serde_json::to_string` over a `BTreeMap<&str, String>`, so
+        // testing the underlying redaction + serialisation pair is
+        // testing the load-bearing assumption.
+        #[test]
+        fn redacted_header_json_never_contains_secret_value(
+            secret in "[a-zA-Z0-9]{16,128}",
+            cookie in "[a-zA-Z0-9=]{8,64}",
+        ) {
+            let r = RedactConfig {
+                headers: vec!["authorization".into(), "cookie".into()],
+                query_params: vec![],
+            }
+            .compile();
+            let mut pairs: std::collections::BTreeMap<&str, String> = Default::default();
+            // Redacted entries.
+            pairs.insert(
+                "authorization",
+                r.redact_header_value("authorization", &format!("Bearer {secret}"))
+                    .into_owned(),
+            );
+            pairs.insert(
+                "cookie",
+                r.redact_header_value("cookie", &cookie)
+                    .into_owned(),
+            );
+            // Non-redacted entry should pass through unchanged.
+            pairs.insert(
+                "user-agent",
+                r.redact_header_value("user-agent", "Mozilla/5.0")
+                    .into_owned(),
+            );
+            let json = serde_json::to_string(&pairs).expect("BTreeMap<&str, String> serialises");
+            prop_assert!(!json.contains(&*secret), "Bearer secret leaked in JSON: {json}");
+            prop_assert!(!json.contains(&*cookie), "cookie value leaked in JSON: {json}");
+            // Non-redacted header value survives.
+            prop_assert!(
+                json.contains("Mozilla/5.0"),
+                "non-redacted user-agent should pass through; got {json}"
+            );
+            // Redacted token shape.
+            prop_assert!(
+                json.contains("<redacted:"),
+                "redacted token marker missing: {json}"
+            );
         }
 
         // HMAC chain integrity: signing the same event twice with the same

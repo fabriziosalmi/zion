@@ -51,6 +51,14 @@ pub struct ZionConfig {
     #[serde(default)]
     pub redact: crate::audit::RedactConfig,
 
+    /// Access-log emission policy (issue #60). Controls which request
+    /// headers are included in the structured `tracing::info!(target:
+    /// "access", ...)` event and whether the mTLS fingerprint is
+    /// surfaced as a separate field. Empty list = no headers logged
+    /// (default — back-compat with v0.2.x).
+    #[serde(default)]
+    pub access_log: AccessLogConfig,
+
     /// AIMP control-plane / mesh config (feature: sovereign-aimp).
     /// Optional — absent block = mesh disabled.
     #[cfg(feature = "sovereign-aimp")]
@@ -187,6 +195,64 @@ fn default_cors_headers() -> Vec<String> {
 
 fn default_cors_max_age() -> u64 {
     86400
+}
+
+// ============================================================================
+// ACCESS LOG (issue #60)
+// ============================================================================
+
+/// Access-log emission policy. Controls which request headers are
+/// included in the structured `tracing::info!(target: "access", ...)`
+/// event in [`crate::dispatch`].
+///
+/// Defaults: empty header list, mTLS fingerprint included when present.
+/// The mTLS fingerprint is a SHA-256 hash and is **never redacted** —
+/// it's already an opaque identifier suitable for upstream correlation.
+///
+/// All other configured headers pass through
+/// [`crate::audit::CompiledRedaction::redact_header_value`] before
+/// emission, using the same `[redact.headers]` policy that protects
+/// the audit log. If a header name appears in `[redact.headers]`,
+/// every value of that header is replaced by `<redacted:N>` where
+/// `N` is the byte length of the original value.
+#[derive(Deserialize, Clone, Debug)]
+pub struct AccessLogConfig {
+    /// Header names to include in the access-log event. Lowercased
+    /// at deserialise time so case-insensitive matching against
+    /// `req.headers().get(name)` is cheap. Default: empty.
+    #[serde(default, deserialize_with = "deserialize_lowercased_headers")]
+    pub include_headers: Vec<String>,
+
+    /// When `true` (default), the mTLS leaf-cert SHA-256 fingerprint
+    /// (already injected by the listener as `X-Client-Cert-Fingerprint`)
+    /// is emitted on a dedicated `mtls_fp` field. The hash is opaque,
+    /// so no redaction is applied. Set `false` to omit even when
+    /// mTLS is configured.
+    #[serde(default = "default_mtls_fingerprint")]
+    pub mtls_fingerprint: bool,
+}
+
+fn default_mtls_fingerprint() -> bool {
+    true
+}
+
+impl Default for AccessLogConfig {
+    fn default() -> Self {
+        Self {
+            include_headers: Vec::new(),
+            mtls_fingerprint: default_mtls_fingerprint(),
+        }
+    }
+}
+
+/// Lowercase every entry on parse so the dispatch hot path can do
+/// `eq_ignore_ascii_case`-free comparisons against `HeaderName::as_str()`.
+fn deserialize_lowercased_headers<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Vec<String> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(raw.into_iter().map(|s| s.to_ascii_lowercase()).collect())
 }
 
 // ============================================================================
@@ -1062,6 +1128,52 @@ upstream = "frontend"
         assert!(config.tls.hot_reload); // default true
         assert_eq!(config.tls.min_version, "1.3"); // default
         assert_eq!(config.route.len(), 1);
+    }
+
+    #[test]
+    fn access_log_default_back_compat() {
+        // Issue #60: a config without `[access_log]` produces empty
+        // include_headers AND mtls_fingerprint = true. The default-true
+        // is intentional — the fingerprint is already opaque (SHA-256)
+        // so an operator who configures mTLS expects to see it logged.
+        let config: ZionConfig = toml::from_str(minimal_toml()).unwrap();
+        assert!(config.access_log.include_headers.is_empty());
+        assert!(config.access_log.mtls_fingerprint);
+    }
+
+    #[test]
+    fn access_log_lowercases_include_headers() {
+        // Issue #60: header names from the operator's TOML are
+        // matched against `req.headers().get(name)` on the hot path,
+        // and `HeaderName::as_str()` returns lowercase. Lowercasing
+        // at parse time means the dispatcher uses one canonical form.
+        let toml_str = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+[tls]
+cert_path = "/tmp/cert.pem"
+key_path = "/tmp/cert.key"
+[upstreams]
+backend = "http://127.0.0.1:8000"
+[[route]]
+path = "/{*rest}"
+upstream = "backend"
+
+[access_log]
+include_headers = ["User-Agent", "Authorization", "X-Forwarded-For"]
+mtls_fingerprint = false
+"#;
+        let config: ZionConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.access_log.include_headers,
+            vec![
+                "user-agent".to_string(),
+                "authorization".to_string(),
+                "x-forwarded-for".to_string()
+            ]
+        );
+        assert!(!config.access_log.mtls_fingerprint);
     }
 
     #[test]
