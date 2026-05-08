@@ -6,6 +6,23 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **BPF demux v2 — unified-port co-existence integration test +
+  loader status documented**
+  ([`tests/integration.rs`](tests/integration.rs),
+  [`bpf/README.md`](bpf/README.md)). New `t30_unified_port_*`
+  integration test pins one of the two open acceptance items on
+  issue #53: TCP HTTPS on `:4433` keeps working when zion is built
+  with `--features http3` AND the QUIC listener occupies the same
+  port via UDP. The probe is OS-portable (binds UDP locally; either
+  trips `EADDRINUSE` and confirms QUIC is up, or succeeds and logs
+  that the build was TCP-only). New `bpf/README.md` documents the
+  loader-runtime status: aya 0.13 has no typed `SkReuseport`
+  program helper, so the userspace `Ebpf::load_file` +
+  `setsockopt(SO_ATTACH_REUSEPORT_EBPF)` path is **deferred** —
+  tracked in [#100](https://github.com/fabriziosalmi/zion/issues/100)
+  with the precise upstream-aya gap and three viable closing paths
+  (upstream contribution, libbpf-rs switch, hand-rolled
+  `bpf(BPF_PROG_LOAD)` FFI). (#53 partial)
 - **`[access_log]` config block — PII redaction on the access-log
   path** ([`src/config.rs`](src/config.rs),
   [`src/dispatch.rs`](src/dispatch.rs),
