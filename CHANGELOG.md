@@ -6,6 +6,14 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **Streaming WAF body inspection** — opt-in per WAF profile via
+  `[waf_profile.X] streaming = true`. The dispatcher feeds each
+  request-body frame to a `StreamingScanner` as it arrives off the wire;
+  an injection pattern in the first chunk denies before the rest of the
+  upload is read. Frames are reassembled on Allow so the regular
+  `validate_request` pipeline still runs the encoded-payload pass +
+  entropy + JSON gates that the streamer does not cover. Default is
+  `false` (existing buffered behaviour). (#49)
 - **Criterion microbench harness** — five `cargo bench` targets under
   `benches/` (waf_streaming, sovereign, traceparent, audit_hmac,
   cache_lookup) covering the hot-path components named in

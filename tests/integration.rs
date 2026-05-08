@@ -188,6 +188,84 @@ integration_test!(t08_waf_valid_put_passes, {
     assert_eq!(status, 201, "valid PUT should pass WAF");
 });
 
+// ── Streaming WAF (issue #49) ─────────────────────────────────────────────
+// Routes under /stream/* use `waf_profile = "streamed"` (streaming = true).
+// The dispatch path feeds each frame to a StreamingScanner; attack patterns
+// in the first chunk deny without reading the rest of the upload.
+
+integration_test!(t08a_stream_waf_clean_post_passes, {
+    // Small, clean text/plain body must pass the streaming gate AND the
+    // buffered re-validation that runs on the assembled body.
+    let (status, _, _) = curl(&[
+        "-X",
+        "POST",
+        "-H",
+        "Host: bench.local",
+        "-H",
+        "Content-Type: text/plain",
+        "-d",
+        "hello from a normal client; nothing suspicious here",
+        "https://127.0.0.1:4433/stream/echo",
+    ]);
+    assert!(
+        matches!(status, 200..=299),
+        "clean streaming POST should reach upstream, got {status}"
+    );
+});
+
+integration_test!(t08b_stream_waf_attack_first_chunk_denies, {
+    // Inject a known WAF pattern (`<script>`) at the very start of the body.
+    // The streaming scanner must deny on chunk #1 — well before a 10MB
+    // upload would finish. We don't measure wall-clock here (CI noise),
+    // but the upload completes well under any reasonable buffered
+    // baseline because the deny short-circuits the body read.
+    let mut payload = String::with_capacity(1_048_576);
+    payload.push_str("<script>alert(1)</script>");
+    while payload.len() < 1_048_576 {
+        payload.push_str("padding ");
+    }
+    let (status, _, _) = curl(&[
+        "-X",
+        "POST",
+        "-H",
+        "Host: bench.local",
+        "-H",
+        "Content-Type: text/plain",
+        "-d",
+        &payload,
+        "https://127.0.0.1:4433/stream/echo",
+    ]);
+    assert_eq!(
+        status, 400,
+        "attack pattern in first chunk must deny on the streaming path"
+    );
+});
+
+integration_test!(t08c_stream_waf_oversize_body_denies, {
+    // Streaming scanner enforces the size cap incrementally. Build a body
+    // that exceeds `max_body_mb = 10` and expect deny — buffered path
+    // returns 413 (PAYLOAD_TOO_LARGE) via `Limited`; streaming path
+    // returns 400 because `StreamVerdict::Deny("body exceeds max size")`
+    // is treated as a WAF deny. Both are correct rejections; the test
+    // asserts on the 4xx class so either path passes.
+    let big = "A".repeat(11 * 1024 * 1024);
+    let (status, _, _) = curl(&[
+        "-X",
+        "POST",
+        "-H",
+        "Host: bench.local",
+        "-H",
+        "Content-Type: text/plain",
+        "-d",
+        &big,
+        "https://127.0.0.1:4433/stream/echo",
+    ]);
+    assert!(
+        (400..=499).contains(&status),
+        "oversize body must be rejected with a 4xx, got {status}"
+    );
+});
+
 // ── Static Cache ──
 
 integration_test!(t09_static_cache_serves_asset, {

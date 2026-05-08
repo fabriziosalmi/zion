@@ -83,6 +83,19 @@ pub struct WafProfile {
     /// payloads are not flagged. Random/encrypted content sits at ~7.5–8.0.
     #[serde(default = "default_entropy_threshold")]
     pub entropy_threshold: f64,
+    /// Opt-in streaming WAF body inspection (issue #49). When `true`, the
+    /// dispatcher feeds each request-body frame to a [`StreamingScanner`] as
+    /// it arrives off the wire — an injection pattern in the first chunk
+    /// returns 400 before the rest of the upload is read. On allow, the
+    /// frames are reassembled and the regular [`validate_request`]
+    /// pipeline runs on the buffered body for the encoded-payload pass +
+    /// entropy + JSON gates that the streamer does not cover.
+    ///
+    /// Default: `false` (existing buffered behaviour). Promote to default
+    /// once the bench numbers (`waf/streaming/*` in
+    /// `benchmarks/results/criterion/baseline.json`) hold steady.
+    #[serde(default)]
+    pub streaming: bool,
 }
 
 fn default_max_body_mb() -> u64 {
@@ -118,6 +131,7 @@ impl Default for WafProfile {
             allowed_content_types: default_allowed_content_types(),
             entropy_check: true,
             entropy_threshold: default_entropy_threshold(),
+            streaming: false,
         }
     }
 }
@@ -435,19 +449,11 @@ fn scanner_for(mode: WafMode) -> &'static AhoCorasick {
 /// AGGRESSIVE. Verified by the `pattern_lengths_fit_max` test.
 /// Bumping this is cheap (a few bytes of overlap per chunk); shrinking it
 /// requires re-checking every pattern.
-//
-// `#[allow(dead_code)]`: the streaming-scan API is shipped now and is
-// covered by unit tests; the dispatch wiring lands in the next Track D
-// commit (see docs/perf/roadmap.md "Streaming WAF dispatch integration").
-// Until then the binary doesn't reach for these items, but they're
-// public so external consumers and the follow-up PR can land cleanly.
-#[allow(dead_code)]
 pub const MAX_PATTERN_LEN: usize = 64;
 
 /// Verdict from a streaming scan. `Allow` means *every chunk consumed so
 /// far* was clean — the caller is expected to keep feeding chunks until
 /// the body is exhausted. `Deny` is terminal: drop the connection / 400.
-#[allow(dead_code)] // see MAX_PATTERN_LEN note
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamVerdict {
     Allow,
@@ -462,7 +468,6 @@ pub enum StreamVerdict {
 ///     boundary is still matched on the next call;
 ///   * a hard cap on total bytes consumed (mirrors `max_body_mb`),
 ///     enforced incrementally so an oversized body is rejected early.
-#[allow(dead_code)] // see MAX_PATTERN_LEN note
 pub struct StreamingScanner {
     scanner: &'static AhoCorasick,
     overlap: Vec<u8>,
@@ -470,7 +475,6 @@ pub struct StreamingScanner {
     max_bytes: u64,
 }
 
-#[allow(dead_code)] // see MAX_PATTERN_LEN note
 impl StreamingScanner {
     /// New scanner targeting the given profile. `max_body_bytes` mirrors
     /// `WafProfile::max_body_mb * 1_048_576`.
@@ -517,7 +521,12 @@ impl StreamingScanner {
 
     /// Total bytes consumed so far. Useful for emitting metrics from the
     /// caller without exposing internal state.
-    #[allow(dead_code)] // wired by dispatch when the streaming path lands
+    ///
+    /// `#[allow(dead_code)]`: dispatch tracks the size cap via the
+    /// scanner's internal counter (returned as `Deny("body exceeds max
+    /// size")`); this getter is exposed for benches and external
+    /// consumers that want a non-deny readout.
+    #[allow(dead_code)]
     pub fn bytes_seen(&self) -> u64 {
         self.bytes_seen
     }

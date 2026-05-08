@@ -587,14 +587,107 @@ pub(crate) async fn process_request(
                 .and_then(|v| v.to_str().ok());
 
             let max_body_bytes = (waf_profile.max_body_mb * 1_048_576) as usize;
-            let limited = Limited::new(body, max_body_bytes);
-            let body_bytes = match BodyExt::collect(limited).await {
-                Ok(collected) => collected.to_bytes(),
-                Err(_) => {
-                    return Ok(text_response(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "request body too large",
-                    ))
+
+            // ── Body collection: streaming (#49) vs buffered ──────────────
+            // When `[waf_profile.X] streaming = true`, the dispatcher feeds
+            // each frame to a StreamingScanner as it arrives off the wire.
+            // An injection pattern in the first chunk denies before the
+            // rest of the upload is read. The frames are tee'd into a
+            // BytesMut and reassembled on Allow so the regular
+            // `validate_request` pipeline still runs the encoded-payload
+            // pass + entropy + JSON gates that the streamer does not cover.
+            //
+            // On the buffered path (default) `Limited::new` enforces the
+            // size cap; on the streaming path the StreamingScanner does
+            // the same incrementally and emits its own size-exceeded deny.
+            let body_bytes = if waf_profile.streaming {
+                let mut scanner =
+                    waf::StreamingScanner::new(waf_profile.mode, max_body_bytes as u64);
+                let mut chunks: Vec<Bytes> = Vec::new();
+                let mut total: usize = 0;
+                let mut body = body;
+                let mut early_deny: Option<&'static str> = None;
+                loop {
+                    match BodyExt::frame(&mut body).await {
+                        Some(Ok(frame)) => match frame.into_data() {
+                            Ok(data) => {
+                                match scanner.feed(&data) {
+                                    waf::StreamVerdict::Allow => {}
+                                    waf::StreamVerdict::Deny(reason) => {
+                                        early_deny = Some(reason);
+                                        break;
+                                    }
+                                }
+                                total += data.len();
+                                chunks.push(data);
+                            }
+                            // Trailers / non-data frames: ignore (no body bytes).
+                            Err(_other) => continue,
+                        },
+                        Some(Err(_)) => {
+                            return Ok(text_response(
+                                StatusCode::BAD_REQUEST,
+                                "request body read error",
+                            ))
+                        }
+                        None => break, // EOF
+                    }
+                }
+
+                if let Some(reason) = early_deny {
+                    if rule.waf_shadow {
+                        metrics::METRICS
+                            .waf_shadow_would_block
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        logging::warn(
+                            "waf_shadow",
+                            &format!(
+                                "would_block=true source=body_streaming method={} reason={} path={}",
+                                method,
+                                reason,
+                                parts.uri.path()
+                            ),
+                        );
+                        // Shadow mode: don't deny. We did NOT read the rest
+                        // of the body off the wire; reconstruct from what
+                        // we have and forward — this produces a truncated
+                        // request to upstream, which is the correct shadow-
+                        // mode trade-off (we never silently buffer attacks
+                        // for the upstream after a streaming match).
+                    } else {
+                        metrics::METRICS
+                            .waf_denied
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        metrics::METRICS.record_status(400);
+                        emit_waf_block(
+                            &state,
+                            &remote_addr,
+                            method,
+                            parts.uri.path(),
+                            "body",
+                            reason,
+                        );
+                        return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
+                    }
+                }
+
+                // Reassemble Bytes from the frame Vec for the buffered
+                // re-validation + upstream forward.
+                let mut buf = bytes::BytesMut::with_capacity(total);
+                for c in &chunks {
+                    buf.extend_from_slice(c);
+                }
+                buf.freeze()
+            } else {
+                let limited = Limited::new(body, max_body_bytes);
+                match BodyExt::collect(limited).await {
+                    Ok(collected) => collected.to_bytes(),
+                    Err(_) => {
+                        return Ok(text_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "request body too large",
+                        ))
+                    }
                 }
             };
 

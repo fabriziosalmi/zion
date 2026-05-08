@@ -1023,6 +1023,10 @@ max_string_len = 524288
 max_body_mb = 200
 deny_unknown_content_types = false
 
+[waf_profile.streamed]
+max_body_mb = 50
+streaming = true
+
 [cache_profile.immutable]
 mode = "memory"
 max_entries = 5000
@@ -1095,10 +1099,16 @@ upstream = "frontend"
         assert_eq!(strict.max_depth, 8);
         assert_eq!(strict.max_string_len, 524288);
         assert!(strict.deny_unknown_content_types); // default true
+        assert!(!strict.streaming); // default false (#49)
 
         let upload = config.waf_profile.get("upload").unwrap();
         assert_eq!(upload.max_body_mb, 200);
         assert!(!upload.deny_unknown_content_types);
+
+        // `streaming = true` is parsed and surfaced (issue #49 wire-up).
+        let streamed = config.waf_profile.get("streamed").unwrap();
+        assert!(streamed.streaming);
+        assert_eq!(streamed.max_body_mb, 50);
     }
 
     #[test]
@@ -1343,6 +1353,10 @@ cache_profile = "nonexistent"
             profile.allowed_content_types,
             vec!["application/json", "multipart/form-data"]
         );
+        // Streaming WAF body inspection (issue #49) defaults to off so
+        // existing deployments are byte-for-byte unchanged after the
+        // upgrade. Operators opt in per profile via `streaming = true`.
+        assert!(!profile.streaming);
     }
 
     #[test]
