@@ -60,6 +60,60 @@ Five new counters are exposed alongside the existing ones:
 | `zion_traces_emitted_total` | Request spans observed (one per request). |
 | `zion_traces_invalid_total` | Inbound `traceparent` headers rejected as malformed. |
 
+## Access log
+
+Every successful request emits one structured `tracing::info!`
+event under the `access` target with these fields:
+
+| Field        | Type   | Notes                                                        |
+|--------------|--------|--------------------------------------------------------------|
+| `status`     | u16    | HTTP response status.                                        |
+| `latency_us` | u64    | Total request duration (client → response sent), in µs.      |
+| `method`     | str    | HTTP method.                                                 |
+| `path`       | str    | URI path with query-string redacted via `[redact.query_params]`. |
+| `remote_ip`  | str    | Client IP after XFF resolution.                              |
+| `headers`    | json   | Configured headers, redacted per `[redact.headers]`. Empty when `[access_log] include_headers` is empty (default). |
+| `mtls_fp`    | str    | `X-Client-Cert-Fingerprint` value (SHA-256 hex), when present and `[access_log] mtls_fingerprint = true`. Never redacted — the value is already a hash. |
+
+### Configuration (issue #60)
+
+```toml
+[access_log]
+# Headers to emit on every access-log line. Lowercased on parse;
+# values pass through `[redact.headers]` before serialisation.
+include_headers   = ["user-agent", "authorization", "host", "x-forwarded-for"]
+# Surface the mTLS leaf-cert SHA-256 fingerprint as a dedicated
+# `mtls_fp` field. Default true — set false to omit even when mTLS
+# is configured.
+mtls_fingerprint  = true
+
+[redact]
+# headers in this list are replaced by `<redacted:N>` (N = byte
+# length of the original value). Same policy already protects the
+# audit log's request_blocked / auth_failure events.
+headers       = ["authorization", "cookie", "x-api-key"]
+```
+
+### Storage budget
+
+Each line is a JSON object. With the default fields plus 5 headers
+emitted, expect **~500 B per request**. At 100 k rps that's
+~50 MB/s of access-log volume — operators sizing log shippers
+(Vector, Fluent Bit, Loki agent) should account for this when
+opting into `include_headers`. When the list is empty (default),
+the line stays at ~120 B.
+
+### Audit-log mirror (`request_completed`)
+
+When `[access_log]` opts in (any header configured OR
+`mtls_fingerprint = true` AND `[audit].enabled = true`), every
+access-log line is mirrored as a signed audit event with
+`kind = "request_completed"`. The `detail` field carries
+`status=N latency_us=N headers={…} mtls_fp=…` so a compliance
+reviewer querying the audit log sees the same shape they'd see in
+the access log, with the HMAC chain attached. The audit kind is
+defined as the canonical constant `audit::kind::REQUEST_COMPLETED`.
+
 ## Audit log
 
 The audit log is a tamper-evident, HMAC-SHA256-chained JSON-Lines file. It is **disabled by default**.
@@ -190,5 +244,5 @@ Threat-model addendum specific to the mesh surface:
 ## What's next
 
 - **Span instrumentation** — automatic span creation around `process_request` is wired through the W3C parser; richer per-stage spans (WAF, cache, upstream) will follow in a small follow-up.
-- **PII redaction in access logs** — the `[redact]` config is consumed by the audit log today; extending it to the structured access-log path is a small, additive change.
+- ~~**PII redaction in access logs**~~ — landed via [`[access_log]`](#access-log) (issue #60). Configured headers pass through the same `[redact.headers]` policy that protects audit events.
 - **OTLP metrics** — the SDK supports it; we have not enabled the export path yet because the lock-free metrics module already covers the use cases. We may add it for parity if a downstream consumer needs an OTLP-only ingest.
