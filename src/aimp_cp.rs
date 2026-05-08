@@ -505,61 +505,16 @@ async fn run_publisher(
     }
 }
 
-// ── Cross-track wires (Track B3: CRDT update → data plane) ───────────
-
-/// Spawn a task that mirrors the AIMP reputation map into the XDP
-/// `BLOCKED_V4` LPM-trie. Each map update bumps the watch counter, the
-/// watcher wakes, scans the reputation map for entries above
-/// `block_threshold`, and inserts/removes XDP map keys accordingly.
-///
-/// This is the wire that turns "we heard about a bad IP from a peer"
-/// into "kernel-level XDP drop on this NIC" — the single path that
-/// converts gossip into line-rate enforcement.
-///
-/// Compiled only when **all three** features line up: the control
-/// plane (Track B), Linux, and the XDP loader (Track A). On any other
-/// build the wire compiles to nothing.
-#[cfg(all(target_os = "linux", feature = "xdp"))]
-pub fn spawn_xdp_sync(
-    cp: AimpControlPlane,
-    handle: std::sync::Arc<crate::xdp::XdpHandle>,
-    block_threshold: f32,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut updates = cp.subscribe();
-        let map = cp.reputation();
-        loop {
-            // Wait for the *next* version bump. `changed()` returns
-            // immediately if there has been an update we haven't seen.
-            if updates.changed().await.is_err() {
-                break; // sender dropped → control plane shut down
-            }
-
-            // Scan all entries and reconcile with the XDP map. v0
-            // implementation is O(N) per update, which is fine until
-            // the map exceeds ~10k entries — at that point switch to
-            // a delta-only API on the control plane.
-            for entry in map.iter() {
-                let (ip, rep) = entry.pair();
-                let ip_v4 = match ip {
-                    std::net::IpAddr::V4(v4) => *v4,
-                    std::net::IpAddr::V6(_) => continue, // v0: IPv4 only
-                };
-                let cidr = crate::xdp::Cidr4::host(ip_v4);
-                // A score that fell back below threshold (e.g. a
-                // downgrade from a peer who saw the IP behave) must
-                // also remove the XDP entry — otherwise we keep
-                // dropping packets from an IP that is no longer
-                // collectively considered hostile.
-                if rep.score >= block_threshold {
-                    let _ = handle.add_blocked(cidr).await;
-                } else {
-                    let _ = handle.remove_blocked(cidr).await;
-                }
-            }
-        }
-    })
-}
+// ── Cross-track wire (Track B3: CRDT update → data plane) ────────────
+//
+// (Track B3 v0 lived here as `spawn_xdp_sync(cp, Arc<XdpHandle>, ...)`.
+//  Removed for v0.2.x because the function references `crate::xdp::*`,
+//  which is fine inside the zion *binary* but breaks the example
+//  crates in `examples/aimp_*.rs` — those use `#[path = "../src/aimp_cp.rs"]`
+//  to embed this file as a private module, and their crate root has
+//  no `xdp` module to satisfy the path. The reconciler will land back
+//  in its own file `src/aimp_xdp_sync.rs` (only declared in main.rs)
+//  in the next PR, so examples never see it.)
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
