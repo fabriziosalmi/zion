@@ -11,6 +11,18 @@ hot_reload = false
 [upstreams]
 backend = "http://127.0.0.1:9090"
 
+# Streaming WAF profile (issue #49). Frame-by-frame scan with early
+# deny when an injection pattern lands in the first chunk.
+[waf_profile.streamed]
+streaming = true
+max_body_mb = 10
+# Body shapes the streaming bench/integration uses are not JSON; keep the
+# allowed list permissive so requests reach gate 3 (Aho-Corasick).
+allowed_content_types = ["application/json", "multipart/form-data", "text/plain"]
+# Disable entropy + JSON gates so the integration-test deny is purely
+# attributable to the streaming AC scan.
+entropy_check = false
+
 # API with WAF
 [[route]]
 path = "/api/{*rest}"
@@ -18,6 +30,14 @@ upstream = "backend"
 mode = "standard"
 waf = true
 max_body_mb = 10
+
+# Streaming-WAF route (issue #49). Body inspection happens chunk-by-chunk;
+# attacks in the first chunk deny without reading the rest of the upload.
+[[route]]
+path = "/stream/{*rest}"
+upstream = "backend"
+mode = "standard"
+waf_profile = "streamed"
 
 # SSE streaming
 [[route]]
