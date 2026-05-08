@@ -207,6 +207,12 @@ xdp = ["dep:aya", "dep:aya-log"]
 # Track A — kTLS post-handshake offload. Linux >= 5.10 + CONFIG_TLS.
 # Switches established rustls server connections to in-kernel TLS_TX/RX.
 ktls = ["dep:ktls"]
+# v0.2 perf-ceiling — NUMA-aware DashMap sharding (issue #50).
+# Splits `rate_map` and `inflight` into per-node shards, routed by the
+# calling thread's NUMA node. Single-socket / non-Linux: transparent
+# (1 shard). Reads `/sys/devices/system/node/` directly — no libnuma
+# dep — see src/numa.rs for the design rationale.
+numa-aware = []
 # Track C — ML-augmented WAF scoring. Loads a quantized ONNX model and
 # scores requests on the hot path with a strict latency budget.
 ml-waf = ["dep:tract-onnx"]
@@ -247,6 +253,10 @@ harness = false
 
 [[bench]]
 name = "cache_lookup"
+harness = false
+
+[[bench]]
+name = "numa"
 harness = false
 
 [profile.release]

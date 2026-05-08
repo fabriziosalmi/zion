@@ -49,6 +49,12 @@ pub struct Platform {
     pub backlog: i32,          // listen backlog
     pub send_buf: usize,       // TCP send buffer
 
+    // ── NUMA topology (issue #50) ──
+    /// Number of NUMA nodes detected at boot. 1 on macOS / Windows /
+    /// builds without `--features numa-aware`. >1 only on Linux
+    /// multi-socket boxes that opted in.
+    pub numa_nodes: usize,
+
     // ── Probe timings (microseconds) ──
     pub probe_us: u64,
 
@@ -143,10 +149,24 @@ pub fn detect() -> &'static Platform {
 
             aes_kops_per_core,
             calibration_us,
+
+            // NUMA topology — populated only on Linux + `numa-aware`;
+            // otherwise this stays at the safe default of 1 node so
+            // every consumer can use it as a shard count without a
+            // feature gate at the call site.
+            numa_nodes: detect_numa_nodes(),
         };
 
         platform
     })
+}
+
+/// Number of NUMA nodes detected at boot. Implementation lives in
+/// `crate::numa`; this thin wrapper keeps `bootstrap` agnostic to the
+/// detection mechanism.
+#[inline]
+fn detect_numa_nodes() -> usize {
+    crate::numa::node_count()
 }
 
 /// Calibrate AES-128-GCM seal throughput on a single core. Runs a tight
@@ -1354,6 +1374,7 @@ mod tests {
             probe_us: 0,
             aes_kops_per_core: None,
             calibration_us: None,
+            numa_nodes: 1,
         }
     }
 

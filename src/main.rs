@@ -56,6 +56,7 @@ mod listener;
 mod logging;
 mod metrics;
 mod net;
+mod numa;
 mod observability;
 mod proxy;
 #[cfg(feature = "http3")]
@@ -365,7 +366,14 @@ struct AppState {
     acme_challenges: acme::ChallengeStore,
     /// Per-IP rate limiter map. Persists across config reloads — the IP
     /// counters are about the IP's behaviour, not about the config.
-    rate_map: Arc<dashmap::DashMap<std::net::IpAddr, RateEntry>>,
+    ///
+    /// NUMA wrapper (issue #50): on a single-socket box / non-Linux /
+    /// `--no-default-features` build this is a transparent newtype
+    /// around `DashMap`. With `--features numa-aware` on a multi-socket
+    /// Linux host, `NumaAwareMap` shards by NUMA node and routes by the
+    /// calling thread's current node — same-socket workers stay
+    /// cache-local, cross-socket fallback scans on get-miss.
+    rate_map: Arc<numa::NumaAwareMap<std::net::IpAddr, RateEntry>>,
     /// Singleflight: coalesce concurrent cache misses for the same key.
     /// First request fetches from upstream and inserts a `watch::Sender<bool>`;
     /// subsequent requests subscribe and await `true`. Watch (vs Notify) is
@@ -374,7 +382,7 @@ struct AppState {
     /// still observe the wake instead of hanging until the client times out.
     /// Sender drop without sending `true` (fetch aborted) yields Err on the
     /// receiver side and waiters fall through to re-check the cache.
-    inflight: dashmap::DashMap<Arc<str>, tokio::sync::watch::Sender<bool>>,
+    inflight: numa::NumaAwareMap<Arc<str>, tokio::sync::watch::Sender<bool>>,
     /// HMAC-chained audit log handle. `noop()` when audit is disabled.
     /// Cloned per request handler; `emit()` is non-blocking.
     pub(crate) audit: audit::AuditHandle,
@@ -734,8 +742,8 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         static_cache: cache::StaticCache::new(),
         conn_limit: Arc::new(Semaphore::new(platform.conn_limit)),
         acme_challenges: acme::new_challenge_store(),
-        rate_map: Arc::new(dashmap::DashMap::new()),
-        inflight: dashmap::DashMap::new(),
+        rate_map: Arc::new(numa::NumaAwareMap::new()),
+        inflight: numa::NumaAwareMap::new(),
         audit: audit_handle,
         redact: compiled_redact,
         http_builder: Arc::new({

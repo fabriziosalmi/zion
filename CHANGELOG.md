@@ -6,6 +6,17 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **NUMA-aware sharding for `rate_map` + `inflight`** — opt-in via
+  `--features numa-aware`. On Linux multi-socket boxes, the per-IP
+  rate-limit map and the singleflight inflight map split storage into
+  one `DashMap` per NUMA node, routed by the calling thread's current
+  node (`sched_getcpu(2)` + `/sys/devices/system/node/`). Same-socket
+  workers stay cache-local; cross-socket fallback scans on get-miss.
+  Single-socket / non-Linux / `--no-default-features` builds collapse
+  to a single shard with no routing overhead — verified by criterion
+  bench `numa/single_shard/get_hit` matching the bare `DashMap`
+  baseline within noise. New `bootstrap::Platform.numa_nodes` field
+  exposes the detected count. See [src/numa.rs](src/numa.rs). (#50)
 - **PGO release builds (Linux x86_64-gnu)** — release.yml gains an
   opt-in `pgo: true` matrix flag. When set, the build runs a two-pass
   profile-guided pipeline: instrumented binary → 10 s deterministic
