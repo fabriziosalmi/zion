@@ -77,21 +77,17 @@ fn tune_listener(socket: &socket2::Socket) {
             eprintln!("  warning: TCP_DEFER_ACCEPT unavailable (may be in restricted container)");
         }
 
-        // TCP_CORK: batch small writes into full MSS segments on listener.
-        // Accepted connections inherit this, reducing small-packet overhead.
-        // Combined with TCP_NODELAY set on accept, this gives optimal behavior:
-        // cork batches the TLS record + HTTP headers, nodelay flushes on write.
-        let cork: i32 = 1;
-        if libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_CORK,
-            &cork as *const _ as *const libc::c_void,
-            std::mem::size_of::<i32>() as libc::socklen_t,
-        ) != 0
-        {
-            eprintln!("  warning: TCP_CORK unavailable");
-        }
+        // (Historical: TCP_CORK was set on the listener with the intent
+        //  that accepted connections would inherit it and batch
+        //  HTTP-headers + body into a single packet. In practice the
+        //  kernel inherits this flag onto every accepted socket, where
+        //  it holds outbound writes for up to 200ms — the canonical
+        //  TCP_CORK flush timeout. Empirically: pcap of a one-shot HTTP
+        //  request to /healthz showed response data delayed by exactly
+        //  202ms after the request ACK. We removed the cork; small
+        //  responses now flush immediately. If a future bulk-write path
+        //  wants cork semantics, set/unset it explicitly around the
+        //  write boundaries — never on the listener.)
 
         // TCP_FASTOPEN: allow data in SYN for returning clients
         let tfo: i32 = 256;

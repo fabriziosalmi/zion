@@ -130,7 +130,7 @@ Two surfaces report the reload state:
 
   ```json
   {
-    "version": "0.1.12",
+    "version": "0.2.1",
     "timestamp_ms": 1714425600000,
     "uptime_secs": 3712,
     "config_generation": 5,

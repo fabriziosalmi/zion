@@ -71,6 +71,22 @@ mod tui;
 mod uring;
 mod waf;
 
+// ── Beyond-FAANG tracks (experimental, feature-gated) ─────────────────
+// Track A — XDP pre-filter: drops blacklisted CIDRs at NIC driver layer.
+#[cfg(all(target_os = "linux", feature = "xdp"))]
+mod xdp;
+// Track A — kTLS post-handshake offload (Linux >= 5.10 + CONFIG_TLS).
+#[cfg(all(target_os = "linux", feature = "ktls"))]
+mod ktls;
+// Track C — ML-augmented WAF scoring (ONNX via tract).
+#[cfg(feature = "ml-waf")]
+mod waf_ml;
+// Track B — AIMP-as-control-plane: serverless gossip of WAF rules and
+// IP reputation via Merkle-CRDT. Top-level `aimp_cp` instead of nesting
+// under `sovereign::` so it does not pull in geo-* features by accident.
+#[cfg(feature = "sovereign-aimp")]
+mod aimp_cp;
+
 // ── Global allocator: mimalloc ──────────────────────────────────
 // ~2-3x faster than system malloc on small allocations.
 // Reduces allocator contention under high concurrency.
@@ -361,6 +377,13 @@ struct AppState {
     /// time. Cheap to clone (`Vec<String>`); held by Arc for ABI stability
     /// across hot-reloads of `[redact]`.
     pub(crate) redact: Arc<audit::CompiledRedaction>,
+    /// AIMP serverless control plane handle (Track B). `None` when the
+    /// feature is compiled in but disabled by config, or when bootstrap
+    /// failed (logged at boot). The dispatcher uses this for both
+    /// `lookup` (pre-WAF reputation gate) and `publish_block` (gossip a
+    /// local block to the mesh). Cloning is cheap — internal `Arc`s.
+    #[cfg(feature = "sovereign-aimp")]
+    pub(crate) aimp_cp: Option<aimp_cp::AimpControlPlane>,
 }
 
 impl AppState {
@@ -622,6 +645,62 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     let audit_handle = audit::spawn_writer(&config.audit);
     let compiled_redact = Arc::new(config.redact.compile());
 
+    // Optionally bootstrap the AIMP serverless control plane. When
+    // `--features sovereign-aimp` is on AND `ZION_AIMP_ENABLED=1` is in
+    // the environment, we read listen + peer list from env vars and
+    // spawn the gossip listener + publisher tasks before AppState is
+    // sealed. Env-var driven for v0; a `[sovereign.aimp]` TOML section
+    // is the natural follow-up, but it requires extending
+    // `config::ZionConfig` so we keep it env-only here.
+    //
+    // Failure to bootstrap is non-fatal — log once at WARN and continue
+    // with `aimp_cp = None`. The dispatcher already handles that case.
+    #[cfg(feature = "sovereign-aimp")]
+    let aimp_cp_handle: Option<aimp_cp::AimpControlPlane> = {
+        if std::env::var("ZION_AIMP_ENABLED").ok().as_deref() == Some("1") {
+            let listen: std::net::SocketAddr = std::env::var("ZION_AIMP_LISTEN")
+                .unwrap_or_else(|_| "0.0.0.0:9443".to_string())
+                .parse()
+                .unwrap_or_else(|_| "0.0.0.0:9443".parse().unwrap());
+            let peers: Vec<std::net::SocketAddr> = std::env::var("ZION_AIMP_PEERS")
+                .unwrap_or_default()
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            let cfg = aimp_cp::AimpControlPlaneConfig {
+                enabled: true,
+                listen,
+                peers,
+                identity_path: std::env::var("ZION_AIMP_IDENTITY_PATH")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| {
+                        std::path::PathBuf::from("/var/lib/zion/aimp-identity.bin")
+                    }),
+            };
+            match aimp_cp::bootstrap(cfg).await {
+                Ok(cp) => {
+                    eprintln!(
+                        "  AIMP control plane up: node_id[0..4]={:02x?} listen={} peers={}",
+                        &cp.node_id()[..4],
+                        listen,
+                        cp.reputation().is_empty() as u8 // touch the handle
+                    );
+                    Some(cp)
+                }
+                Err(e) => {
+                    crate::logging::warn(
+                        "aimp_cp",
+                        &format!("bootstrap failed: {e} — continuing without AIMP"),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     let state = Arc::new(AppState {
         config: Arc::new(ArcSwap::from_pointee(resolved)),
         tls_acceptor: tls_acceptor_store,
@@ -640,6 +719,8 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
             b.http1().title_case_headers(false);
             b
         }),
+        #[cfg(feature = "sovereign-aimp")]
+        aimp_cp: aimp_cp_handle,
     });
 
     // 5b. Phase 1.5 channels.
@@ -1047,6 +1128,14 @@ async fn handle_http_connection(
     state: Arc<AppState>,
     builder: Arc<AutoBuilder<TokioExecutor>>,
 ) {
+    // Disable Nagle on the accepted socket. Without this, response data
+    // for small replies (e.g. /healthz, 301 redirects) gets coalesced
+    // with the FIN handshake or paired with delayed-ACK on the client,
+    // adding ~40-200ms to TTFB. The HTTPS path already does this in
+    // its accept site; this is the symmetric call for HTTP.
+    let _ = stream.set_nodelay(true);
+    net::tune_accepted(&stream);
+
     let io = TokioIo::new(stream);
     let _ = builder
         .serve_connection(

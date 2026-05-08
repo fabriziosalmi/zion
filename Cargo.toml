@@ -1,6 +1,6 @@
 [package]
 name = "zion"
-version = "0.1.12"
+version = "0.2.1"
 edition = "2021"
 # MSRV is the *core* default-features build (TLS proxy + WAF + cache + metrics).
 # Opt-in features (acme, auth, init, http3) pull crypto/i18n crates that have
@@ -127,9 +127,49 @@ tracing-opentelemetry = { version = "0.28", default-features = false, optional =
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 io-uring = { version = "0.7", optional = true }
+# XDP / eBPF userspace loader (Track A — `--features xdp`).
+# Aya is pure-Rust (no libbpf C dep) and ships its own BTF loader.
+aya = { version = "0.13", optional = true }
+aya-log = { version = "0.2", optional = true }
+# kTLS post-handshake offload (Track A — `--features ktls`).
+# Bridges a rustls ServerConnection to the kernel's TLS_TX/RX so that
+# subsequent record encrypt/decrypt happens in-kernel (sendfile-style
+# zero-copy enabled). Linux-only; kernel >= 5.10 with CONFIG_TLS=y.
+ktls = { version = "6", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+
+# Track C: ML-augmented WAF scoring (`--features ml-waf`).
+# `tract` is pure-Rust ONNX inference — no libonnxruntime C dep, hermetic
+# build, deterministic across platforms. Loads quantized models on the
+# request hot path with a strict per-request budget (see waf_ml.rs).
+[dependencies.tract-onnx]
+version = "0.21"
+optional = true
+default-features = false
+
+# Track B: AIMP serverless control plane (`--features sovereign-aimp`).
+# Pinned to a specific commit on the public `fabriziosalmi/aimp` repo
+# so CI / fresh clones don't need a sibling working copy. Treat as
+# experimental: the protocol is research-grade (Merkle-CRDT + Epistemic
+# Layer L3) and the upstream API is not yet semver-stable.
+[dependencies.aimp_node]
+version = "0.1"
+git = "https://github.com/fabriziosalmi/aimp"
+# Pin past the v0.1.x license-declaration commit (9408956…); without
+# `license = "MIT"` in aimp_node's Cargo.toml, cargo-deny flags it as
+# unlicensed.
+rev = "9408956ae7e51bcfb7d1fcddb15a33468b14a723"
+package = "aimp_node"
+optional = true
+
+# rmp-serde — MessagePack codec used by AIMP envelopes. Pulled in
+# directly so zion can construct/parse `AimpEnvelope`s without going
+# through aimp_node's private module path.
+[dependencies.rmp-serde]
+version = "1"
+optional = true
 
 [features]
 default = []
@@ -156,6 +196,23 @@ fips = ["aws-lc-rs/fips"]
 geo-ita = []                       # 🇮🇹 Italian ASN + gov + ISP ranges
 geo-eu  = ["geo-ita"]              # 🇪🇺 EU superset (includes geo-ita)
 sovereign-signals = []             # Gossip mesh for signal sharing (Phase 3)
+
+# ── Experimental tracks ───────────────────────────────────────────────
+# Track A — XDP pre-filter: drops blacklisted CIDRs at the NIC driver
+# layer before the kernel network stack. Linux-only. Requires CAP_NET_ADMIN
+# at runtime; the eBPF program is shipped separately under `xdp/` and
+# loaded from disk (or embedded — see xdp.rs::EBPF_OBJECT_PATH).
+xdp = ["dep:aya", "dep:aya-log"]
+# Track A — kTLS post-handshake offload. Linux >= 5.10 + CONFIG_TLS.
+# Switches established rustls server connections to in-kernel TLS_TX/RX.
+ktls = ["dep:ktls"]
+# Track C — ML-augmented WAF scoring. Loads a quantized ONNX model and
+# scores requests on the hot path with a strict latency budget.
+ml-waf = ["dep:tract-onnx"]
+# Track B — AIMP-as-control-plane. Bootstraps an aimp_node task for
+# serverless gossip of WAF rules / IP reputation / threat intel via
+# Merkle-CRDT. Implies sovereign-signals (the existing Phase 3 hook).
+sovereign-aimp = ["sovereign-signals", "dep:aimp_node", "dep:rmp-serde"]
 
 # Track C — property-based testing (proptest) only used by `cargo test`.
 [dev-dependencies]

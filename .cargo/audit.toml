@@ -15,6 +15,9 @@ ignore = [
     "RUSTSEC-2025-0134",  # `rustls-pemfile` archived; migrate to rustls-pki-types::pem — review by 2026-08-01
     # ── Soundness issue in transitive dep (TUI feature only) ──
     "RUSTSEC-2026-0002",  # `lru` IterMut Stacked Borrows; tracked via `ratatui` upstream — review by 2026-08-01
+    # ── Pulled in by aimp_node (--features sovereign-aimp, off by default) ──
+    "RUSTSEC-2024-0437",  # `protobuf 2.x` recursion-DoS via prometheus 0.13.4 → aimp_node — review by 2026-09-01
+    "RUSTSEC-2024-0320",  # `yaml-rust` unmaintained, via config 0.13.4 → aimp_node — review by 2026-09-01
 ]
 
 # `informational` advisories (notice/unmaintained) are surfaced as warnings.

@@ -91,6 +91,22 @@ fn emit_waf_block(
         path: Some(path_safe),
         detail: Some(format!("waf:{source}:{reason}")),
     });
+
+    // ── AIMP control-plane publish (Track B) ────────────────────────
+    // Tell the gossip mesh that *this* zion node has just blocked
+    // `remote_addr.ip()`. Best-effort: if the queue is full or the
+    // control plane is not bootstrapped, we drop the publish. The
+    // local block has already happened; gossip is purely informational.
+    #[cfg(feature = "sovereign-aimp")]
+    if let Some(cp) = state.aimp_cp.as_ref() {
+        // Map source label → numeric reason for the wire payload.
+        let reason_code: u8 = match source {
+            "uri" | "body" | "headers" => 1, // legacy WAF gate
+            "ml" => 2,                       // ML scorer (Track C)
+            _ => 0,                          // generic
+        };
+        let _ = cp.publish_block(remote_addr.ip(), 1.0, reason_code);
+    }
 }
 
 pub(crate) async fn process_request(
@@ -485,6 +501,52 @@ pub(crate) async fn process_request(
                 logging::info("waf", &format!("URI denied: {reason} ({uri_str})"));
                 emit_waf_block(&state, &remote_addr, method, uri_str, "uri", &reason);
                 return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
+            }
+        }
+
+        // ── Gate: ML scorer (Track C, --features ml-waf) ─────────────
+        // Anomaly score over URI + headers. Cheap (~50µs p50, 200µs p99
+        // budget enforced via metrics, not active cancel). Returns None
+        // when the model is disabled or failed to load — fall through.
+        #[cfg(feature = "ml-waf")]
+        if let Some(verdict) = crate::waf_ml::evaluate(method, uri_str, req.headers()) {
+            if verdict.over_budget {
+                logging::warn(
+                    "waf_ml",
+                    &format!(
+                        "score over budget: elapsed_us={} score={:.3} path={}",
+                        verdict.elapsed_us, verdict.score, uri_str
+                    ),
+                );
+            }
+            if verdict.denies {
+                let reason = "ml score above threshold";
+                if rule.waf_shadow {
+                    metrics::METRICS
+                        .waf_shadow_would_block
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    logging::warn(
+                        "waf_shadow",
+                        &format!(
+                            "would_block=true source=ml score={:.3} path={uri_str}",
+                            verdict.score
+                        ),
+                    );
+                } else {
+                    metrics::METRICS
+                        .waf_denied
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics::METRICS.record_status(400);
+                    logging::info(
+                        "waf_ml",
+                        &format!(
+                            "denied: score={:.3} elapsed_us={} path={}",
+                            verdict.score, verdict.elapsed_us, uri_str
+                        ),
+                    );
+                    emit_waf_block(&state, &remote_addr, method, uri_str, "ml", reason);
+                    return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
+                }
             }
         }
 
