@@ -319,6 +319,7 @@ cargo test --test integration -- --ignored --test-threads=1
 
 - [Threat model (STRIDE)](docs/security/threat-model.md) — surfaces, mitigations, residual risk.
 - [OWASP ASVS L2 mapping](docs/security/asvs.md) — control → implementation site → test/evidence.
+- [SOC 2 + FedRAMP control mapping](docs/security/compliance-mapping.md) — TSC + NIST 800-53 rev5 evidence for the auditor's binder.
 - [FIPS 140-3 build](docs/security/fips.md) — `cargo build --features fips` for the FIPS-validated AWS-LC backend.
 - [TLS conformance](docs/security/tls-conformance.md) — BoGo / RFC 8446 / SSL Labs verification recipes.
 - [Supply chain](docs/security/supply-chain.md) — SLSA L3 provenance, cosign, SBOM verification.
