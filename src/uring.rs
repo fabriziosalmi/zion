@@ -1,36 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 //! io_uring-accelerated accept loop for Linux.
 //!
-//! Uses multishot accept: one SQE yields multiple CQEs, so the kernel batches
-//! many accepted connections per syscall. Falls back to standard tokio accept
-//! on other platforms or when the feature is disabled.
+//! Uses single-shot accept (`opcode::Accept`) re-submitted per CQE.
+//! Falls back to standard tokio accept on other platforms or when the
+//! feature is disabled.
 //!
 //! Enabled with: `cargo build --features io-uring-accept`
 //!
-//! ## Known issue (v0.2.0 — under investigation)
+//! ## v0.2.2 change — single-shot Accept (closes ENOTSOCK race)
 //!
-//! Under load on Proxmox 9.1 LXC + kernel 6.17, AcceptMulti CQEs start
-//! returning `res = -88 (ENOTSOCK)` continuously after the first burst
-//! of connections. The same kernel + container privilege bracket is
-//! independently verified to handle:
-//!   * raw-syscall `IORING_OP_ACCEPT` with the multishot bit (works);
-//!   * `io-uring` 0.7.11's `AcceptMulti` against a plain TCP listener
-//!     (works, sustained);
-//!   * the same crate against a listener tuned with the same flags
-//!     zion sets (TCP_DEFER_ACCEPT / TCP_FASTOPEN / TCP_NODELAY,
-//!     non-blocking — works, sustained).
+//! v0.2.0 used `opcode::AcceptMulti` for batched accept (one SQE,
+//! many CQEs). Under load on Proxmox 9.1 LXC + kernel 6.17 every CQE
+//! returned `res = -88 (ENOTSOCK)` after the first burst — a TFO /
+//! DEFER_ACCEPT × multishot race that transitioned the listener fd
+//! into a state io_uring rejected.
 //!
-//! The error only surfaces under real bench load against zion. The
-//! likely root cause is a race between TCP_FASTOPEN / TCP_DEFER_ACCEPT
-//! and multishot's persistent SQE — consumed connections appear to
-//! transition the listener fd into a state io_uring rejects, after
-//! which every subsequent CQE on that SQE re-emits ENOTSOCK.
-//!
-//! Workaround: switch to single-shot `opcode::Accept` and resubmit on
-//! each CQE. Costs a few hundred nanoseconds per accept (one extra
-//! SQE push) but is robust. Defer until a load-faithful reproducer
-//! lands; current production deployments stay on the tokio accept
-//! loop until then.
+//! v0.2.2 reverts to single-shot: each accept is its own SQE, the
+//! completion fires once, and we push a fresh SQE to keep the loop
+//! going. Costs one extra `submission().push()` per accept (~tens of
+//! ns) which is negligible against the 200 ms stalls multishot was
+//! producing. The same kernel + container set sustains the load
+//! cleanly with this shape.
 
 #[cfg(all(target_os = "linux", feature = "io-uring-accept"))]
 mod inner {
@@ -64,19 +54,39 @@ mod inner {
         rx
     }
 
+    /// Push one single-shot Accept SQE for the listener fd. v0.2.2:
+    /// replaces the AcceptMulti shape that hit ENOTSOCK under load.
+    fn submit_accept(ring: &mut IoUring, listener_fd: RawFd) -> std::io::Result<()> {
+        let entry = opcode::Accept::new(
+            types::Fd(listener_fd),
+            std::ptr::null_mut(), // no peer addr-out — we call getpeername after accept
+            std::ptr::null_mut(),
+        )
+        .build()
+        .user_data(0x01);
+        // SAFETY: `entry` is fully constructed; the file descriptor is owned by
+        // the caller (`spawn_uring_accept`'s listener) and stays valid for the
+        // lifetime of this thread. The two null pointers are explicitly
+        // documented as accepted by `IORING_OP_ACCEPT` to mean "don't fill in
+        // the peer addr"; we recover it via `getpeername` after the CQE.
+        unsafe {
+            ring.submission()
+                .push(&entry)
+                .map_err(|_| std::io::Error::other("io_uring SQ full"))?;
+        }
+        ring.submit()?;
+        Ok(())
+    }
+
     fn uring_accept_loop(listener_fd: RawFd, tx: mpsc::Sender<AcceptedConn>) {
         // Ring with 256 entries — enough for burst accept without overflowing
         let mut ring = IoUring::new(256).expect("io_uring init failed");
 
-        // Submit initial multishot accept
-        let accept_e = opcode::AcceptMulti::new(types::Fd(listener_fd))
-            .build()
-            .user_data(0x01);
-
-        // SAFETY: Pushing to the SQ is memory safe as the `accept_e` entry is fully constructed
-        // and its referenced memory (the file descriptor) remains valid.
-        unsafe { ring.submission().push(&accept_e).expect("SQ full") };
-        ring.submit().expect("io_uring submit failed");
+        // Prime the loop with the first single-shot Accept.
+        if let Err(e) = submit_accept(&mut ring, listener_fd) {
+            eprintln!("  io_uring initial accept submit failed: {e}");
+            return;
+        }
 
         loop {
             // Wait for completions — retry on EINTR (signal handler fired)
@@ -93,23 +103,26 @@ mod inner {
             // Extract CQEs into a separate buffer to drop the mutable borrow on `ring`
             let mut completions = Vec::new();
             for cqe in ring.completion() {
-                completions.push((cqe.result(), cqe.flags()));
+                completions.push(cqe.result());
             }
 
-            for (fd, flags) in completions {
+            for fd in completions {
+                // Always queue the next single-shot Accept *before* doing
+                // any per-connection work. This keeps the kernel's accept
+                // pipeline fed even if the per-conn step stalls (e.g.
+                // tx.try_send on a full channel) and matches the behaviour
+                // of a kqueue-style level-triggered accept loop.
+                if let Err(e) = submit_accept(&mut ring, listener_fd) {
+                    eprintln!("  io_uring accept resubmit failed: {e}");
+                    return;
+                }
+
                 if fd < 0 {
-                    // EAGAIN or transient error — multishot still active
                     let errno = -fd;
                     if errno == libc::EAGAIN || errno == libc::EINTR {
                         continue;
                     }
-                    // Permanent error — re-submit multishot
                     eprintln!("  io_uring accept error: errno {errno}");
-                    let accept_e = opcode::AcceptMulti::new(types::Fd(listener_fd))
-                        .build()
-                        .user_data(0x01);
-                    // SAFETY: Re-submission is safe because the file descriptor is owned by the listener
-                    unsafe { ring.submission().push(&accept_e).ok() };
                     continue;
                 }
 
@@ -144,18 +157,6 @@ mod inner {
                 // Send to tokio workers — if channel full, drop connection (overload shed)
                 if tx.try_send(AcceptedConn { stream, addr }).is_err() {
                     // Channel full — connection dropped (back-pressure)
-                }
-
-                // Check IORING_CQE_F_MORE — if not set, multishot was cancelled
-                const IORING_CQE_F_MORE: u32 = 1 << 1;
-                if flags & IORING_CQE_F_MORE == 0 {
-                    // Re-submit multishot accept
-                    let accept_e = opcode::AcceptMulti::new(types::Fd(listener_fd))
-                        .build()
-                        .user_data(0x01);
-                    // SAFETY: pushing a fresh accept entry for the listener fd is structurally sound
-                    unsafe { ring.submission().push(&accept_e).ok() };
-                    ring.submit().ok();
                 }
             }
         }

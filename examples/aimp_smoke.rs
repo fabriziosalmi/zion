@@ -38,12 +38,14 @@ fn main() {
             listen: format!("127.0.0.1:{port_a}").parse().unwrap(),
             peers: vec![format!("127.0.0.1:{port_b}").parse::<SocketAddr>().unwrap()],
             identity_path: "/tmp/zion-aimp-a.bin".into(),
+            anti_entropy_secs: 0, // 2-node loopback smoke — gossip is enough
         };
         let cfg_b = aimp_cp::AimpControlPlaneConfig {
             enabled: true,
             listen: format!("127.0.0.1:{port_b}").parse().unwrap(),
             peers: vec![format!("127.0.0.1:{port_a}").parse::<SocketAddr>().unwrap()],
             identity_path: "/tmp/zion-aimp-b.bin".into(),
+            anti_entropy_secs: 0,
         };
 
         eprintln!("→ booting node A on :{port_a} (peer={port_b})");
