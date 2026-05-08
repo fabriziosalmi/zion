@@ -146,6 +146,24 @@ Installed before any worker thread is spawned. On a panic anywhere in the proces
 
 Because the release profile ships `panic = "abort"`, the hook runs once and the process exits. A sidecar / next-boot probe surfaces the persisted record. Liveness probes detect the corresponding restart through the orchestrator (Helm probes on `/healthz` flap; readiness goes red until a fresh process is up).
 
+## Mesh (`--features sovereign-aimp`)
+
+The mesh layer surfaces its own observability through the same triad
+(audit log + counters + structured boot log). When zion is built with
+`--features sovereign-aimp` and the mesh is enabled in `zion.toml`,
+the following are exposed alongside the core surfaces above:
+
+- `zion_mesh_claims_published_total{kind=...}` — outbound counter per claim type.
+- `zion_mesh_claims_received_total{kind=...}` — inbound counter.
+- `zion_mesh_claims_rejected_total{reason=...}` — verification failures bucketed by `signature` / `unknown_peer` / `replay`.
+- `zion_mesh_peers` — current peer-set size.
+- Audit events with `kind=mesh_publish` / `kind=mesh_receive` — every publish + receive carries the envelope's signature, the resolved `node_id`, and the local HMAC chain `prev_hash`.
+
+The full operator-facing guide (topology, identity rotation,
+debugging) lives at [docs/mesh/integration.md](../mesh/integration.md).
+Threat-model addendum specific to the mesh surface:
+[docs/security/threat-model.md §10](../security/threat-model.md#10-mesh-aimp-integration).
+
 ## What's next
 
 - **Span instrumentation** — automatic span creation around `process_request` is wired through the W3C parser; richer per-stage spans (WAF, cache, upstream) will follow in a small follow-up.

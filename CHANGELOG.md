@@ -6,6 +6,25 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **STRIDE threat-model addendum on the mesh (AIMP) surface** — new
+  §10 in [docs/security/threat-model.md](docs/security/threat-model.md)
+  walking the six STRIDE categories against the mesh: Ed25519 signing
+  for Spoofing, Noise AEAD + Merkle-CRDT integrity for Tampering,
+  signed audit trail for Repudiation, opt-in IP anonymisation for
+  Information disclosure, per-peer rate-cap + LRU for DoS, and
+  revocation-key-signed claims plus quorum thresholds for Elevation
+  of privilege. ASVS map ([docs/security/asvs.md](docs/security/asvs.md))
+  gets a new V9.2.4 row pointing at the addendum, and
+  [docs/guide/observability.md](docs/guide/observability.md) gains a
+  Mesh section listing the `zion_mesh_*` counters + audit-event
+  kinds. (#70)
+- **ADR-0008 + mesh integration guide** — formal architectural record
+  for embedding AIMP as the mesh control-plane bus
+  ([docs/adr/0008-mesh-aimp-integration.md](docs/adr/0008-mesh-aimp-integration.md)),
+  alongside an operator-facing deployment guide
+  ([docs/mesh/integration.md](docs/mesh/integration.md)) covering peer
+  topology, identity management, anti-entropy tuning, and
+  diagnostics. README "Compliance" section gains a Mesh sub-link. (#73)
 - **SO_REUSEPORT + BPF demux foundation (`bpf-demux` feature)**
   (partial — see Deferred). New `src/bpf_demux.rs` module with a
   three-state `DemuxReadiness` probe (`Ready` /
@@ -85,6 +104,15 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Changed
 
+- **OSSF Scorecard split into a minimal workflow** — moved from
+  `supply-chain.yml` to a dedicated [`scorecard.yml`](.github/workflows/scorecard.yml)
+  with no global `env`/`defaults` blocks, satisfying the
+  scorecard-action verification policy required for
+  `publish_results: true`. The public badge at scorecard.dev now
+  auto-refreshes within ~24 h of the first successful run; the SARIF
+  still flows into the GitHub Security tab as before. Triggers
+  (master push + 06:00 UTC cron + workflow_dispatch) match the
+  previous in-supply-chain shape. (#57)
 - **`WafMode` and `WafProfile` moved from `config` to `waf`** — semantic
   home, and lets the bench harness construct profiles via the lib
   surface without dragging the full config-loader dependency graph.
