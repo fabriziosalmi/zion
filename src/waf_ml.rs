@@ -22,6 +22,12 @@
 //! Model load failure is not fatal — log once at boot, disable scoring
 //! for the lifetime of the process, the Aho-Corasick gate keeps running.
 
+// Scaffolding: public init / is_active / config fields are part of the
+// v0.2.x stable surface. They are unused by the binary today (the
+// dispatcher reaches them via `evaluate`) but the boot-banner / health
+// endpoint integration that consumes them is the next-PR delta.
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Instant;

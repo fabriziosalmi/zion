@@ -149,4 +149,11 @@ skip-tree = [
 unknown-registry = "deny"
 unknown-git      = "deny"
 allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
-allow-git        = []
+allow-git        = [
+    # AIMP serverless control plane (`--features sovereign-aimp`).
+    # Pinned to a specific commit (see Cargo.toml). Promote to a
+    # crates.io publish + version-pinned dep when AIMP cuts a stable
+    # release.
+    "https://github.com/fabriziosalmi/aimp",
+]
+

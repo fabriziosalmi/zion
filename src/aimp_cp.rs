@@ -31,6 +31,13 @@
 //!   register (last-writer-wins by `ts_secs`). v1: graduate to the
 //!   full Merkle-CRDT layer in `aimp_node::crdt`.
 
+// Scaffolding: several public types and methods are present here for
+// the data-plane consumers (XDP map populator, ML threshold updater,
+// dashboard) to call once those wires land. They are intentionally
+// part of the v0.2.x stable surface — keeping them allows downstream
+// integration to land in small PRs without further API churn.
+#![allow(dead_code)]
+
 use aimp_node::crypto::Identity;
 use aimp_node::crypto::SecurityFirewall;
 use aimp_node::protocol::envelope::{AimpData, AimpEnvelope, OpCode};
