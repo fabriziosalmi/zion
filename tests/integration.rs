@@ -95,6 +95,24 @@ fn zion_is_running() -> bool {
         .is_ok()
 }
 
+/// Write `bytes` to a tempfile and return its path. Used by the streaming
+/// WAF tests (issue #49) to ship MB-scale bodies into curl via `-d @path`
+/// — passing them as argv arguments trips `ArgumentListTooLong` (ARG_MAX)
+/// on the CI runner.
+fn write_tempfile(prefix: &str, bytes: &[u8]) -> std::path::PathBuf {
+    use std::io::Write;
+    let mut path = std::env::temp_dir();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    path.push(format!("{prefix}-{nanos}.bin"));
+    let mut f = std::fs::File::create(&path).expect("create tempfile");
+    f.write_all(bytes).expect("write tempfile");
+    f.sync_all().expect("sync tempfile");
+    path
+}
+
 // ============================================================================
 // Tests (all #[ignore]d — run with: cargo test --test integration -- --ignored)
 // ============================================================================
@@ -219,11 +237,16 @@ integration_test!(t08b_stream_waf_attack_first_chunk_denies, {
     // upload would finish. We don't measure wall-clock here (CI noise),
     // but the upload completes well under any reasonable buffered
     // baseline because the deny short-circuits the body read.
+    //
+    // Bodies in the MB range are written to a tempfile and passed via
+    // `-d @path` — argv-passing trips ARG_MAX on tighter CI runners.
     let mut payload = String::with_capacity(1_048_576);
     payload.push_str("<script>alert(1)</script>");
     while payload.len() < 1_048_576 {
         payload.push_str("padding ");
     }
+    let path = write_tempfile("zion-stream-attack", payload.as_bytes());
+    let body_arg = format!("@{}", path.display());
     let (status, _, _) = curl(&[
         "-X",
         "POST",
@@ -231,10 +254,11 @@ integration_test!(t08b_stream_waf_attack_first_chunk_denies, {
         "Host: bench.local",
         "-H",
         "Content-Type: text/plain",
-        "-d",
-        &payload,
+        "--data-binary",
+        &body_arg,
         "https://127.0.0.1:4433/stream/echo",
     ]);
+    let _ = std::fs::remove_file(&path);
     assert_eq!(
         status, 400,
         "attack pattern in first chunk must deny on the streaming path"
@@ -248,7 +272,9 @@ integration_test!(t08c_stream_waf_oversize_body_denies, {
     // returns 400 because `StreamVerdict::Deny("body exceeds max size")`
     // is treated as a WAF deny. Both are correct rejections; the test
     // asserts on the 4xx class so either path passes.
-    let big = "A".repeat(11 * 1024 * 1024);
+    let big = vec![b'A'; 11 * 1024 * 1024];
+    let path = write_tempfile("zion-stream-oversize", &big);
+    let body_arg = format!("@{}", path.display());
     let (status, _, _) = curl(&[
         "-X",
         "POST",
@@ -256,10 +282,11 @@ integration_test!(t08c_stream_waf_oversize_body_denies, {
         "Host: bench.local",
         "-H",
         "Content-Type: text/plain",
-        "-d",
-        &big,
+        "--data-binary",
+        &body_arg,
         "https://127.0.0.1:4433/stream/echo",
     ]);
+    let _ = std::fs::remove_file(&path);
     assert!(
         (400..=499).contains(&status),
         "oversize body must be rejected with a 4xx, got {status}"
