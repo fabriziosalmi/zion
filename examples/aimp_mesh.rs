@@ -126,8 +126,7 @@ fn parse_args() -> Args {
     let mut print_every_ms: u64 = 500;
 
     let mut it = std::env::args().skip(1);
-    loop {
-        let Some(a) = it.next() else { break };
+    while let Some(a) = it.next() {
         match a.as_str() {
             "--listen" => {
                 listen = Some(
