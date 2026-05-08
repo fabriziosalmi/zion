@@ -147,6 +147,18 @@ All notable changes to Zion Edge Gateway are documented here.
   delta-vs-master summary as a PR comment. See
   [docs/perf/microbench.md](docs/perf/microbench.md). (#54)
 
+### Fixed
+
+- **`scorecard.yml` publish step — top-level write permissions
+  rejected by scorecard.dev**. The split workflow shipped in #57
+  declared `id-token: write` and `security-events: write` at the
+  workflow level, which scorecard-action's webapp verifier rejects
+  with `400 Bad Request: "global perm is set to write"`. Move the
+  writes to the `scorecard` job's `permissions:` block; top-level
+  becomes `read-all`. The first scheduled / manual run after this
+  lands publishes the public badge to scorecard.dev. (follow-up to
+  #57)
+
 ### Changed
 
 - **`cargo-vet` promoted to a required CI gate** — `supply-chain/`
