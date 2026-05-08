@@ -157,10 +157,11 @@ default-features = false
 [dependencies.aimp_node]
 version = "0.1"
 git = "https://github.com/fabriziosalmi/aimp"
-# Pin past the v0.1.x license-declaration commit (9408956…); without
-# `license = "MIT"` in aimp_node's Cargo.toml, cargo-deny flags it as
-# unlicensed.
-rev = "9408956ae7e51bcfb7d1fcddb15a33468b14a723"
+# Pin includes:
+#   * 9408956…  `license = "MIT"` in aimp_node/Cargo.toml (cargo-deny).
+#   * 4631819…  `Identity::from_secret_bytes` + `secret_bytes` so
+#               zion can persist the Ed25519 seed across restarts.
+rev = "46318198785f8600c08af8c90533795316f4b1b3"
 package = "aimp_node"
 optional = true
 

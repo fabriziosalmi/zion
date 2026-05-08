@@ -86,6 +86,11 @@ mod waf_ml;
 // under `sovereign::` so it does not pull in geo-* features by accident.
 #[cfg(feature = "sovereign-aimp")]
 mod aimp_cp;
+// AIMP→XDP reconciler. Lives in its own file so the example crates
+// (`examples/aimp_*.rs`) that embed `aimp_cp.rs` via `#[path]` don't
+// drag in `crate::xdp::*` references they cannot resolve.
+#[cfg(all(target_os = "linux", feature = "xdp", feature = "sovereign-aimp"))]
+mod aimp_xdp_sync;
 
 // ── Global allocator: mimalloc ──────────────────────────────────
 // ~2-3x faster than system malloc on small allocations.
@@ -1244,10 +1249,19 @@ fn spawn_https_handler(
             .connections_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        // kTLS upgrade requires the rustls handshake to happen on a
+        // `CorkStream<TcpStream>` adapter (ktls 6.x API). Wrap up-front
+        // when the feature is on; the cfg-gated branch costs nothing
+        // when compiled without it.
+        #[cfg(all(target_os = "linux", feature = "ktls"))]
+        let inner_for_handshake = crate::ktls::cork_for_handshake(tcp_stream);
+        #[cfg(not(all(target_os = "linux", feature = "ktls")))]
+        let inner_for_handshake = tcp_stream;
+
         let tls_start = std::time::Instant::now();
         let mut tls_stream = match tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            (*acceptor).accept(tcp_stream),
+            (*acceptor).accept(inner_for_handshake),
         )
         .await
         {
@@ -1273,7 +1287,9 @@ fn spawn_https_handler(
 
         // mTLS: stable SHA-256 fingerprint of the leaf cert DER. See the
         // module-level rationale in v0.1.7 — replaced the previous XOR
-        // pseudo-DN. Forwarded as `X-Client-Cert-Fingerprint`.
+        // pseudo-DN. Forwarded as `X-Client-Cert-Fingerprint`. Read the
+        // peer certificates BEFORE any kTLS upgrade — after the upgrade
+        // the rustls connection state is gone (kernel owns the AEAD).
         let client_cert_fingerprint: Option<String> = tls_stream
             .get_ref()
             .1
@@ -1293,6 +1309,24 @@ fn spawn_https_handler(
             });
         let client_fp = client_cert_fingerprint.map(std::sync::Arc::new);
 
+        // Optionally swap the userspace TLS stream for an in-kernel
+        // KtlsStream. The kernel takes over record framing + AEAD so
+        // hyper sees plaintext directly. Failure here closes the
+        // connection — there is no fall-back to userspace mode on the
+        // same stream (the cork adapter is consumed by `try_upgrade`).
+        //
+        // The cfg-arms are mutually exclusive, so `io` resolves to a
+        // single concrete type per build (no dyn / boxing needed —
+        // `serve_connection_with_upgrades` is generic over the IO).
+        #[cfg(all(target_os = "linux", feature = "ktls"))]
+        let io = match crate::ktls::try_upgrade(tls_stream).await {
+            Ok(ktls_stream) => TokioIo::new(ktls_stream),
+            Err(e) => {
+                eprintln!("  kTLS upgrade failed, closing connection: {e}");
+                return;
+            }
+        };
+        #[cfg(not(all(target_os = "linux", feature = "ktls")))]
         let io = TokioIo::new(tls_stream);
         // Connection-level idle timeout. 1h to cover long-lived HTTP/2
         // mux / WebSocket / SSE; per-request timeouts are in process_request.

@@ -212,9 +212,12 @@ pub async fn bootstrap(cfg: AimpControlPlaneConfig) -> Result<AimpControlPlane, 
         return Err("aimp-cp: bootstrap called with disabled config".to_string());
     }
 
-    // --- Identity (load or generate). v0 PoC just generates a fresh
-    //     ephemeral identity; v1 will persist to `cfg.identity_path`.
-    let identity = Arc::new(Identity::new());
+    // --- Identity: load from `cfg.identity_path` if it exists, else
+    //     generate a fresh keypair and persist the secret seed.
+    //     Persisting keeps the derived `node_id` (Ed25519 public key)
+    //     stable across restarts so peers don't have to re-classify
+    //     us as a new node and discard the prior trust state.
+    let identity = Arc::new(load_or_generate_identity(&cfg.identity_path)?);
     let self_node_id = identity.node_id();
 
     // --- UDP socket
@@ -517,6 +520,89 @@ async fn run_publisher(
 //  in the next PR, so examples never see it.)
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/// Load an `Identity` from `path` if the file exists and contains a
+/// 32-byte Ed25519 secret seed; otherwise generate a fresh `Identity`
+/// and persist its secret seed at `path` with permissions `0600`.
+///
+/// Failure to read or write the persistence path is **not** fatal: we
+/// fall back to an ephemeral identity and log the reason. A common
+/// case where the path is unwritable is the default
+/// `/var/lib/zion/aimp-identity.bin` on systems where zion runs as a
+/// non-root user that doesn't own that directory — there the operator
+/// is expected to point `identity_path` at a path the service can write.
+fn load_or_generate_identity(path: &std::path::Path) -> Result<Identity, String> {
+    use std::io::Write;
+
+    // Try to load an existing seed.
+    if path.exists() {
+        match std::fs::read(path) {
+            Ok(bytes) if bytes.len() == 32 => {
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(&bytes);
+                return Ok(Identity::from_secret_bytes(seed));
+            }
+            Ok(other) => {
+                eprintln!(
+                    "aimp_cp: warn: identity_path {} has wrong length ({} bytes, expected 32) — generating ephemeral",
+                    path.display(),
+                    other.len()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "aimp_cp: warn: identity_path {} unreadable ({e}) — generating ephemeral",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    // Generate fresh and try to persist.
+    let identity = Identity::new();
+    let secret = identity.secret_bytes();
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Atomic write: tmp file + rename, so a partial write never
+    // produces a half-baked seed file. chmod 0600 BEFORE the rename
+    // so the file is never readable by other users in transit.
+    let tmp_path = path.with_extension("bin.tmp");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp_path)
+    {
+        Ok(mut f) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+            }
+            if let Err(e) = f.write_all(&secret) {
+                eprintln!(
+                    "aimp_cp: warn: identity_path {} write failed: {e}",
+                    path.display()
+                );
+            } else if let Err(e) = std::fs::rename(&tmp_path, path) {
+                eprintln!(
+                    "aimp_cp: warn: identity_path {} rename failed: {e}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "aimp_cp: warn: identity_path {} cannot create tmp file: {e} — running with ephemeral identity",
+                path.display()
+            );
+        }
+    }
+
+    Ok(identity)
+}
 
 fn now_secs() -> u64 {
     SystemTime::now()

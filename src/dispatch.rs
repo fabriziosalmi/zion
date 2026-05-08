@@ -223,6 +223,32 @@ pub(crate) async fn process_request(
         }
     }
 
+    // ── AIMP mesh score lookup (signal, not gate) ──
+    //
+    // If the AIMP control plane is up and has a reputation entry for
+    // `client_ip` (received via gossip from another zion node), inject
+    // the score into the request headers as `X-Zion-Mesh-Score`. The
+    // header travels to the upstream so application code can use it
+    // as one more signal alongside its own anti-abuse logic.
+    //
+    // We deliberately do NOT use this score as a hard gate here — the
+    // local WAF / rate-limiter / auth decisions remain authoritative.
+    // The mesh is advisory only, by design (see issue #65).
+    #[cfg(feature = "sovereign-aimp")]
+    if let Some(cp) = state.aimp_cp.as_ref() {
+        if let Some(rep) = cp.lookup(&client_ip) {
+            // 3 decimals so log/grep humans see a stable string;
+            // upstreams parse as f32 and tolerate any precision.
+            let formatted = format!("{:.3}", rep.score);
+            if let Ok(val) = hyper::header::HeaderValue::from_str(&formatted) {
+                req.headers_mut().insert(
+                    hyper::header::HeaderName::from_static("x-zion-mesh-score"),
+                    val,
+                );
+            }
+        }
+    }
+
     // ── Built-in health endpoints (no routing, no upstream) ──
     {
         let path = req.uri().path();
