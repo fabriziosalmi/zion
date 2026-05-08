@@ -6,6 +6,18 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **STRIDE threat-model addendum on the mesh (AIMP) surface** — new
+  §10 in [docs/security/threat-model.md](docs/security/threat-model.md)
+  walking the six STRIDE categories against the mesh: Ed25519 signing
+  for Spoofing, Noise AEAD + Merkle-CRDT integrity for Tampering,
+  signed audit trail for Repudiation, opt-in IP anonymisation for
+  Information disclosure, per-peer rate-cap + LRU for DoS, and
+  revocation-key-signed claims plus quorum thresholds for Elevation
+  of privilege. ASVS map ([docs/security/asvs.md](docs/security/asvs.md))
+  gets a new V9.2.4 row pointing at the addendum, and
+  [docs/guide/observability.md](docs/guide/observability.md) gains a
+  Mesh section listing the `zion_mesh_*` counters + audit-event
+  kinds. (#70)
 - **ADR-0008 + mesh integration guide** — formal architectural record
   for embedding AIMP as the mesh control-plane bus
   ([docs/adr/0008-mesh-aimp-integration.md](docs/adr/0008-mesh-aimp-integration.md)),
