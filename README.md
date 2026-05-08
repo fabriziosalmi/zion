@@ -322,6 +322,7 @@ cargo test --test integration -- --ignored --test-threads=1
 - [FIPS 140-3 build](docs/security/fips.md) — `cargo build --features fips` for the FIPS-validated AWS-LC backend.
 - [TLS conformance](docs/security/tls-conformance.md) — BoGo / RFC 8446 / SSL Labs verification recipes.
 - [Supply chain](docs/security/supply-chain.md) — SLSA L3 provenance, cosign, SBOM verification.
+- [Mesh integration](docs/mesh/integration.md) — `--features sovereign-aimp` operator guide: topology, identity, observability, debugging.
 - [Architecture Decision Records](docs/adr/) — the load-bearing engineering choices, in writing.
 
 ## Verifying a Release

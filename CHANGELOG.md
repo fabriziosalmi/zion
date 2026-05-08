@@ -6,6 +6,13 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **ADR-0008 + mesh integration guide** — formal architectural record
+  for embedding AIMP as the mesh control-plane bus
+  ([docs/adr/0008-mesh-aimp-integration.md](docs/adr/0008-mesh-aimp-integration.md)),
+  alongside an operator-facing deployment guide
+  ([docs/mesh/integration.md](docs/mesh/integration.md)) covering peer
+  topology, identity management, anti-entropy tuning, and
+  diagnostics. README "Compliance" section gains a Mesh sub-link. (#73)
 - **SO_REUSEPORT + BPF demux foundation (`bpf-demux` feature)**
   (partial — see Deferred). New `src/bpf_demux.rs` module with a
   three-state `DemuxReadiness` probe (`Ready` /
