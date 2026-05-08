@@ -15,6 +15,25 @@ export default defineConfig({
   lastUpdated: true,
   cleanUrls: true,
 
+  // Many docs (security/asvs.md, perf/roadmap.md, the ADRs) deep-link
+  // to source files outside the docs/ tree (e.g. ../../src/dispatch.rs,
+  // ../../deny.toml, ../../CHANGELOG). VitePress's dead-link checker
+  // doesn't follow paths outside the docs root and flags every such
+  // reference as broken — even though the files exist on the same
+  // commit and resolve correctly when the rendered HTML is browsed
+  // via the GitHub source view. Skip these patterns; internal-only
+  // docs cross-links remain checked.
+  ignoreDeadLinks: [
+    // Anything that walks up out of the docs tree (matches both
+    // `../../...` and `./../../...` shapes used across the docs).
+    /\.\.\/\.\.\//,
+    // Sibling directory hops that reach a doc index that's only
+    // referenced as `index` without an extension (e.g. `./../adr/index`).
+    /\/index$/,
+    // Bare repo-root files referenced from any depth.
+    /\/(SECURITY|CHANGELOG|README|Dockerfile|deny\.toml|rust-toolchain\.toml)$/,
+  ],
+
   themeConfig: {
     logo: '/logo.svg',
     siteTitle: 'Zion',
@@ -31,7 +50,7 @@ export default defineConfig({
         ]
       },
       {
-        text: 'v0.1.7',
+        text: 'v0.2.2',
         items: [
           { text: 'Changelog', link: 'https://github.com/fabriziosalmi/zion/blob/master/CHANGELOG.md' },
           { text: 'Releases', link: 'https://github.com/fabriziosalmi/zion/releases' },
