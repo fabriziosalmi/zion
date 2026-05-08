@@ -738,6 +738,10 @@ pub fn snapshot_json(
             // NUMA topology — 1 unless built with `--features numa-aware`
             // on a multi-socket Linux box (issue #50).
             "numa_nodes": platform.numa_nodes,
+            // Whether the running kernel supports io_uring rw surface
+            // (≥ 5.19). Independent of build features — even non-Linux
+            // hosts surface this, always as `false`. (issue #51)
+            "has_io_uring_rw_kernel": platform.has_io_uring_rw_kernel,
         },
         "metrics": {
             "requests_total": m.requests_total.load(Relaxed),

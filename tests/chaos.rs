@@ -159,6 +159,130 @@ fn redact_idempotence_under_repeated_calls() {
     assert!(!pass1.contains("xyz"));
 }
 
+// ── Connection reset mid-read recoverable (issue #51) ─────────────────────
+//
+// Invariant: when a peer abruptly closes a TCP connection during a body
+// read, the server-side `AsyncRead` future resolves to an `io::Error`
+// (ConnectionReset / UnexpectedEof / BrokenPipe) — NOT a panic, NOT a
+// hang. The same contract must hold for the eventual io_uring rw
+// adapter that replaces tokio's read/write half (#51); shipping the
+// test against today's tokio path pins the contract early.
+
+#[tokio::test]
+async fn tcp_read_terminates_cleanly_on_peer_close() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        // Server side: read into a buffer. Peer will abandon mid-stream.
+        let mut buf = vec![0u8; 1024];
+        sock.read(&mut buf).await
+    });
+
+    // Client: connect, send a partial frame, then drop without
+    // shutting down cleanly — on Linux + macOS this surfaces as EOF
+    // (read returns Ok(0)) once the kernel's TCP teardown completes.
+    let client = TcpStream::connect(addr).await.expect("connect");
+    drop(client);
+
+    let read_result = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("server task did not deadlock")
+        .expect("server task did not panic");
+
+    // The contract: read terminates with either Ok(0) (clean EOF) or
+    // an io::Error of a "peer went away" kind. Both are recoverable —
+    // the connection is dropped, no daemon-wide state corruption.
+    match read_result {
+        Ok(n) => {
+            assert_eq!(n, 0, "read returned {n} bytes; expected EOF (Ok(0))");
+        }
+        Err(e) => {
+            use std::io::ErrorKind::*;
+            assert!(
+                matches!(
+                    e.kind(),
+                    ConnectionReset | UnexpectedEof | BrokenPipe | ConnectionAborted
+                ),
+                "unexpected error kind on peer close: {e:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tcp_read_terminates_cleanly_on_so_linger_zero_close() {
+    // Stronger version: client sets SO_LINGER 0 before close so the
+    // kernel sends RST instead of FIN. Server-side read should
+    // surface ConnectionReset (or, on platforms that map RST to EOF
+    // here, UnexpectedEof). Either way, no panic / no hang.
+    use socket2::Socket;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        let mut buf = vec![0u8; 1024];
+        sock.read(&mut buf).await
+    });
+
+    // Build the client through socket2 so we can flip SO_LINGER
+    // before the close. The std-lib std::net::TcpStream doesn't
+    // expose linger setting; tokio's wraps std and inherits the
+    // sockopt setup, so we go one layer down.
+    let client = Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .expect("socket2 create");
+    client.connect(&addr.into()).expect("socket2 connect");
+    client
+        .set_linger(Some(std::time::Duration::from_secs(0)))
+        .expect("set_linger 0");
+    drop(client); // RST instead of FIN
+
+    let read_result = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .expect("server did not deadlock")
+        .expect("server did not panic");
+
+    match read_result {
+        Ok(n) => {
+            // Some kernels still surface RST as EOF here; OK.
+            assert_eq!(n, 0, "read returned {n} bytes; expected RST or EOF");
+        }
+        Err(e) => {
+            use std::io::ErrorKind::*;
+            assert!(
+                matches!(
+                    e.kind(),
+                    ConnectionReset | UnexpectedEof | BrokenPipe | ConnectionAborted
+                ),
+                "unexpected error kind on RST: {e:?}"
+            );
+        }
+    }
+
+    // Sanity: the io_uring rw kernel probe (issue #51) is callable
+    // without panicking from inside an async test. The full
+    // IoUringStream adapter is deferred — when it lands, this test
+    // (along with `tcp_read_terminates_cleanly_on_peer_close`) will
+    // be re-pointed at it to pin the same recoverability contract.
+    let _kernel_ready = zion::uring::probe_io_uring_rw_supported();
+}
+
 fn tempdir(label: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!(

@@ -175,6 +175,20 @@ optional = true
 [features]
 default = []
 io-uring-accept = ["io-uring"]
+# v0.2 perf-ceiling — io_uring read/write vectored (issue #51).
+#
+# Wires the boot-time probe (kernel >= 5.19, where IORING_OP_READV_FIXED
+# and the rest of the rw surface we'd target are stable) and reserves
+# the feature gate. The full `IoUringStream<R, W>` adapter that
+# replaces the tokio-driven read/write half of accepted connections is
+# tracked on a follow-up — it requires a careful tokio-reactor
+# integration we don't paper over with a delegating stub.
+#
+# Until that follow-up lands, this feature only enables the boot
+# capability probe and the kernel-version structured log line. The
+# listener supervisor keeps using tokio's `AsyncReadExt` /
+# `AsyncWriteExt` — no behavioural change at runtime.
+io-uring-rw = ["io-uring-accept"]
 acme = ["instant-acme", "rcgen", "base64"]
 auth = ["jsonwebtoken", "reqwest"]
 http3 = ["quinn", "h3", "h3-quinn"]

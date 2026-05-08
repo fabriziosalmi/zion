@@ -68,7 +68,11 @@ mod sovereign;
 mod tls;
 #[cfg(feature = "tui")]
 mod tui;
-#[cfg(all(target_os = "linux", feature = "io-uring-accept"))]
+// `uring.rs` compiles on every target — the io_uring-accept inner
+// module is feature-gated *inside* the file. This way the
+// `io-uring-rw` capability probe (issue #51) and its tests stay
+// reachable even when `io-uring-accept` is off, and on non-Linux the
+// probe degrades to "always returns false".
 mod uring;
 mod waf;
 
@@ -645,6 +649,27 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         );
     }
     logging::info("proxy", &format!("xff_mode: {:?}", resolved.xff_mode));
+
+    // io_uring rw kernel probe boot line (issue #51). Emitted only when
+    // the operator opted into `--features io-uring-rw`, otherwise the
+    // probe result is just a Platform field surfaced on /metrics.
+    // The full IoUringStream wire-up that consumes this is tracked on
+    // a follow-up; the boot line lets a deployment confirm the host is
+    // ready before the perf work lands.
+    #[cfg(feature = "io-uring-rw")]
+    {
+        if platform.has_io_uring_rw_kernel {
+            logging::info(
+                "io_uring_rw",
+                "kernel supports vectored rw (>= 5.19) — feature ready, runtime adapter pending follow-up",
+            );
+        } else {
+            logging::warn(
+                "io_uring_rw",
+                "kernel does NOT support vectored rw (need >= 5.19) — feature compiled in but auto-disabled",
+            );
+        }
+    }
 
     // Hold a clone for the background tasks below (health prober,
     // connection pool pre-warm) that spawn before the AppState `Arc` is

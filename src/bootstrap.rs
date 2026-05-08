@@ -55,6 +55,14 @@ pub struct Platform {
     /// multi-socket boxes that opted in.
     pub numa_nodes: usize,
 
+    // ── io_uring rw capability (issue #51) ──
+    /// Whether the running kernel supports the `io_uring` read/write
+    /// vectored surface zion would target (5.19+). Surfaced to
+    /// `/metrics` and the boot log so operators can see at a glance
+    /// whether the host is ready for the follow-up that wires the
+    /// `IoUringStream` adapter into the listener supervisor.
+    pub has_io_uring_rw_kernel: bool,
+
     // ── Probe timings (microseconds) ──
     pub probe_us: u64,
 
@@ -155,6 +163,11 @@ pub fn detect() -> &'static Platform {
             // every consumer can use it as a shard count without a
             // feature gate at the call site.
             numa_nodes: detect_numa_nodes(),
+
+            // io_uring rw kernel probe (issue #51). Always runs (cheap
+            // — one `uname(2)` syscall) so non-Linux + `--no-default-
+            // features` builds also report a definite `false`.
+            has_io_uring_rw_kernel: crate::uring::probe_io_uring_rw_supported(),
         };
 
         platform
@@ -1375,6 +1388,7 @@ mod tests {
             aes_kops_per_core: None,
             calibration_us: None,
             numa_nodes: 1,
+            has_io_uring_rw_kernel: false,
         }
     }
 

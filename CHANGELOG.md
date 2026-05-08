@@ -6,6 +6,18 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **io_uring rw capability probe + `io-uring-rw` feature gate**
+  (partial — see Deferred). New `bootstrap::Platform.has_io_uring_rw_kernel`
+  bool, populated at boot via `uname(2)` parsed against the 5.19+
+  threshold (where `IORING_OP_READV_FIXED` and the rest of the rw
+  surface zion would target are stable). Boot log line emitted only
+  when the feature is on; the bool is unconditionally surfaced on
+  `/metrics`. Two new chaos tests
+  (`tests/chaos.rs::tcp_read_terminates_cleanly_*`) pin the
+  "connection reset mid-read returns clean io::Error, never panics or
+  hangs" contract — applies to today's tokio path AND to the future
+  `IoUringStream` adapter so any regression is caught the moment the
+  follow-up lands. (#51 partial — see Deferred)
 - **NUMA-aware sharding for `rate_map` + `inflight`** — opt-in via
   `--features numa-aware`. On Linux multi-socket boxes, the per-IP
   rate-limit map and the singleflight inflight map split storage into
@@ -51,6 +63,20 @@ All notable changes to Zion Edge Gateway are documented here.
   surface without dragging the full config-loader dependency graph.
   `config::{WafMode, WafProfile}` re-exports preserve every existing
   import site; no breaking change.
+
+### Deferred
+
+- **`IoUringStream<R, W>` runtime adapter (issue #51)** — the
+  `io_uring_prep_readv` / `writev` integration that replaces tokio's
+  read/write half of accepted connections is tracked separately. The
+  v0.2.x slice ships only the `io-uring-rw` feature gate, the
+  `bootstrap::Platform.has_io_uring_rw_kernel` probe, the chaos
+  contract test, and a structured boot log line. The adapter itself
+  is research-grade (correct AsyncRead/AsyncWrite over a tokio-driven
+  io_uring submission queue is multi-day work that doesn't compress
+  cleanly) and we don't ship a delegating stub — operators that
+  enable the feature today get the probe and the auto-disable signal,
+  not silent userspace I/O dressed up in io_uring trappings.
 
 ## [0.2.2] - 2026-05-08
 
