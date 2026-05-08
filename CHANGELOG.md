@@ -6,6 +6,32 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **SOC 2 + FedRAMP control-mapping document**
+  ([docs/security/compliance-mapping.md](docs/security/compliance-mapping.md))
+  — TSC (CC + A + C + PI) tables and NIST 800-53 rev5 (AC, AU, CM,
+  IA, SC, SI, SA) mapped to in-binary code paths, workflow files,
+  and operator-side residuals. Each row links to the implementation
+  site and to the deployment-side doc the auditor still needs from
+  the operator. Cross-referenced from the README "Compliance"
+  section. (#61)
+- **Mesh observability — counters + audit-kind taxonomy**
+  ([`src/metrics.rs`](src/metrics.rs), [`src/audit.rs`](src/audit.rs)).
+  Eight always-on Prometheus counters under `zion_mesh_*`
+  (`claims_emitted`, `claims_received`, `claims_dropped_total{reason=...}`
+  with `signature`/`replay`/`other`, `score_lookups`,
+  `gossip_bytes_in`, `gossip_bytes_out`). Wired at the four mesh
+  callsites: `try_merge` accept + each rejection path, `publish_block`
+  enqueue, `run_receiver` byte counting, `run_publisher` /
+  `run_anti_entropy` byte counting, dispatcher's `cp.lookup` positive
+  path. Counters are zero on builds without `--features
+  sovereign-aimp` so operators can grep the same metric names
+  regardless of build flavour. New canonical audit-kind constants
+  (`audit::kind::{AUTH_*, CONFIG_RELOAD, REQUEST_BLOCKED,
+  ADMIN_ACCESS, PANIC, MESH_PUBLISH, MESH_RECEIVE, MESH_PEER_*,
+  MESH_QUORUM_DECISION}`) replace ad-hoc string literals at future
+  callsites. Performance budget documented at
+  [docs/perf/mesh-overhead.md](docs/perf/mesh-overhead.md) (target
+  < 0.5 % throughput on a 100k rps host). (#69)
 - **STRIDE threat-model addendum on the mesh (AIMP) surface** — new
   §10 in [docs/security/threat-model.md](docs/security/threat-model.md)
   walking the six STRIDE categories against the mesh: Ed25519 signing
@@ -104,6 +130,18 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Changed
 
+- **`cargo-vet` promoted to a required CI gate** — `supply-chain/`
+  baseline committed via `cargo vet init`, with audit imports from
+  Mozilla, Google, Embark, Bytecode Alliance, ISRG, and Zcash
+  reducing the residual exemption set from ~700 to 414 transitive
+  crates. The `supply-chain.yml` `cargo-vet` job no longer runs with
+  `continue-on-error` — a transitive crate that lacks an audit
+  verdict OR an explicit `[[exemptions]]` row now fails the build.
+  Workflow for refreshing the baseline documented in
+  [docs/security/supply-chain.md](docs/security/supply-chain.md)
+  "Updating the cargo-vet baseline". *Operator action required:*
+  promote `cargo-vet` to a required status check in the master
+  branch protection rule. (#58)
 - **OSSF Scorecard split into a minimal workflow** — moved from
   `supply-chain.yml` to a dedicated [`scorecard.yml`](.github/workflows/scorecard.yml)
   with no global `env`/`defaults` blocks, satisfying the

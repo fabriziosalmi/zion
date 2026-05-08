@@ -148,16 +148,39 @@ Because the release profile ships `panic = "abort"`, the hook runs once and the 
 
 ## Mesh (`--features sovereign-aimp`)
 
-The mesh layer surfaces its own observability through the same triad
-(audit log + counters + structured boot log). When zion is built with
-`--features sovereign-aimp` and the mesh is enabled in `zion.toml`,
-the following are exposed alongside the core surfaces above:
+The mesh layer surfaces its observability through the same triad
+(audit log + counters + structured boot log). All mesh counters are
+**always rendered on `/metrics`**, zero on builds without
+`--features sovereign-aimp` — operators can grep for the same metric
+name regardless of which build their distro produced.
 
-- `zion_mesh_claims_published_total{kind=...}` — outbound counter per claim type.
-- `zion_mesh_claims_received_total{kind=...}` — inbound counter.
-- `zion_mesh_claims_rejected_total{reason=...}` — verification failures bucketed by `signature` / `unknown_peer` / `replay`.
-- `zion_mesh_peers` — current peer-set size.
-- Audit events with `kind=mesh_publish` / `kind=mesh_receive` — every publish + receive carries the envelope's signature, the resolved `node_id`, and the local HMAC chain `prev_hash`.
+Counters wired today (issue #69):
+
+| Metric | Type | What it counts |
+|--------|------|----------------|
+| `zion_mesh_claims_emitted_total` | counter | Successful local emits (`aimp_cp::publish_block`). |
+| `zion_mesh_claims_received_total` | counter | Inbound envelopes that passed *all* policy gates and merged into local state. |
+| `zion_mesh_claims_dropped_total{reason="signature"}` | counter | Inbound envelopes rejected on Ed25519 signature verification. |
+| `zion_mesh_claims_dropped_total{reason="replay"}` | counter | Inbound envelopes rejected as duplicates (seen-signature filter). |
+| `zion_mesh_claims_dropped_total{reason="other"}` | counter | Other rejections — timestamp skew (past/future), magic-prefix mismatch, payload decode error, revocation by non-original source. |
+| `zion_mesh_score_lookups_total` | counter | Dispatcher hits that found a mesh score for the client IP — the `X-Zion-Mesh-Score` header rate. |
+| `zion_mesh_gossip_bytes_in_total` | counter | Total bytes received on the gossip socket (covers malformed packets too). |
+| `zion_mesh_gossip_bytes_out_total` | counter | Total bytes sent on the gossip socket. |
+
+Audit kinds (see [`src/audit.rs`](../../src/audit.rs)
+`mod kind` for the canonical reference list):
+
+- `mesh_publish` / `mesh_receive` — every publish + receive can be
+  recorded as a signed audit event carrying the envelope's signature,
+  the resolved `node_id`, and the local HMAC chain `prev_hash`.
+- `mesh_peer_joined` / `mesh_peer_dropped` — reserved for the mesh
+  peer-state tracker (issue [#68](https://github.com/fabriziosalmi/zion/issues/68)).
+- `mesh_quorum_decision` — reserved for the quorum aggregator
+  ([#66](https://github.com/fabriziosalmi/zion/issues/66) /
+   [#67](https://github.com/fabriziosalmi/zion/issues/67)).
+
+Cost: see [`docs/perf/mesh-overhead.md`](../perf/mesh-overhead.md) for
+the budget the observability surface is allowed to spend.
 
 The full operator-facing guide (topology, identity rotation,
 debugging) lives at [docs/mesh/integration.md](../mesh/integration.md).

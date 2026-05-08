@@ -98,6 +98,15 @@ fn main() {
     }
 }
 
+// `aimp_cp.rs` references `crate::metrics::METRICS` for the issue-#69
+// observability counters. The example crate's root has no metrics
+// module of its own, so we vendor a tiny shim alongside (matching the
+// field layout aimp_cp consumes) — same pattern xdp uses for
+// example-vs-bin code-sharing.
+#[cfg(feature = "sovereign-aimp")]
+#[path = "_shared/aimp_metrics_stub.rs"]
+mod metrics;
+
 #[cfg(feature = "sovereign-aimp")]
 #[path = "../src/aimp_cp.rs"]
 mod aimp_cp;

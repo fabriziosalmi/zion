@@ -69,15 +69,17 @@ jobs:
           command: check ${{ matrix.checks }}
           arguments: --all-features
 
-  # ── 3. cargo-vet — supply-chain trust audit (runs in advisory mode). ─────
-  # `vet` requires a one-time `cargo vet init` to populate supply-chain/
-  # config files. Until that lands, we run in `--locked` mode and treat the
-  # job as informational (continue-on-error). Promote to required once the
-  # audit baseline exists in supply-chain/.
+  # ── 3. cargo-vet — supply-chain trust audit (REQUIRED). ──────────────────
+  # The baseline lives under `supply-chain/`. The job runs in `--locked`
+  # mode so a fresh `imports.lock` cannot silently bypass the audited
+  # surface; any new transitive crate that isn't covered by the imported
+  # audit feeds (mozilla, google, embark, bytecode-alliance, isrg,
+  # zcash) OR an explicit `[[exemptions.X]]` row in `config.toml` fails
+  # the build. See `docs/security/supply-chain.md` "Updating the
+  # cargo-vet baseline" for the standing operator workflow.
   vet:
     name: cargo-vet
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -86,17 +88,7 @@ jobs:
           shared-key: vet
       - name: Install cargo-vet
         run: cargo install --locked cargo-vet
-      - name: Check vet baseline exists
-        id: baseline
-        run: |
-          if [ -f supply-chain/config.toml ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::No supply-chain/config.toml yet — run 'cargo vet init' to bootstrap."
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
       - name: Run cargo-vet
-        if: steps.baseline.outputs.exists == 'true'
         run: cargo vet --locked
 
   # ── 4. cargo-geiger — quantify unsafe surface (informational signal). ────

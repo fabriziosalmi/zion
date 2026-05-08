@@ -192,6 +192,12 @@ impl AimpControlPlane {
         self.publish_tx
             .try_send(delta)
             .map_err(|_| "aimp-cp: publish queue full or closed")?;
+        // Successful local emit (the publisher task drains and signs +
+        // sends). Increment AFTER a successful enqueue so a
+        // back-pressure drop doesn't get counted as an emit.
+        crate::metrics::METRICS
+            .mesh_claims_emitted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -375,34 +381,45 @@ impl ReceiverState {
     /// Apply the policy gates and merge, returning what happened.
     /// `now_secs` is injected so tests can pin time without sleeping.
     pub(crate) fn try_merge(&mut self, envelope: &AimpEnvelope, now_secs: u64) -> MergeOutcome {
+        use std::sync::atomic::Ordering::Relaxed;
+        let metrics = &crate::metrics::METRICS;
+
         // 1. Replay filter (cheap; do this before crypto).
         if self.seen_sigs.contains(&envelope.signature) {
+            metrics.mesh_claims_dropped_replay.fetch_add(1, Relaxed);
             return MergeOutcome::Rejected;
         }
 
         // 2. Signature verification — every ingress envelope must pass.
         if !SecurityFirewall::verify(envelope) {
+            metrics.mesh_claims_dropped_signature.fetch_add(1, Relaxed);
             return MergeOutcome::Rejected;
         }
 
         // 3. Magic prefix check (filters AIMP-native chatter).
         let payload = &envelope.data.payload;
         if payload.len() < ZION_MAGIC.len() || &payload[..ZION_MAGIC.len()] != ZION_MAGIC {
+            metrics.mesh_claims_dropped_other.fetch_add(1, Relaxed);
             return MergeOutcome::Rejected;
         }
 
         // 4. Decode the inner delta.
         let delta: WafReputationDelta = match rmp_serde::from_slice(&payload[ZION_MAGIC.len()..]) {
             Ok(d) => d,
-            Err(_) => return MergeOutcome::Rejected,
+            Err(_) => {
+                metrics.mesh_claims_dropped_other.fetch_add(1, Relaxed);
+                return MergeOutcome::Rejected;
+            }
         };
 
         // 5. Timestamp window. A peer with a future clock or a
         //    captured-and-replayed-from-the-past delta is rejected.
         if delta.ts_secs > now_secs.saturating_add(self.skew_future_secs) {
+            metrics.mesh_claims_dropped_other.fetch_add(1, Relaxed);
             return MergeOutcome::Rejected;
         }
         if delta.ts_secs.saturating_add(self.skew_past_secs) < now_secs {
+            metrics.mesh_claims_dropped_other.fetch_add(1, Relaxed);
             return MergeOutcome::Rejected;
         }
 
@@ -441,8 +458,15 @@ impl ReceiverState {
                 }
                 None => MergeOutcome::Stale,
             };
-            if outcome == MergeOutcome::Removed {
-                self.bump_version();
+            match outcome {
+                MergeOutcome::Removed => {
+                    metrics.mesh_claims_received.fetch_add(1, Relaxed);
+                    self.bump_version();
+                }
+                MergeOutcome::Rejected => {
+                    metrics.mesh_claims_dropped_other.fetch_add(1, Relaxed);
+                }
+                _ => {}
             }
             return outcome;
         }
@@ -466,6 +490,7 @@ impl ReceiverState {
             }
         };
         if matches!(outcome, MergeOutcome::Inserted | MergeOutcome::Updated) {
+            metrics.mesh_claims_received.fetch_add(1, Relaxed);
             self.bump_version();
         }
         outcome
@@ -482,6 +507,7 @@ async fn run_receiver(
     reputation: Arc<DashMap<IpAddr, WafReputation>>,
     update_tx: watch::Sender<u64>,
 ) {
+    use std::sync::atomic::Ordering::Relaxed;
     let mut buf = vec![0u8; 65_507]; // max UDP datagram
     let mut state = ReceiverState::new(reputation, update_tx);
 
@@ -490,10 +516,23 @@ async fn run_receiver(
             Ok(v) => v,
             Err(_) => continue,
         };
+        // Bytes accounting (issue #69) covers everything that hits
+        // our socket — even malformed packets, so traffic-analysis
+        // and rate observations match the kernel's view.
+        crate::metrics::METRICS
+            .mesh_gossip_bytes_in
+            .fetch_add(len as u64, Relaxed);
         let envelope: AimpEnvelope = match rmp_serde::from_slice(&buf[..len]) {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(_) => {
+                crate::metrics::METRICS
+                    .mesh_claims_dropped_other
+                    .fetch_add(1, Relaxed);
+                continue;
+            }
         };
+        // try_merge bumps mesh_claims_received / dropped_* counters
+        // internally so this loop doesn't double-count.
         let _ = state.try_merge(&envelope, now_secs());
     }
 }
@@ -538,7 +577,11 @@ async fn run_publisher(
             // try_send — losing a delta because the OS buffer is full
             // is acceptable, the next delta from the same source will
             // re-converge the receiver's map.
-            let _ = socket.send_to(&bytes, peer).await;
+            if let Ok(n) = socket.send_to(&bytes, peer).await {
+                crate::metrics::METRICS
+                    .mesh_gossip_bytes_out
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 }
@@ -624,7 +667,11 @@ async fn run_anti_entropy(
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            let _ = socket.send_to(&bytes, peer).await;
+            if let Ok(n) = socket.send_to(&bytes, peer).await {
+                crate::metrics::METRICS
+                    .mesh_gossip_bytes_out
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 }
@@ -988,5 +1035,100 @@ mod tests {
         let entry = map.get(&target).unwrap();
         assert_eq!(entry.source_node, alice.node_id());
         assert!((entry.score - 0.5).abs() < 1e-6);
+    }
+
+    /// Issue #69 — `try_merge` bumps the right metrics counter for
+    /// each rejection class, and bumps `mesh_claims_received` on a
+    /// successful merge. We assert `delta >= expected` (not exact)
+    /// because cargo runs aimp_cp tests in parallel and other tests
+    /// also exercise `try_merge` against the same global METRICS
+    /// singleton; concurrent contributions can only ADD to these
+    /// counters (never subtract), so `>=` is the precise correctness
+    /// claim — not a relaxation.
+    #[test]
+    fn try_merge_increments_mesh_metrics() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let metrics = &crate::metrics::METRICS;
+        let base_received = metrics.mesh_claims_received.load(Relaxed);
+        let base_signature = metrics.mesh_claims_dropped_signature.load(Relaxed);
+        let base_replay = metrics.mesh_claims_dropped_replay.load(Relaxed);
+        let base_other = metrics.mesh_claims_dropped_other.load(Relaxed);
+
+        let alice = Identity::new();
+        let target = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99));
+        let now = 1_700_000_000u64;
+
+        let (mut state, _map) = fresh_state();
+
+        // Path A: clean Insert — `mesh_claims_received += 1`.
+        let env = build_envelope(&alice, target, 0.85, now, 1);
+        assert_eq!(state.try_merge(&env, now), MergeOutcome::Inserted);
+
+        // Path B: replay (same envelope again) — `mesh_claims_dropped_replay += 1`.
+        assert_eq!(state.try_merge(&env, now), MergeOutcome::Rejected);
+
+        // Path C: ts in the far past — `mesh_claims_dropped_other += 1`.
+        let stale = build_envelope(&alice, target, 0.5, now - 10 * 86_400, 1);
+        assert_eq!(state.try_merge(&stale, now), MergeOutcome::Rejected);
+
+        // Path D: forged signature — `mesh_claims_dropped_signature += 1`.
+        // Build a real envelope, then mutate one byte of the signature
+        // so verify() fails. Must use a fresh sig (not in seen filter)
+        // so we exercise the signature path, not the replay path.
+        let mut forged = build_envelope(&alice, target, 0.42, now + 1, 1);
+        forged.signature[0] ^= 0xff;
+        assert_eq!(state.try_merge(&forged, now), MergeOutcome::Rejected);
+
+        let d_received = metrics.mesh_claims_received.load(Relaxed) - base_received;
+        let d_signature = metrics.mesh_claims_dropped_signature.load(Relaxed) - base_signature;
+        let d_replay = metrics.mesh_claims_dropped_replay.load(Relaxed) - base_replay;
+        let d_other = metrics.mesh_claims_dropped_other.load(Relaxed) - base_other;
+
+        // `>=` is exact: counters are monotonic + we did at least the
+        // shown number of bumps each. Concurrent test contributions
+        // can only inflate the right side.
+        assert!(
+            d_received >= 1,
+            "received delta = {d_received}; expected >= 1"
+        );
+        assert!(d_replay >= 1, "replay delta = {d_replay}; expected >= 1");
+        assert!(d_other >= 1, "other delta = {d_other}; expected >= 1");
+        assert!(
+            d_signature >= 1,
+            "signature delta = {d_signature}; expected >= 1"
+        );
+    }
+
+    /// Issue #69 — `publish_block` bumps `mesh_claims_emitted` on a
+    /// successful enqueue. We exercise it here by constructing an
+    /// AimpControlPlane manually (bypassing the UDP bind in
+    /// `bootstrap()`) so the test runs in any CI sandbox.
+    #[test]
+    fn publish_block_increments_mesh_emitted_metric() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let metrics = &crate::metrics::METRICS;
+        let base = metrics.mesh_claims_emitted.load(Relaxed);
+
+        let identity = Identity::new();
+        let (publish_tx, _publish_rx) = mpsc::channel::<WafReputationDelta>(8);
+        let (_update_tx, update_rx) = watch::channel::<u64>(0);
+        let cp = AimpControlPlane {
+            reputation: Arc::new(DashMap::new()),
+            publish_tx,
+            update_rx,
+            self_node_id: identity.node_id(),
+        };
+
+        let target = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 100));
+        cp.publish_block(target, 0.91, 1).expect("enqueue");
+        cp.publish_block(target, 0.92, 1).expect("enqueue");
+
+        let delta = metrics.mesh_claims_emitted.load(Relaxed) - base;
+        // `>=` for the same monotonic-counter / parallel-tests
+        // reasoning as the try_merge metrics test above.
+        assert!(
+            delta >= 2,
+            "publish_block called twice → counter delta = {delta}; expected >= 2"
+        );
     }
 }
