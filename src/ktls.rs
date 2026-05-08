@@ -32,6 +32,11 @@
 //! caller gets an `io::Error` and falls back to the userspace TLS path.
 //! Zion's HTTPS listener never goes offline because of a kTLS issue.
 
+// Scaffolding: `cork_for_handshake` and `try_upgrade` are the public
+// shape the rustls accept loop will switch to once the cork wrapping
+// lands at the handshake site. Until that lands they are unreached.
+#![allow(dead_code)]
+
 use std::io;
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;

@@ -1,3 +1,8 @@
+// Examples include `#[path = "../src/*.rs"]` modules whose surface
+// is bigger than the example actually uses. Allow dead_code here so
+// CI clippy with `-D warnings` doesn't flag every unread item.
+#![allow(dead_code)]
+
 //! AIMP control-plane two-node gossip smoke test.
 //!
 //! Spawns two `aimp_cp` instances within one process on different

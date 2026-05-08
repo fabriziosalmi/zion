@@ -1,3 +1,8 @@
+// Examples include `#[path = "../src/*.rs"]` modules whose surface
+// is bigger than the example actually uses. Allow dead_code here so
+// CI clippy with `-D warnings` doesn't flag every unread item.
+#![allow(dead_code)]
+
 //! AIMP gossip mesh stress driver.
 //!
 //! Standalone binary, runs as PID 1 in a microVM (or as a regular

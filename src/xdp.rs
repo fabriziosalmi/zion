@@ -35,6 +35,12 @@
 //! XDP attach is **never load-bearing**. A typo in `zion.toml` should
 //! never strand zion offline.
 
+// Scaffolding: the loader exposes `add_blocked_bulk`, `remove_blocked`,
+// `Cidr4::host`, etc. for the XDP-AIMP wire that lands in the next PR.
+// Until that wire is in place these are unreached from the binary —
+// allow them at the file level rather than per-item.
+#![allow(dead_code)]
+
 use aya::maps::lpm_trie::{Key, LpmTrie};
 use aya::maps::Array;
 use aya::programs::{Xdp, XdpFlags};
