@@ -81,6 +81,12 @@ Payload x concurrency grid -- measures end-to-end TLS throughput. These numbers 
 
 ## Features
 
+**v0.2.x Tracks (feature-gated, default-off)**
+- **XDP pre-filter** (`--features xdp`, Linux): eBPF LPM-trie drop at the NIC driver layer. Blocked source IPs never reach the userspace TLS handshake — frees CPU for legitimate traffic and keeps the WAF gate cheap.
+- **kTLS post-handshake offload** (`--features ktls`, Linux 5.10+ with `CONFIG_TLS=y`): once the rustls handshake completes the socket is flipped into in-kernel TLS via `SOL_TLS`. Removes the userspace AEAD trip and unlocks `sendfile`-class zero-copy for static cache hits. Handshake cipher must be TLS 1.3 AES-GCM or ChaCha20-Poly1305. Falls back to userspace TLS on upgrade failure.
+- **ML-augmented WAF** (`--features ml-waf`): 16-dim feature extractor + tract-onnx scorer on the WAF hot path, 200µs p99 budget. The score is reported as a metric and travels into the request as a header — never a hard gate; the local Aho-Corasick + entropy gate stays authoritative.
+- **AIMP serverless mesh** (`--features sovereign-aimp`): Ed25519-signed UDP gossip of WAF rule deltas + IP-reputation across a fleet, source-bound revocation, replay LRU, ts-window admission, last-writer-wins merge, periodic anti-entropy. No central control plane — each node keeps serving with its last known map when the mesh partitions. Configure under `[sovereign_aimp]` in `zion.toml` (or via `ZION_AIMP_*` env vars for back-compat).
+
 **Core Proxy**
 - TLS 1.3 termination (rustls + hardware crypto: AES-NI, AES-CE)
 - HTTP/2 upstream multiplexing (hyper-rustls ALPN negotiation)
@@ -142,8 +148,8 @@ Payload x concurrency grid -- measures end-to-end TLS throughput. These numbers 
 - Platform JSON dump for CI / automation (`zion bootstrap`)
 - WAF Shadow Mode (`waf_shadow = true`) — log + count, never block
 - JSON snapshot endpoint (`/_zion/snapshot.json`, internal-only)
-- TCP tuning: TCP_NODELAY, TCP_DEFER_ACCEPT, TCP_FASTOPEN, TCP_QUICKACK, TCP_CORK, SO_BUSY_POLL
-- SO_REUSEPORT, sys_membarrier, io_uring multishot accept (Linux)
+- TCP tuning: TCP_NODELAY, TCP_DEFER_ACCEPT, TCP_FASTOPEN, TCP_QUICKACK, SO_BUSY_POLL
+- SO_REUSEPORT, sys_membarrier, io_uring single-shot accept (Linux, `--features io-uring-accept`)
 - `target-cpu=native` build optimization, PGO build script included
 - systemd unit file + Docker HEALTHCHECK
 
