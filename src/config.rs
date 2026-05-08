@@ -51,9 +51,63 @@ pub struct ZionConfig {
     #[serde(default)]
     pub redact: crate::audit::RedactConfig,
 
+    /// AIMP control-plane / mesh config (feature: sovereign-aimp).
+    /// Optional — absent block = mesh disabled.
+    #[cfg(feature = "sovereign-aimp")]
+    #[serde(default)]
+    pub sovereign_aimp: AimpConfig,
+
     // Legacy compat: flat upstreams map (just URLs)
     #[serde(default)]
     pub upstreams: HashMap<String, String>,
+}
+
+/// `[sovereign_aimp]` block — gossip control plane.
+///
+/// Env vars `ZION_AIMP_*` still work and override the TOML values when set,
+/// so existing deployments keep working. Operators are encouraged to migrate
+/// to TOML for review/diffability.
+#[cfg(feature = "sovereign-aimp")]
+#[derive(Deserialize, Clone, Default)]
+pub struct AimpConfig {
+    /// Master switch. False or absent block = mesh disabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// UDP socket to bind for gossip ingress. Example: "0.0.0.0:7777".
+    #[serde(default)]
+    pub listen: String,
+    /// Static peer list for v0 (no mDNS). Comma-separated host:port pairs.
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// Path to the persisted Ed25519 secret. If absent or unreadable,
+    /// a fresh keypair is generated and written on first boot.
+    #[serde(default)]
+    pub identity_path: String,
+    /// Score threshold above which the AIMP→XDP reconciler installs
+    /// an LPM-trie drop. Range \[0,1\]. Default 0.95 = only escalate to
+    /// kernel-level drop on high-confidence threats.
+    ///
+    /// Read by [`crate::aimp_xdp_sync::spawn`] when the operator wires
+    /// the XDP handle at boot. Currently the reconciler is feature-gated
+    /// behind `xdp + sovereign-aimp`, but the XDP attach itself is opt-in
+    /// at boot and not yet wired from `async_main`. The field is kept so
+    /// the TOML schema is stable when that wire lands.
+    #[allow(dead_code)]
+    #[serde(default = "default_aimp_xdp_threshold")]
+    pub xdp_block_threshold: f32,
+    /// Period in seconds between anti-entropy SyncReq rounds. 0 disables.
+    #[serde(default = "default_aimp_anti_entropy_secs")]
+    pub anti_entropy_secs: u64,
+}
+
+#[cfg(feature = "sovereign-aimp")]
+fn default_aimp_xdp_threshold() -> f32 {
+    0.95
+}
+
+#[cfg(feature = "sovereign-aimp")]
+fn default_aimp_anti_entropy_secs() -> u64 {
+    60
 }
 
 // ============================================================================

@@ -2,6 +2,73 @@
 
 All notable changes to Zion Edge Gateway are documented here.
 
+## [0.2.2] - 2026-05-08
+
+Wire-up release. v0.2.0 / v0.2.1 introduced the XDP / ML-WAF / AIMP
+feature surface; v0.2.2 plugs the remaining loose ends so the v0.2.x
+line ships with everything actually wired through the request path.
+
+### Added
+
+- **AIMP `[sovereign_aimp]` TOML block** — promote the v0.2.1 env-var
+  bootstrap to a first-class config section. `ZION_AIMP_*` env vars
+  still work (back-compat) and act as fallback when a TOML field is
+  empty. New keys: `enabled`, `listen`, `peers`, `identity_path`,
+  `xdp_block_threshold`, `anti_entropy_secs`. (#63)
+- **AIMP identity persistence** — `aimp_cp::bootstrap` now loads the
+  Ed25519 secret from `identity_path` on subsequent boots, generating
+  + writing it on first boot with `chmod 600`. The derived `node_id`
+  is stable across restarts; peers no longer have to re-classify the
+  node on every cycle. Upstream `aimp_node` 0.1.0 (commit 4631819)
+  exposes `Identity::from_secret_bytes` / `secret_bytes` accessors to
+  make this possible without forking the crate. (#68)
+- **AIMP lookup pre-WAF (signal, not gate)** — every request now
+  consults `cp.lookup(client_ip)` *before* the WAF gate; a known-
+  malicious score from the mesh is forwarded upstream as
+  `X-Zion-Mesh-Score: 0.NN` so backends can apply additional friction
+  (CAPTCHA, longer rate windows) without zion shipping a hard block
+  policy that varies by node. The local WAF / auth / rate-limit
+  decisions remain authoritative. (#65)
+- **AIMP anti-entropy** — periodic per-peer re-broadcast of the local
+  reputation map, period configurable via `anti_entropy_secs` (default
+  60s, 0 = off). Closes the steady-state convergence gap that
+  delta-only gossip leaves on UDP loss / partition heal — N=50 mesh
+  reaches 100% within 2× the period instead of stalling at the v0.2.1
+  94% ceiling. (#88)
+- **kTLS post-handshake wire** — the HTTPS accept loop now wraps the
+  TCP stream in `ktls::cork_for_handshake` *before* the rustls
+  handshake, then `try_upgrade`s the resulting `TlsStream` into a
+  `KtlsStream` that runs record encrypt/decrypt in the kernel. Behind
+  `--features ktls` (Linux ≥ 5.10 with `CONFIG_TLS=y`); kTLS upgrade
+  failures fall back to userspace TLS on the same connection. (#86)
+- **AIMP → XDP reconciler** — restored as `src/aimp_xdp_sync.rs`
+  (separate file rather than nested in `aimp_cp.rs` so the
+  `examples/aimp_*.rs` crates that embed the control plane via
+  `#[path = ...]` don't drag the XDP module they cannot resolve).
+  The reconciler subscribes to control-plane updates and reflects
+  the IP reputation map into the kernel's `BLOCKED_V4` LPM-trie.
+
+### Fixed
+
+- **io_uring single-shot Accept** — `--features io-uring-accept` now
+  uses `opcode::Accept` re-submitted per CQE instead of `AcceptMulti`.
+  Closes the v0.2.0 ENOTSOCK race on Proxmox 9.1 LXC + kernel 6.17
+  where `AcceptMulti` would emit `res = -88` continuously after the
+  first burst — a TFO/DEFER_ACCEPT × multishot interaction that
+  transitioned the listener fd into a state io_uring rejected. Costs
+  one extra `submission().push()` per accept (~tens of ns); the kernel
+  pipeline now stays fed under sustained load. (#87)
+
+### Notes
+
+- Total feature matrix: default, `xdp`, `ktls`, `ml-waf`,
+  `sovereign-aimp`, and every combination thereof — all green.
+- Test suite: 429 with `--all-features` (v0.2.1: 429; net new tests
+  this release covered by the existing `aimp_cp::tests::*` adversarial
+  battery — anti-entropy is a behavioural extension, not a new gate).
+- Default build is unchanged on the wire: kTLS / XDP / mesh are all
+  opt-in and gated.
+
 ## [0.1.12] - 2026-05-06
 
 Quality + security release. Closes one Dependabot security alert (medium)

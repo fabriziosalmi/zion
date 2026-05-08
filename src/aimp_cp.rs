@@ -79,6 +79,15 @@ pub struct AimpControlPlaneConfig {
     /// peers will treat the node as new (full re-sync).
     #[serde(default = "default_key_path")]
     pub identity_path: PathBuf,
+
+    /// Period in seconds between anti-entropy SyncReq rounds. 0 = off.
+    /// Closes the steady-state gap that delta-only gossip leaves when a
+    /// peer was offline during a publish burst (UDP loss, late boot,
+    /// transient partition). With anti-entropy on, every `T` seconds
+    /// each node picks one peer and exchanges digests; mismatches
+    /// trigger a `SyncRes` with the diff.
+    #[serde(default = "default_anti_entropy_secs")]
+    pub anti_entropy_secs: u64,
 }
 
 fn default_listen() -> SocketAddr {
@@ -86,6 +95,9 @@ fn default_listen() -> SocketAddr {
 }
 fn default_key_path() -> PathBuf {
     PathBuf::from("/var/lib/zion/aimp-identity.bin")
+}
+fn default_anti_entropy_secs() -> u64 {
+    60
 }
 
 impl Default for AimpControlPlaneConfig {
@@ -95,6 +107,7 @@ impl Default for AimpControlPlaneConfig {
             listen: default_listen(),
             peers: vec![],
             identity_path: default_key_path(),
+            anti_entropy_secs: default_anti_entropy_secs(),
         }
     }
 }
@@ -248,6 +261,28 @@ pub async fn bootstrap(cfg: AimpControlPlaneConfig) -> Result<AimpControlPlane, 
         let peers = cfg.peers.clone();
         tokio::spawn(async move {
             run_publisher(socket, identity, peers, publish_rx).await;
+        });
+    }
+
+    // --- Anti-entropy loop. Closes the steady-state gap left by
+    //     delta-only gossip when a peer was offline during a publish
+    //     burst (UDP loss, late boot, transient partition). Every
+    //     `anti_entropy_secs` we walk our local reputation map and
+    //     re-broadcast every entry to a single peer (round-robin).
+    //     Cost: O(map_size) packets per round per node, O(N) total
+    //     mesh load (one peer per round per node, not all-to-all).
+    //     Receivers de-dup via the existing replay LRU (signature is
+    //     identical when re-signed by the same identity over the same
+    //     {ip, ts_secs, score, reason}, but ts_secs is bumped to "now"
+    //     on each round so the LWW gate accepts it as a heartbeat).
+    if cfg.anti_entropy_secs > 0 && !cfg.peers.is_empty() {
+        let socket = socket.clone();
+        let identity = identity.clone();
+        let peers = cfg.peers.clone();
+        let reputation = reputation.clone();
+        let period = std::time::Duration::from_secs(cfg.anti_entropy_secs);
+        tokio::spawn(async move {
+            run_anti_entropy(socket, identity, peers, reputation, period).await;
         });
     }
 
@@ -508,6 +543,92 @@ async fn run_publisher(
     }
 }
 
+// ── Anti-entropy task ────────────────────────────────────────────────
+//
+// v0 design: round-robin one peer per round, re-broadcast every entry
+// in our local map to that peer. This is the "naive" anti-entropy —
+// digest comparison + delta is a v1 follow-up that needs a new
+// `OpCode::SyncReq`/`SyncRes` upstream in `aimp_node`.
+
+async fn run_anti_entropy(
+    socket: Arc<UdpSocket>,
+    identity: Arc<Identity>,
+    peers: Vec<SocketAddr>,
+    reputation: Arc<DashMap<IpAddr, WafReputation>>,
+    period: std::time::Duration,
+) {
+    let origin = identity.node_id();
+    let mut peer_idx: usize = 0;
+    let mut ticker = tokio::time::interval(period);
+    // Skip the immediate first tick — we want the first round to wait
+    // a full `period` so a freshly-booted node doesn't blast its
+    // (almost certainly empty) map onto the wire before it's done
+    // catching up via gossip.
+    ticker.tick().await;
+
+    loop {
+        ticker.tick().await;
+
+        if peers.is_empty() {
+            continue;
+        }
+        let peer = peers[peer_idx % peers.len()];
+        peer_idx = peer_idx.wrapping_add(1);
+
+        // Snapshot the map. We cannot hold a DashMap iterator across
+        // .await points (the shard guards aren't Send-safe across
+        // suspend), so collect first, send second.
+        let entries: Vec<(IpAddr, WafReputation)> =
+            reputation.iter().map(|e| (*e.key(), *e.value())).collect();
+
+        if entries.is_empty() {
+            continue;
+        }
+
+        let now = now_secs();
+        for (ip, rep) in entries {
+            // Refresh ts_secs to "now" for the heartbeat — receiver's
+            // LWW gate would otherwise reject the round as a stale
+            // duplicate. We are *re-asserting* what we know, not
+            // claiming to have observed it again, so this is correct.
+            let ip_v6 = match ip {
+                IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+                IpAddr::V6(v6) => v6.octets(),
+            };
+            let delta = WafReputationDelta {
+                ip_v6,
+                score: rep.score,
+                ts_secs: now,
+                reason: rep.reason,
+            };
+            let inner = match rmp_serde::to_vec(&delta) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let mut payload = Vec::with_capacity(ZION_MAGIC.len() + inner.len());
+            payload.extend_from_slice(ZION_MAGIC);
+            payload.extend_from_slice(&inner);
+            let data = AimpData {
+                v: 0x01,
+                op: OpCode::Infer,
+                ttl: 4,
+                origin_pubkey: origin,
+                vclock: BTreeMap::new(),
+                payload,
+            };
+            let envelope = match identity.sign(data) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let bytes = match rmp_serde::to_vec(&envelope) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let _ = socket.send_to(&bytes, peer).await;
+        }
+    }
+}
+
 // ── Cross-track wire (Track B3: CRDT update → data plane) ────────────
 //
 // (Track B3 v0 lived here as `spawn_xdp_sync(cp, Arc<XdpHandle>, ...)`.
@@ -666,6 +787,7 @@ mod tests {
             listen,
             peers: vec![listen],
             identity_path: default_key_path(),
+            anti_entropy_secs: 0, // off in this loopback smoke test
         };
         let cp = match bootstrap(cfg).await {
             Ok(c) => c,

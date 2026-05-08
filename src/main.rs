@@ -651,37 +651,58 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     let compiled_redact = Arc::new(config.redact.compile());
 
     // Optionally bootstrap the AIMP serverless control plane. When
-    // `--features sovereign-aimp` is on AND `ZION_AIMP_ENABLED=1` is in
-    // the environment, we read listen + peer list from env vars and
-    // spawn the gossip listener + publisher tasks before AppState is
-    // sealed. Env-var driven for v0; a `[sovereign.aimp]` TOML section
-    // is the natural follow-up, but it requires extending
-    // `config::ZionConfig` so we keep it env-only here.
+    // AIMP control plane bootstrap. Two configuration sources, in
+    // order of precedence:
+    //   1. `[sovereign_aimp]` block in zion.toml (preferred; reviewable
+    //      and hot-reloadable along with the rest of config).
+    //   2. `ZION_AIMP_*` env vars (legacy; back-compat for the v0.2.1
+    //      env-only release).
+    // If either says enabled = true, we bootstrap. Env-var values fill
+    // in any missing TOML field, never override one that's set.
     //
     // Failure to bootstrap is non-fatal — log once at WARN and continue
     // with `aimp_cp = None`. The dispatcher already handles that case.
     #[cfg(feature = "sovereign-aimp")]
     let aimp_cp_handle: Option<aimp_cp::AimpControlPlane> = {
-        if std::env::var("ZION_AIMP_ENABLED").ok().as_deref() == Some("1") {
-            let listen: std::net::SocketAddr = std::env::var("ZION_AIMP_LISTEN")
-                .unwrap_or_else(|_| "0.0.0.0:9443".to_string())
+        let env_enabled = std::env::var("ZION_AIMP_ENABLED").ok().as_deref() == Some("1");
+        let toml_cfg = &config.sovereign_aimp;
+        let enabled = toml_cfg.enabled || env_enabled;
+        if enabled {
+            let listen_raw = if !toml_cfg.listen.is_empty() {
+                toml_cfg.listen.clone()
+            } else {
+                std::env::var("ZION_AIMP_LISTEN").unwrap_or_else(|_| "0.0.0.0:9443".to_string())
+            };
+            let listen: std::net::SocketAddr = listen_raw
                 .parse()
                 .unwrap_or_else(|_| "0.0.0.0:9443".parse().unwrap());
-            let peers: Vec<std::net::SocketAddr> = std::env::var("ZION_AIMP_PEERS")
-                .unwrap_or_default()
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .filter_map(|s| s.parse().ok())
-                .collect();
+            let peers: Vec<std::net::SocketAddr> = if !toml_cfg.peers.is_empty() {
+                toml_cfg
+                    .peers
+                    .iter()
+                    .filter_map(|s| s.parse().ok())
+                    .collect()
+            } else {
+                std::env::var("ZION_AIMP_PEERS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse().ok())
+                    .collect()
+            };
+            let identity_path = if !toml_cfg.identity_path.is_empty() {
+                std::path::PathBuf::from(&toml_cfg.identity_path)
+            } else {
+                std::env::var("ZION_AIMP_IDENTITY_PATH")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/zion/aimp-identity.bin"))
+            };
             let cfg = aimp_cp::AimpControlPlaneConfig {
                 enabled: true,
                 listen,
                 peers,
-                identity_path: std::env::var("ZION_AIMP_IDENTITY_PATH")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| {
-                        std::path::PathBuf::from("/var/lib/zion/aimp-identity.bin")
-                    }),
+                identity_path,
+                anti_entropy_secs: toml_cfg.anti_entropy_secs,
             };
             match aimp_cp::bootstrap(cfg).await {
                 Ok(cp) => {

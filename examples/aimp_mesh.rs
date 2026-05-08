@@ -49,6 +49,9 @@ fn main() {
             listen: args.listen,
             peers: args.peers.clone(),
             identity_path: PathBuf::from(format!("/tmp/aimp-{}.bin", args.listen.port())),
+            // Mesh smoke: short anti-entropy round so the harness
+            // converges quickly without waiting a full minute.
+            anti_entropy_secs: 5,
         };
         let cp = aimp_cp::bootstrap(cfg).await.expect("bootstrap");
         let started = Instant::now();
