@@ -49,6 +49,20 @@ pub struct Platform {
     pub backlog: i32,          // listen backlog
     pub send_buf: usize,       // TCP send buffer
 
+    // ── NUMA topology (issue #50) ──
+    /// Number of NUMA nodes detected at boot. 1 on macOS / Windows /
+    /// builds without `--features numa-aware`. >1 only on Linux
+    /// multi-socket boxes that opted in.
+    pub numa_nodes: usize,
+
+    // ── io_uring rw capability (issue #51) ──
+    /// Whether the running kernel supports the `io_uring` read/write
+    /// vectored surface zion would target (5.19+). Surfaced to
+    /// `/metrics` and the boot log so operators can see at a glance
+    /// whether the host is ready for the follow-up that wires the
+    /// `IoUringStream` adapter into the listener supervisor.
+    pub has_io_uring_rw_kernel: bool,
+
     // ── Probe timings (microseconds) ──
     pub probe_us: u64,
 
@@ -143,10 +157,29 @@ pub fn detect() -> &'static Platform {
 
             aes_kops_per_core,
             calibration_us,
+
+            // NUMA topology — populated only on Linux + `numa-aware`;
+            // otherwise this stays at the safe default of 1 node so
+            // every consumer can use it as a shard count without a
+            // feature gate at the call site.
+            numa_nodes: detect_numa_nodes(),
+
+            // io_uring rw kernel probe (issue #51). Always runs (cheap
+            // — one `uname(2)` syscall) so non-Linux + `--no-default-
+            // features` builds also report a definite `false`.
+            has_io_uring_rw_kernel: crate::uring::probe_io_uring_rw_supported(),
         };
 
         platform
     })
+}
+
+/// Number of NUMA nodes detected at boot. Implementation lives in
+/// `crate::numa`; this thin wrapper keeps `bootstrap` agnostic to the
+/// detection mechanism.
+#[inline]
+fn detect_numa_nodes() -> usize {
+    crate::numa::node_count()
 }
 
 /// Calibrate AES-128-GCM seal throughput on a single core. Runs a tight
@@ -1354,6 +1387,8 @@ mod tests {
             probe_us: 0,
             aes_kops_per_core: None,
             calibration_us: None,
+            numa_nodes: 1,
+            has_io_uring_rw_kernel: false,
         }
     }
 

@@ -57,6 +57,16 @@
     "waf/streaming/chunk_size/1024B":              { "median_ns": 2514400.0,   "thrpt": "411 MiB/s" },
     "waf/streaming/chunk_size/4096B":              { "median_ns": 2304200.0,   "thrpt": "434 MiB/s" },
     "waf/streaming/chunk_size/16384B":             { "median_ns": 2413200.0,   "thrpt": "440 MiB/s" },
-    "waf/streaming/chunk_size/65536B":             { "median_ns": 2278900.0,   "thrpt": "439 MiB/s" }
+    "waf/streaming/chunk_size/65536B":             { "median_ns": 2278900.0,   "thrpt": "439 MiB/s" },
+
+    "numa/baseline_dashmap/get_hit":               { "median_ns": 9.6,         "thrpt": "104 Melem/s" },
+    "numa/baseline_dashmap/get_miss":              { "median_ns": 9.0,         "thrpt": "111 Melem/s" },
+    "numa/single_shard/get_hit":                   { "median_ns": 9.3,         "thrpt": "108 Melem/s" },
+    "numa/single_shard/get_miss":                  { "median_ns": 8.9,         "thrpt": "112 Melem/s" },
+    "numa/quad_shard_local/get_hit":               { "median_ns": 33.4,        "thrpt": "30 Melem/s"  },
+    "numa/quad_shard_full_miss/get_miss":          { "median_ns": 32.6,        "thrpt": "31 Melem/s"  },
+    "numa/insert/baseline_dashmap":                { "median_ns": 140.3,       "thrpt": "7.1 Melem/s" },
+    "numa/insert/single_shard":                    { "median_ns": 134.7,       "thrpt": "7.4 Melem/s" },
+    "numa/insert/quad_shard":                      { "median_ns": 246.8,       "thrpt": "4.0 Melem/s" }
   }
 }

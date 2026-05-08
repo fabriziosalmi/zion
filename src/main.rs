@@ -56,6 +56,7 @@ mod listener;
 mod logging;
 mod metrics;
 mod net;
+mod numa;
 mod observability;
 mod proxy;
 #[cfg(feature = "http3")]
@@ -67,7 +68,11 @@ mod sovereign;
 mod tls;
 #[cfg(feature = "tui")]
 mod tui;
-#[cfg(all(target_os = "linux", feature = "io-uring-accept"))]
+// `uring.rs` compiles on every target — the io_uring-accept inner
+// module is feature-gated *inside* the file. This way the
+// `io-uring-rw` capability probe (issue #51) and its tests stay
+// reachable even when `io-uring-accept` is off, and on non-Linux the
+// probe degrades to "always returns false".
 mod uring;
 mod waf;
 
@@ -75,9 +80,19 @@ mod waf;
 // Track A — XDP pre-filter: drops blacklisted CIDRs at NIC driver layer.
 #[cfg(all(target_os = "linux", feature = "xdp"))]
 mod xdp;
+// v0.2 perf-ceiling — SO_REUSEPORT + BPF demux scaffolding (issue #53).
+// Probe + capability check today; listener wire-up deferred.
+#[cfg(all(target_os = "linux", feature = "bpf-demux"))]
+mod bpf_demux;
 // Track A — kTLS post-handshake offload (Linux >= 5.10 + CONFIG_TLS).
 #[cfg(all(target_os = "linux", feature = "ktls"))]
 mod ktls;
+// Track A — memfd-backed cache entries (issue #52 building block).
+// Compiles on Linux only; consumed by the future sendfile dispatch
+// path. Gated on `--features ktls` so today's bin builds without it
+// don't carry an unused module.
+#[cfg(all(target_os = "linux", feature = "ktls"))]
+mod memfd;
 // Track C — ML-augmented WAF scoring (ONNX via tract).
 #[cfg(feature = "ml-waf")]
 mod waf_ml;
@@ -365,7 +380,14 @@ struct AppState {
     acme_challenges: acme::ChallengeStore,
     /// Per-IP rate limiter map. Persists across config reloads — the IP
     /// counters are about the IP's behaviour, not about the config.
-    rate_map: Arc<dashmap::DashMap<std::net::IpAddr, RateEntry>>,
+    ///
+    /// NUMA wrapper (issue #50): on a single-socket box / non-Linux /
+    /// `--no-default-features` build this is a transparent newtype
+    /// around `DashMap`. With `--features numa-aware` on a multi-socket
+    /// Linux host, `NumaAwareMap` shards by NUMA node and routes by the
+    /// calling thread's current node — same-socket workers stay
+    /// cache-local, cross-socket fallback scans on get-miss.
+    rate_map: Arc<numa::NumaAwareMap<std::net::IpAddr, RateEntry>>,
     /// Singleflight: coalesce concurrent cache misses for the same key.
     /// First request fetches from upstream and inserts a `watch::Sender<bool>`;
     /// subsequent requests subscribe and await `true`. Watch (vs Notify) is
@@ -374,7 +396,7 @@ struct AppState {
     /// still observe the wake instead of hanging until the client times out.
     /// Sender drop without sending `true` (fetch aborted) yields Err on the
     /// receiver side and waiters fall through to re-check the cache.
-    inflight: dashmap::DashMap<Arc<str>, tokio::sync::watch::Sender<bool>>,
+    inflight: numa::NumaAwareMap<Arc<str>, tokio::sync::watch::Sender<bool>>,
     /// HMAC-chained audit log handle. `noop()` when audit is disabled.
     /// Cloned per request handler; `emit()` is non-blocking.
     pub(crate) audit: audit::AuditHandle,
@@ -638,6 +660,72 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     }
     logging::info("proxy", &format!("xff_mode: {:?}", resolved.xff_mode));
 
+    // io_uring rw kernel probe boot line (issue #51). Emitted only when
+    // the operator opted into `--features io-uring-rw`, otherwise the
+    // probe result is just a Platform field surfaced on /metrics.
+    // The full IoUringStream wire-up that consumes this is tracked on
+    // a follow-up; the boot line lets a deployment confirm the host is
+    // ready before the perf work lands.
+    #[cfg(feature = "io-uring-rw")]
+    {
+        if platform.has_io_uring_rw_kernel {
+            logging::info(
+                "io_uring_rw",
+                "kernel supports vectored rw (>= 5.19) — feature ready, runtime adapter pending follow-up",
+            );
+        } else {
+            logging::warn(
+                "io_uring_rw",
+                "kernel does NOT support vectored rw (need >= 5.19) — feature compiled in but auto-disabled",
+            );
+        }
+    }
+
+    // kTLS post-handshake offload boot probe (issue #52). Surfaced
+    // unconditionally when the feature is on so a deployment can
+    // confirm the kernel + module set is ready for in-kernel record
+    // framing + the future sendfile path. The probe itself is one
+    // socket() + setsockopt(TCP_ULP, "tls") + close — cheap.
+    #[cfg(all(target_os = "linux", feature = "ktls"))]
+    {
+        if crate::ktls::probe_kernel_support() {
+            logging::info(
+                "ktls",
+                "kernel supports kTLS (TCP_ULP=tls) — handshake corker active, sendfile path pending follow-up",
+            );
+        } else {
+            logging::warn(
+                "ktls",
+                "kernel does NOT advertise kTLS support — try_upgrade will fail and the connection will close",
+            );
+        }
+    }
+
+    // SO_REUSEPORT + BPF demux probe (issue #53). Reports kernel
+    // version + capability state at boot so an operator can tell
+    // whether the (currently-deferred) listener wire-up will be able
+    // to attach the program when it lands.
+    #[cfg(all(target_os = "linux", feature = "bpf-demux"))]
+    {
+        match crate::bpf_demux::probe() {
+            crate::bpf_demux::DemuxReadiness::Ready => logging::info(
+                "bpf_demux",
+                "kernel + capabilities ready (>= 5.7, CAP_BPF or CAP_SYS_ADMIN) — listener wire-up pending follow-up",
+            ),
+            crate::bpf_demux::DemuxReadiness::KernelTooOld { release } => logging::warn(
+                "bpf_demux",
+                &format!(
+                    "kernel {release} < 5.7 — SO_ATTACH_REUSEPORT_EBPF + UDP support unavailable; default reuseport hash will be used"
+                ),
+            ),
+            crate::bpf_demux::DemuxReadiness::MissingCapability => logging::warn(
+                "bpf_demux",
+                "kernel ready but process lacks CAP_BPF/CAP_SYS_ADMIN — grant with `setcap cap_bpf+ep` or run as root",
+            ),
+            crate::bpf_demux::DemuxReadiness::NotLinux => {} // unreachable under cfg
+        }
+    }
+
     // Hold a clone for the background tasks below (health prober,
     // connection pool pre-warm) that spawn before the AppState `Arc` is
     // constructed and need the upstream URL → health map.
@@ -734,8 +822,8 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         static_cache: cache::StaticCache::new(),
         conn_limit: Arc::new(Semaphore::new(platform.conn_limit)),
         acme_challenges: acme::new_challenge_store(),
-        rate_map: Arc::new(dashmap::DashMap::new()),
-        inflight: dashmap::DashMap::new(),
+        rate_map: Arc::new(numa::NumaAwareMap::new()),
+        inflight: numa::NumaAwareMap::new(),
         audit: audit_handle,
         redact: compiled_redact,
         http_builder: Arc::new({

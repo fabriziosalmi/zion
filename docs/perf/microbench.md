@@ -19,6 +19,7 @@ benches/
   traceparent.rs         — W3C parser, RFC vectors + garbage
   audit_hmac.rs          — HMAC chain throughput (events/sec)
   cache_lookup.rs        — L1 hit / L2 hit / full miss / singleflight
+  numa.rs                — NumaAwareMap vs DashMap baseline, 1/4 shards
 benchmarks/results/criterion/
   baseline.json          — checked-in numbers from a stable laptop
 .github/workflows/
@@ -103,6 +104,7 @@ so HTML is generated only on local runs that have a browser to view it).
 | `sovereign.rs`          | `record_classification` stays a single atomic increment (no allocation regression).          |
 | `cache_lookup.rs`       | L1/L2 lookup latencies; alerts if a refactor makes the L1 path drift toward L2 cost.         |
 | `waf_streaming.rs`      | Aho-Corasick scan cost (gate 3) on representative payloads; per-chunk overhead of streaming. |
+| `numa.rs`               | `NumaAwareMap` single-shard cost stays at `DashMap` baseline (issue #50 acceptance).         |
 
 ## Why `--no-default-features`
 

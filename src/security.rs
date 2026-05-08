@@ -173,7 +173,7 @@ impl RateEntry {
 pub fn check_rate_limit(
     rate_limit_rps: u32,
     rate_limit_window: u64,
-    rate_map: &dashmap::DashMap<std::net::IpAddr, RateEntry>,
+    rate_map: &crate::numa::NumaAwareMap<std::net::IpAddr, RateEntry>,
     ip: std::net::IpAddr,
 ) -> bool {
     if rate_limit_rps == 0 {
@@ -241,7 +241,7 @@ pub fn check_rate_limit(
 /// Returns `true` if an entry was evicted, `false` if all probed entries
 /// belong to the current window.
 fn try_evict_stale(
-    rate_map: &dashmap::DashMap<std::net::IpAddr, RateEntry>,
+    rate_map: &crate::numa::NumaAwareMap<std::net::IpAddr, RateEntry>,
     current_window: u32,
 ) -> bool {
     const EVICT_PROBE_LIMIT: usize = 16;
@@ -269,7 +269,7 @@ fn try_evict_stale(
 /// Removes all entries whose window is older than `current_window`.
 /// Returns the number of entries removed.
 pub fn scavenge_rate_map(
-    rate_map: &dashmap::DashMap<std::net::IpAddr, RateEntry>,
+    rate_map: &crate::numa::NumaAwareMap<std::net::IpAddr, RateEntry>,
     rate_limit_window: u64,
 ) -> usize {
     let now = std::time::SystemTime::now()
@@ -572,7 +572,7 @@ mod proptests {
             rps in 1u32..=100,
             burst in 1usize..=500,
         ) {
-            let map = dashmap::DashMap::new();
+            let map = crate::numa::NumaAwareMap::new();
             let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
             let mut allowed = 0;
             for _ in 0..burst {
@@ -597,7 +597,7 @@ mod proptests {
         // of burst size — the gate is documented as zero-overhead when off.
         #[test]
         fn rate_limiter_disabled_admits_everything(burst in 1usize..=10_000) {
-            let map = dashmap::DashMap::new();
+            let map = crate::numa::NumaAwareMap::new();
             let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 2).into();
             for _ in 0..burst {
                 prop_assert!(check_rate_limit(0, 1, &map, ip));
@@ -612,7 +612,7 @@ mod proptests {
             burst_a in 1usize..=200,
             burst_b in 1usize..=200,
         ) {
-            let map = dashmap::DashMap::new();
+            let map = crate::numa::NumaAwareMap::new();
             let ip_a: IpAddr = Ipv4Addr::new(10, 0, 0, 3).into();
             let ip_b: IpAddr = Ipv4Addr::new(10, 0, 0, 4).into();
             let mut allowed_a = 0;

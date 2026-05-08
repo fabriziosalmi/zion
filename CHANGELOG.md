@@ -6,6 +6,56 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **SO_REUSEPORT + BPF demux foundation (`bpf-demux` feature)**
+  (partial — see Deferred). New `src/bpf_demux.rs` module with a
+  three-state `DemuxReadiness` probe (`Ready` /
+  `KernelTooOld { release }` / `MissingCapability`), wired at boot
+  with a structured log line. New eBPF source crate
+  `bpf/zion-bpf-demux/` (mirrors `xdp/zion-xdp-prog/`'s layout) plus
+  `bpf/build.sh` produces `bpfel-unknown-none` ELF that the loader
+  reads from `ZION_BPF_DEMUX_OBJECT` (defaults to the build path).
+  The v1 program returns `SK_PASS` — the userspace attach hook + map
+  populate + body-replacement-with-real-routing are deferred. (#53
+  partial — see Deferred)
+- **kTLS secret-extraction fix + boot probe + `Memfd` cache helper**
+  (partial — see Deferred). Three pieces:
+    - `tls.rs` now sets `ServerConfig.enable_secret_extraction = true`
+      under `--features ktls` (Linux). The existing `try_upgrade` path
+      that wraps the post-handshake stream in `KtlsStream` requires
+      this to be true; without it `config_ktls_server` fails and the
+      connection is closed. This was a real bug on the kTLS path.
+    - Boot log line `ktls=enabled|disabled: <reason>` emitted at
+      startup when the feature is on, populated by the existing
+      `probe_kernel_support` helper.
+    - New `src/memfd.rs` module wrapping `memfd_create(2)` —
+      `Memfd::from_bytes(label, &[u8])` produces a kernel-tmpfs-backed
+      file handle. `MIN_MEMFD_THRESHOLD = 64 KB`. The dispatch-side
+      sendfile path that consumes this is the deferred piece. (#52
+      partial — see Deferred)
+  `ktls` feature now depends on `io-uring-rw` per the issue spec.
+- **io_uring rw capability probe + `io-uring-rw` feature gate**
+  (partial — see Deferred). New `bootstrap::Platform.has_io_uring_rw_kernel`
+  bool, populated at boot via `uname(2)` parsed against the 5.19+
+  threshold (where `IORING_OP_READV_FIXED` and the rest of the rw
+  surface zion would target are stable). Boot log line emitted only
+  when the feature is on; the bool is unconditionally surfaced on
+  `/metrics`. Two new chaos tests
+  (`tests/chaos.rs::tcp_read_terminates_cleanly_*`) pin the
+  "connection reset mid-read returns clean io::Error, never panics or
+  hangs" contract — applies to today's tokio path AND to the future
+  `IoUringStream` adapter so any regression is caught the moment the
+  follow-up lands. (#51 partial — see Deferred)
+- **NUMA-aware sharding for `rate_map` + `inflight`** — opt-in via
+  `--features numa-aware`. On Linux multi-socket boxes, the per-IP
+  rate-limit map and the singleflight inflight map split storage into
+  one `DashMap` per NUMA node, routed by the calling thread's current
+  node (`sched_getcpu(2)` + `/sys/devices/system/node/`). Same-socket
+  workers stay cache-local; cross-socket fallback scans on get-miss.
+  Single-socket / non-Linux / `--no-default-features` builds collapse
+  to a single shard with no routing overhead — verified by criterion
+  bench `numa/single_shard/get_hit` matching the bare `DashMap`
+  baseline within noise. New `bootstrap::Platform.numa_nodes` field
+  exposes the detected count. See [src/numa.rs](src/numa.rs). (#50)
 - **PGO release builds (Linux x86_64-gnu)** — release.yml gains an
   opt-in `pgo: true` matrix flag. When set, the build runs a two-pass
   profile-guided pipeline: instrumented binary → 10 s deterministic
@@ -40,6 +90,44 @@ All notable changes to Zion Edge Gateway are documented here.
   surface without dragging the full config-loader dependency graph.
   `config::{WafMode, WafProfile}` re-exports preserve every existing
   import site; no breaking change.
+
+### Deferred
+
+- **BPF demux listener wire-up (issue #53)** — binding N sockets to a
+  single SO_REUSEPORT group on `:443`, populating the
+  `BPF_MAP_TYPE_REUSEPORT_SOCKARRAY` with the per-worker fds, and
+  attaching the program via `SO_ATTACH_REUSEPORT_EBPF` is the runtime
+  glue we don't ship in v1. It requires reorganising how `main.rs`
+  constructs the HTTPS listener (today it's one `bind_with_reuseport`
+  call; the BPF flow needs a coordinated bind across worker
+  threads). The integration test ("TCP and QUIC clients both reach
+  upstream through the unified socket") and the no-regression bench
+  on TCP-only workloads land with that PR. The probe + boot log
+  shipped today let an operator confirm the host is ready before the
+  perf work arrives.
+- **kTLS sendfile dispatch path (issue #52)** — the static-cache hot
+  path that detects "memfd-backed entry + kTLS-upgraded connection"
+  and routes the response through `sendfile(target_socket_fd, memfd,
+  ...)` instead of hyper's body machinery is tracked separately. It
+  requires (a) plumbing the connection's raw fd through dispatch (a
+  layer hyper deliberately abstracts), (b) sidestepping hyper's
+  AsyncWrite-driven body-send to avoid double-encoding the payload,
+  and (c) a 100 KB+ benchmark to validate the issue's "≥30%
+  throughput" target — none of which we ship a half-working version
+  of. The `Memfd` helper (`src/memfd.rs`) and the secret-extraction
+  fix mean the next PR can focus purely on (a) + (b) + (c) without
+  re-litigating the kTLS plumbing.
+- **`IoUringStream<R, W>` runtime adapter (issue #51)** — the
+  `io_uring_prep_readv` / `writev` integration that replaces tokio's
+  read/write half of accepted connections is tracked separately. The
+  v0.2.x slice ships only the `io-uring-rw` feature gate, the
+  `bootstrap::Platform.has_io_uring_rw_kernel` probe, the chaos
+  contract test, and a structured boot log line. The adapter itself
+  is research-grade (correct AsyncRead/AsyncWrite over a tokio-driven
+  io_uring submission queue is multi-day work that doesn't compress
+  cleanly) and we don't ship a delegating stub — operators that
+  enable the feature today get the probe and the auto-disable signal,
+  not silent userspace I/O dressed up in io_uring trappings.
 
 ## [0.2.2] - 2026-05-08
 

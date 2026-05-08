@@ -59,3 +59,16 @@ pub mod waf;
 /// Exposed for `benches/sovereign.rs`.
 #[doc(hidden)]
 pub mod sovereign;
+
+/// NUMA-aware sharded map (issue #50). Pure — depends only on
+/// `dashmap` + (Linux + `numa-aware`) `libc::sched_getcpu`. Exposed for
+/// `benches/numa.rs` so the regression harness can compare the
+/// single-shard fast path against the multi-shard wrapper.
+#[doc(hidden)]
+pub mod numa;
+
+/// io_uring accept thread + capability probe (issue #51). The full
+/// `IoUringStream` adapter is deferred to a follow-up; this exposure
+/// is for the chaos test (`tests/chaos.rs`) and external diagnostics.
+#[doc(hidden)]
+pub mod uring;
