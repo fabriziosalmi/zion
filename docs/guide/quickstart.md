@@ -2,7 +2,9 @@
 
 ## Prerequisites
 
-- Rust 1.75+ (`rustup install stable`)
+- Rust 1.82+ for the default build (`rustup install stable`).
+  Opt-in features `acme`, `auth`, `init`, `http3` need 1.88+ because
+  of transitive dependencies that bumped their own MSRV.
 - A TLS certificate and key (PEM format)
 - An upstream HTTP service to proxy to
 
