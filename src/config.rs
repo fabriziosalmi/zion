@@ -314,88 +314,15 @@ pub(crate) fn default_client_auth() -> String {
 // WAF PROFILES (layered, named, per-route)
 // ============================================================================
 
-/// WAF detection mode — selects which Aho-Corasick pattern set is scanned.
-///
-/// `Balanced` (default): high-precision patterns. SQLi/XSS tags/path traversal/
-/// SSRF/XXE/Log4Shell/CRLF/SSTI/most LDAP and PHP patterns. Tuned to keep the
-/// false-positive rate low for content-bearing APIs (comments, code paste,
-/// docs, payloads with base64).
-///
-/// `Aggressive`: balanced PLUS broad-substring patterns that catch more
-/// attacks but also flag legitimate developer/tooling content. Use this on
-/// strict admin paths, never on user-content APIs unless you've measured the
-/// FP rate. Examples added under aggressive: `alert(`, `eval(`,
-/// `document.cookie`, `innerhtml`, `os.system(`, `pickle.loads`,
-/// `Runtime.getRuntime`, `$gt`/`$ne`/`$regex` (unanchored MongoDB ops), and
-/// generic XSS event handlers like `onclick=`/`onmouseover=`.
-#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum WafMode {
-    #[default]
-    Balanced,
-    Aggressive,
-}
-
-#[derive(Deserialize, Clone, Debug)]
-pub struct WafProfile {
-    #[serde(default)]
-    pub mode: WafMode,
-    #[serde(default = "default_max_body_mb")]
-    pub max_body_mb: u64,
-    #[serde(default = "default_max_depth")]
-    pub max_depth: usize,
-    #[serde(default = "default_max_string_len")]
-    pub max_string_len: usize,
-    #[serde(default = "default_true")]
-    pub deny_unknown_content_types: bool,
-    #[serde(default = "default_allowed_content_types")]
-    pub allowed_content_types: Vec<String>,
-    /// Run Shannon-entropy gate on bodies ≥256 bytes. When true, denies
-    /// requests whose entropy exceeds `entropy_threshold`. Default: true.
-    /// Disable on routes that legitimately accept high-entropy payloads
-    /// (binary uploads as JSON-base64, encrypted blobs, signed envelopes).
-    #[serde(default = "default_true")]
-    pub entropy_check: bool,
-    /// Entropy threshold in bits/byte. Default: 6.5 — leaves headroom above
-    /// pure base64 (6.0 theoretical max) so JWTs, signed URLs and base64
-    /// payloads are not flagged. Random/encrypted content sits at ~7.5–8.0.
-    #[serde(default = "default_entropy_threshold")]
-    pub entropy_threshold: f64,
-}
-
-fn default_max_body_mb() -> u64 {
-    10
-}
-fn default_max_depth() -> usize {
-    10
-}
-fn default_max_string_len() -> usize {
-    1_048_576
-}
-fn default_allowed_content_types() -> Vec<String> {
-    vec![
-        "application/json".to_string(),
-        "multipart/form-data".to_string(),
-    ]
-}
-fn default_entropy_threshold() -> f64 {
-    6.5
-}
-
-impl Default for WafProfile {
-    fn default() -> Self {
-        Self {
-            mode: WafMode::default(),
-            max_body_mb: default_max_body_mb(),
-            max_depth: default_max_depth(),
-            max_string_len: default_max_string_len(),
-            deny_unknown_content_types: true,
-            allowed_content_types: default_allowed_content_types(),
-            entropy_check: true,
-            entropy_threshold: default_entropy_threshold(),
-        }
-    }
-}
+// `WafMode` and `WafProfile` are defined in `crate::waf` (their semantic home
+// — they're the inputs the scanner consumes). Re-exported here so existing
+// `config::WafProfile` import sites keep working unchanged. The move was
+// driven by the microbench harness (issue #54): the bench needs to construct
+// a profile via the lib surface without dragging the full config-loader
+// dependency graph (auth, security, audit, sovereign).
+#[allow(unused_imports)]
+// `WafMode` re-exported for downstream/test code; bin uses `crate::waf::WafMode`.
+pub use crate::waf::{WafMode, WafProfile};
 
 // ============================================================================
 // CACHE PROFILES
