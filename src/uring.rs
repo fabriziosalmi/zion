@@ -295,7 +295,7 @@ fn read_kernel_release() -> Option<String> {
 /// dot-separated components at the start.
 #[cfg(target_os = "linux")]
 pub(crate) fn parse_kernel_release(s: &str) -> Option<(u32, u32)> {
-    let s = s.split(|c: char| c == '-' || c == '+').next()?;
+    let s = s.split(['-', '+']).next()?;
     let mut parts = s.split('.');
     let maj: u32 = parts.next()?.parse().ok()?;
     let min: u32 = parts.next()?.parse().ok()?;

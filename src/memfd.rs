@@ -24,6 +24,14 @@
 //! this module must guard the call site on the same `cfg`.
 
 #![cfg(target_os = "linux")]
+// `Memfd::{from_bytes, len, is_empty, as_raw_fd}` are the public API
+// the deferred sendfile dispatch path will consume. Until that lands
+// the bin compile sees them as unused; module-level allow keeps the
+// items intact and their tests reachable instead of having to
+// scatter `#[allow]` per item. Same posture as `src/ktls.rs`'s
+// `#![allow(dead_code)]` for `cork_for_handshake` / `try_upgrade`
+// before the listener wire-up landed.
+#![allow(dead_code)]
 
 use std::fs::File;
 use std::io::{self, Write};
