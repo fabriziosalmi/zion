@@ -6,6 +6,16 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **PGO release builds (Linux x86_64-gnu)** — release.yml gains an
+  opt-in `pgo: true` matrix flag. When set, the build runs a two-pass
+  profile-guided pipeline: instrumented binary → 10 s deterministic
+  workload via [`scripts/pgo-collect.sh`](scripts/pgo-collect.sh) →
+  `llvm-profdata merge` → optimised rebuild. The PGO archive ships
+  alongside the regular one with a `-pgo` suffix, its own `SHA256SUMS`
+  entry, and its own SLSA build provenance. Default off for every
+  target; only `x86_64-unknown-linux-gnu` is PGO'd today (musl +
+  aarch64 + macOS + Windows pending). See
+  [docs/perf/pgo.md](docs/perf/pgo.md). (#55)
 - **Streaming WAF body inspection** — opt-in per WAF profile via
   `[waf_profile.X] streaming = true`. The dispatcher feeds each
   request-body frame to a `StreamingScanner` as it arrives off the wire;

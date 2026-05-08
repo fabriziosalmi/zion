@@ -64,33 +64,56 @@ jobs:
             os: ubuntu-latest
             cross: zig
             artifact: zion
+            pgo: false
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             cross: zig
             artifact: zion
+            pgo: false
           # Linux musl (fully static — runs on Alpine, distroless, scratch)
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             cross: zig
             artifact: zion
+            pgo: false
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             cross: zig
             artifact: zion
+            pgo: false
           # macOS — native runners; one Intel, one Apple Silicon.
           - target: x86_64-apple-darwin
             os: macos-15-intel
             cross: native
             artifact: zion
+            pgo: false
           - target: aarch64-apple-darwin
             os: macos-15
             cross: native
             artifact: zion
+            pgo: false
           # Windows
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             cross: native
             artifact: zion.exe
+            pgo: false
+          # ── PGO variants (issue #55) ──────────────────────────────
+          # Profile-Guided Optimization: a two-pass build trains the
+          # release binary on a deterministic 10s workload via
+          # scripts/pgo-collect.sh. Ships alongside the regular binary
+          # with a `-pgo` archive suffix so operators can pick it
+          # explicitly. Currently only x86_64-unknown-linux-gnu is
+          # PGO'd — it's the most common server target and the
+          # ubuntu-latest runner can natively execute the
+          # instrumented binary to collect profiles. musl + aarch64
+          # variants will follow once the wire-up has run a few
+          # release cycles cleanly.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: native
+            artifact: zion
+            pgo: true
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout (tag or dispatch ref)
@@ -190,16 +213,84 @@ jobs:
 
       # ── Build ──
       - name: Build (zigbuild)
-        if: matrix.cross == 'zig'
+        if: matrix.cross == 'zig' && !matrix.pgo
         shell: bash
         run: |
           cargo zigbuild --release --locked --target ${{ matrix.target }}
 
       - name: Build (native)
-        if: matrix.cross == 'native'
+        if: matrix.cross == 'native' && !matrix.pgo
         shell: bash
         run: |
           cargo build --release --locked --target ${{ matrix.target }}
+
+      # ── PGO build (issue #55) ─────────────────────────────────────────
+      # Two-pass profile-guided build:
+      #   Phase 1 — instrumented binary written with `-Cprofile-generate`.
+      #   Workload — scripts/pgo-collect.sh runs the binary against an
+      #              in-process Go backend for ~30s (3 endpoints × 10s)
+      #              with deterministic wrk parameters.
+      #   Phase 2 — re-build with `-Cprofile-use` after llvm-profdata merge.
+      #
+      # Restricted to native x86_64 ubuntu-latest entries: the ubuntu
+      # runner can execute the instrumented binary directly. Cross-PGO
+      # (musl, aarch64) requires QEMU and is deferred.
+      - name: Install PGO tooling (LLVM + Go + wrk)
+        if: matrix.pgo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm wrk
+          # Go is preinstalled on ubuntu-latest; sanity-check.
+          go version
+
+      - name: PGO Phase 1 — instrumented build
+        if: matrix.pgo
+        shell: bash
+        env:
+          PGO_DIR: ${{ runner.temp }}/pgo-data
+        run: |
+          mkdir -p "$PGO_DIR"
+          # `-Cprofile-generate=$PGO_DIR` instruments every function;
+          # the runtime writes one .profraw per process / module on
+          # exit (LLVM_PROFILE_FILE controls the filename pattern,
+          # set in pgo-collect.sh).
+          RUSTFLAGS="-Cprofile-generate=${PGO_DIR}" \
+            cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: PGO workload — collect profraws
+        if: matrix.pgo
+        shell: bash
+        env:
+          ZION_BIN: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          PGO_PROFILE_DIR: ${{ runner.temp }}/pgo-data
+        run: bash scripts/pgo-collect.sh
+
+      - name: PGO Phase 2 — merge profiles + optimised build
+        if: matrix.pgo
+        shell: bash
+        env:
+          PGO_DIR: ${{ runner.temp }}/pgo-data
+        run: |
+          PROFDATA=$(command -v llvm-profdata 2>/dev/null \
+            || command -v llvm-profdata-14 2>/dev/null \
+            || command -v llvm-profdata-15 2>/dev/null \
+            || command -v llvm-profdata-16 2>/dev/null \
+            || command -v llvm-profdata-17 2>/dev/null \
+            || command -v llvm-profdata-18 2>/dev/null \
+            || true)
+          if [[ -z "$PROFDATA" ]]; then
+            echo "::error::llvm-profdata not found on PATH"
+            exit 1
+          fi
+          "$PROFDATA" merge -o "${PGO_DIR}/merged.profdata" "${PGO_DIR}"/*.profraw
+          # No `cargo clean` needed: Cargo's fingerprint includes
+          # RUSTFLAGS, so swapping `-Cprofile-generate` → `-Cprofile-use`
+          # triggers a fresh rebuild of every item the flag touches.
+          # `-Cllvm-args=-pgo-warn-missing-function`: surface functions
+          # that have no profile data so future workload tweaks can fix
+          # gaps before they bite.
+          RUSTFLAGS="-Cprofile-use=${PGO_DIR}/merged.profdata -Cllvm-args=-pgo-warn-missing-function" \
+            cargo build --release --locked --target ${{ matrix.target }}
 
       # ── Strip + stage artifact ──
       - name: Stage artifact
@@ -208,11 +299,21 @@ jobs:
         env:
           MATRIX_TARGET: ${{ matrix.target }}
           MATRIX_ARTIFACT: ${{ matrix.artifact }}
+          MATRIX_PGO: ${{ matrix.pgo }}
           STAGE_VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p dist
-          name="zion-${STAGE_VERSION}-${MATRIX_TARGET}"
+          # PGO-built binaries get a `-pgo` archive suffix so the regular
+          # and optimised binaries can co-exist in a single release. The
+          # SHA256 differs from the non-PGO build by construction (issue
+          # #55 acceptance: "PGO build verified to produce a different
+          # SHA256 than the non-PGO build").
+          if [[ "${MATRIX_PGO}" == "true" ]]; then
+            name="zion-${STAGE_VERSION}-${MATRIX_TARGET}-pgo"
+          else
+            name="zion-${STAGE_VERSION}-${MATRIX_TARGET}"
+          fi
           src="target/${MATRIX_TARGET}/release/${MATRIX_ARTIFACT}"
 
           # Strip on platforms where we have a strip in PATH that targets the
@@ -256,7 +357,9 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: zion-${{ matrix.target }}
+          # Suffix the artifact key with `-pgo` so the PGO row does not
+          # collide with the regular build of the same target (issue #55).
+          name: zion-${{ matrix.target }}${{ matrix.pgo && '-pgo' || '' }}
           path: dist/*
           if-no-files-found: error
           retention-days: 14
