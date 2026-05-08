@@ -120,7 +120,7 @@ pub fn probe_kernel_support() -> bool {
             stream.as_raw_fd(),
             libc::SOL_TCP,
             libc::TCP_ULP,
-            b"tls\0".as_ptr() as *const _,
+            c"tls".as_ptr() as *const _,
             4,
         )
     };
