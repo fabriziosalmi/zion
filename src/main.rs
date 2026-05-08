@@ -80,6 +80,10 @@ mod waf;
 // Track A — XDP pre-filter: drops blacklisted CIDRs at NIC driver layer.
 #[cfg(all(target_os = "linux", feature = "xdp"))]
 mod xdp;
+// v0.2 perf-ceiling — SO_REUSEPORT + BPF demux scaffolding (issue #53).
+// Probe + capability check today; listener wire-up deferred.
+#[cfg(all(target_os = "linux", feature = "bpf-demux"))]
+mod bpf_demux;
 // Track A — kTLS post-handshake offload (Linux >= 5.10 + CONFIG_TLS).
 #[cfg(all(target_os = "linux", feature = "ktls"))]
 mod ktls;
@@ -694,6 +698,31 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                 "ktls",
                 "kernel does NOT advertise kTLS support — try_upgrade will fail and the connection will close",
             );
+        }
+    }
+
+    // SO_REUSEPORT + BPF demux probe (issue #53). Reports kernel
+    // version + capability state at boot so an operator can tell
+    // whether the (currently-deferred) listener wire-up will be able
+    // to attach the program when it lands.
+    #[cfg(all(target_os = "linux", feature = "bpf-demux"))]
+    {
+        match crate::bpf_demux::probe() {
+            crate::bpf_demux::DemuxReadiness::Ready => logging::info(
+                "bpf_demux",
+                "kernel + capabilities ready (>= 5.7, CAP_BPF or CAP_SYS_ADMIN) — listener wire-up pending follow-up",
+            ),
+            crate::bpf_demux::DemuxReadiness::KernelTooOld { release } => logging::warn(
+                "bpf_demux",
+                &format!(
+                    "kernel {release} < 5.7 — SO_ATTACH_REUSEPORT_EBPF + UDP support unavailable; default reuseport hash will be used"
+                ),
+            ),
+            crate::bpf_demux::DemuxReadiness::MissingCapability => logging::warn(
+                "bpf_demux",
+                "kernel ready but process lacks CAP_BPF/CAP_SYS_ADMIN — grant with `setcap cap_bpf+ep` or run as root",
+            ),
+            crate::bpf_demux::DemuxReadiness::NotLinux => {} // unreachable under cfg
         }
     }
 

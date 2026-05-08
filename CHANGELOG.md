@@ -6,6 +6,17 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **SO_REUSEPORT + BPF demux foundation (`bpf-demux` feature)**
+  (partial — see Deferred). New `src/bpf_demux.rs` module with a
+  three-state `DemuxReadiness` probe (`Ready` /
+  `KernelTooOld { release }` / `MissingCapability`), wired at boot
+  with a structured log line. New eBPF source crate
+  `bpf/zion-bpf-demux/` (mirrors `xdp/zion-xdp-prog/`'s layout) plus
+  `bpf/build.sh` produces `bpfel-unknown-none` ELF that the loader
+  reads from `ZION_BPF_DEMUX_OBJECT` (defaults to the build path).
+  The v1 program returns `SK_PASS` — the userspace attach hook + map
+  populate + body-replacement-with-real-routing are deferred. (#53
+  partial — see Deferred)
 - **kTLS secret-extraction fix + boot probe + `Memfd` cache helper**
   (partial — see Deferred). Three pieces:
     - `tls.rs` now sets `ServerConfig.enable_secret_extraction = true`
@@ -82,6 +93,18 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Deferred
 
+- **BPF demux listener wire-up (issue #53)** — binding N sockets to a
+  single SO_REUSEPORT group on `:443`, populating the
+  `BPF_MAP_TYPE_REUSEPORT_SOCKARRAY` with the per-worker fds, and
+  attaching the program via `SO_ATTACH_REUSEPORT_EBPF` is the runtime
+  glue we don't ship in v1. It requires reorganising how `main.rs`
+  constructs the HTTPS listener (today it's one `bind_with_reuseport`
+  call; the BPF flow needs a coordinated bind across worker
+  threads). The integration test ("TCP and QUIC clients both reach
+  upstream through the unified socket") and the no-regression bench
+  on TCP-only workloads land with that PR. The probe + boot log
+  shipped today let an operator confirm the host is ready before the
+  perf work arrives.
 - **kTLS sendfile dispatch path (issue #52)** — the static-cache hot
   path that detects "memfd-backed entry + kTLS-upgraded connection"
   and routes the response through `sendfile(target_socket_fd, memfd,

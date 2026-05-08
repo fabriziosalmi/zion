@@ -218,6 +218,15 @@ sovereign-signals = []             # Gossip mesh for signal sharing (Phase 3)
 # at runtime; the eBPF program is shipped separately under `xdp/` and
 # loaded from disk (or embedded — see xdp.rs::EBPF_OBJECT_PATH).
 xdp = ["dep:aya", "dep:aya-log"]
+# v0.2 perf-ceiling — SO_REUSEPORT + BPF demux for unified :443 (issue
+# #53). Loads a small `SK_REUSEPORT` program that overrides the
+# kernel's default reuseport hash on the SO_REUSEPORT group bound on
+# :443 so connection→worker affinity can be steered from userspace
+# (gossip-driven, NUMA-aware, etc — all follow-up). The runtime
+# listener wire-up that consumes the loader is deferred — see
+# CHANGELOG. Linux >= 5.7 (when SO_ATTACH_REUSEPORT_EBPF gained UDP
+# support, matching the issue's QUIC integration requirement).
+bpf-demux = ["dep:aya"]
 # Track A — kTLS post-handshake offload. Linux >= 5.10 + CONFIG_TLS.
 # Switches established rustls server connections to in-kernel TLS_TX/RX.
 #
