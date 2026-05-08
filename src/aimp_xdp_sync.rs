@@ -15,6 +15,12 @@
 //! drag in `crate::xdp::*` references they cannot resolve.
 
 #![cfg(all(target_os = "linux", feature = "xdp", feature = "sovereign-aimp"))]
+// Scaffolding: `spawn` is the entry point for the boot path to start
+// the AIMP→XDP reconciler. The XDP attach itself isn't yet wired from
+// `async_main` (that's its own follow-up — needs the xdp.rs `XdpHandle`
+// to be loaded at boot under the same feature flags). Keep `spawn`
+// reachable now so the wire-up lands in a small follow-up PR.
+#![allow(dead_code)]
 
 use crate::aimp_cp::AimpControlPlane;
 use crate::xdp::{Cidr4, XdpHandle};
