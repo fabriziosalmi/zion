@@ -1,0 +1,50 @@
+# OSSF Scorecard — repo-level supply-chain posture grade.
+#
+# Lives in its own file (split from supply-chain.yml on issue #57)
+# specifically to satisfy scorecard-action's `publish_results: true`
+# verification policy: the workflow must be "minimal" — NO top-level
+# `env:` or `defaults:` blocks, only `name`, `on`, `permissions`, and
+# `jobs`. The webapp at scorecard.dev rejects publishes from
+# workflows that carry global env, even if the env is harmless.
+#
+# Triggers mirror the previous in-supply-chain shape: master pushes,
+# daily cron at 06:00 UTC, and manual dispatch. Tag pushes and PRs
+# are excluded — Scorecard only operates against the default branch.
+
+name: scorecard
+
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write          # signed results upload (Sigstore)
+  security-events: write   # publish SARIF to the Security tab
+
+jobs:
+  scorecard:
+    name: OSSF Scorecard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: ossf/scorecard-action@62b2cac7ed8198b15735ed49ab1e5cf35480ba46 # v2.4.0
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          # `publish_results: true` works only because this workflow
+          # is "minimal" (no global env/defaults). After the first
+          # successful run, scorecard.dev surfaces the public badge
+          # within ~24 h.
+          publish_results: true
+
+      - name: Upload scorecard SARIF
+        uses: github/codeql-action/upload-sarif@0daab03d71ff584ef619d027a3fd9146679c5d84 # v3
+        with:
+          sarif_file: scorecard.sarif

@@ -92,6 +92,15 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Changed
 
+- **OSSF Scorecard split into a minimal workflow** — moved from
+  `supply-chain.yml` to a dedicated [`scorecard.yml`](.github/workflows/scorecard.yml)
+  with no global `env`/`defaults` blocks, satisfying the
+  scorecard-action verification policy required for
+  `publish_results: true`. The public badge at scorecard.dev now
+  auto-refreshes within ~24 h of the first successful run; the SARIF
+  still flows into the GitHub Security tab as before. Triggers
+  (master push + 06:00 UTC cron + workflow_dispatch) match the
+  previous in-supply-chain shape. (#57)
 - **`WafMode` and `WafProfile` moved from `config` to `waf`** — semantic
   home, and lets the bench harness construct profiles via the lib
   surface without dragging the full config-loader dependency graph.

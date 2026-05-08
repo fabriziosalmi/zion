@@ -159,40 +159,10 @@ jobs:
           path: "zion-sbom.cdx.json"
           retention-days: 90
 
-  # ── 6. OSSF Scorecard — repo-level supply-chain posture grade. ───────────
-  scorecard:
-    name: OSSF Scorecard
-    # Scorecard only runs against the default branch — it errors out
-    # immediately on tag pushes ("only default branch is supported"). So
-    # we gate to: push on master, scheduled cron, and manual dispatch.
-    # PRs and tag pushes are excluded.
-    if: |
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/master')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write          # for SARIF + signed results upload
-      security-events: write   # to publish results to the Security tab
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: ossf/scorecard-action@62b2cac7ed8198b15735ed49ab1e5cf35480ba46 # v2.4.0
-        with:
-          results_file: scorecard.sarif
-          results_format: sarif
-          # `publish_results` requires the workflow to be "minimal" by
-          # the scorecard webapp's standards (no global `env:` or
-          # `defaults:`). Our supply-chain.yml has `env: CARGO_TERM_COLOR`
-          # at the top, so the publish step rejects with HTTP 400. The
-          # SARIF still uploads to GitHub's Security tab below — that's
-          # the consumer-facing surface we care about. The public badge
-          # at scorecard.dev is a follow-up: split scorecard into its own
-          # global-env-free workflow file.
-          publish_results: false
-      - name: Upload scorecard SARIF
-        uses: github/codeql-action/upload-sarif@0daab03d71ff584ef619d027a3fd9146679c5d84 # v3
-        with:
-          sarif_file: scorecard.sarif
+  # OSSF Scorecard moved to its own workflow file
+  # (.github/workflows/scorecard.yml) on issue #57: scorecard-action's
+  # `publish_results: true` requires a minimal workflow (no global
+  # `env:` / `defaults:`), which this file's `env: CARGO_TERM_COLOR`
+  # block prevents. The split lets the public scorecard.dev badge
+  # auto-refresh while keeping the rest of the supply-chain audits
+  # under their consolidated banner.
