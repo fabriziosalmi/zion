@@ -69,6 +69,12 @@ impl IpClass {
     /// Stable index into [`CLASS_COUNTERS`]. Hand-rolled instead of
     /// `enum_iterator` so this stays a `const fn` and the enum stays
     /// `#[derive(Copy)]`-able. Update both sides if a new variant lands.
+    ///
+    /// `Self::Unknown` resolves to `CLASS_COUNT - 1` rather than
+    /// `CLASS_COUNTERS.len() - 1`: referencing a `static` from a
+    /// `const fn` is unstable on rustc < 1.83 (E0658, see
+    /// rust-lang/rust#119618), and the project's MSRV floor is 1.82.
+    /// Both expressions evaluate to the same usize.
     #[inline]
     const fn index(self) -> usize {
         match self {
@@ -81,7 +87,7 @@ impl IpClass {
             Self::ResidentialEu => 4,
             #[cfg(feature = "geo-eu")]
             Self::DatacenterEu => 5,
-            Self::Unknown => CLASS_COUNTERS.len() - 1,
+            Self::Unknown => CLASS_COUNT - 1,
         }
     }
 }

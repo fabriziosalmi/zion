@@ -305,7 +305,7 @@ Results saved to `benchmarks/bench-history.json` with automatic delta comparison
 ## Testing
 
 ```bash
-# Unit tests (421) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
+# Unit tests (533) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
 cargo test
 
 # Integration tests (19 -- requires running Zion + backend)
