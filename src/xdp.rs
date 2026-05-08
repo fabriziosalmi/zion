@@ -215,7 +215,7 @@ impl XdpHandle {
             LpmTrie::try_from(map).map_err(|e| format!("xdp: BLOCKED_V4 typing: {e}"))?;
         let key = Key::new(cidr.prefix as u32, cidr.addr.octets());
         trie.insert(&key, 1u32, 0)
-            .map_err(|e| format!("xdp: BLOCKED_V4 insert {:?}: {e}", cidr))?;
+            .map_err(|e| format!("xdp: BLOCKED_V4 insert {cidr:?}: {e}"))?;
         Ok(())
     }
 

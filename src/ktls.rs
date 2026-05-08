@@ -93,7 +93,7 @@ pub async fn try_upgrade(
     // returned `KtlsStream` is parameterised on the *raw* `TcpStream`.
     ktls::config_ktls_server(stream)
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("kTLS upgrade failed: {e}")))
+        .map_err(|e| io::Error::other(format!("kTLS upgrade failed: {e}")))
 }
 
 /// Diagnostic: returns whether the running kernel claims kTLS support.
