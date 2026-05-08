@@ -2,10 +2,20 @@
 #
 # Lives in its own file (split from supply-chain.yml on issue #57)
 # specifically to satisfy scorecard-action's `publish_results: true`
-# verification policy: the workflow must be "minimal" — NO top-level
-# `env:` or `defaults:` blocks, only `name`, `on`, `permissions`, and
-# `jobs`. The webapp at scorecard.dev rejects publishes from
-# workflows that carry global env, even if the env is harmless.
+# verification policy. Two restrictions the webapp enforces and that
+# we satisfy here:
+#
+#   1. **No top-level `env:` or `defaults:` blocks.** Only `name`,
+#      `on`, `permissions`, `jobs`.
+#   2. **No top-level WRITE permissions.** Top-level may only be
+#      `read-all` (or omitted, or every entry set to `read`). All
+#      `write` permissions belong on the per-job `permissions:` block.
+#
+# The first run of v0.2.x on master tripped restriction #2: the
+# top-level had `id-token: write` + `security-events: write`, and
+# scorecard.dev's verifier rejected the publish with `400 Bad
+# Request: "global perm is set to write"`. Fix is purely
+# YAML-structural — move the writes to the `scorecard` job.
 #
 # Triggers mirror the previous in-supply-chain shape: master pushes,
 # daily cron at 06:00 UTC, and manual dispatch. Tag pushes and PRs
@@ -20,15 +30,24 @@ on:
     - cron: "0 6 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: read
-  id-token: write          # signed results upload (Sigstore)
-  security-events: write   # publish SARIF to the Security tab
+# Top-level permissions are READ-ONLY per scorecard-action's webapp
+# policy. Each job that needs write permissions declares them on its
+# own `permissions:` block.
+permissions: read-all
 
 jobs:
   scorecard:
     name: OSSF Scorecard
     runs-on: ubuntu-latest
+    permissions:
+      # Required for the OIDC-signed results upload (Sigstore).
+      id-token: write
+      # Required to publish SARIF to the GitHub Security tab.
+      security-events: write
+      # Explicit `contents: read` — actions/checkout needs it, and
+      # scorecard-action expects to find it at the job level when
+      # the top-level uses `read-all`.
+      contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -39,9 +58,9 @@ jobs:
           results_file: scorecard.sarif
           results_format: sarif
           # `publish_results: true` works only because this workflow
-          # is "minimal" (no global env/defaults). After the first
-          # successful run, scorecard.dev surfaces the public badge
-          # within ~24 h.
+          # is "minimal" (no global env/defaults, no top-level
+          # writes). After the first successful run, scorecard.dev
+          # surfaces the public badge within ~24 h.
           publish_results: true
 
       - name: Upload scorecard SARIF
