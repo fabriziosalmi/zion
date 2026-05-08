@@ -182,7 +182,10 @@ pub const fn cidr_range(a: u8, b: u8, c: u8, d: u8, prefix_len: u8) -> (u32, u32
 ///
 /// O(log N) binary search over sorted CIDR ranges. Zero allocation.
 pub fn classify(ip: IpAddr) -> IpClass {
-    let ipv4 = match ip {
+    // `_ipv4` (vs `ipv4`) silences an `unused_variable` warning when neither
+    // `geo-ita` nor `geo-eu` is enabled (e.g. lib build for the bench
+    // harness): both reader blocks below are then `cfg`-stripped.
+    let _ipv4 = match ip {
         IpAddr::V4(v4) => u32::from(v4),
         IpAddr::V6(v6) => {
             // Check for IPv4-mapped IPv6 (::ffff:a.b.c.d)
@@ -196,7 +199,7 @@ pub fn classify(ip: IpAddr) -> IpClass {
     // Search ITA data first (more specific)
     #[cfg(feature = "geo-ita")]
     {
-        let result = lookup(ipv4, data_ita::RANGES);
+        let result = lookup(_ipv4, data_ita::RANGES);
         if result != IpClass::Unknown {
             return result;
         }
@@ -205,7 +208,7 @@ pub fn classify(ip: IpAddr) -> IpClass {
     // Then EU data (broader)
     #[cfg(feature = "geo-eu")]
     {
-        let result = lookup(ipv4, data_eu::RANGES);
+        let result = lookup(_ipv4, data_eu::RANGES);
         if result != IpClass::Unknown {
             return result;
         }
@@ -215,6 +218,13 @@ pub fn classify(ip: IpAddr) -> IpClass {
 }
 
 /// Binary search a sorted `CidrEntry` array for the given IPv4 address.
+///
+/// `#[allow(dead_code)]`: the public `classify` only calls this under
+/// `feature = "geo-ita"` or `feature = "geo-eu"`, but the function itself
+/// is unit-tested below regardless of feature flags so the bench-time
+/// build (no-default-features) keeps coverage. Suppressing the warning is
+/// preferable to gating tests behind `cfg(any(...))`.
+#[allow(dead_code)]
 #[inline]
 fn lookup(ip: u32, ranges: &[CidrEntry]) -> IpClass {
     // Binary search: find the last range whose `start <= ip`

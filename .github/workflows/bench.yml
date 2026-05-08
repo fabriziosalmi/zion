@@ -1,0 +1,139 @@
+# Microbench — Criterion harness for the v0.2 perf-ceiling work (issue #54).
+#
+# Trigger: manual `workflow_dispatch` only. Microbenchmarks need a stable,
+# noise-free runner; the GitHub-hosted ubuntu-latest is too noisy for
+# reliable variance numbers, so this workflow is opt-in and the comparison
+# is best-effort. The numbers it posts are *signals*, not gates — a regression
+# alert here means "look", not "fail the build".
+#
+# What the workflow does:
+#   1. Build the bench binaries (release profile + debug-info, see Cargo.toml).
+#   2. Run criterion against the PR head, capture target/criterion/*.json.
+#   3. If invoked from a PR, build master at the merge-base and re-run, then
+#      diff the two estimates.json trees to surface deltas.
+#   4. Post the delta summary as a single PR comment (compact table).
+#
+# Artifact retention is 14 days — long enough for a humans-in-the-loop review
+# cycle, short enough to keep storage bills sensible.
+
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      bench:
+        description: "Bench filter (criterion regex). Empty = all benches."
+        required: false
+        default: ""
+      pr:
+        description: "Pull request number to compare against (optional)."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  criterion:
+    name: criterion (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
+
+      - name: bench (head)
+        run: |
+          mkdir -p bench-out/head
+          cargo bench --no-default-features --bench waf_streaming -- "${{ inputs.bench }}" || exit 1
+          cargo bench --no-default-features --bench traceparent  -- "${{ inputs.bench }}"
+          cargo bench --no-default-features --bench audit_hmac   -- "${{ inputs.bench }}"
+          cargo bench --no-default-features --bench sovereign    -- "${{ inputs.bench }}"
+          cargo bench --no-default-features --bench cache_lookup -- "${{ inputs.bench }}"
+          # criterion writes per-bench JSON estimates under target/criterion/.
+          # Snapshot them now so the master rebuild below cannot clobber them.
+          cp -R target/criterion bench-out/head/criterion
+
+      - name: bench (master baseline)
+        if: github.event_name == 'pull_request' || inputs.pr != ''
+        run: |
+          mkdir -p bench-out/master
+          # Determine merge-base. For workflow_dispatch with a PR input,
+          # `gh pr view` would resolve the head ref; we fall back to
+          # comparing against origin/master tip.
+          BASE=$(git merge-base HEAD origin/master || echo origin/master)
+          git -c advice.detachedHead=false checkout "$BASE"
+          # Reuse cargo cache; clean only the criterion output.
+          rm -rf target/criterion
+          cargo bench --no-default-features --bench waf_streaming -- "${{ inputs.bench }}"
+          cargo bench --no-default-features --bench traceparent  -- "${{ inputs.bench }}"
+          cargo bench --no-default-features --bench audit_hmac   -- "${{ inputs.bench }}"
+          cargo bench --no-default-features --bench sovereign    -- "${{ inputs.bench }}"
+          cargo bench --no-default-features --bench cache_lookup -- "${{ inputs.bench }}"
+          cp -R target/criterion bench-out/master/criterion
+          git checkout -
+
+      - name: diff vs master
+        if: github.event_name == 'pull_request' || inputs.pr != ''
+        run: |
+          python3 scripts/criterion-diff.py \
+            --head bench-out/head/criterion \
+            --base bench-out/master/criterion \
+            --threshold-pct 5 \
+            --out bench-out/delta.md
+          cat bench-out/delta.md
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: criterion-${{ github.run_id }}
+          path: bench-out/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'bench-out/delta.md';
+            if (!fs.existsSync(path)) { return; }
+            const body = fs.readFileSync(path, 'utf8');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.startsWith('<!-- bench-bot -->'));
+            const tagged = `<!-- bench-bot -->\n${body}`;
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: tagged,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: tagged,
+              });
+            }

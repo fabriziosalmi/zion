@@ -1,0 +1,62 @@
+{
+  "_meta": {
+    "format": "zion.bench.criterion.baseline.v1",
+    "issue": "https://github.com/fabriziosalmi/zion/issues/54",
+    "regenerate_with": "scripts/criterion-baseline.sh",
+    "platform": "macOS arm64 (Apple M-series), 64GiB RAM",
+    "rustc": "1.82.0 (default-features off)",
+    "captured_at": "2026-05-08",
+    "notes": [
+      "Numbers below are the median time of a quick-mode (`-- --quick`) run on an idle laptop.",
+      "CI-regenerated baselines should keep the same JSON shape so the diff bot can parse them.",
+      "Bench IDs match `target/criterion/<group>/<bench>/new/estimates.json` paths verbatim."
+    ]
+  },
+  "benchmarks": {
+    "traceparent/valid/rfc_example":              { "median_ns": 17.3,        "thrpt": "2.96 GiB/s" },
+    "traceparent/valid/flag_unsampled":           { "median_ns": 18.4,        "thrpt": "2.79 GiB/s" },
+    "traceparent/rejected/all_zero_trace_id":     { "median_ns": 18.3,        "thrpt": null },
+    "traceparent/rejected/all_zero_span_id":      { "median_ns": 20.4,        "thrpt": null },
+    "traceparent/rejected/wrong_version":         { "median_ns": 6.6,         "thrpt": null },
+    "traceparent/garbage/too_short":              { "median_ns": 6.5,         "thrpt": null },
+    "traceparent/garbage/non_hex_digits":         { "median_ns": 6.8,         "thrpt": null },
+    "traceparent/garbage/malformed_dash":         { "median_ns": 6.4,         "thrpt": null },
+    "traceparent/garbage/empty":                  { "median_ns": 6.7,         "thrpt": null },
+
+    "audit/compute_hmac/typical_event":           { "median_ns": 256.1,       "thrpt": "867 MiB/s" },
+    "audit/compute_hmac/verbose_2kb_detail":      { "median_ns": 970.0,       "thrpt": "2.14 GiB/s" },
+    "audit/sign_event/single_link":               { "median_ns": 482.8,       "thrpt": "2.07 Melem/s" },
+    "audit/chain/64_link_chain":                  { "median_ns": 38506.0,     "thrpt": "1.66 Melem/s" },
+    "audit/genesis_hash":                         { "median_ns": 159.5,       "thrpt": null },
+
+    "sovereign/record_classification/residential_ita": { "median_ns": 0.6,    "thrpt": null },
+    "sovereign/record_classification/unknown":         { "median_ns": 0.6,    "thrpt": null },
+    "sovereign/record_classification/gov_ita":         { "median_ns": 0.6,    "thrpt": null },
+    "sovereign/classify/ipv4_in_range":           { "median_ns": 2.04,        "thrpt": "489 Melem/s" },
+    "sovereign/classify/ipv6_v4mapped":            { "median_ns": 2.02,        "thrpt": "496 Melem/s" },
+    "sovereign/classify/ipv6_pure":                { "median_ns": 2.01,        "thrpt": "498 Melem/s" },
+    "sovereign/classify/ipv4_miss":                { "median_ns": 2.02,        "thrpt": "496 Melem/s" },
+    "sovereign/as_str/residential_ita":            { "median_ns": 0.67,        "thrpt": null },
+    "sovereign/as_str/unknown":                    { "median_ns": 0.67,        "thrpt": null },
+
+    "cache/l1/hit":                                { "median_ns": 6.5,         "thrpt": "153 Melem/s" },
+    "cache/l1/miss":                               { "median_ns": 7.8,         "thrpt": "128 Melem/s" },
+    "cache/l2/hit":                                { "median_ns": 16.4,        "thrpt": "61 Melem/s" },
+    "cache/l2/miss":                               { "median_ns": 8.5,         "thrpt": "118 Melem/s" },
+    "cache/full_miss/l1_then_l2_both_miss":        { "median_ns": 16.2,        "thrpt": "61 Melem/s" },
+    "cache/singleflight/oncecell_uncontended_get": { "median_ns": 3.8,         "thrpt": "266 Melem/s" },
+
+    "waf/buffered/clean/1KB":                      { "median_ns": 2769.0,      "thrpt": null },
+    "waf/buffered/clean/1MB":                      { "median_ns": 2791500.0,   "thrpt": null },
+    "waf/buffered/clean/10MB":                     { "median_ns": 28135000.0,  "thrpt": null },
+    "waf/streaming/clean/1KB":                     { "median_ns": 2243.0,      "thrpt": "435 MiB/s" },
+    "waf/streaming/clean/1MB":                     { "median_ns": 2273000.0,   "thrpt": "440 MiB/s" },
+    "waf/streaming/clean/10MB":                    { "median_ns": 23329000.0,  "thrpt": "439 MiB/s" },
+    "waf/attack_first_64b/10MB/buffered_scans_full_body": { "median_ns": 22.7, "thrpt": null },
+    "waf/attack_first_64b/10MB/streaming_early_exit":     { "median_ns": 127.8,"thrpt": null },
+    "waf/streaming/chunk_size/1024B":              { "median_ns": 2514400.0,   "thrpt": "411 MiB/s" },
+    "waf/streaming/chunk_size/4096B":              { "median_ns": 2304200.0,   "thrpt": "434 MiB/s" },
+    "waf/streaming/chunk_size/16384B":             { "median_ns": 2413200.0,   "thrpt": "440 MiB/s" },
+    "waf/streaming/chunk_size/65536B":             { "median_ns": 2278900.0,   "thrpt": "439 MiB/s" }
+  }
+}

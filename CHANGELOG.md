@@ -2,6 +2,27 @@
 
 All notable changes to Zion Edge Gateway are documented here.
 
+## [Unreleased]
+
+### Added
+
+- **Criterion microbench harness** — five `cargo bench` targets under
+  `benches/` (waf_streaming, sovereign, traceparent, audit_hmac,
+  cache_lookup) covering the hot-path components named in
+  [docs/perf/roadmap.md](docs/perf/roadmap.md). Numbers checked in at
+  `benchmarks/results/criterion/baseline.json` for trend tracking; CI
+  workflow `bench.yml` runs the suite on manual dispatch and posts a
+  delta-vs-master summary as a PR comment. See
+  [docs/perf/microbench.md](docs/perf/microbench.md). (#54)
+
+### Changed
+
+- **`WafMode` and `WafProfile` moved from `config` to `waf`** — semantic
+  home, and lets the bench harness construct profiles via the lib
+  surface without dragging the full config-loader dependency graph.
+  `config::{WafMode, WafProfile}` re-exports preserve every existing
+  import site; no breaking change.
+
 ## [0.2.2] - 2026-05-08
 
 Wire-up release. v0.2.0 / v0.2.1 introduced the XDP / ML-WAF / AIMP

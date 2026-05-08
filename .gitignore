@@ -1,8 +1,18 @@
 /target
 *.DS_Store
 
-# Benchmark results (generated, large, machine-specific)
-benchmarks/results/
+# Benchmark results (generated, large, machine-specific). We ignore each
+# child rather than the directory itself because git cannot re-include
+# files below a fully-excluded directory (see `gitignore(5)` — "It is not
+# possible to re-include a file if a parent directory of that file is
+# excluded.").
+benchmarks/results/*
+!benchmarks/results/criterion
+benchmarks/results/criterion/*
+# Criterion baseline JSON IS checked in (issue #54): it's small,
+# hand-curated, and the trend-tracking signal lives in version control
+# rather than CI cache.
+!benchmarks/results/criterion/baseline.json
 
 # Generated benchmark artifacts
 benchmarks/results/**/*.svg
