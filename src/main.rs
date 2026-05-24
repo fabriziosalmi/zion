@@ -1070,7 +1070,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         .map_err(|e| error::ZionError::Listener(format!("HTTPS bind {https_addr}: {e}")))?;
     eprintln!("  listening HTTPS on {https_addr}");
 
-    // io_uring multishot accept on Linux (one syscall for N connections).
+    // io_uring single-shot accept on Linux (dedicated thread, one SQE re-submitted per connection).
     // The uring task is bound to the listener's fd at spawn time and the
     // listener supervisor explicitly does NOT manage HTTPS rebind in this
     // build flavour — that limitation is documented in `listener.rs`.
@@ -1080,7 +1080,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     let https_initial: Option<(SocketAddr, tokio::net::TcpListener)> = {
         use std::os::unix::io::AsRawFd;
         let fd = https_listener.as_raw_fd();
-        eprintln!("  io_uring multishot accept enabled");
+        eprintln!("  io_uring single-shot accept enabled");
         let uring_rx = uring::spawn_uring_accept(fd, 4096);
         // Spawn the accept loop ourselves; pass `https_initial = None`
         // to the supervisor so it tracks no HTTPS slot.

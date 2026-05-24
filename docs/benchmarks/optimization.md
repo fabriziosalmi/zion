@@ -101,7 +101,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | `TCP_CORK` | Batches writes on listener; combined with NODELAY on accept |
 | `SO_BUSY_POLL` (50us) | Spin-poll NIC queue before sleeping; trades CPU for latency |
 | Listen backlog 1024 | Prevents SYN drops under burst load |
-| io_uring multishot accept | Feature-gated: one syscall for N connections |
+| io_uring single-shot accept | Feature-gated: dedicated accept thread, one SQE re-submitted per connection |
 
 ## Proxy
 
