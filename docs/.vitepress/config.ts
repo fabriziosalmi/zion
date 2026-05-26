@@ -72,6 +72,7 @@ export default defineConfig({
         items: [
           { text: 'Reference', link: '/config/' },
           { text: 'TLS & SNI', link: '/config/tls' },
+          { text: 'ACME (auto-renewal)', link: '/config/acme' },
           { text: 'Routing', link: '/config/routing' },
           { text: 'WAF', link: '/config/waf' },
           { text: 'CORS', link: '/config/cors' },

@@ -427,6 +427,13 @@ pub struct Metrics {
     /// Total bytes sent on the gossip socket.
     pub mesh_gossip_bytes_out: AtomicU64,
 
+    // ACME (issue #59) — certificate lifecycle observability.
+    /// Certificates successfully issued or renewed via the ACME flow.
+    pub acme_renewals_total: AtomicU64,
+    /// ACME renewal attempts that failed (any stage: account, order,
+    /// challenge, finalize, write).
+    pub acme_renewal_failures_total: AtomicU64,
+
     // Gauges
     pub active_connections: AtomicI64,
 
@@ -465,6 +472,8 @@ impl Metrics {
             mesh_score_lookups: AtomicU64::new(0),
             mesh_gossip_bytes_in: AtomicU64::new(0),
             mesh_gossip_bytes_out: AtomicU64::new(0),
+            acme_renewals_total: AtomicU64::new(0),
+            acme_renewal_failures_total: AtomicU64::new(0),
             active_connections: AtomicI64::new(0),
             request_duration: LatencyHistogram::new(),
             upstream_duration: LatencyHistogram::new(),
@@ -729,6 +738,28 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.mesh_gossip_bytes_out.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_acme_renewals_total Certificates successfully issued or renewed via ACME.\n\
+                                # TYPE zion_acme_renewals_total counter\n\
+                                zion_acme_renewals_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.acme_renewals_total.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(
+            b"\n# HELP zion_acme_renewal_failures_total ACME renewal attempts that failed.\n\
+                                # TYPE zion_acme_renewal_failures_total counter\n\
+                                zion_acme_renewal_failures_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.acme_renewal_failures_total.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");

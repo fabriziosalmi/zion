@@ -527,6 +527,24 @@ fn main() -> error::ZionResult<()> {
         cli::Command::Doctor => {
             std::process::exit(doctor::run());
         }
+        cli::Command::AcmeSoak => {
+            #[cfg(feature = "acme")]
+            {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime");
+                std::process::exit(rt.block_on(acme::run_soak()));
+            }
+            #[cfg(not(feature = "acme"))]
+            {
+                eprintln!(
+                    "zion acme-soak requires the `acme` feature.\n\
+                     rebuild with: cargo build --release --features acme"
+                );
+                std::process::exit(2);
+            }
+        }
         cli::Command::Init(opts) => {
             std::process::exit(init::run(opts));
         }

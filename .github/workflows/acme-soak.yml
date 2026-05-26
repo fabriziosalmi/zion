@@ -1,0 +1,107 @@
+# ACME staging soak (issue #59).
+#
+# Drives a full issue → renew → revoke cycle of zion's ACME flow against
+# a hermetic Pebble test CA (Let's Encrypt's official test server) — no
+# real Let's Encrypt, no external DNS, no rate limits. Pebble's resolver
+# is pointed at pebble-challtestsrv (mock DNS); zion's own HTTP-01
+# responder (`zion acme-soak`) answers the validation request.
+#
+# Pebble + challtestsrv run via `docker run` (not GitHub `services:`) so
+# we can pass `-dnsserver` to Pebble and avoid any ghcr login for the
+# public images.
+#
+# Fault-injection legs (nonce-collision via PEBBLE_WFE_NONCEREJECT,
+# key-rollover, TTL-edge expiry) are tracked as a follow-up: they need
+# per-request badNonce retry, which is instant-acme's responsibility and
+# is not exposed by 0.8.x (an operation-level retry can't recover a 50%
+# per-request rejection rate).
+name: acme-soak
+
+on:
+  schedule:
+    # Weekly, Sunday 04:00 UTC.
+    - cron: "0 4 * * 0"
+  workflow_dispatch:
+  # Also run on PRs that touch the ACME flow or this workflow, so a
+  # change to the issuance path is proven against Pebble before merge.
+  pull_request:
+    paths:
+      - "src/acme.rs"
+      - "src/cli.rs"
+      - "src/main.rs"
+      - ".github/workflows/acme-soak.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: acme-soak-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      ZION_ACME_TEST_DIRECTORY: https://localhost:14000/dir
+      ZION_ACME_TEST_DOMAIN: acme-soak.test
+      ZION_ACME_TEST_HTTP_PORT: "5002"
+      ZION_ACME_TEST_DIR: /tmp/zion-acme-soak
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # ubuntu-latest ships a recent stable Rust — use it directly rather
+      # than pulling a toolchain action (one less external dependency on
+      # the soak's critical path).
+      - name: Build zion (--features acme)
+        run: |
+          rustc --version && cargo --version
+          cargo build --release --features acme --bin zion
+
+      - name: Start Pebble + challtestsrv
+        run: |
+          docker network create acme-net
+          # Mock DNS + challenge server: REST API on :8055, DNS on :8053.
+          docker run -d --name challtestsrv --network acme-net -p 8055:8055 \
+            ghcr.io/letsencrypt/pebble-challtestsrv:latest \
+            -defaultIPv6 "" -defaultIPv4 ""
+          # Resolve every A query to the docker bridge gateway = the host,
+          # where zion's HTTP-01 responder binds on :5002.
+          GATEWAY="$(docker network inspect acme-net -f '{{ (index .IPAM.Config 0).Gateway }}')"
+          echo "host (from container) = $GATEWAY"
+          for i in $(seq 1 20); do
+            curl -sf -X POST "http://localhost:8055/set-default-ipv4" \
+              -d "{\"ip\":\"$GATEWAY\"}" && break
+            echo "waiting for challtestsrv REST ($i)..."; sleep 1
+          done
+          # Pebble: resolver → challtestsrv, no validation sleep, inject
+          # the configured share of bad nonces.
+          # The image entrypoint is already `pebble`; pass only its flags.
+          docker run -d --name pebble --network acme-net -p 14000:14000 -p 15000:15000 \
+            -e PEBBLE_VA_NOSLEEP=1 \
+            ghcr.io/letsencrypt/pebble:latest \
+            -config /test/config/pebble-config.json -dnsserver challtestsrv:8053
+
+      - name: Wait for Pebble and export its directory-TLS root
+        run: |
+          for i in $(seq 1 40); do
+            if curl -ksf https://localhost:15000/roots/0 -o /dev/null; then break; fi
+            echo "waiting for pebble ($i)..."; sleep 1
+          done
+          # Pebble serves its ACME directory (:14000) over TLS signed by a
+          # static minica root bundled in the image. instant-acme must
+          # trust *that* to connect — pass it via ZION_ACME_ROOT_PEM.
+          docker cp pebble:/test/certs/pebble.minica.pem ./pebble.minica.pem
+          echo "ZION_ACME_ROOT_PEM=$PWD/pebble.minica.pem" >> "$GITHUB_ENV"
+
+      - name: Run soak (issue → renew → revoke)
+        run: ./target/release/zion acme-soak
+
+      - name: Pebble logs (on failure)
+        if: failure()
+        run: |
+          echo "=== pebble ==="; docker logs pebble || true
+          echo "=== challtestsrv ==="; docker logs challtestsrv || true
