@@ -230,9 +230,7 @@ fn check_kernel_version() -> Check {
         if supports_io_uring_accept {
             Check::ok(
                 "kernel version",
-                format!(
-                    "{detail} (io_uring accept supported — try `--features io-uring-accept`)"
-                ),
+                format!("{detail} (io_uring accept supported — try `--features io-uring-accept`)"),
             )
         } else if major >= 5 {
             Check::warn(
