@@ -121,7 +121,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 opentelemetry = { version = "0.27", optional = true }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = "0.27", default-features = false, features = ["grpc-tonic", "trace"], optional = true }
-opentelemetry-semantic-conventions = { version = "0.27", optional = true }
+opentelemetry-semantic-conventions = { version = "0.32", optional = true }
 tracing-opentelemetry = { version = "0.28", default-features = false, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
