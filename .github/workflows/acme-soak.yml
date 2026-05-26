@@ -59,12 +59,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
+      # ubuntu-latest ships a recent stable Rust — use it directly rather
+      # than pulling a toolchain action (one less external dependency on
+      # the soak's critical path).
       - name: Build zion (--features acme)
-        run: cargo build --release --features acme --bin zion
+        run: |
+          rustc --version && cargo --version
+          cargo build --release --features acme --bin zion
 
       - name: Start Pebble + challtestsrv
         run: |
