@@ -797,6 +797,8 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                 peers,
                 identity_path,
                 anti_entropy_secs: toml_cfg.anti_entropy_secs,
+                inbound_claims_per_sec: toml_cfg.inbound_claims_per_sec,
+                inbound_claim_burst: toml_cfg.inbound_claim_burst,
             };
             match aimp_cp::bootstrap(cfg).await {
                 Ok(cp) => {

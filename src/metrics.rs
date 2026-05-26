@@ -417,6 +417,9 @@ pub struct Metrics {
     /// malformed, revocation by non-original source). Generic bucket
     /// — `cargo run --release -- doctor` exposes a finer split.
     pub mesh_claims_dropped_other: AtomicU64,
+    /// Inbound envelopes dropped by the per-source rate-cap (#71). A
+    /// flooding source trips this before signature verification.
+    pub mesh_claims_dropped_rate: AtomicU64,
     /// Dispatcher hits that found a mesh score for the client IP.
     pub mesh_score_lookups: AtomicU64,
     /// Total bytes received on the gossip socket (decoded or not).
@@ -458,6 +461,7 @@ impl Metrics {
             mesh_claims_dropped_signature: AtomicU64::new(0),
             mesh_claims_dropped_replay: AtomicU64::new(0),
             mesh_claims_dropped_other: AtomicU64::new(0),
+            mesh_claims_dropped_rate: AtomicU64::new(0),
             mesh_score_lookups: AtomicU64::new(0),
             mesh_gossip_bytes_in: AtomicU64::new(0),
             mesh_gossip_bytes_out: AtomicU64::new(0),
@@ -683,6 +687,12 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.mesh_claims_dropped_other.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\nzion_mesh_claims_dropped_total{reason=\"rate\"} ");
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.mesh_claims_dropped_rate.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");

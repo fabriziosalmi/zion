@@ -106,6 +106,15 @@ pub struct AimpConfig {
     /// Period in seconds between anti-entropy SyncReq rounds. 0 disables.
     #[serde(default = "default_aimp_anti_entropy_secs")]
     pub anti_entropy_secs: u64,
+    /// Per-source inbound claim rate-cap (issue #71). 0 = disabled
+    /// (default). When set, a flooding peer is capped to this many
+    /// claims/sec; other sources are unaffected (own token bucket).
+    #[serde(default)]
+    pub inbound_claims_per_sec: u32,
+    /// Burst headroom (in claims) for the inbound rate-cap. Only used
+    /// when `inbound_claims_per_sec > 0`. Default 256.
+    #[serde(default = "default_aimp_inbound_claim_burst")]
+    pub inbound_claim_burst: u32,
 }
 
 #[cfg(feature = "sovereign-aimp")]
@@ -116,6 +125,11 @@ fn default_aimp_xdp_threshold() -> f32 {
 #[cfg(feature = "sovereign-aimp")]
 fn default_aimp_anti_entropy_secs() -> u64 {
     60
+}
+
+#[cfg(feature = "sovereign-aimp")]
+fn default_aimp_inbound_claim_burst() -> u32 {
+    256
 }
 
 // ============================================================================

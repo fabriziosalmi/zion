@@ -49,6 +49,14 @@ peers          = ["10.0.1.10:7777", "10.0.2.10:7777"]
 identity_path  = "/var/lib/zion/aimp.identity"
 anti_entropy_secs = 60                     # 0 to disable
 
+# Inbound claim rate-cap (issue #71). Per-source-node token bucket on the
+# merge path: a flooding peer (even a compromised one with a valid key) is
+# capped, while every other source keeps flowing through its own bucket.
+# 0 = disabled (default) — leaves the legitimate anti-entropy full-map
+# re-broadcast unthrottled. Set only when you expect adversarial gossip.
+inbound_claims_per_sec = 0                 # 0 = no cap
+inbound_claim_burst    = 256               # headroom, used when cap > 0
+
 # Reconciler threshold for XDP→kernel drop install (0.0–1.0).
 # Default 0.95: only the highest-confidence consensus drops to LPM-trie.
 xdp_block_threshold = 0.95

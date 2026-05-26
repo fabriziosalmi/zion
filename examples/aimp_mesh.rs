@@ -52,6 +52,7 @@ fn main() {
             // Mesh smoke: short anti-entropy round so the harness
             // converges quickly without waiting a full minute.
             anti_entropy_secs: 5,
+            ..Default::default()
         };
         let cp = aimp_cp::bootstrap(cfg).await.expect("bootstrap");
         let started = Instant::now();
