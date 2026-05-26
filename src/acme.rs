@@ -347,20 +347,20 @@ async fn do_renewal_native(
             .map_err(|e| format!("challenge set_ready failed: {e}"))?;
     }
 
-    // Phase 2: Poll ALL authorizations in parallel using JoinSet.
-    // Note: instant-acme's order.poll_ready() natively polls the authorizations sequentially.
-    // We rely on it instead of a custom JoinSet pipeline.
-
-    // Phase 3: Clean up all challenge tokens — ACME server has validated
-    for token in &pending_tokens {
-        challenge_store.remove(token);
-    }
-
     // --- Step 4: Wait for order to be ready ---
+    // The ACME server fetches the HTTP-01 token *during* this poll, so the
+    // tokens MUST stay in the store until it returns. (Cleaning them up
+    // before poll_ready — as this did previously — races the validator and
+    // yields a 404 / `unauthorized`; surfaced by the #59 Pebble soak.)
     let status = order
         .poll_ready(&RetryPolicy::default())
         .await
         .map_err(|e| format!("poll_ready failed: {e}"))?;
+
+    // Validation is done — now it's safe to drop the challenge tokens.
+    for token in &pending_tokens {
+        challenge_store.remove(token);
+    }
 
     if status != OrderStatus::Ready {
         return Err(format!("unexpected order status after poll: {status:?}"));
