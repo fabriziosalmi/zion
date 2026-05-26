@@ -111,6 +111,64 @@ pub fn spawn_renewal_task(
     });
 }
 
+/// Run a single ACME issuance/renewal synchronously and return the
+/// outcome. Drives the same path as the periodic task (and bumps the
+/// `zion_acme_renewals_total` / `..._failures_total` counters) without
+/// the 12-hour loop. Exposed for the soak workflow (issue #59) and for
+/// operator tooling that wants a one-shot renew.
+#[cfg(feature = "acme")]
+pub async fn renew_once(
+    config: &crate::config::AcmeConfig,
+    challenge_store: &ChallengeStore,
+    tls_config: &crate::config::TlsConfig,
+) -> Result<(), String> {
+    do_renewal(config, challenge_store, tls_config).await
+}
+
+/// Revoke the leaf certificate at `cert_path` against the ACME account
+/// persisted in `config.state_dir`. Completes the issue → renew → revoke
+/// lifecycle exercised by the soak workflow (issue #59), and lets an
+/// operator retire a compromised key out-of-band.
+#[cfg(feature = "acme")]
+pub async fn revoke_cert(
+    config: &crate::config::AcmeConfig,
+    cert_path: &str,
+) -> Result<(), String> {
+    use instant_acme::{Account, RevocationReason, RevocationRequest};
+    use std::io::BufReader;
+
+    // Restore the persisted account that issued the cert.
+    let creds_path = std::path::Path::new(&config.state_dir).join("account.json");
+    let creds_json = std::fs::read_to_string(&creds_path)
+        .map_err(|e| format!("cannot read account.json: {e}"))?;
+    let creds: instant_acme::AccountCredentials =
+        serde_json::from_str(&creds_json).map_err(|e| format!("invalid account.json: {e}"))?;
+    let account = Account::builder()
+        .map_err(|e| format!("cannot build ACME client: {e}"))?
+        .from_credentials(creds)
+        .await
+        .map_err(|e| format!("cannot restore ACME account: {e}"))?;
+
+    // Parse the leaf certificate (first PEM block) into DER.
+    let cert_file = std::fs::File::open(cert_path)
+        .map_err(|e| format!("cannot open cert '{cert_path}': {e}"))?;
+    let leaf = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .next()
+        .ok_or_else(|| "no certificate in chain".to_string())?
+        .map_err(|e| format!("cannot parse leaf certificate: {e}"))?;
+
+    account
+        .revoke(&RevocationRequest {
+            certificate: &leaf,
+            reason: Some(RevocationReason::Unspecified),
+        })
+        .await
+        .map_err(|e| format!("ACME revoke failed: {e}"))?;
+
+    crate::logging::info("acme", "certificate revoked");
+    Ok(())
+}
+
 /// Check if the certificate at `path` expires within `days`.
 /// Returns true if renewal is needed (or cert doesn't exist / can't be read).
 /// Uses the real X.509 notAfter field via the ASN.1 parser in tls.rs.
@@ -136,15 +194,30 @@ async fn do_renewal(
     _challenge_store: &ChallengeStore,
     _tls_config: &crate::config::TlsConfig,
 ) -> Result<(), String> {
-    // Try native ACME first (if compiled with --features acme)
-    #[cfg(feature = "acme")]
-    {
-        return do_renewal_native(config, _challenge_store, _tls_config).await;
-    }
+    use std::sync::atomic::Ordering::Relaxed;
 
-    // Fallback: renew.sh script
-    #[allow(unreachable_code)]
-    do_renewal_script(config).await
+    // Native ACME (instant-acme) when built with --features acme,
+    // else the renew.sh fallback. Either way we record the outcome on
+    // the ACME lifecycle counters (issue #59) so the soak workflow and
+    // production dashboards can alert on renewal failures.
+    #[cfg(feature = "acme")]
+    let result = do_renewal_native(config, _challenge_store, _tls_config).await;
+    #[cfg(not(feature = "acme"))]
+    let result = do_renewal_script(config).await;
+
+    match &result {
+        Ok(()) => {
+            crate::metrics::METRICS
+                .acme_renewals_total
+                .fetch_add(1, Relaxed);
+        }
+        Err(_) => {
+            crate::metrics::METRICS
+                .acme_renewal_failures_total
+                .fetch_add(1, Relaxed);
+        }
+    }
+    result
 }
 
 /// Native ACME renewal via instant-acme.
@@ -310,8 +383,10 @@ async fn do_renewal_native(
     Ok(())
 }
 
-/// Fallback: execute renew.sh from state_dir.
+/// Fallback: execute renew.sh from state_dir. Only compiled without the
+/// `acme` feature — with it, `do_renewal` always takes the native path.
 /// C-05: Security hardening — validate script before execution.
+#[cfg(not(feature = "acme"))]
 async fn do_renewal_script(config: &crate::config::AcmeConfig) -> Result<(), String> {
     crate::logging::warn(
         "acme",
@@ -364,6 +439,175 @@ async fn do_renewal_script(config: &crate::config::AcmeConfig) -> Result<(), Str
         return Err(format!("renew.sh failed: {stderr}"));
     }
     Ok(())
+}
+
+// ============================================================================
+// Soak driver (issue #59) — `zion acme-soak`
+// ============================================================================
+
+/// Drive a full ACME **issue → renew → revoke** cycle against a test
+/// directory (Pebble) and return a process exit code (0 = pass). Invoked
+/// by `zion acme-soak` from the soak workflow; never part of the daemon
+/// boot path. Exercises the real `renew_once` / `revoke_cert` code so a
+/// regression in zion's ACME flow fails the soak.
+///
+/// Configuration comes from env vars so the workflow can point us at its
+/// ephemeral Pebble with no config file:
+///   - `ZION_ACME_TEST_DIRECTORY` — ACME directory URL (required)
+///   - `ZION_ACME_TEST_DOMAIN`    — SAN to request (default `acme-soak.test`)
+///   - `ZION_ACME_TEST_HTTP_PORT` — HTTP-01 responder port (default `5002`)
+///   - `ZION_ACME_TEST_DIR`       — state + cert output dir (default `/tmp/zion-acme-soak`)
+///   - `ZION_ACME_TEST_EMAIL`     — account contact (default `soak@zion.test`)
+#[cfg(feature = "acme")]
+pub async fn run_soak() -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let directory_url = match std::env::var("ZION_ACME_TEST_DIRECTORY") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            eprintln!("acme-soak: ZION_ACME_TEST_DIRECTORY is required");
+            return 2;
+        }
+    };
+    let domain = std::env::var("ZION_ACME_TEST_DOMAIN").unwrap_or_else(|_| "acme-soak.test".into());
+    let http_port: u16 = std::env::var("ZION_ACME_TEST_HTTP_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5002);
+    let state_dir =
+        std::env::var("ZION_ACME_TEST_DIR").unwrap_or_else(|_| "/tmp/zion-acme-soak".into());
+    let email = std::env::var("ZION_ACME_TEST_EMAIL").unwrap_or_else(|_| "soak@zion.test".into());
+
+    if let Err(e) = std::fs::create_dir_all(&state_dir) {
+        eprintln!("acme-soak: cannot create state dir {state_dir}: {e}");
+        return 1;
+    }
+    let cert_path = format!("{state_dir}/cert.pem");
+    let key_path = format!("{state_dir}/key.pem");
+
+    let acme_config = crate::config::AcmeConfig {
+        email,
+        domains: vec![domain.clone()],
+        directory_url,
+        // renew_once issues unconditionally (it doesn't consult expiry),
+        // so this value is irrelevant here; kept large for clarity.
+        renew_before_days: 3650,
+        state_dir: state_dir.clone(),
+    };
+    let tls_config = crate::config::TlsConfig {
+        cert_path: cert_path.clone(),
+        key_path: key_path.clone(),
+        hot_reload: true,
+        min_version: "1.2".into(),
+        alpn: vec!["http/1.1".into()],
+        sni: vec![],
+        acme: None,
+        client_ca_path: None,
+        client_auth: "none".into(),
+    };
+
+    // HTTP-01 responder: Pebble (via challtestsrv DNS) resolves `domain`
+    // to this host and GETs the challenge path. We serve the key
+    // authorization straight from the shared store.
+    let store = new_challenge_store();
+    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", http_port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("acme-soak: cannot bind :{http_port}: {e}");
+            return 1;
+        }
+    };
+    {
+        let store = store.clone();
+        tokio::spawn(async move { serve_challenges(listener, store).await });
+    }
+
+    eprintln!(
+        "acme-soak: directory={} domain={domain} http_port={http_port}",
+        acme_config.directory_url
+    );
+
+    let base = crate::metrics::METRICS.acme_renewals_total.load(Relaxed);
+    let base_fail = crate::metrics::METRICS
+        .acme_renewal_failures_total
+        .load(Relaxed);
+
+    // 1. Issue.
+    if let Err(e) = renew_once(&acme_config, &store, &tls_config).await {
+        eprintln!("acme-soak: FAIL issue: {e}");
+        return 1;
+    }
+    if !std::path::Path::new(&cert_path).exists() {
+        eprintln!("acme-soak: FAIL issue: no certificate written to {cert_path}");
+        return 1;
+    }
+    eprintln!("acme-soak: ✓ issued");
+
+    // 2. Renew (drive the issuance path again over the same account).
+    if let Err(e) = renew_once(&acme_config, &store, &tls_config).await {
+        eprintln!("acme-soak: FAIL renew: {e}");
+        return 1;
+    }
+    let renewals = crate::metrics::METRICS.acme_renewals_total.load(Relaxed) - base;
+    if renewals < 2 {
+        eprintln!("acme-soak: FAIL renew: acme_renewals_total moved by {renewals}, expected >= 2");
+        return 1;
+    }
+    eprintln!("acme-soak: ✓ renewed (acme_renewals_total +{renewals})");
+
+    // 3. Revoke.
+    if let Err(e) = revoke_cert(&acme_config, &cert_path).await {
+        eprintln!("acme-soak: FAIL revoke: {e}");
+        return 1;
+    }
+    eprintln!("acme-soak: ✓ revoked");
+
+    let failures = crate::metrics::METRICS
+        .acme_renewal_failures_total
+        .load(Relaxed)
+        - base_fail;
+    eprintln!("acme-soak: PASS (issue → renew → revoke; failures during run: {failures})");
+    0
+}
+
+/// Minimal HTTP/1.1 responder for ACME HTTP-01 validation. Reads the
+/// request line, serves the key authorization for a known token, 404s
+/// otherwise. Single-purpose — not a general-purpose server.
+#[cfg(feature = "acme")]
+async fn serve_challenges(listener: tokio::net::TcpListener, store: ChallengeStore) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let (mut sock, _) = match listener.accept().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let store = store.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let n = match sock.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => return,
+            };
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("");
+            let resp = match handle_challenge(&store, path) {
+                Some(key_auth) => format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    key_auth.len(),
+                    key_auth
+                ),
+                None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+            };
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+    }
 }
 
 #[cfg(test)]

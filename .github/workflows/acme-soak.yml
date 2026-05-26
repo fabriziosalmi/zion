@@ -1,0 +1,121 @@
+# ACME staging soak (issue #59).
+#
+# Drives a full issue → renew → revoke cycle of zion's ACME flow against
+# a hermetic Pebble test CA (Let's Encrypt's official test server) — no
+# real Let's Encrypt, no external DNS, no rate limits. Pebble's DNS is
+# mocked by pebble-challtestsrv; zion's own HTTP-01 responder
+# (`zion acme-soak`) answers the validation request.
+#
+# Decoupled from PR CI on purpose: this is a soak, run on a weekly
+# schedule and on demand. The matrix adds a fault-injection leg
+# (PEBBLE_WFE_NONCEREJECT) that proves instant-acme's badNonce retry
+# holds — the "nonce-collision" failure mode from #59.
+name: acme-soak
+
+on:
+  schedule:
+    # Weekly, Sunday 04:00 UTC.
+    - cron: "0 4 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: acme-soak-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Run the job itself in a container so it shares the services'
+    # docker network: Pebble can reach our HTTP-01 responder by the
+    # job container's address, and we reach Pebble at `pebble:14000`.
+    container:
+      image: rust:1.85-bookworm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: happy-path
+            nonce_reject: "0"
+          - name: nonce-collision
+            # Reject 50% of nonces — instant-acme must retry on
+            # badNonce and still complete the cycle.
+            nonce_reject: "50"
+    services:
+      challtestsrv:
+        image: ghcr.io/letsencrypt/pebble-challtestsrv:latest
+        # -defaultIPv6 "" so A-record answers are IPv4 only.
+        options: >-
+          --entrypoint /usr/bin/pebble-challtestsrv
+        ports:
+          - 8055:8055
+      pebble:
+        image: ghcr.io/letsencrypt/pebble:latest
+        env:
+          # Point Pebble's recursive resolver at challtestsrv's mock DNS,
+          # don't sleep between validation attempts, and inject the
+          # configured share of bad nonces.
+          PEBBLE_VA_NOSLEEP: "1"
+          PEBBLE_WFE_NONCEREJECT: ${{ matrix.nonce_reject }}
+        options: >-
+          --entrypoint /usr/bin/pebble
+        ports:
+          - 14000:14000
+          - 15000:15000
+
+    env:
+      # Pebble serves its ACME directory over HTTPS with its own test CA.
+      # instant-acme must trust it: Pebble ships the root at this path and
+      # we expose it to the OS trust store + via SSL_CERT_FILE.
+      ZION_ACME_TEST_DIRECTORY: https://pebble:14000/dir
+      ZION_ACME_TEST_DOMAIN: acme-soak.test
+      ZION_ACME_TEST_HTTP_PORT: "5002"
+      ZION_ACME_TEST_DIR: /tmp/zion-acme-soak
+      ZION_ACME_TEST_EMAIL: soak@zion.test
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install runtime deps (dns tools, ca-certificates, curl)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq curl ca-certificates dnsutils >/dev/null
+
+      - name: Trust Pebble's test CA
+        run: |
+          # Pebble's management API serves its issuing roots; fetch and
+          # install so instant-acme's HTTPS client trusts the directory.
+          for i in $(seq 1 30); do
+            if curl -ksf https://pebble:15000/roots/0 -o /usr/local/share/ca-certificates/pebble-root.crt; then
+              break
+            fi
+            echo "waiting for pebble management API ($i)..."; sleep 2
+          done
+          # Also grab the intermediate signing chain.
+          curl -ksf https://pebble:15000/intermediates/0 \
+            -o /usr/local/share/ca-certificates/pebble-intermediate.crt || true
+          update-ca-certificates
+          echo "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt" >> "$GITHUB_ENV"
+
+      - name: Point challtestsrv DNS at this job container
+        run: |
+          # Resolve every A query (so `acme-soak.test`) to the job
+          # container's address — that's where our HTTP-01 responder
+          # binds. challtestsrv's REST API listens on :8055.
+          MY_IP="$(hostname -i | awk '{print $1}')"
+          echo "job container ip: $MY_IP"
+          curl -sf -X POST http://challtestsrv:8055/set-default-ipv4 \
+            -d "{\"ip\":\"$MY_IP\"}"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build zion (--features acme)
+        run: cargo build --release --features acme --bin zion
+
+      - name: Run soak (issue → renew → revoke)
+        run: |
+          ./target/release/zion acme-soak

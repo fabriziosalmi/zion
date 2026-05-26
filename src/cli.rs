@@ -38,6 +38,11 @@ pub enum Command {
     Version,
     /// Print help and exit 0.
     Help,
+    /// Drive a full ACME issue → renew → revoke cycle against the
+    /// directory in `ZION_ACME_TEST_*` env vars and exit (issue #59).
+    /// Hidden: only the soak workflow / CI invokes it. Requires the
+    /// `acme` feature; without it the subcommand prints a hint and exits.
+    AcmeSoak,
     /// Unknown subcommand — print help to stderr and exit 1.
     Unknown(String),
 }
@@ -152,6 +157,7 @@ pub(crate) fn parse_argv(args: &[String]) -> Command {
         "init" => Command::Init(parse_init_opts(&args[1..])),
         "bootstrap" => Command::Bootstrap,
         "auto" => Command::Auto(parse_auto_opts(&args[1..])),
+        "acme-soak" => Command::AcmeSoak,
         other => {
             // Anything else: surface as Unknown — caller prints help and exits 1.
             // Note: legacy invocations passed nothing, so this only triggers on

@@ -6,6 +6,21 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **ACME issue → renew → revoke soak in CI (#59)**
+  ([`.github/workflows/acme-soak.yml`](.github/workflows/acme-soak.yml),
+  [`src/acme.rs`](src/acme.rs)). New `acme-soak` weekly + on-demand
+  workflow drives the full certificate lifecycle against a hermetic
+  [Pebble](https://github.com/letsencrypt/pebble) test CA with mocked DNS
+  (`pebble-challtestsrv`) — no real Let's Encrypt, no external DNS, no
+  rate limits. A hidden `zion acme-soak` subcommand runs zion's *real*
+  `renew_once` / `revoke_cert` paths and asserts the lifecycle counters
+  move, so an ACME-flow regression fails the soak. A matrix leg injects
+  `PEBBLE_WFE_NONCEREJECT=50` to prove instant-acme's `badNonce` retry
+  holds (the nonce-collision failure mode). New metrics
+  `zion_acme_renewals_total` and `zion_acme_renewal_failures_total`;
+  new operator-facing `revoke_cert` for retiring a compromised key.
+  Docs: [`docs/config/acme.md`](docs/config/acme.md).
+
 - **Mesh chaos coverage + inbound claim rate-cap (#71)**
   ([`src/aimp_cp.rs`](src/aimp_cp.rs)). Three failure-mode tests pin the
   gossip subsystem under adversarial conditions: split-brain
