@@ -49,6 +49,11 @@ updates:
       # until MSRV-core moves to 1.85. Same posture as hyper-rustls above.
       - dependency-name: "dashmap"
         versions: [">=6.2.0"]
+      # criterion 0.8 raised its MSRV to rustc 1.86, well past the 1.82
+      # anchor. It's a dev/bench-only dependency with no runtime value, so
+      # hold at 0.5.x rather than relitigate MSRV for a benchmark harness.
+      - dependency-name: "criterion"
+        versions: [">=0.6.0"]
       # Pin major-version bumps for the cryptographic / network core — those
       # need a manual security review (release notes, advisory diff) before merge.
       - dependency-name: "rustls"
