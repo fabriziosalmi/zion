@@ -14,12 +14,21 @@ All notable changes to Zion Edge Gateway are documented here.
   (`pebble-challtestsrv`) — no real Let's Encrypt, no external DNS, no
   rate limits. A hidden `zion acme-soak` subcommand runs zion's *real*
   `renew_once` / `revoke_cert` paths and asserts the lifecycle counters
-  move, so an ACME-flow regression fails the soak. A matrix leg injects
-  `PEBBLE_WFE_NONCEREJECT=50` to prove instant-acme's `badNonce` retry
-  holds (the nonce-collision failure mode). New metrics
+  move, so an ACME-flow regression fails the soak. New metrics
   `zion_acme_renewals_total` and `zion_acme_renewal_failures_total`;
   new operator-facing `revoke_cert` for retiring a compromised key.
-  Docs: [`docs/config/acme.md`](docs/config/acme.md).
+  Docs: [`docs/config/acme.md`](docs/config/acme.md). Fault-injection
+  legs (nonce-collision, key-rollover, TTL-edge) are tracked as a
+  follow-up.
+
+### Fixed
+
+- **ACME HTTP-01 token cleanup raced validation.** `do_renewal_native`
+  removed the challenge tokens from the responder store *before*
+  `poll_ready`, but the ACME server fetches them *during* that poll —
+  yielding a 404 / `unauthorized`. Tokens are now dropped only after
+  `poll_ready` returns. Surfaced by the new #59 Pebble soak (real
+  Let's Encrypt validated fast enough to usually mask it).
 
 - **Mesh chaos coverage + inbound claim rate-cap (#71)**
   ([`src/aimp_cp.rs`](src/aimp_cp.rs)). Three failure-mode tests pin the

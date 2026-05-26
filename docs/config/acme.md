@@ -45,9 +45,14 @@ zion acme-soak        # exits 0 on PASS, non-zero on FAIL
 
 `acme-soak` runs zion's *real* `renew_once` / `revoke_cert` paths, so a regression in the production ACME flow fails the soak. It also asserts the lifecycle counters move (`zion_acme_renewals_total` ≥ 2 across issue + renew).
 
-### Failure modes
+### Failure modes (follow-up)
 
-- **Nonce collision** — a matrix leg sets `PEBBLE_WFE_NONCEREJECT=50`, rejecting half of all nonces. The cycle must still complete, proving instant-acme's `badNonce` retry holds.
-- **Key rollover / TTL-edge expiry** — tracked as follow-up soak legs (fresh-account issuance and short-validity renewal).
+Three adversarial legs are tracked for a follow-up:
+
+- **Nonce collision** (`PEBBLE_WFE_NONCEREJECT`) — needs **per-request** `badNonce` retry; instant-acme 0.8.x does not expose it, and an operation-level retry can't recover a high per-request rejection rate.
+- **Key rollover** — fresh-account issuance after discarding `account.json`.
+- **TTL-edge expiry** — short-validity issuance + assert renewal fires.
+
+The happy-path leg already proved its worth: it surfaced a real ordering bug (HTTP-01 tokens were dropped before `poll_ready`, racing validation) that real Let's Encrypt masked with slower validation timing.
 
 Revocation uses `RevocationReason::Unspecified` against the account that issued the cert (restored from `state_dir/account.json`); the same `revoke_cert` entry point lets an operator retire a compromised key out-of-band.
