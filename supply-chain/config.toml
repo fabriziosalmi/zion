@@ -115,11 +115,11 @@ version = "0.13.14"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-lc-rs]]
-version = "1.16.2"
+version = "1.17.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-lc-sys]]
-version = "0.39.1"
+version = "0.41.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.axum]]
@@ -619,7 +619,7 @@ version = "0.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.jsonwebtoken]]
-version = "10.3.0"
+version = "10.4.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.kqueue]]
@@ -1243,11 +1243,11 @@ version = "1.11.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio]]
-version = "1.50.0"
+version = "1.52.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio-macros]]
-version = "2.6.1"
+version = "2.7.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio-rustls]]
