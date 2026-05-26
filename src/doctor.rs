@@ -207,7 +207,7 @@ fn check_somaxconn() -> Check {
     }
 }
 
-/// Kernel version — io_uring multishot accept needs 5.19+. We don't fail
+/// Kernel version — io_uring accept needs 5.19+. We don't fail
 /// on this; we just nudge the user toward a feature flag they may not
 /// know about.
 fn check_kernel_version() -> Check {
@@ -226,19 +226,17 @@ fn check_kernel_version() -> Check {
         let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let detail = format!("{major}.{minor}");
-        let supports_io_uring_multishot = major > 5 || (major == 5 && minor >= 19);
-        if supports_io_uring_multishot {
+        let supports_io_uring_accept = major > 5 || (major == 5 && minor >= 19);
+        if supports_io_uring_accept {
             Check::ok(
                 "kernel version",
-                format!(
-                    "{detail} (io_uring multishot supported — try `--features io-uring-accept`)"
-                ),
+                format!("{detail} (io_uring accept supported — try `--features io-uring-accept`)"),
             )
         } else if major >= 5 {
             Check::warn(
                 "kernel version",
                 detail,
-                "for io_uring multishot accept, upgrade to 5.19+",
+                "for io_uring accept, upgrade to 5.19+",
             )
         } else {
             Check::warn(

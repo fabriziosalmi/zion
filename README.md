@@ -193,7 +193,7 @@ cargo build --release --features http3           # + HTTP/3 QUIC listener
 cargo build --release --features otel            # + OpenTelemetry tracing + OTLP export
 cargo build --release --features fips            # + FIPS 140-3 build (aws-lc-rs validated backend)
 cargo build --release --features geo-ita         # + Italian ASN/gov/ISP ranges (sovereign edge)
-cargo build --release --features io-uring-accept # Linux 5.19+: multishot accept
+cargo build --release --features io-uring-accept # Linux 5.19+: single-shot accept
 ```
 
 Stack flavors for a "max" build:

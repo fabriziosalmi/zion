@@ -888,7 +888,7 @@ fn upgrade_hint(p: &Platform) -> String {
 
     // ── 2. Build flags — biggest perf win first, then UX ──
     if cfg!(target_os = "linux") && !cfg!(feature = "io-uring-accept") {
-        return "linux + multi-core — rebuild with `--features io-uring-accept` for multishot accept (kernel 5.19+)."
+        return "linux + multi-core — rebuild with `--features io-uring-accept` for a dedicated io_uring accept thread (kernel 5.19+)."
             .to_string();
     }
     if !cfg!(feature = "tui") {

@@ -355,7 +355,7 @@ def build():
         "Zero-regex WAF: Aho-Corasick O(N) single-pass over 70+ patterns, SIMD pre-filter bypass "
         "for clean traffic, entropy analysis for obfuscated payloads",
         "Hardware-aware bootstrap: CPU affinity pinning, L1d cache sizing, AES-NI/NEON detection, "
-        "SO_REUSEPORT, TCP_FASTOPEN, io_uring multishot accept",
+        "SO_REUSEPORT, TCP_FASTOPEN, io_uring single-shot accept",
         "Graceful shutdown: 30s connection drain via semaphore-based tracking",
         "Request coalescing (singleflight): prevents thundering herd on cache cold starts",
     ]

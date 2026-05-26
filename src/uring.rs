@@ -36,7 +36,7 @@ mod inner {
         pub addr: SocketAddr,
     }
 
-    /// Run io_uring multishot accept in a dedicated thread.
+    /// Run io_uring single-shot accept in a dedicated thread.
     /// Sends accepted connections to the returned channel.
     ///
     /// The listener_fd must be a bound, listening, non-blocking TCP socket.

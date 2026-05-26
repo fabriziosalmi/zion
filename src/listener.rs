@@ -15,7 +15,7 @@
 //! in `zion.toml` never strands Zion offline.
 //!
 //! Out of scope for Phase 1.5:
-//!   * io_uring multishot accept (`--features io-uring-accept`): the
+//!   * io_uring single-shot accept (`--features io-uring-accept`): the
 //!     uring task is bound to the listener's file descriptor at spawn
 //!     time and cannot be re-pointed without tearing it down. The
 //!     supervisor logs a WARN and skips the rebind in that build flavour.

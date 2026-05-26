@@ -51,7 +51,7 @@ When certificates are hot-reloaded, both the TCP TLS acceptor **and** the QUIC c
 
 - HTTP/3 uses the same upstream connection pool (HTTP/1.1 to backend)
 - WebSocket upgrade is not supported over HTTP/3 (protocol limitation)
-- `io_uring` multishot accept applies to TCP only (QUIC uses standard UDP recv)
+- `io_uring` single-shot accept applies to TCP only (QUIC uses standard UDP recv)
 
 ## Dependencies
 

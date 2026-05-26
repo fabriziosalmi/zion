@@ -20,7 +20,7 @@ src/
 ├── auth.rs        # JWT/OIDC validation gate (feature: --features auth)
 ├── acme.rs        # ACME HTTP-01 auto-renewal (feature: --features acme)
 ├── quic.rs        # HTTP/3 QUIC listener (feature: --features http3)
-├── uring.rs       # io_uring multishot accept (feature: --features io-uring-accept)
+├── uring.rs       # io_uring single-shot accept (feature: --features io-uring-accept)
 ├── bootstrap.rs   # Platform detection (CPU, RAM, L1d cache, AES-NI/NEON, kernel features) + AES-GCM calibration
 ├── net.rs         # Socket tuning (SO_REUSEPORT, TCP_FASTOPEN, TCP_QUICKACK, TCP_DEFER_ACCEPT, TCP_CORK, SO_BUSY_POLL)
 ├── doctor.rs      # `zion doctor` environment diagnostic
@@ -147,7 +147,7 @@ Client
 | `OnceLock` for WAF scanners + WS TLS | One Aho-Corasick automaton per WAF mode (balanced + aggressive); root cert store for upstream WS TLS — both built once on first hit, reused for process lifetime |
 | Stack buffers for request ID + traceparent | Zero heap allocation on per-request headers |
 | `Arc<AutoBuilder>` for HTTP builder | Per-connection clone is ref-count bump, not deep copy |
-| io_uring multishot accept (Linux) | Batches N connections per syscall |
+| io_uring single-shot accept (Linux) | Dedicated accept thread; one SQE re-submitted per connection |
 | `SO_BUSY_POLL` (Linux) | Spin-poll NIC queue 50us for lower p99 latency |
 | Semaphore for connection limit | Bound from detected RAM: `(RAM_MB / 4) * 1024 / 50`, clamped 1k-100k |
 
@@ -162,7 +162,7 @@ Zion uses Tokio's multi-threaded runtime. Worker count is set to available CPU c
 | ACME auto-renewal | `--features acme` | HTTP-01 challenge, auto-renew via Let's Encrypt |
 | JWT/OIDC auth | `--features auth` | Per-route JWT validation (HMAC, RSA, ECDSA, JWKS) |
 | HTTP/3 QUIC | `--features http3` | UDP listener on same port, Alt-Svc advertisement |
-| io_uring accept | `--features io-uring-accept` | Linux 5.19+, multishot accept batching |
+| io_uring accept | `--features io-uring-accept` | Linux 5.19+, single-shot accept on a dedicated thread |
 
 Build with multiple features:
 ```bash

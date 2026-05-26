@@ -282,7 +282,7 @@ def create_pdf(data, rdir, pngs, outpath):
     Story.append(Paragraph("6. Statistical Jitter and Deviation Profiling", styles['SectionLabel']))
     Story.append(Paragraph(
         "Measuring the Coefficient of Variation (CV%) isolates instances where a proxy struggles to share threads under contention, causing unpredictable micro-stalls. "
-        "A CV% > 15% denotes profound instability. Thanks to the io_uring multishot accept queues (on Linux) and fully deterministic state machines, "
+        "A CV% > 15% denotes profound instability. Thanks to the io_uring single-shot accept loop (on Linux) and fully deterministic state machines, "
         "Zion minimizes jitter even when deeply parsing WAF rules, demonstrating remarkably flat standard variation across test iterations.", styles['NormalText']))
     Story.append(Spacer(1, 0.1 * inch))
     Story.append(RLImage(pngs[3], width=6.5*inch, height=3.0*inch))

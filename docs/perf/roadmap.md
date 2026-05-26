@@ -121,7 +121,7 @@ hardware.
 ### io_uring read/write vectored, splice/sendfile (estimate: 1–2% on large payloads)
 
 [`src/uring.rs`](../../src/uring.rs) currently uses io_uring only for
-multishot accept. Read/write vectored would reduce syscall count for
+single-shot accept. Read/write vectored would reduce syscall count for
 large bodies; `splice` / `sendfile` would zero-copy cacheable static
 responses from the file system to the socket.
 
