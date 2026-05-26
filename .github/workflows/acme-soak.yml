@@ -85,11 +85,12 @@ jobs:
           done
           # Pebble: resolver → challtestsrv, no validation sleep, inject
           # the configured share of bad nonces.
+          # The image entrypoint is already `pebble`; pass only its flags.
           docker run -d --name pebble --network acme-net -p 14000:14000 -p 15000:15000 \
             -e PEBBLE_VA_NOSLEEP=1 \
             -e PEBBLE_WFE_NONCEREJECT=${{ matrix.nonce_reject }} \
             ghcr.io/letsencrypt/pebble:latest \
-            pebble -config /test/config/pebble-config.json -dnsserver challtestsrv:8053
+            -config /test/config/pebble-config.json -dnsserver challtestsrv:8053
 
       - name: Wait for Pebble and export its directory-TLS root
         run: |
