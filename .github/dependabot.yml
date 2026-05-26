@@ -38,6 +38,12 @@ updates:
         applies-to: "security-updates"
         update-types: ["patch", "minor", "major"]
     ignore:
+      # hyper-rustls 0.27.8+ raised its MSRV to rustc 1.85, which collides
+      # with our MSRV-core 1.82 anchor (ADR-0007, "do not relitigate"). Hold
+      # at 0.27.7 (rustc 1.71) until MSRV-core moves to 1.85. The MSRV CI gate
+      # is the hard guard; this rule just stops Dependabot re-proposing it.
+      - dependency-name: "hyper-rustls"
+        versions: [">=0.27.8"]
       # Pin major-version bumps for the cryptographic / network core — those
       # need a manual security review (release notes, advisory diff) before merge.
       - dependency-name: "rustls"
