@@ -6,6 +6,20 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **Mesh chaos coverage + inbound claim rate-cap (#71)**
+  ([`src/aimp_cp.rs`](src/aimp_cp.rs)). Three failure-mode tests pin the
+  gossip subsystem under adversarial conditions: split-brain
+  reconciliation (LWW converges both halves to the one newest
+  observation, no double-count, no permanent ban), claim flood (a
+  per-source-node token bucket caps a flooding peer — including a
+  compromised one with a valid key — while other sources keep flowing),
+  and slow gossip (a wedged peer's backlog arriving in a burst yields no
+  duplicate decisions — replays and stale claims change nothing). The
+  rate-cap is new behaviour: opt-in via `sovereign_aimp.inbound_claims_per_sec`
+  (0 = disabled, the default, so the legitimate anti-entropy full-map
+  re-broadcast stays unthrottled) with `inbound_claim_burst` headroom,
+  surfaced as `zion_mesh_claims_dropped_total{reason="rate"}`.
+
 - **BPF demux v2 — unified-port co-existence integration test +
   loader status documented**
   ([`tests/integration.rs`](tests/integration.rs),

@@ -88,6 +88,25 @@ pub struct AimpControlPlaneConfig {
     /// trigger a `SyncRes` with the diff.
     #[serde(default = "default_anti_entropy_secs")]
     pub anti_entropy_secs: u64,
+
+    /// Inbound claim rate-cap (issue #71). Per *source node* token-bucket
+    /// guarding the merge path: a flooding peer — including a compromised
+    /// one holding a valid key — is capped to `inbound_claims_per_sec`
+    /// sustained, with `inbound_claim_burst` headroom, while claims from
+    /// every other source keep flowing through their own buckets.
+    ///
+    /// `0` (default) disables the cap entirely — matching the back-compat
+    /// posture of `server.rate_limit_rps`. Leaving it off keeps the
+    /// anti-entropy full-map re-broadcast (a *legitimate* per-source
+    /// burst) unthrottled; only set it when you expect adversarial gossip.
+    #[serde(default)]
+    pub inbound_claims_per_sec: u32,
+
+    /// Burst headroom for the inbound rate-cap, in claims. Only meaningful
+    /// when `inbound_claims_per_sec > 0`. Defaults to 256 so a short legit
+    /// spike (e.g. a peer reconnecting after a blip) isn't clipped.
+    #[serde(default = "default_inbound_claim_burst")]
+    pub inbound_claim_burst: u32,
 }
 
 fn default_listen() -> SocketAddr {
@@ -99,6 +118,9 @@ fn default_key_path() -> PathBuf {
 fn default_anti_entropy_secs() -> u64 {
     60
 }
+fn default_inbound_claim_burst() -> u32 {
+    256
+}
 
 impl Default for AimpControlPlaneConfig {
     fn default() -> Self {
@@ -108,6 +130,8 @@ impl Default for AimpControlPlaneConfig {
             peers: vec![],
             identity_path: default_key_path(),
             anti_entropy_secs: default_anti_entropy_secs(),
+            inbound_claims_per_sec: 0,
+            inbound_claim_burst: default_inbound_claim_burst(),
         }
     }
 }
@@ -255,8 +279,10 @@ pub async fn bootstrap(cfg: AimpControlPlaneConfig) -> Result<AimpControlPlane, 
         let socket = socket.clone();
         let reputation = reputation.clone();
         let update_tx = update_tx.clone();
+        let rate = cfg.inbound_claims_per_sec;
+        let burst = cfg.inbound_claim_burst;
         tokio::spawn(async move {
-            run_receiver(socket, reputation, update_tx).await;
+            run_receiver(socket, reputation, update_tx, rate, burst).await;
         });
     }
 
@@ -353,6 +379,78 @@ impl SeenFilter {
     }
 }
 
+/// One source node's token bucket. Time is measured in whole seconds —
+/// the same `now_secs` the merge path already threads through, so the
+/// limiter is deterministic under `try_merge`'s injected clock.
+struct TokenBucket {
+    tokens: f64,
+    last_secs: u64,
+}
+
+/// Per-source-node inbound claim rate-cap (issue #71).
+///
+/// Keyed on the envelope's claimed `origin_pubkey`, checked *after* the
+/// cheap replay filter but *before* signature verification — so a flood
+/// from a compromised peer (valid key) is dropped without paying the
+/// Ed25519 cost, and the per-source bucketing guarantees a flooding
+/// source can't starve claims from any other source ("legitimate signals
+/// must keep flowing").
+///
+/// `rate_per_sec == 0` disables the limiter (the default). The bucket
+/// table is itself bounded by `max_sources`: once full, an unseen source
+/// is treated as over-limit, so a forger rotating fake pubkeys can't grow
+/// the table without bound (that traffic fails signature verification
+/// anyway; the cap just stops it costing memory + CPU first).
+struct InboundRateLimiter {
+    rate_per_sec: f64,
+    burst: f64,
+    buckets: std::collections::HashMap<[u8; 32], TokenBucket>,
+    max_sources: usize,
+}
+
+impl InboundRateLimiter {
+    fn new(rate_per_sec: u32, burst: u32) -> Self {
+        Self {
+            rate_per_sec: f64::from(rate_per_sec),
+            burst: f64::from(burst.max(1)),
+            buckets: std::collections::HashMap::new(),
+            max_sources: 4096,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.rate_per_sec > 0.0
+    }
+
+    /// Returns `true` if a claim from `source` is admitted at `now_secs`,
+    /// consuming one token; `false` if the source is over its rate.
+    fn allow(&mut self, source: &[u8; 32], now_secs: u64) -> bool {
+        if !self.enabled() {
+            return true;
+        }
+        if !self.buckets.contains_key(source) && self.buckets.len() >= self.max_sources {
+            // Table saturated — refuse unknown sources rather than grow.
+            return false;
+        }
+        let (rate, burst) = (self.rate_per_sec, self.burst);
+        let b = self.buckets.entry(*source).or_insert(TokenBucket {
+            tokens: burst,
+            last_secs: now_secs,
+        });
+        let elapsed = now_secs.saturating_sub(b.last_secs) as f64;
+        if elapsed > 0.0 {
+            b.tokens = (b.tokens + elapsed * rate).min(burst);
+            b.last_secs = now_secs;
+        }
+        if b.tokens >= 1.0 {
+            b.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// State the receiver task holds. Extracted so unit tests can drive
 /// `try_merge` directly without a UDP socket round-trip.
 pub(crate) struct ReceiverState {
@@ -364,6 +462,8 @@ pub(crate) struct ReceiverState {
     skew_future_secs: u64,
     /// Reject ts older than `now - skew_past_secs` (default 24h).
     skew_past_secs: u64,
+    /// Per-source inbound claim rate-cap (#71). Disabled by default.
+    rate_limiter: InboundRateLimiter,
 }
 
 impl ReceiverState {
@@ -375,7 +475,16 @@ impl ReceiverState {
             version: 0,
             skew_future_secs: 60,
             skew_past_secs: 86_400,
+            rate_limiter: InboundRateLimiter::new(0, 0),
         }
+    }
+
+    /// Builder: enable the per-source inbound rate-cap (#71). `rate == 0`
+    /// leaves it disabled. Used by the receive loop (from config) and by
+    /// chaos tests; the plain `new` path stays uncapped for back-compat.
+    fn with_inbound_rate(mut self, rate_per_sec: u32, burst: u32) -> Self {
+        self.rate_limiter = InboundRateLimiter::new(rate_per_sec, burst);
+        self
     }
 
     /// Apply the policy gates and merge, returning what happened.
@@ -387,6 +496,20 @@ impl ReceiverState {
         // 1. Replay filter (cheap; do this before crypto).
         if self.seen_sigs.contains(&envelope.signature) {
             metrics.mesh_claims_dropped_replay.fetch_add(1, Relaxed);
+            return MergeOutcome::Rejected;
+        }
+
+        // 1b. Per-source inbound rate-cap (#71). Keyed on the *claimed*
+        //     origin_pubkey — checked before the Ed25519 verify so a
+        //     compromised peer's flood is dropped cheaply, and bucketed
+        //     per source so it can't starve other peers' claims. No-op
+        //     when disabled (rate_per_sec == 0, the default).
+        if self.rate_limiter.enabled()
+            && !self
+                .rate_limiter
+                .allow(&envelope.data.origin_pubkey, now_secs)
+        {
+            metrics.mesh_claims_dropped_rate.fetch_add(1, Relaxed);
             return MergeOutcome::Rejected;
         }
 
@@ -506,10 +629,13 @@ async fn run_receiver(
     socket: Arc<UdpSocket>,
     reputation: Arc<DashMap<IpAddr, WafReputation>>,
     update_tx: watch::Sender<u64>,
+    inbound_claims_per_sec: u32,
+    inbound_claim_burst: u32,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     let mut buf = vec![0u8; 65_507]; // max UDP datagram
-    let mut state = ReceiverState::new(reputation, update_tx);
+    let mut state = ReceiverState::new(reputation, update_tx)
+        .with_inbound_rate(inbound_claims_per_sec, inbound_claim_burst);
 
     loop {
         let (len, _peer) = match socket.recv_from(&mut buf).await {
@@ -835,6 +961,7 @@ mod tests {
             peers: vec![listen],
             identity_path: default_key_path(),
             anti_entropy_secs: 0, // off in this loopback smoke test
+            ..Default::default()
         };
         let cp = match bootstrap(cfg).await {
             Ok(c) => c,
@@ -1129,6 +1256,185 @@ mod tests {
         assert!(
             delta >= 2,
             "publish_block called twice → counter delta = {delta}; expected >= 2"
+        );
+    }
+
+    // ── Chaos scenarios (issue #71) ──────────────────────────────────
+    // Failure modes that don't surface under happy-path gossip:
+    // split-brain reconciliation, inbound claim flood, and a slow peer
+    // whose backlog arrives in a burst. These drive `try_merge` directly
+    // (the same minimal-state pattern as the hammer tests) so they're
+    // deterministic and need no UDP socket or wall-clock sleep.
+
+    /// #71 F2.1 — split brain: the cluster partitions, each half forms
+    /// its own view of the same IP from a different peer, and on heal the
+    /// claims reconcile cleanly. LWW must converge both halves to the one
+    /// newest observation — no double-count, and no permanent ban
+    /// synthesised from the losing half's older accusation.
+    #[test]
+    fn mesh_split_brain_reconciles_after_partition_heals() {
+        let alice = Identity::new(); // peer heard by half A
+        let bob = Identity::new(); // peer heard by half B
+        let target = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let t_a = 1_700_000_100u64;
+        let t_b = 1_700_000_200u64; // bob's observation is the newer one
+        let now = t_b; // both halves evaluate against the same clock
+
+        let (mut half_a, map_a) = fresh_state();
+        let (mut half_b, map_b) = fresh_state();
+
+        // During the partition each half sees only its own peer's claim.
+        let claim_a = build_envelope(&alice, target, 0.80, t_a, 1);
+        let claim_b = build_envelope(&bob, target, 0.90, t_b, 1);
+        assert_eq!(half_a.try_merge(&claim_a, now), MergeOutcome::Inserted);
+        assert_eq!(half_b.try_merge(&claim_b, now), MergeOutcome::Inserted);
+
+        // Heal: each half now also receives the other's claim.
+        // Half A adopts bob's newer claim; half B keeps its own (alice's
+        // is older → Stale under strict-`>` LWW).
+        assert_eq!(half_a.try_merge(&claim_b, now), MergeOutcome::Updated);
+        assert_eq!(half_b.try_merge(&claim_a, now), MergeOutcome::Stale);
+
+        // Converged: exactly one entry per half, the same winner, and no
+        // duplicate rows for the same IP.
+        assert_eq!(map_a.len(), 1, "half A must hold exactly one entry");
+        assert_eq!(map_b.len(), 1, "half B must hold exactly one entry");
+        let ea = *map_a.get(&target).unwrap();
+        let eb = *map_b.get(&target).unwrap();
+        assert_eq!(ea.ts_secs, t_b);
+        assert_eq!(eb.ts_secs, t_b);
+        assert_eq!(ea.source_node, bob.node_id());
+        assert_eq!(eb.source_node, bob.node_id());
+        assert!((ea.score - 0.90).abs() < 1e-6);
+        assert!((eb.score - 0.90).abs() < 1e-6);
+    }
+
+    /// #71 F2.2 — claim flood: one source (a compromised peer holding a
+    /// valid key) floods the merge path. The per-source rate-cap must
+    /// hold (only `burst` admitted at a single instant, the rest dropped
+    /// and counted), legitimate signals from *other* sources must keep
+    /// flowing, and the cap must throttle rather than ban (the flooder
+    /// recovers capacity once the window advances).
+    #[test]
+    fn mesh_inbound_flood_caps_at_configured_rate() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let metrics = &crate::metrics::METRICS;
+        let base_rate = metrics.mesh_claims_dropped_rate.load(Relaxed);
+
+        let rate = 5u32;
+        let burst = 10u32;
+        let now = 1_700_000_000u64;
+
+        let map: Arc<DashMap<IpAddr, WafReputation>> = Arc::new(DashMap::new());
+        let (tx, _rx) = watch::channel(0u64);
+        let mut state = ReceiverState::new(map.clone(), tx).with_inbound_rate(rate, burst);
+
+        let mallory = Identity::new(); // flooding source
+        let alice = Identity::new(); // legitimate source
+
+        // Flood with N distinct claims at one instant. A distinct target
+        // IP per claim → distinct payload → distinct signature, so none
+        // collide with the replay filter: the rate-cap is the only gate
+        // that can drop them.
+        let flood = 40u32;
+        let mut admitted = 0u32;
+        let mut rate_dropped = 0u32;
+        for i in 0..flood {
+            let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, i as u8));
+            let env = build_envelope(&mallory, ip, 0.95, now, 1);
+            match state.try_merge(&env, now) {
+                MergeOutcome::Inserted => admitted += 1,
+                MergeOutcome::Rejected => rate_dropped += 1,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        }
+
+        // At a single instant the bucket starts full and never refills, so
+        // exactly `burst` are admitted and the remainder trip the cap.
+        assert_eq!(
+            admitted, burst,
+            "admitted {admitted}, expected burst {burst}"
+        );
+        assert_eq!(rate_dropped, flood - burst);
+
+        // Legitimate signals keep flowing: a different source has its own
+        // bucket, untouched by Mallory's flood at the same instant.
+        let legit = build_envelope(
+            &alice,
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            0.70,
+            now,
+            1,
+        );
+        assert_eq!(state.try_merge(&legit, now), MergeOutcome::Inserted);
+
+        // Throttle, not ban: after the window advances tokens refill, so
+        // Mallory can publish again.
+        let later = now + 2; // +10 tokens, capped at burst
+        let env = build_envelope(
+            &mallory,
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200)),
+            0.95,
+            later,
+            1,
+        );
+        assert_eq!(state.try_merge(&env, later), MergeOutcome::Inserted);
+
+        let d_rate = metrics.mesh_claims_dropped_rate.load(Relaxed) - base_rate;
+        assert!(
+            d_rate >= u64::from(flood - burst),
+            "dropped_rate delta {d_rate}; expected >= {}",
+            flood - burst
+        );
+    }
+
+    /// #71 F2.3 — slow gossip: a wedged peer's claims accumulate and
+    /// arrive in a burst once its link recovers. Replays and stale
+    /// observations must not synthesise duplicate decisions; only the
+    /// genuinely newer claim changes state, exactly once.
+    #[test]
+    fn mesh_slow_gossip_no_duplicate_decisions() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let metrics = &crate::metrics::METRICS;
+        let base_received = metrics.mesh_claims_received.load(Relaxed);
+
+        let alice = Identity::new();
+        let target = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 42));
+        let t0 = 1_700_000_000u64;
+        let now = t0 + 100; // the link recovers well after the originals
+
+        let (mut state, map) = fresh_state();
+
+        // Decision 1: the first observation lands.
+        let c0 = build_envelope(&alice, target, 0.80, t0, 1);
+        assert_eq!(state.try_merge(&c0, now), MergeOutcome::Inserted);
+
+        // The wedged peer's backlog now arrives all at once:
+        // (a) exact replay of c0 → dropped at the replay filter.
+        assert_eq!(state.try_merge(&c0, now), MergeOutcome::Rejected);
+        // (b) an older queued claim → Stale under LWW, no state change.
+        let older = build_envelope(&alice, target, 0.60, t0 - 50, 1);
+        assert_eq!(state.try_merge(&older, now), MergeOutcome::Stale);
+        // (c) the one genuinely newer claim → a single new decision.
+        let newer = build_envelope(&alice, target, 0.90, t0 + 10, 1);
+        assert_eq!(state.try_merge(&newer, now), MergeOutcome::Updated);
+        // (d) the slow peer re-sends the newer claim → replay, no decision.
+        assert_eq!(state.try_merge(&newer, now), MergeOutcome::Rejected);
+
+        // Exactly one row, holding the newest observation — no duplicates
+        // synthesised from the six delivered envelopes.
+        assert_eq!(map.len(), 1);
+        let e = *map.get(&target).unwrap();
+        assert_eq!(e.ts_secs, t0 + 10);
+        assert!((e.score - 0.90).abs() < 1e-6);
+
+        // The per-call outcomes above are the proof that replays/stale
+        // changed nothing; the counter delta corroborates (>= the two
+        // genuine decisions; `==` would be racy against parallel tests).
+        let d_received = metrics.mesh_claims_received.load(Relaxed) - base_received;
+        assert!(
+            d_received >= 2,
+            "received delta {d_received}; expected >= 2 genuine decisions"
         );
     }
 }
