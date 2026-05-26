@@ -243,6 +243,26 @@ All notable changes to Zion Edge Gateway are documented here.
   enable the feature today get the probe and the auto-disable signal,
   not silent userspace I/O dressed up in io_uring trappings.
 
+## [0.2.3] - 2026-05-26
+
+Maintenance release. No code-surface change — dependency hygiene only.
+
+### Changed
+
+- **MSRV-safe lockfile refresh.** `Cargo.lock` rolled forward to the
+  latest dependency versions that still resolve under MSRV-core 1.82
+  (ADR-0007 anchor): `rustls` 0.23.37→0.23.40, `reqwest` 0.13.2→0.13.3,
+  `rcgen` 0.14.7→0.14.8, `serde_json` 1.0.149→1.0.150, `yasna`
+  0.5.2→0.6.0, plus `libc`, `mimalloc`/`libmimalloc-sys`, `io-uring`
+  0.7.11→0.7.12 and `arc-swap`. `socket2`/`itertools` pinned down to
+  MSRV-compatible releases. All bumps are within-major (patch/minor).
+- **Dependabot:** hold `hyper-rustls < 0.27.8` — 0.27.8 raises its MSRV
+  to rustc 1.85, colliding with the 1.82 anchor. The MSRV CI gate is the
+  hard guard; the ignore rule just stops re-proposal until MSRV-core
+  moves to 1.85.
+- **cargo-vet:** exemptions regenerated to match the refreshed lockfile;
+  `imports.lock` refreshed from the trusted audit sources.
+
 ## [0.2.2] - 2026-05-08
 
 Wire-up release. v0.2.0 / v0.2.1 introduced the XDP / ML-WAF / AIMP
