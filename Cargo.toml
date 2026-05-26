@@ -256,7 +256,7 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 # Criterion microbench harness (issue #54). Pinned to 0.5; the `html_reports`
 # default feature is dropped — we publish a JSON baseline (target/criterion/
 # *.json) and the GitHub Actions runner has no browser to render HTML in.
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # DashMap is also a runtime dep, but the cache-lookup bench needs to construct
 # its own L2-shaped fixture without dragging in `crate::cache` (which pulls
 # bootstrap/metrics/reload). Listing it here is a no-op for the binary.
