@@ -473,6 +473,11 @@ async fn do_renewal_script(config: &crate::config::AcmeConfig) -> Result<(), Str
 pub async fn run_soak() -> i32 {
     use std::sync::atomic::Ordering::Relaxed;
 
+    // instant-acme drives rustls 0.23, which needs a process-level
+    // CryptoProvider. The daemon installs this at boot (main.rs); the
+    // acme-soak subcommand bypasses that path, so install it here.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let directory_url = match std::env::var("ZION_ACME_TEST_DIRECTORY") {
         Ok(v) if !v.is_empty() => v,
         _ => {
