@@ -44,6 +44,11 @@ updates:
       # is the hard guard; this rule just stops Dependabot re-proposing it.
       - dependency-name: "hyper-rustls"
         versions: [">=0.27.8"]
+      # dashmap 6.2.0+ raised its MSRV to rustc 1.85 (interim v6 maintenance
+      # release before v7), colliding with the 1.82 anchor. Hold at 6.1.x
+      # until MSRV-core moves to 1.85. Same posture as hyper-rustls above.
+      - dependency-name: "dashmap"
+        versions: [">=6.2.0"]
       # Pin major-version bumps for the cryptographic / network core — those
       # need a manual security review (release notes, advisory diff) before merge.
       - dependency-name: "rustls"
