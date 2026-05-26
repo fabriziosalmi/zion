@@ -17,6 +17,16 @@ on:
     # Weekly, Sunday 04:00 UTC.
     - cron: "0 4 * * 0"
   workflow_dispatch:
+  # Also run on PRs that touch the ACME flow or this workflow, so a
+  # change to the issuance path is proven against Pebble before merge.
+  pull_request:
+    paths:
+      - "src/acme.rs"
+      - "src/cli.rs"
+      - "src/main.rs"
+      - ".github/workflows/acme-soak.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
 
 permissions:
   contents: read
