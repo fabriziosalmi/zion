@@ -134,7 +134,7 @@ pub async fn revoke_cert(
     config: &crate::config::AcmeConfig,
     cert_path: &str,
 ) -> Result<(), String> {
-    use instant_acme::{Account, RevocationReason, RevocationRequest};
+    use instant_acme::{RevocationReason, RevocationRequest};
     use std::io::BufReader;
 
     // Restore the persisted account that issued the cert.
@@ -143,8 +143,7 @@ pub async fn revoke_cert(
         .map_err(|e| format!("cannot read account.json: {e}"))?;
     let creds: instant_acme::AccountCredentials =
         serde_json::from_str(&creds_json).map_err(|e| format!("invalid account.json: {e}"))?;
-    let account = Account::builder()
-        .map_err(|e| format!("cannot build ACME client: {e}"))?
+    let account = account_builder()?
         .from_credentials(creds)
         .await
         .map_err(|e| format!("cannot restore ACME account: {e}"))?;
@@ -220,6 +219,20 @@ async fn do_renewal(
     result
 }
 
+/// Build an instant-acme account client. When `ZION_ACME_ROOT_PEM` is
+/// set (the soak workflow, issue #59), trust that PEM as the only root
+/// so the client can talk to a test CA (Pebble) whose directory TLS is
+/// signed by a private root. Unset (production) → the default Mozilla
+/// root store, so real Let's Encrypt works unchanged.
+#[cfg(feature = "acme")]
+fn account_builder() -> Result<instant_acme::AccountBuilder, String> {
+    match std::env::var("ZION_ACME_ROOT_PEM") {
+        Ok(p) if !p.is_empty() => instant_acme::Account::builder_with_root(&p)
+            .map_err(|e| format!("cannot build ACME client with custom root '{p}': {e}")),
+        _ => instant_acme::Account::builder().map_err(|e| format!("cannot build ACME client: {e}")),
+    }
+}
+
 /// Native ACME renewal via instant-acme.
 /// Full RFC 8555 flow: account → order → HTTP-01 challenge → finalize → cert.
 #[cfg(feature = "acme")]
@@ -229,7 +242,7 @@ async fn do_renewal_native(
     tls_config: &crate::config::TlsConfig,
 ) -> Result<(), String> {
     use instant_acme::{
-        Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
+        AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
         RetryPolicy,
     };
 
@@ -245,8 +258,7 @@ async fn do_renewal_native(
             .map_err(|e| format!("cannot read account.json: {e}"))?;
         let creds: instant_acme::AccountCredentials =
             serde_json::from_str(&creds_json).map_err(|e| format!("invalid account.json: {e}"))?;
-        Account::builder()
-            .map_err(|e| format!("cannot build ACME client: {e}"))?
+        account_builder()?
             .from_credentials(creds)
             .await
             .map_err(|e| format!("cannot restore ACME account: {e}"))?
@@ -257,8 +269,7 @@ async fn do_renewal_native(
             vec![format!("mailto:{}", config.email)]
         };
         let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
-        let (account, credentials) = Account::builder()
-            .map_err(|e| format!("cannot build ACME client: {e}"))?
+        let (account, credentials) = account_builder()?
             .create(
                 &NewAccount {
                     contact: &contact_refs,
