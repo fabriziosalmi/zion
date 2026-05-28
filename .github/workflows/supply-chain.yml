@@ -35,7 +35,7 @@ jobs:
   # ── 1. RustSec advisories — scheduled + on-PR. ────────────────────────────
   audit:
     name: cargo-audit (advisories)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -51,7 +51,7 @@ jobs:
   # ── 2. cargo-deny: advisories+licenses+bans+sources, all in one. ──────────
   deny:
     name: cargo-deny (${{ matrix.checks }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     strategy:
       fail-fast: false
       matrix:
@@ -79,7 +79,7 @@ jobs:
   # cargo-vet baseline" for the standing operator workflow.
   vet:
     name: cargo-vet
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -94,7 +94,7 @@ jobs:
   # ── 4. cargo-geiger — quantify unsafe surface (informational signal). ────
   geiger:
     name: cargo-geiger (unsafe surface)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     continue-on-error: true   # geiger is a *report*, not a gate
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -120,7 +120,7 @@ jobs:
   # ── 5. CycloneDX SBOM — on master + release tags. Attached to releases. ──
   sbom:
     name: SBOM (CycloneDX)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     if: github.event_name != 'pull_request'
     permissions:
       contents: read
