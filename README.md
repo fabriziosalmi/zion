@@ -153,6 +153,37 @@ Payload x concurrency grid -- measures end-to-end TLS throughput. These numbers 
 - `target-cpu=native` build optimization, PGO build script included
 - systemd unit file + Docker HEALTHCHECK
 
+## Sovereign edge & DDoS resistance
+
+Zion is built to be the **operator's toolkit at the edge** — sharp,
+composable primitives with explicit knobs, not an auto-magic black box.
+You bring the playbook; Zion gives you the levers, each cheap enough to
+leave on under load. Defence is layered, outside-in:
+
+| Layer | Primitive | Status |
+|---|---|---|
+| **L3/4 — NIC** | XDP eBPF LPM-trie source drop (`--features xdp`); blocked IPs never reach the TLS handshake. AIMP-synced blocklist feeds the trie. | ✅ shipping |
+| **L7 — pre-routing** | Zero-cost edge gates before any work: URI-length cap, method whitelist, XFF-spoof-resistant client-IP resolution (no rate-limit bypass via forged `X-Forwarded-For`). | ✅ shipping |
+| **L7 — admission** | Per-IP rate limiter — lock-free fixed-window counter (packed window+count in one atomic), `429` over budget. | ✅ shipping |
+| **L7 — inspection** | WAF: zero-regex Aho-Corasick O(N) single-pass, Shannon entropy, simd-json structural limits, 5 gates. | ✅ shipping |
+| **Origin tagging** | IT/EU range classification (`--features geo-ita` / `geo-eu`) — O(log N) binary search over baked CIDR data + one atomic, **no GeoIP DB, no syscall**. Class lands on the request (`extensions`), a metric, and an optional log. Answers "% EU vs non-EU traffic" out of the box (see [observability](https://fabriziosalmi.github.io/zion/guide/observability)). | ✅ shipping (IPv4) |
+| **Fleet signal** | AIMP serverless mesh (`--features sovereign-aimp`): Ed25519-signed UDP gossip of blocks + IP-reputation, source-bound revocation, no central control plane. Reputation rides to the upstream as `X-Zion-Mesh-Score`. | ✅ shipping (advisory) |
+
+**On the roadmap — the levers still to build** (tracked; PRs welcome):
+
+- **Tag-driven enforcement** ([#150](https://github.com/fabriziosalmi/zion/issues/150)) —
+  today the origin tag and mesh score are *signals* (metric / header /
+  request extension). Wiring them as *active* admission knobs — e.g.
+  tighter rate-limit or tarpit for non-EU or low-reputation sources,
+  allowlist your sovereign ranges — is the next lever.
+- **L7 tarpit / slow-drip** ([#151](https://github.com/fabriziosalmi/zion/issues/151)) —
+  hold flagged connections instead of a clean `429`, so a backed
+  attacker pays wall-clock and socket budget.
+
+The design rule: tagging and reputation never *silently* gate — the
+operator opts a signal into enforcement explicitly, and the local
+rate-limiter / WAF / auth stay authoritative.
+
 ## Quick Start
 
 Fastest path — TLS proxy in front of a dev backend with one command:
