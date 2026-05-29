@@ -98,14 +98,6 @@ criteria = "safe-to-deploy"
 version = "1.5.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.async-stream]]
-version = "0.3.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.async-stream-impl]]
-version = "0.3.6"
-criteria = "safe-to-deploy"
-
 [[exemptions.async-trait]]
 version = "0.1.89"
 criteria = "safe-to-deploy"
@@ -466,10 +458,6 @@ criteria = "safe-to-deploy"
 version = "0.14.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.hashbrown]]
-version = "0.16.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.hermit-abi]]
 version = "0.5.2"
 criteria = "safe-to-deploy"
@@ -532,10 +520,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.icu_provider]]
 version = "2.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.indexmap]]
-version = "1.9.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.indexmap]]
@@ -807,23 +791,23 @@ version = "0.2.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry]]
-version = "0.27.1"
+version = "0.32.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry-otlp]]
-version = "0.27.0"
+version = "0.32.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry-proto]]
-version = "0.27.0"
+version = "0.32.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry-semantic-conventions]]
-version = "0.27.0"
+version = "0.32.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry_sdk]]
-version = "0.27.1"
+version = "0.32.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.ordered-multimap]]
@@ -934,8 +918,20 @@ criteria = "safe-to-run"
 version = "0.11.9"
 criteria = "safe-to-deploy"
 
+[[exemptions.prost]]
+version = "0.14.3"
+criteria = "safe-to-deploy"
+
 [[exemptions.prost-derive]]
 version = "0.11.9"
+criteria = "safe-to-deploy"
+
+[[exemptions.prost-derive]]
+version = "0.14.3"
+criteria = "safe-to-deploy"
+
+[[exemptions.prost-types]]
+version = "0.14.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.protobuf]]
@@ -1295,11 +1291,15 @@ version = "0.1.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.tonic]]
-version = "0.12.3"
+version = "0.14.6"
 criteria = "safe-to-deploy"
 
-[[exemptions.tower]]
-version = "0.4.13"
+[[exemptions.tonic-prost]]
+version = "0.14.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.tonic-types]]
+version = "0.14.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.tower]]
@@ -1331,7 +1331,7 @@ version = "0.1.36"
 criteria = "safe-to-deploy"
 
 [[exemptions.tracing-opentelemetry]]
-version = "0.28.0"
+version = "0.33.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tracing-serde]]

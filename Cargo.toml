@@ -118,11 +118,14 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 
 # OTLP gRPC export — opt-in. Pulls in tonic/prost; we keep it gated so the
 # default binary stays lean. Enable with `--features otel`.
-opentelemetry = { version = "0.27", optional = true }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.27", default-features = false, features = ["grpc-tonic", "trace"], optional = true }
-opentelemetry-semantic-conventions = { version = "0.27", optional = true }
-tracing-opentelemetry = { version = "0.28", default-features = false, optional = true }
+# Since 0.28 the batch span processor runs on a dedicated background thread,
+# so the SDK no longer needs an `rt-tokio` runtime feature (grpc-tonic still
+# requires a Tokio runtime to exist at export time, which the daemon provides).
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry_sdk = { version = "0.32", optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"], optional = true }
+opentelemetry-semantic-conventions = { version = "0.32", optional = true }
+tracing-opentelemetry = { version = "0.33", default-features = false, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

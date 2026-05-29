@@ -427,7 +427,7 @@ mod otel {
 
     use opentelemetry::{global, trace::TracerProvider as _, KeyValue};
     use opentelemetry_otlp::WithExportConfig;
-    use opentelemetry_sdk::{trace::TracerProvider, Resource};
+    use opentelemetry_sdk::{trace::SdkTracerProvider, Resource};
     use opentelemetry_semantic_conventions as semconv;
     use tracing::Subscriber;
     use tracing_opentelemetry::OpenTelemetryLayer;
@@ -447,17 +447,19 @@ mod otel {
             .build()
             .ok()?;
 
-        let resource = Resource::new(vec![
-            KeyValue::new(semconv::resource::SERVICE_NAME, "zion"),
-            KeyValue::new(
-                semconv::resource::SERVICE_VERSION,
+        let resource = Resource::builder()
+            .with_service_name("zion")
+            .with_attribute(KeyValue::new(
+                semconv::attribute::SERVICE_VERSION,
                 env!("CARGO_PKG_VERSION"),
-            ),
-        ]);
+            ))
+            .build();
 
-        let provider = TracerProvider::builder()
+        // Since opentelemetry 0.28 the batch processor owns its own background
+        // thread, so `with_batch_exporter` no longer takes a runtime argument.
+        let provider = SdkTracerProvider::builder()
             .with_resource(resource)
-            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+            .with_batch_exporter(exporter)
             .build();
 
         let tracer = provider.tracer("zion");
