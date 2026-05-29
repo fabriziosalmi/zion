@@ -1,15 +1,33 @@
 #!/usr/bin/env python3
 """Generate sovereign CIDR data for Zion from RIPE NCC and IPtoASN sources.
 
-Usage:
+Usage (Italy — ASN-role only, unchanged):
     python3 generate_sovereign_data.py \
-        --country IT \
+        --region ita \
         --ripe delegated-ripencc-latest \
         --iptoasn ip2asn-v4.tsv \
         --output src/sovereign/data_ita.rs
 
+Usage (EU — hybrid: country baseline + curated-ASN role override):
+    python3 generate_sovereign_data.py \
+        --region eu \
+        --ripe delegated-ripencc-latest \
+        --iptoasn ip2asn-v4.tsv \
+        --output src/sovereign/data_eu.rs
+
 Produces a sorted, non-overlapping array of CidrEntry structs for
 binary search in the Zion sovereign edge classifier.
+
+Region models:
+  * ``ita`` — ASN-driven only. Emits ranges for the hand-curated Italian
+    ASN sets below (gov / residential / datacenter). RIPE allocations are
+    not emitted; an IP is classified only if it sits in a known ASN.
+  * ``eu``  — hybrid. Every IPv4 allocation RIPE delegates to an EU-27
+    member state is emitted as the country-level baseline ``Eu``; ranges
+    belonging to a curated EU ASN override it with the more specific
+    ``GovEu`` / ``ResidentialEu`` / ``DatacenterEu`` role. This answers
+    "% EU vs non-EU traffic" with full coverage while still surfacing the
+    role where we know it.
 """
 
 import argparse
@@ -81,12 +99,107 @@ DATACENTER_ASNS = {
     24940,
 }
 
+# ── EU-27 member states (ISO-3166 alpha-2, as used in RIPE delegated
+# stats `cc` field). RIPE NCC also delegates to non-EU European/ME/CA
+# countries, so we filter to exactly the 27 member states. ───────────
+EU27 = {
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE",
+    "GR", "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT",
+    "RO", "SK", "SI", "ES", "SE",
+}
+
+# ── Curated EU ASN role overrides (hybrid model). Not exhaustive — the
+# RIPE country baseline covers everything else as plain `Eu`; these only
+# add role where it's well-known. Reviewed by humans on PR. ───────────
+GOV_EU_ASNS = {
+    # GÉANT — pan-European research backbone
+    20965, 21320,
+    # DFN (Germany), RENATER (France), RedIRIS (Spain), SURF (NL),
+    # GARR (Italy), national research/education networks
+    680, 2200, 766, 1103, 137, 2598,
+    # European Commission / EU institutions
+    5400,
+}
+
+RESIDENTIAL_EU_ASNS = {
+    # Deutsche Telekom (DE)
+    3320,
+    # Vodafone group (DE/multiple)
+    3209,
+    # Orange (FR)
+    3215,
+    # Free/Iliad (FR)
+    12322,
+    # Telefonica / Movistar (ES)
+    3352,
+    # KPN (NL)
+    1136,
+    # Proximus (BE)
+    5432,
+    # TIM (IT)
+    3269,
+    # Orange Polska (PL)
+    5617,
+    # Telekom Austria (AT)
+    8447,
+}
+
+DATACENTER_EU_ASNS = {
+    # OVH (FR)
+    16276,
+    # Hetzner (DE)
+    24940, 213230,
+    # Scaleway / Online SAS (FR)
+    12876,
+    # IONOS / 1&1 (DE)
+    8560,
+    # Aruba (IT)
+    12797,
+    # LeaseWeb (NL)
+    60781, 16265,
+    # Contabo (DE)
+    51167,
+}
+
+# ── Region configuration table ───────────────────────────────────────
+REGIONS = {
+    "ita": {
+        "module": "data_ita",
+        "adjective": "Italian",
+        "countries": {"IT"},
+        "baseline_class": None,  # ASN-only, no country baseline
+        "asn_roles": [
+            (GOV_ASNS, "GovIta"),
+            (RESIDENTIAL_ASNS, "ResidentialIta"),
+            (DATACENTER_ASNS, "DatacenterIta"),
+        ],
+    },
+    "eu": {
+        "module": "data_eu",
+        "adjective": "EU-27",
+        "countries": EU27,
+        "baseline_class": "Eu",  # every EU-27 allocation → Eu baseline
+        "asn_roles": [
+            (GOV_EU_ASNS, "GovEu"),
+            (RESIDENTIAL_EU_ASNS, "ResidentialEu"),
+            (DATACENTER_EU_ASNS, "DatacenterEu"),
+        ],
+    },
+}
+
+# Role classes win over the country baseline; lower number = lower
+# priority. Baseline gets 0, every role gets 1 (roles never overlap each
+# other — an ASN maps to a single role set).
+BASELINE_PRIORITY = 0
+ROLE_PRIORITY = 1
+
 
 @dataclass
 class CidrRange:
     start: int
     end: int
     ip_class: str
+    priority: int = ROLE_PRIORITY
 
     @property
     def prefix(self) -> str:
@@ -101,8 +214,8 @@ class CidrRange:
             return f"{ipaddress.IPv4Address(self.start)}-{ipaddress.IPv4Address(self.end)}"
 
 
-def parse_ripe_delegated(path: Path, country: str) -> list[CidrRange]:
-    """Parse RIPE NCC delegated stats for a country's IPv4 allocations."""
+def parse_ripe_delegated(path: Path, countries: set[str]) -> list[CidrRange]:
+    """Parse RIPE NCC delegated stats for the given countries' IPv4 allocations."""
     ranges = []
     with open(path) as f:
         for line in f:
@@ -111,8 +224,8 @@ def parse_ripe_delegated(path: Path, country: str) -> list[CidrRange]:
             parts = line.strip().split('|')
             if len(parts) < 7:
                 continue
-            registry, cc, rec_type, start_ip, count_str = parts[0], parts[1], parts[2], parts[3], parts[4]
-            if cc != country or rec_type != 'ipv4':
+            cc, rec_type, start_ip, count_str = parts[1], parts[2], parts[3], parts[4]
+            if cc not in countries or rec_type != 'ipv4':
                 continue
             try:
                 count = int(count_str)
@@ -144,19 +257,8 @@ def parse_iptoasn(path: Path) -> dict[int, list[CidrRange]]:
     return asn_ranges
 
 
-def classify_asn(asn: int) -> str | None:
-    """Classify an ASN into an IpClass variant name."""
-    if asn in GOV_ASNS:
-        return 'GovIta'
-    if asn in RESIDENTIAL_ASNS:
-        return 'ResidentialIta'
-    if asn in DATACENTER_ASNS:
-        return 'DatacenterIta'
-    return None
-
-
-def merge_ranges(ranges: list[CidrRange]) -> list[CidrRange]:
-    """Merge overlapping/adjacent ranges with the same class."""
+def merge_same_class(ranges: list[CidrRange]) -> list[CidrRange]:
+    """Merge overlapping/adjacent ranges that share a class (and priority)."""
     if not ranges:
         return []
     ranges.sort(key=lambda r: (r.start, r.end))
@@ -170,77 +272,98 @@ def merge_ranges(ranges: list[CidrRange]) -> list[CidrRange]:
     return merged
 
 
-def remove_overlaps(ranges: list[CidrRange]) -> list[CidrRange]:
-    """Remove overlapping ranges, keeping the more specific (smaller) one."""
-    ranges.sort(key=lambda r: (r.start, -(r.end - r.start)))
-    result = []
+def resolve_priority(ranges: list[CidrRange]) -> list[CidrRange]:
+    """Flatten possibly-overlapping ranges into a sorted, non-overlapping set
+    where each address takes the class of the highest-priority range that
+    covers it (role > baseline). Ties keep the first seen.
+
+    Sweep over elementary segments between every boundary; for each segment
+    pick the max-priority covering range, then coalesce adjacent equal-class
+    segments.
+    """
+    if not ranges:
+        return []
+    # Boundary points: each range contributes `start` and `end+1`.
+    bounds = set()
     for r in ranges:
-        if result and r.start <= result[-1].end:
-            # Overlap — skip the broader range
-            if r.end - r.start < result[-1].end - result[-1].start:
-                result[-1] = r  # Keep smaller
+        bounds.add(r.start)
+        bounds.add(r.end + 1)
+    points = sorted(bounds)
+
+    # Index ranges by start for a forward sweep.
+    ranges_sorted = sorted(ranges, key=lambda r: r.start)
+    out: list[CidrRange] = []
+    active: list[CidrRange] = []
+    ri = 0
+    n = len(ranges_sorted)
+    for i in range(len(points) - 1):
+        seg_start = points[i]
+        seg_end = points[i + 1] - 1  # inclusive
+        # Add ranges that start at/before this segment.
+        while ri < n and ranges_sorted[ri].start <= seg_start:
+            active.append(ranges_sorted[ri])
+            ri += 1
+        # Drop ranges that ended before this segment.
+        active = [r for r in active if r.end >= seg_start]
+        if not active:
             continue
-        result.append(r)
-    return result
+        # Highest priority wins; ties → keep the earliest-added (stable).
+        best = max(active, key=lambda r: r.priority)
+        if out and out[-1].ip_class == best.ip_class and out[-1].end + 1 == seg_start:
+            out[-1].end = seg_end
+        else:
+            out.append(CidrRange(seg_start, seg_end, best.ip_class, best.priority))
+    return out
 
 
-def ip_to_dotted(ip: int) -> tuple[int, int, int, int]:
-    """Convert u32 to (a, b, c, d)."""
-    return (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF
+def generate_rust(ranges: list[CidrRange], region: dict) -> str:
+    """Generate the Rust source for the data module.
 
-
-def guess_prefix_len(start: int, end: int) -> int:
-    """Guess the CIDR prefix length from a start/end range."""
-    size = end - start + 1
-    if size & (size - 1) != 0:
-        return 0  # Not a power of 2
-    import math
-    return 32 - int(math.log2(size))
-
-
-def generate_rust(ranges: list[CidrRange], module_name: str) -> str:
-    """Generate the Rust source for the data module."""
+    Emits explicit `CidrEntry { start, end, class }` literals (host-order
+    u32) rather than a dotted-quad + prefix helper, so arbitrary ranges —
+    including non-CIDR-aligned remainders left by priority resolution —
+    are represented exactly in a single entry. Adjacent same-class ranges
+    are coalesced upstream, keeping the table small.
+    """
+    adjective = region["adjective"]
     lines = [
-        f'//! Baked-in Italian CIDR ranges for sovereign edge classification.',
+        f'//! Baked-in {adjective} CIDR ranges for sovereign edge classification.',
         f'//!',
         f'//! AUTO-GENERATED by scripts/generate_sovereign_data.py',
         f'//! DO NOT EDIT MANUALLY — changes will be overwritten by CI.',
         f'//!',
         f'//! Sources: RIPE NCC delegated stats + IPtoASN (Team Cymru)',
         f'',
-        f'use super::{{CidrEntry, IpClass, cidr_range}};',
+        f'use super::{{CidrEntry, IpClass}};',
         f'',
-        f'/// Italian CIDR ranges — sorted by start IP (ascending).',
+        f'/// {adjective} CIDR ranges — sorted by start IP (ascending),',
+        f'/// non-overlapping. `start`/`end` are inclusive host-order u32.',
         f'pub static RANGES: &[CidrEntry] = &[',
     ]
+
+    class_label = {
+        'GovIta': 'GOVERNMENT / INSTITUTIONAL',
+        'ResidentialIta': 'RESIDENTIAL ISPs',
+        'DatacenterIta': 'DATACENTER / HOSTING',
+        'Eu': 'EU-27 BASELINE (country-level)',
+        'GovEu': 'EU GOVERNMENT / RESEARCH',
+        'ResidentialEu': 'EU RESIDENTIAL ISPs',
+        'DatacenterEu': 'EU DATACENTER / CLOUD',
+    }
 
     current_class = None
     for r in ranges:
         if r.ip_class != current_class:
             current_class = r.ip_class
-            class_label = {
-                'GovIta': 'GOVERNMENT / INSTITUTIONAL',
-                'ResidentialIta': 'RESIDENTIAL ISPs',
-                'DatacenterIta': 'DATACENTER / HOSTING',
-            }.get(current_class, current_class)
-            lines.append(f'    // ── {class_label} ──')
-
-        a, b, c, d = ip_to_dotted(r.start)
-        prefix = guess_prefix_len(r.start, r.end)
-        comment = r.prefix
+            label = class_label.get(current_class, current_class)
+            lines.append(f'    // ── {label} ──')
         lines.append(
-            f'    cr({a}, {b}, {c}, {d}, {prefix}, IpClass::{r.ip_class}),'
-            f'  // {comment}'
+            f'    CidrEntry {{ start: 0x{r.start:08X}, end: 0x{r.end:08X}, '
+            f'class: IpClass::{r.ip_class} }},'
         )
 
     lines.extend([
         '];',
-        '',
-        '/// Const constructor for CidrEntry.',
-        'const fn cr(a: u8, b: u8, c: u8, d: u8, prefix_len: u8, class: IpClass) -> CidrEntry {',
-        '    let (start, end) = cidr_range(a, b, c, d, prefix_len);',
-        '    CidrEntry { start, end, class }',
-        '}',
         '',
         '#[cfg(test)]',
         'mod tests {',
@@ -280,41 +403,55 @@ def generate_rust(ranges: list[CidrRange], module_name: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description='Generate sovereign CIDR data for Zion')
-    parser.add_argument('--country', default='IT', help='Country code (default: IT)')
+    parser.add_argument('--region', default='ita', choices=sorted(REGIONS),
+                        help='Region model: ita (ASN-only) or eu (country baseline + ASN roles)')
     parser.add_argument('--ripe', required=True, help='Path to delegated-ripencc-latest')
     parser.add_argument('--iptoasn', required=True, help='Path to ip2asn-v4.tsv')
     parser.add_argument('--output', required=True, help='Output .rs file path')
-    parser.add_argument('--module-name', default='data_ita', help='Rust module name')
     args = parser.parse_args()
 
-    print(f'Parsing RIPE delegated stats for {args.country}...')
-    ripe_ranges = parse_ripe_delegated(Path(args.ripe), args.country)
-    print(f'  Found {len(ripe_ranges)} IPv4 allocations for {args.country}')
+    region = REGIONS[args.region]
+    asn_to_class = {asn: cls for asns, cls in region["asn_roles"] for asn in asns}
 
-    print(f'Parsing IPtoASN...')
+    print(f'Region: {args.region} ({region["adjective"]})')
+
+    # ── ASN-role ranges (priority over baseline) ──
+    print('Parsing IPtoASN...')
     asn_ranges = parse_iptoasn(Path(args.iptoasn))
     print(f'  Loaded {len(asn_ranges)} ASNs')
-
-    # Classify known ASNs
-    classified = []
+    role_ranges: list[CidrRange] = []
     for asn, ranges in asn_ranges.items():
-        ip_class = classify_asn(asn)
-        if ip_class:
+        cls = asn_to_class.get(asn)
+        if cls:
             for r in ranges:
-                r.ip_class = ip_class
-                classified.append(r)
+                r.ip_class = cls
+                r.priority = ROLE_PRIORITY
+                role_ranges.append(r)
+    print(f'  Classified {len(role_ranges)} ranges across {len(asn_to_class)} curated ASNs')
 
-    print(f'  Classified {len(classified)} ranges across {len(GOV_ASNS | RESIDENTIAL_ASNS | DATACENTER_ASNS)} ASNs')
+    all_ranges = list(role_ranges)
 
-    # Sort, merge, dedup
-    classified = merge_ranges(classified)
-    classified = remove_overlaps(classified)
-    classified.sort(key=lambda r: r.start)
+    # ── Country baseline (EU only) ──
+    if region["baseline_class"] is not None:
+        print(f'Parsing RIPE delegated stats for {len(region["countries"])} countries...')
+        base = parse_ripe_delegated(Path(args.ripe), region["countries"])
+        for r in base:
+            r.ip_class = region["baseline_class"]
+            r.priority = BASELINE_PRIORITY
+        print(f'  Found {len(base)} IPv4 allocations')
+        all_ranges.extend(base)
 
-    print(f'  Final: {len(classified)} non-overlapping ranges')
+    if not all_ranges:
+        print('ERROR: no ranges produced', file=sys.stderr)
+        sys.exit(1)
 
-    # Generate Rust
-    rust_code = generate_rust(classified, args.module_name)
+    # ── Resolve priority into a non-overlapping set, coalesce, sort ──
+    resolved = resolve_priority(all_ranges)
+    resolved = merge_same_class(resolved)
+    resolved.sort(key=lambda r: r.start)
+    print(f'  Final: {len(resolved)} non-overlapping ranges')
+
+    rust_code = generate_rust(resolved, region)
     Path(args.output).write_text(rust_code)
     print(f'  Written to {args.output}')
 
