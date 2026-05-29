@@ -90,9 +90,10 @@ sum(zion_sovereign_classifications_total{class=~"eu|gov_eu|residential_eu|datace
   / ignoring(class) sum(zion_sovereign_classifications_total)
 ```
 
-`unknown` covers IPs in no dataset (non-EU, or — until IPv6 support
-lands — any pure-IPv6 client), so a high `unknown` share on an
-IPv6-heavy front-end is expected for now.
+Both IPv4 and IPv6 clients are classified (the dataset bakes a `u32`
+table and a parallel `u128` table; IPv4-mapped IPv6 folds onto the v4
+path). `unknown` therefore means an IP in no dataset — genuinely non-EU
+on the `geo-eu` build, or unclassified-by-ASN on `geo-ita`.
 
 ## Access log
 

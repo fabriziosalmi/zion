@@ -42,10 +42,13 @@ jobs:
         # RIPE NCC delegated stats — authoritative IP allocation by country.
         curl -sL https://ftp.ripe.net/pub/stats/ripencc/delegated-ripencc-latest \
           -o .sovereign-data/delegated-ripencc-latest
-        # IPtoASN bulk data (Team Cymru, free) — ASN → prefix mapping.
+        # IPtoASN bulk data (Team Cymru, free) — ASN → prefix mapping, v4 + v6.
         curl -sL https://iptoasn.com/data/ip2asn-v4.tsv.gz \
           -o .sovereign-data/ip2asn-v4.tsv.gz
         gunzip -f .sovereign-data/ip2asn-v4.tsv.gz
+        curl -sL https://iptoasn.com/data/ip2asn-v6.tsv.gz \
+          -o .sovereign-data/ip2asn-v6.tsv.gz
+        gunzip -f .sovereign-data/ip2asn-v6.tsv.gz
 
     - name: Generate ${{ matrix.output }}
       run: |
@@ -53,6 +56,7 @@ jobs:
           --region ${{ matrix.region }} \
           --ripe .sovereign-data/delegated-ripencc-latest \
           --iptoasn .sovereign-data/ip2asn-v4.tsv \
+          --iptoasn6 .sovereign-data/ip2asn-v6.tsv \
           --output ${{ matrix.output }}
 
     - name: Check for changes

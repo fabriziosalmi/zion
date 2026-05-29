@@ -158,11 +158,11 @@ impl std::fmt::Display for IpClass {
 // CIDR Range Representation (compile-time baked)
 // ═══════════════════════════════════════════════════════════════════
 
-/// A single CIDR range entry: [start_ip, end_ip] → IpClass.
-/// Stored as packed u32 for IPv4. IPv6 support is deferred to Phase 2.
+/// A single IPv4 CIDR range entry: [start_ip, end_ip] → IpClass.
+/// Stored as packed u32.
 ///
-/// The arrays in `data_ita.rs` / `data_eu.rs` are sorted by `start`
-/// so we can binary-search in O(log N).
+/// The `RANGES` arrays in `data_ita.rs` / `data_eu.rs` are sorted by
+/// `start` so we can binary-search in O(log N).
 #[derive(Debug, Clone, Copy)]
 pub struct CidrEntry {
     /// First IP in the range (host order u32)
@@ -173,10 +173,31 @@ pub struct CidrEntry {
     pub class: IpClass,
 }
 
+/// A single IPv6 CIDR range entry: [start_ip, end_ip] → IpClass.
+/// Stored as packed u128 (host order, i.e. `u128::from(Ipv6Addr)`).
+///
+/// The `RANGES6` arrays in `data_ita.rs` / `data_eu.rs` are sorted by
+/// `start` so we can binary-search in O(log N), same as the v4 path.
+#[derive(Debug, Clone, Copy)]
+pub struct CidrEntry6 {
+    /// First IP in the range (host order u128)
+    pub start: u128,
+    /// Last IP in the range (host order u128), inclusive
+    pub end: u128,
+    /// Classification for IPs in this range
+    pub class: IpClass,
+}
+
 /// Convert a CIDR notation prefix to (start, end) u32 range.
 /// Useful for `const` initialization of `CidrEntry` arrays.
 ///
+/// `#[allow(dead_code)]`: the generated `data_*.rs` now emit raw
+/// `cr(start, end, class)` calls (no dotted-quad+prefix), so nothing in
+/// the binary calls this — but it's a public const-init utility, kept for
+/// hand-written entries/fixtures and exercised by the unit tests below.
+///
 /// Example: `cidr_range(192, 168, 1, 0, 24)` → `(0xC0A80100, 0xC0A801FF)`
+#[allow(dead_code)]
 pub const fn cidr_range(a: u8, b: u8, c: u8, d: u8, prefix_len: u8) -> (u32, u32) {
     let ip = (a as u32) << 24 | (b as u32) << 16 | (c as u32) << 8 | d as u32;
     if prefix_len >= 32 {
@@ -197,35 +218,52 @@ pub const fn cidr_range(a: u8, b: u8, c: u8, d: u8, prefix_len: u8) -> (u32, u32
 ///
 /// O(log N) binary search over sorted CIDR ranges. Zero allocation.
 pub fn classify(ip: IpAddr) -> IpClass {
-    // `_ipv4` (vs `ipv4`) silences an `unused_variable` warning when neither
-    // `geo-ita` nor `geo-eu` is enabled (e.g. lib build for the bench
-    // harness): both reader blocks below are then `cfg`-stripped.
-    let _ipv4 = match ip {
-        IpAddr::V4(v4) => u32::from(v4),
-        IpAddr::V6(v6) => {
-            // Check for IPv4-mapped IPv6 (::ffff:a.b.c.d)
-            match v6.to_ipv4_mapped() {
-                Some(v4) => u32::from(v4),
-                None => return IpClass::Unknown, // Pure IPv6 — Phase 2
-            }
-        }
+    // Normalise to either a v4 u32 or a v6 u128. IPv4-mapped IPv6
+    // (`::ffff:a.b.c.d`) folds onto the v4 path so a dual-stack listener
+    // classifies a mapped client the same as a native v4 one. The `_`
+    // prefixes silence `unused_variable` when no geo feature is enabled
+    // (the reader blocks below are then `cfg`-stripped).
+    let (_ipv4, _ipv6): (Option<u32>, Option<u128>) = match ip {
+        IpAddr::V4(v4) => (Some(u32::from(v4)), None),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => (Some(u32::from(v4)), None),
+            None => (None, Some(u128::from(v6))),
+        },
     };
 
-    // Search ITA data first (more specific)
-    #[cfg(feature = "geo-ita")]
-    {
-        let result = lookup(_ipv4, data_ita::RANGES);
-        if result != IpClass::Unknown {
-            return result;
+    // IPv4 path: ITA first (more specific), then EU.
+    if let Some(_v4) = _ipv4 {
+        #[cfg(feature = "geo-ita")]
+        {
+            let result = lookup(_v4, data_ita::RANGES);
+            if result != IpClass::Unknown {
+                return result;
+            }
+        }
+        #[cfg(feature = "geo-eu")]
+        {
+            let result = lookup(_v4, data_eu::RANGES);
+            if result != IpClass::Unknown {
+                return result;
+            }
         }
     }
 
-    // Then EU data (broader)
-    #[cfg(feature = "geo-eu")]
-    {
-        let result = lookup(_ipv4, data_eu::RANGES);
-        if result != IpClass::Unknown {
-            return result;
+    // IPv6 path: same ITA-then-EU precedence over the u128 tables.
+    if let Some(_v6) = _ipv6 {
+        #[cfg(feature = "geo-ita")]
+        {
+            let result = lookup6(_v6, data_ita::RANGES6);
+            if result != IpClass::Unknown {
+                return result;
+            }
+        }
+        #[cfg(feature = "geo-eu")]
+        {
+            let result = lookup6(_v6, data_eu::RANGES6);
+            if result != IpClass::Unknown {
+                return result;
+            }
         }
     }
 
@@ -243,6 +281,24 @@ pub fn classify(ip: IpAddr) -> IpClass {
 #[inline]
 fn lookup(ip: u32, ranges: &[CidrEntry]) -> IpClass {
     // Binary search: find the last range whose `start <= ip`
+    let idx = ranges.partition_point(|entry| entry.start <= ip);
+    if idx == 0 {
+        return IpClass::Unknown;
+    }
+    let entry = &ranges[idx - 1];
+    if ip <= entry.end {
+        entry.class
+    } else {
+        IpClass::Unknown
+    }
+}
+
+/// Binary search a sorted `CidrEntry6` array for the given IPv6 address.
+/// Identical shape to [`lookup`], over u128 bounds. See its note re
+/// `#[allow(dead_code)]`.
+#[allow(dead_code)]
+#[inline]
+fn lookup6(ip: u128, ranges: &[CidrEntry6]) -> IpClass {
     let idx = ranges.partition_point(|entry| entry.start <= ip);
     if idx == 0 {
         return IpClass::Unknown;
@@ -427,5 +483,29 @@ mod tests {
         assert_eq!(IpClass::GovEu.as_str(), "gov_eu");
         assert_eq!(IpClass::ResidentialEu.as_str(), "residential_eu");
         assert_eq!(IpClass::DatacenterEu.as_str(), "datacenter_eu");
+    }
+
+    #[cfg(feature = "geo-eu")]
+    #[test]
+    fn classify_eu_ipv6() {
+        // 2606:4700::1 (Cloudflare, US) stays Unknown — no false EU positive.
+        assert_eq!(classify("2606:4700::1".parse().unwrap()), IpClass::Unknown);
+
+        // 2001:608::1 is a stable DE allocation (RIPE) with no curated-ASN
+        // role → country-level baseline.
+        assert_eq!(classify("2001:608::1".parse().unwrap()), IpClass::Eu);
+
+        // 2003:a::1 is Deutsche Telekom v6 (AS3320) — the curated ASN role
+        // overrides the baseline, proving the hybrid model works on the
+        // u128 path too. Don't pin the exact role (regenerated upstream),
+        // just assert it's an EU class.
+        let dt6 = classify("2003:a::1".parse().unwrap());
+        assert!(
+            matches!(
+                dt6,
+                IpClass::Eu | IpClass::GovEu | IpClass::ResidentialEu | IpClass::DatacenterEu
+            ),
+            "2003:a::1 (Deutsche Telekom v6) should classify as an EU class, got {dt6:?}"
+        );
     }
 }
