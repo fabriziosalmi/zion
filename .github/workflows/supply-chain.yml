@@ -50,11 +50,14 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: audit
+      # Prebuilt binary, not `cargo install` from source: building the tool
+      # on the self-hosted runners is the flaky step ("could not parse/
+      # generate dep info … .d: No such file" — a /tmp race during the
+      # install build). A downloaded binary sidesteps it and is faster.
       - name: Install cargo-audit
-        run: cargo install --locked cargo-audit
+        uses: taiki-e/install-action@873c7452cadb7c034694a1282227095d93fbdf92 # v2.79.14
+        with:
+          tool: cargo-audit
       - name: Run cargo-audit
         # Fail on any unfixed advisory + any yanked crate.
         run: cargo audit --deny warnings --deny unmaintained --deny unsound --deny yanked
@@ -94,11 +97,12 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: vet
+      # Prebuilt binary (see cargo-audit note) — avoids the flaky
+      # source-build of the tool on the self-hosted runners.
       - name: Install cargo-vet
-        run: cargo install --locked cargo-vet
+        uses: taiki-e/install-action@873c7452cadb7c034694a1282227095d93fbdf92 # v2.79.14
+        with:
+          tool: cargo-vet
       - name: Run cargo-vet
         run: cargo vet --locked
 
