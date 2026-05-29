@@ -340,6 +340,10 @@ def generate_rust(ranges: list[CidrRange], region: dict) -> str:
         f'/// non-overlapping. `start`/`end` are inclusive host-order u32.',
         f'pub static RANGES: &[CidrEntry] = &[',
     ]
+    # Emitted via the `cr(start, end, class)` function-call helper rather
+    # than a struct literal: rustfmt keeps a call on one line but expands
+    # any struct literal wider than `struct_lit_width` onto four — which
+    # would blow a 25k-entry table up to ~100k lines.
 
     class_label = {
         'GovIta': 'GOVERNMENT / INSTITUTIONAL',
@@ -358,12 +362,16 @@ def generate_rust(ranges: list[CidrRange], region: dict) -> str:
             label = class_label.get(current_class, current_class)
             lines.append(f'    // ── {label} ──')
         lines.append(
-            f'    CidrEntry {{ start: 0x{r.start:08X}, end: 0x{r.end:08X}, '
-            f'class: IpClass::{r.ip_class} }},'
+            f'    cr(0x{r.start:08X}, 0x{r.end:08X}, IpClass::{r.ip_class}),'
         )
 
     lines.extend([
         '];',
+        '',
+        '/// Const constructor — raw inclusive host-order u32 bounds.',
+        'const fn cr(start: u32, end: u32, class: IpClass) -> CidrEntry {',
+        '    CidrEntry { start, end, class }',
+        '}',
         '',
         '#[cfg(test)]',
         'mod tests {',
