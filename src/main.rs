@@ -48,6 +48,7 @@ mod bootstrap;
 mod cache;
 mod cli;
 mod config;
+mod connlimit;
 mod doctor;
 mod error;
 mod health;
@@ -199,6 +200,9 @@ pub(crate) struct ResolvedAppConfig {
     pub(crate) rate_limit_rps: u32,
     /// Rate limiter window in seconds.
     pub(crate) rate_limit_window: u64,
+    /// Max concurrent connections per source IP. 0 = disabled. Read at
+    /// accept, so a hot-reload retunes the cap without dropping live conns.
+    pub(crate) max_connections_per_ip: u32,
     /// Pre-parsed listen address for plain HTTP. `None` if the config
     /// string is malformed; the listener supervisor logs the parse error
     /// at reload time and keeps the previously-bound listener.
@@ -235,6 +239,7 @@ impl ResolvedAppConfig {
             xff_mode: proxy::XffMode::Append,
             rate_limit_rps: 0,
             rate_limit_window: 1,
+            max_connections_per_ip: 0,
             listen_http: None,
             listen_https: None,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
@@ -352,6 +357,7 @@ impl ResolvedAppConfig {
             xff_mode,
             rate_limit_rps: config.server.rate_limit_rps,
             rate_limit_window: config.server.rate_limit_window_secs,
+            max_connections_per_ip: config.server.max_connections_per_ip,
             listen_http,
             listen_https,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
@@ -394,6 +400,11 @@ struct AppState {
     /// calling thread's current node — same-socket workers stay
     /// cache-local, cross-socket fallback scans on get-miss.
     rate_map: Arc<numa::NumaAwareMap<std::net::IpAddr, RateEntry>>,
+    /// Per-IP concurrent-connection limiter. Like `rate_map`, persists
+    /// across config reloads (it tracks live sockets, not config); the cap
+    /// is read from the config snapshot at accept time. The global ceiling
+    /// stays the `conn_limit` semaphore above.
+    conn_per_ip: Arc<connlimit::PerIpConnLimiter>,
     /// Singleflight: coalesce concurrent cache misses for the same key.
     /// First request fetches from upstream and inserts a `watch::Sender<bool>`;
     /// subsequent requests subscribe and await `true`. Watch (vs Notify) is
@@ -849,6 +860,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         conn_limit: Arc::new(Semaphore::new(platform.conn_limit)),
         acme_challenges: acme::new_challenge_store(),
         rate_map: Arc::new(numa::NumaAwareMap::new()),
+        conn_per_ip: Arc::new(connlimit::PerIpConnLimiter::new()),
         inflight: numa::NumaAwareMap::new(),
         audit: audit_handle,
         redact: compiled_redact,
@@ -1363,10 +1375,28 @@ fn spawn_https_handler(
     remote_addr: SocketAddr,
     state: Arc<AppState>,
 ) {
-    // Connection limit — fast atomic check, no Arc clone.
+    // Global connection ceiling — fast atomic check, no Arc clone.
     let permit = match state.conn_limit.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
+            drop(tcp_stream);
+            return;
+        }
+    };
+
+    // Per-IP concurrent-connection cap (anti-DDoS, issue #150 lever). Read
+    // the cap from the live config snapshot so a hot-reload retunes it.
+    // `cap == 0` short-circuits inside `try_acquire` (zero overhead). A
+    // rejected source is closed immediately, before the TLS handshake.
+    let ip_slot = match state
+        .conn_per_ip
+        .try_acquire(remote_addr.ip(), state.config.load().max_connections_per_ip)
+    {
+        Some(slot) => slot,
+        None => {
+            metrics::METRICS
+                .connections_rejected_per_ip
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             drop(tcp_stream);
             return;
         }
@@ -1377,6 +1407,9 @@ fn spawn_https_handler(
 
     tokio::spawn(async move {
         let _permit = permit;
+        // Held for the connection's lifetime; releases the per-IP slot on
+        // drop (including early return / panic during the handshake).
+        let _ip_slot = ip_slot;
         let _conn_guard = metrics::ConnectionGuard::new();
         let _ = tcp_stream.set_nodelay(true);
         net::tune_accepted(&tcp_stream);

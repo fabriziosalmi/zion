@@ -400,6 +400,9 @@ pub struct Metrics {
     pub websocket_upgrades: AtomicU64,
     pub connections_total: AtomicU64,
     pub tls_handshake_errors: AtomicU64,
+    /// Connections closed at accept because the source IP was already at
+    /// its `max_connections_per_ip` concurrent cap (anti-DDoS lever).
+    pub connections_rejected_per_ip: AtomicU64,
 
     // ── Mesh observability (issue #69) ──────────────────────────────
     // Always-on counters (zero on builds without `--features
@@ -463,6 +466,7 @@ impl Metrics {
             websocket_upgrades: AtomicU64::new(0),
             connections_total: AtomicU64::new(0),
             tls_handshake_errors: AtomicU64::new(0),
+            connections_rejected_per_ip: AtomicU64::new(0),
             mesh_claims_emitted: AtomicU64::new(0),
             mesh_claims_received: AtomicU64::new(0),
             mesh_claims_dropped_signature: AtomicU64::new(0),
@@ -632,6 +636,18 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.tls_handshake_errors.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_connections_rejected_per_ip Connections closed at accept for exceeding max_connections_per_ip.\n\
+                                # TYPE zion_connections_rejected_per_ip counter\n\
+                                zion_connections_rejected_per_ip ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.connections_rejected_per_ip.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");

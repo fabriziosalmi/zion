@@ -125,6 +125,7 @@ Payload x concurrency grid -- measures end-to-end TLS throughput. These numbers 
 - Server header stripped, hop-by-hop headers stripped (RFC 7230)
 - URI length limit (8 KB path+query), method whitelist (7 methods)
 - Per-IP rate limiting (lock-free atomic, configurable window)
+- Per-IP concurrent-connection cap (`max_connections_per_ip`, enforced at accept; 0 = off)
 - CORS with FNV O(1) origin lookup, case-insensitive (RFC 6454)
 - TLS handshake timeout (10s), connection timeout (1h for H2/WS/SSE)
 - Header bomb prevention (64 headers, 16 KB buffer)
@@ -164,9 +165,9 @@ leave on under load. Defence is layered, outside-in:
 |---|---|---|
 | **L3/4 — NIC** | XDP eBPF LPM-trie source drop (`--features xdp`); blocked IPs never reach the TLS handshake. AIMP-synced blocklist feeds the trie. | ✅ shipping |
 | **L7 — pre-routing** | Zero-cost edge gates before any work: URI-length cap, method whitelist, XFF-spoof-resistant client-IP resolution (no rate-limit bypass via forged `X-Forwarded-For`). | ✅ shipping |
-| **L7 — admission** | Per-IP rate limiter — lock-free fixed-window counter (packed window+count in one atomic), `429` over budget. | ✅ shipping |
+| **L7 — admission** | Per-IP **rate** limiter (lock-free fixed-window, `429` over budget) **and** per-IP **concurrent-connection** cap (`max_connections_per_ip`, enforced at accept before the TLS handshake) — the connection-exhaustion lever a slow/backed flood actually hits. Global ceiling = the platform connection semaphore. | ✅ shipping |
 | **L7 — inspection** | WAF: zero-regex Aho-Corasick O(N) single-pass, Shannon entropy, simd-json structural limits, 5 gates. | ✅ shipping |
-| **Origin tagging** | IT/EU range classification (`--features geo-ita` / `geo-eu`) — O(log N) binary search over baked CIDR data + one atomic, **no GeoIP DB, no syscall**. Class lands on the request (`extensions`), a metric, and an optional log. Answers "% EU vs non-EU traffic" out of the box (see [observability](https://fabriziosalmi.github.io/zion/guide/observability)). | ✅ shipping (IPv4) |
+| **Origin tagging** | IT/EU range classification (`--features geo-ita` / `geo-eu`), **IPv4 + IPv6** — O(log N) binary search over baked CIDR data + one atomic, **no GeoIP DB, no syscall**. Class lands on the request (`extensions`), a metric, and an optional log. Answers "% EU vs non-EU traffic" out of the box (see [observability](https://fabriziosalmi.github.io/zion/guide/observability)). | ✅ shipping |
 | **Fleet signal** | AIMP serverless mesh (`--features sovereign-aimp`): Ed25519-signed UDP gossip of blocks + IP-reputation, source-bound revocation, no central control plane. Reputation rides to the upstream as `X-Zion-Mesh-Score`. | ✅ shipping (advisory) |
 
 **On the roadmap — the levers still to build** (tracked; PRs welcome):
@@ -310,7 +311,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 ```
 
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-38 modules, ~25,400 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+39 modules, ~25,600 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Benchmarking
 
@@ -336,7 +337,7 @@ Results saved to `benchmarks/bench-history.json` with automatic delta comparison
 ## Testing
 
 ```bash
-# Unit tests (557) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
+# Unit tests (561) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
 cargo test
 
 # Integration tests (19 -- requires running Zion + backend)
