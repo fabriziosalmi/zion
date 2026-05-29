@@ -27,35 +27,50 @@ above. The version locks in `Cargo.lock` are the integrity link — pin
 upgrades go through `cargo audit` + manual review per
 [deny.toml](../../deny.toml).
 
-## Running BoGo against a Zion build (operator recipe)
+## Running BoGo against the rustls version Zion ships
 
-To exercise Zion's *integration* with rustls (rather than rustls in
-isolation), run the BoGo shim against a live daemon on `:443`:
+> **BoGo does not connect to a TLS server.** Its Go runner drives a
+> *shim* binary as a subprocess per test case, feeding the per-test
+> handshake configuration over a CLI protocol. Zion is not a BoGo shim,
+> so you cannot point BoGo at Zion's `:443`. rustls ships the shim (in
+> its `bogo/` directory); the meaningful, version-locked check is to
+> build that shim from the **rustls release Zion pins** and run the
+> suite. A green run proves the exact `rustls` + `aws-lc-rs` versions in
+> Zion's `Cargo.lock` are BoGo-conformant.
+
+This is automated in CI — see
+[`.github/workflows/tls-conformance.yml`](../../.github/workflows/tls-conformance.yml)
+(`tls-conformance`): weekly + on any PR touching `src/tls.rs` /
+`Cargo.toml` / `Cargo.lock`, plus `gh workflow run tls-conformance.yml`.
+
+The operator recipe it encodes:
 
 ```bash
-# 1. Start Zion with a self-signed cert.
-cargo build --release --features init,acme
-./target/release/zion init -y --hostname conformance.test.local
-ZION_CONFIG=zion.toml ./target/release/zion &
-ZION_PID=$!
-trap "kill $ZION_PID" EXIT
+# 1. Read the rustls version Zion pins.
+RUSTLS_VER=$(awk '/^name = "rustls"$/{getline; gsub(/[" ]/,"",$3); print $3; exit}' Cargo.lock)
 
-# 2. Clone the rustls BoGo runner.
-git clone --depth=1 https://github.com/rustls/rustls
-cd rustls/rustls-bogo-shim
-cargo build --release
+# 2. Check out rustls at that release (tags are `v/<version>`).
+git clone --depth=1 --branch "v/$RUSTLS_VER" https://github.com/rustls/rustls
+cd rustls
 
-# 3. Point BoGo at Zion's HTTPS port.
-RUSTLS_BOGO_TARGET=127.0.0.1:443 cargo run --release -- \
-    -shim-path ../../target/release/zion \
-    -test-error-map ./testerrormap.json \
-    -allow-unimplemented
+# 3. (optional) Align aws-lc-rs with Zion's exact pin.
+cargo update -p aws-lc-rs --precise "$(awk '/^name = "aws-lc-rs"$/{getline; gsub(/[" ]/,"",$3); print $3; exit}' ../Cargo.lock)" || true
+
+# 4. Run the suite (needs Go + a C preprocessor; `runme` builds the
+#    shim and the pinned BoringSSL runner). On Linux `runme` exits
+#    non-zero on any unexpected failure.
+cd bogo && BOGO_SHIM_PROVIDER=aws-lc-rs ./runme
 ```
 
-Expected: every case the upstream rustls passes also passes against
-Zion. Failures are *integration* defects (something Zion configured
-overrode a rustls default in a way that broke conformance) and become
-P1 issues.
+Expected: the same pass rate upstream rustls reports for that release.
+A failure here means the pinned `rustls`/`aws-lc-rs` combination
+diverged from upstream BoGo expectations — i.e. a dependency bump
+regressed conformance, caught on the PR that bumps it.
+
+> Testing Zion's *own* `ServerConfig` integration (rather than rustls in
+> isolation) would require Zion to expose a BoGo-shim-compatible mode —
+> tracked as a possible follow-up. Since Zion builds on rustls's
+> defaults, the version-pinned suite above is the high-value coverage.
 
 ## Internal smoke + soak tests
 
@@ -101,7 +116,8 @@ For deployments that need third-party attestation:
 
 | Gap | Status |
 |---|---|
-| Run BoGo as a CI job (build-only) | Tracked in [docs/perf/roadmap.md](../perf/roadmap.md); needs a Linux runner with the BoGo build pre-warmed |
+| Run BoGo as a CI job | **Done** (#56) — [`tls-conformance.yml`](../../.github/workflows/tls-conformance.yml) runs the suite against the rustls release Zion pins, weekly + on dependency-pin PRs |
+| BoGo against Zion's own `ServerConfig` (shim mode) | Possible follow-up — needs a `zion`-side BoGo shim; low marginal value while Zion uses rustls defaults |
 | Wycheproof crypto vectors for HMAC/ECDSA | Inherited from aws-lc-rs CI; not re-run inside Zion |
 | ACME staging-environment soak | Manual today — `--features acme` against Let's Encrypt staging |
 | Public-internet TLS scan in release pipeline | Out of scope — operator-side concern |
