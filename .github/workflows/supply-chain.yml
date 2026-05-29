@@ -30,6 +30,17 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The repo's `rust-toolchain.toml` pins `channel = "1.88.0"` with
+  # `profile = "minimal"`. Some self-hosted runners have that 1.88.0
+  # toolchain installed *without* the `cargo` component, so the in-repo
+  # override makes `cargo install`/`cargo vet` fail with "the 'cargo'
+  # binary … is not applicable to the '1.88.0' toolchain". These audit
+  # tools don't need the pinned compiler — they analyse Cargo.lock and the
+  # vet baseline — so we force `stable` (installed by dtolnay/rust-toolchain
+  # below) and bypass the override. RUSTUP_TOOLCHAIN has the highest
+  # precedence, above rust-toolchain.toml. GitHub-hosted CI is unaffected
+  # because a fresh runner auto-syncs a complete 1.88.0.
+  RUSTUP_TOOLCHAIN: stable
 
 jobs:
   # ── 1. RustSec advisories — scheduled + on-PR. ────────────────────────────
@@ -104,8 +115,15 @@ jobs:
           shared-key: geiger
       - name: Install build deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+          # Self-hosted runners typically have these pre-installed and may
+          # lack passwordless sudo, so only reach for apt when something is
+          # actually missing — and don't hard-fail the step if sudo is
+          # unavailable (the later cargo step surfaces any real gap).
+          if ! command -v cmake >/dev/null || ! command -v pkg-config >/dev/null; then
+            sudo apt-get update && \
+            sudo apt-get install -y cmake pkg-config build-essential libssl-dev || \
+            echo "::warning::could not apt-get build deps; relying on pre-installed toolchain"
+          fi
       - name: Install cargo-geiger
         run: cargo install --locked cargo-geiger
       - name: Geiger report
@@ -132,8 +150,15 @@ jobs:
           shared-key: sbom
       - name: Install build deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+          # Self-hosted runners typically have these pre-installed and may
+          # lack passwordless sudo, so only reach for apt when something is
+          # actually missing — and don't hard-fail the step if sudo is
+          # unavailable (the later cargo step surfaces any real gap).
+          if ! command -v cmake >/dev/null || ! command -v pkg-config >/dev/null; then
+            sudo apt-get update && \
+            sudo apt-get install -y cmake pkg-config build-essential libssl-dev || \
+            echo "::warning::could not apt-get build deps; relying on pre-installed toolchain"
+          fi
       - name: Install cargo-cyclonedx
         run: cargo install --locked cargo-cyclonedx
       - name: Generate SBOM (JSON, all features)
