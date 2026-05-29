@@ -43,7 +43,13 @@ fi
 # counted. The previous depth=1 implementation silently undercounted.
 modules=$(find src -name '*.rs' -type f | wc -l | awk '{print $1}')
 
-lines_total=$(find src -name '*.rs' -type f -exec cat {} + | wc -l | awk '{print $1}')
+# Exclude auto-generated data tables (e.g. src/sovereign/data_*.rs — baked
+# CIDR datasets, tens of thousands of lines) from the *lines of Rust*
+# headline: they're machine-generated data, not hand-written code, and would
+# drown the signal. They still count as modules above (they are real `mod`s).
+lines_total=$(find src -name '*.rs' -type f \
+    -not -path 'src/sovereign/data_*.rs' \
+    -exec cat {} + | wc -l | awk '{print $1}')
 # Round to nearest 100 for the README — the precise count fluctuates with
 # every edit and the headline number doesn't need that resolution.
 # Thousands-separator formatting is done in Python below (BSD printf on
