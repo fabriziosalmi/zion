@@ -1,0 +1,141 @@
+# BoGo TLS conformance (issue #56).
+#
+# Runs BoringSSL's BoGo TLS test suite (~600 cases) against the exact
+# rustls + aws-lc-rs versions zion ships — NOT against zion's :443.
+#
+# Why not :443? BoGo does not connect to a TLS server. Its Go runner
+# drives a *shim* binary as a subprocess per test case, feeding it the
+# per-test handshake configuration over a documented CLI protocol. zion
+# is not a BoGo shim, so it cannot be a BoGo target. rustls ships the
+# shim (in its `bogo/` dir); the meaningful, version-locked gate is to
+# build that shim from the rustls release zion pins and run the suite.
+# This turns the "inherited coverage" claim in
+# docs/security/tls-conformance.md into a verified, pinned check: if a
+# future Cargo.lock bump moves rustls to a version that regresses BoGo,
+# this job goes red on the PR that bumps it.
+#
+# Mirrors rustls's own CI bogo job (ubuntu-latest + stable Rust + Go +
+# `bogo/runme`). On Linux `runme` is a real gate: `set -e` aborts before
+# its trailing `true` when the Go runner exits non-zero (the `set +e`
+# best-effort path is macOS-only).
+name: tls-conformance
+
+on:
+  schedule:
+    # Weekly, Monday 04:00 UTC.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+  # Re-run whenever the TLS surface or the dependency pins move, so a
+  # rustls/aws-lc-rs bump is proven against BoGo before it merges.
+  pull_request:
+    paths:
+      - "src/tls.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/tls-conformance.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tls-conformance-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  bogo:
+    name: BoGo TLS conformance (rustls @ zion's pin)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout zion
+        uses: actions/checkout@v5
+        with:
+          path: zion
+
+      - name: Resolve the rustls + aws-lc-rs versions zion pins
+        id: pins
+        working-directory: zion
+        run: |
+          # Exact-match the crate names ('^name = "rustls"$' so rustls-pemfile
+          # / rustls-webpki don't match) and take the version on the next line.
+          ver() {
+            awk -v c="$1" '
+              $0=="name = \""c"\"" { getline; gsub(/[" ]/,"",$3); print $3; exit }
+            ' Cargo.lock
+          }
+          RUSTLS_VER="$(ver rustls)"
+          AWSLC_VER="$(ver aws-lc-rs)"
+          test -n "$RUSTLS_VER" || { echo "::error::could not read rustls version from Cargo.lock"; exit 1; }
+          echo "rustls=$RUSTLS_VER"        >> "$GITHUB_OUTPUT"
+          echo "aws_lc_rs=$AWSLC_VER"      >> "$GITHUB_OUTPUT"
+          echo "zion pins rustls $RUSTLS_VER, aws-lc-rs ${AWSLC_VER:-<none>}"
+
+      - name: Checkout rustls at zion's pinned tag
+        uses: actions/checkout@v5
+        with:
+          repository: rustls/rustls
+          # rustls tags releases as `v/<version>` (e.g. v/0.23.40).
+          ref: v/${{ steps.pins.outputs.rustls }}
+          path: rustls
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "stable"
+
+      - name: Cache the shim/runner build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rustls
+          shared-key: bogo
+
+      - name: Pin aws-lc-rs to zion's exact version
+        if: steps.pins.outputs.aws_lc_rs != ''
+        working-directory: rustls
+        # Best-effort: align the shim's aws-lc-rs with what zion ships so the
+        # suite exercises the same primitives. If the rustls release at this
+        # tag constrains aws-lc-rs away from zion's pin, keep rustls's own
+        # lock rather than failing the gate.
+        run: |
+          cargo update -p aws-lc-rs --precise "${{ steps.pins.outputs.aws_lc_rs }}" \
+            || echo "::warning::could not pin aws-lc-rs to ${{ steps.pins.outputs.aws_lc_rs }}; using rustls's resolved version"
+
+      - name: Run BoGo suite (aws-lc-rs provider)
+        working-directory: rustls/bogo
+        env:
+          BOGO_SHIM_PROVIDER: aws-lc-rs
+        # `runme` builds the rustls shim, fetches+builds the pinned BoringSSL
+        # Go runner, and runs the suite. On Linux it exits non-zero on any
+        # unexpected failure, so the step status IS the conformance gate.
+        run: |
+          set -o pipefail
+          ./runme 2>&1 | tee "$GITHUB_WORKSPACE/bogo.log"
+
+      - name: Summarise result
+        if: always()
+        run: |
+          {
+            echo "## BoGo TLS conformance"
+            echo
+            echo "- rustls: \`${{ steps.pins.outputs.rustls }}\` (tag \`v/${{ steps.pins.outputs.rustls }}\`)"
+            echo "- aws-lc-rs (zion pin): \`${{ steps.pins.outputs.aws_lc_rs }}\`"
+            echo "- provider: \`aws-lc-rs\`"
+            echo
+            if [ "${{ job.status }}" = "success" ]; then
+              echo "✅ Suite passed — the rustls version zion ships is BoGo-conformant."
+            else
+              echo "❌ Suite failed — see the log tail below. A regression here means the"
+              echo "pinned rustls/aws-lc-rs combination diverged from upstream BoGo expectations."
+            fi
+            echo
+            echo "<details><summary>runner output (tail)</summary>"
+            echo
+            echo '```'
+            tail -n 40 "$GITHUB_WORKSPACE/bogo.log" 2>/dev/null || echo "(no log captured)"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
