@@ -17,6 +17,13 @@ listen_https = "0.0.0.0:443"
 # rate_limit_rps = 1000
 # rate_limit_window_secs = 1
 
+# Per-IP concurrent-connection cap. 0 = disabled (default). Caps how many
+# sockets a single source IP may hold open at once (enforced at accept,
+# before the TLS handshake) — the resource a slow/backed flood drains.
+# Complements rate_limit_rps (which caps request frequency, not sockets).
+# rejected connections are counted in `zion_connections_rejected_per_ip`.
+# max_connections_per_ip = 256
+
 # Trusted proxy CIDR ranges. When the TCP peer matches one of these,
 # the real client IP is extracted from X-Forwarded-For using the
 # rightmost-untrusted-hop algorithm. Leave empty when Zion is the front

@@ -146,6 +146,13 @@ pub struct ServerConfig {
     /// Rate limit window in seconds. Default: 1.
     #[serde(default = "default_rate_window")]
     pub rate_limit_window_secs: u64,
+    /// Max *concurrent* connections from a single source IP. 0 = unlimited
+    /// (default). This is the connection-exhaustion lever: rate_limit_rps
+    /// caps request frequency, this caps how many sockets one source can
+    /// hold open at once — the resource a slow/backed flood actually
+    /// drains. The global ceiling is the platform connection semaphore.
+    #[serde(default)]
+    pub max_connections_per_ip: u32,
     /// Log format: "text" (default) or "json".
     #[serde(default = "default_log_format")]
     pub log_format: String,
