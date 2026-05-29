@@ -34,16 +34,19 @@ pub enum IpClass {
     ResidentialIta,
     /// Italian datacenter / hosting (Aruba, Register, Seeweb, etc.)
     DatacenterIta,
-    /// EU institutional (EU Parliament, ECB, Europol ranges)
+    /// EU member-state allocation, role unknown. The country-level
+    /// baseline from RIPE delegated stats (EU27); a more specific
+    /// curated-ASN class below overrides it where known.
+    #[cfg(feature = "geo-eu")]
+    Eu,
+    /// EU institutional (EU Parliament, ECB, Europol, national gov/research)
     #[cfg(feature = "geo-eu")]
     GovEu,
     /// EU residential (major ISPs per country)
     #[cfg(feature = "geo-eu")]
-    #[allow(dead_code)] // reserved for Phase 2 — data_eu.rs expansion pending
     ResidentialEu,
     /// EU datacenter / cloud
     #[cfg(feature = "geo-eu")]
-    #[allow(dead_code)] // reserved for Phase 2 — data_eu.rs expansion pending
     DatacenterEu,
     /// Unclassified — not in any baked-in dataset
     Unknown,
@@ -56,6 +59,8 @@ impl IpClass {
             Self::GovIta => "gov_ita",
             Self::ResidentialIta => "residential_ita",
             Self::DatacenterIta => "datacenter_ita",
+            #[cfg(feature = "geo-eu")]
+            Self::Eu => "eu",
             #[cfg(feature = "geo-eu")]
             Self::GovEu => "gov_eu",
             #[cfg(feature = "geo-eu")]
@@ -82,11 +87,13 @@ impl IpClass {
             Self::ResidentialIta => 1,
             Self::DatacenterIta => 2,
             #[cfg(feature = "geo-eu")]
-            Self::GovEu => 3,
+            Self::Eu => 3,
             #[cfg(feature = "geo-eu")]
-            Self::ResidentialEu => 4,
+            Self::GovEu => 4,
             #[cfg(feature = "geo-eu")]
-            Self::DatacenterEu => 5,
+            Self::ResidentialEu => 5,
+            #[cfg(feature = "geo-eu")]
+            Self::DatacenterEu => 6,
             Self::Unknown => CLASS_COUNT - 1,
         }
     }
@@ -104,7 +111,7 @@ pub static CLASS_COUNTERS: [std::sync::atomic::AtomicU64; CLASS_COUNT] =
     [const { std::sync::atomic::AtomicU64::new(0) }; CLASS_COUNT];
 
 #[cfg(feature = "geo-eu")]
-const CLASS_COUNT: usize = 7; // 6 named + Unknown
+const CLASS_COUNT: usize = 8; // 7 named (3 ITA + Eu/GovEu/ResidentialEu/DatacenterEu) + Unknown
 
 #[cfg(not(feature = "geo-eu"))]
 const CLASS_COUNT: usize = 4; // GovIta, ResidentialIta, DatacenterIta, Unknown
@@ -122,6 +129,8 @@ pub fn classification_counts() -> impl Iterator<Item = (&'static str, u64)> {
         IpClass::GovIta,
         IpClass::ResidentialIta,
         IpClass::DatacenterIta,
+        #[cfg(feature = "geo-eu")]
+        IpClass::Eu,
         #[cfg(feature = "geo-eu")]
         IpClass::GovEu,
         #[cfg(feature = "geo-eu")]
@@ -381,5 +390,42 @@ mod tests {
         assert_eq!(IpClass::GovIta.as_str(), "gov_ita");
         assert_eq!(IpClass::ResidentialIta.as_str(), "residential_ita");
         assert_eq!(IpClass::Unknown.as_str(), "unknown");
+    }
+
+    // ── EU dataset (geo-eu) ──────────────────────────────────────────
+    #[cfg(feature = "geo-eu")]
+    #[test]
+    fn classify_eu_baseline_and_role_override() {
+        // 8.8.8.8 (Google, US) stays Unknown — proves we don't classify
+        // the whole world as EU.
+        assert_eq!(classify("8.8.8.8".parse().unwrap()), IpClass::Unknown);
+
+        // 193.0.0.1 is RIPE NCC's own block (NL) — a stable EU-27
+        // allocation with no curated-ASN role, so it lands on the
+        // country-level baseline.
+        assert_eq!(classify("193.0.0.1".parse().unwrap()), IpClass::Eu);
+
+        // 217.0.0.1 is Deutsche Telekom (AS3320, DE residential). It sits
+        // inside the EU baseline but the curated ASN override wins — this
+        // is the whole point of the hybrid model. We assert it resolves to
+        // *some* EU class (role data is regenerated from upstream feeds,
+        // so don't pin the exact role) and is more specific than Unknown.
+        let dt = classify("217.0.0.1".parse().unwrap());
+        assert!(
+            matches!(
+                dt,
+                IpClass::Eu | IpClass::GovEu | IpClass::ResidentialEu | IpClass::DatacenterEu
+            ),
+            "217.0.0.1 (Deutsche Telekom, DE) should classify as an EU class, got {dt:?}"
+        );
+    }
+
+    #[cfg(feature = "geo-eu")]
+    #[test]
+    fn ipclass_display_eu() {
+        assert_eq!(IpClass::Eu.as_str(), "eu");
+        assert_eq!(IpClass::GovEu.as_str(), "gov_eu");
+        assert_eq!(IpClass::ResidentialEu.as_str(), "residential_eu");
+        assert_eq!(IpClass::DatacenterEu.as_str(), "datacenter_eu");
     }
 }

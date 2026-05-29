@@ -8,49 +8,61 @@ on:
     # Manual trigger for immediate refresh
 
 # Top-level: read-only by default. Write scopes are granted per-job
-# below (only `refresh-ita` actually needs them, and only to push a
-# branch + open a PR). Scopes any future job we add will start at
-# read-only and have to opt in.
+# below (only the refresh job actually needs them, and only to push a
+# branch + open a PR). Any future job starts read-only and has to opt in.
 permissions:
   contents: read
 
 jobs:
-  refresh-ita:
+  # One leg per baked-in dataset. `ita` is ASN-role only; `eu` is the
+  # hybrid country-baseline + curated-ASN-role model. Both regenerate
+  # from the same authoritative sources and open their own refresh PR.
+  refresh:
+    name: refresh ${{ matrix.region }}
     runs-on: ubuntu-latest
     permissions:
       contents: write       # push the auto-generated branch
       pull-requests: write  # open the refresh PR
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - region: ita
+            output: src/sovereign/data_ita.rs
+            adjective: Italian
+          - region: eu
+            output: src/sovereign/data_eu.rs
+            adjective: EU-27
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-    - name: Download RIPE NCC RIS dump (IT country)
+    - name: Download RIPE NCC delegated stats + IPtoASN
       run: |
         mkdir -p .sovereign-data
-        # Download latest RIPE NCC delegated stats (authoritative source for IP allocation)
+        # RIPE NCC delegated stats — authoritative IP allocation by country.
         curl -sL https://ftp.ripe.net/pub/stats/ripencc/delegated-ripencc-latest \
           -o .sovereign-data/delegated-ripencc-latest
-        # Download IPtoASN bulk data (Team Cymru, free)
+        # IPtoASN bulk data (Team Cymru, free) — ASN → prefix mapping.
         curl -sL https://iptoasn.com/data/ip2asn-v4.tsv.gz \
           -o .sovereign-data/ip2asn-v4.tsv.gz
         gunzip -f .sovereign-data/ip2asn-v4.tsv.gz
 
-    - name: Generate data_ita.rs
+    - name: Generate ${{ matrix.output }}
       run: |
         python3 scripts/generate_sovereign_data.py \
-          --country IT \
+          --region ${{ matrix.region }} \
           --ripe .sovereign-data/delegated-ripencc-latest \
           --iptoasn .sovereign-data/ip2asn-v4.tsv \
-          --output src/sovereign/data_ita.rs \
-          --module-name data_ita
+          --output ${{ matrix.output }}
 
     - name: Check for changes
       id: diff
       run: |
-        if git diff --quiet src/sovereign/data_ita.rs; then
+        if git diff --quiet ${{ matrix.output }}; then
           echo "changed=false" >> "$GITHUB_OUTPUT"
         else
-          LINES_ADDED=$(git diff --stat src/sovereign/data_ita.rs | tail -1 | grep -oP '\d+ insertion' | grep -oP '\d+' || echo "0")
-          LINES_REMOVED=$(git diff --stat src/sovereign/data_ita.rs | tail -1 | grep -oP '\d+ deletion' | grep -oP '\d+' || echo "0")
+          LINES_ADDED=$(git diff --stat ${{ matrix.output }} | tail -1 | grep -oP '\d+ insertion' | grep -oP '\d+' || echo "0")
+          LINES_REMOVED=$(git diff --stat ${{ matrix.output }} | tail -1 | grep -oP '\d+ deletion' | grep -oP '\d+' || echo "0")
           echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "added=$LINES_ADDED" >> "$GITHUB_OUTPUT"
           echo "removed=$LINES_REMOVED" >> "$GITHUB_OUTPUT"
@@ -59,18 +71,18 @@ jobs:
     - name: Create PR
       if: steps.diff.outputs.changed == 'true'
       run: |
-        BRANCH="sovereign-data-$(date +%Y%m%d)"
+        BRANCH="sovereign-data-${{ matrix.region }}-$(date +%Y%m%d)"
         git checkout -b "$BRANCH"
-        git add src/sovereign/data_ita.rs
-        git commit -m "data(sovereign): weekly Italian CIDR refresh
+        git add ${{ matrix.output }}
+        git commit -m "data(sovereign): weekly ${{ matrix.adjective }} CIDR refresh
 
         Source: RIPE NCC delegated + IPtoASN ($(date +%Y-%m-%d))
         Changes: +${{ steps.diff.outputs.added }} -${{ steps.diff.outputs.removed }} lines"
 
         git push origin "$BRANCH"
         gh pr create \
-          --title "data(sovereign): weekly Italian CIDR refresh ($(date +%Y-%m-%d))" \
-          --body "Automated weekly refresh of Italian ASN/CIDR ranges from authoritative sources.
+          --title "data(sovereign): weekly ${{ matrix.adjective }} CIDR refresh ($(date +%Y-%m-%d))" \
+          --body "Automated weekly refresh of ${{ matrix.adjective }} ASN/CIDR ranges from authoritative sources.
 
         **Sources:**
         - RIPE NCC delegated stats: \`ftp.ripe.net/pub/stats/ripencc/delegated-ripencc-latest\`
