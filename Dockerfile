@@ -60,8 +60,11 @@ RUN mkdir -p src benches && \
     rm -rf src benches target/release/zion target/release/zion.d \
            target/release/deps/zion-* target/release/build/zion-*
 
-# Real source.
+# Real source. `benches/` is copied too: the manifest declares `[[bench]]`
+# targets, and Cargo won't parse it if their files are absent (the binary
+# build below doesn't compile benches, so this only satisfies the parse).
 COPY src/ src/
+COPY benches/ benches/
 COPY .cargo/ .cargo/
 RUN cargo build --release --locked && \
     strip target/release/zion && \
