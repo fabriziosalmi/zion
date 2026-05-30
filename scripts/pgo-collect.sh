@@ -48,23 +48,35 @@ echo "  duration  : ${WORKLOAD_SECONDS}s × 3 endpoints"
 # ── 1. Backend ────────────────────────────────────────────────────────
 # The Go test-server is shipped in-tree under benchmarks/backend/. Go is
 # preinstalled on ubuntu-latest; on macOS the runner has it too.
+# Declared up-front (empty) so the EXIT trap is safe under `set -u` even
+# if we bail out before Zion starts.
+ZION_PID=""
+
+# Build the backend *synchronously* first, then run the compiled binary.
+# `go run … &` backgrounds the compile + module-fetch, which on a cold
+# runner can outlast the readiness wait and lose the race ("backend never
+# became ready"). A pre-built binary starts effectively instantly, and a
+# build failure surfaces here instead of as a silent timeout.
+echo "[1/5] building backend"
+BACKEND_BIN="$(mktemp -t pgo-backend-XXXXXX)"
+( cd benchmarks/backend && go build -o "$BACKEND_BIN" test-server.go )
 echo "[1/5] starting backend on :$BACKEND_PORT"
-cd benchmarks/backend
-go run test-server.go > /tmp/pgo-backend.log 2>&1 &
+"$BACKEND_BIN" > /tmp/pgo-backend.log 2>&1 &
 BACKEND_PID=$!
-cd "$OLDPWD"
 
 cleanup() {
   set +e
   kill "$BACKEND_PID" 2>/dev/null || true
-  kill "$ZION_PID" 2>/dev/null || true
+  [ -n "${ZION_PID:-}" ] && kill "$ZION_PID" 2>/dev/null || true
   wait "$BACKEND_PID" 2>/dev/null || true
-  wait "$ZION_PID" 2>/dev/null || true
+  [ -n "${ZION_PID:-}" ] && wait "$ZION_PID" 2>/dev/null || true
+  rm -f "$BACKEND_BIN" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-# Wait for backend ready (max 10 s).
-for _ in $(seq 1 20); do
+# Wait for backend ready (the binary is already built, so this only covers
+# process startup + port bind, but keep margin for slow CI).
+for _ in $(seq 1 40); do
   if curl -fsS "http://127.0.0.1:${BACKEND_PORT}/api/v1/data" >/dev/null 2>&1; then
     break
   fi
