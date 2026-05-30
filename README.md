@@ -169,17 +169,15 @@ leave on under load. Defence is layered, outside-in:
 | **L7 — inspection** | WAF: zero-regex Aho-Corasick O(N) single-pass, Shannon entropy, simd-json structural limits, 5 gates. | ✅ shipping |
 | **Origin tagging** | IT/EU range classification (`--features geo-ita` / `geo-eu`), **IPv4 + IPv6** — O(log N) binary search over baked CIDR data + one atomic, **no GeoIP DB, no syscall**. Class lands on the request (`extensions`), a metric, and an optional log. Answers "% EU vs non-EU traffic" out of the box (see [observability](https://fabriziosalmi.github.io/zion/guide/observability)). | ✅ shipping |
 | **Fleet signal** | AIMP serverless mesh (`--features sovereign-aimp`): Ed25519-signed UDP gossip of blocks + IP-reputation, source-bound revocation, no central control plane. Reputation rides to the upstream as `X-Zion-Mesh-Score`. | ✅ shipping (advisory) |
+| **Tag-driven enforcement** | `[sovereign.enforce]` (`#150`) promotes the origin tag / mesh score from *signal* to an opt-in `403` deny — e.g. `deny = ["unknown"]` blocks every non-EU source while EU classes pass (sovereign allowlist by complement), or deny above an AIMP reputation threshold. Off by default; local WAF / rate-limit / auth stay authoritative. Counted in `zion_enforcement_denied_total{reason}`. | ✅ shipping |
 
-**On the roadmap — the levers still to build** (tracked; PRs welcome):
+**On the roadmap — the lever still to build** (tracked; PRs welcome):
 
-- **Tag-driven enforcement** ([#150](https://github.com/fabriziosalmi/zion/issues/150)) —
-  today the origin tag and mesh score are *signals* (metric / header /
-  request extension). Wiring them as *active* admission knobs — e.g.
-  tighter rate-limit or tarpit for non-EU or low-reputation sources,
-  allowlist your sovereign ranges — is the next lever.
 - **L7 tarpit / slow-drip** ([#151](https://github.com/fabriziosalmi/zion/issues/151)) —
-  hold flagged connections instead of a clean `429`, so a backed
-  attacker pays wall-clock and socket budget.
+  hold flagged connections (those an enforcement policy or a rate/conn
+  breach marks) instead of a clean `429`, so a backed attacker pays
+  wall-clock and socket budget. Bounded by a hard concurrency ceiling
+  (the per-IP connection-limit primitive) so it can't self-DoS.
 
 The design rule: tagging and reputation never *silently* gate — the
 operator opts a signal into enforcement explicitly, and the local
@@ -311,7 +309,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 ```
 
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-39 modules, ~25,600 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+39 modules, ~25,800 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Benchmarking
 
@@ -337,7 +335,7 @@ Results saved to `benchmarks/bench-history.json` with automatic delta comparison
 ## Testing
 
 ```bash
-# Unit tests (561) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
+# Unit tests (565) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
 cargo test
 
 # Integration tests (19 -- requires running Zion + backend)

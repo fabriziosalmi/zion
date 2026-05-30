@@ -342,6 +342,109 @@ pub struct SovereignConfig {
     /// Log IP classification in structured request logs.
     #[serde(default = "default_true")]
     pub log_classification: bool,
+
+    /// Tag-driven enforcement policy (`[sovereign.enforce]`, issue #150).
+    /// Off by default — classification stays a pure signal unless the
+    /// operator opts a class (or a mesh-reputation threshold) into a
+    /// hard deny.
+    #[serde(default)]
+    pub enforce: EnforceConfig,
+}
+
+/// `[sovereign.enforce]` — promotes the origin tag / mesh-reputation
+/// score from *signal* to an opt-in admission gate (issue #150). Disabled
+/// by default. The local WAF / rate-limiter / auth gates stay
+/// authoritative; this only adds a deny on top.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct EnforceConfig {
+    /// Master switch. Default: false (signals-only).
+    #[serde(default)]
+    pub enabled: bool,
+    /// `IpClass` labels (as in [`IpClass::as_str`], e.g. `"unknown"`,
+    /// `"datacenter_eu"`) whose requests are denied with `403`. On a
+    /// `geo-eu` build, `["unknown"]` denies every non-EU source while the
+    /// EU classes pass — the sovereign allowlist *by complement*.
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// Deny (`403`) when the AIMP mesh reputation score for the source
+    /// exceeds this threshold. `0.0` = off (default). Promotes the mesh
+    /// score from advisory header to optional hard gate (ADR-0008
+    /// high-confidence path). Requires `--features sovereign-aimp`.
+    #[serde(default)]
+    pub mesh_score_deny_above: f32,
+}
+
+impl Default for EnforceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            deny: Vec::new(),
+            mesh_score_deny_above: 0.0,
+        }
+    }
+}
+
+/// Resolved, hot-path form of [`EnforceConfig`]: deny labels lowercased
+/// into a set for O(1) membership. Pure decision methods so the policy is
+/// unit-testable without a live request.
+#[derive(Debug, Clone, Default)]
+pub struct EnforcePolicy {
+    pub enabled: bool,
+    deny: std::collections::HashSet<String>,
+    mesh_score_deny_above: f32,
+}
+
+impl EnforcePolicy {
+    pub fn from_config(c: &EnforceConfig) -> Self {
+        Self {
+            enabled: c.enabled,
+            deny: c.deny.iter().map(|s| s.to_ascii_lowercase()).collect(),
+            mesh_score_deny_above: c.mesh_score_deny_above,
+        }
+    }
+
+    /// True if a request from `class_label` should be denied (`403`).
+    #[inline]
+    pub fn denies_class(&self, class_label: &str) -> bool {
+        self.enabled && self.deny.contains(class_label)
+    }
+
+    /// True if a source with mesh reputation `score` should be denied.
+    #[inline]
+    #[allow(dead_code)] // only reached on `--features sovereign-aimp`
+    pub fn denies_score(&self, score: f32) -> bool {
+        self.enabled && self.mesh_score_deny_above > 0.0 && score > self.mesh_score_deny_above
+    }
+
+    /// Deny labels that don't match any known `IpClass` — surfaced at
+    /// config-load so a typo (`"datacentre_eu"`) doesn't silently no-op.
+    pub fn unknown_deny_labels(&self) -> Vec<&str> {
+        let known = known_class_labels();
+        self.deny
+            .iter()
+            .filter(|l| !known.contains(&l.as_str()))
+            .map(|s| s.as_str())
+            .collect()
+    }
+}
+
+/// Every `IpClass` label valid in the current build (the EU labels exist
+/// only under `--features geo-eu`). Used to validate enforcement config.
+pub fn known_class_labels() -> &'static [&'static str] {
+    &[
+        "gov_ita",
+        "residential_ita",
+        "datacenter_ita",
+        #[cfg(feature = "geo-eu")]
+        "eu",
+        #[cfg(feature = "geo-eu")]
+        "gov_eu",
+        #[cfg(feature = "geo-eu")]
+        "residential_eu",
+        #[cfg(feature = "geo-eu")]
+        "datacenter_eu",
+        "unknown",
+    ]
 }
 
 impl Default for SovereignConfig {
@@ -352,6 +455,7 @@ impl Default for SovereignConfig {
             signals: false,
             signal_listen: "0.0.0.0:9443".to_string(),
             log_classification: true,
+            enforce: EnforceConfig::default(),
         }
     }
 }
@@ -483,6 +587,63 @@ mod tests {
         assert_eq!(IpClass::GovEu.as_str(), "gov_eu");
         assert_eq!(IpClass::ResidentialEu.as_str(), "residential_eu");
         assert_eq!(IpClass::DatacenterEu.as_str(), "datacenter_eu");
+    }
+
+    // ── Tag-driven enforcement policy (issue #150) ───────────────────
+    #[test]
+    fn enforce_disabled_denies_nothing() {
+        let p = EnforcePolicy::from_config(&EnforceConfig {
+            enabled: false,
+            deny: vec!["unknown".into()],
+            mesh_score_deny_above: 0.5,
+        });
+        assert!(!p.denies_class("unknown"));
+        assert!(!p.denies_score(0.99));
+    }
+
+    #[test]
+    fn enforce_denies_listed_class_case_insensitively() {
+        let p = EnforcePolicy::from_config(&EnforceConfig {
+            enabled: true,
+            deny: vec!["Unknown".into(), "DATACENTER_EU".into()],
+            mesh_score_deny_above: 0.0,
+        });
+        assert!(p.denies_class("unknown"));
+        assert!(p.denies_class("datacenter_eu"));
+        // A class not on the list passes (the sovereign-allowlist-by-complement).
+        assert!(!p.denies_class("residential_eu"));
+        assert!(!p.denies_class("gov_ita"));
+    }
+
+    #[test]
+    fn enforce_score_threshold_is_strict_and_off_at_zero() {
+        let off = EnforcePolicy::from_config(&EnforceConfig {
+            enabled: true,
+            deny: vec![],
+            mesh_score_deny_above: 0.0, // 0 = disabled
+        });
+        assert!(!off.denies_score(1.0));
+
+        let p = EnforcePolicy::from_config(&EnforceConfig {
+            enabled: true,
+            deny: vec![],
+            mesh_score_deny_above: 0.9,
+        });
+        assert!(p.denies_score(0.91));
+        assert!(!p.denies_score(0.9)); // strict `>`, equal does not deny
+        assert!(!p.denies_score(0.5));
+    }
+
+    #[test]
+    fn enforce_flags_typoed_deny_labels() {
+        let p = EnforcePolicy::from_config(&EnforceConfig {
+            enabled: true,
+            deny: vec!["unknown".into(), "datacentre_eu".into()], // British typo
+            mesh_score_deny_above: 0.0,
+        });
+        let unknown = p.unknown_deny_labels();
+        assert!(unknown.contains(&"datacentre_eu"));
+        assert!(!unknown.contains(&"unknown"));
     }
 
     #[cfg(feature = "geo-eu")]

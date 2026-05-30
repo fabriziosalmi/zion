@@ -403,6 +403,12 @@ pub struct Metrics {
     /// Connections closed at accept because the source IP was already at
     /// its `max_connections_per_ip` concurrent cap (anti-DDoS lever).
     pub connections_rejected_per_ip: AtomicU64,
+    /// Requests denied (403) by tag-driven enforcement because the origin
+    /// class is on the `[sovereign.enforce] deny` list (#150).
+    pub enforcement_denied_class: AtomicU64,
+    /// Requests denied (403) by tag-driven enforcement because the AIMP
+    /// mesh reputation score exceeded `mesh_score_deny_above` (#150).
+    pub enforcement_denied_mesh_score: AtomicU64,
 
     // ── Mesh observability (issue #69) ──────────────────────────────
     // Always-on counters (zero on builds without `--features
@@ -467,6 +473,8 @@ impl Metrics {
             connections_total: AtomicU64::new(0),
             tls_handshake_errors: AtomicU64::new(0),
             connections_rejected_per_ip: AtomicU64::new(0),
+            enforcement_denied_class: AtomicU64::new(0),
+            enforcement_denied_mesh_score: AtomicU64::new(0),
             mesh_claims_emitted: AtomicU64::new(0),
             mesh_claims_received: AtomicU64::new(0),
             mesh_claims_dropped_signature: AtomicU64::new(0),
@@ -648,6 +656,24 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.connections_rejected_per_ip.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_enforcement_denied_total Requests denied (403) by tag-driven enforcement.\n\
+                                # TYPE zion_enforcement_denied_total counter\n\
+                                zion_enforcement_denied_total{reason=\"class\"} ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.enforcement_denied_class.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\nzion_enforcement_denied_total{reason=\"mesh_score\"} ");
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.enforcement_denied_mesh_score.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");

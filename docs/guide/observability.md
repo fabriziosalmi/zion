@@ -95,6 +95,21 @@ table and a parallel `u128` table; IPv4-mapped IPv6 folds onto the v4
 path). `unknown` therefore means an IP in no dataset — genuinely non-EU
 on the `geo-eu` build, or unclassified-by-ASN on `geo-ita`.
 
+**Tag-driven enforcement (`[sovereign.enforce]`).** By default the class
+is a pure *signal*. The operator can opt a class (or an AIMP
+mesh-reputation threshold) into a hard `403` deny — e.g. `deny =
+["unknown"]` on a `geo-eu` build blocks every non-EU source while the EU
+classes pass (the sovereign allowlist *by complement*). Denials are
+counted, split by reason:
+
+```
+zion_enforcement_denied_total{reason="class"}       1043
+zion_enforcement_denied_total{reason="mesh_score"}    77
+```
+
+The local WAF / rate-limiter / auth gates stay authoritative — enforcement
+only *adds* a deny on top, and is off until configured.
+
 ## Access log
 
 Every successful request emits one structured `tracing::info!`
