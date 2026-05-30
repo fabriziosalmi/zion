@@ -161,6 +161,13 @@ jobs:
         run: rm -f rust-toolchain.toml
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          # `llvm-tools` ships rustc's *own* `llvm-profdata`, whose raw
+          # profile format always matches the compiler that wrote the
+          # `.profraw` files. A system llvm-profdata can be older (profraw
+          # version mismatch → "no profile can be merged"). Needed by the
+          # PGO merge step; harmless on the non-PGO legs.
+          components: llvm-tools
 
       - name: Install matrix target
         shell: bash
@@ -271,7 +278,12 @@ jobs:
         env:
           PGO_DIR: ${{ runner.temp }}/pgo-data
         run: |
-          PROFDATA=$(command -v llvm-profdata 2>/dev/null \
+          # Prefer rustc's bundled llvm-profdata (from the `llvm-tools`
+          # component) — its raw-profile format always matches the rustc
+          # that produced the .profraw files. Fall back to a system one
+          # only if that's somehow missing.
+          PROFDATA=$(ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-profdata 2>/dev/null | head -1 || true)
+          [[ -n "$PROFDATA" ]] || PROFDATA=$(command -v llvm-profdata 2>/dev/null \
             || command -v llvm-profdata-14 2>/dev/null \
             || command -v llvm-profdata-15 2>/dev/null \
             || command -v llvm-profdata-16 2>/dev/null \
@@ -279,9 +291,10 @@ jobs:
             || command -v llvm-profdata-18 2>/dev/null \
             || true)
           if [[ -z "$PROFDATA" ]]; then
-            echo "::error::llvm-profdata not found on PATH"
+            echo "::error::llvm-profdata not found (install the llvm-tools component)"
             exit 1
           fi
+          echo "using llvm-profdata: $PROFDATA"
           "$PROFDATA" merge -o "${PGO_DIR}/merged.profdata" "${PGO_DIR}"/*.profraw
           # No `cargo clean` needed: Cargo's fingerprint includes
           # RUSTFLAGS, so swapping `-Cprofile-generate` → `-Cprofile-use`
