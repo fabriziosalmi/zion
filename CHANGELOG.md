@@ -4,8 +4,47 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-30
+
+The first tagged release since v0.2.2. Completes the **v0.3 — Compliance
+frontier** milestone (BoGo TLS conformance in CI) and ships the
+**Sovereign Edge** origin tagging (IT/EU, IPv4 + IPv6) plus the first
+**anti-DDoS admission levers** (per-IP concurrent-connection limit,
+tag-driven enforcement). The full OpenTelemetry stack moved to 0.32 and
+the CI / supply-chain were hardened. Supersedes the unreleased 0.2.3 line.
+
 ### Added
 
+- **BoGo TLS conformance suite in CI (#56)**
+  ([`.github/workflows/tls-conformance.yml`](.github/workflows/tls-conformance.yml)).
+  Runs BoringSSL's BoGo suite (~600 cases) against the exact `rustls` +
+  `aws-lc-rs` versions zion pins — version-locked, so a future
+  `Cargo.lock` bump that regresses conformance goes red on the bumping
+  PR. Closes the v0.3 milestone. Corrected the long-standing doc/issue
+  myth that BoGo could be pointed at zion's `:443` (it drives a *shim*).
+- **Sovereign Edge — IT/EU origin tagging, IPv4 + IPv6 (#147)**
+  (`--features geo-ita` / `geo-eu`). Classifies the client IP via an
+  O(log N) binary search over baked CIDR tables (a `u32` table + a
+  parallel `u128` table for IPv6) — no GeoIP DB, no syscall, one atomic.
+  `geo-eu` is a hybrid model: every EU-27 RIPE allocation is the
+  `Eu` baseline, curated EU ASN sets override it with gov/residential/
+  datacenter roles. Answers "% EU vs non-EU traffic" out of the box via
+  `zion_sovereign_classifications_total{class}`. Dataset auto-refreshes
+  weekly (`sovereign-data.yml`, RIPE NCC + Team Cymru).
+- **Per-IP concurrent-connection limit (#155)** —
+  `server.max_connections_per_ip` (0 = off). Caps how many sockets one
+  source IP may hold open at once, enforced at accept *before* the TLS
+  handshake (the resource a slow/backed flood drains). RAII release,
+  zero overhead when disabled, hot-reloadable. Metric
+  `zion_connections_rejected_per_ip`.
+- **Tag-driven enforcement (#150)** — `[sovereign.enforce]` promotes the
+  origin tag / AIMP mesh score from a *signal* to an opt-in `403` deny.
+  `deny = ["unknown"]` on a `geo-eu` build blocks every non-EU source
+  while the EU classes pass (sovereign allowlist by complement), or deny
+  above a mesh-reputation threshold. Off by default; local WAF /
+  rate-limit / auth stay authoritative. Metric
+  `zion_enforcement_denied_total{reason}`. A README "Sovereign edge &
+  DDoS resistance" section maps the layered defence.
 - **ACME issue → renew → revoke soak in CI (#59)**
   ([`.github/workflows/acme-soak.yml`](.github/workflows/acme-soak.yml),
   [`src/acme.rs`](src/acme.rs)). New `acme-soak` weekly + on-demand
@@ -216,6 +255,20 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Changed
 
+- **OpenTelemetry stack migrated 0.27 → 0.32 (#145)** — adapted
+  `src/observability.rs` to the post-0.28 SDK API (`SdkTracerProvider`,
+  `with_batch_exporter` without a runtime arg, `Resource::builder`,
+  semconv `attribute::`). All target versions are MSRV 1.75. The
+  cargo-vet baseline was regenerated for the new transitive crates
+  (prost 0.14, tonic 0.14, …).
+- **CI hardening.** `cargo-audit` / `cargo-vet` now install as **prebuilt
+  binaries** (`taiki-e/install-action`) instead of building from source,
+  eliminating an intermittent self-hosted-runner build flake (#154).
+  Three high-volume workflows (supply-chain, CodeQL, DCO) moved to
+  self-hosted runners (#144); `supply-chain.yml` forces
+  `RUSTUP_TOOLCHAIN=stable` so the repo's pinned 1.88.0 toolchain can't
+  break the audit jobs (#146).
+- **Security:** `tar` 0.4.45 → 0.4.46 (Dependabot rust-security group).
 - **`cargo-vet` promoted to a required CI gate** — `supply-chain/`
   baseline committed via `cargo vet init`, with audit imports from
   Mozilla, Google, Embark, Bytecode Alliance, ISRG, and Zcash
