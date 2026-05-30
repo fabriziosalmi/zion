@@ -46,10 +46,18 @@ RUN apt-get update && \
 # /usr/local/cargo/registry survives the next COPY thanks to BuildKit's
 # layer cache, so application changes don't rebuild every dep.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-RUN mkdir -p src && \
+RUN mkdir -p src benches && \
     echo 'fn main() {}' > src/main.rs && \
+    # The manifest declares `[[bench]]` targets (Criterion, harness=false);
+    # Cargo refuses to even parse it if their source files are absent. Create
+    # empty placeholders for whatever benches Cargo.toml lists (read from the
+    # manifest so the set never drifts) — `cargo build --release` doesn't
+    # compile benches, so empty files are enough. The real sources are copied
+    # for the application build below.
+    awk '/^\[\[bench\]\]/{b=1} b&&/^name[[:space:]]*=/{gsub(/[" ]/,"",$3); print $3; b=0}' Cargo.toml \
+      | while IFS= read -r bench; do : > "benches/${bench}.rs"; done && \
     cargo build --release --locked && \
-    rm -rf src target/release/zion target/release/zion.d \
+    rm -rf src benches target/release/zion target/release/zion.d \
            target/release/deps/zion-* target/release/build/zion-*
 
 # Real source.
