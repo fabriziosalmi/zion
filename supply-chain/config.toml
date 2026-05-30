@@ -1215,7 +1215,7 @@ version = "0.6.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tar]]
-version = "0.4.45"
+version = "0.4.46"
 criteria = "safe-to-deploy"
 
 [[exemptions.thiserror]]
