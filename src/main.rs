@@ -203,6 +203,12 @@ pub(crate) struct ResolvedAppConfig {
     /// Max concurrent connections per source IP. 0 = disabled. Read at
     /// accept, so a hot-reload retunes the cap without dropping live conns.
     pub(crate) max_connections_per_ip: u32,
+    /// Resolved tag-driven enforcement policy (`[sovereign.enforce]`, #150).
+    /// Lives under the geo-gated `[sovereign]` block (class deny needs the
+    /// dataset). Disabled by default. Mesh-score deny additionally needs
+    /// `--features sovereign-aimp`.
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    pub(crate) enforce: sovereign::EnforcePolicy,
     /// Pre-parsed listen address for plain HTTP. `None` if the config
     /// string is malformed; the listener supervisor logs the parse error
     /// at reload time and keeps the previously-bound listener.
@@ -240,6 +246,8 @@ impl ResolvedAppConfig {
             rate_limit_rps: 0,
             rate_limit_window: 1,
             max_connections_per_ip: 0,
+            #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+            enforce: sovereign::EnforcePolicy::default(),
             listen_http: None,
             listen_https: None,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
@@ -350,6 +358,28 @@ impl ResolvedAppConfig {
             (sov.enabled, sov.log_classification)
         };
 
+        // Resolve the tag-driven enforcement policy (#150) and warn on any
+        // deny label that matches no known IpClass — a typo would silently
+        // never fire, which is exactly the failure an operator can't see.
+        #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+        let enforce = {
+            let policy = sovereign::EnforcePolicy::from_config(&config.sovereign.enforce);
+            if config.sovereign.enforce.enabled {
+                let unknown = policy.unknown_deny_labels();
+                if !unknown.is_empty() {
+                    logging::warn(
+                        "sovereign",
+                        &format!(
+                            "[sovereign.enforce] deny lists unknown class label(s) {:?} — they will never match (known: {:?})",
+                            unknown,
+                            sovereign::known_class_labels(),
+                        ),
+                    );
+                }
+            }
+            policy
+        };
+
         Ok(Self {
             router,
             health_map,
@@ -358,6 +388,8 @@ impl ResolvedAppConfig {
             rate_limit_rps: config.server.rate_limit_rps,
             rate_limit_window: config.server.rate_limit_window_secs,
             max_connections_per_ip: config.server.max_connections_per_ip,
+            #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+            enforce,
             listen_http,
             listen_https,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]

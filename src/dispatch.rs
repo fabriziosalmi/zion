@@ -213,6 +213,15 @@ pub(crate) async fn process_request(
             let ip_class = sovereign::classify(client_ip);
             sovereign::record_classification(ip_class);
             req.extensions_mut().insert(ip_class);
+            // Tag-driven enforcement (#150): deny classes the operator
+            // opted in. Off by default; the local WAF / rate-limit / auth
+            // gates stay authoritative — this only adds a deny on top.
+            if cfg.enforce.denies_class(ip_class.as_str()) {
+                metrics::METRICS
+                    .enforcement_denied_class
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(empty_response(StatusCode::FORBIDDEN));
+            }
             if cfg.sovereign_log_classification && ip_class != sovereign::IpClass::Unknown {
                 tracing::info!(
                     target: "sovereign",
@@ -246,6 +255,18 @@ pub(crate) async fn process_request(
             metrics::METRICS
                 .mesh_score_lookups
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Tag-driven enforcement (#150): deny low-reputation sources
+            // when the operator set a threshold. Promotes the mesh score
+            // from advisory header to optional hard gate (ADR-0008). The
+            // policy lives under the geo-gated `[sovereign]` block, so this
+            // deny is only compiled when geo is on too.
+            #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+            if cfg.enforce.denies_score(rep.score) {
+                metrics::METRICS
+                    .enforcement_denied_mesh_score
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(empty_response(StatusCode::FORBIDDEN));
+            }
             // 3 decimals so log/grep humans see a stable string;
             // upstreams parse as f32 and tolerate any precision.
             let formatted = format!("{:.3}", rep.score);

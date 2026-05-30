@@ -39,6 +39,28 @@ listen_https = "0.0.0.0:443"
 # Invalid values fall back to "append" with a startup warning.
 # xff_mode = "append"
 
+# ── Sovereign edge: IT/EU origin tagging (build with --features geo-ita
+# / geo-eu). Classifies the client IP (IPv4+IPv6) and exposes
+# `zion_sovereign_classifications_total{class}` → "% EU vs non-EU".
+# [sovereign]
+# enabled = true
+# log_classification = false   # also emit a per-request `sovereign` log line
+#
+# Tag-driven enforcement (#150) — promotes the origin tag / mesh score
+# from a *signal* to an opt-in admission DENY. Off by default. The local
+# WAF / rate-limit / auth gates stay authoritative; this only adds a deny.
+# [sovereign.enforce]
+# enabled = true
+# # IpClass labels to deny with 403. On a geo-eu build `["unknown"]` blocks
+# # every non-EU source while the EU classes pass — the sovereign allowlist
+# # by complement. Labels: eu, gov_eu, residential_eu, datacenter_eu,
+# # gov_ita, residential_ita, datacenter_ita, unknown.
+# deny = ["unknown"]
+# # Deny when the AIMP mesh reputation score exceeds this (0 = off).
+# # Requires --features sovereign-aimp. Counted in
+# # `zion_enforcement_denied_total{reason="class"|"mesh_score"}`.
+# mesh_score_deny_above = 0.9
+
 [tls]
 cert_path = "/etc/ssl/zion/tls.crt"
 key_path = "/etc/ssl/zion/tls.key"
