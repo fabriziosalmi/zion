@@ -989,6 +989,10 @@ pub fn snapshot_json(
     use serde_json::json;
 
     let m = &METRICS;
+    // Refresh the process-resource gauges so `zion top` shows live RSS and
+    // fd counts. The snapshot is already built fresh on every poll (no
+    // caching), so sampling here keeps the JSON consistent with that intent.
+    m.sample_resource_gauges();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1045,6 +1049,11 @@ pub fn snapshot_json(
             "cache_misses": m.cache_misses.load(Relaxed),
             "websocket_upgrades": m.websocket_upgrades.load(Relaxed),
             "active_connections": m.active_connections.load(Relaxed),
+            // Process self-introspection (Linux /proc/self; 0 elsewhere).
+            // RSS in bytes alongside the box total at platform.ram_mb, so
+            // `zion top` can show "of N MB total, the daemon holds X".
+            "process_resident_memory_bytes": m.process_resident_memory_bytes.load(Relaxed),
+            "process_open_fds": m.process_open_fds.load(Relaxed),
             "connections_total": m.connections_total.load(Relaxed),
             "tls_handshake_errors": m.tls_handshake_errors.load(Relaxed),
             "request_p50_us": m.request_duration.quantile_us(0.50),
