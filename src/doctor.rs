@@ -88,6 +88,7 @@ pub fn run() -> i32 {
 fn collect_checks(p: &crate::bootstrap::Platform) -> Vec<Check> {
     vec![
         check_fd_limit(),
+        check_memory_introspection(),
         check_privileged_port_80(),
         check_privileged_port_443(),
         check_somaxconn(),
@@ -138,6 +139,49 @@ fn check_fd_limit() -> Check {
     #[cfg(not(unix))]
     {
         Check::skip("fd limit", "non-unix platform")
+    }
+}
+
+/// Memory-introspection readiness. The daemon populates the
+/// `zion_process_resident_memory_bytes` gauge by reading `/proc/self/status`
+/// (`VmRSS`); this preflight confirms that source is actually readable on
+/// the deployment host and reports the current resident set size. In a
+/// hardened container that masks `/proc`, this warns up front that the RSS
+/// gauge will read 0 — so an operator doesn't discover a blind metric only
+/// while chasing a leak in production.
+fn check_memory_introspection() -> Check {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string("/proc/self/status") {
+            Ok(status) => match status
+                .lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                Some(kib) => Check::ok(
+                    "memory introspection",
+                    format!("VmRSS readable ({} MB) — /metrics RSS gauge active", kib / 1024),
+                ),
+                None => Check::warn(
+                    "memory introspection",
+                    "/proc/self/status exposes no VmRSS line",
+                    "the zion_process_resident_memory_bytes gauge will report 0 here",
+                ),
+            },
+            Err(e) => Check::warn(
+                "memory introspection",
+                format!("/proc/self/status unreadable: {e}"),
+                "unmask /proc so the RSS / open-fd gauges can populate (some hardened container runtimes mask it)",
+            ),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Check::skip(
+            "memory introspection",
+            "RSS / open-fd gauges are Linux-only (sourced from /proc/self)",
+        )
     }
 }
 
@@ -559,9 +603,9 @@ mod tests {
     fn collect_checks_returns_all_categories() {
         let p = synth_platform();
         let checks = collect_checks(&p);
-        // Seven canonical checks: fd, port80, port443, somaxconn, kernel,
-        // hwcrypto, aes-cal.
-        assert_eq!(checks.len(), 7);
+        // Eight canonical checks: fd, memory-introspection, port80, port443,
+        // somaxconn, kernel, hwcrypto, aes-cal.
+        assert_eq!(checks.len(), 8);
         for c in &checks {
             assert!(!c.name.is_empty());
             assert!(!c.detail.is_empty(), "empty detail in {}", c.name);
