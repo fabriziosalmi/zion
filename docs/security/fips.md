@@ -61,14 +61,17 @@ ZION_CONFIG=zion.toml ./target/release/zion
 # is the green signal.
 
 # 3. Cipher inventory — verify the offered cipher list against the
-#    FIPS-approved subset. We ship a one-off helper script:
-bash scripts/fips-self-check.sh ./target/release/zion
+#    FIPS-approved subset with a direct TLS 1.3 handshake:
+echo | openssl s_client -connect 127.0.0.1:443 -tls1_3 \
+    -ciphersuites TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256 2>/dev/null \
+    | grep -E 'Protocol|Cipher'
+# A successful handshake on an approved AEAD suite is the green signal.
 ```
 
-`scripts/fips-self-check.sh` is shipped under the `fips` feature only;
-it boots Zion, performs a `s_client` handshake against `127.0.0.1:443`
-with `-cipher` filtered to the approved subset, and asserts the
-handshake succeeds.
+> **Honest note:** there is currently **no** bundled `fips-self-check.sh`
+> helper. The `openssl s_client` cipher-inventory check above is the
+> documented manual procedure; a packaged self-check script is tracked as
+> future work, not something this repo ships today.
 
 ## Cargo / CI integration
 
@@ -81,18 +84,22 @@ build pulls in `aws-lc-fips-sys`, which:
 - is incompatible with the `aws-lc-sys` (non-FIPS) build in the same
   resolver target — they pick different `aws-lc-sys` versions.
 
-A separate CI job (`.github/workflows/ci.yml::clippy[flavor=fips]`)
-exercises the build to keep it from rotting:
-
-```yaml
-- flavor: fips
-  features: "--features fips"
-```
-
-The release pipeline does NOT publish a FIPS binary by default. To cut
-a FIPS release artifact, dispatch `release.yml` with the `flavor: fips`
-input — the matrix builds an additional asset suffixed `-fips` per
-target.
+> **Current status (honest posture):** the FIPS build is **not yet wired
+> into CI or the release pipeline.** There is no `flavor: fips` job in
+> `ci.yml`, and `release.yml` publishes no `-fips` artifact. A FIPS build
+> is therefore a **manual** `cargo build --release --features fips` today,
+> and it does **not** carry the SLSA provenance attestation that the
+> default release binaries do (see [supply-chain](supply-chain.md)).
+>
+> This matters for the FIPS *chain of custody*: a self-built FIPS binary
+> is **unattested** — you are the build authority and the custody chain is
+> yours to establish (reproducible toolchain, recorded build environment,
+> signed artifact). The validated cryptographic *module* is still
+> AWS-LC's; what an in-house build does not give you is third-party
+> evidence of *how your specific binary* was produced.
+>
+> Wiring a `fips` clippy flavor into CI (to keep the build from rotting)
+> and an attested `-fips` release asset are tracked as future work.
 
 ## Compliance posture summary
 
@@ -103,12 +110,14 @@ target.
 | Approved curves enforced | P-256, P-384, P-521 (X25519 disabled by upstream provider) |
 | Self-tests | Power-on, run by AWS-LC at process start |
 | Key generation | CTR-DRBG seeded from `getrandom(2)` |
+| Build attestation | **None for FIPS builds today** — manual build, no CI/release wiring; SLSA provenance covers the default binaries only |
 | Out of scope | Key storage, log retention, physical security |
 
 ## Related work
 
 - [Track A](../security/supply-chain.md): SLSA L3 build provenance,
-  cosign signatures — independent of FIPS but stacks with it.
+  cosign signatures — covers the **default** release binaries; it would
+  stack with FIPS once a `-fips` release artifact is published (not today).
 - [Track B](../guide/observability.md): HMAC-chained audit log uses
   the same backend, so enabling `fips` automatically uplifts the
   audit-log integrity guarantee.
