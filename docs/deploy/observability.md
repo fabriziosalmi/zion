@@ -34,6 +34,18 @@ These endpoints are handled before rate limiting and routing, ensuring they alwa
 
 All counters are lock-free atomic `u64` values. Incrementing a counter costs ~2ns (single `fetch_add` with `Relaxed` ordering).
 
+### Runtime Resource Gauges
+
+`/metrics` also exposes process self-introspection gauges, so you can watch the daemon's own footprint live — and catch a slow leak (for example ~1 MB per 1000 connections) by its RSS slope, without restarting under a profiler.
+
+| Metric | Type | Description |
+|---|---|---|
+| `zion_active_connections` | gauge | Currently active TLS connections |
+| `zion_process_resident_memory_bytes` | gauge | Resident set size of the Zion process, in bytes (Linux `/proc/self/status` `VmRSS`; `0` on other platforms) |
+| `zion_process_open_fds` | gauge | Open file descriptors held by the process (Linux `/proc/self/fd`; `0` on other platforms) |
+
+The two `process_*` gauges are sampled from `/proc/self` **once per scrape** — the `/metrics` render is cached for one second, so the two small file reads never run on the hot connection path. The same values are surfaced in `/_zion/snapshot.json` and the `zion top` TUI ("rss" / "open fds" rows). They are Linux-only; on macOS/Windows they render as `0` so one dashboard works across hosts. Run `zion doctor` to confirm the host actually exposes `/proc/self/status` — a hardened container runtime that masks `/proc` will report `0` here, and the check warns you up front.
+
 ### Prometheus Scrape Config
 
 ```yaml
@@ -63,6 +75,14 @@ zion_cache_hits / (zion_cache_hits + zion_cache_misses)
 
 # TLS handshake failure rate
 rate(zion_tls_handshake_errors[5m])
+
+# Memory-leak slope: RSS growth rate over 30m. A sustained positive
+# slope under flat request traffic is the silent-leak signal.
+deriv(zion_process_resident_memory_bytes[30m])
+
+# File-descriptor leak: open fds climbing without bound (alert if it
+# approaches the `zion doctor` fd soft limit).
+zion_process_open_fds
 ```
 
 ## X-Request-ID
