@@ -1303,4 +1303,44 @@ mod tests {
         assert!(out.contains("zion_upstream_duration_seconds_bucket"));
         assert!(out.contains("zion_tls_handshake_duration_seconds_bucket"));
     }
+
+    #[test]
+    fn render_always_emits_resource_gauges() {
+        // The gauge lines must be present on every platform (value 0 off
+        // Linux) so dashboards can scrape the same names everywhere.
+        let m = Metrics::new();
+        let out = String::from_utf8(m.render().to_vec()).unwrap();
+        assert!(out.contains("# TYPE zion_process_resident_memory_bytes gauge"));
+        assert!(out.contains("zion_process_resident_memory_bytes "));
+        assert!(out.contains("# TYPE zion_process_open_fds gauge"));
+        assert!(out.contains("zion_process_open_fds "));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resource_sampler_populates_on_linux() {
+        let m = Metrics::new();
+        assert_eq!(m.process_resident_memory_bytes.load(Relaxed), 0);
+        assert_eq!(m.process_open_fds.load(Relaxed), 0);
+        m.sample_resource_gauges();
+        // The test process has resident memory and at least the stdio fds.
+        assert!(
+            m.process_resident_memory_bytes.load(Relaxed) > 0,
+            "VmRSS should be readable from /proc/self/status on Linux"
+        );
+        assert!(
+            m.process_open_fds.load(Relaxed) > 0,
+            "open-fd count should be at least the stdio descriptors"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn resource_sampler_is_noop_off_linux() {
+        // /proc does not exist; the fallback leaves both gauges at 0.
+        let m = Metrics::new();
+        m.sample_resource_gauges();
+        assert_eq!(m.process_resident_memory_bytes.load(Relaxed), 0);
+        assert_eq!(m.process_open_fds.load(Relaxed), 0);
+    }
 }
