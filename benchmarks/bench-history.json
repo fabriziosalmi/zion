@@ -166,5 +166,29 @@
       "conns": 100,
       "method": "wrk, median of N runs, native binary"
     }
+  },
+  {
+    "commit": "d77914f",
+    "branch": "chore/release-v0.3.2",
+    "arch": "native",
+    "timestamp": "2026-06-01T17:34:57Z",
+    "tls_proxy_rps": 107220,
+    "html_rps": 102658,
+    "js_rps": 108055,
+    "png_rps": 104851,
+    "waf_post_rps": 101295,
+    "cache_hit_rps": 190532,
+    "font_rps": 92748,
+    "css_rps": 222410,
+    "sqli_blocked": 1,
+    "xss_blocked": 1,
+    "meta": {
+      "cpu": "Apple M4",
+      "os": "Darwin arm64",
+      "duration": 10,
+      "runs": 5,
+      "conns": 100,
+      "method": "wrk, median of N runs, native binary"
+    }
   }
 ]

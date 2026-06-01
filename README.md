@@ -17,7 +17,7 @@
 [![License](https://img.shields.io/github/license/fabriziosalmi/zion)](https://github.com/fabriziosalmi/zion/blob/master/LICENSE)
 
 <!-- Capabilities -->
-[![Performance](https://img.shields.io/badge/Performance-233k%20req%2Fs-success?style=flat&color=brightgreen)](https://github.com/fabriziosalmi/zion/tree/master/benchmarks)
+[![Performance](https://img.shields.io/badge/TLS_proxy-107k%20req%2Fs%20%C2%B7%20cache%20222k%20(M4)-success?style=flat&color=brightgreen)](https://github.com/fabriziosalmi/zion/tree/master/benchmarks)
 [![WAF](https://img.shields.io/badge/WAF-Zero%20Regex-orange)](https://github.com/fabriziosalmi/zion/blob/master/src/waf.rs)
 
 <p align="center">
@@ -28,56 +28,48 @@ High-performance TLS reverse proxy with built-in WAF, written in Rust.
 
 ## Performance
 
-### Native Benchmark (Apple M4, Rust backend, 5 runs x 10s, c=100)
+### Native Benchmark (Apple M4, v0.3.2, Rust backend, 5×10s, c=100, wrk)
 
-| Endpoint | Median req/s | Best Run | CV% | Errors |
-|----------|-------------|----------|-----|--------|
-| HTML SSR 5KB | **233,170** | 235,370 | 1.1% | 0 |
-| CSS 3KB (cached) | **209,573** | 215,408 | 3.4% | 0 |
-| Cache Hit JS 4KB (RAM) | **195,318** | 207,521 | 7.1% | 0 |
-| TLS Proxy API GET 1KB | **106,505** | 107,189 | 2.1% | 0 |
-| WAF POST JSON | **103,206** | 103,547 | 0.5% | 0 |
-| JS 4KB (no cache) | **102,892** | 104,135 | 1.3% | 0 |
-| PNG 8KB (no cache) | **99,496** | 101,290 | 1.7% | 0 |
-| WOFF2 16KB (no cache) | **83,870** | 86,242 | 2.5% | 0 |
-| SQLi blocked | Yes (400) | -- | -- | -- |
-| XSS blocked | Yes (400) | -- | -- | -- |
+End-to-end TLS 1.3 over loopback to a zero-overhead hyper backend. Median of 5
+runs; **0 errors (all 2xx) on every row**.
 
-**Peak**: 233K req/s HTML (TLS 1.3 e2e) -- 210K cache hit -- 107K API proxy -- 103K WAF POST (CV 0.5%)
+| Endpoint | Path | Median req/s | CV% |
+|---|---|--:|--:|
+| TLS proxy — JS 4KB | `/_next/static/chunk.js` | **108,055** | 1.3% |
+| TLS proxy — API GET 1KB | `/api/v1/data` | **107,220** | 8.3% |
+| TLS proxy — PNG 8KB | `/_next/static/hero.png` | **104,851** | 0.7% |
+| TLS proxy — HTML SSR 5KB | `/` | **102,658** | 2.8% |
+| TLS proxy — WOFF2 16KB | `/_next/static/font.woff2` | **92,748** | 0.8% |
+| TLS + **WAF** — POST JSON | `/api/v1/data` | **101,295** | 3.7% |
+| TLS + **cache hit** — JS 4KB (RAM) | `/_next/static/chunk.js` | **190,532** | 2.2% |
+| TLS + **cache hit** — CSS 3KB (RAM) | `/_next/static/style.css` | **222,410** | 1.9% |
+| **WAF** — SQLi / XSS | — | blocked (400) | — |
 
-Reproduce: `bash benchmarks/bench-native.sh`
+**Reliable baseline**: ~**100–108k req/s** end-to-end TLS proxy to a live upstream
+(92k for 16 KB bodies), ~**101k** with the WAF scanning every request, and
+**190–222k** for cache hits served from RAM — all at **zero errors**. Peak
+(cache, CSS): **222k req/s**. (Reference: the bare hyper backend tops out at
+~255k req/s, so the proxy path costs ~2.4× for TLS termination + relay.)
 
-### Fair Comparison with nginx (Docker, 1 CPU, 256 MB)
+Reproduce: `bash benchmarks/certs/generate.sh && bash benchmarks/bench-native.sh`
 
-| Endpoint | nginx 1.27 | Zion TLS | Zion WAF | Zion Full | Best Delta | Errors |
-|---|---|---|---|---|---|---|
-| API GET (1KB) | 29,404 | 27,517 | 27,438 | 27,537 | -6.3% | 0 |
-| HTML (5KB) | 25,657 | 52,581 | 53,016 | 53,368 | **+108.0%** | 0 |
-| JS (4KB) | 23,152 | 18,165 | 18,037 | 32,366 | **+39.8%** | 0 |
-| PNG (8KB) | 17,409 | 13,411 | 14,345 | 24,770 | **+42.3%** | 0 |
-| WAF POST | 27,772 | 26,173 | 25,653 | 26,909 | -3.1% | 0 |
-| CSS cached | 27,436 | 16,800 | 14,949 | 25,111 | -8.5% | 0 |
+> **Corrected number.** Earlier READMEs headlined "HTML SSR 5KB — 233k req/s".
+> That was an artifact: before v0.3.2 the bare `/` did not match the catch-all
+> route (a matchit edge case) and returned **404**, so the benchmark was timing a
+> 404 error path — not a proxied response (verified: that run was 100% non-2xx).
+> v0.3.2 (#171) fixes the routing; `/` now correctly proxies the 5 KB HTML at
+> ~103k, in line with every other proxy path. The honest baseline above replaces
+> the bogus peak.
 
-Full methodology: `bash benchmarks/bench-scientific.sh` (5 runs, CI95).
+### Fair comparison with nginx
 
-<details>
-<summary>Throughput Matrix (Apple M4, Go backend, TLS 1.3, wrk)</summary>
-
-Payload x concurrency grid -- measures end-to-end TLS throughput. These numbers use the Go backend (lower ceiling than Rust backend above).
-
-| Mode | Payload | c=1 | c=10 | c=100 |
-|---|---|---|---|---|
-| **Dynamic** (Go backend) | 1 MB | 2,067 | 3,491 | 3,138 |
-| | 10 MB | 323 | 406 | 203 |
-| | 100 MB | 9,334 | 22,758 | 18,865 |
-| **Static** (uncached proxy) | 1 MB | 14,328 | 35,543 | 46,416 |
-| | 10 MB | 11,889 | 41,116 | 53,144 |
-| | 100 MB | 15,669 | 46,118 | 39,295 |
-| **Cached RAM** (L1+L2) | 1 MB | 30,247 | 88,181 | **140,301** |
-| | 10 MB | 33,781 | 80,246 | 123,936 |
-| | 100 MB | 36,067 | 90,091 | 96,706 |
-
-</details>
+The previous Docker nginx-vs-Zion table was measured on v0.1.x (pre-#171), so its
+Zion rows shared the 404-routing artifact above and are **not trustworthy** for
+v0.3.2. The harness has been corrected (the bench image now builds on v0.3.2, and
+the error gate counts non-2xx so a 404/503-spewing run can no longer report
+"zero errors"); a refreshed apples-to-apples comparison is pending a re-run:
+`bash benchmarks/bench-scientific.sh` (HTTP/1.1 over TLS 1.3 — wrk has no h2
+client).
 
 ## Features
 
@@ -109,8 +101,8 @@ Payload x concurrency grid -- measures end-to-end TLS throughput. These numbers 
 
 **WAF (Zero-Regex, O(N) Single-Pass)**
 - Aho-Corasick scanner with two pattern sets:
-  - `balanced` (default): ~120 high-precision patterns — anchored SQLi/XSS/CMDi, specific SSRF endpoints, CVE-class strings (Log4Shell, XXE)
-  - `aggressive` (opt-in via `mode = "aggressive"`): adds ~70 broad-substring patterns (`alert(`, `eval(`, `$gt`, `os.system(`, generic event handlers) for higher recall on admin/internal routes
+  - `balanced` (default): ~100 high-precision patterns — anchored SQLi/XSS/CMDi, specific SSRF endpoints, CVE-class strings (Log4Shell, XXE)
+  - `aggressive` (opt-in via `mode = "aggressive"`): adds ~90 broad-substring patterns (`alert(`, `eval(`, `$gt`, `os.system(`, generic event handlers) for higher recall on admin/internal routes
 - Shannon entropy analysis (default 6.5 bits/byte; for JSON, computed on string literals only). Configurable threshold + kill-switch per profile.
 - simd-json structural validation (depth + string length limits)
 - Content-Type strict validation with delimiter enforcement
@@ -139,7 +131,7 @@ Payload x concurrency grid -- measures end-to-end TLS throughput. These numbers 
 **Operations**
 - Config validation at startup (fail fast, validates all profile references)
 - Graceful drain on shutdown (30s timeout, semaphore-tracked)
-- Upstream health checking (30s interval, EWMA latency, gray failure detection)
+- Adaptive upstream recovery (#173): healthy upstreams probed every 30 s; a DOWN upstream is re-probed on a per-upstream **decorrelated-jitter backoff** (100 ms → 3 s cap, AWS/Brooker), so a recovered origin returns to service in **~1.4 s instead of up to 30 s** (~21× faster, measured on the v0.3.2 e2e rig) — jitter avoids a recovery thundering-herd. EWMA latency (α=0.125) + gray-failure circuit breaker (ignores EWMA > 2000 ms). Backoff state survives config reload (Arc-reuse); request path stays lock-free.
 - Bootstrap auto-detection (CPU cores, RAM, L1d cache, AES-NI/NEON, kernel features)
 - Performance Tier badge at boot (S/A/B/C with live AES-GCM calibration)
 - Live TUI dashboard (`zion top`, opt-in `--features tui`)
@@ -302,7 +294,7 @@ See [zion.example.toml](zion.example.toml) for the full configuration reference.
 ```
 Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) -> Proxy/Cache -> Upstream
                          |                                |
-                    URI limit                  Aho-Corasick (~120 balanced / ~190 aggressive)
+                    URI limit                  Aho-Corasick (~100 balanced / ~190 aggressive)
                     Method whitelist           Entropy analysis (JSON-string-only)
                     Rate limiter              simd-json validation
                     CORS pre-flight           Depth/size limits
@@ -326,7 +318,7 @@ bash benchmarks/bench-matrix.sh --quick
 # Docker comparison vs nginx (5 runs, CI95)
 bash benchmarks/bench-scientific.sh
 
-# PGO optimized build (+10-20%)
+# PGO optimized build (~10-20% target; shipped as the -pgo release artifact)
 bash benchmarks/bench-pgo.sh
 ```
 
@@ -338,7 +330,7 @@ Results saved to `benchmarks/bench-history.json` with automatic delta comparison
 # Unit tests (580) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
 cargo test
 
-# Integration tests (19 -- requires running Zion + backend)
+# Integration tests (23 -- requires running Zion + backend)
 # 1. cd benchmarks/backend && cargo run --release &
 # 2. ZION_CONFIG=tests/zion-test.toml ./target/release/zion &
 # 3. Run:

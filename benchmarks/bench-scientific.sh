@@ -85,9 +85,13 @@ extract() {
         p50) grep "50%" "$file" | awk '{print $2}' ;;
         p99) grep "99%" "$file" | awk '{print $2}' ;;
         errors)
+            # Count BOTH socket errors AND non-2xx/3xx responses: a proxy that
+            # 404s/503s every request would otherwise report high RPS with
+            # "zero errors" and silently corrupt the table (this is exactly how
+            # a pre-#171 catch-all-root 404 once masqueraded as a 233k peak).
             local sock=$(grep "Socket errors" "$file" | awk '{print $4+$6+$8+$10}')
-            local non200=$(grep -c "Non-2xx" "$file" || true)
-            echo "${sock:-0}" ;;
+            local non2xx=$(grep "Non-2xx or 3xx" "$file" | awk '{print $NF}')
+            echo "$(( ${sock:-0} + ${non2xx:-0} ))" ;;
     esac
 }
 

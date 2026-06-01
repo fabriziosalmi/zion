@@ -2,7 +2,11 @@ FROM rust:1.86-bookworm@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57b
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
-RUN cargo build --release
+# v0.3.2's manifest declares [[bench]] targets; cargo refuses to parse the
+# manifest if their source files are absent, so the bench dir must be present
+# even for a --release (non-bench) build. (parity with the release Dockerfile)
+COPY benches/ benches/
+RUN cargo build --release --locked
 
 FROM debian:bookworm-slim@sha256:f9c6a2fd2ddbc23e336b6257a5245e31f996953ef06cd13a59fa0a1df2d5c252
 RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
