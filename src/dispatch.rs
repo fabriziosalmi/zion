@@ -1195,6 +1195,23 @@ async fn handle_static_cache(
     dyn_authority: &hyper::http::uri::Authority,
     xff_mode: proxy::XffMode,
 ) -> Result<Response<ZionBody>, hyper::Error> {
+    // Only GET is cacheable. HEAD/POST/PUT/PATCH/DELETE/OPTIONS must bypass the
+    // cache and never populate it: the cache key is the path (no method), so a
+    // non-GET 200 stored under it — a HEAD's empty body, or a POST response —
+    // would later be served to a GET (method-confusion cache poisoning).
+    if *req.method() != hyper::Method::GET {
+        return proxy::proxy_pass(
+            &state.http_client,
+            req,
+            dyn_scheme,
+            dyn_authority,
+            Some(remote_addr),
+            "https",
+            xff_mode,
+        )
+        .await;
+    }
+
     // Use full path+query as cache key to prevent cache poisoning:
     // /api?user=alice and /api?user=bob must NOT share a cache entry.
     let cache_key = req
