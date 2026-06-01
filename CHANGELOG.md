@@ -4,6 +4,45 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-06-01
+
+A focused patch on operability and documentation honesty. Makes the
+daemon's own resource footprint observable in production — the answer to
+"can you debug a silent memory leak without restarting?" — and corrects
+three FIPS-guide claims about tooling that did not exist.
+
+### Added
+
+- **Runtime resource introspection (#163)** — two new `/metrics` gauges,
+  `zion_process_resident_memory_bytes` (RSS via `/proc/self/status`
+  `VmRSS`) and `zion_process_open_fds` (`/proc/self/fd` entry count),
+  sampled **once per scrape** off the hot connection path — the existing
+  1-second render cache throttles the two `/proc/self` reads, so there is
+  no per-request cost. Surfaced on three operator planes: `/metrics`,
+  `/_zion/snapshot.json`, and the `zion top` TUI (new "rss" / "open fds"
+  rows, version-skew tolerant via `#[serde(default)]`). A steadily
+  climbing RSS or fd count under flat traffic is now visible on a
+  dashboard within one scrape cycle, no restart required. Linux-only;
+  both gauges render as `0` on other platforms so a single dashboard
+  works across hosts. No new dependencies, no `unsafe`. New Grafana
+  leak-detection queries in
+  [`docs/deploy/observability.md`](docs/deploy/observability.md).
+- **`zion doctor` memory-introspection check (#163)** — a preflight that
+  confirms `/proc/self/status` is readable on the host and reports the
+  current RSS, warning up front when a hardened container runtime masks
+  `/proc` (where the gauges would otherwise silently read `0`).
+
+### Fixed
+
+- **FIPS guide referenced tooling that does not exist (#164)** — the guide
+  promised a `scripts/fips-self-check.sh` helper, a `ci.yml` `flavor=fips`
+  job, and a `release.yml` `-fips` artifact, none of which the repo ships.
+  Rewrote [`docs/security/fips.md`](docs/security/fips.md) to the honest
+  posture: a FIPS build is a manual `cargo build --features fips` today,
+  carries no SLSA provenance attestation (unlike the default release
+  binaries), and its chain of custody is the operator's to establish.
+  CI/release wiring is noted as future work.
+
 ## [0.3.0] - 2026-05-30
 
 The first tagged release since v0.2.2. Completes the **v0.3 — Compliance
