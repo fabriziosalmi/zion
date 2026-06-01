@@ -600,11 +600,50 @@ fn normalize_unified(input: &[u8], out: &mut Vec<u8>) {
             push_norm(out, b' ');
             i += 1;
             continue;
-        } else if b == b'%' && i + 2 < len {
-            if let (Some(hi), Some(lo)) = (hex_val(input[i + 1]), hex_val(input[i + 2])) {
-                push_norm(out, (hi << 4) | lo);
-                i += 3;
-                continue;
+        } else if b == b'%' {
+            // 6-char forms first — both evade a plain %XX decoder:
+            if i + 5 < len {
+                let win = &input[i..i + 6];
+                // Overlong-UTF-8 encodings of '/' and '\' used to slip "../"
+                // past path filters (e.g. ..%c0%af..%c0%af -> ../../).
+                if win.eq_ignore_ascii_case(b"%c0%af") {
+                    push_norm(out, b'/');
+                    i += 6;
+                    continue;
+                }
+                if win.eq_ignore_ascii_case(b"%c1%9c") {
+                    push_norm(out, b'\\');
+                    i += 6;
+                    continue;
+                }
+                // IIS-style %uXXXX -> codepoint (mirrors JSON \uXXXX). Nested
+                // if-let (not an `&& let` chain) to stay within MSRV 1.82.
+                if input[i + 1] == b'u' || input[i + 1] == b'U' {
+                    if let (Some(h1), Some(h2), Some(h3), Some(h4)) = (
+                        hex_val(input[i + 2]),
+                        hex_val(input[i + 3]),
+                        hex_val(input[i + 4]),
+                        hex_val(input[i + 5]),
+                    ) {
+                        push_codepoint(
+                            out,
+                            ((h1 as u16) << 12)
+                                | ((h2 as u16) << 8)
+                                | ((h3 as u16) << 4)
+                                | (h4 as u16),
+                        );
+                        i += 6;
+                        continue;
+                    }
+                }
+            }
+            // Standard %XX.
+            if i + 2 < len {
+                if let (Some(hi), Some(lo)) = (hex_val(input[i + 1]), hex_val(input[i + 2])) {
+                    push_norm(out, (hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
             }
         }
 
@@ -616,16 +655,10 @@ fn normalize_unified(input: &[u8], out: &mut Vec<u8>) {
                 hex_val(input[i + 4]),
                 hex_val(input[i + 5]),
             ) {
-                let codepoint =
-                    ((h1 as u16) << 12) | ((h2 as u16) << 8) | ((h3 as u16) << 4) | (h4 as u16);
-
-                if codepoint <= 0xFF {
-                    push_norm(out, codepoint as u8);
-                } else {
-                    let mut utf8_buf = [0u8; 3];
-                    let ch = char::from_u32(codepoint as u32).unwrap_or('?');
-                    out.extend_from_slice(ch.encode_utf8(&mut utf8_buf).as_bytes());
-                }
+                push_codepoint(
+                    out,
+                    ((h1 as u16) << 12) | ((h2 as u16) << 8) | ((h3 as u16) << 4) | (h4 as u16),
+                );
                 i += 6;
                 continue;
             }
@@ -652,6 +685,20 @@ fn push_norm(out: &mut Vec<u8>, b: u8) {
         }
     } else {
         out.push(b.to_ascii_lowercase());
+    }
+}
+
+/// Push a decoded 16-bit codepoint (from `\uXXXX` or `%uXXXX`): the BMP-low
+/// bytes go through `push_norm` (so a decoded space/tab still collapses and
+/// letters lowercase); higher codepoints are emitted as raw UTF-8.
+#[inline]
+fn push_codepoint(out: &mut Vec<u8>, cp: u16) {
+    if cp <= 0xFF {
+        push_norm(out, cp as u8);
+    } else {
+        let mut utf8_buf = [0u8; 3];
+        let ch = char::from_u32(cp as u32).unwrap_or('?');
+        out.extend_from_slice(ch.encode_utf8(&mut utf8_buf).as_bytes());
     }
 }
 
@@ -1872,6 +1919,26 @@ mod tests {
             ),
             WafVerdict::Deny(_)
         ));
+    }
+
+    #[test]
+    fn uri_normalizes_iis_and_overlong_encodings() {
+        // IIS-style %uXXXX: %u003c -> '<', so %u003cscript trips <script.
+        assert!(
+            matches!(
+                validate_uri("/x?h=%u003cscript%u003e", WafMode::Balanced),
+                WafVerdict::Deny(_)
+            ),
+            "%uXXXX should decode like \\uXXXX"
+        );
+        // Overlong UTF-8 of '/': ..%c0%af..%c0%af -> ../../ (traversal).
+        assert!(
+            matches!(
+                validate_uri("/x?f=..%c0%af..%c0%afetc/passwd", WafMode::Balanced),
+                WafVerdict::Deny(_)
+            ),
+            "overlong %c0%af should fold to '/'"
+        );
     }
 
     #[test]
