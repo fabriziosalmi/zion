@@ -694,10 +694,14 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
             config.tls.clone(),
             Some(quic_reload_tx),
         )?;
-    }
 
-    // 4b. Predictive TTL pre-warming: pre-build TLS config before cert expires
-    tls::spawn_cert_prewarm_task(tls_acceptor_store.clone(), config.tls.clone());
+        // 4b. Predictive TTL pre-warming: pre-build the TLS config before the
+        // cert expires. It hot-swaps the acceptor and rotates the session-
+        // ticket key, so it must obey the same hot_reload switch as the watcher
+        // — otherwise it silently rotates certs/keys (breaking resumption /
+        // 0-RTT) behind an operator who set hot_reload = false.
+        tls::spawn_cert_prewarm_task(tls_acceptor_store.clone(), config.tls.clone());
+    }
 
     // 5. Build the config-derived snapshot (router, health map, trusted
     // proxies, XFF policy, rate-limit settings — everything that follows
@@ -1672,8 +1676,16 @@ async fn handle_http(
         return Ok(empty_response(StatusCode::TOO_MANY_REQUESTS));
     }
 
-    // URI length check (same as HTTPS handler)
-    if req.uri().path().len() > MAX_URI_LEN {
+    // URI length check — measure path+query, matching the HTTPS handler. The
+    // old check looked at path() only, so a short path with a multi-kilobyte
+    // query string slipped past the cap on :80 (reflected into the redirect
+    // Location and the access log).
+    let uri_len = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().len())
+        .unwrap_or_else(|| req.uri().path().len());
+    if uri_len > MAX_URI_LEN {
         return Ok(empty_response(StatusCode::URI_TOO_LONG));
     }
 
