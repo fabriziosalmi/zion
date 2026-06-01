@@ -41,6 +41,18 @@ use http_body_util::Limited;
 const MAX_URI_LEN: usize = 8192;
 const MAX_CACHEABLE_BODY: usize = 50 * 1024 * 1024;
 
+/// Per-frame idle timeout while reading a request body on the streaming WAF
+/// path: if no body frame arrives within this window the client is trickling
+/// (slow-read / slowloris-body) and we evict it with 408. This bounds the idle
+/// time *between* reads rather than total upload time, so a legit large upload
+/// over a slow-but-steady link is not penalised.
+const BODY_FRAME_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Total timeout for buffering a request body on the non-streaming path (the
+/// smaller default bodies). A trickled body trips this long before a legit
+/// upload near `max_body_mb` would.
+const BODY_COLLECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 const CACHE_CONTROL_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
 #[inline]
@@ -638,8 +650,10 @@ pub(crate) async fn process_request(
                 let mut body = body;
                 let mut early_deny: Option<&'static str> = None;
                 loop {
-                    match BodyExt::frame(&mut body).await {
-                        Some(Ok(frame)) => match frame.into_data() {
+                    match tokio::time::timeout(BODY_FRAME_IDLE_TIMEOUT, BodyExt::frame(&mut body))
+                        .await
+                    {
+                        Ok(Some(Ok(frame))) => match frame.into_data() {
                             Ok(data) => {
                                 match scanner.feed(&data) {
                                     waf::StreamVerdict::Allow => {}
@@ -654,13 +668,19 @@ pub(crate) async fn process_request(
                             // Trailers / non-data frames: ignore (no body bytes).
                             Err(_other) => continue,
                         },
-                        Some(Err(_)) => {
+                        Ok(Some(Err(_))) => {
                             return Ok(text_response(
                                 StatusCode::BAD_REQUEST,
                                 "request body read error",
                             ))
                         }
-                        None => break, // EOF
+                        Ok(None) => break, // EOF
+                        Err(_elapsed) => {
+                            return Ok(text_response(
+                                StatusCode::REQUEST_TIMEOUT,
+                                "request body read timeout",
+                            ))
+                        }
                     }
                 }
 
@@ -710,12 +730,18 @@ pub(crate) async fn process_request(
                 buf.freeze()
             } else {
                 let limited = Limited::new(body, max_body_bytes);
-                match BodyExt::collect(limited).await {
-                    Ok(collected) => collected.to_bytes(),
-                    Err(_) => {
+                match tokio::time::timeout(BODY_COLLECT_TIMEOUT, BodyExt::collect(limited)).await {
+                    Ok(Ok(collected)) => collected.to_bytes(),
+                    Ok(Err(_)) => {
                         return Ok(text_response(
                             StatusCode::PAYLOAD_TOO_LARGE,
                             "request body too large",
+                        ))
+                    }
+                    Err(_elapsed) => {
+                        return Ok(text_response(
+                            StatusCode::REQUEST_TIMEOUT,
+                            "request body read timeout",
                         ))
                     }
                 }
