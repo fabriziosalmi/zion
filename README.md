@@ -61,15 +61,33 @@ Reproduce: `bash benchmarks/certs/generate.sh && bash benchmarks/bench-native.sh
 > ~103k, in line with every other proxy path. The honest baseline above replaces
 > the bogus peak.
 
-### Fair comparison with nginx
+### Fair comparison with nginx 1.27 (Docker, v0.3.2, 1 CPU / 256 MB each, c=100, 10s×5)
 
-The previous Docker nginx-vs-Zion table was measured on v0.1.x (pre-#171), so its
-Zion rows shared the 404-routing artifact above and are **not trustworthy** for
-v0.3.2. The harness has been corrected (the bench image now builds on v0.3.2, and
-the error gate counts non-2xx so a 404/503-spewing run can no longer report
-"zero errors"); a refreshed apples-to-apples comparison is pending a re-run:
-`bash benchmarks/bench-scientific.sh` (HTTP/1.1 over TLS 1.3 — wrk has no h2
-client).
+Both behind identical cgroup limits, same backend, same TLS material, HTTP/1.1
+over TLS 1.3 (wrk has no h2 client). Median ± CI95, **0 errors** on every cell,
+all CV < 15%. Response sizes verified byte-identical nginx-vs-Zion per endpoint.
+
+| Endpoint | nginx 1.27 | Zion TLS | Zion +WAF | Zion full (cache) | Best Δ vs nginx |
+|---|--:|--:|--:|--:|--:|
+| API GET 1KB | 26,008 | 25,041 | 25,342 | 24,230 | −3% |
+| HTML SSR 5KB | 20,520 | 14,944 | 16,084 | 15,961 | −22% |
+| JS 4KB | 21,076 | 16,477 | 17,337 | **31,953** | **+52%** |
+| PNG 8KB | 16,510 | 13,081 | 12,689 | **24,142** | **+46%** |
+| WAF POST JSON | 24,039 | 24,470 | 23,299 | 20,496 | +2% |
+| CSS 3KB | 22,382 | 16,716 | 17,332 | **31,386** | **+40%** |
+
+Honest snapshot (not a victory lap — nginx is mature, hand-tuned C): **nginx
+leads raw uncached proxy** by ~3–27%; Zion is **at parity on API GET / WAF POST**
+(−3% / +2%) and **wins on cacheable assets** (+40–52%) where its in-RAM cache
+skips the origin round-trip — all while terminating TLS 1.3 *and* running the
+WAF inline. For a one-month-old Rust proxy that is a solid, honest place to be.
+
+Reproduce: `bash benchmarks/bench-scientific.sh`.
+
+> The previous table claimed "Zion HTML +108% vs nginx" — that was the same
+> pre-#171 404 artifact (Zion fast-404'd `/` while nginx served the real HTML).
+> This run verifies byte-identical response sizes + 200-only + counts non-2xx,
+> so it cannot recur.
 
 ## Features
 
