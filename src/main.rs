@@ -898,7 +898,17 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         redact: compiled_redact,
         http_builder: Arc::new({
             let mut b = AutoBuilder::new(TokioExecutor::new());
+            // A clock MUST be installed or hyper's header_read_timeout (and any
+            // other time-based limit) is silently a no-op — hyper logs "no timer
+            // set". With the timer in place, a client that opens a connection
+            // and then dribbles or stalls its request headers is dropped after
+            // the deadline instead of pinning a connection slot (and, on :443,
+            // a conn-limit permit + per-IP slot) for up to the connection cap.
+            // Basic slowloris defence, applied on both :80 and :443.
+            b.http1().timer(hyper_util::rt::TokioTimer::new());
             b.http1().max_headers(64).max_buf_size(16 * 1024);
+            b.http1()
+                .header_read_timeout(std::time::Duration::from_secs(15));
             b.http1().preserve_header_case(false);
             b.http1().title_case_headers(false);
             b
