@@ -122,7 +122,33 @@ fn emit_waf_block(
     }
 }
 
+/// Public entry point. Runs the full pipeline via `process_request_inner`,
+/// then applies the response security headers to EVERY outcome — the success
+/// path AND all the early-return error branches (WAF deny, 405, 413, 431,
+/// 425, ...) — in one place. Previously HSTS / X-Content-Type-Options /
+/// X-Frame-Options / referrer-policy / permissions-policy were only set on the
+/// success path, so Zion-generated error responses shipped without them.
+/// inject_security_headers is idempotent (insert), so the few inner call sites
+/// are harmless. Also echoes the client's X-Request-ID on error responses for
+/// correlation.
 pub(crate) async fn process_request(
+    req: Request<ZionBody>,
+    state: Arc<AppState>,
+    remote_addr: SocketAddr,
+    is_early_data: bool,
+) -> Result<Response<ZionBody>, hyper::Error> {
+    let client_request_id = req.headers().get("X-Request-ID").cloned();
+    let mut resp = process_request_inner(req, state, remote_addr, is_early_data).await?;
+    inject_security_headers(&mut resp);
+    if !resp.headers().contains_key("X-Request-ID") {
+        if let Some(id) = client_request_id {
+            resp.headers_mut().insert("X-Request-ID", id);
+        }
+    }
+    Ok(resp)
+}
+
+async fn process_request_inner(
     mut req: Request<ZionBody>,
     state: Arc<AppState>,
     remote_addr: SocketAddr,
