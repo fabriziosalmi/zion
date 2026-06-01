@@ -1593,7 +1593,15 @@ fn spawn_https_handler(
                         // Consume early_data flag on first request.
                         let was_early =
                             early_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
-                        // Inject mTLS fingerprint header if the peer presented a cert.
+                        // X-Client-Cert-Fingerprint is Zion's attestation of a
+                        // verified client certificate; a client must never be
+                        // able to set it. Strip any inbound value (and the
+                        // legacy -DN) unconditionally, THEN re-inject only the
+                        // verified fingerprint when the peer actually presented
+                        // a cert — otherwise a forged header survives to the
+                        // upstream and the access log as a fake mTLS identity.
+                        req.headers_mut().remove("X-Client-Cert-Fingerprint");
+                        req.headers_mut().remove("X-Client-Cert-DN");
                         if let Some(ref fp) = client_fp {
                             if let Ok(val) = hyper::header::HeaderValue::from_str(fp) {
                                 req.headers_mut().insert("X-Client-Cert-Fingerprint", val);
@@ -1646,10 +1654,16 @@ fn is_valid_host(host: &str) -> bool {
 
 /// HTTP (port 80) handler — ACME challenge proxy or 301 redirect to HTTPS.
 async fn handle_http(
-    req: Request<ZionBody>,
+    mut req: Request<ZionBody>,
     state: Arc<AppState>,
     remote_addr: SocketAddr,
 ) -> Result<Response<ZionBody>, hyper::Error> {
+    // Plaintext :80 never has a verified client certificate, so any inbound
+    // X-Client-Cert-Fingerprint / -DN is forged. Strip both before the request
+    // is logged or proxied, so a client cannot smuggle a fake mTLS identity.
+    req.headers_mut().remove("X-Client-Cert-Fingerprint");
+    req.headers_mut().remove("X-Client-Cert-DN");
+
     // Rate limit HTTP/80 to prevent DoS via redirect/ACME flood
     if !check_rate_limit(&state, remote_addr.ip()) {
         metrics::METRICS
