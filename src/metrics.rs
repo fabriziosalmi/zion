@@ -171,7 +171,7 @@ impl LatencyHistogram {
     }
 
     /// Render Prometheus histogram lines. Zero-alloc using BytesMut/itoa/ryu.
-    pub fn render(&self, name: &str, help: &str, out: &mut bytes::BytesMut) {
+    pub fn render(&self, name: &str, help: &str, out: &mut bytes::BytesMut, openmetrics: bool) {
         out.extend_from_slice(b"# HELP ");
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(b" ");
@@ -193,10 +193,12 @@ impl LatencyHistogram {
             out.extend_from_slice(ryu_buf.format(bound).as_bytes());
             out.extend_from_slice(b"\"} ");
             out.extend_from_slice(itoa_buf.format(cumulative).as_bytes());
-            // OpenMetrics exemplar: only emit when the slot is populated.
-            // The trailing newline goes after the optional exemplar so a
-            // single bucket line is one logical record.
-            self.render_exemplar(i, &mut itoa_buf, &mut ryu_buf, out);
+            // OpenMetrics exemplar: only under the OpenMetrics variant, and
+            // only when the slot is populated. A classic 0.0.4 parser rejects
+            // the trailing `# {...}`, so it must never appear there.
+            if openmetrics {
+                self.render_exemplar(i, &mut itoa_buf, &mut ryu_buf, out);
+            }
             out.extend_from_slice(b"\n");
         }
 
@@ -204,7 +206,9 @@ impl LatencyHistogram {
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(b"_bucket{le=\"+Inf\"} ");
         out.extend_from_slice(itoa_buf.format(cumulative).as_bytes());
-        self.render_exemplar(16, &mut itoa_buf, &mut ryu_buf, out);
+        if openmetrics {
+            self.render_exemplar(16, &mut itoa_buf, &mut ryu_buf, out);
+        }
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(name.as_bytes());
@@ -468,7 +472,8 @@ pub struct Metrics {
     // Caching for Prometheus Output — single ArcSwap for atomicity.
     // Stores (timestamp_secs, rendered_bytes) as one atomic unit to prevent
     // readers seeing a fresh timestamp with a stale buffer.
-    pub cached_render: arc_swap::ArcSwap<(u64, bytes::Bytes)>,
+    /// Cached exposition: (wall-clock second, classic 0.0.4, OpenMetrics).
+    pub cached_render: arc_swap::ArcSwap<(u64, bytes::Bytes, bytes::Bytes)>,
 }
 
 impl Metrics {
@@ -506,7 +511,11 @@ impl Metrics {
             request_duration: LatencyHistogram::new(),
             upstream_duration: LatencyHistogram::new(),
             tls_handshake_duration: LatencyHistogram::new(),
-            cached_render: arc_swap::ArcSwap::from_pointee((0u64, bytes::Bytes::new())),
+            cached_render: arc_swap::ArcSwap::from_pointee((
+                0u64,
+                bytes::Bytes::new(),
+                bytes::Bytes::new(),
+            )),
         }
     }
 
@@ -568,24 +577,49 @@ impl Metrics {
     pub fn sample_resource_gauges(&self) {}
 
     /// Render Prometheus text exposition format. Lock-free cached.
-    pub fn render(&self) -> bytes::Bytes {
+    /// Render the metrics exposition. `openmetrics` selects the OpenMetrics
+    /// variant (histogram exemplars + a `# EOF` terminator) for scrapers that
+    /// sent `Accept: application/openmetrics-text`; otherwise the classic
+    /// Prometheus 0.0.4 variant — no exemplars, since they are an
+    /// OpenMetrics-only construct and a classic parser rejects the trailing
+    /// `# {...}` (which made /metrics unscrapeable by a standard Prometheus).
+    /// Both variants are cached per wall-clock second.
+    pub fn render(&self, openmetrics: bool) -> bytes::Bytes {
         let now_sec = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        // Lock-free cache check: single atomic load of (ts, bytes) for consistency
+        // Lock-free cache check: one atomic load of (ts, classic, openmetrics).
         let cached = self.cached_render.load_full();
         if cached.0 == now_sec {
-            return cached.1.clone();
+            return if openmetrics {
+                cached.2.clone()
+            } else {
+                cached.1.clone()
+            };
         }
 
         // Cache miss (at most once per wall-clock second): refresh the
-        // process-resource gauges so the values we render below are live.
-        // The 1-second render cache above is what throttles the two
-        // `/proc/self` reads — they never run on the per-request path.
+        // process-resource gauges once, then render both variants. The
+        // 1-second cache is what throttles the two `/proc/self` reads.
         self.sample_resource_gauges();
+        let classic = self.render_body(false);
+        let openmetrics_body = self.render_body(true);
+        self.cached_render.store(std::sync::Arc::new((
+            now_sec,
+            classic.clone(),
+            openmetrics_body.clone(),
+        )));
+        if openmetrics {
+            openmetrics_body
+        } else {
+            classic
+        }
+    }
 
+    /// Build one exposition variant into a fresh buffer. See [`Metrics::render`].
+    fn render_body(&self, openmetrics: bool) -> bytes::Bytes {
         // Preallocate estimated capacity to avoid reallocations
         let mut out = bytes::BytesMut::with_capacity(4096);
         let mut itoa_buf = itoa::Buffer::new();
@@ -898,16 +932,19 @@ impl Metrics {
             "zion_request_duration_seconds",
             "Total request duration (client -> response sent).",
             &mut out,
+            openmetrics,
         );
         self.upstream_duration.render(
             "zion_upstream_duration_seconds",
             "Time spent waiting for upstream response.",
             &mut out,
+            openmetrics,
         );
         self.tls_handshake_duration.render(
             "zion_tls_handshake_duration_seconds",
             "TLS handshake duration.",
             &mut out,
+            openmetrics,
         );
 
         // Observability counters (panics, audit events, trace stats) live
@@ -933,13 +970,11 @@ classifications since process start.\n# TYPE zion_sovereign_classifications_tota
             }
         }
 
-        let b: bytes::Bytes = out.into();
-
-        // Lock-free atomic cache update (ts + bytes as one unit)
-        self.cached_render
-            .store(std::sync::Arc::new((now_sec, b.clone())));
-
-        b
+        if openmetrics {
+            // OpenMetrics documents MUST end with this terminator.
+            out.extend_from_slice(b"# EOF\n");
+        }
+        out.into()
     }
 }
 
@@ -1147,7 +1182,7 @@ mod tests {
         assert_eq!(h.buckets[16].load(Relaxed), 0); // no overflow
                                                     // Verify render() produces correct cumulative output
         let mut buf = bytes::BytesMut::new();
-        h.render("test", "test", &mut buf);
+        h.render("test", "test", &mut buf, false);
         let out = String::from_utf8(buf.to_vec()).unwrap();
         // le=0.001 should be 1 (just 1ms)
         assert!(out.contains("test_bucket{le=\"0.001\"} 1"));
@@ -1162,7 +1197,7 @@ mod tests {
         let h = LatencyHistogram::new();
         h.observe(Duration::from_millis(5));
         let mut buf = bytes::BytesMut::new();
-        h.render("test_metric", "A test metric.", &mut buf);
+        h.render("test_metric", "A test metric.", &mut buf, false);
         let out = String::from_utf8(buf.to_vec()).unwrap();
         assert!(out.contains("# TYPE test_metric histogram"));
         assert!(out.contains("test_metric_bucket{le=\"+Inf\"} 1"));
@@ -1187,7 +1222,7 @@ mod tests {
         ];
         h.observe_with_trace(Duration::from_micros(1500), trace_id);
         let mut buf = bytes::BytesMut::new();
-        h.render("xm", "exemplar test", &mut buf);
+        h.render("xm", "exemplar test", &mut buf, true);
         let out = String::from_utf8(buf.to_vec()).unwrap();
         // The 1.5ms observation lands in the le="0.002" bucket.
         // OpenMetrics format: bucket value + " # {trace_id=\"…\"} <s> <ts>".
@@ -1202,7 +1237,7 @@ mod tests {
         let h = LatencyHistogram::new();
         h.observe(Duration::from_millis(5));
         let mut buf = bytes::BytesMut::new();
-        h.render("xm", "no exemplar test", &mut buf);
+        h.render("xm", "no exemplar test", &mut buf, true);
         let out = String::from_utf8(buf.to_vec()).unwrap();
         assert!(
             !out.contains("trace_id="),
@@ -1215,7 +1250,7 @@ mod tests {
         let h = LatencyHistogram::new();
         h.observe_with_trace(Duration::from_millis(5), [0u8; 16]);
         let mut buf = bytes::BytesMut::new();
-        h.render("xm", "zero trace test", &mut buf);
+        h.render("xm", "zero trace test", &mut buf, true);
         let out = String::from_utf8(buf.to_vec()).unwrap();
         assert!(
             !out.contains("trace_id="),
@@ -1233,7 +1268,7 @@ mod tests {
         h.observe_with_trace(Duration::from_micros(1500), tid_a);
         h.observe_with_trace(Duration::from_micros(1500), tid_b); // same bucket
         let mut buf = bytes::BytesMut::new();
-        h.render("xm", "overwrite test", &mut buf);
+        h.render("xm", "overwrite test", &mut buf, true);
         let out = String::from_utf8(buf.to_vec()).unwrap();
         assert!(
             out.contains("trace_id=\"bb"),
@@ -1251,7 +1286,7 @@ mod tests {
         ];
         h.observe_with_trace(Duration::from_micros(1500), trace_id);
         let mut buf = bytes::BytesMut::new();
-        h.render("xm", "lowercase test", &mut buf);
+        h.render("xm", "lowercase test", &mut buf, true);
         let out = String::from_utf8(buf.to_vec()).unwrap();
         assert!(out.contains(r#"trace_id="ffeeddccbbaa99887766554433221100""#));
         // Sanity: no uppercase hex letters anywhere in the trace_id label.
@@ -1295,7 +1330,7 @@ mod tests {
         let m = Metrics::new();
         m.record_status(200);
         m.request_duration.observe(Duration::from_millis(10));
-        let out_bytes = m.render();
+        let out_bytes = m.render(false);
         let out = String::from_utf8(out_bytes.to_vec()).unwrap();
         assert!(out.contains("zion_requests_total 1"));
         assert!(out.contains("zion_active_connections 0"));
@@ -1309,11 +1344,38 @@ mod tests {
         // The gauge lines must be present on every platform (value 0 off
         // Linux) so dashboards can scrape the same names everywhere.
         let m = Metrics::new();
-        let out = String::from_utf8(m.render().to_vec()).unwrap();
+        let out = String::from_utf8(m.render(false).to_vec()).unwrap();
         assert!(out.contains("# TYPE zion_process_resident_memory_bytes gauge"));
         assert!(out.contains("zion_process_resident_memory_bytes "));
         assert!(out.contains("# TYPE zion_process_open_fds gauge"));
         assert!(out.contains("zion_process_open_fds "));
+    }
+
+    #[test]
+    fn classic_omits_exemplars_openmetrics_adds_eof() {
+        // Bug #24: emitting OpenMetrics exemplars under the classic 0.0.4
+        // content-type made /metrics unparseable by a standard Prometheus.
+        let m = Metrics::new();
+        m.request_duration.observe(Duration::from_millis(3));
+        let classic = String::from_utf8(m.render(false).to_vec()).unwrap();
+        let om = String::from_utf8(m.render(true).to_vec()).unwrap();
+        // Classic must be plain 0.0.4: no exemplar suffix, no EOF terminator.
+        assert!(
+            !classic.contains("# {trace_id="),
+            "classic 0.0.4 must not carry OpenMetrics exemplars"
+        );
+        assert!(
+            !classic.contains("# EOF"),
+            "classic 0.0.4 must not be EOF-terminated"
+        );
+        // OpenMetrics must end with the required terminator.
+        assert!(
+            om.ends_with("# EOF\n"),
+            "openmetrics output must end with '# EOF'"
+        );
+        // Same metric families in both.
+        assert!(classic.contains("zion_request_duration_seconds_bucket"));
+        assert!(om.contains("zion_request_duration_seconds_bucket"));
     }
 
     #[cfg(target_os = "linux")]

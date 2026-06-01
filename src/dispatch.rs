@@ -333,10 +333,25 @@ async fn process_request_inner(
             if !is_internal_ip(&client_ip) {
                 return Ok(empty_response(StatusCode::FORBIDDEN));
             }
-            let body = metrics::METRICS.render();
+            // Content-negotiate: serve OpenMetrics (histogram exemplars + EOF)
+            // only when the scraper accepts it, otherwise classic Prometheus
+            // 0.0.4. Emitting OpenMetrics exemplars under the classic
+            // content-type makes /metrics unparseable by a standard Prometheus.
+            let openmetrics = req
+                .headers()
+                .get(hyper::header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.contains("application/openmetrics-text"))
+                .unwrap_or(false);
+            let content_type = if openmetrics {
+                "application/openmetrics-text; version=1.0.0; charset=utf-8"
+            } else {
+                "text/plain; version=0.0.4; charset=utf-8"
+            };
+            let body = metrics::METRICS.render(openmetrics);
             return Ok(Response::builder()
                 .status(StatusCode::OK)
-                .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                .header("Content-Type", content_type)
                 .body(Full::new(body).map_err(|never| match never {}).boxed())
                 .unwrap());
         }
