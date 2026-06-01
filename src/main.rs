@@ -1322,6 +1322,33 @@ async fn handle_http_connection(
     state: Arc<AppState>,
     builder: Arc<AutoBuilder<TokioExecutor>>,
 ) {
+    // Mirror the HTTPS accept ceremony so :80 is not an unmetered bypass of
+    // the connection ceiling. Without these, the :80 listener accepted
+    // unbounded held connections — climbing FD/task count and starving the
+    // shared runtime that also serves :443. The global conn-limit permit and
+    // the per-IP slot are held for the connection's lifetime and released on
+    // drop (including early return / panic).
+    let _permit = match state.conn_limit.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let _ip_slot = match state
+        .conn_per_ip
+        .try_acquire(addr.ip(), state.config.load().max_connections_per_ip)
+    {
+        Some(slot) => slot,
+        None => {
+            metrics::METRICS
+                .connections_rejected_per_ip
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    };
+    let _conn_guard = metrics::ConnectionGuard::new();
+    metrics::METRICS
+        .connections_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     // Disable Nagle on the accepted socket. Without this, response data
     // for small replies (e.g. /healthz, 301 redirects) gets coalesced
     // with the FIN handshake or paired with delayed-ACK on the client,
@@ -1331,16 +1358,21 @@ async fn handle_http_connection(
     net::tune_accepted(&stream);
 
     let io = TokioIo::new(stream);
-    let _ = builder
-        .serve_connection(
+    // Connection-level idle timeout — matches the HTTPS path (1h, generous
+    // enough for keep-alive; header_read_timeout bounds the slowloris header
+    // phase, per-request limits live in handle_http).
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(3600),
+        builder.serve_connection(
             io,
             service_fn(move |req| {
                 use http_body_util::BodyExt;
                 let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
                 handle_http(req_boxed, state.clone(), addr)
             }),
-        )
-        .await;
+        ),
+    )
+    .await;
 }
 
 /// Run the HTTPS / TLS accept loop. On non-Linux or without the
