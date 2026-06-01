@@ -172,23 +172,16 @@ const BALANCED_PATTERNS: &[&str] = &[
     "' or 1=1",
     "'; drop table",
     "'; delete from",
-    "union select",
-    "union all select",
     "1; exec ",
     "1; execute ",
     "' and '1'='1",
     "waitfor delay",
     "pg_sleep(",
     "'; shutdown",
-    "information_schema",
     // ── XSS: Tags (anchored on `<`) ──
     "<script",
     "</script",
-    "<iframe",
-    "<object",
-    "<embed",
     "<svg onload",
-    "<img src",
     "<body onload",
     "<input onfocus",
     "<details ontoggle",
@@ -245,10 +238,8 @@ const BALANCED_PATTERNS: &[&str] = &[
     "http://2852039166",
     "http://169.254.169.254.nip.io",
     "169.254.169.254/metadata",
-    "/metadata/v1",
     "http://192.0.0.192",
     "kubernetes.default.svc",
-    "/openstack/latest",
     // ── Windows Path Traversal ──
     "c:\\windows\\",
     "c:\\inetpub\\",
@@ -261,17 +252,13 @@ const BALANCED_PATTERNS: &[&str] = &[
     ")(uid=*",
     ")(mail=*",
     ")(objectclass=*",
-    "ldap://",
-    "ldaps://",
     // ── XML/XXE ──
     "<!entity",
-    "<!doctype",
     "system \"file://",
     "system \"http://",
     "<xsl:",
     "xmlns:xlink",
     "<!attlist",
-    "data:text/html",
     // ── SSTI ──
     "#{7*7}",
     "${7*7}",
@@ -288,9 +275,6 @@ const BALANCED_PATTERNS: &[&str] = &[
     "${jndi:",
     "${env:",
     "${sys:",
-    // ── Prototype pollution / template (specific) ──
-    "__proto__",
-    "constructor.prototype",
     // ── PHP-specific (specific URI schemes) ──
     "unserialize(",
     "php://input",
@@ -307,6 +291,27 @@ const BALANCED_PATTERNS: &[&str] = &[
 /// content. Use only on routes where the FP rate is tolerable (admin
 /// panels, internal tooling), never on user-content APIs without measuring.
 const AGGRESSIVE_EXTRA_PATTERNS: &[&str] = &[
+    // ── Demoted from BALANCED: high false-positive rate on real traffic
+    //    (prose, CMS/HTML content, config values, JS docs), so they only
+    //    fire on strict/admin routes. Active XSS is still caught in balanced
+    //    via the dangerous *attributes* (onerror=/onload=/javascript:/srcdoc=);
+    //    XXE via "<!entity"; Log4Shell via "${jndi:". See the e2e WAF
+    //    false-positive findings. ──
+    "union select",
+    "union all select",
+    "information_schema",
+    "<iframe",
+    "<object",
+    "<embed",
+    "<img src",
+    "<!doctype",
+    "data:text/html",
+    "ldap://",
+    "ldaps://",
+    "/metadata/v1",
+    "/openstack/latest",
+    "__proto__",
+    "constructor.prototype",
     // ── SQLi: function calls / token reads (FP in BI tools, dump status) ──
     "sleep(",
     "benchmark(",
@@ -1095,8 +1100,9 @@ mod tests {
 
     #[test]
     fn streaming_denies_pattern_in_first_chunk_early_exit() {
-        let mut s = StreamingScanner::new(WafMode::Balanced, 10 * 1_048_576);
-        // SQLi token in first chunk — the second chunk should not even be needed.
+        let mut s = StreamingScanner::new(WafMode::Aggressive, 10 * 1_048_576);
+        // SQLi token (aggressive-tier "union select") in first chunk — the
+        // second chunk should not even be needed.
         let v = s.feed(b"foo bar union select 1,2,3 baz");
         assert!(matches!(v, StreamVerdict::Deny(_)), "got {v:?}");
     }
@@ -1105,7 +1111,7 @@ mod tests {
     fn streaming_catches_pattern_split_across_chunks() {
         // The pattern 'union select' (12 bytes) is split exactly at the
         // chunk boundary. Without an overlap buffer this would be missed.
-        let mut s = StreamingScanner::new(WafMode::Balanced, 10 * 1_048_576);
+        let mut s = StreamingScanner::new(WafMode::Aggressive, 10 * 1_048_576);
         assert_eq!(s.feed(b"prefix union sel"), StreamVerdict::Allow);
         let v = s.feed(b"ect 1 from t");
         assert!(matches!(v, StreamVerdict::Deny(_)), "got {v:?}");
@@ -1357,9 +1363,11 @@ mod tests {
 
     #[test]
     fn denies_prototype_pollution() {
+        // "__proto__" is aggressive-tier (false-positive on JS prose under
+        // balanced); a strict/admin route still catches it.
         let body = br#"{"__proto__":{"admin":true}}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
             WafVerdict::Deny("injection pattern detected")
         );
     }
@@ -1745,10 +1753,11 @@ mod tests {
 
     #[test]
     fn denies_plus_encoded_sqli_in_body() {
-        // "union+select" → "union select" after + normalization
+        // "union+select" → "union select" after + normalization. "union select"
+        // is aggressive-tier now (false-positive on prose under balanced).
         let body = br#"{"query":"union+select+*+from+users"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
             WafVerdict::Deny("injection pattern detected (encoded)")
         );
     }
@@ -1790,9 +1799,11 @@ mod tests {
 
     #[test]
     fn denies_sql_comment_evasion_in_body() {
+        // "union/**/select" → "union select" after comment stripping;
+        // aggressive-tier pattern now.
         let body = br#"{"q":"union/**/select * from users"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
             WafVerdict::Deny("injection pattern detected (encoded)")
         );
     }
@@ -1800,9 +1811,38 @@ mod tests {
     #[test]
     fn uri_denies_sql_comment_evasion() {
         assert_eq!(
-            validate_uri("/search?q=union/**/select", WafMode::Balanced),
+            validate_uri("/search?q=union/**/select", WafMode::Aggressive),
             WafVerdict::Deny("injection pattern in URI (encoded)")
         );
+    }
+
+    #[test]
+    fn balanced_allows_demoted_fp_patterns_aggressive_denies() {
+        // The e2e bug-hunt flagged these as false positives on real traffic:
+        // they no longer fire under the default (balanced) profile, but a
+        // strict/admin (aggressive) route still catches them. Regression guard.
+        let legit: &[&[u8]] = &[
+            br#"{"text":"the trade union select committee met today"}"#,
+            br#"{"err":"relation information_schema.columns does not exist"}"#,
+            br#"{"url":"ldap://ad.corp.local:389"}"#,
+            br#"{"html":"<!doctype html><img src=\"/logo.png\">"}"#,
+            br#"{"note":"never assign to __proto__ in JS code"}"#,
+        ];
+        for body in legit {
+            let shown = String::from_utf8_lossy(body);
+            assert_eq!(
+                validate_request("POST", Some("application/json"), body, &strict_profile()),
+                WafVerdict::Allow,
+                "balanced should ALLOW legit body: {shown}"
+            );
+            assert!(
+                matches!(
+                    validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+                    WafVerdict::Deny(_)
+                ),
+                "aggressive should DENY: {shown}"
+            );
+        }
     }
 
     // ── JSON unicode escape evasion ──
