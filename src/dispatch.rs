@@ -843,7 +843,16 @@ pub(crate) async fn process_request(
             .websocket_upgrades
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let on_upgrade = hyper::upgrade::on(&mut req);
-        let mut resp = proxy::proxy_websocket(req, on_upgrade, &dyn_scheme, &dyn_authority).await?;
+        let mut resp = proxy::proxy_websocket(
+            req,
+            on_upgrade,
+            &dyn_scheme,
+            &dyn_authority,
+            Some(forward_addr),
+            "https",
+            cfg.xff_mode,
+        )
+        .await?;
         inject_security_headers(&mut resp);
         return Ok(resp);
     }
