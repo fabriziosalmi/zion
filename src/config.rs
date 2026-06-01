@@ -1391,7 +1391,12 @@ mtls_fingerprint = false
         assert!(root.value.waf.is_none());
         assert!(root.value.cache.is_none());
         // "/api/{*rest}" → bare "/api" resolves to the API route (strict WAF).
-        assert!(router.at("/api").expect("/api should match its catch-all").value.waf.is_some());
+        assert!(router
+            .at("/api")
+            .expect("/api should match its catch-all")
+            .value
+            .waf
+            .is_some());
         // "/_next/static/{*rest}" → bare "/_next/static" resolves to the cache route.
         assert!(router
             .at("/_next/static")

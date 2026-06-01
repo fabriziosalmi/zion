@@ -1443,7 +1443,12 @@ mod tests {
         // balanced); a strict/admin route still catches it.
         let body = br#"{"__proto__":{"admin":true}}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny("injection pattern detected")
         );
     }
@@ -1833,7 +1838,12 @@ mod tests {
         // is aggressive-tier now (false-positive on prose under balanced).
         let body = br#"{"query":"union+select+*+from+users"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny("injection pattern detected (encoded)")
         );
     }
@@ -1969,7 +1979,12 @@ mod tests {
         // aggressive-tier pattern now.
         let body = br#"{"q":"union/**/select * from users"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny("injection pattern detected (encoded)")
         );
     }
@@ -2003,7 +2018,12 @@ mod tests {
             );
             assert!(
                 matches!(
-                    validate_request("POST", Some("application/json"), body, &aggressive_profile()),
+                    validate_request(
+                        "POST",
+                        Some("application/json"),
+                        body,
+                        &aggressive_profile()
+                    ),
                     WafVerdict::Deny(_)
                 ),
                 "aggressive should DENY: {shown}"
