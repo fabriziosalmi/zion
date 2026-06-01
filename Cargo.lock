@@ -5435,6 +5435,7 @@ dependencies = [
  "criterion",
  "crossterm 0.28.1",
  "dashmap 6.1.0",
+ "fastrand",
  "fnv",
  "h3",
  "h3-quinn",
