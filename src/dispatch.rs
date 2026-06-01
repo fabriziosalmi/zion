@@ -1256,9 +1256,7 @@ async fn handle_static_cache(
         // through to fetch ourselves.
         let _ = rx.wait_for(|v| *v).await;
         if let Some(hit) = state.static_cache.get(path_owned.as_ref()) {
-            metrics::METRICS
-                .cache_hits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // get() already counted this hit — don't double-count it here.
             let mut builder = Response::builder()
                 .status(hit.meta.status)
                 .header("Cache-Control", CACHE_CONTROL_IMMUTABLE);

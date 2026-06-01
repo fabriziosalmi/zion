@@ -316,8 +316,16 @@ impl StaticCache {
             return Some(hit);
         }
 
-        // L2: shared DashMap
-        let entry = l2_concurrent.get(path)?;
+        // L2: shared DashMap. A true absence is a miss and must be counted —
+        // the bare `?` here previously returned None without recording it, so
+        // on multi-core builds cache_misses was undercounted and the reported
+        // hit-rate inflated.
+        let Some(entry) = l2_concurrent.get(path) else {
+            crate::metrics::METRICS
+                .cache_misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        };
         if Instant::now() >= entry.expires_at {
             drop(entry);
             l2_concurrent.remove(path);
