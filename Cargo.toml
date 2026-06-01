@@ -75,6 +75,11 @@ memchr = "2"
 # FNV hash — ~2x faster than SipHash for short keys (SNI hostnames)
 fnv = "1"
 
+# Decorrelated-jitter RNG for the adaptive upstream-recovery backoff scheduler.
+# Already vendored transitively (via h3); promoted to a direct dep. Pure-Rust,
+# MSRV-1.82-clean, single-digit-ns thread-local Wyrand — never on the hot path.
+fastrand = "2"
+
 # Upstream TLS root CAs (embedded Mozilla bundle — deterministic, no system dep)
 webpki-roots = "0.26"
 

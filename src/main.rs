@@ -285,12 +285,8 @@ impl ResolvedAppConfig {
                 continue;
             };
             for url in urls {
-                map.entry(url.clone()).or_insert_with(|| {
-                    Arc::new(health::UpstreamHealth {
-                        healthy: std::sync::atomic::AtomicBool::new(true),
-                        latency_us: std::sync::atomic::AtomicU64::new(0),
-                    })
-                });
+                map.entry(url.clone())
+                    .or_insert_with(|| Arc::new(health::UpstreamHealth::new_healthy()));
             }
         }
         let health_map = Arc::new(map);
@@ -1003,15 +999,30 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
             // 1. HTTPS upstreams get TLS pre-warming (connections stay in pool)
             // 2. HTTP/2 multiplexing for HTTPS health probes
             let client = health_http_client;
+            // Monotonic base for every adaptive probe deadline (immune to NTP
+            // jumps — all scheduling is in µs-since-base, never wall-clock).
+            let base = tokio::time::Instant::now();
+            const MIN_TICK_US: u64 = 10_000;
             loop {
-                let mut upstreams_to_check: Vec<(String, Arc<health::UpstreamHealth>)> = Vec::new();
+                let now_us = base.elapsed().as_micros() as u64;
+                // Probe only upstreams whose adaptive deadline is due: a HEALTHY
+                // upstream every STEADY_US (unchanged 30s), a DOWN one on the
+                // decorrelated-jitter backoff schedule — fast self-heal without
+                // a recovery thundering-herd.
+                let mut due: Vec<(String, Arc<health::UpstreamHealth>)> = Vec::new();
                 for (url, up) in hm.iter() {
-                    upstreams_to_check.push((url.to_string(), Arc::clone(up)));
+                    if up
+                        .next_probe_at_us
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        <= now_us
+                    {
+                        due.push((url.to_string(), Arc::clone(up)));
+                    }
                 }
 
                 let mut join_set = tokio::task::JoinSet::new();
 
-                for (url, up) in upstreams_to_check {
+                for (url, up) in due {
                     let client_clone = client.clone();
                     join_set.spawn(async move {
                         use http_body_util::BodyExt;
@@ -1056,11 +1067,19 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                         let was_healthy = up
                             .healthy
                             .swap(healthy, std::sync::atomic::Ordering::Relaxed);
+                        // Advance the adaptive probe schedule: a success resets
+                        // the backoff to base and returns to the STEADY cadence;
+                        // a failure draws the next decorrelated-jitter delay.
+                        up.reschedule(healthy, base.elapsed().as_micros() as u64);
                         if was_healthy && !healthy {
+                            let next_ms = up
+                                .backoff_us
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                / 1000;
                             logging::warn(
                                 "health",
                                 &format!(
-                                    "upstream {url} is DOWN — requests to this upstream will return 503 until it recovers"
+                                    "upstream {url} is DOWN — 503 until it recovers; adaptive re-probe in ~{next_ms}ms"
                                 ),
                             );
                         } else if !was_healthy && healthy {
@@ -1072,7 +1091,20 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                     });
                 }
                 while join_set.join_next().await.is_some() {}
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+                // Sleep until the earliest upstream is next due, floored so an
+                // all-due-now state cannot busy-spin.
+                let now2 = base.elapsed().as_micros() as u64;
+                let next_due = hm
+                    .values()
+                    .map(|u| {
+                        u.next_probe_at_us
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    })
+                    .min()
+                    .unwrap_or_else(|| now2 + health::STEADY_US);
+                let sleep_us = next_due.saturating_sub(now2).max(MIN_TICK_US);
+                tokio::time::sleep(std::time::Duration::from_micros(sleep_us)).await;
             }
         });
     }

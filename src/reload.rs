@@ -298,6 +298,11 @@ mod tests {
         let old_health = Arc::new(health::UpstreamHealth {
             healthy: std::sync::atomic::AtomicBool::new(false),
             latency_us: std::sync::atomic::AtomicU64::new(42_000),
+            // Sentinel mid-backoff-walk value — must survive the reload via
+            // Arc reuse, else a future refactor could silently reset an
+            // in-progress recovery backoff on every config reload.
+            backoff_us: std::sync::atomic::AtomicU64::new(700_000),
+            next_probe_at_us: std::sync::atomic::AtomicU64::new(0),
         });
         let mut old_map = fnv::FnvHashMap::default();
         old_map.insert(url.clone(), old_health.clone());
@@ -338,6 +343,9 @@ mod tests {
         // The carried state survives.
         assert!(!merged_arc.healthy.load(Ordering::Relaxed));
         assert_eq!(merged_arc.latency_us.load(Ordering::Relaxed), 42_000);
+        // The adaptive-recovery backoff walk also survives the reload (rides
+        // the same Arc) — pins the "reload must not reset in-progress backoff".
+        assert_eq!(merged_arc.backoff_us.load(Ordering::Relaxed), 700_000);
     }
 
     #[test]
@@ -349,6 +357,8 @@ mod tests {
             Arc::new(health::UpstreamHealth {
                 healthy: std::sync::atomic::AtomicBool::new(false),
                 latency_us: std::sync::atomic::AtomicU64::new(99),
+                backoff_us: std::sync::atomic::AtomicU64::new(123_456),
+                next_probe_at_us: std::sync::atomic::AtomicU64::new(0),
             }),
         );
         let previous = ResolvedAppConfig::test_with_health(Arc::new(old_map));
@@ -381,6 +391,13 @@ mod tests {
             .expect("new upstream must be tracked");
         assert!(billing.healthy.load(Ordering::Relaxed));
         assert_eq!(billing.latency_us.load(Ordering::Relaxed), 0);
+        // Fresh upstream starts on the default adaptive schedule (base backoff,
+        // due immediately) — NOT the old upstream's sentinel.
+        assert_eq!(
+            billing.backoff_us.load(Ordering::Relaxed),
+            health::PROBE_BASE_US
+        );
+        assert_eq!(billing.next_probe_at_us.load(Ordering::Relaxed), 0);
     }
 
     #[test]
