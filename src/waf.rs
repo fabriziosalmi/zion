@@ -871,38 +871,40 @@ pub fn validate_request(
     }
 
     // ── Gate 2: Content-Type (zero-alloc case-insensitive) ──
-    let is_json = match content_type {
-        Some(ct) => {
-            // Prefix match with delimiter check: "application/json" must be
-            // followed by EOF, ';' (charset), or ' ' — not arbitrary chars.
-            // Without this, "application/jsonFOO" would be treated as allowed.
-            let is_allowed = profile.allowed_content_types.iter().any(|allowed| {
-                if ct.len() < allowed.len() {
-                    return false;
-                }
-                if !ct.as_bytes()[..allowed.len()].eq_ignore_ascii_case(allowed.as_bytes()) {
-                    return false;
-                }
-                // Must be exact match or followed by a parameter delimiter
-                ct.len() == allowed.len()
-                    || ct.as_bytes()[allowed.len()] == b';'
-                    || ct.as_bytes()[allowed.len()] == b' '
-            });
-
-            if !is_allowed {
-                if profile.deny_unknown_content_types {
-                    return WafVerdict::Deny("unexpected content-type for API request");
-                }
-                return WafVerdict::Allow;
-            }
-
-            ct.as_bytes()
-                .get(..16)
-                .map(|b| b.eq_ignore_ascii_case(b"application/json"))
-                .unwrap_or(false)
-        }
+    let ct = match content_type {
+        Some(ct) => ct,
         None => return WafVerdict::Deny("missing content-type header"),
     };
+    // Prefix match with delimiter check: "application/json" must be followed
+    // by EOF, ';' (charset), or ' ' — not arbitrary chars. Without this,
+    // "application/jsonFOO" would be treated as allowed.
+    let is_allowed = profile.allowed_content_types.iter().any(|allowed| {
+        if ct.len() < allowed.len() {
+            return false;
+        }
+        if !ct.as_bytes()[..allowed.len()].eq_ignore_ascii_case(allowed.as_bytes()) {
+            return false;
+        }
+        ct.len() == allowed.len()
+            || ct.as_bytes()[allowed.len()] == b';'
+            || ct.as_bytes()[allowed.len()] == b' '
+    });
+    // Strict policy denies a disallowed type outright. Lenient policy does NOT
+    // trust it either — we fall through to the Gate 3 injection scan before
+    // allowing. The previous code returned Allow here, forwarding the body
+    // UNSCANNED whenever deny_unknown_content_types was false, letting an
+    // attacker smuggle a payload past the WAF just by mislabelling it.
+    if !is_allowed && profile.deny_unknown_content_types {
+        return WafVerdict::Deny("unexpected content-type for API request");
+    }
+    // The JSON-structural gates (4/5) apply only to an allowed application/json
+    // body; a disallowed type is still injection-scanned but never JSON-parsed.
+    let is_json = is_allowed
+        && ct
+            .as_bytes()
+            .get(..16)
+            .map(|b| b.eq_ignore_ascii_case(b"application/json"))
+            .unwrap_or(false);
 
     // ── Gate 3: Aho-Corasick injection scan (O(N), single pass) ──
     // Profile-driven scanner: balanced (default) or aggressive.
@@ -1870,6 +1872,28 @@ mod tests {
             ),
             WafVerdict::Deny(_)
         ));
+    }
+
+    #[test]
+    fn disallowed_content_type_is_still_scanned_when_lenient() {
+        // deny_unknown_content_types = false must NOT forward a body unscanned:
+        // an injection in a mislabelled (text/html) body is still caught.
+        let lenient = WafProfile {
+            deny_unknown_content_types: false,
+            ..WafProfile::default()
+        };
+        assert!(
+            matches!(
+                validate_request("POST", Some("text/html"), b"; cat /etc/passwd", &lenient),
+                WafVerdict::Deny(_)
+            ),
+            "lenient profile must still injection-scan a disallowed content-type"
+        );
+        // A clean body on a disallowed type is allowed under the lenient policy.
+        assert_eq!(
+            validate_request("POST", Some("text/html"), b"hello world", &lenient),
+            WafVerdict::Allow
+        );
     }
 
     #[test]
