@@ -446,6 +446,20 @@ pub struct Metrics {
     // Gauges
     pub active_connections: AtomicI64,
 
+    // ── Runtime resource gauges (process self-introspection) ─────────
+    // Sampled from `/proc/self` once per `/metrics` scrape (and per JSON
+    // snapshot) — never on the hot connection path. Linux-only; both
+    // stay 0 on other platforms. The point is leak detection *without a
+    // restart*: a steadily climbing RSS or fd count under flat traffic
+    // is exactly the "silent 1 MB / 1000-connection leak" signal an
+    // operator needs to see live on a dashboard.
+    /// Resident set size of this process, in bytes (`/proc/self/status`
+    /// `VmRSS`). 0 on non-Linux platforms.
+    pub process_resident_memory_bytes: AtomicU64,
+    /// Open file descriptors held by this process (`/proc/self/fd`
+    /// entry count). 0 on non-Linux platforms.
+    pub process_open_fds: AtomicU64,
+
     // Histograms
     pub request_duration: LatencyHistogram,
     pub upstream_duration: LatencyHistogram,
@@ -487,6 +501,8 @@ impl Metrics {
             acme_renewals_total: AtomicU64::new(0),
             acme_renewal_failures_total: AtomicU64::new(0),
             active_connections: AtomicI64::new(0),
+            process_resident_memory_bytes: AtomicU64::new(0),
+            process_open_fds: AtomicU64::new(0),
             request_duration: LatencyHistogram::new(),
             upstream_duration: LatencyHistogram::new(),
             tls_handshake_duration: LatencyHistogram::new(),
@@ -512,6 +528,45 @@ impl Metrics {
         }
     }
 
+    /// Refresh the process-level resource gauges from `/proc/self`.
+    ///
+    /// Cheap and lock-free: one `read_to_string` of the small
+    /// `/proc/self/status` file plus a `read_dir` count of
+    /// `/proc/self/fd`. Called once per `/metrics` scrape and per JSON
+    /// snapshot — never on the hot connection path, so the two reads add
+    /// no per-request cost. No-op (gauges stay 0) on non-Linux platforms,
+    /// where `/proc` does not exist.
+    #[cfg(target_os = "linux")]
+    pub fn sample_resource_gauges(&self) {
+        // `/proc/self/status` exposes `VmRSS:\t<N> kB` — the resident set
+        // size directly in kibibytes. This is the same file bpf_demux.rs
+        // already reads for capability probing, so no new syscall surface.
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            if let Some(kib) = status
+                .lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                self.process_resident_memory_bytes
+                    .store(kib.saturating_mul(1024), Relaxed);
+            }
+        }
+        // `/proc/self/fd` has one entry per open descriptor. `read_dir`
+        // itself opens one transient fd that is counted here and released
+        // when the iterator drops, so the value carries a constant +1 —
+        // harmless for the leak-slope signal we care about.
+        if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+            self.process_open_fds.store(entries.count() as u64, Relaxed);
+        }
+    }
+
+    /// Non-Linux fallback: `/proc` is Linux-specific, so the gauges stay
+    /// at 0. Kept as a method (rather than `cfg`-erasing the call sites)
+    /// so the render and snapshot paths compile unchanged everywhere.
+    #[cfg(not(target_os = "linux"))]
+    pub fn sample_resource_gauges(&self) {}
+
     /// Render Prometheus text exposition format. Lock-free cached.
     pub fn render(&self) -> bytes::Bytes {
         let now_sec = std::time::SystemTime::now()
@@ -524,6 +579,12 @@ impl Metrics {
         if cached.0 == now_sec {
             return cached.1.clone();
         }
+
+        // Cache miss (at most once per wall-clock second): refresh the
+        // process-resource gauges so the values we render below are live.
+        // The 1-second render cache above is what throttles the two
+        // `/proc/self` reads — they never run on the per-request path.
+        self.sample_resource_gauges();
 
         // Preallocate estimated capacity to avoid reallocations
         let mut out = bytes::BytesMut::with_capacity(4096);
@@ -686,6 +747,33 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.active_connections.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        // ── Runtime resource gauges (process self-introspection) ──
+        // Linux-only; render as 0 elsewhere so dashboards can `grep` the
+        // same metric names regardless of the host the build runs on.
+        out.extend_from_slice(
+            b"# HELP zion_process_resident_memory_bytes Resident set size of the Zion process in bytes (Linux /proc/self/status VmRSS; 0 elsewhere).\n\
+                                # TYPE zion_process_resident_memory_bytes gauge\n\
+                                zion_process_resident_memory_bytes ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.process_resident_memory_bytes.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_process_open_fds Open file descriptors held by the Zion process (Linux /proc/self/fd; 0 elsewhere).\n\
+                                # TYPE zion_process_open_fds gauge\n\
+                                zion_process_open_fds ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.process_open_fds.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");
@@ -901,6 +989,10 @@ pub fn snapshot_json(
     use serde_json::json;
 
     let m = &METRICS;
+    // Refresh the process-resource gauges so `zion top` shows live RSS and
+    // fd counts. The snapshot is already built fresh on every poll (no
+    // caching), so sampling here keeps the JSON consistent with that intent.
+    m.sample_resource_gauges();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -957,6 +1049,11 @@ pub fn snapshot_json(
             "cache_misses": m.cache_misses.load(Relaxed),
             "websocket_upgrades": m.websocket_upgrades.load(Relaxed),
             "active_connections": m.active_connections.load(Relaxed),
+            // Process self-introspection (Linux /proc/self; 0 elsewhere).
+            // RSS in bytes alongside the box total at platform.ram_mb, so
+            // `zion top` can show "of N MB total, the daemon holds X".
+            "process_resident_memory_bytes": m.process_resident_memory_bytes.load(Relaxed),
+            "process_open_fds": m.process_open_fds.load(Relaxed),
             "connections_total": m.connections_total.load(Relaxed),
             "tls_handshake_errors": m.tls_handshake_errors.load(Relaxed),
             "request_p50_us": m.request_duration.quantile_us(0.50),
@@ -1205,5 +1302,45 @@ mod tests {
         assert!(out.contains("zion_request_duration_seconds_bucket"));
         assert!(out.contains("zion_upstream_duration_seconds_bucket"));
         assert!(out.contains("zion_tls_handshake_duration_seconds_bucket"));
+    }
+
+    #[test]
+    fn render_always_emits_resource_gauges() {
+        // The gauge lines must be present on every platform (value 0 off
+        // Linux) so dashboards can scrape the same names everywhere.
+        let m = Metrics::new();
+        let out = String::from_utf8(m.render().to_vec()).unwrap();
+        assert!(out.contains("# TYPE zion_process_resident_memory_bytes gauge"));
+        assert!(out.contains("zion_process_resident_memory_bytes "));
+        assert!(out.contains("# TYPE zion_process_open_fds gauge"));
+        assert!(out.contains("zion_process_open_fds "));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resource_sampler_populates_on_linux() {
+        let m = Metrics::new();
+        assert_eq!(m.process_resident_memory_bytes.load(Relaxed), 0);
+        assert_eq!(m.process_open_fds.load(Relaxed), 0);
+        m.sample_resource_gauges();
+        // The test process has resident memory and at least the stdio fds.
+        assert!(
+            m.process_resident_memory_bytes.load(Relaxed) > 0,
+            "VmRSS should be readable from /proc/self/status on Linux"
+        );
+        assert!(
+            m.process_open_fds.load(Relaxed) > 0,
+            "open-fd count should be at least the stdio descriptors"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn resource_sampler_is_noop_off_linux() {
+        // /proc does not exist; the fallback leaves both gauges at 0.
+        let m = Metrics::new();
+        m.sample_resource_gauges();
+        assert_eq!(m.process_resident_memory_bytes.load(Relaxed), 0);
+        assert_eq!(m.process_open_fds.load(Relaxed), 0);
     }
 }

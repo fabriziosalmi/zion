@@ -98,6 +98,13 @@ struct MetricsSnap {
     #[allow(dead_code)]
     websocket_upgrades: u64,
     active_connections: i64,
+    // Process self-introspection. `#[serde(default)]` so a newer `zion top`
+    // polling an older daemon that predates these fields still parses (and
+    // shows 0) instead of failing the whole snapshot decode.
+    #[serde(default)]
+    process_resident_memory_bytes: u64,
+    #[serde(default)]
+    process_open_fds: u64,
     connections_total: u64,
     tls_handshake_errors: u64,
     request_p50_us: u64,
@@ -476,6 +483,11 @@ fn draw_traffic(f: &mut Frame, area: Rect, app: &App, snap: &Snapshot) {
         kv("active conn", &snap.metrics.active_connections.to_string()),
         kv("total conn", &fmt_int(snap.metrics.connections_total)),
         kv("tls errors", &fmt_int(snap.metrics.tls_handshake_errors)),
+        kv(
+            "rss",
+            &fmt_bytes(snap.metrics.process_resident_memory_bytes),
+        ),
+        kv("open fds", &fmt_int(snap.metrics.process_open_fds)),
     ];
     let p = Paragraph::new(lines).block(panel(" traffic "));
     f.render_widget(p, area);
@@ -756,6 +768,26 @@ fn fmt_int(mut n: u64) -> String {
     out.chars().rev().collect()
 }
 
+/// Human-readable byte size for the resource panel (RSS). Mirrors the
+/// boot-banner formatter in bootstrap.rs; kept local so the TUI owns its
+/// own display helpers alongside `fmt_int`/`fmt_us`.
+fn fmt_bytes(n: u64) -> String {
+    const K: u64 = 1024;
+    const M: u64 = K * K;
+    const G: u64 = K * M;
+    if n == 0 {
+        "—".to_string()
+    } else if n >= G {
+        format!("{:.1} GB", n as f64 / G as f64)
+    } else if n >= M {
+        format!("{} MB", n / M)
+    } else if n >= K {
+        format!("{} KB", n / K)
+    } else {
+        format!("{n} B")
+    }
+}
+
 fn fmt_us(us: u64) -> String {
     if us == 0 {
         return "—".to_string();
@@ -960,7 +992,9 @@ mod tests {
             "worker_threads":3,"conn_limit":10000},
           "metrics":{"requests_total":10,"requests_2xx":9,"requests_4xx":1,"requests_5xx":0,
             "waf_denied":0,"rate_limited":0,"cache_hits":5,"cache_misses":5,
-            "websocket_upgrades":0,"active_connections":2,"connections_total":7,"tls_handshake_errors":0,
+            "websocket_upgrades":0,"active_connections":2,
+            "process_resident_memory_bytes":47185920,"process_open_fds":128,
+            "connections_total":7,"tls_handshake_errors":0,
             "request_p50_us":1000,"request_p95_us":4000,"request_p99_us":8000,
             "upstream_p50_us":900,"upstream_p95_us":3000,"upstream_p99_us":6000,
             "tls_p50_us":500,"tls_p95_us":900},
@@ -969,7 +1003,33 @@ mod tests {
         let s: Snapshot = serde_json::from_str(json).unwrap();
         assert_eq!(s.platform.tier, "A");
         assert_eq!(s.metrics.requests_total, 10);
+        assert_eq!(s.metrics.process_resident_memory_bytes, 47_185_920);
+        assert_eq!(s.metrics.process_open_fds, 128);
         assert_eq!(s.upstreams.len(), 1);
         assert!(s.upstreams[0].healthy);
+    }
+
+    #[test]
+    fn snapshot_tolerates_missing_resource_fields() {
+        // A `zion top` polling an older daemon predating the resource
+        // gauges must still decode the snapshot (fields default to 0).
+        let json = r#"{
+          "version":"0.1.0","timestamp_ms":0,"uptime_secs":1,
+          "platform":{"os":"linux","arch":"x86_64","cores":1,"ram_mb":1024,
+            "tier":"C","tier_score":10,"projected_kreqs_cached":1,"projected_kreqs_dynamic":1,
+            "has_aes_ni":true,"has_sha256":true,"has_avx2":false,"has_neon":false,
+            "has_so_reuseport":true,"has_tcp_fastopen":false,"has_tcp_quickack":false,
+            "worker_threads":1,"conn_limit":1000},
+          "metrics":{"requests_total":0,"requests_2xx":0,"requests_4xx":0,"requests_5xx":0,
+            "waf_denied":0,"rate_limited":0,"cache_hits":0,"cache_misses":0,
+            "websocket_upgrades":0,"active_connections":0,"connections_total":0,"tls_handshake_errors":0,
+            "request_p50_us":0,"request_p95_us":0,"request_p99_us":0,
+            "upstream_p50_us":0,"upstream_p95_us":0,"upstream_p99_us":0,
+            "tls_p50_us":0,"tls_p95_us":0},
+          "upstreams":[]
+        }"#;
+        let s: Snapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(s.metrics.process_resident_memory_bytes, 0);
+        assert_eq!(s.metrics.process_open_fds, 0);
     }
 }
