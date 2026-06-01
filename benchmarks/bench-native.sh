@@ -222,6 +222,14 @@ cd "$PROJECT_DIR"
 cargo build --release 2>&1 | tail -3 || die "cargo build failed"
 log "Build complete ✓"
 
+# ── Step 1b: Ensure TLS bench certs exist (self-signed, gitignored) ──────
+# The TLS profiles bind :443x and need ./benchmarks/certs/tls.{crt,key}; without
+# them Zion cannot bind the TLS listener and the run dies with a connect timeout.
+if [[ ! -f "$SCRIPT_DIR/certs/tls.crt" || ! -f "$SCRIPT_DIR/certs/tls.key" ]]; then
+    log "Generating self-signed bench certs (benchmarks/certs/)..."
+    bash "$SCRIPT_DIR/certs/generate.sh" || die "cert generation failed"
+fi
+
 # ── Step 2: Start backend (Rust preferred, Go fallback) ──────────────────
 RUST_BACKEND="$SCRIPT_DIR/backend/target/release/zion-bench-backend"
 if [[ -f "$RUST_BACKEND" ]] || (cd "$SCRIPT_DIR/backend" && cargo build --release >/dev/null 2>&1); then
