@@ -176,7 +176,11 @@ pub fn load_tls_config(tls: &TlsConfig) -> Result<ServerConfig, String> {
         let mut map = FnvHashMap::with_capacity_and_hasher(tls.sni.len(), Default::default());
         for entry in &tls.sni {
             let key = load_certified_key(&entry.cert_path, &entry.key_path)?;
-            map.insert(entry.server_name.clone(), key);
+            // Lower-case the key: rustls hands us the client SNI already
+            // lower-cased, so an upper-case server_name in config (e.g.
+            // "Demo.Example.net") would otherwise never match and silently
+            // serve the default cert.
+            map.insert(entry.server_name.to_ascii_lowercase(), key);
             eprintln!("  sni: {} → {}", entry.server_name, entry.cert_path);
         }
         eprintln!("  sni: {} domains + default fallback", map.len());

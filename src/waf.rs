@@ -172,23 +172,16 @@ const BALANCED_PATTERNS: &[&str] = &[
     "' or 1=1",
     "'; drop table",
     "'; delete from",
-    "union select",
-    "union all select",
     "1; exec ",
     "1; execute ",
     "' and '1'='1",
     "waitfor delay",
     "pg_sleep(",
     "'; shutdown",
-    "information_schema",
     // ── XSS: Tags (anchored on `<`) ──
     "<script",
     "</script",
-    "<iframe",
-    "<object",
-    "<embed",
     "<svg onload",
-    "<img src",
     "<body onload",
     "<input onfocus",
     "<details ontoggle",
@@ -245,10 +238,8 @@ const BALANCED_PATTERNS: &[&str] = &[
     "http://2852039166",
     "http://169.254.169.254.nip.io",
     "169.254.169.254/metadata",
-    "/metadata/v1",
     "http://192.0.0.192",
     "kubernetes.default.svc",
-    "/openstack/latest",
     // ── Windows Path Traversal ──
     "c:\\windows\\",
     "c:\\inetpub\\",
@@ -261,17 +252,13 @@ const BALANCED_PATTERNS: &[&str] = &[
     ")(uid=*",
     ")(mail=*",
     ")(objectclass=*",
-    "ldap://",
-    "ldaps://",
     // ── XML/XXE ──
     "<!entity",
-    "<!doctype",
     "system \"file://",
     "system \"http://",
     "<xsl:",
     "xmlns:xlink",
     "<!attlist",
-    "data:text/html",
     // ── SSTI ──
     "#{7*7}",
     "${7*7}",
@@ -288,9 +275,6 @@ const BALANCED_PATTERNS: &[&str] = &[
     "${jndi:",
     "${env:",
     "${sys:",
-    // ── Prototype pollution / template (specific) ──
-    "__proto__",
-    "constructor.prototype",
     // ── PHP-specific (specific URI schemes) ──
     "unserialize(",
     "php://input",
@@ -307,6 +291,27 @@ const BALANCED_PATTERNS: &[&str] = &[
 /// content. Use only on routes where the FP rate is tolerable (admin
 /// panels, internal tooling), never on user-content APIs without measuring.
 const AGGRESSIVE_EXTRA_PATTERNS: &[&str] = &[
+    // ── Demoted from BALANCED: high false-positive rate on real traffic
+    //    (prose, CMS/HTML content, config values, JS docs), so they only
+    //    fire on strict/admin routes. Active XSS is still caught in balanced
+    //    via the dangerous *attributes* (onerror=/onload=/javascript:/srcdoc=);
+    //    XXE via "<!entity"; Log4Shell via "${jndi:". See the e2e WAF
+    //    false-positive findings. ──
+    "union select",
+    "union all select",
+    "information_schema",
+    "<iframe",
+    "<object",
+    "<embed",
+    "<img src",
+    "<!doctype",
+    "data:text/html",
+    "ldap://",
+    "ldaps://",
+    "/metadata/v1",
+    "/openstack/latest",
+    "__proto__",
+    "constructor.prototype",
     // ── SQLi: function calls / token reads (FP in BI tools, dump status) ──
     "sleep(",
     "benchmark(",
@@ -592,14 +597,53 @@ fn normalize_unified(input: &[u8], out: &mut Vec<u8>) {
 
         // 2. URL Decode State
         if b == b'+' {
-            out.push(b' ');
+            push_norm(out, b' ');
             i += 1;
             continue;
-        } else if b == b'%' && i + 2 < len {
-            if let (Some(hi), Some(lo)) = (hex_val(input[i + 1]), hex_val(input[i + 2])) {
-                out.push((hi << 4) | lo);
-                i += 3;
-                continue;
+        } else if b == b'%' {
+            // 6-char forms first — both evade a plain %XX decoder:
+            if i + 5 < len {
+                let win = &input[i..i + 6];
+                // Overlong-UTF-8 encodings of '/' and '\' used to slip "../"
+                // past path filters (e.g. ..%c0%af..%c0%af -> ../../).
+                if win.eq_ignore_ascii_case(b"%c0%af") {
+                    push_norm(out, b'/');
+                    i += 6;
+                    continue;
+                }
+                if win.eq_ignore_ascii_case(b"%c1%9c") {
+                    push_norm(out, b'\\');
+                    i += 6;
+                    continue;
+                }
+                // IIS-style %uXXXX -> codepoint (mirrors JSON \uXXXX). Nested
+                // if-let (not an `&& let` chain) to stay within MSRV 1.82.
+                if input[i + 1] == b'u' || input[i + 1] == b'U' {
+                    if let (Some(h1), Some(h2), Some(h3), Some(h4)) = (
+                        hex_val(input[i + 2]),
+                        hex_val(input[i + 3]),
+                        hex_val(input[i + 4]),
+                        hex_val(input[i + 5]),
+                    ) {
+                        push_codepoint(
+                            out,
+                            ((h1 as u16) << 12)
+                                | ((h2 as u16) << 8)
+                                | ((h3 as u16) << 4)
+                                | (h4 as u16),
+                        );
+                        i += 6;
+                        continue;
+                    }
+                }
+            }
+            // Standard %XX.
+            if i + 2 < len {
+                if let (Some(hi), Some(lo)) = (hex_val(input[i + 1]), hex_val(input[i + 2])) {
+                    push_norm(out, (hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
             }
         }
 
@@ -611,24 +655,50 @@ fn normalize_unified(input: &[u8], out: &mut Vec<u8>) {
                 hex_val(input[i + 4]),
                 hex_val(input[i + 5]),
             ) {
-                let codepoint =
-                    ((h1 as u16) << 12) | ((h2 as u16) << 8) | ((h3 as u16) << 4) | (h4 as u16);
-
-                if codepoint <= 0xFF {
-                    out.push(codepoint as u8);
-                } else {
-                    let mut utf8_buf = [0u8; 3];
-                    let ch = char::from_u32(codepoint as u32).unwrap_or('?');
-                    out.extend_from_slice(ch.encode_utf8(&mut utf8_buf).as_bytes());
-                }
+                push_codepoint(
+                    out,
+                    ((h1 as u16) << 12) | ((h2 as u16) << 8) | ((h3 as u16) << 4) | (h4 as u16),
+                );
                 i += 6;
                 continue;
             }
         }
 
-        // 4. Default: push lowercase byte for case-insensitive normalization
-        out.push(b.to_ascii_lowercase());
+        // 4. Default: fold whitespace runs + lowercase for normalization
+        push_norm(out, b);
         i += 1;
+    }
+}
+
+/// Push one byte into the normalized buffer, folding inline-whitespace runs
+/// (space, tab, vertical-tab, form-feed) to a single space and ASCII-
+/// lowercasing everything else — this is what stops `union  select`,
+/// `union\tselect` and `1;  cat` from slipping past the single-space patterns.
+/// `\n` / `\r` are deliberately NOT folded: several command-injection patterns
+/// ("\ncat ", ...) treat the newline as a separator, and collapsing it to a
+/// space would make them unreachable.
+#[inline]
+fn push_norm(out: &mut Vec<u8>, b: u8) {
+    if matches!(b, b' ' | b'\t' | 0x0b | 0x0c) {
+        if out.last() != Some(&b' ') {
+            out.push(b' ');
+        }
+    } else {
+        out.push(b.to_ascii_lowercase());
+    }
+}
+
+/// Push a decoded 16-bit codepoint (from `\uXXXX` or `%uXXXX`): the BMP-low
+/// bytes go through `push_norm` (so a decoded space/tab still collapses and
+/// letters lowercase); higher codepoints are emitted as raw UTF-8.
+#[inline]
+fn push_codepoint(out: &mut Vec<u8>, cp: u16) {
+    if cp <= 0xFF {
+        push_norm(out, cp as u8);
+    } else {
+        let mut utf8_buf = [0u8; 3];
+        let ch = char::from_u32(cp as u32).unwrap_or('?');
+        out.extend_from_slice(ch.encode_utf8(&mut utf8_buf).as_bytes());
     }
 }
 
@@ -848,38 +918,40 @@ pub fn validate_request(
     }
 
     // ── Gate 2: Content-Type (zero-alloc case-insensitive) ──
-    let is_json = match content_type {
-        Some(ct) => {
-            // Prefix match with delimiter check: "application/json" must be
-            // followed by EOF, ';' (charset), or ' ' — not arbitrary chars.
-            // Without this, "application/jsonFOO" would be treated as allowed.
-            let is_allowed = profile.allowed_content_types.iter().any(|allowed| {
-                if ct.len() < allowed.len() {
-                    return false;
-                }
-                if !ct.as_bytes()[..allowed.len()].eq_ignore_ascii_case(allowed.as_bytes()) {
-                    return false;
-                }
-                // Must be exact match or followed by a parameter delimiter
-                ct.len() == allowed.len()
-                    || ct.as_bytes()[allowed.len()] == b';'
-                    || ct.as_bytes()[allowed.len()] == b' '
-            });
-
-            if !is_allowed {
-                if profile.deny_unknown_content_types {
-                    return WafVerdict::Deny("unexpected content-type for API request");
-                }
-                return WafVerdict::Allow;
-            }
-
-            ct.as_bytes()
-                .get(..16)
-                .map(|b| b.eq_ignore_ascii_case(b"application/json"))
-                .unwrap_or(false)
-        }
+    let ct = match content_type {
+        Some(ct) => ct,
         None => return WafVerdict::Deny("missing content-type header"),
     };
+    // Prefix match with delimiter check: "application/json" must be followed
+    // by EOF, ';' (charset), or ' ' — not arbitrary chars. Without this,
+    // "application/jsonFOO" would be treated as allowed.
+    let is_allowed = profile.allowed_content_types.iter().any(|allowed| {
+        if ct.len() < allowed.len() {
+            return false;
+        }
+        if !ct.as_bytes()[..allowed.len()].eq_ignore_ascii_case(allowed.as_bytes()) {
+            return false;
+        }
+        ct.len() == allowed.len()
+            || ct.as_bytes()[allowed.len()] == b';'
+            || ct.as_bytes()[allowed.len()] == b' '
+    });
+    // Strict policy denies a disallowed type outright. Lenient policy does NOT
+    // trust it either — we fall through to the Gate 3 injection scan before
+    // allowing. The previous code returned Allow here, forwarding the body
+    // UNSCANNED whenever deny_unknown_content_types was false, letting an
+    // attacker smuggle a payload past the WAF just by mislabelling it.
+    if !is_allowed && profile.deny_unknown_content_types {
+        return WafVerdict::Deny("unexpected content-type for API request");
+    }
+    // The JSON-structural gates (4/5) apply only to an allowed application/json
+    // body; a disallowed type is still injection-scanned but never JSON-parsed.
+    let is_json = is_allowed
+        && ct
+            .as_bytes()
+            .get(..16)
+            .map(|b| b.eq_ignore_ascii_case(b"application/json"))
+            .unwrap_or(false);
 
     // ── Gate 3: Aho-Corasick injection scan (O(N), single pass) ──
     // Profile-driven scanner: balanced (default) or aggressive.
@@ -898,8 +970,13 @@ pub fn validate_request(
     let needs_decode = memchr::memchr(b'%', body).is_some() || memchr::memchr(b'+', body).is_some();
     let has_sql_comments = body.windows(2).any(|w| w == b"/*");
     let has_unicode_esc = body.windows(2).any(|w| w == b"\\u");
+    // Whitespace-run evasion: a tab/VT/FF or a doubled space lets an attacker
+    // pad a pattern ("union  select", "1;\tcat") past the raw scan; the
+    // normalized pass collapses these, so run it when they are present too.
+    let has_ws_evasion = body.iter().any(|&b| matches!(b, b'\t' | 0x0b | 0x0c))
+        || body.windows(2).any(|w| w[0] == b' ' && w[1] == b' ');
 
-    if needs_decode || has_sql_comments || has_unicode_esc {
+    if needs_decode || has_sql_comments || has_unicode_esc || has_ws_evasion {
         let verdict = JSON_BUF.with(|buf1| {
             WAF_BUF_SEC.with(|buf2| {
                 let mut out = buf1.borrow_mut();
@@ -1008,8 +1085,12 @@ pub fn validate_uri(uri: &str, mode: WafMode) -> WafVerdict {
     let needs_decode =
         memchr::memchr(b'%', uri_bytes).is_some() || memchr::memchr(b'+', uri_bytes).is_some();
     let has_sql_comments = uri_bytes.windows(2).any(|w| w == b"/*");
+    // Whitespace-run evasion (raw tab/VT/FF or doubled space) — same rationale
+    // as the body gate in validate_request.
+    let has_ws_evasion = uri_bytes.iter().any(|&b| matches!(b, b'\t' | 0x0b | 0x0c))
+        || uri_bytes.windows(2).any(|w| w[0] == b' ' && w[1] == b' ');
 
-    if needs_decode || has_sql_comments {
+    if needs_decode || has_sql_comments || has_ws_evasion {
         let verdict = JSON_BUF.with(|buf1| {
             WAF_BUF_SEC.with(|buf2| {
                 let mut out = buf1.borrow_mut();
@@ -1095,8 +1176,9 @@ mod tests {
 
     #[test]
     fn streaming_denies_pattern_in_first_chunk_early_exit() {
-        let mut s = StreamingScanner::new(WafMode::Balanced, 10 * 1_048_576);
-        // SQLi token in first chunk — the second chunk should not even be needed.
+        let mut s = StreamingScanner::new(WafMode::Aggressive, 10 * 1_048_576);
+        // SQLi token (aggressive-tier "union select") in first chunk — the
+        // second chunk should not even be needed.
         let v = s.feed(b"foo bar union select 1,2,3 baz");
         assert!(matches!(v, StreamVerdict::Deny(_)), "got {v:?}");
     }
@@ -1105,7 +1187,7 @@ mod tests {
     fn streaming_catches_pattern_split_across_chunks() {
         // The pattern 'union select' (12 bytes) is split exactly at the
         // chunk boundary. Without an overlap buffer this would be missed.
-        let mut s = StreamingScanner::new(WafMode::Balanced, 10 * 1_048_576);
+        let mut s = StreamingScanner::new(WafMode::Aggressive, 10 * 1_048_576);
         assert_eq!(s.feed(b"prefix union sel"), StreamVerdict::Allow);
         let v = s.feed(b"ect 1 from t");
         assert!(matches!(v, StreamVerdict::Deny(_)), "got {v:?}");
@@ -1357,9 +1439,16 @@ mod tests {
 
     #[test]
     fn denies_prototype_pollution() {
+        // "__proto__" is aggressive-tier (false-positive on JS prose under
+        // balanced); a strict/admin route still catches it.
         let body = br#"{"__proto__":{"admin":true}}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny("injection pattern detected")
         );
     }
@@ -1745,10 +1834,16 @@ mod tests {
 
     #[test]
     fn denies_plus_encoded_sqli_in_body() {
-        // "union+select" → "union select" after + normalization
+        // "union+select" → "union select" after + normalization. "union select"
+        // is aggressive-tier now (false-positive on prose under balanced).
         let body = br#"{"query":"union+select+*+from+users"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny("injection pattern detected (encoded)")
         );
     }
@@ -1789,10 +1884,107 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_runs_do_not_evade_patterns() {
+        // Padding tokens with extra spaces / tabs must not slip past the
+        // single-space patterns — normalize_unified collapses inline
+        // whitespace. Each payload matches ONLY after collapsing (the raw,
+        // double-spaced form hits no pattern), so this isolates the fix.
+        // Command injection (balanced): double space after ';'.
+        assert!(matches!(
+            validate_request(
+                "POST",
+                Some("application/json"),
+                br#"{"c":"ls;  cat secret"}"#,
+                &strict_profile()
+            ),
+            WafVerdict::Deny(_)
+        ));
+        // Tab as the separator's whitespace (real 0x09 byte).
+        assert!(matches!(
+            validate_request(
+                "POST",
+                Some("application/json"),
+                b"{\"c\":\"ls;\tcat secret\"}",
+                &strict_profile()
+            ),
+            WafVerdict::Deny(_)
+        ));
+        // SQLi with a doubled space (aggressive tier holds "union select").
+        assert!(matches!(
+            validate_request(
+                "POST",
+                Some("application/json"),
+                br#"{"q":"union  select 1"}"#,
+                &aggressive_profile()
+            ),
+            WafVerdict::Deny(_)
+        ));
+        // \n is preserved so the newline command-injection patterns still fire.
+        assert!(matches!(
+            validate_request(
+                "POST",
+                Some("application/json"),
+                b"{\"c\":\"x\ncat secret\"}",
+                &strict_profile()
+            ),
+            WafVerdict::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn uri_normalizes_iis_and_overlong_encodings() {
+        // IIS-style %uXXXX: %u003c -> '<', so %u003cscript trips <script.
+        assert!(
+            matches!(
+                validate_uri("/x?h=%u003cscript%u003e", WafMode::Balanced),
+                WafVerdict::Deny(_)
+            ),
+            "%uXXXX should decode like \\uXXXX"
+        );
+        // Overlong UTF-8 of '/': ..%c0%af..%c0%af -> ../../ (traversal).
+        assert!(
+            matches!(
+                validate_uri("/x?f=..%c0%af..%c0%afetc/passwd", WafMode::Balanced),
+                WafVerdict::Deny(_)
+            ),
+            "overlong %c0%af should fold to '/'"
+        );
+    }
+
+    #[test]
+    fn disallowed_content_type_is_still_scanned_when_lenient() {
+        // deny_unknown_content_types = false must NOT forward a body unscanned:
+        // an injection in a mislabelled (text/html) body is still caught.
+        let lenient = WafProfile {
+            deny_unknown_content_types: false,
+            ..WafProfile::default()
+        };
+        assert!(
+            matches!(
+                validate_request("POST", Some("text/html"), b"; cat /etc/passwd", &lenient),
+                WafVerdict::Deny(_)
+            ),
+            "lenient profile must still injection-scan a disallowed content-type"
+        );
+        // A clean body on a disallowed type is allowed under the lenient policy.
+        assert_eq!(
+            validate_request("POST", Some("text/html"), b"hello world", &lenient),
+            WafVerdict::Allow
+        );
+    }
+
+    #[test]
     fn denies_sql_comment_evasion_in_body() {
+        // "union/**/select" → "union select" after comment stripping;
+        // aggressive-tier pattern now.
         let body = br#"{"q":"union/**/select * from users"}"#;
         assert_eq!(
-            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
             WafVerdict::Deny("injection pattern detected (encoded)")
         );
     }
@@ -1800,9 +1992,43 @@ mod tests {
     #[test]
     fn uri_denies_sql_comment_evasion() {
         assert_eq!(
-            validate_uri("/search?q=union/**/select", WafMode::Balanced),
+            validate_uri("/search?q=union/**/select", WafMode::Aggressive),
             WafVerdict::Deny("injection pattern in URI (encoded)")
         );
+    }
+
+    #[test]
+    fn balanced_allows_demoted_fp_patterns_aggressive_denies() {
+        // The e2e bug-hunt flagged these as false positives on real traffic:
+        // they no longer fire under the default (balanced) profile, but a
+        // strict/admin (aggressive) route still catches them. Regression guard.
+        let legit: &[&[u8]] = &[
+            br#"{"text":"the trade union select committee met today"}"#,
+            br#"{"err":"relation information_schema.columns does not exist"}"#,
+            br#"{"url":"ldap://ad.corp.local:389"}"#,
+            br#"{"html":"<!doctype html><img src=\"/logo.png\">"}"#,
+            br#"{"note":"never assign to __proto__ in JS code"}"#,
+        ];
+        for body in legit {
+            let shown = String::from_utf8_lossy(body);
+            assert_eq!(
+                validate_request("POST", Some("application/json"), body, &strict_profile()),
+                WafVerdict::Allow,
+                "balanced should ALLOW legit body: {shown}"
+            );
+            assert!(
+                matches!(
+                    validate_request(
+                        "POST",
+                        Some("application/json"),
+                        body,
+                        &aggressive_profile()
+                    ),
+                    WafVerdict::Deny(_)
+                ),
+                "aggressive should DENY: {shown}"
+            );
+        }
     }
 
     // ── JSON unicode escape evasion ──

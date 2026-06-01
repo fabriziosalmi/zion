@@ -695,6 +695,10 @@ fn resolve_upstream(config: &ZionConfig, name: &str) -> Result<Vec<String>, Stri
 /// whether to abort or log-and-keep the previous snapshot.
 pub fn build_router(config: &ZionConfig) -> Result<Router<Arc<ResolvedRoute>>, String> {
     let mut router = Router::new();
+    // Extra route aliases applied after every explicit route is inserted (so an
+    // explicit route always wins): a catch-all's bare prefix, and the
+    // trailing-slash-toggled variant of each explicit route.
+    let mut route_aliases: Vec<(String, Arc<ResolvedRoute>)> = Vec::new();
 
     for route in &config.route {
         let upstream_url = resolve_upstream(config, &route.upstream)?;
@@ -810,13 +814,87 @@ pub fn build_router(config: &ZionConfig) -> Result<Router<Arc<ResolvedRoute>>, S
             cors,
         });
 
-        router
-            .insert(route.path.clone(), resolved)
-            .map_err(|e| format!("Bad route pattern '{}': {}", route.path, e))?;
+        // A matchit catch-all "<prefix>/{*name}" does NOT match the bare
+        // "<prefix>" (nor the root "/" when the prefix is empty), so a
+        // "/{*rest}" route silently 404s on "/" even though it is meant to be
+        // the fallback for everything. Record the bare prefix so we can also
+        // map it to this route in a second pass (after all explicit routes).
+        match catchall_bare_prefix(&route.path) {
+            Some(bare) => {
+                router
+                    .insert(route.path.clone(), resolved.clone())
+                    .map_err(|e| format!("Bad route pattern '{}': {}", route.path, e))?;
+                route_aliases.push((bare, resolved));
+            }
+            None => {
+                // Non-catch-all: also alias the trailing-slash-toggled variant
+                // so "/x" and "/x/" resolve to the SAME route. matchit treats
+                // them as distinct, so "/x/" would otherwise fall through to a
+                // different (often more permissive) route — e.g. a stricter
+                // per-route WAF profile silently downgraded.
+                match trailing_slash_variant(&route.path) {
+                    Some(variant) => {
+                        router
+                            .insert(route.path.clone(), resolved.clone())
+                            .map_err(|e| format!("Bad route pattern '{}': {}", route.path, e))?;
+                        route_aliases.push((variant, resolved));
+                    }
+                    None => {
+                        router
+                            .insert(route.path.clone(), resolved)
+                            .map_err(|e| format!("Bad route pattern '{}': {}", route.path, e))?;
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply the aliases (catch-all bare prefixes + trailing-slash variants).
+    // Insert unconditionally and ignore the result: if an explicit route
+    // already occupies the alias, matchit returns a conflict (so the explicit
+    // route keeps priority); otherwise the alias resolves to its route, and
+    // matchit's specificity rules make an exact prefix win over a less-specific
+    // parent catch-all (e.g. "/api" → "/api/{*rest}", not the root "/{*rest}").
+    for (alias, resolved) in route_aliases {
+        let _ = router.insert(alias, resolved);
     }
 
     print_routes_table(&config.route);
     Ok(router)
+}
+
+/// If `path` is a matchit catch-all (`<prefix>/{*name}`), return the bare
+/// prefix the catch-all should also serve (`/` for a root catch-all). matchit's
+/// catch-all does not match the bare prefix, so without registering it a
+/// `/{*rest}` route returns 404 on `/` — surprising for a "match everything"
+/// fallback. Returns `None` for non-catch-all paths.
+fn catchall_bare_prefix(path: &str) -> Option<String> {
+    let slash = path.rfind('/')?;
+    let seg = &path[slash + 1..];
+    if seg.starts_with("{*") && seg.ends_with('}') {
+        Some(if slash == 0 {
+            "/".to_string()
+        } else {
+            path[..slash].to_string()
+        })
+    } else {
+        None
+    }
+}
+
+/// The trailing-slash-toggled variant of an explicit (non-catch-all) route
+/// path, registered as a best-effort alias so "/x" and "/x/" resolve to the
+/// SAME route. matchit treats them as distinct, so without this "/x/" falls
+/// through to whatever broader route matches — silently downgrading a stricter
+/// per-route WAF profile. Returns `None` for the bare root "/".
+fn trailing_slash_variant(path: &str) -> Option<String> {
+    if path == "/" {
+        None
+    } else if let Some(stripped) = path.strip_suffix('/') {
+        Some(stripped.to_string())
+    } else {
+        Some(format!("{path}/"))
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1279,6 +1357,19 @@ mtls_fingerprint = false
         let upload = router.at("/upload").unwrap();
         let waf = upload.value.waf.as_ref().unwrap();
         assert_eq!(waf.max_body_mb, 200);
+        // Trailing-slash variant resolves to the SAME route (rank 18: without
+        // the alias, "/upload/" falls through and loses the upload WAF profile).
+        assert_eq!(
+            router
+                .at("/upload/")
+                .expect("/upload/ should alias /upload")
+                .value
+                .waf
+                .as_ref()
+                .unwrap()
+                .max_body_mb,
+            200
+        );
 
         // Static cache route
         let statics = router.at("/_next/static/chunk.js").unwrap();
@@ -1291,6 +1382,28 @@ mtls_fingerprint = false
         let catchall = router.at("/about").unwrap();
         assert!(catchall.value.waf.is_none());
         assert!(catchall.value.cache.is_none());
+
+        // Bare-prefix fallback: a catch-all "<prefix>/{*rest}" must also serve
+        // its bare prefix. matchit alone would 404 these (regression guard for
+        // the root-route bug found in the e2e harness).
+        // Root "/{*rest}" → "/" resolves to the catch-all (no WAF/cache).
+        let root = router.at("/").expect("root '/' should match the catch-all");
+        assert!(root.value.waf.is_none());
+        assert!(root.value.cache.is_none());
+        // "/api/{*rest}" → bare "/api" resolves to the API route (strict WAF).
+        assert!(router
+            .at("/api")
+            .expect("/api should match its catch-all")
+            .value
+            .waf
+            .is_some());
+        // "/_next/static/{*rest}" → bare "/_next/static" resolves to the cache route.
+        assert!(router
+            .at("/_next/static")
+            .expect("/_next/static should match its catch-all")
+            .value
+            .cache
+            .is_some());
     }
 
     #[test]

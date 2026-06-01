@@ -41,6 +41,18 @@ use http_body_util::Limited;
 const MAX_URI_LEN: usize = 8192;
 const MAX_CACHEABLE_BODY: usize = 50 * 1024 * 1024;
 
+/// Per-frame idle timeout while reading a request body on the streaming WAF
+/// path: if no body frame arrives within this window the client is trickling
+/// (slow-read / slowloris-body) and we evict it with 408. This bounds the idle
+/// time *between* reads rather than total upload time, so a legit large upload
+/// over a slow-but-steady link is not penalised.
+const BODY_FRAME_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Total timeout for buffering a request body on the non-streaming path (the
+/// smaller default bodies). A trickled body trips this long before a legit
+/// upload near `max_body_mb` would.
+const BODY_COLLECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 const CACHE_CONTROL_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
 #[inline]
@@ -110,7 +122,33 @@ fn emit_waf_block(
     }
 }
 
+/// Public entry point. Runs the full pipeline via `process_request_inner`,
+/// then applies the response security headers to EVERY outcome — the success
+/// path AND all the early-return error branches (WAF deny, 405, 413, 431,
+/// 425, ...) — in one place. Previously HSTS / X-Content-Type-Options /
+/// X-Frame-Options / referrer-policy / permissions-policy were only set on the
+/// success path, so Zion-generated error responses shipped without them.
+/// inject_security_headers is idempotent (insert), so the few inner call sites
+/// are harmless. Also echoes the client's X-Request-ID on error responses for
+/// correlation.
 pub(crate) async fn process_request(
+    req: Request<ZionBody>,
+    state: Arc<AppState>,
+    remote_addr: SocketAddr,
+    is_early_data: bool,
+) -> Result<Response<ZionBody>, hyper::Error> {
+    let client_request_id = req.headers().get("X-Request-ID").cloned();
+    let mut resp = process_request_inner(req, state, remote_addr, is_early_data).await?;
+    inject_security_headers(&mut resp);
+    if !resp.headers().contains_key("X-Request-ID") {
+        if let Some(id) = client_request_id {
+            resp.headers_mut().insert("X-Request-ID", id);
+        }
+    }
+    Ok(resp)
+}
+
+async fn process_request_inner(
     mut req: Request<ZionBody>,
     state: Arc<AppState>,
     remote_addr: SocketAddr,
@@ -638,8 +676,10 @@ pub(crate) async fn process_request(
                 let mut body = body;
                 let mut early_deny: Option<&'static str> = None;
                 loop {
-                    match BodyExt::frame(&mut body).await {
-                        Some(Ok(frame)) => match frame.into_data() {
+                    match tokio::time::timeout(BODY_FRAME_IDLE_TIMEOUT, BodyExt::frame(&mut body))
+                        .await
+                    {
+                        Ok(Some(Ok(frame))) => match frame.into_data() {
                             Ok(data) => {
                                 match scanner.feed(&data) {
                                     waf::StreamVerdict::Allow => {}
@@ -654,13 +694,19 @@ pub(crate) async fn process_request(
                             // Trailers / non-data frames: ignore (no body bytes).
                             Err(_other) => continue,
                         },
-                        Some(Err(_)) => {
+                        Ok(Some(Err(_))) => {
                             return Ok(text_response(
                                 StatusCode::BAD_REQUEST,
                                 "request body read error",
                             ))
                         }
-                        None => break, // EOF
+                        Ok(None) => break, // EOF
+                        Err(_elapsed) => {
+                            return Ok(text_response(
+                                StatusCode::REQUEST_TIMEOUT,
+                                "request body read timeout",
+                            ))
+                        }
                     }
                 }
 
@@ -710,12 +756,18 @@ pub(crate) async fn process_request(
                 buf.freeze()
             } else {
                 let limited = Limited::new(body, max_body_bytes);
-                match BodyExt::collect(limited).await {
-                    Ok(collected) => collected.to_bytes(),
-                    Err(_) => {
+                match tokio::time::timeout(BODY_COLLECT_TIMEOUT, BodyExt::collect(limited)).await {
+                    Ok(Ok(collected)) => collected.to_bytes(),
+                    Ok(Err(_)) => {
                         return Ok(text_response(
                             StatusCode::PAYLOAD_TOO_LARGE,
                             "request body too large",
+                        ))
+                    }
+                    Err(_elapsed) => {
+                        return Ok(text_response(
+                            StatusCode::REQUEST_TIMEOUT,
+                            "request body read timeout",
                         ))
                     }
                 }
@@ -817,7 +869,16 @@ pub(crate) async fn process_request(
             .websocket_upgrades
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let on_upgrade = hyper::upgrade::on(&mut req);
-        let mut resp = proxy::proxy_websocket(req, on_upgrade, &dyn_scheme, &dyn_authority).await?;
+        let mut resp = proxy::proxy_websocket(
+            req,
+            on_upgrade,
+            &dyn_scheme,
+            &dyn_authority,
+            Some(forward_addr),
+            "https",
+            cfg.xff_mode,
+        )
+        .await?;
         inject_security_headers(&mut resp);
         return Ok(resp);
     }
@@ -1125,6 +1186,19 @@ pub(crate) async fn process_request(
 /// issues (S-05: browsers blocked cached CSS/JS without Content-Type
 /// because nosniff was set).
 #[inline]
+/// Cache-Control to emit for a cached asset when the upstream did not set one:
+/// the profile TTL as a public max-age, or `immutable` for the ~1-year default
+/// (which marks content-hashed assets). Replaces the old blanket "immutable"
+/// stamp that ignored the profile TTL and clobbered the origin's policy.
+fn profile_cache_control(ttl_seconds: u64) -> hyper::header::HeaderValue {
+    if ttl_seconds >= 31_536_000 {
+        hyper::header::HeaderValue::from_static(CACHE_CONTROL_IMMUTABLE)
+    } else {
+        hyper::header::HeaderValue::try_from(format!("public, max-age={ttl_seconds}"))
+            .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("public"))
+    }
+}
+
 async fn handle_static_cache(
     req: Request<ZionBody>,
     state: Arc<AppState>,
@@ -1134,6 +1208,30 @@ async fn handle_static_cache(
     dyn_authority: &hyper::http::uri::Authority,
     xff_mode: proxy::XffMode,
 ) -> Result<Response<ZionBody>, hyper::Error> {
+    // Only GET is cacheable. HEAD/POST/PUT/PATCH/DELETE/OPTIONS must bypass the
+    // cache and never populate it: the cache key is the path (no method), so a
+    // non-GET 200 stored under it — a HEAD's empty body, or a POST response —
+    // would later be served to a GET (method-confusion cache poisoning).
+    if *req.method() != hyper::Method::GET {
+        return proxy::proxy_pass(
+            &state.http_client,
+            req,
+            dyn_scheme,
+            dyn_authority,
+            Some(remote_addr),
+            "https",
+            xff_mode,
+        )
+        .await;
+    }
+
+    // Cache TTL / capacity from the profile (mode=StaticCache without an
+    // explicit profile uses the ~1-year content-hashed default).
+    let (cache_ttl, cache_max) = match &rule.cache {
+        Some(cp) => (cp.ttl_seconds, cp.max_entries),
+        None => (31_536_000, 10_000),
+    };
+
     // Use full path+query as cache key to prevent cache poisoning:
     // /api?user=alice and /api?user=bob must NOT share a cache entry.
     let cache_key = req
@@ -1146,7 +1244,7 @@ async fn handle_static_cache(
     if let Some(hit) = state.static_cache.get(cache_key) {
         let mut builder = Response::builder()
             .status(hit.meta.status)
-            .header("Cache-Control", CACHE_CONTROL_IMMUTABLE);
+            .header("Cache-Control", profile_cache_control(cache_ttl));
         if let Some(ct) = &hit.meta.content_type {
             builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
         }
@@ -1178,12 +1276,10 @@ async fn handle_static_cache(
         // through to fetch ourselves.
         let _ = rx.wait_for(|v| *v).await;
         if let Some(hit) = state.static_cache.get(path_owned.as_ref()) {
-            metrics::METRICS
-                .cache_hits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // get() already counted this hit — don't double-count it here.
             let mut builder = Response::builder()
                 .status(hit.meta.status)
-                .header("Cache-Control", CACHE_CONTROL_IMMUTABLE);
+                .header("Cache-Control", profile_cache_control(cache_ttl));
             if let Some(ct) = &hit.meta.content_type {
                 builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
             }
@@ -1250,7 +1346,20 @@ async fn handle_static_cache(
             })
             .unwrap_or(false);
 
-        if has_unsafe_vary {
+        // Never cache (or serve from a shared cache) a response the origin
+        // marked private / no-store / no-cache — that could leak one client's
+        // response to another. Stream it straight through instead.
+        let cc_forbids_cache = parts
+            .headers
+            .get(hyper::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| {
+                let v = v.to_ascii_lowercase();
+                v.contains("private") || v.contains("no-store") || v.contains("no-cache")
+            })
+            .unwrap_or(false);
+
+        if has_unsafe_vary || cc_forbids_cache {
             // Stream the body straight to the client without caching.
             // Drop the inflight sender (no `true` sent): waiters fall through
             // to a fresh fetch, since cache will not be populated for this key.
@@ -1278,11 +1387,6 @@ async fn handle_static_cache(
         let path_clone = path_owned.clone();
         let meta_clone = meta.clone();
         let tx_clone = tx.clone();
-
-        let (cache_ttl, cache_max) = match &rule.cache {
-            Some(cp) => (cp.ttl_seconds, cp.max_entries),
-            None => (31_536_000, 10_000),
-        };
 
         // Cache Tee-Reader Pipeline
         tokio::spawn(async move {
@@ -1350,10 +1454,12 @@ async fn handle_static_cache(
         });
 
         let mut resp = Response::from_parts(parts, stream_body.boxed());
-        resp.headers_mut().insert(
-            "Cache-Control",
-            hyper::header::HeaderValue::from_static(CACHE_CONTROL_IMMUTABLE),
-        );
+        // Preserve the upstream Cache-Control if it set one; otherwise supply
+        // the profile-derived default — don't blanket-stamp 1-year immutable.
+        if !resp.headers().contains_key(hyper::header::CACHE_CONTROL) {
+            resp.headers_mut()
+                .insert("Cache-Control", profile_cache_control(cache_ttl));
+        }
         return Ok(resp);
     }
 

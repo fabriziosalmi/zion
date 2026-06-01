@@ -694,10 +694,14 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
             config.tls.clone(),
             Some(quic_reload_tx),
         )?;
-    }
 
-    // 4b. Predictive TTL pre-warming: pre-build TLS config before cert expires
-    tls::spawn_cert_prewarm_task(tls_acceptor_store.clone(), config.tls.clone());
+        // 4b. Predictive TTL pre-warming: pre-build the TLS config before the
+        // cert expires. It hot-swaps the acceptor and rotates the session-
+        // ticket key, so it must obey the same hot_reload switch as the watcher
+        // — otherwise it silently rotates certs/keys (breaking resumption /
+        // 0-RTT) behind an operator who set hot_reload = false.
+        tls::spawn_cert_prewarm_task(tls_acceptor_store.clone(), config.tls.clone());
+    }
 
     // 5. Build the config-derived snapshot (router, health map, trusted
     // proxies, XFF policy, rate-limit settings — everything that follows
@@ -898,7 +902,17 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         redact: compiled_redact,
         http_builder: Arc::new({
             let mut b = AutoBuilder::new(TokioExecutor::new());
+            // A clock MUST be installed or hyper's header_read_timeout (and any
+            // other time-based limit) is silently a no-op — hyper logs "no timer
+            // set". With the timer in place, a client that opens a connection
+            // and then dribbles or stalls its request headers is dropped after
+            // the deadline instead of pinning a connection slot (and, on :443,
+            // a conn-limit permit + per-IP slot) for up to the connection cap.
+            // Basic slowloris defence, applied on both :80 and :443.
+            b.http1().timer(hyper_util::rt::TokioTimer::new());
             b.http1().max_headers(64).max_buf_size(16 * 1024);
+            b.http1()
+                .header_read_timeout(std::time::Duration::from_secs(15));
             b.http1().preserve_header_case(false);
             b.http1().title_case_headers(false);
             b
@@ -1312,6 +1326,33 @@ async fn handle_http_connection(
     state: Arc<AppState>,
     builder: Arc<AutoBuilder<TokioExecutor>>,
 ) {
+    // Mirror the HTTPS accept ceremony so :80 is not an unmetered bypass of
+    // the connection ceiling. Without these, the :80 listener accepted
+    // unbounded held connections — climbing FD/task count and starving the
+    // shared runtime that also serves :443. The global conn-limit permit and
+    // the per-IP slot are held for the connection's lifetime and released on
+    // drop (including early return / panic).
+    let _permit = match state.conn_limit.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let _ip_slot = match state
+        .conn_per_ip
+        .try_acquire(addr.ip(), state.config.load().max_connections_per_ip)
+    {
+        Some(slot) => slot,
+        None => {
+            metrics::METRICS
+                .connections_rejected_per_ip
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    };
+    let _conn_guard = metrics::ConnectionGuard::new();
+    metrics::METRICS
+        .connections_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     // Disable Nagle on the accepted socket. Without this, response data
     // for small replies (e.g. /healthz, 301 redirects) gets coalesced
     // with the FIN handshake or paired with delayed-ACK on the client,
@@ -1321,16 +1362,21 @@ async fn handle_http_connection(
     net::tune_accepted(&stream);
 
     let io = TokioIo::new(stream);
-    let _ = builder
-        .serve_connection(
+    // Connection-level idle timeout — matches the HTTPS path (1h, generous
+    // enough for keep-alive; header_read_timeout bounds the slowloris header
+    // phase, per-request limits live in handle_http).
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(3600),
+        builder.serve_connection(
             io,
             service_fn(move |req| {
                 use http_body_util::BodyExt;
                 let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
                 handle_http(req_boxed, state.clone(), addr)
             }),
-        )
-        .await;
+        ),
+    )
+    .await;
 }
 
 /// Run the HTTPS / TLS accept loop. On non-Linux or without the
@@ -1551,7 +1597,15 @@ fn spawn_https_handler(
                         // Consume early_data flag on first request.
                         let was_early =
                             early_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
-                        // Inject mTLS fingerprint header if the peer presented a cert.
+                        // X-Client-Cert-Fingerprint is Zion's attestation of a
+                        // verified client certificate; a client must never be
+                        // able to set it. Strip any inbound value (and the
+                        // legacy -DN) unconditionally, THEN re-inject only the
+                        // verified fingerprint when the peer actually presented
+                        // a cert — otherwise a forged header survives to the
+                        // upstream and the access log as a fake mTLS identity.
+                        req.headers_mut().remove("X-Client-Cert-Fingerprint");
+                        req.headers_mut().remove("X-Client-Cert-DN");
                         if let Some(ref fp) = client_fp {
                             if let Ok(val) = hyper::header::HeaderValue::from_str(fp) {
                                 req.headers_mut().insert("X-Client-Cert-Fingerprint", val);
@@ -1604,10 +1658,16 @@ fn is_valid_host(host: &str) -> bool {
 
 /// HTTP (port 80) handler — ACME challenge proxy or 301 redirect to HTTPS.
 async fn handle_http(
-    req: Request<ZionBody>,
+    mut req: Request<ZionBody>,
     state: Arc<AppState>,
     remote_addr: SocketAddr,
 ) -> Result<Response<ZionBody>, hyper::Error> {
+    // Plaintext :80 never has a verified client certificate, so any inbound
+    // X-Client-Cert-Fingerprint / -DN is forged. Strip both before the request
+    // is logged or proxied, so a client cannot smuggle a fake mTLS identity.
+    req.headers_mut().remove("X-Client-Cert-Fingerprint");
+    req.headers_mut().remove("X-Client-Cert-DN");
+
     // Rate limit HTTP/80 to prevent DoS via redirect/ACME flood
     if !check_rate_limit(&state, remote_addr.ip()) {
         metrics::METRICS
@@ -1616,8 +1676,16 @@ async fn handle_http(
         return Ok(empty_response(StatusCode::TOO_MANY_REQUESTS));
     }
 
-    // URI length check (same as HTTPS handler)
-    if req.uri().path().len() > MAX_URI_LEN {
+    // URI length check — measure path+query, matching the HTTPS handler. The
+    // old check looked at path() only, so a short path with a multi-kilobyte
+    // query string slipped past the cap on :80 (reflected into the redirect
+    // Location and the access log).
+    let uri_len = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().len())
+        .unwrap_or_else(|| req.uri().path().len());
+    if uri_len > MAX_URI_LEN {
         return Ok(empty_response(StatusCode::URI_TOO_LONG));
     }
 

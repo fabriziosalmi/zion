@@ -100,6 +100,22 @@ pub fn bad_gateway() -> Response<ZionBody> {
         .unwrap()
 }
 
+/// 504 Gateway Timeout — the upstream was reachable but produced no response
+/// within `UPSTREAM_REQUEST_TIMEOUT`. Kept distinct from `bad_gateway` (502 =
+/// connect refused/reset) so an operator can tell a *slow* backend from an
+/// *unreachable* one.
+#[inline]
+pub fn gateway_timeout() -> Response<ZionBody> {
+    Response::builder()
+        .status(StatusCode::GATEWAY_TIMEOUT)
+        .body(
+            Full::new(Bytes::from("504 Gateway Timeout"))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
 /// Rewrite URI for upstream forwarding and add proxy headers.
 /// Uses pre-parsed scheme+authority from config — only path is set at runtime.
 #[inline]
@@ -128,11 +144,36 @@ fn prepare_request<B>(
     *req.uri_mut() = new_uri;
     *req.version_mut() = Version::HTTP_11;
 
-    // Remove hop-by-hop headers (RFC 7230 §6.1).
-    // Forwarding Transfer-Encoding enables CL/TE request smuggling.
-    // Forwarding Proxy-Authorization leaks client credentials to upstream.
-    req.headers_mut().remove(hyper::header::HOST);
+    // Shared forwarding hygiene: strip Host + dangerous hop-by-hop /
+    // credential headers, enforce the X-Forwarded-For policy and set the
+    // X-Real-IP / X-Forwarded-Proto / X-Forwarded-Host trust headers.
+    apply_forwarding_hygiene(&mut req, remote_addr, proto, xff_mode);
+    // Connection is hop-by-hop (RFC 7230 §6.1); unlike the WebSocket path a
+    // normal proxy request must NOT forward it to the upstream.
     req.headers_mut().remove(hyper::header::CONNECTION);
+
+    Some(req)
+}
+
+/// Forwarding header hygiene shared by the normal proxy ([`prepare_request`])
+/// and the WebSocket upgrade ([`proxy_websocket`]). Strips the dangerous
+/// hop-by-hop / credential headers that must never reach the upstream
+/// (Transfer-Encoding, TE, Trailer, Proxy-Authorization, Proxy-Connection,
+/// Keep-Alive), drops the inbound Host (re-surfaced as `X-Forwarded-Host` for
+/// vhost-routing upstreams), and sets the `X-Forwarded-*` / `X-Real-IP` trust
+/// headers per the XFF policy. `Connection` / `Upgrade` are intentionally left
+/// to the caller: the normal proxy strips `Connection`, a WS upgrade keeps
+/// both for the handshake.
+fn apply_forwarding_hygiene<B>(
+    req: &mut Request<B>,
+    remote_addr: Option<SocketAddr>,
+    proto: &str,
+    xff_mode: XffMode,
+) {
+    // Capture the inbound Host for X-Forwarded-Host before we strip it.
+    let inbound_host = req.headers().get(hyper::header::HOST).cloned();
+
+    req.headers_mut().remove(hyper::header::HOST);
     req.headers_mut().remove(hyper::header::TRANSFER_ENCODING);
     req.headers_mut().remove(hyper::header::TE);
     req.headers_mut().remove(hyper::header::TRAILER);
@@ -141,16 +182,12 @@ fn prepare_request<B>(
     req.headers_mut().remove("Keep-Alive");
 
     // ── X-Forwarded-For policy ──
-    // For Rewrite/Drop modes we MUST strip any inbound XFF first, otherwise
-    // an attacker-controlled leftmost entry survives to upstream apps that
-    // read XFF[0] for ACL/audit. For Append we keep the inbound chain.
+    // For Rewrite/Drop we MUST strip any inbound XFF first, otherwise an
+    // attacker-controlled leftmost entry survives to upstream apps that read
+    // XFF[0] for ACL/audit. For Append we keep the inbound chain.
     if matches!(xff_mode, XffMode::Rewrite | XffMode::Drop) {
         req.headers_mut().remove("X-Forwarded-For");
     }
-
-    // X-Real-IP: always set to the resolved client IP (caller passes the
-    // already-resolved address). Inbound X-Real-IP is never trusted —
-    // overwrite unconditionally.
     if let Some(addr) = remote_addr {
         thread_local! {
             static IP_BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(45));
@@ -162,17 +199,12 @@ fn prepare_request<B>(
             if let Ok(val) = HeaderValue::from_str(&buf) {
                 match xff_mode {
                     XffMode::Append => {
-                        // Preserve inbound chain, append our resolved IP.
                         req.headers_mut().append("X-Forwarded-For", val.clone());
                     }
                     XffMode::Rewrite => {
-                        // Single-entry chain; insert (not append) to overwrite
-                        // anything that survived the strip above (defensive).
                         req.headers_mut().insert("X-Forwarded-For", val.clone());
                     }
-                    XffMode::Drop => {
-                        // No XFF emitted at all.
-                    }
+                    XffMode::Drop => {}
                 }
                 req.headers_mut().insert("X-Real-IP", val);
             }
@@ -186,8 +218,12 @@ fn prepare_request<B>(
             PROTO_HTTP.clone()
         },
     );
-
-    Some(req)
+    // X-Forwarded-Host: re-surface the original Host so a vhost-routing
+    // upstream still sees it (the module doc claimed this header was set but
+    // it never was).
+    if let Some(host) = inbound_host {
+        req.headers_mut().insert("X-Forwarded-Host", host);
+    }
 }
 
 /// Forward a request to the upstream (standard proxy).
@@ -283,6 +319,15 @@ pub async fn proxy_pass_stream(
     }
 }
 
+/// Upper bound on a single upstream request/response. A hung or black-holed
+/// backend (TCP/TLS completes but the HTTP response never arrives, or arrives
+/// at a trickle) would otherwise pin the request (and the conn-limit permit
+/// plus per-IP slot it holds) up to the 1h connection cap — a DoS amplifier.
+/// 504 on elapse. Per-upstream `connect_timeout_ms` covers only the connect
+/// phase and is not yet wired to the shared pooled client; this overall bound
+/// is what closes the hang.
+const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Internal: send a prepared request through the shared client.
 #[inline]
 async fn send_request(
@@ -290,20 +335,27 @@ async fn send_request(
     req: Request<ZionBody>,
 ) -> Result<Response<ZionBody>, hyper::Error> {
     let upstream_start = std::time::Instant::now();
-    match client.request(req).await {
-        Ok(resp) => {
+    match tokio::time::timeout(UPSTREAM_REQUEST_TIMEOUT, client.request(req)).await {
+        Ok(Ok(resp)) => {
             crate::metrics::METRICS
                 .upstream_duration
                 .observe(upstream_start.elapsed());
             let (parts, body) = resp.into_parts();
             Ok(Response::from_parts(parts, body.boxed()))
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             crate::metrics::METRICS
                 .upstream_duration
                 .observe(upstream_start.elapsed());
             eprintln!("  proxy error: {e}");
             Ok(bad_gateway())
+        }
+        Err(_elapsed) => {
+            crate::metrics::METRICS
+                .upstream_duration
+                .observe(upstream_start.elapsed());
+            eprintln!("  proxy upstream timeout after {UPSTREAM_REQUEST_TIMEOUT:?}");
+            Ok(gateway_timeout())
         }
     }
 }
@@ -315,6 +367,9 @@ pub async fn proxy_websocket(
     on_client_upgrade: hyper::upgrade::OnUpgrade,
     scheme: &hyper::http::uri::Scheme,
     authority: &hyper::http::uri::Authority,
+    remote_addr: Option<SocketAddr>,
+    proto: &str,
+    xff_mode: XffMode,
 ) -> Result<Response<ZionBody>, hyper::Error> {
     // Build upstream URI
     let path_and_query = req
@@ -359,7 +414,13 @@ pub async fn proxy_websocket(
     // Perform HTTP upgrade handshake with upstream
     *req.uri_mut() = upstream_uri;
     *req.version_mut() = Version::HTTP_11;
-    req.headers_mut().remove(hyper::header::HOST);
+    // Same forwarding hygiene as the normal proxy (strip Host + dangerous
+    // hop-by-hop / credential headers — notably Proxy-Authorization — and set
+    // the X-Forwarded-* / X-Real-IP trust headers per the XFF policy), but
+    // KEEP Connection + Upgrade, which carry the WebSocket handshake. The old
+    // path stripped only Host, so it leaked Proxy-Authorization and a spoofed
+    // X-Forwarded-For straight to the upstream.
+    apply_forwarding_hygiene(&mut req, remote_addr, proto, xff_mode);
 
     // HTTP/1.1 upgrade handshake — works on any AsyncRead+AsyncWrite stream.
     // For TLS upstreams, wrap in tokio-rustls connector first.
