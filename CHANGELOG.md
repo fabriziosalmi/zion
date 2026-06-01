@@ -4,6 +4,49 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-06-01
+
+Resilience and correctness, validated on a real two-node Proxmox e2e bench
+(real FQDN, real Let's Encrypt TLS 1.3). Adds adaptive self-heal so a recovered
+origin returns to service in ~1.4 s instead of up to 30 s, closes 24 data-plane
+findings from a live bug-hunt, and fixes a `/metrics` content-negotiation bug
+that made standard Prometheus unable to scrape.
+
+### Added
+
+- **Adaptive decorrelated-jitter origin recovery (#173)** — replaces the fixed
+  30 s upstream health-probe interval with a per-upstream decorrelated-jitter
+  backoff (AWS / Marc Brooker). A DOWN upstream is re-probed on a 100 ms→3 s
+  schedule, so a recovered origin returns to service in **~1.4 s instead of
+  ~30 s** (measured live on the e2e rig, ~21× faster), with jitter to avoid a
+  recovery thundering-herd across a co-dead pool or mesh replicas. HEALTHY
+  upstreams keep the unchanged 30 s steady cadence — zero happy-path
+  regression, identical steady-state origin load. Backoff state rides the
+  config-reload `Arc`-reuse so an in-progress walk survives reloads; the
+  request path is untouched (lock-free). `fastrand` promoted to a direct dep.
+
+### Fixed
+
+- **`/metrics` content-negotiation (#172)** — OpenMetrics exemplars were emitted
+  under the classic `text/plain; version=0.0.4` content-type, which standard
+  Prometheus rejects, making the target unscrapeable. `/metrics` now
+  content-negotiates on the `Accept` header: classic exposition (no exemplars,
+  no `# EOF`) by default, OpenMetrics only when the client asks for
+  `application/openmetrics-text`.
+- **24 data-plane findings from a live e2e bug-hunt (#171)** — request-path
+  hardening surfaced by real-traffic testing: catch-all-root + trailing-slash
+  routing, header-read / body-read / upstream timeouts (504/408), inbound
+  client-cert-fingerprint header strip, forwarding hygiene on the WebSocket
+  path, WAF whitespace/unicode/overlong-encoding evasion gates, cache GET-gating
+  + `Cache-Control` honoring, and security-header injection on all responses.
+
+### Validated
+
+- Two-node Proxmox e2e benchmark (`benches/e2e/`): Zion on **2 Skylake vCPU**
+  sustains **96 k req/s** cache+WAF+TLS and **43 k req/s** proxy+WAF+TLS at
+  ~40 MB RSS, and holds **flat RSS (OLS −26 MB/h, no leak)** under a
+  4.67 M-request mixed attack while serving 4.66 M legit cache-hits — 0 panics.
+
 ## [0.3.1] - 2026-06-01
 
 A focused patch on operability and documentation honesty. Makes the
