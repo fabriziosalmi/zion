@@ -100,6 +100,22 @@ pub fn bad_gateway() -> Response<ZionBody> {
         .unwrap()
 }
 
+/// 504 Gateway Timeout — the upstream was reachable but produced no response
+/// within `UPSTREAM_REQUEST_TIMEOUT`. Kept distinct from `bad_gateway` (502 =
+/// connect refused/reset) so an operator can tell a *slow* backend from an
+/// *unreachable* one.
+#[inline]
+pub fn gateway_timeout() -> Response<ZionBody> {
+    Response::builder()
+        .status(StatusCode::GATEWAY_TIMEOUT)
+        .body(
+            Full::new(Bytes::from("504 Gateway Timeout"))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
 /// Rewrite URI for upstream forwarding and add proxy headers.
 /// Uses pre-parsed scheme+authority from config — only path is set at runtime.
 #[inline]
@@ -283,6 +299,15 @@ pub async fn proxy_pass_stream(
     }
 }
 
+/// Upper bound on a single upstream request/response. A hung or black-holed
+/// backend (TCP/TLS completes but the HTTP response never arrives, or arrives
+/// at a trickle) would otherwise pin the request (and the conn-limit permit
+/// plus per-IP slot it holds) up to the 1h connection cap — a DoS amplifier.
+/// 504 on elapse. Per-upstream `connect_timeout_ms` covers only the connect
+/// phase and is not yet wired to the shared pooled client; this overall bound
+/// is what closes the hang.
+const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Internal: send a prepared request through the shared client.
 #[inline]
 async fn send_request(
@@ -290,20 +315,27 @@ async fn send_request(
     req: Request<ZionBody>,
 ) -> Result<Response<ZionBody>, hyper::Error> {
     let upstream_start = std::time::Instant::now();
-    match client.request(req).await {
-        Ok(resp) => {
+    match tokio::time::timeout(UPSTREAM_REQUEST_TIMEOUT, client.request(req)).await {
+        Ok(Ok(resp)) => {
             crate::metrics::METRICS
                 .upstream_duration
                 .observe(upstream_start.elapsed());
             let (parts, body) = resp.into_parts();
             Ok(Response::from_parts(parts, body.boxed()))
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             crate::metrics::METRICS
                 .upstream_duration
                 .observe(upstream_start.elapsed());
             eprintln!("  proxy error: {e}");
             Ok(bad_gateway())
+        }
+        Err(_elapsed) => {
+            crate::metrics::METRICS
+                .upstream_duration
+                .observe(upstream_start.elapsed());
+            eprintln!("  proxy upstream timeout after {UPSTREAM_REQUEST_TIMEOUT:?}");
+            Ok(gateway_timeout())
         }
     }
 }
