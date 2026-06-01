@@ -1186,6 +1186,19 @@ async fn process_request_inner(
 /// issues (S-05: browsers blocked cached CSS/JS without Content-Type
 /// because nosniff was set).
 #[inline]
+/// Cache-Control to emit for a cached asset when the upstream did not set one:
+/// the profile TTL as a public max-age, or `immutable` for the ~1-year default
+/// (which marks content-hashed assets). Replaces the old blanket "immutable"
+/// stamp that ignored the profile TTL and clobbered the origin's policy.
+fn profile_cache_control(ttl_seconds: u64) -> hyper::header::HeaderValue {
+    if ttl_seconds >= 31_536_000 {
+        hyper::header::HeaderValue::from_static(CACHE_CONTROL_IMMUTABLE)
+    } else {
+        hyper::header::HeaderValue::try_from(format!("public, max-age={ttl_seconds}"))
+            .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("public"))
+    }
+}
+
 async fn handle_static_cache(
     req: Request<ZionBody>,
     state: Arc<AppState>,
@@ -1212,6 +1225,13 @@ async fn handle_static_cache(
         .await;
     }
 
+    // Cache TTL / capacity from the profile (mode=StaticCache without an
+    // explicit profile uses the ~1-year content-hashed default).
+    let (cache_ttl, cache_max) = match &rule.cache {
+        Some(cp) => (cp.ttl_seconds, cp.max_entries),
+        None => (31_536_000, 10_000),
+    };
+
     // Use full path+query as cache key to prevent cache poisoning:
     // /api?user=alice and /api?user=bob must NOT share a cache entry.
     let cache_key = req
@@ -1224,7 +1244,7 @@ async fn handle_static_cache(
     if let Some(hit) = state.static_cache.get(cache_key) {
         let mut builder = Response::builder()
             .status(hit.meta.status)
-            .header("Cache-Control", CACHE_CONTROL_IMMUTABLE);
+            .header("Cache-Control", profile_cache_control(cache_ttl));
         if let Some(ct) = &hit.meta.content_type {
             builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
         }
@@ -1259,7 +1279,7 @@ async fn handle_static_cache(
             // get() already counted this hit — don't double-count it here.
             let mut builder = Response::builder()
                 .status(hit.meta.status)
-                .header("Cache-Control", CACHE_CONTROL_IMMUTABLE);
+                .header("Cache-Control", profile_cache_control(cache_ttl));
             if let Some(ct) = &hit.meta.content_type {
                 builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
             }
@@ -1326,7 +1346,20 @@ async fn handle_static_cache(
             })
             .unwrap_or(false);
 
-        if has_unsafe_vary {
+        // Never cache (or serve from a shared cache) a response the origin
+        // marked private / no-store / no-cache — that could leak one client's
+        // response to another. Stream it straight through instead.
+        let cc_forbids_cache = parts
+            .headers
+            .get(hyper::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| {
+                let v = v.to_ascii_lowercase();
+                v.contains("private") || v.contains("no-store") || v.contains("no-cache")
+            })
+            .unwrap_or(false);
+
+        if has_unsafe_vary || cc_forbids_cache {
             // Stream the body straight to the client without caching.
             // Drop the inflight sender (no `true` sent): waiters fall through
             // to a fresh fetch, since cache will not be populated for this key.
@@ -1354,11 +1387,6 @@ async fn handle_static_cache(
         let path_clone = path_owned.clone();
         let meta_clone = meta.clone();
         let tx_clone = tx.clone();
-
-        let (cache_ttl, cache_max) = match &rule.cache {
-            Some(cp) => (cp.ttl_seconds, cp.max_entries),
-            None => (31_536_000, 10_000),
-        };
 
         // Cache Tee-Reader Pipeline
         tokio::spawn(async move {
@@ -1426,10 +1454,12 @@ async fn handle_static_cache(
         });
 
         let mut resp = Response::from_parts(parts, stream_body.boxed());
-        resp.headers_mut().insert(
-            "Cache-Control",
-            hyper::header::HeaderValue::from_static(CACHE_CONTROL_IMMUTABLE),
-        );
+        // Preserve the upstream Cache-Control if it set one; otherwise supply
+        // the profile-derived default — don't blanket-stamp 1-year immutable.
+        if !resp.headers().contains_key(hyper::header::CACHE_CONTROL) {
+            resp.headers_mut()
+                .insert("Cache-Control", profile_cache_control(cache_ttl));
+        }
         return Ok(resp);
     }
 
