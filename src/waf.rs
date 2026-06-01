@@ -597,12 +597,12 @@ fn normalize_unified(input: &[u8], out: &mut Vec<u8>) {
 
         // 2. URL Decode State
         if b == b'+' {
-            out.push(b' ');
+            push_norm(out, b' ');
             i += 1;
             continue;
         } else if b == b'%' && i + 2 < len {
             if let (Some(hi), Some(lo)) = (hex_val(input[i + 1]), hex_val(input[i + 2])) {
-                out.push((hi << 4) | lo);
+                push_norm(out, (hi << 4) | lo);
                 i += 3;
                 continue;
             }
@@ -620,7 +620,7 @@ fn normalize_unified(input: &[u8], out: &mut Vec<u8>) {
                     ((h1 as u16) << 12) | ((h2 as u16) << 8) | ((h3 as u16) << 4) | (h4 as u16);
 
                 if codepoint <= 0xFF {
-                    out.push(codepoint as u8);
+                    push_norm(out, codepoint as u8);
                 } else {
                     let mut utf8_buf = [0u8; 3];
                     let ch = char::from_u32(codepoint as u32).unwrap_or('?');
@@ -631,9 +631,27 @@ fn normalize_unified(input: &[u8], out: &mut Vec<u8>) {
             }
         }
 
-        // 4. Default: push lowercase byte for case-insensitive normalization
-        out.push(b.to_ascii_lowercase());
+        // 4. Default: fold whitespace runs + lowercase for normalization
+        push_norm(out, b);
         i += 1;
+    }
+}
+
+/// Push one byte into the normalized buffer, folding inline-whitespace runs
+/// (space, tab, vertical-tab, form-feed) to a single space and ASCII-
+/// lowercasing everything else — this is what stops `union  select`,
+/// `union\tselect` and `1;  cat` from slipping past the single-space patterns.
+/// `\n` / `\r` are deliberately NOT folded: several command-injection patterns
+/// ("\ncat ", ...) treat the newline as a separator, and collapsing it to a
+/// space would make them unreachable.
+#[inline]
+fn push_norm(out: &mut Vec<u8>, b: u8) {
+    if matches!(b, b' ' | b'\t' | 0x0b | 0x0c) {
+        if out.last() != Some(&b' ') {
+            out.push(b' ');
+        }
+    } else {
+        out.push(b.to_ascii_lowercase());
     }
 }
 
@@ -903,8 +921,13 @@ pub fn validate_request(
     let needs_decode = memchr::memchr(b'%', body).is_some() || memchr::memchr(b'+', body).is_some();
     let has_sql_comments = body.windows(2).any(|w| w == b"/*");
     let has_unicode_esc = body.windows(2).any(|w| w == b"\\u");
+    // Whitespace-run evasion: a tab/VT/FF or a doubled space lets an attacker
+    // pad a pattern ("union  select", "1;\tcat") past the raw scan; the
+    // normalized pass collapses these, so run it when they are present too.
+    let has_ws_evasion = body.iter().any(|&b| matches!(b, b'\t' | 0x0b | 0x0c))
+        || body.windows(2).any(|w| w[0] == b' ' && w[1] == b' ');
 
-    if needs_decode || has_sql_comments || has_unicode_esc {
+    if needs_decode || has_sql_comments || has_unicode_esc || has_ws_evasion {
         let verdict = JSON_BUF.with(|buf1| {
             WAF_BUF_SEC.with(|buf2| {
                 let mut out = buf1.borrow_mut();
@@ -1013,8 +1036,12 @@ pub fn validate_uri(uri: &str, mode: WafMode) -> WafVerdict {
     let needs_decode =
         memchr::memchr(b'%', uri_bytes).is_some() || memchr::memchr(b'+', uri_bytes).is_some();
     let has_sql_comments = uri_bytes.windows(2).any(|w| w == b"/*");
+    // Whitespace-run evasion (raw tab/VT/FF or doubled space) — same rationale
+    // as the body gate in validate_request.
+    let has_ws_evasion = uri_bytes.iter().any(|&b| matches!(b, b'\t' | 0x0b | 0x0c))
+        || uri_bytes.windows(2).any(|w| w[0] == b' ' && w[1] == b' ');
 
-    if needs_decode || has_sql_comments {
+    if needs_decode || has_sql_comments || has_ws_evasion {
         let verdict = JSON_BUF.with(|buf1| {
             WAF_BUF_SEC.with(|buf2| {
                 let mut out = buf1.borrow_mut();
@@ -1795,6 +1822,54 @@ mod tests {
             strip_sql_comments(std::borrow::Cow::Borrowed(b"union/*hack*/select")).as_ref(),
             b"union select"
         );
+    }
+
+    #[test]
+    fn whitespace_runs_do_not_evade_patterns() {
+        // Padding tokens with extra spaces / tabs must not slip past the
+        // single-space patterns — normalize_unified collapses inline
+        // whitespace. Each payload matches ONLY after collapsing (the raw,
+        // double-spaced form hits no pattern), so this isolates the fix.
+        // Command injection (balanced): double space after ';'.
+        assert!(matches!(
+            validate_request(
+                "POST",
+                Some("application/json"),
+                br#"{"c":"ls;  cat secret"}"#,
+                &strict_profile()
+            ),
+            WafVerdict::Deny(_)
+        ));
+        // Tab as the separator's whitespace (real 0x09 byte).
+        assert!(matches!(
+            validate_request(
+                "POST",
+                Some("application/json"),
+                b"{\"c\":\"ls;\tcat secret\"}",
+                &strict_profile()
+            ),
+            WafVerdict::Deny(_)
+        ));
+        // SQLi with a doubled space (aggressive tier holds "union select").
+        assert!(matches!(
+            validate_request(
+                "POST",
+                Some("application/json"),
+                br#"{"q":"union  select 1"}"#,
+                &aggressive_profile()
+            ),
+            WafVerdict::Deny(_)
+        ));
+        // \n is preserved so the newline command-injection patterns still fire.
+        assert!(matches!(
+            validate_request(
+                "POST",
+                Some("application/json"),
+                b"{\"c\":\"x\ncat secret\"}",
+                &strict_profile()
+            ),
+            WafVerdict::Deny(_)
+        ));
     }
 
     #[test]
