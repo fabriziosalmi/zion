@@ -1,0 +1,38 @@
+# benches/e2e/config/zion-fullstack.toml
+# "Everything on" throughput lane: TLS 1.3 + WAF (every request) + static cache
+# + security headers + X-Request-ID. Rate-limit / per-IP cap are OFF here on
+# purpose: with a single benchmark source IP, an enabled limiter would throttle
+# the load and we would measure the limiter, not Zion's processing ceiling. The
+# limiter/conn-cap are exercised separately in the SECURITY lane (S7/S8/S9).
+
+[server]
+listen_http  = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+log_format   = "json"
+rate_limit_rps          = 0   # OFF — see note above
+max_connections_per_ip  = 0   # OFF
+
+[tls]
+cert_path  = "/etc/zion/tls.crt"
+key_path   = "/etc/zion/tls.key"
+hot_reload = true
+
+[upstreams]
+origin = "http://127.0.0.1:8080"
+
+# Cached lane: WAF scans every request (gate runs before the cache serve in
+# dispatch), THEN Zion serves from its in-RAM static cache on a hit — no origin
+# round-trip. This is the WAF+cache+TLS "full stack" path.
+[[route]]
+path     = "/static/{*rest}"
+upstream = "origin"
+mode     = "static_cache"
+waf      = true
+
+# Proxy lane: WAF + TLS, straight proxy to the origin (cache bypassed).
+[[route]]
+path        = "/{*rest}"
+upstream    = "origin"
+mode        = "standard"
+waf         = true
+max_body_mb = 10
