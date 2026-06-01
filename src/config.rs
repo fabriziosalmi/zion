@@ -695,6 +695,9 @@ fn resolve_upstream(config: &ZionConfig, name: &str) -> Result<Vec<String>, Stri
 /// whether to abort or log-and-keep the previous snapshot.
 pub fn build_router(config: &ZionConfig) -> Result<Router<Arc<ResolvedRoute>>, String> {
     let mut router = Router::new();
+    // Bare-prefix fallbacks for catch-all routes, applied after every explicit
+    // route is inserted (so an explicit route at the same prefix always wins).
+    let mut catchall_fallbacks: Vec<(String, Arc<ResolvedRoute>)> = Vec::new();
 
     for route in &config.route {
         let upstream_url = resolve_upstream(config, &route.upstream)?;
@@ -810,13 +813,58 @@ pub fn build_router(config: &ZionConfig) -> Result<Router<Arc<ResolvedRoute>>, S
             cors,
         });
 
-        router
-            .insert(route.path.clone(), resolved)
-            .map_err(|e| format!("Bad route pattern '{}': {}", route.path, e))?;
+        // A matchit catch-all "<prefix>/{*name}" does NOT match the bare
+        // "<prefix>" (nor the root "/" when the prefix is empty), so a
+        // "/{*rest}" route silently 404s on "/" even though it is meant to be
+        // the fallback for everything. Record the bare prefix so we can also
+        // map it to this route in a second pass (after all explicit routes).
+        match catchall_bare_prefix(&route.path) {
+            Some(bare) => {
+                router
+                    .insert(route.path.clone(), resolved.clone())
+                    .map_err(|e| format!("Bad route pattern '{}': {}", route.path, e))?;
+                catchall_fallbacks.push((bare, resolved));
+            }
+            None => {
+                router
+                    .insert(route.path.clone(), resolved)
+                    .map_err(|e| format!("Bad route pattern '{}': {}", route.path, e))?;
+            }
+        }
+    }
+
+    // Map each catch-all's bare prefix to its own route. We insert
+    // unconditionally and ignore the result: if an explicit route already
+    // occupies the prefix, matchit returns an insert conflict (so the explicit
+    // route keeps priority); otherwise the bare prefix now resolves to its
+    // catch-all, and matchit's specificity rules make the exact prefix win over
+    // a less-specific parent catch-all (e.g. "/api" → the "/api/{*rest}" route,
+    // not the root "/{*rest}").
+    for (bare, resolved) in catchall_fallbacks {
+        let _ = router.insert(bare, resolved);
     }
 
     print_routes_table(&config.route);
     Ok(router)
+}
+
+/// If `path` is a matchit catch-all (`<prefix>/{*name}`), return the bare
+/// prefix the catch-all should also serve (`/` for a root catch-all). matchit's
+/// catch-all does not match the bare prefix, so without registering it a
+/// `/{*rest}` route returns 404 on `/` — surprising for a "match everything"
+/// fallback. Returns `None` for non-catch-all paths.
+fn catchall_bare_prefix(path: &str) -> Option<String> {
+    let slash = path.rfind('/')?;
+    let seg = &path[slash + 1..];
+    if seg.starts_with("{*") && seg.ends_with('}') {
+        Some(if slash == 0 {
+            "/".to_string()
+        } else {
+            path[..slash].to_string()
+        })
+    } else {
+        None
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1291,6 +1339,23 @@ mtls_fingerprint = false
         let catchall = router.at("/about").unwrap();
         assert!(catchall.value.waf.is_none());
         assert!(catchall.value.cache.is_none());
+
+        // Bare-prefix fallback: a catch-all "<prefix>/{*rest}" must also serve
+        // its bare prefix. matchit alone would 404 these (regression guard for
+        // the root-route bug found in the e2e harness).
+        // Root "/{*rest}" → "/" resolves to the catch-all (no WAF/cache).
+        let root = router.at("/").expect("root '/' should match the catch-all");
+        assert!(root.value.waf.is_none());
+        assert!(root.value.cache.is_none());
+        // "/api/{*rest}" → bare "/api" resolves to the API route (strict WAF).
+        assert!(router.at("/api").expect("/api should match its catch-all").value.waf.is_some());
+        // "/_next/static/{*rest}" → bare "/_next/static" resolves to the cache route.
+        assert!(router
+            .at("/_next/static")
+            .expect("/_next/static should match its catch-all")
+            .value
+            .cache
+            .is_some());
     }
 
     #[test]
