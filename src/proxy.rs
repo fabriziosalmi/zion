@@ -245,6 +245,139 @@ pub async fn proxy_pass(
     send_request(client, req).await
 }
 
+/// Like [`send_request`] but surfaces the transport error to the caller
+/// instead of collapsing it into a 502, so [`proxy_pass_ha`] can decide
+/// whether to fail over to another upstream.
+#[inline]
+async fn send_request_try(
+    client: &HttpClient,
+    req: Request<ZionBody>,
+) -> Result<Response<ZionBody>, hyper_util::client::legacy::Error> {
+    let upstream_start = std::time::Instant::now();
+    let result = client.request(req).await;
+    crate::metrics::METRICS
+        .upstream_duration
+        .observe(upstream_start.elapsed());
+    let (parts, body) = result?.into_parts();
+    Ok(Response::from_parts(parts, body.boxed()))
+}
+
+/// High-availability forward over a multi-upstream pool.
+///
+/// Picks the pool's best healthy upstream and, on a *connection-level*
+/// failure, transparently fails over to the next healthy upstream instead
+/// of returning 502 — closing the window between a backend dying and the
+/// background health prober ejecting it (up to the steady probe interval).
+///
+/// The body is buffered once so it can be safely replayed. Non-idempotent
+/// methods are retried only on a pure connect error (the request provably
+/// never reached the upstream); idempotent methods retry on any transport
+/// error. Single-upstream pools take the zero-overhead [`proxy_pass`] path.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_pass_ha(
+    client: &HttpClient,
+    req: Request<ZionBody>,
+    pool: &[String],
+    default_scheme: &hyper::http::uri::Scheme,
+    default_authority: &hyper::http::uri::Authority,
+    health_map: &crate::health::HealthMap,
+    remote_addr: Option<SocketAddr>,
+    proto: &str,
+    xff_mode: XffMode,
+) -> Result<Response<ZionBody>, hyper::Error> {
+    // Nothing to fail over to — keep the streaming fast path.
+    if pool.len() < 2 {
+        return proxy_pass(
+            client,
+            req,
+            default_scheme,
+            default_authority,
+            remote_addr,
+            proto,
+            xff_mode,
+        )
+        .await;
+    }
+
+    // Buffer the body once so each attempt can replay it.
+    let (parts, body) = req.into_parts();
+    let body_bytes = match body.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return Ok(bad_gateway()),
+    };
+    let method = parts.method.clone();
+    let uri = parts.uri.clone();
+    let version = parts.version;
+    let headers = parts.headers.clone();
+    let idempotent = matches!(
+        method,
+        hyper::Method::GET
+            | hyper::Method::HEAD
+            | hyper::Method::OPTIONS
+            | hyper::Method::PUT
+            | hyper::Method::DELETE
+            | hyper::Method::TRACE
+    );
+
+    // At most one attempt per pool member; marking a failed upstream down
+    // makes the next `select_best_upstream` rotate to a survivor.
+    for _ in 0..pool.len() {
+        let url = match crate::health::select_best_upstream(health_map, pool) {
+            Some(u) => u.clone(),
+            None => break,
+        };
+        let (scheme, authority) = match url.parse::<hyper::Uri>() {
+            Ok(u) => (
+                u.scheme()
+                    .cloned()
+                    .unwrap_or_else(|| default_scheme.clone()),
+                u.authority()
+                    .cloned()
+                    .unwrap_or_else(|| default_authority.clone()),
+            ),
+            Err(_) => (default_scheme.clone(), default_authority.clone()),
+        };
+
+        let mut attempt: Request<ZionBody> = Request::new(
+            Full::new(body_bytes.clone())
+                .map_err(|never| match never {})
+                .boxed(),
+        );
+        *attempt.method_mut() = method.clone();
+        *attempt.uri_mut() = uri.clone();
+        *attempt.version_mut() = version;
+        *attempt.headers_mut() = headers.clone();
+
+        let Some(prepared) =
+            prepare_request(attempt, &scheme, &authority, remote_addr, proto, xff_mode)
+        else {
+            return Ok(bad_gateway());
+        };
+
+        match send_request_try(client, prepared).await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                let connect = e.is_connect();
+                eprintln!("  failover: upstream {url} error (connect={connect}): {e}");
+                // Eagerly eject: mark unhealthy and bring the next probe
+                // forward (`next_probe_at_us = 0` == due now) so the upstream
+                // rejoins rotation the moment it recovers.
+                if let Some(h) = health_map.get(&url) {
+                    h.healthy.store(false, std::sync::atomic::Ordering::Relaxed);
+                    h.next_probe_at_us
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Don't replay a non-idempotent request unless it provably
+                // never reached the upstream.
+                if !(connect || idempotent) {
+                    return Ok(bad_gateway());
+                }
+            }
+        }
+    }
+    Ok(bad_gateway())
+}
+
 /// Forward a request whose body has already been collected (post-WAF path).
 #[allow(dead_code)] // retained for symmetric API; not currently called
 #[allow(clippy::too_many_arguments)]
