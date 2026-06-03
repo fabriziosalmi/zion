@@ -1067,7 +1067,21 @@ async fn process_request_inner(
                 )
                 .await?
             }
-            config::RouteMode::Standard | config::RouteMode::Websocket => {
+            config::RouteMode::Standard => {
+                proxy::proxy_pass_ha(
+                    &state.http_client,
+                    req,
+                    &rule.upstream_url,
+                    &dyn_scheme,
+                    &dyn_authority,
+                    &cfg.health_map,
+                    Some(forward_addr),
+                    "https",
+                    cfg.xff_mode,
+                )
+                .await?
+            }
+            config::RouteMode::Websocket => {
                 proxy::proxy_pass(
                     &state.http_client,
                     req,

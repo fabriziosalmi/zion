@@ -4,6 +4,28 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-06-03
+
+### Fixed
+
+- **Passive upstream failover on connection-level errors**
+  ([`src/proxy.rs`](src/proxy.rs), [`src/dispatch.rs`](src/dispatch.rs)).
+  A `standard`-mode route over a multi-upstream `[upstream]` pool now
+  fails over to the next healthy upstream when the selected backend
+  refuses the connection, instead of returning `502` until the
+  background health prober ejected it (steady probe interval).
+  `proxy_pass_ha` buffers the request body once and replays it; on a
+  connection-level failure it marks the upstream unhealthy — bringing
+  its next probe forward via `next_probe_at_us = 0` so it rejoins on
+  recovery — before retrying the next pool member. Idempotent methods
+  (GET/HEAD/OPTIONS/PUT/DELETE/TRACE) retry on any transport error;
+  non-idempotent methods only on a pure connect error (`is_connect()` —
+  the request provably never reached the upstream). Single-upstream
+  pools keep the zero-overhead `proxy_pass` streaming path; Websocket /
+  SSE forwards are unchanged (no safe replay). Measured on a live
+  2-node cluster: a rolling backend kill went from 170/350 failed
+  requests to 0/350. ([#179](https://github.com/fabriziosalmi/zion/pull/179))
+
 ## [0.3.2] - 2026-06-01
 
 Resilience and correctness, validated on a real two-node Proxmox e2e bench
