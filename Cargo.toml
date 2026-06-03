@@ -81,7 +81,7 @@ fnv = "1"
 fastrand = "2"
 
 # Upstream TLS root CAs (embedded Mozilla bundle — deterministic, no system dep)
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 
 # Upstream HTTPS connector — enables HTTP/2 multiplexing to TLS upstreams
 hyper-rustls = { version = "0.27", features = ["http1", "http2", "webpki-roots", "ring"], default-features = false }
