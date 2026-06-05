@@ -528,47 +528,6 @@ const H2_MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 20;
 const H2_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const H2_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-#[cfg(test)]
-mod h2_limit_tests {
-    use super::*;
-
-    /// CVE-2026-49975 regression guard. Pinning the H2 limits explicitly only
-    /// buys safety if the per-connection memory ceiling stays an asserted
-    /// invariant: if someone widens these, this test fails and forces a
-    /// conscious re-evaluation of the bound rather than a silent regression.
-    #[test]
-    fn h2_per_connection_memory_is_bounded() {
-        // Every concurrent stream may hold a decoded header list up to the cap.
-        let worst_case_header_bytes =
-            H2_MAX_CONCURRENT_STREAMS as u64 * H2_MAX_HEADER_LIST_SIZE as u64;
-        assert!(
-            worst_case_header_bytes <= 4 * 1024 * 1024,
-            "H2 per-conn header ceiling {worst_case_header_bytes} B exceeds 4 MiB — \
-             the HTTP/2 Bomb single-connection bound would regress"
-        );
-        // Functional floors: not so small they break legitimate multiplexing
-        // or normal request headers.
-        assert!(
-            H2_MAX_CONCURRENT_STREAMS >= 64,
-            "stream cap too low for legit multiplexing"
-        );
-        assert!(
-            H2_MAX_HEADER_LIST_SIZE >= 8 * 1024,
-            "header cap too low for normal requests"
-        );
-        // Rapid-Reset defence must stay present and bounded.
-        assert!(
-            (1..=100).contains(&H2_MAX_PENDING_ACCEPT_RESET_STREAMS),
-            "pending-accept reset bound must be a small positive number"
-        );
-        // A silent-hold must be reaped before it can pin state for long.
-        assert!(
-            H2_KEEPALIVE_TIMEOUT <= H2_KEEPALIVE_INTERVAL,
-            "keep-alive timeout should not exceed the interval"
-        );
-    }
-}
-
 pub(crate) fn empty_response(status: StatusCode) -> Response<ZionBody> {
     // INVARIANT: hyper's `Response::builder().status(StatusCode).body(...)`
     // returns `Err` only when the builder accumulated a header parse error.
@@ -1006,7 +965,11 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
             // max_header_list_size bounds retained decoded-header memory per
             // connection; the Rapid-Reset bound blunts CVE-2023-44487; the
             // keep-alive PING reaps a connection gone silent mid-hold (the
-            // flow-control half of the bomb).
+            // flow-control half of the bomb). The keep-alive PING is time-based,
+            // so — exactly as on http1 above — a timer MUST be installed on the
+            // http2 builder too, or hyper panics "You must supply a timer." the
+            // first time it tries to schedule the PING deadline.
+            b.http2().timer(hyper_util::rt::TokioTimer::new());
             b.http2().max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
             b.http2().max_header_list_size(H2_MAX_HEADER_LIST_SIZE);
             b.http2()
@@ -1943,4 +1906,50 @@ fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
 /// Inject security headers — delegates to security module.
 pub(crate) fn inject_security_headers(resp: &mut Response<ZionBody>) {
     security::inject_security_headers(resp);
+}
+
+#[cfg(test)]
+mod h2_limit_tests {
+    use super::*;
+
+    /// CVE-2026-49975 regression guard. Pinning the H2 limits explicitly only
+    /// buys safety if the per-connection memory ceiling stays an asserted
+    /// invariant: if someone widens these, this test fails and forces a
+    /// conscious re-evaluation of the bound rather than a silent regression.
+    ///
+    /// The floor checks deliberately assert on `const` values — that is the
+    /// whole point (a tripwire on the constants), so the `assertions_on_constants`
+    /// lint is intentionally allowed here.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn h2_per_connection_memory_is_bounded() {
+        // Every concurrent stream may hold a decoded header list up to the cap.
+        let worst_case_header_bytes =
+            H2_MAX_CONCURRENT_STREAMS as u64 * H2_MAX_HEADER_LIST_SIZE as u64;
+        assert!(
+            worst_case_header_bytes <= 4 * 1024 * 1024,
+            "H2 per-conn header ceiling {worst_case_header_bytes} B exceeds 4 MiB — \
+             the HTTP/2 Bomb single-connection bound would regress"
+        );
+        // Functional floors: not so small they break legitimate multiplexing
+        // or normal request headers.
+        assert!(
+            H2_MAX_CONCURRENT_STREAMS >= 64,
+            "stream cap too low for legit multiplexing"
+        );
+        assert!(
+            H2_MAX_HEADER_LIST_SIZE >= 8 * 1024,
+            "header cap too low for normal requests"
+        );
+        // Rapid-Reset defence must stay present and bounded.
+        assert!(
+            (1..=100).contains(&H2_MAX_PENDING_ACCEPT_RESET_STREAMS),
+            "pending-accept reset bound must be a small positive number"
+        );
+        // A silent-hold must be reaped before it can pin state for long.
+        assert!(
+            H2_KEEPALIVE_TIMEOUT <= H2_KEEPALIVE_INTERVAL,
+            "keep-alive timeout should not exceed the interval"
+        );
+    }
 }
