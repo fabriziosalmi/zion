@@ -146,13 +146,23 @@ pub struct ServerConfig {
     /// Rate limit window in seconds. Default: 1.
     #[serde(default = "default_rate_window")]
     pub rate_limit_window_secs: u64,
-    /// Max *concurrent* connections from a single source IP. 0 = unlimited
-    /// (default). This is the connection-exhaustion lever: rate_limit_rps
-    /// caps request frequency, this caps how many sockets one source can
-    /// hold open at once — the resource a slow/backed flood actually
-    /// drains. The global ceiling is the platform connection semaphore.
+    /// Max *concurrent* connections from a single source IP.
+    ///
+    /// Tri-state (CVE-2026-49975 multi-connection hardening):
+    ///   * omitted → **AUTO**: ~1/8 of the platform connection ceiling
+    ///     (`compute_conn_limit`), so one peer cannot monopolize admission or
+    ///     drive a multi-connection HTTP/2 Bomb. Scales with box size, so it
+    ///     won't pinch CGNAT / large-NAT clients on big nodes.
+    ///   * `0` → explicitly **DISABLED** (one source may hold any number of
+    ///     slots, up to the global ceiling).
+    ///   * `N` → explicit per-IP cap.
+    ///
+    /// Complements `rate_limit_rps` (request frequency); this caps the held
+    /// sockets a slow/backed flood actually drains. The tri-state is resolved
+    /// to a concrete cap in `ResolvedAppConfig::try_build` and read live at
+    /// accept, so a hot-reload retunes it without dropping live connections.
     #[serde(default)]
-    pub max_connections_per_ip: u32,
+    pub max_connections_per_ip: Option<u32>,
     /// Log format: "text" (default) or "json".
     #[serde(default = "default_log_format")]
     pub log_format: String,

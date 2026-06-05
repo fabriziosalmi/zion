@@ -15,7 +15,11 @@
 //!     entropy threshold + kill-switch)
 //!   * trusted proxy CIDRs
 //!   * xff_mode
-//!   * rate-limit rps + window
+//!   * rate-limit rps + window (enforcement is read live at the request
+//!     path; the rate-map scavenger is spawned unconditionally in
+//!     `async_main` so a 0 → N hot-enable still gets garbage collection)
+//!   * per-IP connection cap (`max_connections_per_ip`) — read live at
+//!     accept, so a reload retunes the cap without dropping live conns
 //!
 //! Out of scope for Phase 1 (require a separate path):
 //!   * `[server.listen_http]` / `[server.listen_https]` — changing
@@ -72,8 +76,9 @@ pub(crate) fn current_generation() -> u64 {
 fn rebuild(
     new_config: &ZionConfig,
     previous: &ResolvedAppConfig,
+    conn_limit_max: usize,
 ) -> Result<ResolvedAppConfig, crate::error::ZionError> {
-    let mut snap = ResolvedAppConfig::try_build(new_config)?;
+    let mut snap = ResolvedAppConfig::try_build(new_config, conn_limit_max)?;
     let mut merged: fnv::FnvHashMap<String, Arc<health::UpstreamHealth>> =
         fnv::FnvHashMap::default();
     for (url, fresh) in snap.health_map.iter() {
@@ -102,6 +107,10 @@ fn rebuild(
 pub(crate) fn spawn_config_watcher(
     config_path: PathBuf,
     state_config: Arc<ArcSwap<ResolvedAppConfig>>,
+    // Platform global connection ceiling — needed to resolve the tri-state
+    // `max_connections_per_ip` (omitted → ~conn_limit/8) on every reload, so a
+    // reloaded snapshot derives the same auto per-IP cap the boot path did.
+    conn_limit_max: usize,
     change_notifier: Option<tokio::sync::watch::Sender<u64>>,
     boot_tls_cert_path: Option<String>,
     boot_tls_key_path: Option<String>,
@@ -203,7 +212,7 @@ pub(crate) fn spawn_config_watcher(
                     let previous = state_config.load_full();
                     let rebuild_result =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            rebuild(&new_config, &previous)
+                            rebuild(&new_config, &previous, conn_limit_max)
                         }));
                     let new_snapshot = match rebuild_result {
                         Ok(Ok(snap)) => snap,
@@ -286,6 +295,11 @@ pub(crate) fn spawn_config_watcher(
 mod tests {
     use super::*;
 
+    /// Stand-in for the platform global connection ceiling in tests that
+    /// exercise `try_build` / `rebuild` (which resolve the tri-state per-IP
+    /// cap against it). 10_000 → auto per-IP cap = 1_250.
+    const TEST_CONN_LIMIT_MAX: usize = 10_000;
+
     /// `rebuild` must reuse `Arc<UpstreamHealth>` for URLs that exist
     /// in both old and new configs — otherwise a hot-reload would
     /// reset every upstream's health state to "untested" and cause a
@@ -330,7 +344,7 @@ mod tests {
         // Bypass disk validation by parsing TOML directly — we only
         // test the rebuild() merging logic, not file I/O.
         let parsed: ZionConfig = toml::from_str(config_toml).unwrap();
-        let merged = rebuild(&parsed, &previous).expect("test config rebuilds");
+        let merged = rebuild(&parsed, &previous, TEST_CONN_LIMIT_MAX).expect("test config rebuilds");
 
         let merged_arc = merged
             .health_map
@@ -380,7 +394,7 @@ mod tests {
             upstream = "billing"
         "#;
         let parsed: ZionConfig = toml::from_str(config_toml).unwrap();
-        let merged = rebuild(&parsed, &previous).expect("test config rebuilds");
+        let merged = rebuild(&parsed, &previous, TEST_CONN_LIMIT_MAX).expect("test config rebuilds");
 
         // Old upstream gone, new one present, with default state
         // ("healthy = true, latency = 0", per ResolvedAppConfig::build).
@@ -398,6 +412,90 @@ mod tests {
             health::PROBE_BASE_US
         );
         assert_eq!(billing.next_probe_at_us.load(Ordering::Relaxed), 0);
+    }
+
+    /// Reload-completeness guard. `try_build` is the SINGLE builder used by
+    /// both boot and hot-reload, and the accept/request paths read these
+    /// `[server]` fields live off the swapped snapshot
+    /// (`max_connections_per_ip` at the per-IP cap, `rate_limit_rps` /
+    /// `rate_limit_window` at the rate limiter). A refactor that dropped any
+    /// of them here would silently turn a hot-reload of that field into a
+    /// no-op — the precise failure this test exists to catch. (Verified live
+    /// on the e2e rig 2026-06-05: editing `max_connections_per_ip` 0→50 and
+    /// waiting past the debounce enforced cap=50 on the next connections.)
+    #[test]
+    fn try_build_carries_security_fields_for_hot_reload() {
+        let toml_text = r#"
+            [server]
+            listen_http = "0.0.0.0:8080"
+            listen_https = "0.0.0.0:8443"
+            rate_limit_rps = 99
+            rate_limit_window_secs = 7
+            max_connections_per_ip = 50
+
+            [tls]
+            cert_path = "/tmp/zion-test.crt"
+            key_path  = "/tmp/zion-test.key"
+
+            [upstreams]
+            api = "http://api:8000"
+
+            [[route]]
+            path = "/api/{*rest}"
+            upstream = "api"
+        "#;
+        let cfg = parse_inline(toml_text);
+
+        let snap = ResolvedAppConfig::try_build(&cfg, TEST_CONN_LIMIT_MAX)
+            .expect("test config builds");
+        // Explicit per-IP cap (Some(50)) is carried verbatim.
+        assert_eq!(snap.max_connections_per_ip, 50, "per-IP cap must survive build");
+        assert_eq!(snap.rate_limit_rps, 99, "rate_limit_rps must survive build");
+        assert_eq!(snap.rate_limit_window, 7, "rate_limit_window must survive build");
+
+        // The merge path used by every hot-reload must preserve them too.
+        let merged = rebuild(&cfg, &snap, TEST_CONN_LIMIT_MAX).expect("test config rebuilds");
+        assert_eq!(merged.max_connections_per_ip, 50);
+        assert_eq!(merged.rate_limit_rps, 99);
+        assert_eq!(merged.rate_limit_window, 7);
+
+        // Tri-state resolution (CVE-2026-49975 #2): an OMITTED per-IP cap must
+        // default ON at ~conn_limit/8; an explicit 0 must stay an opt-out (the
+        // e2e bench's intrinsic lane relies on 0 == off).
+        let auto = parse_inline(
+            r#"
+            [server]
+            listen_http = "0.0.0.0:8080"
+            listen_https = "0.0.0.0:8443"
+
+            [tls]
+            cert_path = "/tmp/zion-test.crt"
+            key_path  = "/tmp/zion-test.key"
+
+            [upstreams]
+            api = "http://api:8000"
+
+            [[route]]
+            path = "/api/{*rest}"
+            upstream = "api"
+        "#,
+        );
+        let auto_snap =
+            ResolvedAppConfig::try_build(&auto, TEST_CONN_LIMIT_MAX).expect("builds");
+        assert_eq!(
+            auto_snap.max_connections_per_ip,
+            (TEST_CONN_LIMIT_MAX / 8) as u32,
+            "omitted per-IP cap must default ON at ~conn_limit/8"
+        );
+
+        let mut off = auto;
+        off.server.max_connections_per_ip = Some(0);
+        let off_snap =
+            ResolvedAppConfig::try_build(&off, TEST_CONN_LIMIT_MAX).expect("builds");
+        assert_eq!(
+            off_snap.max_connections_per_ip, 0,
+            "explicit 0 must disable the cap"
+        );
     }
 
     #[test]
@@ -471,7 +569,7 @@ mod tests {
     fn atomic_swap_preserves_old_snapshot_for_inflight_readers() {
         // Initial snapshot, exposed only via `/api/...`.
         let v1 = parse_inline(TOML_V1);
-        let snap_v1 = ResolvedAppConfig::try_build(&v1).expect("test config builds");
+        let snap_v1 = ResolvedAppConfig::try_build(&v1, TEST_CONN_LIMIT_MAX).expect("test config builds");
         let store = ArcSwap::from_pointee(snap_v1);
 
         // Reader A grabs an Arc clone *before* the swap. This models a
@@ -482,7 +580,7 @@ mod tests {
 
         // Hot-reload: build v2 (adds /billing) and swap.
         let v2 = parse_inline(TOML_V2);
-        let snap_v2 = rebuild(&v2, &reader_a).expect("test config rebuilds");
+        let snap_v2 = rebuild(&v2, &reader_a, TEST_CONN_LIMIT_MAX).expect("test config rebuilds");
         store.store(Arc::new(snap_v2));
 
         // Reader A sees the old routing table (route /api works,
@@ -521,12 +619,12 @@ mod tests {
         // empty `[[route]]` section before the first edit).
         let mut empty = parse_inline(TOML_V1);
         empty.route.clear();
-        let snap_empty = ResolvedAppConfig::try_build(&empty).expect("test config builds");
+        let snap_empty = ResolvedAppConfig::try_build(&empty, TEST_CONN_LIMIT_MAX).expect("test config builds");
         let store = ArcSwap::from_pointee(snap_empty);
 
         let v1 = parse_inline(TOML_V1);
         let prev = store.load_full();
-        let snap_v1 = rebuild(&v1, &prev).expect("test config rebuilds");
+        let snap_v1 = rebuild(&v1, &prev, TEST_CONN_LIMIT_MAX).expect("test config rebuilds");
         store.store(Arc::new(snap_v1));
 
         let after = store.load_full();
