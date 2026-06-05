@@ -4,6 +4,8 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-06-05
+
 ### Security
 
 - **CVE-2026-49975 ("HTTP/2 Bomb") hardening.** The HTTP/2 Bomb chains an
