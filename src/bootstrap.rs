@@ -1203,10 +1203,18 @@ fn compute_workers(cores: usize) -> usize {
 }
 
 /// Connection limit: scale with available RAM.
-/// ~50KB per TLS connection (buffers + state).
+///
+/// Budget **256 KB per connection**, not the ~50 KB of an idle keep-alive:
+/// an *active* HTTP/2 connection carries a 1 MB flow-control window
+/// (amortized), per-stream + HPACK state, and TLS buffers, so the old 50 KB
+/// figure under-provisioned the ceiling by ~5× against a connection actually
+/// doing work. The per-connection *worst case* under the CVE-2026-49975
+/// HTTP/2 Bomb is bounded separately by the explicit H2 limits (`H2_*` in
+/// `main.rs`) and the per-IP connection cap; this is the global admission
+/// ceiling, sized for healthy concurrency.
 fn compute_conn_limit(ram_mb: u64) -> usize {
     let available_mb = ram_mb / 4; // use max 25% of RAM for connections
-    let max_conns = (available_mb * 1024 / 50) as usize; // 50KB per conn
+    let max_conns = (available_mb * 1024 / 256) as usize; // 256 KB per conn
     max_conns.clamp(1_000, 100_000)
 }
 

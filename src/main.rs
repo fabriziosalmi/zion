@@ -270,7 +270,10 @@ impl ResolvedAppConfig {
     /// `main()` and the process exits with the structured ZionResult code;
     /// during hot-reload the existing snapshot stays in place and the
     /// new config is rejected with a logged WARN.
-    pub(crate) fn try_build(config: &config::ZionConfig) -> error::ZionResult<Self> {
+    pub(crate) fn try_build(
+        config: &config::ZionConfig,
+        conn_limit_max: usize,
+    ) -> error::ZionResult<Self> {
         let router = config::build_router(config).map_err(error::ZionError::Config)?;
 
         // Health map: one entry per upstream URL referenced by any route.
@@ -376,6 +379,17 @@ impl ResolvedAppConfig {
             policy
         };
 
+        // Per-IP connection cap (CVE-2026-49975 multi-connection hardening),
+        // resolved from the tri-state config field. `None` (omitted) defaults
+        // ON at ~1/8 of the global connection ceiling so no single source can
+        // monopolize admission or run the multi-connection HTTP/2 Bomb; the
+        // cap scales with the box (via `conn_limit_max`) so it won't pinch
+        // CGNAT/large-NAT on big nodes. `Some(0)` is an explicit opt-out.
+        let max_connections_per_ip = match config.server.max_connections_per_ip {
+            None => ((conn_limit_max / 8) as u32).max(1),
+            Some(explicit) => explicit,
+        };
+
         Ok(Self {
             router,
             health_map,
@@ -383,7 +397,7 @@ impl ResolvedAppConfig {
             xff_mode,
             rate_limit_rps: config.server.rate_limit_rps,
             rate_limit_window: config.server.rate_limit_window_secs,
-            max_connections_per_ip: config.server.max_connections_per_ip,
+            max_connections_per_ip,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             enforce,
             listen_http,
@@ -480,6 +494,39 @@ static EMPTY_BYTES: Bytes = Bytes::new();
 /// Maximum allowed URI length (bytes). Requests exceeding this are dropped
 /// before routing — prevents buffer overflow probes and log pollution.
 const MAX_URI_LEN: usize = 8192;
+
+// ── Explicit HTTP/2 limits — CVE-2026-49975 ("HTTP/2 Bomb") hardening ──
+//
+// These are pinned on the server builder (see the `http_builder` block in
+// `async_main`) rather than left to hyper/h2's defaults, so the
+// per-connection memory ceiling is an ASSERTED property of Zion, not a
+// transitive-dependency default a future bump could silently move. The
+// HTTP/2 Bomb chains an HPACK decompression bomb with a flow-control "hold";
+// the defence is (a) a small decoded-header-list cap that h2 enforces
+// incrementally during HPACK decode, (b) a stream cap bounding how many such
+// lists can be held open at once, (c) the Rapid-Reset bound, and (d)
+// keep-alive PINGs that reap a connection gone silent mid-hold.
+//
+// Worst-case retained decoded-header memory per connection is therefore
+// bounded by `H2_MAX_CONCURRENT_STREAMS * H2_MAX_HEADER_LIST_SIZE`
+// (= 2 MiB here). `h2_limit_tests` pins that invariant.
+
+/// SETTINGS_MAX_CONCURRENT_STREAMS advertised to peers. 128 matches the
+/// common hardened default (e.g. nginx) and is ample for legitimate
+/// multiplexing while halving hyper's 200 default.
+const H2_MAX_CONCURRENT_STREAMS: u32 = 128;
+/// SETTINGS_MAX_HEADER_LIST_SIZE — the decoded (post-HPACK) header-list cap
+/// h2 enforces incrementally per stream. 16 KiB matches the conservative
+/// default; this is the per-stream half of the bomb ceiling.
+const H2_MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
+/// Rapid-Reset (CVE-2023-44487) bound: peer-reset streams allowed to sit
+/// pending-accept before the connection is treated as abusive.
+const H2_MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 20;
+/// Keep-alive PING cadence / deadline. A client that opens streams and then
+/// goes silent (the flow-control "hold" half of the bomb) fails the PING and
+/// is dropped instead of pinning stream state indefinitely.
+const H2_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const H2_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) fn empty_response(status: StatusCode) -> Response<ZionBody> {
     // INVARIANT: hyper's `Response::builder().status(StatusCode).body(...)`
@@ -703,7 +750,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     // proxies, XFF policy, rate-limit settings — everything that follows
     // from `zion.toml`). This is the single entry point that future
     // hot-reload phases will re-invoke and atomic-swap.
-    let resolved = ResolvedAppConfig::try_build(&config)?;
+    let resolved = ResolvedAppConfig::try_build(&config, platform.conn_limit)?;
 
     // Boot-time visibility: structured logs for the bits operators
     // commonly check at startup. (Validation of `xff_mode` happens
@@ -911,6 +958,24 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                 .header_read_timeout(std::time::Duration::from_secs(15));
             b.http1().preserve_header_case(false);
             b.http1().title_case_headers(false);
+            // Explicit HTTP/2 limits — CVE-2026-49975 ("HTTP/2 Bomb")
+            // hardening. Pinned, not inherited from hyper/h2 defaults, so the
+            // per-connection memory ceiling is an asserted property (see the
+            // H2_* consts + `h2_limit_tests`). max_concurrent_streams ×
+            // max_header_list_size bounds retained decoded-header memory per
+            // connection; the Rapid-Reset bound blunts CVE-2023-44487; the
+            // keep-alive PING reaps a connection gone silent mid-hold (the
+            // flow-control half of the bomb). The keep-alive PING is time-based,
+            // so — exactly as on http1 above — a timer MUST be installed on the
+            // http2 builder too, or hyper panics "You must supply a timer." the
+            // first time it tries to schedule the PING deadline.
+            b.http2().timer(hyper_util::rt::TokioTimer::new());
+            b.http2().max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
+            b.http2().max_header_list_size(H2_MAX_HEADER_LIST_SIZE);
+            b.http2()
+                .max_pending_accept_reset_streams(H2_MAX_PENDING_ACCEPT_RESET_STREAMS);
+            b.http2().keep_alive_interval(H2_KEEPALIVE_INTERVAL);
+            b.http2().keep_alive_timeout(H2_KEEPALIVE_TIMEOUT);
             b
         }),
         #[cfg(feature = "sovereign-aimp")]
@@ -937,6 +1002,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     reload::spawn_config_watcher(
         config_path.clone().into(),
         state.config.clone(),
+        platform.conn_limit,
         Some(config_change_tx),
         Some(config.tls.cert_path.clone()),
         Some(config.tls.key_path.clone()),
@@ -959,24 +1025,34 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         );
     }
 
-    // 7. Spawn rate limit cleanup (scavenge stale IPs every 60s).
-    // This prevents the rate map from reaching MAX_RATE_MAP_ENTRIES
-    // with dead entries, which would trigger the fail-closed path
-    // for legitimate new IPs.
-    if config.server.rate_limit_rps > 0 {
-        let rate_map = state.rate_map.clone();
-        let window = config.server.rate_limit_window_secs;
+    // 7. Spawn rate-limit map cleanup (scavenge stale IPs every 60s).
+    // This prevents the rate map from reaching MAX_RATE_MAP_ENTRIES with
+    // dead entries, which would trigger the fail-closed path for legitimate
+    // new IPs.
+    //
+    // Spawned UNCONDITIONALLY rather than gated on the boot-time
+    // `rate_limit_rps`: the limiter can be turned on by a hot-reload
+    // (rps 0 → N, enforced live in `check_rate_limit`), and without a running
+    // scavenger the map would then grow unbounded and trip the fail-closed
+    // path. The window is read live from the current snapshot each pass so a
+    // window change is honored too. When the limiter is disabled the map
+    // stays ~empty and the 60 s scavenge is a cheap no-op.
+    {
+        let state_for_scavenge = state.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                let removed = security::scavenge_rate_map(&rate_map, window);
+                // `.max(1)` guards scavenge_rate_map's `now / window` against a
+                // 0 window ever reaching the snapshot.
+                let window = state_for_scavenge.cfg().rate_limit_window.max(1);
+                let removed = security::scavenge_rate_map(&state_for_scavenge.rate_map, window);
                 if removed > 0 {
                     logging::info(
                         "rate_limit",
                         &format!(
                             "scavenged {} stale IPs ({} tracked)",
                             removed,
-                            rate_map.len()
+                            state_for_scavenge.rate_map.len()
                         ),
                     );
                 }
@@ -1830,4 +1906,50 @@ fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
 /// Inject security headers — delegates to security module.
 pub(crate) fn inject_security_headers(resp: &mut Response<ZionBody>) {
     security::inject_security_headers(resp);
+}
+
+#[cfg(test)]
+mod h2_limit_tests {
+    use super::*;
+
+    /// CVE-2026-49975 regression guard. Pinning the H2 limits explicitly only
+    /// buys safety if the per-connection memory ceiling stays an asserted
+    /// invariant: if someone widens these, this test fails and forces a
+    /// conscious re-evaluation of the bound rather than a silent regression.
+    ///
+    /// The floor checks deliberately assert on `const` values — that is the
+    /// whole point (a tripwire on the constants), so the `assertions_on_constants`
+    /// lint is intentionally allowed here.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn h2_per_connection_memory_is_bounded() {
+        // Every concurrent stream may hold a decoded header list up to the cap.
+        let worst_case_header_bytes =
+            H2_MAX_CONCURRENT_STREAMS as u64 * H2_MAX_HEADER_LIST_SIZE as u64;
+        assert!(
+            worst_case_header_bytes <= 4 * 1024 * 1024,
+            "H2 per-conn header ceiling {worst_case_header_bytes} B exceeds 4 MiB — \
+             the HTTP/2 Bomb single-connection bound would regress"
+        );
+        // Functional floors: not so small they break legitimate multiplexing
+        // or normal request headers.
+        assert!(
+            H2_MAX_CONCURRENT_STREAMS >= 64,
+            "stream cap too low for legit multiplexing"
+        );
+        assert!(
+            H2_MAX_HEADER_LIST_SIZE >= 8 * 1024,
+            "header cap too low for normal requests"
+        );
+        // Rapid-Reset defence must stay present and bounded.
+        assert!(
+            (1..=100).contains(&H2_MAX_PENDING_ACCEPT_RESET_STREAMS),
+            "pending-accept reset bound must be a small positive number"
+        );
+        // A silent-hold must be reaped before it can pin state for long.
+        assert!(
+            H2_KEEPALIVE_TIMEOUT <= H2_KEEPALIVE_INTERVAL,
+            "keep-alive timeout should not exceed the interval"
+        );
+    }
 }

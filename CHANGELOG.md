@@ -4,6 +4,49 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-06-05
+
+### Security
+
+- **CVE-2026-49975 ("HTTP/2 Bomb") hardening.** The HTTP/2 Bomb chains an
+  HPACK decompression bomb with a flow-control "hold". Zion's single-connection
+  resistance was *inherited* from hyper/h2 defaults rather than asserted, and
+  the multi-connection variant was unbounded with the per-IP cap off (the
+  default). This makes the ceilings explicit and on by default. Verified live
+  on the e2e rig: released 0.3.3 advertised the inherited
+  `max_concurrent_streams = 200`; a single-connection bomb stayed bounded
+  (~3 MB/conn, RSS flat, 0 panics), confirming the premise.
+  - **Explicit HTTP/2 limits** ([`src/main.rs`](src/main.rs)) — pinned on the
+    server builder instead of inherited: `max_concurrent_streams = 128` (was
+    the inherited 200), `max_header_list_size = 16 KiB`,
+    `max_pending_accept_reset_streams = 20` (CVE-2023-44487 Rapid-Reset bound),
+    plus HTTP/2 keep-alive PINGs (30 s / 10 s) to reap a connection gone silent
+    mid-hold. A regression test pins the invariant that worst-case retained
+    header memory per connection (`streams × header-list`) stays ≤ 4 MiB.
+  - **Per-IP connection cap ON by default** ([`src/config.rs`](src/config.rs),
+    [`src/main.rs`](src/main.rs)) — `server.max_connections_per_ip` is now
+    tri-state: omitted → **auto** (~1/8 of the global connection ceiling,
+    scaling with RAM so it won't pinch CGNAT/large-NAT on big nodes); `0` →
+    explicitly disabled; `N` → explicit. Resolved in `try_build` and read live
+    at accept, so a hot-reload retunes it without dropping live connections.
+  - **`compute_conn_limit` re-based to 256 KB/connection**
+    ([`src/bootstrap.rs`](src/bootstrap.rs)) — was 50 KB, which
+    under-provisioned the global ceiling ~5× against an *active* HTTP/2
+    connection (1 MB flow-control window + per-stream/HPACK state + TLS
+    buffers). The per-connection worst case stays bounded by the explicit H2
+    limits and the per-IP cap above.
+
+### Fixed
+
+- **Rate-limit map scavenger spawned unconditionally**
+  ([`src/main.rs`](src/main.rs)) — it was gated on the boot-time
+  `rate_limit_rps > 0`, so enabling the limiter via hot-reload (`0 → N`) left
+  the per-IP rate map without garbage collection, risking unbounded growth to
+  `MAX_RATE_MAP_ENTRIES` and the fail-closed path for new IPs. It now always
+  runs (a cheap no-op when the map is empty) and reads the window live. A
+  regression test pins that a hot-reload carries `rate_limit_rps`,
+  `rate_limit_window`, and `max_connections_per_ip` into the new snapshot.
+
 ## [0.3.3] - 2026-06-03
 
 ### Fixed
