@@ -344,7 +344,8 @@ mod tests {
         // Bypass disk validation by parsing TOML directly — we only
         // test the rebuild() merging logic, not file I/O.
         let parsed: ZionConfig = toml::from_str(config_toml).unwrap();
-        let merged = rebuild(&parsed, &previous, TEST_CONN_LIMIT_MAX).expect("test config rebuilds");
+        let merged =
+            rebuild(&parsed, &previous, TEST_CONN_LIMIT_MAX).expect("test config rebuilds");
 
         let merged_arc = merged
             .health_map
@@ -394,7 +395,8 @@ mod tests {
             upstream = "billing"
         "#;
         let parsed: ZionConfig = toml::from_str(config_toml).unwrap();
-        let merged = rebuild(&parsed, &previous, TEST_CONN_LIMIT_MAX).expect("test config rebuilds");
+        let merged =
+            rebuild(&parsed, &previous, TEST_CONN_LIMIT_MAX).expect("test config rebuilds");
 
         // Old upstream gone, new one present, with default state
         // ("healthy = true, latency = 0", per ResolvedAppConfig::build).
@@ -446,12 +448,18 @@ mod tests {
         "#;
         let cfg = parse_inline(toml_text);
 
-        let snap = ResolvedAppConfig::try_build(&cfg, TEST_CONN_LIMIT_MAX)
-            .expect("test config builds");
+        let snap =
+            ResolvedAppConfig::try_build(&cfg, TEST_CONN_LIMIT_MAX).expect("test config builds");
         // Explicit per-IP cap (Some(50)) is carried verbatim.
-        assert_eq!(snap.max_connections_per_ip, 50, "per-IP cap must survive build");
+        assert_eq!(
+            snap.max_connections_per_ip, 50,
+            "per-IP cap must survive build"
+        );
         assert_eq!(snap.rate_limit_rps, 99, "rate_limit_rps must survive build");
-        assert_eq!(snap.rate_limit_window, 7, "rate_limit_window must survive build");
+        assert_eq!(
+            snap.rate_limit_window, 7,
+            "rate_limit_window must survive build"
+        );
 
         // The merge path used by every hot-reload must preserve them too.
         let merged = rebuild(&cfg, &snap, TEST_CONN_LIMIT_MAX).expect("test config rebuilds");
@@ -480,8 +488,7 @@ mod tests {
             upstream = "api"
         "#,
         );
-        let auto_snap =
-            ResolvedAppConfig::try_build(&auto, TEST_CONN_LIMIT_MAX).expect("builds");
+        let auto_snap = ResolvedAppConfig::try_build(&auto, TEST_CONN_LIMIT_MAX).expect("builds");
         assert_eq!(
             auto_snap.max_connections_per_ip,
             (TEST_CONN_LIMIT_MAX / 8) as u32,
@@ -490,8 +497,7 @@ mod tests {
 
         let mut off = auto;
         off.server.max_connections_per_ip = Some(0);
-        let off_snap =
-            ResolvedAppConfig::try_build(&off, TEST_CONN_LIMIT_MAX).expect("builds");
+        let off_snap = ResolvedAppConfig::try_build(&off, TEST_CONN_LIMIT_MAX).expect("builds");
         assert_eq!(
             off_snap.max_connections_per_ip, 0,
             "explicit 0 must disable the cap"
@@ -569,7 +575,8 @@ mod tests {
     fn atomic_swap_preserves_old_snapshot_for_inflight_readers() {
         // Initial snapshot, exposed only via `/api/...`.
         let v1 = parse_inline(TOML_V1);
-        let snap_v1 = ResolvedAppConfig::try_build(&v1, TEST_CONN_LIMIT_MAX).expect("test config builds");
+        let snap_v1 =
+            ResolvedAppConfig::try_build(&v1, TEST_CONN_LIMIT_MAX).expect("test config builds");
         let store = ArcSwap::from_pointee(snap_v1);
 
         // Reader A grabs an Arc clone *before* the swap. This models a
@@ -619,7 +626,8 @@ mod tests {
         // empty `[[route]]` section before the first edit).
         let mut empty = parse_inline(TOML_V1);
         empty.route.clear();
-        let snap_empty = ResolvedAppConfig::try_build(&empty, TEST_CONN_LIMIT_MAX).expect("test config builds");
+        let snap_empty =
+            ResolvedAppConfig::try_build(&empty, TEST_CONN_LIMIT_MAX).expect("test config builds");
         let store = ArcSwap::from_pointee(snap_empty);
 
         let v1 = parse_inline(TOML_V1);

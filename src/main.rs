@@ -1082,8 +1082,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                 // `.max(1)` guards scavenge_rate_map's `now / window` against a
                 // 0 window ever reaching the snapshot.
                 let window = state_for_scavenge.cfg().rate_limit_window.max(1);
-                let removed =
-                    security::scavenge_rate_map(&state_for_scavenge.rate_map, window);
+                let removed = security::scavenge_rate_map(&state_for_scavenge.rate_map, window);
                 if removed > 0 {
                     logging::info(
                         "rate_limit",
