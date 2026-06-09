@@ -10,7 +10,7 @@ http-body-util = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 bytes = "1"
 rand = "0.9"
-mimalloc = "0.1"
+mimalloc = "0.1.39"
 
 [profile.release]
 opt-level = 3
