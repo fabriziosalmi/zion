@@ -16,6 +16,12 @@ if ! [[ "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
   exit 2
 fi
 
+# Ensure we are inside a Git repository.
+if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+  echo "error: this script must be run from within a Git repository" >&2
+  exit 2
+fi
+
 cd "$(git rev-parse --show-toplevel)"
 
 OLD=$(awk '
