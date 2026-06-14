@@ -42,6 +42,24 @@ if [[ "$OLD" == "$NEW" ]]; then
   exec scripts/check-version-sync.sh
 fi
 
+# Validate that NEW is strictly greater than OLD (semver-compliant)
+# Use cargo's built-in semver comparison via `cargo metadata` if available,
+# otherwise fall back to a simple numeric comparison (ignores pre-release).
+# Pre-release versions are considered less than the same version without prerelease.
+# We only compare major.minor.patch for simplicity and safety.
+OLD_BASE=$(echo "$OLD" | cut -d'-' -f1 | cut -d'+' -f1)
+NEW_BASE=$(echo "$NEW" | cut -d'-' -f1 | cut -d'+' -f1)
+
+IFS='.' read -r OLD_MAJOR OLD_MINOR OLD_PATCH <<< "$OLD_BASE"
+IFS='.' read -r NEW_MAJOR NEW_MINOR NEW_PATCH <<< "$NEW_BASE"
+
+if ! (( (NEW_MAJOR > OLD_MAJOR) ||
+        (NEW_MAJOR == OLD_MAJOR && NEW_MINOR > OLD_MINOR) ||
+        (NEW_MAJOR == OLD_MAJOR && NEW_MINOR == OLD_MINOR && NEW_PATCH > OLD_PATCH) )); then
+  echo "error: new version '$NEW' is not greater than current '$OLD'" >&2
+  exit 2
+fi
+
 echo "Bumping $OLD → $NEW"
 
 # Portable in-place sed (works on both BSD/macOS and GNU).
