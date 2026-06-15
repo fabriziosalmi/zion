@@ -825,4 +825,44 @@ mod tests {
         }
         assert!(ok, "slots not reclaimed after all conns done");
     }
+
+    // Increment 6: backpressure. A slow consumer must throttle the writer
+    // (poll_write returns Pending while a Send is in flight — the one-staged-
+    // buffer high-water) WITHOUT deadlocking, with memory bounded to that one
+    // buffer, and the payload arrives byte-exact.
+    #[tokio::test]
+    async fn backpressure_slow_consumer_no_deadlock() {
+        let shared = start().unwrap();
+        let (fa, fb) = socketpair();
+        let mut a = shared.register(fa).unwrap();
+        let mut peer = tokio_peer(fb);
+        let data = payload(); // 1 MiB
+        let total = data.len();
+
+        let d2 = data.clone();
+        // Writer: push the whole payload through the io_uring stream. If
+        // backpressure deadlocked, this never completes and the test times out.
+        let w = tokio::spawn(async move {
+            a.write_all(&d2).await.unwrap();
+            a.shutdown().await.unwrap();
+        });
+
+        // Slow reader: drain in small chunks with periodic pauses so the socket
+        // buffer fills and the writer is forced to wait on backpressure.
+        let mut got = Vec::with_capacity(total);
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = peer.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&chunk[..n]);
+            if got.len() % (64 * 1024) < 4096 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        w.await.unwrap();
+        assert_eq!(got.len(), total);
+        assert!(got == data, "backpressure payload mismatch");
+    }
 }
