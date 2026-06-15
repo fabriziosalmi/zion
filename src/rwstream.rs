@@ -9,9 +9,10 @@
 //! today. The `Uring` arm only exists on `linux + io-uring-rw`; everywhere
 //! else `RwStream` is just the `Tcp` arm.
 //!
-//! Increment 3 (ADR-0009): the enum + delegation + the runtime gate. The
-//! serve-path seam that constructs it (lifting the accepted fd into the
-//! driver) lands in increment 5; until then this is exercised only by tests.
+//! The serve seam (`spawn_https_handler`) constructs it via [`from_accepted`],
+//! which lifts the accepted fd out of tokio's epoll reactor into the io_uring
+//! driver when the kernel supports it, otherwise binds the `Tcp` arm
+//! (ADR-0009).
 
 // RwStream is constructed by the serve seam only on `linux + io-uring-rw`; on
 // every other build (macOS, default, etc.) it is unused, so allow dead_code

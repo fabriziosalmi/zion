@@ -94,6 +94,7 @@ Reproduce: `bash benchmarks/bench-scientific.sh`.
 **v0.2.x Tracks (feature-gated, default-off)**
 - **XDP pre-filter** (`--features xdp`, Linux): eBPF LPM-trie drop at the NIC driver layer. Blocked source IPs never reach the userspace TLS handshake — frees CPU for legitimate traffic and keeps the WAF gate cheap.
 - **kTLS post-handshake offload** (`--features ktls`, Linux 5.10+ with `CONFIG_TLS=y`): once the rustls handshake completes the socket is flipped into in-kernel TLS via `SOL_TLS`. Removes the userspace AEAD trip and unlocks `sendfile`-class zero-copy for static cache hits. Handshake cipher must be TLS 1.3 AES-GCM or ChaCha20-Poly1305. Falls back to userspace TLS on upgrade failure.
+- **io_uring read/write** (`--features io-uring-rw`, Linux 5.19+): the accepted TLS connection's read/write half runs over a dedicated io_uring driver (`IoUringStream`, completion→poll bridge) instead of epoll, behind a runtime kernel gate with a transparent fallback to the tokio path. **Experimental, off by default** — kept opt-in pending the throughput/syscall bench gate (ADR-0009).
 - **ML-augmented WAF** (`--features ml-waf`): 16-dim feature extractor + tract-onnx scorer on the WAF hot path, 200µs p99 budget. The score is reported as a metric and travels into the request as a header — never a hard gate; the local Aho-Corasick + entropy gate stays authoritative.
 - **AIMP serverless mesh** (`--features sovereign-aimp`): Ed25519-signed UDP gossip of WAF rule deltas + IP-reputation across a fleet, source-bound revocation, replay LRU, ts-window admission, last-writer-wins merge, periodic anti-entropy. No central control plane — each node keeps serving with its last known map when the mesh partitions. Configure under `[sovereign_aimp]` in `zion.toml` (or via `ZION_AIMP_*` env vars for back-compat).
 
@@ -312,7 +313,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 ```
 
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-40 modules, ~27,700 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+42 modules, ~28,900 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Benchmarking
 
@@ -338,7 +339,7 @@ Results saved to `benchmarks/bench-history.json` with automatic delta comparison
 ## Testing
 
 ```bash
-# Unit tests (587) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
+# Unit tests (588) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
 cargo test
 
 # Integration tests (23 -- requires running Zion + backend)

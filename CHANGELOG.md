@@ -6,6 +6,21 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **io_uring read/write data path** (`--features io-uring-rw`, Linux 5.19+; #51,
+  ADR-0009, [`src/uring_rw.rs`](src/uring_rw.rs), [`src/rwstream.rs`](src/rwstream.rs)).
+  The accepted TLS connection's read/write half runs over a dedicated io_uring
+  driver thread + owned-buffer slab (`IoUringStream`, a completion→poll bridge
+  implementing tokio `AsyncRead`/`AsyncWrite`), selected once at accept via
+  `RwStream::{Uring,Tcp}` behind a runtime kernel gate, with a transparent
+  fallback to the tokio path; rustls's vectored writes are gathered into one
+  `Send`. **Off by default and not yet default-on** — the double memcpy
+  (kernel↔slab↔caller) over rustls's small records may not pay off, so the
+  feature stays opt-in pending the throughput/syscall **bench gate** (ADR-0009).
+  `tokio-uring` was ruled out (`!Send` runtime + no `AsyncRead`/`AsyncWrite`).
+  Verified on a 6.17 kernel: a real rustls handshake + round-trip over the
+  io_uring stream, EOF/RST/drop-with-inflight (UAF-proof slot reclaim), and
+  concurrent-connection echo. Follow-ups: write-backpressure tuning, the bench
+  gate, then optionally fixed buffers / sharding.
 - **L7 tarpit / slow-drip for flagged sources** (#151,
   [`src/tarpit.rs`](src/tarpit.rs)). Closes the anti-DDoS enforcement arc
   (#147 → #155 → #150 → #151). When tag-driven enforcement (#150) decides to
