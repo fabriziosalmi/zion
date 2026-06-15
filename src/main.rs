@@ -1588,7 +1588,13 @@ async fn run_https_accept_loop(
             }
             conn = uring_rx.recv() => {
                 let Some(conn) = conn else { return; };
-                spawn_https_handler(conn.stream, conn.addr, state.clone());
+                // Convert std -> tokio TcpStream HERE: we are in a tokio runtime
+                // context, whereas the io_uring accept thread is not (its
+                // `from_std` would panic "no reactor running").
+                match tokio::net::TcpStream::from_std(conn.std_stream) {
+                    Ok(stream) => spawn_https_handler(stream, conn.addr, state.clone()),
+                    Err(e) => eprintln!("  io_uring accept: tokio from_std failed: {e}"),
+                }
             }
         }
     }

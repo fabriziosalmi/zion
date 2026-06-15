@@ -27,12 +27,14 @@ mod inner {
     use io_uring::{opcode, types, IoUring};
     use std::net::SocketAddr;
     use std::os::unix::io::{FromRawFd, RawFd};
-    use tokio::net::TcpStream;
     use tokio::sync::mpsc;
 
-    /// Accepted connection ready for TLS handshake.
+    /// A freshly-accepted connection as a *std* `TcpStream`. Conversion to a
+    /// tokio `TcpStream` happens on the consuming side (a tokio worker), NOT
+    /// here: `tokio::net::TcpStream::from_std` panics ("no reactor running")
+    /// when called from this bare std::thread accept loop.
     pub struct AcceptedConn {
-        pub stream: TcpStream,
+        pub std_stream: std::net::TcpStream,
         pub addr: SocketAddr,
     }
 
@@ -182,17 +184,17 @@ mod inner {
                     }
                 };
 
-                // Convert to tokio TcpStream
-                // SAFETY: the raw_fd is fresh from the kernel accept call and exclusive to this thread
+                // Build a *std* TcpStream (runtime-free) and hand it to a tokio
+                // worker, which converts it inside a runtime context. Calling
+                // `tokio::net::TcpStream::from_std` HERE panics — this accept
+                // loop runs on a bare std::thread with no Tokio reactor.
+                // SAFETY: raw_fd is fresh from the kernel accept, exclusive to us.
                 let std_stream = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
-                let stream = match TcpStream::from_std(std_stream) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
 
-                // Send to tokio workers — if channel full, drop connection (overload shed)
-                if tx.try_send(AcceptedConn { stream, addr }).is_err() {
-                    // Channel full — connection dropped (back-pressure)
+                // Send to tokio workers — if the channel is full, the connection
+                // is dropped (overload shed).
+                if tx.try_send(AcceptedConn { std_stream, addr }).is_err() {
+                    // Channel full — connection dropped (back-pressure).
                 }
             }
         }
