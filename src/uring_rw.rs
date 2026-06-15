@@ -30,11 +30,6 @@
 //! in-flight-op count reaches 0, so a dropped stream with a `Recv`/`Send`
 //! still in flight can never use-after-free.
 
-// Interim: until the serve-path seam is wired (increment 5, ADR-0009), every
-// item here is exercised only by the in-module tests, so a non-test build
-// sees them as dead. Lifted when `spawn_https_handler` constructs the stream.
-#![allow(dead_code)]
-
 use std::io;
 use std::os::fd::RawFd;
 use std::pin::Pin;
@@ -109,6 +104,8 @@ enum WriteState {
 struct SlotInner {
     fd: RawFd,
     gen: u16,
+    /// Occupancy flag; written on register/reclaim. Read via `/metrics` later.
+    #[allow(dead_code)]
     in_use: bool,
     orphaned: bool,
     /// Count of in-flight SQEs (read + write) referencing this slot's buffers.
@@ -195,6 +192,7 @@ impl Shared {
 
     /// Introspection (tests today, `/metrics` later): slots currently
     /// registered and not yet reclaimed.
+    #[allow(dead_code)]
     pub(crate) fn active_slots(&self) -> usize {
         MAX_SLOTS - self.free.lock().unwrap().len()
     }
@@ -545,6 +543,49 @@ impl AsyncWrite for IoUringStream {
             }
             WriteState::Err(e) => Poll::Ready(Err(io::Error::from_raw_os_error(e))),
         }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let s = &self.shared.slots[self.slot as usize];
+        let mut inner = s.inner.lock().unwrap();
+        match inner.write_state {
+            WriteState::Idle => {
+                // Gather as many slices as fit into the one staged buffer and
+                // submit a SINGLE Send — rustls drives bulk writes vectored
+                // (up to 64 slices), so this avoids one Send per slice and the
+                // per-flush serialization that would otherwise kill throughput.
+                let cap = inner.write_buf.len();
+                let mut n = 0;
+                for b in bufs {
+                    if n >= cap {
+                        break;
+                    }
+                    let take = std::cmp::min(b.len(), cap - n);
+                    inner.write_buf[n..n + take].copy_from_slice(&b[..take]);
+                    n += take;
+                }
+                if n == 0 {
+                    return Poll::Ready(Ok(0));
+                }
+                inner.write_state = WriteState::Submitted { off: 0, len: n };
+                drop(inner);
+                self.shared.send(DriverCmd::Write { slot: self.slot, gen: self.gen });
+                Poll::Ready(Ok(n))
+            }
+            WriteState::Submitted { .. } => {
+                s.write_waker.register(cx.waker());
+                Poll::Pending
+            }
+            WriteState::Err(e) => Poll::Ready(Err(io::Error::from_raw_os_error(e))),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

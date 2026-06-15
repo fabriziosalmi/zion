@@ -13,9 +13,13 @@
 //! serve-path seam that constructs it (lifting the accepted fd into the
 //! driver) lands in increment 5; until then this is exercised only by tests.
 
-// Interim until the seam is wired (increment 5, ADR-0009): the enum is
-// constructed only by tests for now.
-#![allow(dead_code)]
+// RwStream is constructed by the serve seam only on `linux + io-uring-rw`; on
+// every other build (macOS, default, etc.) it is unused, so allow dead_code
+// there only — `linux + io-uring-rw` keeps full dead-code checking.
+#![cfg_attr(
+    not(all(target_os = "linux", feature = "io-uring-rw")),
+    allow(dead_code)
+)]
 
 use std::io;
 use std::pin::Pin;
@@ -136,6 +140,31 @@ pub fn driver() -> Option<&'static std::sync::Arc<crate::uring_rw::Shared>> {
             }
         })
         .as_ref()
+}
+
+/// Build the connection transport from a freshly-accepted tokio `TcpStream`,
+/// choosing the io_uring path when active. Lifts the fd out of tokio's epoll
+/// reactor into the driver (avoids epoll+io_uring double-registration on the
+/// same fd); falls back to `Tcp` when io_uring is inactive or the driver slab
+/// is full. `None` only on a (practically impossible) fd-conversion error, in
+/// which case the caller drops the connection.
+#[cfg(all(target_os = "linux", feature = "io-uring-rw"))]
+pub fn from_accepted(tcp: TcpStream) -> Option<RwStream> {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    if !io_uring_rw_active() {
+        return Some(RwStream::Tcp(tcp));
+    }
+    // into_std() deregisters the fd from tokio's epoll reactor; into_raw_fd()
+    // hands ownership to the driver (which closes it on reclaim).
+    let std_stream = tcp.into_std().ok()?;
+    let fd = std_stream.into_raw_fd();
+    if let Some(s) = driver().and_then(|d| d.register(fd)) {
+        return Some(RwStream::Uring(s));
+    }
+    // Driver slab full → give the fd back to tokio (register left it untouched).
+    // SAFETY: we own `fd` — a valid, connected, nonblocking socket.
+    let reclaimed = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    Some(RwStream::Tcp(TcpStream::from_std(reclaimed).ok()?))
 }
 
 #[cfg(test)]

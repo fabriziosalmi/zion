@@ -1651,9 +1651,23 @@ fn spawn_https_handler(
         // `CorkStream<TcpStream>` adapter (ktls 6.x API). Wrap up-front
         // when the feature is on; the cfg-gated branch costs nothing
         // when compiled without it.
+        // kTLS present → kTLS cork path; io_uring rw is NOT used on this
+        // connection (mutually exclusive in v1, ADR-0009).
         #[cfg(all(target_os = "linux", feature = "ktls"))]
         let inner_for_handshake = crate::ktls::cork_for_handshake(tcp_stream);
-        #[cfg(not(all(target_os = "linux", feature = "ktls")))]
+        // io-uring-rw present (and not kTLS) → io_uring stream when the kernel
+        // supports it, else tokio. `from_accepted` lifts the fd out of epoll
+        // into the driver (no double-registration); `None` → drop the conn (#51).
+        #[cfg(all(target_os = "linux", feature = "io-uring-rw", not(feature = "ktls")))]
+        let inner_for_handshake = match crate::rwstream::from_accepted(tcp_stream) {
+            Some(s) => s,
+            None => return,
+        };
+        // Neither → the portable tokio path (unchanged behaviour).
+        #[cfg(not(any(
+            all(target_os = "linux", feature = "ktls"),
+            all(target_os = "linux", feature = "io-uring-rw")
+        )))]
         let inner_for_handshake = tcp_stream;
 
         let tls_start = std::time::Instant::now();
