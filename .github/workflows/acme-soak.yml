@@ -51,7 +51,7 @@ jobs:
       ZION_ACME_TEST_DIR: /tmp/zion-acme-soak
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6.0.2
 
       # ubuntu-latest ships a recent stable Rust — use it directly rather
       # than pulling a toolchain action (one less external dependency on
