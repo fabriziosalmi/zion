@@ -20,6 +20,7 @@ defined in [0000-template.md](0000-template.md).
 | 0006  | [`tracing` always-on, OTLP gated by `--features otel`](0006-tracing-with-optional-otlp.md) | accepted |
 | 0007  | [Two-tier MSRV — 1.82 core, 1.88 with optional features](0007-bicapa-msrv.md) | accepted |
 | 0008  | [Embed AIMP as the mesh control-plane bus](0008-mesh-aimp-integration.md) | accepted |
+| 0009  | [IoUringStream — io_uring read/write data path](0009-io-uring-rw-stream.md) | accepted |
 
 ## When to write a new ADR
 

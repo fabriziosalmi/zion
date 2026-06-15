@@ -76,6 +76,8 @@ mod tui;
 // reachable even when `io-uring-accept` is off, and on non-Linux the
 // probe degrades to "always returns false".
 mod uring;
+#[cfg(all(target_os = "linux", feature = "io-uring-rw"))]
+mod uring_rw;
 mod waf;
 
 // ── Beyond-FAANG tracks (experimental, feature-gated) ─────────────────

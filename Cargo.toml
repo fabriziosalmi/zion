@@ -135,6 +135,9 @@ tracing-opentelemetry = { version = "0.33", default-features = false, optional =
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 io-uring = { version = "0.7", optional = true }
+# AtomicWaker for the io_uring rw driver <-> task wakeups (issue #51,
+# ADR-0009). Only `task::AtomicWaker` is used; keep the dep minimal.
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 # XDP / eBPF userspace loader (Track A — `--features xdp`).
 # Aya is pure-Rust (no libbpf C dep) and ships its own BTF loader.
 aya = { version = "0.13", optional = true }
@@ -196,7 +199,7 @@ io-uring-accept = ["io-uring"]
 # capability probe and the kernel-version structured log line. The
 # listener supervisor keeps using tokio's `AsyncReadExt` /
 # `AsyncWriteExt` — no behavioural change at runtime.
-io-uring-rw = ["io-uring-accept"]
+io-uring-rw = ["io-uring-accept", "futures-util"]
 acme = ["instant-acme", "rcgen", "base64"]
 auth = ["jsonwebtoken", "reqwest"]
 http3 = ["quinn", "h3", "h3-quinn"]
