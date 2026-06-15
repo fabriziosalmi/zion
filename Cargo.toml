@@ -264,6 +264,9 @@ sovereign-aimp = ["sovereign-signals", "dep:aimp_node", "dep:rmp-serde"]
 # Track C — property-based testing (proptest) only used by `cargo test`.
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
+# Self-signed certs for the in-process TLS-handshake test over RwStream
+# (issue #51 increment 4, ADR-0009). Test-only.
+rcgen = "0.14"
 # Criterion microbench harness (issue #54). Pinned to 0.5; the `html_reports`
 # default feature is dropped — we publish a JSON baseline (target/criterion/
 # *.json) and the GitHub Actions runner has no browser to render HTML in.

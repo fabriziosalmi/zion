@@ -214,4 +214,70 @@ mod tests {
         assert!(got == data, "uring arm read mismatch");
         w.await.unwrap();
     }
+
+    // Increment 4: a real rustls handshake + round-trip with the SERVER side
+    // running over RwStream::Uring. Proves the AsyncRead/AsyncWrite impl
+    // satisfies tokio_rustls's bounds AND works under rustls's real I/O
+    // pattern (many small reads + vectored writes) — before the serve seam.
+    #[cfg(all(target_os = "linux", feature = "io-uring-rw"))]
+    #[tokio::test]
+    async fn rustls_handshake_and_roundtrip_over_uring() {
+        use std::os::fd::FromRawFd;
+        use std::sync::Arc;
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        // Self-signed cert for "localhost".
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = ck.cert.der().clone();
+        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der());
+
+        let server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der.into())
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+
+        // Transport: socketpair; server end through the io_uring driver, client
+        // end a plain tokio stream.
+        let drv = driver().expect("io_uring rw driver");
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        let server_io = RwStream::Uring(drv.register(fds[0]).expect("register"));
+        let client_std = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fds[1]) };
+        client_std.set_nonblocking(true).unwrap();
+        let client_io = tokio::net::UnixStream::from_std(client_std).unwrap();
+
+        // Server: accept TLS over the io_uring stream, echo a small message.
+        let srv = tokio::spawn(async move {
+            let mut tls = acceptor.accept(server_io).await.expect("server handshake");
+            let mut buf = [0u8; 5];
+            tls.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"PING!");
+            tls.write_all(b"PONG!").await.unwrap();
+            tls.flush().await.unwrap();
+        });
+
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls = connector
+            .connect(name, client_io)
+            .await
+            .expect("client handshake");
+        tls.write_all(b"PING!").await.unwrap();
+        tls.flush().await.unwrap();
+        let mut resp = [0u8; 5];
+        tls.read_exact(&mut resp).await.unwrap();
+        assert_eq!(&resp, b"PONG!");
+        srv.await.unwrap();
+    }
 }
