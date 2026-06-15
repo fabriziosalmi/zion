@@ -30,6 +30,11 @@
 //! in-flight-op count reaches 0, so a dropped stream with a `Recv`/`Send`
 //! still in flight can never use-after-free.
 
+// Interim: until the serve-path seam is wired (increment 5, ADR-0009), every
+// item here is exercised only by the in-module tests, so a non-test build
+// sees them as dead. Lifted when `spawn_https_handler` constructs the stream.
+#![allow(dead_code)]
+
 use std::io;
 use std::os::fd::RawFd;
 use std::pin::Pin;
