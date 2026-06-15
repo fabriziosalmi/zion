@@ -372,6 +372,10 @@ pub struct EnforceConfig {
     /// high-confidence path). Requires `--features sovereign-aimp`.
     #[serde(default)]
     pub mesh_score_deny_above: f32,
+    /// L7 tarpit (#151): escalate a deny from a cheap `403` to a bounded
+    /// *held* connection. Off by default.
+    #[serde(default)]
+    pub tarpit: TarpitConfig,
 }
 
 impl Default for EnforceConfig {
@@ -380,6 +384,49 @@ impl Default for EnforceConfig {
             enabled: false,
             deny: Vec::new(),
             mesh_score_deny_above: 0.0,
+            tarpit: TarpitConfig::default(),
+        }
+    }
+}
+
+/// `[sovereign.enforce.tarpit]` — escalate an enforcement *deny* from a
+/// cheap `403` to a bounded held connection (issue #151). Off by default.
+/// Bounded by `max_concurrent`: at the ceiling the tarpit sheds back to an
+/// immediate `403`, so it can never become a self-inflicted resource sink.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TarpitConfig {
+    /// Master switch. Default: false (denies stay immediate 403s). Only
+    /// takes effect when `[sovereign.enforce] enabled = true`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How long a flagged connection is held before its rejection, seconds.
+    #[serde(default = "default_tarpit_hold_secs")]
+    pub hold_secs: u64,
+    /// Hard ceiling on concurrently-held connections. At the ceiling the
+    /// tarpit sheds to an immediate `403`. `0` holds nothing (sheds all).
+    #[serde(default = "default_tarpit_max_concurrent")]
+    pub max_concurrent: u32,
+}
+
+fn default_tarpit_hold_secs() -> u64 {
+    10
+}
+
+fn default_tarpit_max_concurrent() -> u32 {
+    // Small fixed fraction of any box's connection pool (the global ceiling
+    // is RAM-scaled with a ~1000 floor). Kept comfortably below the
+    // `conn_limit/4` self-DoS clamp applied at config-load (#151) so the
+    // default never trips the clamp warning. Operators can raise it; the
+    // clamp still bounds an over-large override.
+    128
+}
+
+impl Default for TarpitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hold_secs: default_tarpit_hold_secs(),
+            max_concurrent: default_tarpit_max_concurrent(),
         }
     }
 }
@@ -392,6 +439,14 @@ pub struct EnforcePolicy {
     pub enabled: bool,
     deny: std::collections::HashSet<String>,
     mesh_score_deny_above: f32,
+    /// True only when enforcement *and* the tarpit are both on (#151) — a
+    /// tarpit with no enforcement deny would never fire.
+    pub tarpit_enabled: bool,
+    /// How long a flagged connection is held before its rejection.
+    pub tarpit_hold: std::time::Duration,
+    /// Hard ceiling on concurrently-held tarpit connections; at the ceiling
+    /// the deny path sheds to an immediate rejection.
+    pub tarpit_max_concurrent: u32,
 }
 
 impl EnforcePolicy {
@@ -400,6 +455,11 @@ impl EnforcePolicy {
             enabled: c.enabled,
             deny: c.deny.iter().map(|s| s.to_ascii_lowercase()).collect(),
             mesh_score_deny_above: c.mesh_score_deny_above,
+            // The tarpit is an escalation of an enforcement deny, so it is
+            // live only when enforcement itself is enabled.
+            tarpit_enabled: c.enabled && c.tarpit.enabled,
+            tarpit_hold: std::time::Duration::from_secs(c.tarpit.hold_secs),
+            tarpit_max_concurrent: c.tarpit.max_concurrent,
         }
     }
 
@@ -596,6 +656,7 @@ mod tests {
             enabled: false,
             deny: vec!["unknown".into()],
             mesh_score_deny_above: 0.5,
+            ..Default::default()
         });
         assert!(!p.denies_class("unknown"));
         assert!(!p.denies_score(0.99));
@@ -607,6 +668,7 @@ mod tests {
             enabled: true,
             deny: vec!["Unknown".into(), "DATACENTER_EU".into()],
             mesh_score_deny_above: 0.0,
+            ..Default::default()
         });
         assert!(p.denies_class("unknown"));
         assert!(p.denies_class("datacenter_eu"));
@@ -621,6 +683,7 @@ mod tests {
             enabled: true,
             deny: vec![],
             mesh_score_deny_above: 0.0, // 0 = disabled
+            ..Default::default()
         });
         assert!(!off.denies_score(1.0));
 
@@ -628,6 +691,7 @@ mod tests {
             enabled: true,
             deny: vec![],
             mesh_score_deny_above: 0.9,
+            ..Default::default()
         });
         assert!(p.denies_score(0.91));
         assert!(!p.denies_score(0.9)); // strict `>`, equal does not deny
@@ -640,10 +704,45 @@ mod tests {
             enabled: true,
             deny: vec!["unknown".into(), "datacentre_eu".into()], // British typo
             mesh_score_deny_above: 0.0,
+            ..Default::default()
         });
         let unknown = p.unknown_deny_labels();
         assert!(unknown.contains(&"datacentre_eu"));
         assert!(!unknown.contains(&"unknown"));
+    }
+
+    #[test]
+    fn tarpit_resolves_and_requires_enforcement_on() {
+        // Tarpit on but enforcement off → not live (a tarpit with no deny to
+        // escalate would never fire).
+        let off = EnforcePolicy::from_config(&EnforceConfig {
+            enabled: false,
+            tarpit: TarpitConfig {
+                enabled: true,
+                hold_secs: 5,
+                max_concurrent: 32,
+            },
+            ..Default::default()
+        });
+        assert!(!off.tarpit_enabled);
+
+        // Both on → live, with resolved hold + ceiling.
+        let on = EnforcePolicy::from_config(&EnforceConfig {
+            enabled: true,
+            deny: vec!["unknown".into()],
+            tarpit: TarpitConfig {
+                enabled: true,
+                hold_secs: 7,
+                max_concurrent: 64,
+            },
+            ..Default::default()
+        });
+        assert!(on.tarpit_enabled);
+        assert_eq!(on.tarpit_hold, std::time::Duration::from_secs(7));
+        assert_eq!(on.tarpit_max_concurrent, 64);
+
+        // Default config → tarpit off.
+        assert!(!EnforcePolicy::from_config(&EnforceConfig::default()).tarpit_enabled);
     }
 
     #[cfg(feature = "geo-eu")]

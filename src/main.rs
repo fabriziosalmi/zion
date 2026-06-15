@@ -66,6 +66,7 @@ mod reload;
 mod security;
 #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
 mod sovereign;
+mod tarpit;
 mod tls;
 #[cfg(feature = "tui")]
 mod tui;
@@ -362,7 +363,7 @@ impl ResolvedAppConfig {
         // never fire, which is exactly the failure an operator can't see.
         #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
         let enforce = {
-            let policy = sovereign::EnforcePolicy::from_config(&config.sovereign.enforce);
+            let mut policy = sovereign::EnforcePolicy::from_config(&config.sovereign.enforce);
             if config.sovereign.enforce.enabled {
                 let unknown = policy.unknown_deny_labels();
                 if !unknown.is_empty() {
@@ -374,6 +375,46 @@ impl ResolvedAppConfig {
                             sovereign::known_class_labels(),
                         ),
                     );
+                }
+                let tp = &config.sovereign.enforce.tarpit;
+                // #151: a tarpit with a zero ceiling holds nothing — every
+                // flagged request sheds straight to the 403. Surface it so the
+                // operator doesn't think the tarpit is doing anything.
+                if tp.enabled && tp.max_concurrent == 0 {
+                    logging::warn(
+                        "sovereign",
+                        "[sovereign.enforce.tarpit] enabled with max_concurrent = 0 — every flagged request is shed to an immediate 403 (tarpit is a no-op)",
+                    );
+                }
+                // #151 self-DoS guard: a held tarpit connection keeps its
+                // global connection-pool permit and per-IP slot for the whole
+                // hold, so the ceiling must stay a small fraction of the pool —
+                // otherwise a flood of flagged sources pins admission. Clamp to
+                // 1/4 of the global connection ceiling and say so.
+                if tp.enabled && policy.tarpit_max_concurrent > 0 {
+                    let safety_cap = ((conn_limit_max / 4) as u32).max(1);
+                    if policy.tarpit_max_concurrent > safety_cap {
+                        logging::warn(
+                            "sovereign",
+                            &format!(
+                                "[sovereign.enforce.tarpit] max_concurrent {} exceeds 1/4 of the global connection ceiling ({}) — clamping to {} so held connections can't pin the admission pool",
+                                policy.tarpit_max_concurrent, conn_limit_max, safety_cap,
+                            ),
+                        );
+                        policy.tarpit_max_concurrent = safety_cap;
+                    }
+                    // A few seconds already imposes the cost; very long holds
+                    // tie up connections (capped by the connection idle timeout)
+                    // and slow the shutdown drain.
+                    if tp.hold_secs > 60 {
+                        logging::warn(
+                            "sovereign",
+                            &format!(
+                                "[sovereign.enforce.tarpit] hold_secs = {} is very large — a few seconds already imposes the cost; long holds tie up connections and slow shutdown drain",
+                                tp.hold_secs,
+                            ),
+                        );
+                    }
                 }
             }
             policy

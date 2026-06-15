@@ -180,14 +180,7 @@ leave on under load. Defence is layered, outside-in:
 | **Origin tagging** | IT/EU range classification (`--features geo-ita` / `geo-eu`), **IPv4 + IPv6** — O(log N) binary search over baked CIDR data + one atomic, **no GeoIP DB, no syscall**. Class lands on the request (`extensions`), a metric, and an optional log. Answers "% EU vs non-EU traffic" out of the box (see [observability](https://fabriziosalmi.github.io/zion/guide/observability)). | ✅ shipping |
 | **Fleet signal** | AIMP serverless mesh (`--features sovereign-aimp`): Ed25519-signed UDP gossip of blocks + IP-reputation, source-bound revocation, no central control plane. Reputation rides to the upstream as `X-Zion-Mesh-Score`. | ✅ shipping (advisory) |
 | **Tag-driven enforcement** | `[sovereign.enforce]` (`#150`) promotes the origin tag / mesh score from *signal* to an opt-in `403` deny — e.g. `deny = ["unknown"]` blocks every non-EU source while EU classes pass (sovereign allowlist by complement), or deny above an AIMP reputation threshold. Off by default; local WAF / rate-limit / auth stay authoritative. Counted in `zion_enforcement_denied_total{reason}`. | ✅ shipping |
-
-**On the roadmap — the lever still to build** (tracked; PRs welcome):
-
-- **L7 tarpit / slow-drip** ([#151](https://github.com/fabriziosalmi/zion/issues/151)) —
-  hold flagged connections (those an enforcement policy or a rate/conn
-  breach marks) instead of a clean `429`, so a backed attacker pays
-  wall-clock and socket budget. Bounded by a hard concurrency ceiling
-  (the per-IP connection-limit primitive) so it can't self-DoS.
+| **L7 tarpit** | `[sovereign.enforce.tarpit]` (`#151`) escalates an enforcement deny from a cheap `403` to a *held* connection: a flagged source is parked `hold_secs` before the refusal, so a backed flood pays wall-clock + socket budget instead of an instantly-recyclable reject. A hard global ceiling (`max_concurrent`) sheds back to an immediate `403`, so the tarpit can't self-DoS. Off by default. Metrics `zion_tarpit_{active,total,shed_total,held_ms_total}`. | ✅ shipping |
 
 The design rule: tagging and reputation never *silently* gate — the
 operator opts a signal into enforcement explicitly, and the local
@@ -319,7 +312,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 ```
 
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-39 modules, ~27,300 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+40 modules, ~27,700 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Benchmarking
 
@@ -345,7 +338,7 @@ Results saved to `benchmarks/bench-history.json` with automatic delta comparison
 ## Testing
 
 ```bash
-# Unit tests (582) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
+# Unit tests (587) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
 cargo test
 
 # Integration tests (23 -- requires running Zion + backend)

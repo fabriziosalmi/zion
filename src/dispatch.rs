@@ -38,6 +38,34 @@ use crate::auth;
 use crate::config::ResolvedRoute;
 use http_body_util::Limited;
 
+/// Issue #151: turn an enforcement *deny* into a bounded held (tarpit)
+/// response when the operator enabled it, otherwise the plain immediate
+/// rejection. Bounded by the global ceiling — at capacity it sheds back to
+/// the immediate reject, so the tarpit can never become a self-DoS. The
+/// request is denied either way; the tarpit only changes *how long* the
+/// flagged client waits for the refusal.
+#[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+async fn deny_or_tarpit(
+    enforce: &crate::sovereign::EnforcePolicy,
+    status: StatusCode,
+) -> Response<ZionBody> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if enforce.tarpit_enabled {
+        match crate::tarpit::try_enter(enforce.tarpit_max_concurrent) {
+            Some(_guard) => {
+                metrics::METRICS.tarpit_total.fetch_add(1, Relaxed);
+                tokio::time::sleep(enforce.tarpit_hold).await;
+                // `_guard` drops here: active gauge--, held-time recorded.
+            }
+            None => {
+                // Ceiling full — shed to the immediate rejection.
+                metrics::METRICS.tarpit_shed_total.fetch_add(1, Relaxed);
+            }
+        }
+    }
+    empty_response(status)
+}
+
 const MAX_URI_LEN: usize = 8192;
 const MAX_CACHEABLE_BODY: usize = 50 * 1024 * 1024;
 
@@ -258,7 +286,7 @@ async fn process_request_inner(
                 metrics::METRICS
                     .enforcement_denied_class
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(empty_response(StatusCode::FORBIDDEN));
+                return Ok(deny_or_tarpit(&cfg.enforce, StatusCode::FORBIDDEN).await);
             }
             if cfg.sovereign_log_classification && ip_class != sovereign::IpClass::Unknown {
                 tracing::info!(
@@ -303,7 +331,7 @@ async fn process_request_inner(
                 metrics::METRICS
                     .enforcement_denied_mesh_score
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(empty_response(StatusCode::FORBIDDEN));
+                return Ok(deny_or_tarpit(&cfg.enforce, StatusCode::FORBIDDEN).await);
             }
             // 3 decimals so log/grep humans see a stable string;
             // upstreams parse as f32 and tolerate any precision.
@@ -1689,6 +1717,70 @@ mod tests {
     fn test_is_internal_ip_link_local() {
         let ip: std::net::IpAddr = "169.254.0.1".parse().unwrap();
         assert!(is_internal_ip(&ip));
+    }
+
+    // ── #151 L7 tarpit wiring (deny_or_tarpit) ──
+    //
+    // Deterministic, no timing: `hold_secs = 0` exercises the held path
+    // without sleeping; `max_concurrent = 0` forces the shed path. Only
+    // `deny_or_tarpit` ever touches the `zion_tarpit_*` metrics, so these
+    // before/after deltas are race-free across the parallel test run.
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    #[tokio::test]
+    async fn tarpit_wiring_holds_and_sheds() {
+        use crate::sovereign::{EnforceConfig, EnforcePolicy, TarpitConfig};
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let m = &metrics::METRICS;
+
+        // Tarpit disabled → immediate 403, no tarpit accounting.
+        let disabled = EnforcePolicy::from_config(&EnforceConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        assert!(!disabled.tarpit_enabled);
+        let (t0, s0) = (
+            m.tarpit_total.load(Relaxed),
+            m.tarpit_shed_total.load(Relaxed),
+        );
+        let r = deny_or_tarpit(&disabled, StatusCode::FORBIDDEN).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(m.tarpit_total.load(Relaxed), t0);
+        assert_eq!(m.tarpit_shed_total.load(Relaxed), s0);
+
+        // Tarpit on, zero hold, ceiling 1 → held path: total +1, gauge back to
+        // baseline once the guard drops before return.
+        let held = EnforcePolicy::from_config(&EnforceConfig {
+            enabled: true,
+            tarpit: TarpitConfig {
+                enabled: true,
+                hold_secs: 0,
+                max_concurrent: 1,
+            },
+            ..Default::default()
+        });
+        assert!(held.tarpit_enabled);
+        let (t1, a1) = (m.tarpit_total.load(Relaxed), m.tarpit_active.load(Relaxed));
+        let r = deny_or_tarpit(&held, StatusCode::FORBIDDEN).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(m.tarpit_total.load(Relaxed), t1 + 1);
+        assert_eq!(m.tarpit_active.load(Relaxed), a1);
+
+        // Tarpit on but ceiling 0 → shed path: shed +1, nothing held.
+        let shed = EnforcePolicy::from_config(&EnforceConfig {
+            enabled: true,
+            tarpit: TarpitConfig {
+                enabled: true,
+                hold_secs: 0,
+                max_concurrent: 0,
+            },
+            ..Default::default()
+        });
+        assert!(shed.tarpit_enabled);
+        let s1 = m.tarpit_shed_total.load(Relaxed);
+        let r = deny_or_tarpit(&shed, StatusCode::FORBIDDEN).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(m.tarpit_shed_total.load(Relaxed), s1 + 1);
     }
 
     // ── Singleflight primitive (race fix) ──

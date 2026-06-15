@@ -413,6 +413,17 @@ pub struct Metrics {
     /// Requests denied (403) by tag-driven enforcement because the AIMP
     /// mesh reputation score exceeded `mesh_score_deny_above` (#150).
     pub enforcement_denied_mesh_score: AtomicU64,
+    /// L7 tarpit (#151), `[sovereign.enforce.tarpit]`. Connections currently
+    /// held before their enforcement `403` (gauge).
+    pub tarpit_active: AtomicU64,
+    /// Total requests ever held by the tarpit (counter).
+    pub tarpit_total: AtomicU64,
+    /// Flagged requests shed straight to a `403` because the tarpit was at
+    /// its `max_concurrent` ceiling (counter).
+    pub tarpit_shed_total: AtomicU64,
+    /// Cumulative wall-clock the tarpit held connections, milliseconds
+    /// (counter). With `tarpit_total` it gives the mean hold.
+    pub tarpit_held_ms_total: AtomicU64,
 
     // ── Mesh observability (issue #69) ──────────────────────────────
     // Always-on counters (zero on builds without `--features
@@ -494,6 +505,10 @@ impl Metrics {
             connections_rejected_per_ip: AtomicU64::new(0),
             enforcement_denied_class: AtomicU64::new(0),
             enforcement_denied_mesh_score: AtomicU64::new(0),
+            tarpit_active: AtomicU64::new(0),
+            tarpit_total: AtomicU64::new(0),
+            tarpit_shed_total: AtomicU64::new(0),
+            tarpit_held_ms_total: AtomicU64::new(0),
             mesh_claims_emitted: AtomicU64::new(0),
             mesh_claims_received: AtomicU64::new(0),
             mesh_claims_dropped_signature: AtomicU64::new(0),
@@ -769,6 +784,41 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.enforcement_denied_mesh_score.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        // L7 tarpit (#151).
+        out.extend_from_slice(
+            b"# HELP zion_tarpit_active Connections currently held by the L7 tarpit before their 403.\n\
+                                # TYPE zion_tarpit_active gauge\n\
+                                zion_tarpit_active ",
+        );
+        out.extend_from_slice(itoa_buf.format(self.tarpit_active.load(Relaxed)).as_bytes());
+        out.extend_from_slice(
+            b"\n# HELP zion_tarpit_total Total requests held by the L7 tarpit before rejection.\n\
+                                # TYPE zion_tarpit_total counter\n\
+                                zion_tarpit_total ",
+        );
+        out.extend_from_slice(itoa_buf.format(self.tarpit_total.load(Relaxed)).as_bytes());
+        out.extend_from_slice(
+            b"\n# HELP zion_tarpit_shed_total Flagged requests shed to an immediate 403 at the tarpit ceiling.\n\
+                                # TYPE zion_tarpit_shed_total counter\n\
+                                zion_tarpit_shed_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.tarpit_shed_total.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(
+            b"\n# HELP zion_tarpit_held_ms_total Cumulative milliseconds connections were held by the tarpit.\n\
+                                # TYPE zion_tarpit_held_ms_total counter\n\
+                                zion_tarpit_held_ms_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.tarpit_held_ms_total.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");
