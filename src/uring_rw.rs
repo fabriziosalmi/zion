@@ -192,6 +192,12 @@ impl Shared {
         drop(inner);
         Some(IoUringStream { shared: self.clone(), slot, gen })
     }
+
+    /// Introspection (tests today, `/metrics` later): slots currently
+    /// registered and not yet reclaimed.
+    pub(crate) fn active_slots(&self) -> usize {
+        MAX_SLOTS - self.free.lock().unwrap().len()
+    }
 }
 
 /// Start the rw driver: create the ring + eventfd + slab, spawn the driver
@@ -592,6 +598,7 @@ impl Drop for IoUringStream {
 mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// AF_UNIX SOCK_STREAM socketpair → (a, b) raw fds.
@@ -655,5 +662,126 @@ mod tests {
         assert_eq!(got.len(), data.len());
         assert!(got == data, "write payload mismatch");
         writer.await.unwrap();
+    }
+
+    // EOF: peer half-closes; reader gets the full payload then a clean 0, and
+    // EOF is sticky (a second read also yields 0).
+    #[tokio::test]
+    async fn eof_is_clean_and_sticky() {
+        let shared = start().unwrap();
+        let (fa, fb) = socketpair();
+        let mut a = shared.register(fa).unwrap();
+        let mut peer = tokio_peer(fb);
+        peer.write_all(b"hello uring").await.unwrap();
+        peer.shutdown().await.unwrap();
+        drop(peer);
+        let mut got = Vec::new();
+        a.read_to_end(&mut got).await.unwrap();
+        assert_eq!(&got, b"hello uring");
+        // Sticky EOF.
+        let n = a.read(&mut [0u8; 8]).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    // RST mid-read must surface as an Err, not a silent EOF. TCP loopback +
+    // SO_LINGER 0 forces a reset.
+    #[tokio::test]
+    async fn reset_surfaces_as_error() {
+        use std::net::{TcpListener, TcpStream};
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        let shared = start().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut a = shared.register(server.into_raw_fd()).unwrap();
+        // Arm a Recv with no data available (times out → stays in flight).
+        let read = tokio::time::timeout(Duration::from_millis(100), a.read(&mut [0u8; 64])).await;
+        assert!(read.is_err(), "expected a pending read");
+        // Force a RST on close: SO_LINGER {on, 0} (std::net::set_linger is
+        // unstable on stable Rust, so set the sockopt via libc).
+        let lin = libc::linger { l_onoff: 1, l_linger: 0 };
+        // SAFETY: setsockopt on a valid TCP fd with a correctly-sized linger.
+        unsafe {
+            libc::setsockopt(
+                peer.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &lin as *const libc::linger as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            );
+        }
+        drop(peer);
+        let r = tokio::time::timeout(Duration::from_secs(2), a.read(&mut [0u8; 64]))
+            .await
+            .expect("read should resolve after RST");
+        assert!(r.is_err(), "RST must surface as Err, got {r:?}");
+    }
+
+    // Drop while a Recv is in flight: the slot must NOT be reclaimed until the
+    // CQE lands (slot keep-alive is the UAF-proof mechanism), then it must.
+    #[tokio::test]
+    async fn drop_with_inflight_recv_reclaims_only_after_cqe() {
+        let shared = start().unwrap();
+        let (fa, fb) = socketpair();
+        let mut a = shared.register(fa).unwrap();
+        let peer = tokio_peer(fb);
+        assert_eq!(shared.active_slots(), 1);
+        // Arm a Recv (no data → in flight).
+        let read = tokio::time::timeout(Duration::from_millis(100), a.read(&mut [0u8; 64])).await;
+        assert!(read.is_err());
+        drop(a); // Orphan — but the Recv is still in flight.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(shared.active_slots(), 1, "slot freed while Recv in flight (UAF risk)");
+        // Close the peer → the Recv completes (EOF) → driver reclaims.
+        drop(peer);
+        let mut reclaimed = false;
+        for _ in 0..200 {
+            if shared.active_slots() == 0 {
+                reclaimed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(reclaimed, "slot not reclaimed after the in-flight Recv completed");
+    }
+
+    // Many concurrent connections through the single driver ring: no lost
+    // wakeups / hangs, all byte-exact, and every slot reclaims at the end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_connections_echo() {
+        let shared = start().unwrap();
+        const N: usize = 64;
+        const SZ: usize = 64 * 1024;
+        let mut tasks = Vec::new();
+        for k in 0..N {
+            let (fa, fb) = socketpair();
+            let mut a = shared.register(fa).unwrap();
+            let mut peer = tokio_peer(fb);
+            tasks.push(tokio::spawn(async move {
+                let data: Vec<u8> = (0..SZ).map(|i| ((i + k) % 251) as u8).collect();
+                let d2 = data.clone();
+                let w = tokio::spawn(async move {
+                    peer.write_all(&d2).await.unwrap();
+                    peer.shutdown().await.unwrap();
+                });
+                let mut got = Vec::new();
+                a.read_to_end(&mut got).await.unwrap();
+                w.await.unwrap();
+                assert!(got == data, "conn {k} mismatch");
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let mut ok = false;
+        for _ in 0..200 {
+            if shared.active_slots() == 0 {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ok, "slots not reclaimed after all conns done");
     }
 }
