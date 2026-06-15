@@ -110,6 +110,26 @@ zion_enforcement_denied_total{reason="mesh_score"}    77
 The local WAF / rate-limiter / auth gates stay authoritative — enforcement
 only *adds* a deny on top, and is off until configured.
 
+**L7 tarpit (`[sovereign.enforce.tarpit]`, #151).** When enforcement is on,
+the operator can escalate a deny from a cheap `403` to a *held* connection:
+a flagged source is parked `hold_secs` before the refusal so a backed flood
+pays wall-clock and socket budget. A hard global ceiling (`max_concurrent`)
+sheds back to an immediate `403` at capacity, and is clamped at config-load
+to ¼ of the global connection pool so held connections can't pin admission.
+
+```
+zion_tarpit_active        12     # gauge: connections currently held
+zion_tarpit_total       4310     # counter: total ever held
+zion_tarpit_shed_total   118     # counter: shed to immediate 403 at the ceiling
+zion_tarpit_held_ms_total 43100  # counter: cumulative held wall-clock (ms)
+```
+
+Mean hold ≈ `rate(zion_tarpit_held_ms_total[5m]) / rate(zion_tarpit_total[5m])`.
+A rising `zion_tarpit_shed_total` means the ceiling is saturated — raise
+`max_concurrent` (bounded by the ¼-pool clamp) or lower `hold_secs`. The
+ceiling counts in-flight held *requests* (HTTP/2 streams), so size it with
+stream fan-out in mind.
+
 ## Access log
 
 Every successful request emits one structured `tracing::info!`

@@ -67,6 +67,19 @@ listen_https = "0.0.0.0:443"
 # # Requires --features sovereign-aimp. Counted in
 # # `zion_enforcement_denied_total{reason="class"|"mesh_score"}`.
 # mesh_score_deny_above = 0.9
+#
+# # L7 tarpit (#151) — escalate an enforcement deny from a cheap 403 to a
+# # *held* connection: a flagged source is parked `hold_secs` before the
+# # refusal, so a backed flood pays wall-clock + socket budget. A hard
+# # global ceiling sheds back to an immediate 403 at capacity, so the tarpit
+# # can never become a self-DoS. Only active when enforcement is on.
+# # Metrics: zion_tarpit_{active,total,shed_total,held_ms_total}.
+# [sovereign.enforce.tarpit]
+# enabled = true
+# hold_secs = 10        # how long a flagged connection is held (warn if > 60)
+# max_concurrent = 128  # hard ceiling; over → shed to immediate 403.
+#                       # Clamped at load to 1/4 of the global connection pool
+#                       # so held connections can't pin admission.
 
 [tls]
 cert_path = "/etc/ssl/zion/tls.crt"

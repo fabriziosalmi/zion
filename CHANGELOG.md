@@ -4,6 +4,47 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **L7 tarpit / slow-drip for flagged sources** (#151,
+  [`src/tarpit.rs`](src/tarpit.rs)). Closes the anti-DDoS enforcement arc
+  (#147 → #155 → #150 → #151). When tag-driven enforcement (#150) decides to
+  deny a request, the operator can now escalate the cheap `403` into a
+  *held* connection: the flagged source is parked for a bounded `hold_secs`
+  before the refusal, so a backed flood pays wall-clock and socket budget
+  instead of getting an instant, immediately-recyclable reject.
+  - **Config** `[sovereign.enforce.tarpit]` — `enabled` (default `false`),
+    `hold_secs` (default `10`), `max_concurrent` (default `128`). Only takes
+    effect when `[sovereign.enforce] enabled = true`; geo-gated like the rest
+    of enforcement. Config-load warns if `enabled` with `max_concurrent = 0`
+    (sheds every request → no-op) or `hold_secs > 60` (over-long holds tie up
+    connections), and **clamps `max_concurrent` to ¼ of the global connection
+    ceiling** so held connections can't pin the admission pool (self-DoS guard).
+  - **Bounded** — a single global ceiling caps concurrently held requests; at
+    the ceiling the tarpit *sheds* back to the immediate `403`. A held request
+    keeps its global connection permit + per-IP slot for the hold, so the
+    ceiling is clamped to a small fraction (¼) of the connection pool.
+    Admission is one CAS; a held request is one parked tokio timer + the open
+    socket, released by an RAII guard (gauge and held-time stay correct on
+    early return / panic). The deny still denies — the tarpit only changes how
+    long the flagged client waits.
+  - **Metrics** `zion_tarpit_active` (gauge), `zion_tarpit_total`,
+    `zion_tarpit_shed_total`, `zion_tarpit_held_ms_total` (counters).
+
+### Deferred
+
+- Per-byte **slow header/body drip** (the endlessh-style trickle). The
+  bounded delayed-hold already imposes the wall-clock + socket cost that is
+  the point of a tarpit; a streaming-body trickle is a follow-up. Tarpit on
+  the plain `429` rate-limit path (currently scoped to the `[sovereign.enforce]`
+  deny points) is likewise a follow-up.
+- **Per-IP tarpit sub-cap.** The ceiling is global, and on HTTP/2 each held
+  *stream* consumes a slot, so one source (a few H2 connections) can occupy a
+  large share of the holding capacity and push other flagged sources to a fast
+  `403`. This degrades the tarpit's effectiveness but not zion's stability (the
+  shed fallback is the safe pre-tarpit behaviour, and the global / per-IP
+  connection caps still bound sockets). A per-IP sub-cap is a follow-up.
+
 ## [0.3.4] - 2026-06-05
 
 ### Security
