@@ -61,7 +61,11 @@ fn pack_ud(slot: u32, gen: u16, op: u64) -> u64 {
 }
 #[inline]
 fn unpack_ud(ud: u64) -> (u32, u16, u64) {
-    (((ud >> 32) & 0xFFFF_FFFF) as u32, ((ud >> 16) & 0xFFFF) as u16, ud & 0xFFFF)
+    (
+        ((ud >> 32) & 0xFFFF_FFFF) as u32,
+        ((ud >> 16) & 0xFFFF) as u16,
+        ud & 0xFFFF,
+    )
 }
 
 /// Driver command from a handle (or its `Drop`) to the driver thread.
@@ -187,7 +191,11 @@ impl Shared {
         s.read_waker.take();
         s.write_waker.take();
         drop(inner);
-        Some(IoUringStream { shared: self.clone(), slot, gen })
+        Some(IoUringStream {
+            shared: self.clone(),
+            slot,
+            gen,
+        })
     }
 
     /// Introspection (tests today, `/metrics` later): slots currently
@@ -340,7 +348,10 @@ fn process_cqe(shared: &Arc<Shared>, ud: u64, res: i32) -> Option<squeue::Entry>
             } else if res == 0 {
                 ReadState::Eof
             } else {
-                ReadState::Ready { filled: res as usize, pos: 0 }
+                ReadState::Ready {
+                    filled: res as usize,
+                    pos: 0,
+                }
             };
         }
         OP_WRITE => {
@@ -384,8 +395,7 @@ fn process_cqe(shared: &Arc<Shared>, ud: u64, res: i32) -> Option<squeue::Entry>
     }
 
     let read_done = matches!(op, OP_READ);
-    let write_idle_or_err =
-        matches!(inner.write_state, WriteState::Idle | WriteState::Err(_));
+    let write_idle_or_err = matches!(inner.write_state, WriteState::Idle | WriteState::Err(_));
     drop(inner);
     if read_done {
         s.read_waker.wake();
@@ -489,7 +499,10 @@ impl AsyncRead for IoUringStream {
                 inner.read_state = ReadState::Arming;
                 s.read_waker.register(cx.waker());
                 drop(inner);
-                self.shared.send(DriverCmd::ArmRead { slot: self.slot, gen: self.gen });
+                self.shared.send(DriverCmd::ArmRead {
+                    slot: self.slot,
+                    gen: self.gen,
+                });
                 Poll::Pending
             }
             ReadState::Arming | ReadState::Submitted => {
@@ -504,9 +517,15 @@ impl AsyncRead for IoUringStream {
                     inner.read_state = ReadState::Idle;
                     drop(inner);
                     // Re-arm the next Recv eagerly so the pipeline stays full.
-                    self.shared.send(DriverCmd::ArmRead { slot: self.slot, gen: self.gen });
+                    self.shared.send(DriverCmd::ArmRead {
+                        slot: self.slot,
+                        gen: self.gen,
+                    });
                 } else {
-                    inner.read_state = ReadState::Ready { filled, pos: new_pos };
+                    inner.read_state = ReadState::Ready {
+                        filled,
+                        pos: new_pos,
+                    };
                 }
                 Poll::Ready(Ok(()))
             }
@@ -533,7 +552,10 @@ impl AsyncWrite for IoUringStream {
                 inner.write_buf[..n].copy_from_slice(&data[..n]);
                 inner.write_state = WriteState::Submitted { off: 0, len: n };
                 drop(inner);
-                self.shared.send(DriverCmd::Write { slot: self.slot, gen: self.gen });
+                self.shared.send(DriverCmd::Write {
+                    slot: self.slot,
+                    gen: self.gen,
+                });
                 Poll::Ready(Ok(n))
             }
             WriteState::Submitted { .. } => {
@@ -573,7 +595,10 @@ impl AsyncWrite for IoUringStream {
                 }
                 inner.write_state = WriteState::Submitted { off: 0, len: n };
                 drop(inner);
-                self.shared.send(DriverCmd::Write { slot: self.slot, gen: self.gen });
+                self.shared.send(DriverCmd::Write {
+                    slot: self.slot,
+                    gen: self.gen,
+                });
                 Poll::Ready(Ok(n))
             }
             WriteState::Submitted { .. } => {
@@ -601,10 +626,7 @@ impl AsyncWrite for IoUringStream {
         }
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // Flush any staged write first.
         let fd = {
             let s = &self.shared.slots[self.slot as usize];
@@ -631,7 +653,10 @@ impl Drop for IoUringStream {
     fn drop(&mut self) {
         // Non-blocking: the driver reclaims the slot + closes the fd once all
         // in-flight ops are reaped (UAF-proof, ADR-0009).
-        self.shared.send(DriverCmd::Orphan { slot: self.slot, gen: self.gen });
+        self.shared.send(DriverCmd::Orphan {
+            slot: self.slot,
+            gen: self.gen,
+        });
     }
 }
 
@@ -741,7 +766,10 @@ mod tests {
         assert!(read.is_err(), "expected a pending read");
         // Force a RST on close: SO_LINGER {on, 0} (std::net::set_linger is
         // unstable on stable Rust, so set the sockopt via libc).
-        let lin = libc::linger { l_onoff: 1, l_linger: 0 };
+        let lin = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
         // SAFETY: setsockopt on a valid TCP fd with a correctly-sized linger.
         unsafe {
             libc::setsockopt(
@@ -773,7 +801,11 @@ mod tests {
         assert!(read.is_err());
         drop(a); // Orphan — but the Recv is still in flight.
         tokio::time::sleep(Duration::from_millis(80)).await;
-        assert_eq!(shared.active_slots(), 1, "slot freed while Recv in flight (UAF risk)");
+        assert_eq!(
+            shared.active_slots(),
+            1,
+            "slot freed while Recv in flight (UAF risk)"
+        );
         // Close the peer → the Recv completes (EOF) → driver reclaims.
         drop(peer);
         let mut reclaimed = false;
@@ -784,7 +816,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(reclaimed, "slot not reclaimed after the in-flight Recv completed");
+        assert!(
+            reclaimed,
+            "slot not reclaimed after the in-flight Recv completed"
+        );
     }
 
     // Many concurrent connections through the single driver ring: no lost
