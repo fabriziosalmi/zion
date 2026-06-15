@@ -78,6 +78,7 @@ mod tui;
 mod uring;
 #[cfg(all(target_os = "linux", feature = "io-uring-rw"))]
 mod uring_rw;
+mod rwstream;
 mod waf;
 
 // ── Beyond-FAANG tracks (experimental, feature-gated) ─────────────────
