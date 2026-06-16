@@ -2353,9 +2353,9 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "matchit"
-version = "0.8.6"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f926ade0c4e170215ae43342bf13b9310a437609c81f29f86c5df6657582ef9"
+checksum = "8863b587001c1b9a8a4e36008cebc6b3612cb1226fe2de94858e06092687b608"
 
 [[package]]
 name = "matrixmultiply"
@@ -5449,7 +5449,7 @@ dependencies = [
  "jsonwebtoken",
  "ktls",
  "libc",
- "matchit 0.8.6",
+ "matchit 0.9.2",
  "memchr",
  "mimalloc",
  "notify",
