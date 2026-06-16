@@ -27,12 +27,14 @@ mod inner {
     use io_uring::{opcode, types, IoUring};
     use std::net::SocketAddr;
     use std::os::unix::io::{FromRawFd, RawFd};
-    use tokio::net::TcpStream;
     use tokio::sync::mpsc;
 
-    /// Accepted connection ready for TLS handshake.
+    /// A freshly-accepted connection as a *std* `TcpStream`. Conversion to a
+    /// tokio `TcpStream` happens on the consuming side (a tokio worker), NOT
+    /// here: `tokio::net::TcpStream::from_std` panics ("no reactor running")
+    /// when called from this bare std::thread accept loop.
     pub struct AcceptedConn {
-        pub stream: TcpStream,
+        pub std_stream: std::net::TcpStream,
         pub addr: SocketAddr,
     }
 
@@ -44,10 +46,31 @@ mod inner {
     pub fn spawn_uring_accept(listener_fd: RawFd, capacity: usize) -> mpsc::Receiver<AcceptedConn> {
         let (tx, rx) = mpsc::channel(capacity);
 
+        // Own a STABLE fd for the accept thread. `listener_fd` is *borrowed*:
+        // its owning listener can be dropped / recycled out from under us (a
+        // tokio task drop, a config rebind). Once the number is freed,
+        // `io_uring_setup` can reuse it for this thread's own ring fd — and
+        // `accept()` on that fd then floods ENOTSOCK/EBADF (a tight ~10^6/s
+        // spin; reproduced with `zion auto`). `dup()` gives the thread an
+        // independent fd that (a) keeps the listening socket alive and (b)
+        // whose number cannot be recycled while the thread runs.
+        // SAFETY: dup of a currently-valid fd; returns -1 on error.
+        let owned_fd = unsafe { libc::dup(listener_fd) };
+        if owned_fd < 0 {
+            eprintln!(
+                "  io_uring accept: dup(listener_fd) failed: {} — io_uring accept disabled",
+                std::io::Error::last_os_error()
+            );
+            return rx;
+        }
+
         std::thread::Builder::new()
             .name("io_uring-accept".into())
             .spawn(move || {
-                uring_accept_loop(listener_fd, tx);
+                uring_accept_loop(owned_fd, tx);
+                // Release our owned fd once the loop exits.
+                // SAFETY: `owned_fd` is our dup; closed exactly once here.
+                unsafe { libc::close(owned_fd) };
             })
             .expect("failed to spawn io_uring accept thread");
 
@@ -88,6 +111,11 @@ mod inner {
             return;
         }
 
+        // Consecutive non-transient accept errors. A persistently-bad listener
+        // fd would otherwise spin this loop flooding stderr; cap the noise and
+        // bail loudly instead of burning a core forever.
+        let mut consecutive_errors: u32 = 0;
+
         loop {
             // Wait for completions — retry on EINTR (signal handler fired)
             // instead of panicking, which would silently kill the accept thread.
@@ -122,9 +150,19 @@ mod inner {
                     if errno == libc::EAGAIN || errno == libc::EINTR {
                         continue;
                     }
-                    eprintln!("  io_uring accept error: errno {errno}");
+                    consecutive_errors += 1;
+                    if consecutive_errors <= 3 || consecutive_errors % 1000 == 0 {
+                        eprintln!("  io_uring accept error: errno {errno} (#{consecutive_errors})");
+                    }
+                    if consecutive_errors >= 50 {
+                        eprintln!(
+                            "  io_uring accept: {consecutive_errors} consecutive errors (errno {errno}); listener fd unusable — stopping accept loop"
+                        );
+                        return;
+                    }
                     continue;
                 }
+                consecutive_errors = 0;
 
                 // Got a valid accepted fd
                 let raw_fd = fd as RawFd;
@@ -146,17 +184,17 @@ mod inner {
                     }
                 };
 
-                // Convert to tokio TcpStream
-                // SAFETY: the raw_fd is fresh from the kernel accept call and exclusive to this thread
+                // Build a *std* TcpStream (runtime-free) and hand it to a tokio
+                // worker, which converts it inside a runtime context. Calling
+                // `tokio::net::TcpStream::from_std` HERE panics — this accept
+                // loop runs on a bare std::thread with no Tokio reactor.
+                // SAFETY: raw_fd is fresh from the kernel accept, exclusive to us.
                 let std_stream = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
-                let stream = match TcpStream::from_std(std_stream) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
 
-                // Send to tokio workers — if channel full, drop connection (overload shed)
-                if tx.try_send(AcceptedConn { stream, addr }).is_err() {
-                    // Channel full — connection dropped (back-pressure)
+                // Send to tokio workers — if the channel is full, the connection
+                // is dropped (overload shed).
+                if tx.try_send(AcceptedConn { std_stream, addr }).is_err() {
+                    // Channel full — connection dropped (back-pressure).
                 }
             }
         }

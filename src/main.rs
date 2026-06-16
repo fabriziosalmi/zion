@@ -1311,12 +1311,23 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         let uring_rx = uring::spawn_uring_accept(fd, 4096);
         // Spawn the accept loop ourselves; pass `https_initial = None`
         // to the supervisor so it tracks no HTTPS slot.
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        let _ = tx; // sender held by main task lifetime; supervisor doesn't touch this loop
+        //
+        // Subscribe to the REAL process shutdown signal (`super_shutdown_tx`,
+        // flipped on SIGINT/SIGTERM). The earlier code created a throwaway
+        // `watch::channel(false)` and then did `let _ = tx;` — which drops the
+        // Sender immediately. With no live sender, the loop's very first
+        // `shutdown_rx.changed()` returned `Err` → the loop `return`ed at once
+        // → `uring_rx` was dropped → the accept thread's `try_send` then failed
+        // (channel closed) for every accepted connection, which was silently
+        // reset. Net effect: io_uring accept "listened" but served nothing
+        // (curl: connection reset during the TLS ClientHello). Subscribing to a
+        // sender that actually lives for the process fixes the lifetime and
+        // gives the loop a working graceful-shutdown path.
+        let uring_shutdown_rx = super_shutdown_tx.subscribe();
         tokio::spawn(run_https_accept_loop(
             https_listener,
             state.clone(),
-            rx,
+            uring_shutdown_rx,
             Some(uring_rx),
         ));
         None
@@ -1588,7 +1599,13 @@ async fn run_https_accept_loop(
             }
             conn = uring_rx.recv() => {
                 let Some(conn) = conn else { return; };
-                spawn_https_handler(conn.stream, conn.addr, state.clone());
+                // Convert std -> tokio TcpStream HERE: we are in a tokio runtime
+                // context, whereas the io_uring accept thread is not (its
+                // `from_std` would panic "no reactor running").
+                match tokio::net::TcpStream::from_std(conn.std_stream) {
+                    Ok(stream) => spawn_https_handler(stream, conn.addr, state.clone()),
+                    Err(e) => eprintln!("  io_uring accept: tokio from_std failed: {e}"),
+                }
             }
         }
     }
