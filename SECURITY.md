@@ -3,12 +3,12 @@
 ## Supported Versions
 
 Security fixes ship in the latest minor release. Point releases inherit fixes
-from their containing minor — i.e. the latest `0.1.x` is always patched.
+from their containing minor — i.e. the latest `0.4.x` is always patched.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x (latest minor) | Yes |
-| < 0.3.4 | No |
+| 0.4.x (latest minor) | Yes |
+| < 0.4.0 | No |
 
 ## Reporting a Vulnerability
 
