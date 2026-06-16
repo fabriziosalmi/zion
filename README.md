@@ -28,7 +28,7 @@ High-performance TLS reverse proxy with built-in WAF, written in Rust.
 
 ## Performance
 
-### Native Benchmark (Apple M4, v0.3.4, Rust backend, 5×10s, c=100, wrk)
+### Native Benchmark (Apple M4, v0.4.0, Rust backend, 5×10s, c=100, wrk)
 
 End-to-end TLS 1.3 over loopback to a zero-overhead hyper backend. Median of 5
 runs; **0 errors (all 2xx) on every row**.
@@ -54,14 +54,14 @@ runs; **0 errors (all 2xx) on every row**.
 Reproduce: `bash benchmarks/certs/generate.sh && bash benchmarks/bench-native.sh`
 
 > **Corrected number.** Earlier READMEs headlined "HTML SSR 5KB — 233k req/s".
-> That was an artifact: before v0.3.4 the bare `/` did not match the catch-all
+> That was an artifact: before v0.4.0 the bare `/` did not match the catch-all
 > route (a matchit edge case) and returned **404**, so the benchmark was timing a
 > 404 error path — not a proxied response (verified: that run was 100% non-2xx).
-> v0.3.4 (#171) fixes the routing; `/` now correctly proxies the 5 KB HTML at
+> v0.4.0 (#171) fixes the routing; `/` now correctly proxies the 5 KB HTML at
 > ~103k, in line with every other proxy path. The honest baseline above replaces
 > the bogus peak.
 
-### Fair comparison with nginx 1.27 (Docker, v0.3.4, 1 CPU / 256 MB each, c=100, 10s×5)
+### Fair comparison with nginx 1.27 (Docker, v0.4.0, 1 CPU / 256 MB each, c=100, 10s×5)
 
 Both behind identical cgroup limits, same backend, same TLS material, HTTP/1.1
 over TLS 1.3 (wrk has no h2 client). Median ± CI95, **0 errors** on every cell,
@@ -149,7 +149,7 @@ Reproduce: `bash benchmarks/bench-scientific.sh`.
 **Operations**
 - Config validation at startup (fail fast, validates all profile references)
 - Graceful drain on shutdown (30s timeout, semaphore-tracked)
-- Adaptive upstream recovery (#173): healthy upstreams probed every 30 s; a DOWN upstream is re-probed on a per-upstream **decorrelated-jitter backoff** (100 ms → 3 s cap, AWS/Brooker), so a recovered origin returns to service in **~1.4 s instead of up to 30 s** (~21× faster, measured on the v0.3.4 e2e rig) — jitter avoids a recovery thundering-herd. EWMA latency (α=0.125) + gray-failure circuit breaker (ignores EWMA > 2000 ms). Backoff state survives config reload (Arc-reuse); request path stays lock-free.
+- Adaptive upstream recovery (#173): healthy upstreams probed every 30 s; a DOWN upstream is re-probed on a per-upstream **decorrelated-jitter backoff** (100 ms → 3 s cap, AWS/Brooker), so a recovered origin returns to service in **~1.4 s instead of up to 30 s** (~21× faster, measured on the v0.4.0 e2e rig) — jitter avoids a recovery thundering-herd. EWMA latency (α=0.125) + gray-failure circuit breaker (ignores EWMA > 2000 ms). Backoff state survives config reload (Arc-reuse); request path stays lock-free.
 - Bootstrap auto-detection (CPU cores, RAM, L1d cache, AES-NI/NEON, kernel features)
 - Performance Tier badge at boot (S/A/B/C with live AES-GCM calibration)
 - Live TUI dashboard (`zion top`, opt-in `--features tui`)
@@ -367,12 +367,12 @@ commands. The short version:
 
 ```bash
 # Binary release (Sigstore-backed provenance via gh CLI)
-gh release download v0.3.4 -R fabriziosalmi/zion -p '*x86_64-unknown-linux-musl*' -p 'SHA256SUMS'
+gh release download v0.4.0 -R fabriziosalmi/zion -p '*x86_64-unknown-linux-musl*' -p 'SHA256SUMS'
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify zion-v0.3.4-x86_64-unknown-linux-musl.tar.gz --owner fabriziosalmi
+gh attestation verify zion-v0.4.0-x86_64-unknown-linux-musl.tar.gz --owner fabriziosalmi
 
 # Container image (cosign keyless)
-cosign verify ghcr.io/fabriziosalmi/zion:v0.3.4 \
+cosign verify ghcr.io/fabriziosalmi/zion:v0.4.0 \
     --certificate-identity-regexp "^https://github.com/fabriziosalmi/zion/\\.github/workflows/release\\.yml@refs/tags/v" \
     --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 ```

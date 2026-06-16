@@ -4,6 +4,8 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-16
+
 ### Added
 
 - **L7 tarpit / slow-drip for flagged sources** (#151,
@@ -30,6 +32,35 @@ All notable changes to Zion Edge Gateway are documented here.
     long the flagged client waits.
   - **Metrics** `zion_tarpit_active` (gauge), `zion_tarpit_total`,
     `zion_tarpit_shed_total`, `zion_tarpit_held_ms_total` (counters).
+
+### Fixed
+
+- **`io-uring-accept` now serves HTTPS end-to-end** (#195,
+  [`src/uring.rs`](src/uring.rs), [`src/main.rs`](src/main.rs)). The opt-in,
+  off-by-default `io-uring-accept` feature (Linux) was previously
+  non-functional — it never served a single request. Three masked lifecycle
+  bugs are fixed: (1) a *borrowed* listener fd was recycled out from under the
+  accept thread, so `io_uring_setup` reused the freed number and `accept()`
+  flooded `EBADF`/`ENOTSOCK` at ~10⁶/s — the thread now owns a `dup()`ed fd;
+  (2) `tokio::net::TcpStream::from_std` was called on the bare accept
+  `std::thread` and panicked "no reactor running" — the conversion now happens
+  inside a runtime context; (3) the accept loop was handed a throwaway shutdown
+  `watch` channel whose sender was dropped immediately, so the loop returned at
+  once and every accepted connection was RST during the TLS ClientHello — it is
+  now wired to the real process shutdown signal. Verified on Linux 6.17
+  (concurrent `/healthz` 20/20, flood = 0, panics = 0).
+- Guard against running outside a Git repository (#186).
+
+### Security
+
+- High-severity dependency bump in `Cargo.toml` (#185); `rand` → 0.9.3 (#183).
+
+### Dependencies
+
+- `hyper` 1.9.0 → 1.10.1 (#167), `memchr` 2.8.0 → 2.8.2 (#166).
+- CI actions: `upload-artifact` → 7.0.1 (#142), `checkout` → 6.0.2 (#141),
+  `download-artifact` → 8.0.1 (#140), `setup-buildx-action` → 4.1.0 (#139),
+  `deploy-pages` → 5.0.0 (#138).
 
 ### Deferred
 
