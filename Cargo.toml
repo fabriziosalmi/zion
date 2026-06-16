@@ -38,7 +38,7 @@ http-body-util = "0.1"
 bytes = "1"
 
 # Radix tree routing (same engine as Axum)
-matchit = "0.8"
+matchit = "0.9"
 
 # TLS + hot-reload
 rustls = "0.23"
