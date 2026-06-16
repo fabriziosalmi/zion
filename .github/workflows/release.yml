@@ -196,7 +196,10 @@ jobs:
       # ── Cross-compile path: zigbuild handles musl + aarch64 + aws-lc-rs ──
       - name: Setup zigbuild
         if: matrix.cross == 'zig'
-        uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7 # v1
+        # NOTE: v2.2.1 is still a Node 20 action (mlugg/setup-zig has no Node 24
+        # release yet), so GitHub's Node-20 deprecation warning persists for this
+        # step until upstream migrates — it runs forced-on-node24 meanwhile.
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.13.0
 
@@ -363,7 +366,7 @@ jobs:
       # ── Provenance: bind the cryptographic hash of every archive to the
       # workflow run identity (GitHub OIDC -> Fulcio -> Rekor). SLSA v1.0 L3.
       - name: Generate SLSA build provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: "dist/${{ steps.stage.outputs.archive }}"
 
@@ -440,7 +443,7 @@ jobs:
           cat SHA256SUMS
 
       - name: Attest SHA256SUMS + SBOM
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: |
             dist/SHA256SUMS
@@ -562,7 +565,7 @@ jobs:
           push-to-registry: true
 
       - name: Attest container provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.push.outputs.digest }}
