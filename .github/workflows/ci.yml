@@ -163,7 +163,7 @@ jobs:
     needs: [fmt]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@f2dd9f8ae5c180b960971aa7ebe1779681fbbda4 # 1.82.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.82.0
       - name: Override rust-toolchain.toml for this job
         # rust-toolchain.toml pins the *dev* compiler to 1.85; the dtolnay
         # action only sets a default toolchain, so we drop the file for this
