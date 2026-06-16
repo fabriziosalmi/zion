@@ -1611,6 +1611,29 @@ async fn run_https_accept_loop(
     }
 }
 
+/// Rate-limit TLS-handshake failure logging to ~one line per second,
+/// process-wide. A failed handshake is per-connection — each runs on its own
+/// task, so there is no shared `last_log` instant like the accept loops keep;
+/// this gates on a shared timestamp instead. The `tls_handshake_errors` metric
+/// still counts *every* failure; only the stderr line is throttled, so a
+/// scanning/hostile client can't turn handshake failures into a log flood.
+/// Best-effort: a benign race may let two lines through in the same second.
+fn tls_handshake_log_allowed() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = LAST_LOG_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last) >= 1000 {
+        LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
 /// Common path for spawning a single HTTPS connection task: enforces
 /// the connection-limit semaphore, performs the TLS handshake, extracts
 /// 0-RTT and mTLS-fingerprint context, then drives `serve_connection_with_upgrades`.
@@ -1683,7 +1706,19 @@ fn spawn_https_handler(
                     .observe(tls_start.elapsed());
                 s
             }
-            _ => {
+            Ok(Err(e)) => {
+                if tls_handshake_log_allowed() {
+                    eprintln!("  tls handshake failed from {remote_addr}: {e}");
+                }
+                metrics::METRICS
+                    .tls_handshake_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            Err(_) => {
+                if tls_handshake_log_allowed() {
+                    eprintln!("  tls handshake timed out (10s) from {remote_addr}");
+                }
                 metrics::METRICS
                     .tls_handshake_errors
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
