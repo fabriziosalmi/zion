@@ -49,6 +49,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # rust-toolchain.toml pins the dev compiler to 1.88, which shadows the
+      # nightly default *inside the checkout* — so `cargo install cargo-fuzz`
+      # would build under 1.88 and fail (cargo-fuzz's cargo-platform dep now
+      # needs rustc >= 1.91). This whole job is a nightly job, so drop the pin
+      # and let the nightly installed below apply to every cargo invocation.
+      # Same pattern as release.yml's "Drop dev toolchain pin" step.
+      - name: Drop dev toolchain pin (this job builds on nightly)
+        run: rm -f rust-toolchain.toml
+
       # cargo-fuzz requires nightly because libfuzzer-sys uses unstable
       # rustc internals for its #[no_main] runtime. We don't run fuzz
       # campaigns here — only verify the harness compiles.
