@@ -4,6 +4,49 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-18
+
+A hardening + supply-chain patch: one user-facing TLS fix, a completed
+Node 24 / SHA-pinned CI migration, a green-again fuzz harness, a sweep of
+safe dependency bumps, and a new mesh-cost benchmark. No behaviour change to
+the proxy/WAF/cache data path.
+
+### Added
+
+- **`benchmarks/bench-mesh.sh`** (#72) — reproducer that measures the
+  `--features sovereign-aimp` cost as an RPS delta vs a default build across
+  three operating points (idle / lookup-active / 3-node mesh-active) on the
+  API-GET hot path, with the issue's acceptance gates (<1% / <3% / <5%)
+  enforced. Harness only; numbers belong on a Linux rig.
+
+### Fixed
+
+- **TLS handshake errors are no longer swallowed** (#201,
+  [`src/tls.rs`](src/tls.rs)). `spawn_https_handler` collapsed the
+  handshake-error and 10s-timeout cases into one arm that only bumped a
+  counter, losing the rustls error string. Split into distinct, rate-limited
+  (≈1 line/s, process-wide) log lines for the error vs timeout cases, each
+  with the client address; the metric still counts every failure. Benefits
+  both the tokio and io_uring accept paths.
+- **`cargo-fuzz build` green again on master** (#205,
+  [`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml)). The repo-root
+  `rust-toolchain.toml` (1.88) shadowed dtolnay's nightly inside the checkout,
+  so `cargo install cargo-fuzz` built under 1.88 and tripped a transitive
+  dep's 1.91 MSRV. Drop the pin for the (nightly-only) fuzz job.
+
+### Changed
+
+- **Node 24 GitHub Actions migration completed** and the last mutable action
+  refs SHA-pinned (#200, #203, #206) — `attest-build-provenance`/`attest-sbom`
+  → v4.1.0, plus checkout/codeql/setup-qemu/cargo-deny bumps; every workflow
+  now pins by full commit SHA.
+- **Dependency bumps** (verified to build all-features + hold the 1.82 MSRV
+  floor): matchit 0.8→0.9 (#204), socket2 0.5→0.6, webpki-roots 0.26→1.0,
+  crossterm 0.28→0.29 (#207); docker rust 1.95→1.96 (#178),
+  docker/metadata-action 5→6 (#190); rand 0.9→0.10 in the standalone bench
+  backend (#208). simd-json 0.17, toml 1.1, and notify 8 were intentionally
+  held back — their transitive deps require rustc 1.85, above zion's 1.82 MSRV.
+
 ## [0.4.0] - 2026-06-16
 
 ### Added
