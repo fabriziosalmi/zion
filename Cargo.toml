@@ -45,7 +45,7 @@ rustls = "0.23"
 rustls-pemfile = "2"
 tokio-rustls = "0.26"
 arc-swap = "1"
-notify = "7"
+notify = "8"
 
 # AEAD primitives for the boot-time AES-GCM calibration microbench.
 # Already pulled in transitively via rustls — declaring it here only
