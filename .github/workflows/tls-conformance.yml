@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout zion
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           path: zion
 
@@ -71,7 +71,7 @@ jobs:
           echo "zion pins rustls $RUSTLS_VER, aws-lc-rs ${AWSLC_VER:-<none>}"
 
       - name: Checkout rustls at zion's pinned tag
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: rustls/rustls
           # rustls tags releases as `v/<version>` (e.g. v/0.23.40).
