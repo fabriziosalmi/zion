@@ -111,7 +111,7 @@ h3-quinn = { version = "0.0.10", optional = true }
 
 # Live TUI dashboard (opt-in: cargo build --features tui)
 ratatui = { version = "0.29", optional = true }
-crossterm = { version = "0.28", optional = true }
+crossterm = { version = "0.29", optional = true }
 
 # ── Observability (Track B) ────────────────────────────────────────────
 # `tracing` is always-on: it gives us spans + structured events with
