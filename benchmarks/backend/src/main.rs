@@ -44,7 +44,7 @@ static PAYLOADS: OnceLock<Payloads> = OnceLock::new();
 
 fn payloads() -> &'static Payloads {
     PAYLOADS.get_or_init(|| {
-        use rand::Rng;
+        use rand::RngExt;
         let mut rng = rand::rng();
 
         // 1KB JSON
