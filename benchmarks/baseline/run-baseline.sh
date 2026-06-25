@@ -250,13 +250,16 @@ h1=$(metric zion_cache_hits); m1=$(metric zion_cache_misses)
 # one "rps p50 p99 p999 p9999 cpu rssmb" line per trial to $out.
 bench_oha() {
   local url="$1" out="$2" pid="${3:-$ZION_PID}"; : > "$out"
-  for _ in $(seq 1 "$WARMUP"); do curl -sk -o /dev/null "$url"; done
+  # A leg that errors (e.g. the optional nginx target refusing oha) must NOT
+  # abort the whole run under `set -e` — tolerate per-request and per-oha
+  # failures and let the row fall to zeros, which the report renders as absent.
+  for _ in $(seq 1 "$WARMUP"); do curl -sk -o /dev/null "$url" || true; done
   for _ in $(seq 1 "$TRIALS"); do
     local rfile; rfile=$(mktemp)
     local dsec="${DURATION%s}"
     sample_proc "$pid" "$dsec" "$rfile" &
     local sp=$!
-    local o; o=$($PIN_LOAD oha -z "$DURATION" -c "$CONNS" --insecure --no-tui "$url" 2>&1)
+    local o; o=$($PIN_LOAD oha -z "$DURATION" -c "$CONNS" --insecure --no-tui "$url" 2>&1 || true)
     wait "$sp" 2>/dev/null || true
     local rps p50 p99 p999 p9999 cpu rss
     rps=$(awk '/Requests\/sec:/{print $2}' <<<"$o")
@@ -279,8 +282,8 @@ fi
 log "concurrency sweep (zion cache-hit)"
 : > "$RES/sweep.dat"
 for c in $SWEEP; do
-  for _ in $(seq 1 "$WARMUP"); do curl -sk -o /dev/null "$URL_CHUNK"; done
-  o=$($PIN_LOAD oha -z "$DURATION" -c "$c" --insecure --no-tui "$URL_CHUNK" 2>&1)
+  for _ in $(seq 1 "$WARMUP"); do curl -sk -o /dev/null "$URL_CHUNK" || true; done
+  o=$($PIN_LOAD oha -z "$DURATION" -c "$c" --insecure --no-tui "$URL_CHUNK" 2>&1 || true)
   rps=$(awk '/Requests\/sec:/{print $2}' <<<"$o"); p99=$(awk '/99\.00%/{print $3}' <<<"$o")
   echo "$c ${rps:-0} ${p99:-0}" >> "$RES/sweep.dat"
 done
