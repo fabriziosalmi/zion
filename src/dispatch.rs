@@ -1256,6 +1256,66 @@ fn profile_cache_control(ttl_seconds: u64) -> hyper::header::HeaderValue {
     }
 }
 
+/// Origin freshness lifetime (seconds) from the response `Cache-Control`.
+/// Prefers `s-maxage` (the shared-cache directive) over `max-age`. Returns
+/// `None` when the origin states no explicit lifetime — the caller then falls
+/// back to the profile TTL. This is what lets a short-lived origin policy
+/// (e.g. `max-age=300` on HTML) actually shorten zion's cache lifetime instead
+/// of being ignored in favour of the profile's blanket TTL.
+fn origin_freshness(headers: &hyper::HeaderMap) -> Option<u64> {
+    let cc = headers
+        .get(hyper::header::CACHE_CONTROL)?
+        .to_str()
+        .ok()?
+        .to_ascii_lowercase();
+    // s-maxage wins for shared caches; only then fall back to max-age.
+    for directive in ["s-maxage", "max-age"] {
+        for part in cc.split(',') {
+            let part = part.trim();
+            if let Some(rest) = part.strip_prefix(directive) {
+                if let Some(val) = rest.trim_start().strip_prefix('=') {
+                    if let Ok(secs) = val.trim().trim_matches('"').parse::<u64>() {
+                        return Some(secs);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Age (seconds) the response already carried on arrival, from the upstream
+/// `Age` header (the shield Varnish stamps it). Seeds the entry's age so the
+/// `Age` zion emits reflects the object's true age across all cache tiers,
+/// rather than restarting from zero at the zion layer.
+fn upstream_age(headers: &hyper::HeaderMap) -> u64 {
+    headers
+        .get(hyper::header::AGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Build the response for a RAM cache hit: preserved status/Content-Type/
+/// Content-Encoding, a `Cache-Control` whose `max-age` matches the entry's
+/// freshness lifetime, and the `Age` header so downstream caches subtract
+/// elapsed time instead of resetting their freshness clock on every hit.
+fn cache_hit_response(hit: cache::CacheHit) -> Response<ZionBody> {
+    let mut builder = Response::builder()
+        .status(hit.meta.status)
+        .header("Cache-Control", profile_cache_control(hit.max_age_secs))
+        .header(hyper::header::AGE, hit.age_secs);
+    if let Some(ct) = &hit.meta.content_type {
+        builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
+    }
+    if let Some(ce) = &hit.meta.content_encoding {
+        builder = builder.header(hyper::header::CONTENT_ENCODING, ce.clone());
+    }
+    builder
+        .body(Full::new(hit.body).map_err(|never| match never {}).boxed())
+        .unwrap()
+}
+
 async fn handle_static_cache(
     req: Request<ZionBody>,
     state: Arc<AppState>,
@@ -1299,18 +1359,7 @@ async fn handle_static_cache(
 
     // RAM hit — zero-copy serve with preserved Content-Type and Content-Encoding
     if let Some(hit) = state.static_cache.get(cache_key) {
-        let mut builder = Response::builder()
-            .status(hit.meta.status)
-            .header("Cache-Control", profile_cache_control(cache_ttl));
-        if let Some(ct) = &hit.meta.content_type {
-            builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
-        }
-        if let Some(ce) = &hit.meta.content_encoding {
-            builder = builder.header(hyper::header::CONTENT_ENCODING, ce.clone());
-        }
-        return Ok(builder
-            .body(Full::new(hit.body).map_err(|never| match never {}).boxed())
-            .unwrap());
+        return Ok(cache_hit_response(hit));
     }
 
     // Own cache key before consuming req — use Arc directly (cache stores Arc<str>)
@@ -1334,18 +1383,7 @@ async fn handle_static_cache(
         let _ = rx.wait_for(|v| *v).await;
         if let Some(hit) = state.static_cache.get(path_owned.as_ref()) {
             // get() already counted this hit — don't double-count it here.
-            let mut builder = Response::builder()
-                .status(hit.meta.status)
-                .header("Cache-Control", profile_cache_control(cache_ttl));
-            if let Some(ct) = &hit.meta.content_type {
-                builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
-            }
-            if let Some(ce) = &hit.meta.content_encoding {
-                builder = builder.header(hyper::header::CONTENT_ENCODING, ce.clone());
-            }
-            return Ok(builder
-                .body(Full::new(hit.body).map_err(|never| match never {}).boxed())
-                .unwrap());
+            return Ok(cache_hit_response(hit));
         }
         // Cache miss even after wait — fall through to fetch from upstream
     }
@@ -1416,7 +1454,20 @@ async fn handle_static_cache(
             })
             .unwrap_or(false);
 
-        if has_unsafe_vary || cc_forbids_cache {
+        // Honor the origin's freshness instead of blanket-applying the profile
+        // TTL: a short origin `max-age`/`s-maxage` shortens the lifetime, the
+        // profile TTL is the ceiling. Seed the entry's age from the upstream
+        // `Age` (shield Varnish) so freshness is computed across all tiers.
+        let initial_age = upstream_age(&parts.headers);
+        let effective_ttl = origin_freshness(&parts.headers)
+            .map(|o| o.min(cache_ttl))
+            .unwrap_or(cache_ttl);
+
+        // Skip caching when content-negotiated, origin-forbidden, or already
+        // non-fresh (max-age=0, or arrived older than its lifetime → would be
+        // stale the instant it's stored). Stream straight through instead.
+        if has_unsafe_vary || cc_forbids_cache || effective_ttl == 0 || initial_age >= effective_ttl
+        {
             // Stream the body straight to the client without caching.
             // Drop the inflight sender (no `true` sent): waiters fall through
             // to a fresh fetch, since cache will not be populated for this key.
@@ -1496,7 +1547,8 @@ async fn handle_static_cache(
                     &path_clone,
                     cache_buffer.into(),
                     meta_clone,
-                    cache_ttl,
+                    effective_ttl,
+                    initial_age,
                     cache_max,
                 );
                 // Cache populated: signal `true` so waiters' wait_for resolves
@@ -1515,7 +1567,7 @@ async fn handle_static_cache(
         // the profile-derived default — don't blanket-stamp 1-year immutable.
         if !resp.headers().contains_key(hyper::header::CACHE_CONTROL) {
             resp.headers_mut()
-                .insert("Cache-Control", profile_cache_control(cache_ttl));
+                .insert("Cache-Control", profile_cache_control(effective_ttl));
         }
         return Ok(resp);
     }
@@ -1688,6 +1740,50 @@ mod route_cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hdr(name: hyper::header::HeaderName, val: &str) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(name, val.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn origin_freshness_reads_max_age() {
+        let h = hdr(hyper::header::CACHE_CONTROL, "public, max-age=300");
+        assert_eq!(origin_freshness(&h), Some(300));
+    }
+
+    #[test]
+    fn origin_freshness_prefers_s_maxage() {
+        let h = hdr(hyper::header::CACHE_CONTROL, "max-age=60, s-maxage=600");
+        assert_eq!(origin_freshness(&h), Some(600));
+    }
+
+    #[test]
+    fn origin_freshness_none_when_absent() {
+        assert_eq!(origin_freshness(&hyper::HeaderMap::new()), None);
+        // no max-age directive present
+        let h = hdr(hyper::header::CACHE_CONTROL, "public");
+        assert_eq!(origin_freshness(&h), None);
+    }
+
+    #[test]
+    fn origin_freshness_ignores_substring_of_s_maxage() {
+        // "max-age" must not falsely match inside "s-maxage".
+        let h = hdr(hyper::header::CACHE_CONTROL, "s-maxage=42");
+        assert_eq!(origin_freshness(&h), Some(42));
+    }
+
+    #[test]
+    fn upstream_age_parses_header() {
+        let h = hdr(hyper::header::AGE, "123");
+        assert_eq!(upstream_age(&h), 123);
+    }
+
+    #[test]
+    fn upstream_age_defaults_zero() {
+        assert_eq!(upstream_age(&hyper::HeaderMap::new()), 0);
+    }
 
     #[test]
     fn test_is_internal_ip_loopback_v4() {

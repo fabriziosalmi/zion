@@ -33,13 +33,27 @@ pub struct CachedMeta {
 pub struct CacheHit {
     pub body: Bytes,
     pub meta: CachedMeta,
+    /// Seconds since the origin generated this response — the value to emit as
+    /// the `Age` header. Seeded from the upstream `Age` at insert (so time
+    /// spent in the shield Varnish counts) plus the time the entry has lived in
+    /// zion's cache. Without this, downstream caches reset their freshness
+    /// clock on every hit and serve content far past its real lifetime.
+    pub age_secs: u64,
+    /// The entry's freshness lifetime in seconds — the `max-age` to emit so
+    /// downstream caches compute the same expiry zion does.
+    pub max_age_secs: u64,
 }
 
 /// L1 entry — with TTL from L2 (prevents stale data after expiry).
 struct L1Entry {
     body: Bytes,
     meta: CachedMeta,
+    inserted_at: Instant,
     expires_at: Instant,
+    /// Age the object already carried on arrival (upstream `Age` header).
+    initial_age_secs: u64,
+    /// Freshness lifetime used for this entry (origin-derived, clamped to profile).
+    freshness_secs: u64,
     /// Cache generation at promotion time — stale if < StaticCache.generation.
     generation: u64,
 }
@@ -48,7 +62,20 @@ struct L1Entry {
 struct L2Entry {
     body: Bytes,
     meta: CachedMeta,
+    inserted_at: Instant,
     expires_at: Instant,
+    /// Age the object already carried on arrival (upstream `Age` header).
+    initial_age_secs: u64,
+    /// Freshness lifetime used for this entry (origin-derived, clamped to profile).
+    freshness_secs: u64,
+}
+
+/// Expiry instant from a freshness lifetime and the age the object already
+/// carried on arrival. An object that arrives already older than its freshness
+/// lifetime expires immediately (`expires_at == now`).
+#[inline]
+fn expiry_from(now: Instant, freshness_secs: u64, initial_age_secs: u64) -> Instant {
+    now + Duration::from_secs(freshness_secs.saturating_sub(initial_age_secs))
 }
 
 /// Thread-local L1 cache with O(1) LRU eviction.
@@ -163,19 +190,30 @@ impl L1Cache {
         }
         let body = entry.body.clone();
         let meta = entry.meta.clone();
+        let age_secs = entry.initial_age_secs + entry.inserted_at.elapsed().as_secs();
+        let max_age_secs = entry.freshness_secs;
         let idx = *node_idx;
         self.touch(idx);
 
-        Some(CacheHit { body, meta })
+        Some(CacheHit {
+            body,
+            meta,
+            age_secs,
+            max_age_secs,
+        })
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn insert(
         &mut self,
         path: Arc<str>,
         body: Bytes,
         meta: CachedMeta,
+        inserted_at: Instant,
         expires_at: Instant,
+        initial_age_secs: u64,
+        freshness_secs: u64,
         generation: u64,
     ) {
         // If key already exists, update in place and move to MRU
@@ -183,7 +221,10 @@ impl L1Cache {
             *entry = L1Entry {
                 body,
                 meta,
+                inserted_at,
                 expires_at,
+                initial_age_secs,
+                freshness_secs,
                 generation,
             };
             let idx = *node_idx;
@@ -208,7 +249,10 @@ impl L1Cache {
                 L1Entry {
                     body,
                     meta,
+                    inserted_at,
                     expires_at,
+                    initial_age_secs,
+                    freshness_secs,
                     generation,
                 },
                 idx,
@@ -275,6 +319,9 @@ impl StaticCache {
                         Some(CacheHit {
                             body: entry.body.clone(),
                             meta: entry.meta.clone(),
+                            age_secs: entry.initial_age_secs
+                                + entry.inserted_at.elapsed().as_secs(),
+                            max_age_secs: entry.freshness_secs,
                         })
                     }
                 } else {
@@ -337,29 +384,53 @@ impl StaticCache {
         let body = entry.body.clone();
         let meta = entry.meta.clone();
         let key: Arc<str> = entry.key().clone();
+        let inserted_at = entry.inserted_at;
         let expires_at = entry.expires_at;
+        let initial_age_secs = entry.initial_age_secs;
+        let freshness_secs = entry.freshness_secs;
         drop(entry); // release DashMap read lock
 
-        // Promote to L1 with same TTL and current generation
+        // Promote to L1 preserving the original birth time, TTL and generation.
         L1.with(|l1| {
             let mut l1 = l1.borrow_mut();
             let l1 = l1.get_or_insert_with(|| L1Cache::new(l1_max));
-            l1.insert(key, body.clone(), meta.clone(), expires_at, current_gen);
+            l1.insert(
+                key,
+                body.clone(),
+                meta.clone(),
+                inserted_at,
+                expires_at,
+                initial_age_secs,
+                freshness_secs,
+                current_gen,
+            );
         });
 
         crate::metrics::METRICS
             .cache_hits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(CacheHit { body, meta })
+        Some(CacheHit {
+            body,
+            meta,
+            age_secs: initial_age_secs + inserted_at.elapsed().as_secs(),
+            max_age_secs: freshness_secs,
+        })
     }
 
     /// Insert into L2 (source of truth). L1 populated lazily on next get.
+    ///
+    /// `freshness_secs` is the entry's freshness lifetime (origin `max-age` /
+    /// `s-maxage`, clamped to the profile TTL by the caller). `initial_age_secs`
+    /// is the age the object already carried on arrival (upstream `Age` header),
+    /// so an object cached behind the shield Varnish expires at the right wall
+    /// time rather than getting a fresh full lifetime at every tier.
     pub fn insert(
         &self,
         path: &str,
         body: Bytes,
         meta: CachedMeta,
-        ttl_seconds: u64,
+        freshness_secs: u64,
+        initial_age_secs: u64,
         max_entries: usize,
     ) {
         if self.l2.is_none() {
@@ -388,12 +459,16 @@ impl StaticCache {
                         }
                     }
                 }
+                let now = Instant::now();
                 m.insert(
                     Arc::from(path),
                     L2Entry {
                         body,
                         meta,
-                        expires_at: Instant::now() + Duration::from_secs(ttl_seconds),
+                        inserted_at: now,
+                        expires_at: expiry_from(now, freshness_secs, initial_age_secs),
+                        initial_age_secs,
+                        freshness_secs,
                     },
                 );
             });
@@ -439,12 +514,16 @@ impl StaticCache {
             }
         }
 
+        let now = Instant::now();
         l2_concurrent.insert(
             Arc::from(path),
             L2Entry {
                 body,
                 meta,
-                expires_at: Instant::now() + Duration::from_secs(ttl_seconds),
+                inserted_at: now,
+                expires_at: expiry_from(now, freshness_secs, initial_age_secs),
+                initial_age_secs,
+                freshness_secs,
             },
         );
         // Bump generation so L1 caches on other threads see the update
@@ -482,6 +561,7 @@ mod tests {
             Bytes::from("body{}"),
             default_meta(),
             3600,
+            0,
             100,
         );
         let hit = cache.get("/style.css").unwrap();
@@ -499,13 +579,13 @@ mod tests {
     #[test]
     fn insert_overwrites_existing() {
         let cache = StaticCache::new();
-        cache.insert("/a.js", Bytes::from("v1"), default_meta(), 3600, 100);
+        cache.insert("/a.js", Bytes::from("v1"), default_meta(), 3600, 0, 100);
         let meta2 = CachedMeta {
             content_type: Some(HeaderValue::from_static("application/javascript")),
             content_encoding: None,
             status: StatusCode::OK,
         };
-        cache.insert("/a.js", Bytes::from("v2"), meta2, 3600, 100);
+        cache.insert("/a.js", Bytes::from("v2"), meta2, 3600, 0, 100);
         let hit = cache.get("/a.js").unwrap();
         assert_eq!(hit.body, Bytes::from("v2"));
         assert_eq!(hit.meta.content_type.unwrap(), "application/javascript");
@@ -515,7 +595,7 @@ mod tests {
     #[test]
     fn ttl_expiration() {
         let cache = StaticCache::new();
-        cache.insert("/expired.js", Bytes::from("old"), default_meta(), 0, 100);
+        cache.insert("/expired.js", Bytes::from("old"), default_meta(), 0, 0, 100);
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(cache.get("/expired.js").is_none());
         assert_eq!(cache.len(), 0);
@@ -524,12 +604,12 @@ mod tests {
     #[test]
     fn max_entries_eviction() {
         let cache = StaticCache::new();
-        cache.insert("/a", Bytes::from("a"), default_meta(), 3600, 3);
-        cache.insert("/b", Bytes::from("b"), default_meta(), 3600, 3);
-        cache.insert("/c", Bytes::from("c"), default_meta(), 3600, 3);
+        cache.insert("/a", Bytes::from("a"), default_meta(), 3600, 0, 3);
+        cache.insert("/b", Bytes::from("b"), default_meta(), 3600, 0, 3);
+        cache.insert("/c", Bytes::from("c"), default_meta(), 3600, 0, 3);
         assert_eq!(cache.len(), 3);
 
-        cache.insert("/d", Bytes::from("d"), default_meta(), 3600, 3);
+        cache.insert("/d", Bytes::from("d"), default_meta(), 3600, 0, 3);
         assert_eq!(cache.len(), 3);
         assert!(cache.get("/d").is_some());
     }
@@ -537,16 +617,16 @@ mod tests {
     #[test]
     fn zero_max_entries_disables_eviction() {
         let cache = StaticCache::new();
-        cache.insert("/a", Bytes::from("a"), default_meta(), 3600, 0);
-        cache.insert("/b", Bytes::from("b"), default_meta(), 3600, 0);
-        cache.insert("/c", Bytes::from("c"), default_meta(), 3600, 0);
+        cache.insert("/a", Bytes::from("a"), default_meta(), 3600, 0, 0);
+        cache.insert("/b", Bytes::from("b"), default_meta(), 3600, 0, 0);
+        cache.insert("/c", Bytes::from("c"), default_meta(), 3600, 0, 0);
         assert_eq!(cache.len(), 3);
     }
 
     #[test]
     fn empty_body_cacheable() {
         let cache = StaticCache::new();
-        cache.insert("/empty", Bytes::new(), default_meta(), 3600, 100);
+        cache.insert("/empty", Bytes::new(), default_meta(), 3600, 0, 100);
         assert!(cache.get("/empty").is_some());
     }
 
@@ -554,7 +634,7 @@ mod tests {
     fn large_body_cacheable() {
         let cache = StaticCache::new();
         let big = Bytes::from(vec![0xFFu8; 1024 * 1024]);
-        cache.insert("/big.bin", big.clone(), default_meta(), 3600, 100);
+        cache.insert("/big.bin", big.clone(), default_meta(), 3600, 0, 100);
         let hit = cache.get("/big.bin").unwrap();
         assert_eq!(hit.body, big);
     }
@@ -562,7 +642,7 @@ mod tests {
     #[test]
     fn l1_promotion() {
         let cache = StaticCache::new();
-        cache.insert("/hot.js", Bytes::from("hot"), default_meta(), 3600, 100);
+        cache.insert("/hot.js", Bytes::from("hot"), default_meta(), 3600, 0, 100);
 
         // First get: L2 hit + L1 promote
         assert!(cache.get("/hot.js").is_some());
@@ -586,7 +666,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 let key = format!("/item/{i}");
                 let val = Bytes::from(format!("value-{i}"));
-                c.insert(&key, val, default_meta(), 3600, 1000);
+                c.insert(&key, val, default_meta(), 3600, 0, 1000);
             }));
         }
 
@@ -615,7 +695,7 @@ mod tests {
             content_encoding: None,
             status: StatusCode::OK,
         };
-        cache.insert("/no-ct", Bytes::from("data"), meta, 3600, 100);
+        cache.insert("/no-ct", Bytes::from("data"), meta, 3600, 0, 100);
         let hit = cache.get("/no-ct").unwrap();
         assert!(hit.meta.content_type.is_none());
     }
@@ -628,8 +708,49 @@ mod tests {
             content_encoding: None,
             status: StatusCode::NOT_MODIFIED,
         };
-        cache.insert("/304", Bytes::new(), meta, 3600, 100);
+        cache.insert("/304", Bytes::new(), meta, 3600, 0, 100);
         let hit = cache.get("/304").unwrap();
         assert_eq!(hit.meta.status, StatusCode::NOT_MODIFIED);
+    }
+
+    #[test]
+    fn hit_reports_freshness_as_max_age() {
+        let cache = StaticCache::new();
+        cache.insert("/a.css", Bytes::from("x"), default_meta(), 600, 0, 100);
+        let hit = cache.get("/a.css").unwrap();
+        assert_eq!(hit.max_age_secs, 600);
+    }
+
+    #[test]
+    fn fresh_entry_has_zero_age() {
+        let cache = StaticCache::new();
+        cache.insert("/a.css", Bytes::from("x"), default_meta(), 600, 0, 100);
+        let hit = cache.get("/a.css").unwrap();
+        // Just inserted with no upstream age — Age must be ~0, never the lifetime.
+        assert_eq!(hit.age_secs, 0);
+    }
+
+    #[test]
+    fn initial_age_is_carried_into_age_header() {
+        // Object arrived from the shield already 120s old (upstream Age: 120).
+        let cache = StaticCache::new();
+        cache.insert("/a.css", Bytes::from("x"), default_meta(), 600, 120, 100);
+        let hit = cache.get("/a.css").unwrap();
+        assert!(
+            hit.age_secs >= 120,
+            "Age must include the upstream age, got {}",
+            hit.age_secs
+        );
+    }
+
+    #[test]
+    fn initial_age_shortens_lifetime() {
+        // Freshness 100s but already 100s old on arrival → already stale.
+        let cache = StaticCache::new();
+        cache.insert("/stale", Bytes::from("x"), default_meta(), 100, 100, 100);
+        assert!(
+            cache.get("/stale").is_none(),
+            "an object that arrives already past its lifetime must not be served"
+        );
     }
 }
