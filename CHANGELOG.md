@@ -4,6 +4,29 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-06-25
+
+A cache-correctness patch fixing stale content served by the edge cache. The
+RAM cache now emits an `Age` header and honours the origin's freshness, so
+content updates propagate within the origin's real lifetime instead of being
+pinned for the full profile TTL and re-freshed on every downstream hit.
+
+### Fixed
+
+- **Cached responses now carry an `Age` header** ([`src/cache.rs`](src/cache.rs),
+  [`src/dispatch.rs`](src/dispatch.rs)). On a RAM hit the cache previously
+  re-stamped a fresh `Cache-Control: max-age=<ttl>` with **no `Age`**, so every
+  downstream cache (the shield Varnish, browsers) reset its freshness clock on
+  each hit and served content far past its real lifetime — observed as stale
+  content on audiolibri.org. Each entry now records its birth time (seeded from
+  the upstream `Age`, so time spent behind the shield counts) and serves a
+  correct `Age`, letting downstream caches subtract elapsed time.
+- **The origin's freshness is now honoured for the cache lifetime**
+  ([`src/dispatch.rs`](src/dispatch.rs)). The entry TTL is derived from the
+  origin's `s-maxage`/`max-age`, clamped to the profile TTL as a ceiling,
+  instead of blanket-applying the profile TTL. A response that is `max-age=0`
+  or already older than its lifetime on arrival is streamed through uncached.
+
 ## [0.4.1] - 2026-06-18
 
 A hardening + supply-chain patch: one user-facing TLS fix, a completed
