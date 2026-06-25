@@ -4,6 +4,19 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **WAF command-injection coverage** ([`src/waf.rs`](src/waf.rs)). The CMDi
+  patterns only matched a metachar followed by a few specific commands
+  (`cat`/`ls`/`rm`/`wget`/`curl`), so bare-metachar and substitution forms slipped
+  through. Added unambiguous Unix forms to the balanced set (reverse shells
+  `/dev/tcp/` · `nc -e` · `bash -i`, `${IFS}` bypass, brace expansion, `; nc`) and
+  the FP-prone forms to aggressive (`$(`, `` `id` ``, `whoami`, `&& ls`, `| sh`).
+  Measured against the new `benchmarks/waf-corpus/` baseline: command-injection
+  recall **33% → 100%** (aggressive) / 27% → 44% (balanced), overall **64.7% →
+  73.3%** (aggressive), **at an unchanged 0% false-positive rate** on the benign
+  set. New unit tests lock in both the detections and the no-false-positive guard.
+
 ## [0.4.3] - 2026-06-25
 
 A cache-observability + operability patch, both items drawn from a real
