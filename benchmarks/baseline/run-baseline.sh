@@ -222,15 +222,19 @@ getage() { curl -sk -D - -o /dev/null "$1" | awk 'tolower($1)=="age:"{print $2}'
 # hit-ratio under 90/10 hot/cold load: scrape zion metrics delta
 log "cache hit-ratio under load"
 metric() { curl -sk "http://127.0.0.1:8082/metrics" 2>/dev/null | awk -v k="$1" '$1==k{print $2}'; }
-# Counts are bounded: each curl is a fresh TLS handshake (no keepalive), so
-# thousands of them crawl on a small/loaded box. The 90/10 ratio is what the
-# metric needs, not absolute volume — a few hundred requests measure it fine.
+# 90/10 hot/cold. Each curl is a fresh TLS handshake (no keepalive); the whole
+# leg is wall-clock-capped so it can NEVER stall the run on a slow/contended box
+# (where curls may hit --max-time) — we measure the ratio from whatever
+# completed within the window. The 90/10 ratio, not absolute volume, is the point.
 case "$MODE" in full) HOT=450; COLD=50;; *) HOT=180; COLD=20;; esac
 h0=$(metric zion_cache_hits); m0=$(metric zion_cache_misses)
 : "${h0:=0}"; : "${m0:=0}"
-for _ in $(seq 1 "$HOT");  do curl -sk --max-time 5 -o /dev/null "$HTTPS$(blob $((1024 + RANDOM % 50)))"; done &
-for i in $(seq 1 "$COLD"); do curl -sk --max-time 5 -o /dev/null "$HTTPS$(blob $((100000 + i)))"; done
-wait
+timeout "${HITRATIO_SECS:-90}" bash -c '
+  H='"$HOT"'; C='"$COLD"'; U="'"$HTTPS"'"
+  for _ in $(seq 1 "$H"); do curl -sk --max-time 3 -o /dev/null "$U/_next/static/blob?bytes=$((1024 + RANDOM % 50))"; done &
+  for i in $(seq 1 "$C"); do curl -sk --max-time 3 -o /dev/null "$U/_next/static/blob?bytes=$((100000 + i))"; done
+  wait
+' 2>/dev/null || true
 h1=$(metric zion_cache_hits); m1=$(metric zion_cache_misses)
 : "${h1:=0}"; : "${m1:=0}"
 { echo "hits_delta=$((h1 - h0))"; echo "misses_delta=$((m1 - m0))"
