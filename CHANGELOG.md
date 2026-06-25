@@ -4,6 +4,14 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-06-25
+
+A WAF-coverage patch. Adds a measured detection/false-positive regression
+baseline (`benchmarks/waf-corpus/`, 200 payloads) and, driven by it, plugs the
+biggest gaps in the balanced/aggressive pattern sets — command injection, SSRF,
+deserialization, and error-based SQLi — lifting aggressive recall from 64.7% to
+85.3% against the corpus at an unchanged **0% false-positive rate**.
+
 ### Changed
 
 - **WAF command-injection coverage** ([`src/waf.rs`](src/waf.rs)). The CMDi
