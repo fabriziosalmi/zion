@@ -168,7 +168,7 @@ for i in $(seq 1 30); do curl -sk -o /dev/null --max-time 2 "$URL_PROXY" 2>/dev/
 if [ "$OPT_NGINX" = 1 ]; then
   log "starting nginx comparison (:4433, proxy_cache → backend)"
   cat > "$RES/nginx.conf" <<NGINX
-worker_processes auto; error_log /dev/null; pid $RES/nginx.pid;
+worker_processes auto; error_log /dev/null; pid $RES/nginx.pid; daemon off;
 events { worker_connections 4096; }
 http {
   access_log off;
@@ -265,7 +265,10 @@ bench_oha() {
     rps=$(awk '/Requests\/sec:/{print $2}' <<<"$o")
     p50=$(awk '/50\.00%/{print $3}'  <<<"$o"); p99=$(awk '/99\.00%/{print $3}'  <<<"$o")
     p999=$(awk '/99\.90%/{print $3}' <<<"$o"); p9999=$(awk '/99\.99%/{print $3}' <<<"$o")
-    read -r cpu rss < "$rfile"; rm -f "$rfile"
+    # `read` returns non-zero on an empty rfile (sample_proc couldn't read the
+    # pid — e.g. a daemonized/exited process), which would abort under set -e.
+    read -r cpu rss < "$rfile" 2>/dev/null || true; rm -f "$rfile"
+    cpu="${cpu:-0}"; rss="${rss:-0}"
     echo "${rps:-0} ${p50:-0} ${p99:-0} ${p999:-0} ${p9999:-0} ${cpu:-0} ${rss:-0}" >> "$out"
   done
 }
