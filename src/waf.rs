@@ -177,6 +177,11 @@ const BALANCED_PATTERNS: &[&str] = &[
     "' and '1'='1",
     "waitfor delay",
     "pg_sleep(",
+    // Error-based + stacked SQLi: specific function/proc names, ~0 FP.
+    "extractvalue(",
+    "updatexml(",
+    "xp_cmdshell",
+    "||(select",
     "'; shutdown",
     // ── XSS: Tags (anchored on `<`) ──
     "<script",
@@ -255,6 +260,9 @@ const BALANCED_PATTERNS: &[&str] = &[
     "169.254.169.254/metadata",
     "http://192.0.0.192",
     "kubernetes.default.svc",
+    // SSRF: internal-only URI schemes — never legitimate in user input.
+    "gopher://",
+    "dict://",
     // ── Windows Path Traversal ──
     "c:\\windows\\",
     "c:\\inetpub\\",
@@ -429,6 +437,27 @@ const AGGRESSIVE_EXTRA_PATTERNS: &[&str] = &[
     "__schema",
     "__type",
     "mutation{",
+    // ── SSRF: loopback / internal targets (FP on legit localhost dev URLs) ──
+    "http://localhost:",
+    "https://localhost:",
+    "://127.0.0.1",
+    "http://0.0.0.0",
+    "http://2130706433",
+    "file:///proc",
+    "ftp://127.0.0.1",
+    // ── Deserialization / prototype pollution / YAML (FP on code/serialized) ──
+    "o:8:\"",
+    "ro0ab",
+    "__proto__",
+    "constructor[prototype",
+    "[prototype][",
+    "!!python/",
+    // ── Shellshock (`() { :` — not bare `() {`, which is a legit empty fn) ──
+    "() { :",
+    // ── SQLi: quote-paren OR variants + comment-terminated injection ──
+    "\") or (\"",
+    "') or ('",
+    "'--",
 ];
 
 static BALANCED_SCANNER: OnceLock<AhoCorasick> = OnceLock::new();
@@ -1504,6 +1533,71 @@ mod tests {
                 String::from_utf8_lossy(body)
             );
         }
+    }
+
+    #[test]
+    fn denies_ssrf_internal_schemes_balanced() {
+        for body in [
+            br#"{"u":"gopher://127.0.0.1:11211/_stats"}"#.as_slice(),
+            br#"{"u":"dict://127.0.0.1:11211/stat"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                validate_request("POST", Some("application/json"), body, &strict_profile()),
+                WafVerdict::Deny("injection pattern detected"),
+                "missed: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn denies_ssrf_loopback_and_deser_aggressive() {
+        for body in [
+            br#"{"u":"http://localhost:6379/"}"#.as_slice(),
+            br#"{"u":"http://127.0.0.1:22"}"#.as_slice(),
+            br#"{"u":"http://2130706433/"}"#.as_slice(),
+            br#"{"x":"rO0ABXNyAA=="}"#.as_slice(),
+            br#"{"x":"constructor[prototype][isAdmin]=true"}"#.as_slice(),
+            br#"{"x":"!!python/object/apply:os.system ['id']"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                validate_request(
+                    "POST",
+                    Some("application/json"),
+                    body,
+                    &aggressive_profile()
+                ),
+                WafVerdict::Deny("injection pattern detected"),
+                "missed: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn denies_sqli_error_based_balanced() {
+        let body = br#"{"q":"1 AND extractvalue(1,concat(0x7e,version()))"}"#;
+        assert_eq!(
+            validate_request("POST", Some("application/json"), body, &strict_profile()),
+            WafVerdict::Deny("injection pattern detected")
+        );
+    }
+
+    #[test]
+    fn allows_empty_function_aggressive() {
+        // Precision guard: an empty JS function `() {` must NOT trip the
+        // shellshock pattern (`() { :`). A regression here is a false positive.
+        let body = br#"{"code":"const f = () => {}; function g() { return 1; }"}"#;
+        assert_eq!(
+            validate_request(
+                "POST",
+                Some("application/json"),
+                body,
+                &aggressive_profile()
+            ),
+            WafVerdict::Allow,
+            "false positive on empty function"
+        );
     }
 
     #[test]

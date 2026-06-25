@@ -16,6 +16,17 @@ All notable changes to Zion Edge Gateway are documented here.
   recall **33% → 100%** (aggressive) / 27% → 44% (balanced), overall **64.7% →
   73.3%** (aggressive), **at an unchanged 0% false-positive rate** on the benign
   set. New unit tests lock in both the detections and the no-false-positive guard.
+- **WAF SSRF / deserialization / SQLi-error-based / shellshock coverage**
+  ([`src/waf.rs`](src/waf.rs)). Continuing against the corpus: internal SSRF
+  schemes `gopher://`/`dict://` and error-based SQLi (`extractvalue(` ·
+  `updatexml(` · `xp_cmdshell` · `||(select`) to balanced; loopback/decimal-IP
+  SSRF (`http://localhost:` · `http://127.0.0.1:` · `http://2130706433`),
+  deserialization / prototype-pollution (java `rO0AB`, PHP `O:8:"`, `__proto__`,
+  `constructor[prototype`, YAML `!!python/`), shellshock (`() { :` — *not* bare
+  `() {`, which is a legit empty function) and quote-paren SQLi OR-variants to
+  aggressive. Corpus delta (aggressive): SSRF **33% → 100%**, deserialization
+  **33% → 100%**, SQLi **68% → 90%**, overall **73.3% → 85.3%** — still **0%
+  false positives**. New unit tests incl. an empty-function precision guard.
 
 ## [0.4.3] - 2026-06-25
 
