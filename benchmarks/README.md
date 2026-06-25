@@ -1,48 +1,42 @@
 # Benchmarks
 
-## Active Scripts
+## Canonical: `baseline/`
+
+[`baseline/run-baseline.sh`](baseline/) is the reproducible macro-benchmark —
+throughput (median-of-N trials + 95% CI + p50/p99/p99.9 + CPU/RSS), an nginx
+comparison on the same box, a concurrency sweep, a payload matrix, **HTTP/2 +
+TLS conformance**, and **cache-correctness** — rendered to a tracked PDF. It
+supersedes the older native/matrix/scientific throughput scripts (archived).
+
+```bash
+MODE=full  bash benchmarks/baseline/run-baseline.sh   # authoritative → zion-<ver>-baseline.pdf
+MODE=smoke bash benchmarks/baseline/run-baseline.sh   # fast pipeline check
+```
+
+See [`baseline/README.md`](baseline/README.md) for prerequisites and knobs.
+
+## Specialised scripts
 
 | Script | Purpose | Duration |
 |---|---|---|
-| `bench-matrix.sh` | Payload × concurrency grid (36 cells). Main benchmark. | ~15 min |
-| `bench-matrix.sh --quick` | Quick mode: 1 round × 3s per cell | ~2 min |
-| `bench-scientific.sh` | Zion vs nginx (Docker, 5 runs, CI95) | ~20 min |
+| `bench-pgo.sh` | Two-phase PGO build (profile → optimized) | ~10–20 min |
+| `bench-mesh.sh` | `--features sovereign-aimp` mesh cost (idle/lookup/3-node) — issue #72 | ~10 min |
+| `bench-xdp-ktls.sh` | XDP + kTLS A/B (Track A, Linux) | varies |
 | `bench-profile.sh` | CPU flamegraph profiling via `samply` | ~3 min |
 
-## Usage
+## Distributed rig + microbenches
 
-```bash
-# Full matrix (recommended for release validation)
-bash benchmarks/bench-matrix.sh
+- Network-realistic numbers (load box → SUT over a real NIC): [`../benches/e2e/`](../benches/e2e/) (`RESULTS.md`).
+- Rust `cargo bench` microbenches: [`../benches/`](../benches/) (Criterion; baseline at `results/criterion/baseline.json`).
 
-# Quick smoke test
-bash benchmarks/bench-matrix.sh --quick
+## Configuration files
 
-# Docker comparison with nginx
-bash benchmarks/bench-scientific.sh
-
-# CPU profiling (requires samply)
-bash benchmarks/bench-profile.sh
-```
-
-## Results
-
-Results are saved to `results/matrix-history.json` with automatic delta comparison.
-
-Live dashboard: `cd benchmarks && python3 -m http.server 8888` → `http://localhost:8888/dashboard.html`
-
-## Configuration Files
-
-| File | Description |
-|---|---|
-| `zion-bench-tls.toml` | TLS only (no WAF, no cache) |
-| `zion-bench-tls-waf.toml` | TLS + WAF |
-| `zion-bench-tls-cache.toml` | TLS + cache |
-| `zion-bench-tls-waf-cache.toml` | TLS + WAF + cache (full stack) |
-| `zion-docker.toml` | Docker container config |
-| `zion-docker-waf.toml` | Docker + WAF |
-| `zion-docker-full.toml` | Docker full stack |
+`zion-bench-tls*.toml` (TLS / +WAF / +cache / full) and `zion-docker*.toml`
+(container variants) drive the specialised scripts. The baseline harness uses
+its own [`baseline/zion-lab.toml`](baseline/zion-lab.toml).
 
 ## Archive
 
-Superseded scripts are preserved in `archive/` for reference.
+Superseded throughput scripts — `bench-native.sh`, `bench-matrix.sh`,
+`bench-scientific.sh`, and their report generators — are preserved under
+[`archive/`](archive/) for reference. Use `baseline/` instead.

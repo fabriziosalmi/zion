@@ -4,8 +4,8 @@
 //! Designed to remove the Go runtime as a bottleneck so benchmarks measure
 //! the proxy layer alone.
 //!
-//! Endpoints mirror the Go backend exactly for compatibility with
-//! bench-native.sh and integration tests.
+//! Endpoints mirror the Go backend exactly for compatibility with the
+//! benchmark harnesses and integration tests.
 
 #![allow(clippy::needless_borrow)]
 
