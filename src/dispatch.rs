@@ -410,6 +410,34 @@ async fn process_request_inner(
                 .body(Full::new(body).map_err(|never| match never {}).boxed())
                 .unwrap());
         }
+        // Cache purge — flush the in-RAM cache so a deploy can invalidate
+        // immediately instead of waiting out the TTL. Internal-only + POST
+        // (mutating). `?prefix=/path` purges matching keys; no prefix = all.
+        if path == "/_zion/cache/purge" {
+            if !is_internal_ip(&client_ip) {
+                return Ok(empty_response(StatusCode::FORBIDDEN));
+            }
+            if *req.method() != hyper::Method::POST {
+                return Ok(empty_response(StatusCode::METHOD_NOT_ALLOWED));
+            }
+            let prefix = req.uri().query().and_then(|q| {
+                q.split('&')
+                    .find_map(|kv| kv.strip_prefix("prefix="))
+                    .map(|p| p.to_string())
+            });
+            let (removed, scope) = match &prefix {
+                Some(p) => (state.static_cache.purge_prefix(p), format!("{p:?}")),
+                None => (state.static_cache.purge_all(), "\"all\"".to_string()),
+            };
+            crate::logging::info("cache", &format!("purge scope={scope} removed={removed}"));
+            let body = Bytes::from(format!("{{\"purged\":{removed},\"scope\":{scope}}}\n"));
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json; charset=utf-8")
+                .header("Cache-Control", "no-store")
+                .body(Full::new(body).map_err(|never| match never {}).boxed())
+                .unwrap());
+        }
     }
 
     // ── Route lookup (thread-local LRU + radix tree fallback) ──
@@ -1304,6 +1332,7 @@ fn cache_hit_response(hit: cache::CacheHit) -> Response<ZionBody> {
     let mut builder = Response::builder()
         .status(hit.meta.status)
         .header("Cache-Control", profile_cache_control(hit.max_age_secs))
+        .header("X-Zion-Cache", "HIT")
         .header(hyper::header::AGE, hit.age_secs);
     if let Some(ct) = &hit.meta.content_type {
         builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
@@ -1472,7 +1501,11 @@ async fn handle_static_cache(
             // Drop the inflight sender (no `true` sent): waiters fall through
             // to a fresh fetch, since cache will not be populated for this key.
             state.inflight.remove(&path_owned);
-            let resp = Response::from_parts(parts, body.map_err(hyper::Error::from).boxed());
+            let mut resp = Response::from_parts(parts, body.map_err(hyper::Error::from).boxed());
+            resp.headers_mut().insert(
+                "X-Zion-Cache",
+                hyper::header::HeaderValue::from_static("BYPASS"),
+            );
             return Ok(resp);
         }
 
@@ -1563,6 +1596,12 @@ async fn handle_static_cache(
         });
 
         let mut resp = Response::from_parts(parts, stream_body.boxed());
+        // This response was fetched from upstream and is being populated into
+        // the cache as it streams — a MISS that fills the cache for next time.
+        resp.headers_mut().insert(
+            "X-Zion-Cache",
+            hyper::header::HeaderValue::from_static("MISS"),
+        );
         // Preserve the upstream Cache-Control if it set one; otherwise supply
         // the profile-derived default — don't blanket-stamp 1-year immutable.
         if !resp.headers().contains_key(hyper::header::CACHE_CONTROL) {

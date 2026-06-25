@@ -4,6 +4,23 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`X-Zion-Cache: HIT|MISS|BYPASS` response header** ([`src/dispatch.rs`](src/dispatch.rs)).
+  A cache HIT was previously distinguishable only by the absence of upstream/shield
+  headers plus the rewritten `Cache-Control` and the `Age` value — which cost real
+  debugging time during a stale-content incident. The cache now states its decision
+  explicitly: `HIT` (served from RAM), `MISS` (fetched from upstream and cached as it
+  streams), `BYPASS` (not cacheable — content-negotiated, `no-store`/`private`,
+  already-stale-on-arrival, or `max-age=0`).
+- **Cache purge endpoint `POST /_zion/cache/purge`** ([`src/cache.rs`](src/cache.rs),
+  [`src/dispatch.rs`](src/dispatch.rs)). Flush the in-RAM cache so a deploy hook can
+  invalidate immediately instead of waiting out the TTL (previously only a pod restart
+  would do it, briefly dropping `:443`). `?prefix=/path` purges matching keys; no prefix
+  purges everything. Internal-only (same IP gate as `/metrics`) and POST-only; returns
+  `{"purged":N,"scope":...}`. L2 is cleared directly; the existing generation counter
+  lazily invalidates every thread-local L1 — no cross-thread iteration.
+
 ## [0.4.2] - 2026-06-25
 
 A cache-correctness patch fixing stale content served by the edge cache. The
