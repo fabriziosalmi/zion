@@ -10,7 +10,7 @@ estimates from the original gap analysis — measure, don't trust.
 
 Previously [`src/dispatch.rs`](../../src/dispatch.rs) called
 `format!("ip={…} class={…}")` on every classified request when
-`sovereign_log_classification = true`. That's one heap allocation per
+`[sovereign].log_classification = true`. That's one heap allocation per
 request, on the hot path, with no opt-out short of disabling the log.
 
 The new path:

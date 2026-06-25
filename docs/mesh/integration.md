@@ -163,11 +163,13 @@ tracked at [#69](https://github.com/fabriziosalmi/zion/issues/69):
 
 `/metrics` exposes:
 
-* `zion_mesh_claims_published_total{kind=...}` — outbound claim count.
-* `zion_mesh_claims_received_total{kind=...}` — inbound count.
-* `zion_mesh_claims_rejected_total{reason=...}` — verification failures
-  bucketed by reason (`signature`, `unknown_peer`, `replay`, etc.).
-* `zion_mesh_peers` — current peer-set size.
+* `zion_mesh_claims_emitted_total` — outbound claim count.
+* `zion_mesh_claims_received_total` — inbound count.
+* `zion_mesh_claims_dropped_total{reason=...}` — verification / admission
+  failures bucketed by reason (`signature`, `replay`, `rate`, `other`).
+* `zion_mesh_score_lookups_total` — reputation lookups on the request path.
+* `zion_mesh_gossip_bytes_in_total` / `zion_mesh_gossip_bytes_out_total` —
+  gossip wire volume.
 
 ## Debugging
 
@@ -177,9 +179,9 @@ Common diagnostic commands once the mesh is up:
 # Verify the gossip listener is bound.
 sudo ss -uap | grep ':7777'
 
-# Dump the local reputation map (read-only HTTP endpoint, when
-# [observability].mesh_dump_enabled = true).
-curl -s https://node-a.example.com/admin/mesh/dump | jq
+# Inspect mesh counters (claims emitted/received/dropped, gossip bytes).
+# There is no HTTP reputation-map dump endpoint; use /metrics + the audit log.
+curl -s http://127.0.0.1:80/metrics | grep '^zion_mesh_'
 
 # Observe live publish/receive events from the audit log.
 tail -f /var/log/zion/audit.jsonl | jq 'select(.kind | startswith("mesh_"))'
@@ -219,5 +221,5 @@ Items listed in ADR-0008 "Negative consequences" or referenced above:
   [#67](https://github.com/fabriziosalmi/zion/issues/67).
 * **Chaos coverage (split-brain, claim flood, slow gossip)** —
   [#71](https://github.com/fabriziosalmi/zion/issues/71).
-* **Bench: --features mesh idle vs saturation cost** —
+* **Bench: --features sovereign-aimp idle vs saturation cost** —
   [#72](https://github.com/fabriziosalmi/zion/issues/72).
