@@ -539,6 +539,65 @@ impl StaticCache {
             LOCAL_L2.with(|m| m.borrow().len())
         }
     }
+
+    /// Purge the whole cache. Clears L2 (source of truth) and bumps the
+    /// generation so every thread-local L1 entry is treated as stale on its
+    /// next get — no cross-thread iteration needed. Returns the number of L2
+    /// entries dropped. Lets a deploy hook invalidate immediately instead of
+    /// waiting out the TTL.
+    pub fn purge_all(&self) -> usize {
+        let n = if let Some(l2) = &self.l2 {
+            let n = l2.len();
+            l2.clear();
+            n
+        } else {
+            LOCAL_L2.with(|m| {
+                let mut m = m.borrow_mut();
+                let n = m.len();
+                m.clear();
+                n
+            })
+        };
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        n
+    }
+
+    /// Purge L2 entries whose key (path+query) starts with `prefix`. Returns
+    /// the count removed. Bumps the generation, which lazily invalidates ALL
+    /// L1 entries (not just the prefix) — over-broad but safe: unaffected keys
+    /// simply re-promote from L2 on next get. The common deploy case
+    /// (invalidate `/assets/...`) is well served.
+    pub fn purge_prefix(&self, prefix: &str) -> usize {
+        let mut removed = 0;
+        if let Some(l2) = &self.l2 {
+            let keys: Vec<Arc<str>> = l2
+                .iter()
+                .filter(|e| e.key().starts_with(prefix))
+                .map(|e| e.key().clone())
+                .collect();
+            for k in &keys {
+                l2.remove(k);
+                removed += 1;
+            }
+        } else {
+            LOCAL_L2.with(|m| {
+                let mut m = m.borrow_mut();
+                let keys: Vec<Arc<str>> = m
+                    .keys()
+                    .filter(|k| k.starts_with(prefix))
+                    .cloned()
+                    .collect();
+                for k in &keys {
+                    m.remove(k);
+                    removed += 1;
+                }
+            });
+        }
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        removed
+    }
 }
 
 #[cfg(test)]
@@ -740,6 +799,56 @@ mod tests {
             hit.age_secs >= 120,
             "Age must include the upstream age, got {}",
             hit.age_secs
+        );
+    }
+
+    #[test]
+    fn purge_all_empties_and_invalidates() {
+        let cache = StaticCache::new();
+        cache.insert("/a.css", Bytes::from("a"), default_meta(), 3600, 0, 100);
+        cache.insert("/b.css", Bytes::from("b"), default_meta(), 3600, 0, 100);
+        assert!(cache.get("/a.css").is_some()); // promote into L1
+        let n = cache.purge_all();
+        assert_eq!(n, 2);
+        assert_eq!(cache.len(), 0);
+        // L1 entry must be treated as stale after the generation bump
+        assert!(cache.get("/a.css").is_none());
+        assert!(cache.get("/b.css").is_none());
+    }
+
+    #[test]
+    fn purge_prefix_removes_only_matching() {
+        let cache = StaticCache::new();
+        cache.insert(
+            "/assets/x.js",
+            Bytes::from("x"),
+            default_meta(),
+            3600,
+            0,
+            100,
+        );
+        cache.insert(
+            "/assets/y.js",
+            Bytes::from("y"),
+            default_meta(),
+            3600,
+            0,
+            100,
+        );
+        cache.insert(
+            "/index.html",
+            Bytes::from("h"),
+            default_meta(),
+            3600,
+            0,
+            100,
+        );
+        let n = cache.purge_prefix("/assets/");
+        assert_eq!(n, 2);
+        assert!(cache.get("/assets/x.js").is_none());
+        assert!(
+            cache.get("/index.html").is_some(),
+            "non-matching key survives"
         );
     }
 
