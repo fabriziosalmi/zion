@@ -317,8 +317,8 @@ with no record.
 - **ACME**: HTTP-01 challenges land in an in-memory store and are served
   *only* under `/.well-known/acme-challenge/<token>`. The store auto-
   expires entries and the renewal task is the sole writer.
-- **Auth**: JWT signature verification uses pinned algorithms via
-  `[auth_profile.<name>.algorithms]`; JWKS fetch is rate-limited and
+- **Auth**: JWT signature verification uses a pinned algorithm via
+  `[auth_profile.<name>.algorithm]`; JWKS fetch is rate-limited and
   cached.
 
 Both expand the threat surface; operators opting in must re-read the
@@ -370,8 +370,8 @@ from a trusted peer (a corrupted WAF reputation, a fake
   `aimp_node::crypto::SecurityFirewall` before any merge. Pubkeys
   are TOFU-logged on first sight + persisted under
   `[sovereign_aimp].identity_path` with `chmod 600`. An unknown-pubkey
-  envelope is dropped with `zion_mesh_claims_rejected_total{reason="unknown_peer"}`
-  ticked. Identity rotation is documented in
+  envelope fails signature verification and is dropped with
+  `zion_mesh_claims_dropped_total{reason="signature"}` ticked. Identity rotation is documented in
   [docs/mesh/integration.md](../mesh/integration.md) §"Identity management".
 - **Residual**: TOFU has the standard "first-contact spoof" caveat —
   a network attacker on the path between two nodes' first exchange
