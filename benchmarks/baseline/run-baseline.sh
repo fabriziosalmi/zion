@@ -42,10 +42,13 @@ H2LOAD_M="${H2LOAD_M:-20}"
 WARMUP="${WARMUP:-200}"
 REPORT="${REPORT:-1}"          # 1=build report here; 0=measure only (render PDF elsewhere)
 # CPU pinning (Linux/taskset only): keep the load generator off the server's
-# cores so it can't steal CPU from zion and understate the ceiling. Disjoint
-# sets. Override ZION_CPUS/LOAD_CPUS for other core counts; empty = no pinning.
-ZION_CPUS="${ZION_CPUS:-0-3}"
-LOAD_CPUS="${LOAD_CPUS:-4-7}"
+# cores so it can't steal CPU from zion. By default the allowed cpuset is
+# auto-split in half (server | load) — this handles LXC cpusets with
+# non-contiguous host core IDs (e.g. "23,31-32,34-38"). Override ZION_CPUS /
+# LOAD_CPUS to pin explicitly, or set PIN=0 to disable.
+PIN="${PIN:-1}"
+ZION_CPUS="${ZION_CPUS:-}"
+LOAD_CPUS="${LOAD_CPUS:-}"
 
 HTTPS="https://127.0.0.1:4432"
 NGINX_HTTPS="https://127.0.0.1:4433"
@@ -66,13 +69,37 @@ H2SPEC_BIN="${H2SPEC:-$(command -v h2spec || echo "$HOME/http-tools/h2spec")}"
 # ── Preflight ───────────────────────────────────────────────────────────────
 for t in cargo go openssl python3 oha h2load wrk; do have "$t" || die "missing required tool: $t"; done
 [ "$REPORT" = 1 ] && { have weasyprint || die "weasyprint missing (set REPORT=0 to measure only and render elsewhere)"; }
-# CPU pinning prefixes (taskset present + a core set given) — else no-op.
+# CPU pinning prefixes. Auto-derive from the allowed cpuset unless overridden;
+# validate each set with a no-op taskset and fall back to no pinning if the
+# kernel/container rejects it.
 PIN_ZION=""; PIN_LOAD=""
-if have taskset; then
-  [ -n "$ZION_CPUS" ] && PIN_ZION="taskset -c $ZION_CPUS"
-  [ -n "$LOAD_CPUS" ] && PIN_LOAD="taskset -c $LOAD_CPUS"
+if [ "$PIN" = 1 ] && have taskset; then
+  if [ -z "$ZION_CPUS" ] && [ -z "$LOAD_CPUS" ]; then
+    allowed="$(cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || cat /sys/devices/system/cpu/online 2>/dev/null || echo)"
+    flat="$(python3 -c "
+import sys
+o=[]
+for p in sys.argv[1].split(','):
+    if '-' in p: a,b=p.split('-'); o+=range(int(a),int(b)+1)
+    elif p.strip(): o.append(int(p))
+print(' '.join(map(str,o)))" "$allowed" 2>/dev/null)"
+    set -- $flat; n=$#
+    if [ "$n" -ge 4 ]; then
+      h=$((n/2)); first=""; second=""; i=0
+      for c in $flat; do i=$((i+1)); if [ "$i" -le "$h" ]; then first="$first,$c"; else second="$second,$c"; fi; done
+      ZION_CPUS="${first#,}"; LOAD_CPUS="${second#,}"
+    else
+      skip "only $n CPUs allowed → no pinning"
+    fi
+  fi
+  if [ -n "$ZION_CPUS" ] && taskset -c "$ZION_CPUS" true 2>/dev/null && taskset -c "$LOAD_CPUS" true 2>/dev/null; then
+    PIN_ZION="taskset -c $ZION_CPUS"; PIN_LOAD="taskset -c $LOAD_CPUS"
+  else
+    skip "taskset rejected cpuset ($ZION_CPUS | $LOAD_CPUS) → no CPU pinning"
+    ZION_CPUS=""; LOAD_CPUS=""
+  fi
 else
-  [ -n "$ZION_CPUS$LOAD_CPUS" ] && skip "taskset absent → no CPU pinning (load and server share cores)"
+  [ "$PIN" = 1 ] && skip "taskset absent → no CPU pinning (load and server share cores)"
 fi
 OPT_NGINX=$(have nginx && echo 1 || echo 0)
 OPT_WRK2=$(have wrk2 && echo 1 || echo 0)
