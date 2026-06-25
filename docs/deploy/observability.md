@@ -2,15 +2,20 @@
 
 ## Health Endpoints
 
-Zion exposes three built-in endpoints that bypass routing and upstream forwarding:
+Zion exposes built-in endpoints that bypass routing and upstream forwarding:
 
-| Endpoint | Response | Purpose |
-|---|---|---|
-| `GET /healthz` | `200 ok` | Liveness probe (is the process alive?) |
-| `GET /readyz` | `200 ready` | Readiness probe (is the process ready to serve?) |
-| `GET /metrics` | Prometheus text format | Metrics scraping |
+| Endpoint | Response | Access | Purpose |
+|---|---|---|---|
+| `GET /healthz` | `200 ok` | public | Liveness probe (is the process alive?) |
+| `GET /readyz` | `200 ready` | public | Readiness probe (is the process ready to serve?) |
+| `GET /metrics` | Prometheus text format | **internal IPs only** (`403` otherwise) | Metrics scraping |
+| `GET /_zion/snapshot.json` | JSON (metrics + quantiles + platform) | **internal IPs only** | `zion top` / dashboards |
+| `POST /_zion/cache/purge` | `{"purged":N,"scope":...}` | **internal IPs only**, POST-only (`405` on GET) | Flush the RAM cache on deploy; `?prefix=/path` for scoped purge |
 
-These endpoints are handled before rate limiting and routing, ensuring they always respond even under load.
+`/healthz` and `/readyz` are handled before rate limiting and routing, so they
+always respond even under load. `/metrics`, `/_zion/snapshot.json`, and
+`/_zion/cache/purge` are restricted to internal source IPs (external clients get
+`403`).
 
 ## Prometheus Metrics
 

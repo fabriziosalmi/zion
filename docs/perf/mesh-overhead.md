@@ -87,7 +87,7 @@ cargo build --release --features sovereign-aimp
 #    with the mesh enabled but no peers. publish_block is never
 #    called; mesh_score_lookups is exercised on every request.
 ZION_AIMP_LISTEN=127.0.0.1:7777 ZION_AIMP_PEERS= \
-  ./target/release/zion --config benchmarks/zion-bench-tls.toml &
+  ZION_CONFIG=benchmarks/zion-bench-tls.toml ./target/release/zion &
 
 # 3. wrk a 100k rps burst against /api/v1/data, scrape /metrics, and
 #    confirm `zion_mesh_score_lookups_total` ticks at the expected
