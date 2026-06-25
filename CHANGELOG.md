@@ -4,6 +4,13 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-06-25
+
+A cache-observability + operability patch, both items drawn from a real
+audiolibri.org stale-content incident: the cache now states its decision on the
+wire, and an operator can flush it on deploy instead of waiting out the TTL.
+No change to the proxy/WAF data path.
+
 ### Added
 
 - **`X-Zion-Cache: HIT|MISS|BYPASS` response header** ([`src/dispatch.rs`](src/dispatch.rs)).

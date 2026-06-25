@@ -46,8 +46,8 @@ You need the GitHub CLI (`gh >= 2.49`) and `cosign >= 2.2`.
 
 ```bash
 # 1. Download the artifact + SHA256SUMS from the release page.
-gh release download v0.4.2 -R fabriziosalmi/zion \
-    -p 'zion-v0.4.2-x86_64-unknown-linux-musl.tar.gz' \
+gh release download v0.4.3 -R fabriziosalmi/zion \
+    -p 'zion-v0.4.3-x86_64-unknown-linux-musl.tar.gz' \
     -p 'SHA256SUMS' \
     -p 'zion-sbom.cdx.json'
 
@@ -55,7 +55,7 @@ gh release download v0.4.2 -R fabriziosalmi/zion \
 sha256sum --check --ignore-missing SHA256SUMS
 
 # 3. Verify the SLSA build provenance bound to the artifact's hash.
-gh attestation verify zion-v0.4.2-x86_64-unknown-linux-musl.tar.gz \
+gh attestation verify zion-v0.4.3-x86_64-unknown-linux-musl.tar.gz \
     --owner fabriziosalmi
 
 # Step 3 fails if:
@@ -78,7 +78,7 @@ grype zion-sbom.cdx.json
 ## Verifying a container image
 
 ```bash
-IMAGE=ghcr.io/fabriziosalmi/zion:v0.4.2
+IMAGE=ghcr.io/fabriziosalmi/zion:v0.4.3
 
 # 1. Pin to the digest immediately — tags are mutable, digests are not.
 DIGEST=$(crane digest "$IMAGE")
@@ -120,7 +120,7 @@ deterministically, and pins the Rust toolchain via
 [`rust-toolchain.toml`](../../rust-toolchain.toml). To reproduce locally:
 
 ```bash
-git checkout v0.4.2
+git checkout v0.4.3
 export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
 # Linux musl example — matches the release artifact byte-for-byte
 # (modulo strip's stable behavior on your distro).
