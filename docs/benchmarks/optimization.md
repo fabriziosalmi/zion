@@ -1,6 +1,6 @@
 # Optimization Log
 
-Changes made to improve throughput and latency, with rationale. Throughput claims reference `wrk` benchmark results from `benchmarks/bench-native.sh`.
+Changes made to improve throughput and latency, with rationale. Throughput claims reference the [`benchmarks/baseline/`](https://github.com/fabriziosalmi/zion/tree/master/benchmarks/baseline) harness.
 
 ## Architectural
 

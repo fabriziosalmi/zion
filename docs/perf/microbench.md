@@ -117,7 +117,7 @@ document it here.
 
 ## Comparison to the wrk suites
 
-|                       | `cargo bench` (this harness)                | `benchmarks/bench-scientific.sh`        |
+|                       | `cargo bench` (this harness)                | `benchmarks/baseline/` harness          |
 |-----------------------|---------------------------------------------|-----------------------------------------|
 | What it measures      | Per-call cost of pure functions             | End-to-end RPS / p99 / TLS handshake    |
 | Target                | One hot-path component at a time            | Full request pipeline incl. upstream    |

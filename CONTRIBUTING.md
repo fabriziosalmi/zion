@@ -43,7 +43,7 @@ Before spending time on a large PR, we strongly suggest opening a feature reques
    ```
 6. If your PR touches the request processing path (`src/dispatch.rs`, `src/waf.rs`, `src/proxy.rs`), please run the benchmarks:
    ```bash
-   bash benchmarks/bench-matrix.sh
+   MODE=full bash benchmarks/baseline/run-baseline.sh
    ```
 
 ### Code Style Guidelines

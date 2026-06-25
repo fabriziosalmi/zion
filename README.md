@@ -232,13 +232,14 @@ by ~3–27%; Zion is at parity on API GET / WAF POST and **wins on cacheable ass
 (+40–52%)** where the in-RAM cache skips the origin round-trip — all while
 terminating TLS *and* running the WAF inline.
 
-Numbers are a regression baseline on fixed hardware, not a WAN figure. Reproduce
-and see the full methodology + raw data under [`benchmarks/`](benchmarks/):
+Numbers are a regression baseline on fixed hardware, not a WAN figure. The
+canonical reproducible harness (throughput + nginx comparison + HTTP/2 & TLS
+conformance + cache-correctness → a tracked PDF) lives under
+[`benchmarks/baseline/`](benchmarks/baseline/); WAN-realistic distributed numbers
+are in [`benches/e2e/`](benches/e2e/).
 
 ```bash
-bash benchmarks/certs/generate.sh
-bash benchmarks/bench-native.sh        # native, 8 endpoints × 5 runs (~8 min)
-bash benchmarks/bench-scientific.sh    # Docker comparison vs nginx, CI95 (~10 min)
+MODE=full bash benchmarks/baseline/run-baseline.sh   # → benchmarks/baseline/zion-<ver>-baseline.pdf
 ```
 
 ## Testing

@@ -91,8 +91,8 @@ intended for hand-tuning; `scripts/pgo-collect.sh` is the CI workload.
 
 ## Expected delta
 
-Target: **+10 %** on the representative workloads tracked by
-[`benchmarks/bench-scientific.sh`](../../benchmarks/bench-scientific.sh)
+Target: **+10 %** on the representative workloads tracked by the
+[`benchmarks/baseline/`](../../benchmarks/baseline) harness
 and the criterion microbench surface ([docs/perf/microbench.md](microbench.md)).
 We expect the largest wins on:
 
