@@ -175,7 +175,7 @@ http {
   proxy_cache_path $RES/ngxcache levels=1:2 keys_zone=z:10m max_size=512m inactive=1h;
   upstream be { server 127.0.0.1:9090; keepalive 64; }
   server {
-    listen 4433 ssl; http2 on;
+    listen 4433 ssl http2;
     ssl_certificate $REPO_ROOT/benchmarks/certs/tls.crt;
     ssl_certificate_key $REPO_ROOT/benchmarks/certs/tls.key;
     ssl_protocols TLSv1.2 TLSv1.3;
