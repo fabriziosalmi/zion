@@ -1,0 +1,4 @@
+# Raw tool outputs + intermediate HTML are regenerable; the committed PDF
+# already embeds the raw evidence verbatim in its appendix.
+results/
+report.html

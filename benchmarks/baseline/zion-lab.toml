@@ -1,0 +1,44 @@
+# Baseline lab config — reproducible benchmark + RFC-conformance harness.
+# Mirrors the production edge profile (TLS min 1.2 + memory cache, no WAF) so
+# the numbers and conformance verdicts are representative of the deployed edge.
+#
+# Cert paths are repo-relative; run-baseline.sh generates them (gitignored) via
+# benchmarks/certs/generate.sh before launching zion. Backend is the Go
+# bench-backend on :9090 (benchmarks/backend/main.go).
+[server]
+listen_http = "0.0.0.0:8082"
+listen_https = "0.0.0.0:4432"
+
+[tls]
+cert_path = "benchmarks/certs/tls.crt"
+key_path = "benchmarks/certs/tls.key"
+hot_reload = false
+# 1.2 floor matches the production edge (gitops zion-configmap min_version=1.2)
+# and lets legacy conformance tooling (h2spec, built on an older Go TLS stack)
+# negotiate. rustls still prefers TLS 1.3 when the client supports it.
+min_version = "1.2"
+
+[upstreams]
+backend = "http://127.0.0.1:9090"
+frontend = "http://127.0.0.1:9090"
+
+# Proxy passthrough path (no cache) — measures raw reverse-proxy throughput.
+[[route]]
+path = "/api/{*rest}"
+upstream = "backend"
+mode = "standard"
+waf = false
+
+# Static-cache path — measures RAM cache-hit serve (the data path the v0.4.2
+# Age/origin-TTL fix touches).
+[[route]]
+path = "/_next/static/{*rest}"
+upstream = "frontend"
+mode = "static_cache"
+waf = false
+
+[[route]]
+path = "/{*rest}"
+upstream = "frontend"
+mode = "standard"
+waf = false
