@@ -1647,17 +1647,17 @@ mod tests {
         // real-world misses added to the aggressive set. One assertion per family.
         let p = aggressive_profile();
         for body in [
-            &br#"{"x":"<?php system('id'); ?>"}"#[..],   // php tag + func
-            &br#"{"x":"shell_exec('ls')"}"#[..],         // php dangerous func
-            &br#"{"x":"java.lang.Process"}"#[..],        // java gadget class
-            &br#"{"x":"java.io.PrintStream"}"#[..],      // java io class
-            &br#"{"x":"file:///etc/passwd"}"#[..],       // ssrf/lfi scheme
+            &br#"{"x":"<?php system('id'); ?>"}"#[..], // php tag + func
+            &br#"{"x":"shell_exec('ls')"}"#[..],       // php dangerous func
+            &br#"{"x":"java.lang.Process"}"#[..],      // java gadget class
+            &br#"{"x":"java.io.PrintStream"}"#[..],    // java io class
+            &br#"{"x":"file:///etc/passwd"}"#[..],     // ssrf/lfi scheme
             &br#"{"x":"jar:http://evil.co/b.zip!a"}"#[..], // ssrf jar scheme
-            &br#"{"x":"& net view"}"#[..],               // windows cmdi
-            &br#"{"x":"| sleep 15"}"#[..],               // metachar sleep
-            &br#"{"name__startswith":"a"}"#[..],         // django/orm lookup injection
+            &br#"{"x":"& net view"}"#[..],             // windows cmdi
+            &br#"{"x":"| sleep 15"}"#[..],             // metachar sleep
+            &br#"{"name__startswith":"a"}"#[..],       // django/orm lookup injection
             &br#"{"x":"compress.bzip2://file.bz2"}"#[..], // php stream wrapper
-            &br#"{"x":"@{[ system 'id' ]}"}"#[..],       // perl ssti
+            &br#"{"x":"@{[ system 'id' ]}"}"#[..],     // perl ssti
         ] {
             assert_eq!(
                 validate_request("POST", Some("application/json"), body, &p),
