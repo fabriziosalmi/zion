@@ -37,7 +37,7 @@ use crate::observability;
 
 /// `[audit]` block in zion.toml.
 #[derive(Deserialize, Clone, Debug, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AuditConfig {
     /// Enable the writer task. Disabled by default — operator must opt in.
     pub enabled: bool,
@@ -66,7 +66,7 @@ fn default_queue_depth() -> usize {
 
 /// `[redact]` block. Lists are case-insensitive. Empty = no redaction.
 #[derive(Deserialize, Clone, Debug, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RedactConfig {
     /// HTTP header names whose value should be replaced with `<redacted:N>`.
     /// Compared lowercase per RFC 9110 §5.1 (header names are case-insensitive).

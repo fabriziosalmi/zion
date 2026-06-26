@@ -46,6 +46,7 @@ pub struct Claims {
 /// are only consumed by code under `#[cfg(feature = "auth")]`.
 #[allow(dead_code)]
 #[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct AuthProfileConfig {
     /// Expected issuer (validated against token's `iss` claim).
     #[serde(default)]
