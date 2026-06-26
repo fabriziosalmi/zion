@@ -85,7 +85,9 @@ pub fn run() -> i32 {
     }
 }
 
-fn collect_checks(p: &crate::bootstrap::Platform) -> Vec<Check> {
+/// The host/environment checks — deterministic, no config or network I/O, so
+/// they're stable to unit-test. Always present regardless of deployment.
+fn host_checks(p: &crate::bootstrap::Platform) -> Vec<Check> {
     vec![
         check_fd_limit(),
         check_memory_introspection(),
@@ -96,6 +98,93 @@ fn collect_checks(p: &crate::bootstrap::Platform) -> Vec<Check> {
         check_hardware_crypto(p),
         check_aes_calibration(p),
     ]
+}
+
+fn collect_checks(p: &crate::bootstrap::Platform) -> Vec<Check> {
+    let mut checks = host_checks(p);
+
+    // ── Deploy-time checks ──
+    // The checks above validate the host; these validate the actual deployment,
+    // so a bad config or an unreachable backend is caught by `zion doctor`
+    // BEFORE start, not at first request.
+    let path = std::env::var("ZION_CONFIG").unwrap_or_else(|_| "zion.toml".to_string());
+    if !std::path::Path::new(&path).exists() {
+        checks.push(Check::skip(
+            "config",
+            format!("no config at {path} — run `zion init` or set ZION_CONFIG"),
+        ));
+    } else {
+        match crate::config::load_config(&path) {
+            Ok(cfg) => {
+                checks.push(Check::ok("config", format!("{path} parses and validates")));
+                checks.push(check_upstreams_reachable(&cfg));
+            }
+            Err(e) => checks.push(Check::fail(
+                "config",
+                format!("{path}: {e}"),
+                "fix the config error above, then re-run `zion doctor`",
+            )),
+        }
+    }
+
+    checks
+}
+
+/// Derive the `host:port` to probe from an upstream URL, defaulting the port by
+/// scheme (https→443, else 80). Pure + unit-tested. `None` when the URL has no
+/// host (already reported by config validation).
+fn upstream_socket_addr(url: &str) -> Option<String> {
+    let uri = url.parse::<hyper::Uri>().ok()?;
+    let host = uri.host()?;
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        });
+    Some(format!("{host}:{port}"))
+}
+
+/// Probe each configured upstream with a short TCP connect. **Warn**, not fail,
+/// on unreachable — a backend may simply be booting — but surface it so a
+/// typo'd host:port or a down backend is visible before the first request.
+fn check_upstreams_reachable(cfg: &crate::config::ZionConfig) -> Check {
+    use std::net::ToSocketAddrs;
+    let mut urls: Vec<String> = cfg.upstreams.values().cloned().collect();
+    for up in cfg.upstream.values() {
+        urls.extend(up.get_urls());
+    }
+    if urls.is_empty() {
+        return Check::skip("upstreams", "no upstreams configured");
+    }
+    let mut unreachable = Vec::new();
+    for url in &urls {
+        let Some(addr) = upstream_socket_addr(url) else {
+            continue; // malformed URL already reported by config validation
+        };
+        let reachable = addr
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut a| a.next())
+            .map(|sa| {
+                std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(500))
+                    .is_ok()
+            })
+            .unwrap_or(false);
+        if !reachable {
+            unreachable.push(url.clone());
+        }
+    }
+    if unreachable.is_empty() {
+        Check::ok("upstreams", format!("{} reachable", urls.len()))
+    } else {
+        Check::warn(
+            "upstreams",
+            format!("unreachable: {}", unreachable.join(", ")),
+            "start the backend(s) or fix host:port — transient if they're still booting",
+        )
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -512,6 +601,28 @@ mod tests {
     }
 
     #[test]
+    fn upstream_socket_addr_defaults_port_by_scheme() {
+        assert_eq!(
+            upstream_socket_addr("http://127.0.0.1:8000").as_deref(),
+            Some("127.0.0.1:8000")
+        );
+        assert_eq!(
+            upstream_socket_addr("http://backend").as_deref(),
+            Some("backend:80")
+        );
+        assert_eq!(
+            upstream_socket_addr("https://backend").as_deref(),
+            Some("backend:443")
+        );
+        assert_eq!(
+            upstream_socket_addr("https://backend:9443").as_deref(),
+            Some("backend:9443")
+        );
+        // No host (malformed) → None; config validation reports it separately.
+        assert_eq!(upstream_socket_addr("not a url"), None);
+    }
+
+    #[test]
     fn fd_limit_returns_some_status() {
         let c = check_fd_limit();
         assert_eq!(c.name, "fd limit");
@@ -602,9 +713,11 @@ mod tests {
     #[test]
     fn collect_checks_returns_all_categories() {
         let p = synth_platform();
-        let checks = collect_checks(&p);
-        // Eight canonical checks: fd, memory-introspection, port80, port443,
-        // somaxconn, kernel, hwcrypto, aes-cal.
+        // Test the host checks (deterministic, no config/network I/O). The
+        // eight canonical checks: fd, memory-introspection, port80, port443,
+        // somaxconn, kernel, hwcrypto, aes-cal. (collect_checks() also appends
+        // deploy-time config/upstream checks, which depend on the environment.)
+        let checks = host_checks(&p);
         assert_eq!(checks.len(), 8);
         for c in &checks {
             assert!(!c.name.is_empty());
