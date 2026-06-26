@@ -307,7 +307,10 @@ impl StaticCache {
 
         // If Single-Core fallback is active, bypass L1/L2 distinction.
         // The L2 becomes thread-local Hashmap (L1 speed for all misses).
-        if self.l2.is_none() {
+        // `let-else` binds l2 for the concurrent path below and diverges
+        // (returns) on the single-core path — this replaces a later
+        // `unreachable!()` that was a latent process-abort under panic=abort.
+        let Some(l2_concurrent) = &self.l2 else {
             let mut expired = false;
             let hit = LOCAL_L2.with(|map| {
                 let m = map.borrow();
@@ -341,10 +344,6 @@ impl StaticCache {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             return hit;
-        }
-
-        let Some(l2_concurrent) = &self.l2 else {
-            unreachable!()
         };
 
         let current_gen = self.generation.load(std::sync::atomic::Ordering::Acquire);
@@ -433,7 +432,9 @@ impl StaticCache {
         initial_age_secs: u64,
         max_entries: usize,
     ) {
-        if self.l2.is_none() {
+        // `let-else`: bind l2 for the concurrent path, diverge (return) on the
+        // single-core path — mirrors get(), removes the `unreachable!()` abort.
+        let Some(l2_concurrent) = &self.l2 else {
             // Lock-free single-core backend insertion
             LOCAL_L2.with(|map| {
                 let mut m = map.borrow_mut();
@@ -473,10 +474,6 @@ impl StaticCache {
                 );
             });
             return;
-        }
-
-        let Some(l2_concurrent) = &self.l2 else {
-            unreachable!()
         };
 
         if max_entries > 0 && l2_concurrent.len() >= max_entries {
