@@ -249,6 +249,42 @@ pub async fn proxy_pass(
 /// instead of collapsing it into a 502, so [`proxy_pass_ha`] can decide
 /// whether to fail over to another upstream.
 #[inline]
+/// Strip hop-by-hop headers from an upstream RESPONSE before relaying it to the
+/// client (RFC 9110 §7.6.1). These are meaningful only on the upstream→zion hop;
+/// hyper frames the client connection itself, so forwarding the upstream's
+/// connection-control headers is at best redundant and at worst a desync /
+/// response-smuggling vector on a kept-alive client connection. Removes the
+/// standard set plus any header named in the response's own `Connection` token
+/// list (RFC 9110 §7.6.1: "intermediaries MUST ... remove ... fields ... listed
+/// in the Connection header field").
+fn scrub_response_hop_by_hop(headers: &mut hyper::HeaderMap) {
+    // Headers nominated by the Connection token list, e.g.
+    // `Connection: close, X-Foo` also strips `X-Foo`.
+    if let Some(conn) = headers.get(hyper::header::CONNECTION).cloned() {
+        if let Ok(conn) = conn.to_str() {
+            for token in conn.split(',') {
+                let name = token.trim();
+                // "close"/"keep-alive" are connection options, not field names.
+                if !name.is_empty()
+                    && !name.eq_ignore_ascii_case("close")
+                    && !name.eq_ignore_ascii_case("keep-alive")
+                {
+                    headers.remove(name);
+                }
+            }
+        }
+    }
+    // The standard hop-by-hop set (RFC 9110 §7.6.1 + well-known extras).
+    headers.remove(hyper::header::CONNECTION);
+    headers.remove(hyper::header::TRANSFER_ENCODING);
+    headers.remove(hyper::header::TE);
+    headers.remove(hyper::header::TRAILER);
+    headers.remove(hyper::header::UPGRADE);
+    headers.remove(hyper::header::PROXY_AUTHENTICATE);
+    headers.remove("Proxy-Connection");
+    headers.remove("Keep-Alive");
+}
+
 async fn send_request_try(
     client: &HttpClient,
     req: Request<ZionBody>,
@@ -258,7 +294,8 @@ async fn send_request_try(
     crate::metrics::METRICS
         .upstream_duration
         .observe(upstream_start.elapsed());
-    let (parts, body) = result?.into_parts();
+    let (mut parts, body) = result?.into_parts();
+    scrub_response_hop_by_hop(&mut parts.headers);
     Ok(Response::from_parts(parts, body.boxed()))
 }
 
@@ -427,6 +464,7 @@ pub async fn proxy_pass_stream(
     match client.request(req).await {
         Ok(resp) => {
             let (mut parts, body) = resp.into_parts();
+            scrub_response_hop_by_hop(&mut parts.headers);
             parts.headers.insert(
                 "Cache-Control",
                 hyper::header::HeaderValue::from_static("no-cache"),
@@ -473,7 +511,8 @@ async fn send_request(
             crate::metrics::METRICS
                 .upstream_duration
                 .observe(upstream_start.elapsed());
-            let (parts, body) = resp.into_parts();
+            let (mut parts, body) = resp.into_parts();
+            scrub_response_hop_by_hop(&mut parts.headers);
             Ok(Response::from_parts(parts, body.boxed()))
         }
         Ok(Err(e)) => {
@@ -775,6 +814,38 @@ mod tests {
             prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).unwrap();
         assert!(req.headers().get(hyper::header::HOST).is_none());
         assert!(req.headers().get(hyper::header::CONNECTION).is_none());
+    }
+
+    #[test]
+    fn scrub_strips_response_hop_by_hop_headers() {
+        // RFC 9110 §7.6.1: the upstream response's hop-by-hop headers + any
+        // header it names in `Connection` must not reach the client; end-to-end
+        // headers must survive.
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::CONNECTION,
+            "keep-alive, X-Custom-Hop".parse().unwrap(),
+        );
+        headers.insert(hyper::header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        headers.insert("Keep-Alive", "timeout=5".parse().unwrap());
+        headers.insert("X-Custom-Hop", "secret".parse().unwrap());
+        headers.insert(hyper::header::CONTENT_TYPE, "text/html".parse().unwrap());
+        headers.insert("X-Keep-Me", "ok".parse().unwrap());
+
+        scrub_response_hop_by_hop(&mut headers);
+
+        // standard hop-by-hop stripped
+        assert!(headers.get(hyper::header::CONNECTION).is_none());
+        assert!(headers.get(hyper::header::TRANSFER_ENCODING).is_none());
+        assert!(headers.get("Keep-Alive").is_none());
+        // header nominated by the Connection token list stripped
+        assert!(headers.get("X-Custom-Hop").is_none());
+        // end-to-end headers preserved
+        assert_eq!(
+            headers.get(hyper::header::CONTENT_TYPE).unwrap(),
+            "text/html"
+        );
+        assert_eq!(headers.get("X-Keep-Me").unwrap(), "ok");
     }
 
     #[test]
