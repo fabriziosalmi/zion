@@ -1,0 +1,115 @@
+name: waf-corpus
+
+# WAF detection / false-positive regression gate.
+#
+# Fires the frozen attack+benign corpora (benchmarks/waf-corpus/) at a live,
+# WAF-protected zion route and asserts the precision invariant: run.py exits
+# non-zero if ANY benign payload is blocked (a false positive is a hard fail).
+# Detection rate per class is printed for visibility (a recall *drop* shows in
+# the log even though it isn't a hard gate — recall is the thing we improve, FP
+# is the thing we must never regress).
+#
+# Was a manual/local gate; this turns it into an automated nightly + a gate on
+# any change to the WAF or the corpus. Mirrors integration.yml's setup
+# (self-signed cert, Rust bench backend on :9090, zion on :4431).
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # nightly 04:00 UTC
+  workflow_dispatch: {}
+  pull_request:
+    branches: [master]
+    paths:
+      - "src/waf.rs"
+      - "benchmarks/waf-corpus/**"
+      - ".github/workflows/waf-corpus.yml"
+  push:
+    branches: [master]
+    paths:
+      - "src/waf.rs"
+      - "benchmarks/waf-corpus/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: waf-corpus-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  waf-corpus:
+    name: WAF corpus (detection + 0% false-positive gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: integration # share the integration job's compiled deps
+
+      - name: Generate self-signed cert
+        run: bash benchmarks/certs/generate.sh
+
+      - name: Build zion (release)
+        run: cargo build --release --bin zion
+
+      - name: Build test backend (release)
+        run: cargo build --release --manifest-path benchmarks/backend/Cargo.toml
+
+      - name: Start backend (:9090)
+        run: |
+          ./benchmarks/backend/target/release/zion-bench-backend > backend.log 2>&1 &
+          echo $! > backend.pid
+
+      - name: Start zion (WAF profile, :4431)
+        env:
+          ZION_CONFIG: benchmarks/zion-bench-tls-waf.toml
+        run: |
+          ./target/release/zion > zion.log 2>&1 &
+          echo $! > zion.pid
+
+      - name: Wait for both daemons to be ready
+        run: |
+          # Backend :9090 (HTTP) + zion :4431 (HTTPS). The catch-all route has
+          # no WAF, so a benign GET to / proves the full path (zion → backend).
+          for i in $(seq 1 30); do
+            backend_ok=0; zion_ok=0
+            curl -s  --max-time 1 http://127.0.0.1:9090/api/v1/health > /dev/null 2>&1 && backend_ok=1
+            curl -sk --max-time 1 https://127.0.0.1:4431/            > /dev/null 2>&1 && zion_ok=1
+            if [ "$backend_ok" = 1 ] && [ "$zion_ok" = 1 ]; then
+              echo "ready after ${i}s (backend=:9090, zion=:4431)"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::backend and/or zion did not become ready in 30s"
+          echo "--- backend.log ---"; cat backend.log || true
+          echo "--- zion.log ---";    cat zion.log || true
+          exit 1
+
+      - name: WAF corpus v1 (balanced) — hard-fails on any false positive
+        run: python3 benchmarks/waf-corpus/run.py https://127.0.0.1:4431 "balanced / v1"
+
+      - name: WAF corpus v2 (balanced, sourced) — hard-fails on any false positive
+        env:
+          WAF_CORPUS: corpus-v2.json
+        run: python3 benchmarks/waf-corpus/run.py https://127.0.0.1:4431 "balanced / v2"
+
+      - name: Dump daemon logs on failure
+        if: failure()
+        run: |
+          echo "::group::zion.log";    cat zion.log    || true; echo "::endgroup::"
+          echo "::group::backend.log"; cat backend.log || true; echo "::endgroup::"
+
+      - name: Tear down daemons
+        if: always()
+        run: |
+          [ -f zion.pid ]    && kill "$(cat zion.pid)"    2>/dev/null || true
+          [ -f backend.pid ] && kill "$(cat backend.pid)" 2>/dev/null || true
