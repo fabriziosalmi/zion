@@ -118,6 +118,7 @@ fn collect_checks(p: &crate::bootstrap::Platform) -> Vec<Check> {
             Ok(cfg) => {
                 checks.push(Check::ok("config", format!("{path} parses and validates")));
                 checks.push(check_upstreams_reachable(&cfg));
+                checks.push(check_security_posture(&cfg));
             }
             Err(e) => checks.push(Check::fail(
                 "config",
@@ -183,6 +184,42 @@ fn check_upstreams_reachable(cfg: &crate::config::ZionConfig) -> Check {
             "upstreams",
             format!("unreachable: {}", unreachable.join(", ")),
             "start the backend(s) or fix host:port — transient if they're still booting",
+        )
+    }
+}
+
+/// Surface the security-relevant defaults that are *silently off*, so they're
+/// a conscious operator choice rather than a surprise: per-IP request-rate
+/// limiting (`rate_limit_rps = 0` = disabled) and WAF coverage (no route with a
+/// `waf_profile` / `waf = true`). **Warn**, not fail — a gateway may legitimately
+/// run without either, but the operator should know.
+fn check_security_posture(cfg: &crate::config::ZionConfig) -> Check {
+    let rate_off = cfg.server.rate_limit_rps == 0;
+    let waf_routes = cfg
+        .route
+        .iter()
+        .filter(|r| r.waf_profile.is_some() || r.waf)
+        .count();
+    let total = cfg.route.len();
+
+    let mut notes = Vec::new();
+    if rate_off {
+        notes.push("per-IP request-rate limiting is OFF (server.rate_limit_rps = 0)".to_string());
+    }
+    if total > 0 && waf_routes == 0 {
+        notes.push("WAF is not assigned to any route".to_string());
+    }
+
+    if notes.is_empty() {
+        Check::ok(
+            "posture",
+            format!("rate-limit on; WAF on {waf_routes}/{total} routes"),
+        )
+    } else {
+        Check::warn(
+            "posture",
+            notes.join("; "),
+            "intentional? set server.rate_limit_rps and/or a route waf_profile to harden",
         )
     }
 }
@@ -620,6 +657,45 @@ mod tests {
         );
         // No host (malformed) → None; config validation reports it separately.
         assert_eq!(upstream_socket_addr("not a url"), None);
+    }
+
+    #[test]
+    fn security_posture_warns_when_protections_off() {
+        // rate-limit defaulted off + no WAF on any route → Warn.
+        let off = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstreams]
+be = "http://127.0.0.1:8000"
+[[route]]
+path = "/{*rest}"
+upstream = "be"
+"#;
+        let cfg: crate::config::ZionConfig = toml::from_str(off).unwrap();
+        assert_eq!(check_security_posture(&cfg).status, Status::Warn);
+
+        // rate-limit on + a WAF-protected route → Ok.
+        let hardened = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+rate_limit_rps = 100
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstreams]
+be = "http://127.0.0.1:8000"
+[[route]]
+path = "/{*rest}"
+upstream = "be"
+waf = true
+"#;
+        let cfg2: crate::config::ZionConfig = toml::from_str(hardened).unwrap();
+        assert_eq!(check_security_posture(&cfg2).status, Status::Ok);
     }
 
     #[test]
