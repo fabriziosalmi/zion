@@ -445,11 +445,9 @@ async fn writer_loop(
         )),
     };
     if let Ok((signed, new_prev)) = sign_event(&key, init, prev_hash.clone()) {
-        if let Ok(line) = serde_json::to_string(&signed) {
-            if file.write_all(line.as_bytes()).await.is_err()
-                || file.write_all(b"\n").await.is_err()
-                || file.flush().await.is_err()
-            {
+        if let Ok(mut line) = serde_json::to_string(&signed) {
+            line.push('\n'); // one all-or-nothing record write (no orphaned line)
+            if file.write_all(line.as_bytes()).await.is_err() || file.flush().await.is_err() {
                 crate::logging::error(
                     "audit",
                     "audit chain-init write/flush failed — the on-disk log may be unreliable",
@@ -461,6 +459,9 @@ async fn writer_loop(
     }
 
     let mut seq: u64 = 1;
+    // Tracks whether flush is currently failing, so we log the degraded↔healthy
+    // transition once instead of per-event.
+    let mut flush_degraded = false;
     while let Some(mut event) = rx.recv().await {
         event.seq = seq;
         if event.ts.is_empty() {
@@ -468,29 +469,43 @@ async fn writer_loop(
         }
         match sign_event(&key, event, prev_hash.clone()) {
             Ok((signed, new_prev)) => {
-                if let Ok(line) = serde_json::to_string(&signed) {
-                    if file.write_all(line.as_bytes()).await.is_err()
-                        || file.write_all(b"\n").await.is_err()
-                    {
+                if let Ok(mut line) = serde_json::to_string(&signed) {
+                    line.push('\n'); // single all-or-nothing record write
+                    if file.write_all(line.as_bytes()).await.is_err() {
+                        // Terminal: the buffer can't even accept the record
+                        // (disk full / fd revoked). Stop rather than spin.
                         crate::logging::error(
                             "audit",
-                            "audit log write failed — disk full or fd revoked, exiting writer",
+                            "audit log write failed — buffer cannot accept data (disk full / fd revoked), exiting writer",
                         );
                         break;
                     }
                     prev_hash = new_prev;
                     seq += 1;
-                    // Flush each event — durability over throughput. Audit
-                    // logs are low-rate; if this becomes a bottleneck we
-                    // can batch on a 100ms timer. A flush failure means the
-                    // event is NOT durable — surface it and stop, rather than
-                    // silently advancing the chain over un-persisted data.
-                    if file.flush().await.is_err() {
-                        crate::logging::error(
-                            "audit",
-                            "audit log flush failed — events may not be durable, exiting writer",
-                        );
-                        break;
+                    // Flush each event — durability over throughput. A flush
+                    // failure (transient ENOSPC, slow network FS) does NOT kill
+                    // the writer: the record stays buffered and a later flush
+                    // retries it, so audit self-heals once the disk recovers.
+                    // Log the degraded↔healthy transition once, not per event.
+                    match file.flush().await {
+                        Ok(()) => {
+                            if flush_degraded {
+                                crate::logging::warn(
+                                    "audit",
+                                    "audit log flush recovered — durability restored",
+                                );
+                                flush_degraded = false;
+                            }
+                        }
+                        Err(e) => {
+                            if !flush_degraded {
+                                crate::logging::error(
+                                    "audit",
+                                    &format!("audit log flush failing ({e}) — records buffered, not yet durable; retrying (writer stays alive)"),
+                                );
+                                flush_degraded = true;
+                            }
+                        }
                     }
                 }
             }

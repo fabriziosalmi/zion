@@ -147,11 +147,35 @@ fn upstream_socket_addr(url: &str) -> Option<String> {
     Some(format!("{host}:{port}"))
 }
 
+/// Resolve + TCP-connect `host:port`, BOUNDED end-to-end. `connect_timeout`
+/// only caps the connect; `to_socket_addrs` (blocking libc `getaddrinfo`) has no
+/// timeout and stalls for the OS resolver budget on a slow/blackholed DNS. Run
+/// the whole probe on a detached thread and cap it with a `recv_timeout` so
+/// `zion doctor` can't hang (a leaked thread on a hung resolver is fine for a
+/// short-lived CLI). Returns false on timeout / unresolved / refused.
+fn probe_reachable(addr: String) -> bool {
+    use std::net::ToSocketAddrs;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ok = addr
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut a| a.next())
+            .map(|sa| {
+                std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(500))
+                    .is_ok()
+            })
+            .unwrap_or(false);
+        let _ = tx.send(ok);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap_or(false)
+}
+
 /// Probe each configured upstream with a short TCP connect. **Warn**, not fail,
 /// on unreachable — a backend may simply be booting — but surface it so a
 /// typo'd host:port or a down backend is visible before the first request.
 fn check_upstreams_reachable(cfg: &crate::config::ZionConfig) -> Check {
-    use std::net::ToSocketAddrs;
     let mut urls: Vec<String> = cfg.upstreams.values().cloned().collect();
     for up in cfg.upstream.values() {
         urls.extend(up.get_urls());
@@ -164,16 +188,7 @@ fn check_upstreams_reachable(cfg: &crate::config::ZionConfig) -> Check {
         let Some(addr) = upstream_socket_addr(url) else {
             continue; // malformed URL already reported by config validation
         };
-        let reachable = addr
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut a| a.next())
-            .map(|sa| {
-                std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(500))
-                    .is_ok()
-            })
-            .unwrap_or(false);
-        if !reachable {
+        if !probe_reachable(addr) {
             unreachable.push(url.clone());
         }
     }

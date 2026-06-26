@@ -1367,17 +1367,27 @@ mtls_fingerprint = false
 
     #[test]
     fn example_config_parses_with_deny_unknown_fields() {
-        // The documented reference config MUST always deserialize — this also
-        // guards `deny_unknown_fields` against drift between zion.example.toml
-        // and the config structs (a new TOML key without a struct field, or a
-        // renamed field, fails here loudly instead of in production).
-        let toml = include_str!("../zion.example.toml");
-        let parsed: Result<ZionConfig, _> = toml::from_str(toml);
-        assert!(
-            parsed.is_ok(),
-            "zion.example.toml failed to parse: {:?}",
-            parsed.err()
-        );
+        // Every shipped reference/example config MUST deserialize — this guards
+        // `deny_unknown_fields` against drift between the docs and the structs
+        // (a new/renamed/misplaced TOML key fails here loudly, not in prod).
+        // Covers zion.example.toml + all examples/*.toml so a new example can't
+        // silently ship un-loadable (this caught examples/multi-site.toml's
+        // top-level [cors] block).
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut files = vec![std::path::PathBuf::from(format!(
+            "{root}/zion.example.toml"
+        ))];
+        for entry in std::fs::read_dir(format!("{root}/examples")).expect("read examples/") {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) == Some("toml") {
+                files.push(p);
+            }
+        }
+        for f in &files {
+            let toml = std::fs::read_to_string(f).unwrap_or_else(|e| panic!("read {f:?}: {e}"));
+            let parsed: Result<ZionConfig, _> = toml::from_str(&toml);
+            assert!(parsed.is_ok(), "{f:?} failed to parse: {:?}", parsed.err());
+        }
     }
 
     #[test]

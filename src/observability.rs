@@ -53,7 +53,7 @@ pub fn render_counters(out: &mut bytes::BytesMut) {
         ),
         (
             "zion_audit_events_dropped_total",
-            "Audit events dropped because the writer queue was full.",
+            "Audit events dropped: queue full (back-pressure) OR the writer task has terminally exited (write failure). A sustained non-zero rate with low traffic indicates a dead writer, not back-pressure.",
             AUDIT_EVENTS_DROPPED_TOTAL.load(Ordering::Relaxed),
         ),
         (

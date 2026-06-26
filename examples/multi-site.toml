@@ -75,11 +75,13 @@ max_entries = 10000
 ttl_seconds = 31536000
 
 # ── Routes ───────────────────────────────────────────────────────
-# API backend (with WAF)
+# API backend (with WAF + CORS)
 [[route]]
 path = "/api/{*rest}"
 upstream = "api"
 waf_profile = "strict"
+# CORS is configured PER ROUTE (there is no top-level [cors] table).
+cors = { allowed_origins = ["https://app.example.com"], allowed_headers = ["Content-Type", "Authorization"], max_age = 86400 }
 
 # Next.js static assets (cached in RAM)
 [[route]]
@@ -115,9 +117,3 @@ internal_only = true
 [[route]]
 path = "/{*rest}"
 upstream = "frontend"
-
-# ── CORS (for API) ───────────────────────────────────────────────
-[cors]
-allowed_origins = ["https://app.example.com"]
-allowed_headers = ["Content-Type", "Authorization"]
-max_age = 86400
