@@ -176,6 +176,18 @@ pub(crate) async fn process_request(
     Ok(resp)
 }
 
+/// RFC 8470 §5.2: TLS 1.3 early data (0-RTT) is replay-vulnerable — a network
+/// adversary who captures the ClientHello + early data can replay it. Only
+/// safe/idempotent methods may ride in 0-RTT; a state-changing method replayed
+/// from early data could duplicate effects, so it gets **425 Too Early** and
+/// the client retries once the handshake completes. Returns `true` when the
+/// request MUST be rejected. Pure + unit-tested — guards the otherwise
+/// untestable `main.rs → dispatch.rs` `was_early` plumbing against a silent
+/// regression that would re-enable non-idempotent 0-RTT replay.
+fn early_data_rejected(is_early_data: bool, method: &hyper::Method) -> bool {
+    is_early_data && !matches!(*method, hyper::Method::GET | hyper::Method::HEAD)
+}
+
 async fn process_request_inner(
     mut req: Request<ZionBody>,
     state: Arc<AppState>,
@@ -223,7 +235,7 @@ async fn process_request_inner(
     // TLS 1.3 early data is inherently replay-vulnerable. Only idempotent
     // methods (GET/HEAD) are safe — state-changing methods could be replayed
     // by a network adversary capturing the ClientHello + early data.
-    if is_early_data && !matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD) {
+    if early_data_rejected(is_early_data, req.method()) {
         // SAFETY: 425 "Too Early" (RFC 8470) is a valid HTTP status code in
         // the 100..1000 range that hyper accepts. The literal `425` is a
         // compile-time constant; `from_u16` rejects only out-of-range u16s.
@@ -1948,6 +1960,48 @@ mod tests {
         // Content-Encoding, so it isn't a path-key collision.
         let h = hdr(hyper::header::VARY, "Accept-Encoding");
         assert!(is_shared_cacheable(false, &h, TTL, 0));
+    }
+
+    // ── RFC 8470 §5.2: 0-RTT early-data replay gate (early_data_rejected) ──
+    // CI-run coverage for the 425 behavior the docs claimed via a
+    // (nonexistent) integration test; guards the main.rs `was_early` plumbing.
+    #[test]
+    fn early_data_allows_safe_methods() {
+        // GET/HEAD are safe to carry in 0-RTT → not rejected.
+        assert!(!early_data_rejected(true, &hyper::Method::GET));
+        assert!(!early_data_rejected(true, &hyper::Method::HEAD));
+    }
+
+    #[test]
+    fn early_data_rejects_state_changing_methods() {
+        // Non-idempotent / unsafe methods replayed from 0-RTT → 425 Too Early.
+        for m in [
+            hyper::Method::POST,
+            hyper::Method::PUT,
+            hyper::Method::PATCH,
+            hyper::Method::DELETE,
+            hyper::Method::OPTIONS,
+        ] {
+            assert!(
+                early_data_rejected(true, &m),
+                "{m} in early data must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn no_early_data_never_rejects() {
+        // Handshake complete (not 0-RTT) → every method passes the gate.
+        for m in [
+            hyper::Method::GET,
+            hyper::Method::POST,
+            hyper::Method::DELETE,
+        ] {
+            assert!(
+                !early_data_rejected(false, &m),
+                "{m} outside early data must pass"
+            );
+        }
     }
 
     #[test]
