@@ -4,6 +4,23 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-06-26
+
+A WAF detection-coverage patch, driven by a larger sourced corpus.
+
+### Added
+- WAF **corpus-v2** (`benchmarks/waf-corpus/corpus-v2.json`): ~1,060 malicious
+  payloads sourced from OWASP CRS + PayloadsAllTheThings, plus 136 benign — the
+  honest regression set. `build-corpus-v2.py` regenerates it; `run.py` takes
+  `WAF_CORPUS=<file>`.
+
+### Changed
+- WAF aggressive pattern set: a corpus-v2-driven round (PHP tags/funcs, Java
+  gadget classes, SSRF schemes, Windows command injection, ORM lookups, PHP
+  stream wrappers, Perl SSTI) lifts aggressive recall vs corpus-v2 from 30.9%
+  to 40.6% at an unchanged **0% false-positive rate** (0/136). balanced
+  unchanged. Guarded by new `denies_/allows_corpus_v2_round` unit tests.
+
 ## [0.4.4] - 2026-06-25
 
 A WAF-coverage patch. Adds a measured detection/false-positive regression
