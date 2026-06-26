@@ -59,6 +59,7 @@ pub enum WafMode {
 }
 
 #[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct WafProfile {
     #[serde(default)]
     pub mode: WafMode,
