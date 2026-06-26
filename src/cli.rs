@@ -34,6 +34,10 @@ pub enum Command {
     /// `zion --auto --upstream=:3000` is the fastest path from "I have a
     /// backend" to "TLS in front of it" with zero config files.
     Auto(AutoOpts),
+    /// Synthesize a validated `zion.toml` from detected signals (a listening
+    /// backend, or `--upstream` / `--domain` hints) and print it (or `--write`
+    /// it). Deterministic, no ML, self-validated by the config parser (#133).
+    Suggest(SuggestOpts),
     /// Print version and exit 0.
     Version,
     /// Print help and exit 0.
@@ -62,6 +66,18 @@ impl Default for TopOpts {
             interval_ms: 500,
         }
     }
+}
+
+/// Options for `zion suggest`. All optional — with none, it scans localhost
+/// for a backend and emits a config to stdout.
+#[derive(Debug, Clone, Default)]
+pub struct SuggestOpts {
+    /// Upstream hint: `:3000`, `3000`, `host:port`. None = scan localhost.
+    pub upstream: Option<String>,
+    /// Domain for the TLS cert path hint. None = "localhost".
+    pub domain: Option<String>,
+    /// Write the (validated) config to this path instead of stdout.
+    pub write: Option<String>,
 }
 
 /// Options for `zion init`. All flags are additive — the wizard fills in
@@ -157,6 +173,7 @@ pub(crate) fn parse_argv(args: &[String]) -> Command {
         "init" => Command::Init(parse_init_opts(&args[1..])),
         "bootstrap" => Command::Bootstrap,
         "auto" => Command::Auto(parse_auto_opts(&args[1..])),
+        "suggest" => Command::Suggest(parse_suggest_opts(&args[1..])),
         "acme-soak" => Command::AcmeSoak,
         other => {
             // Anything else: surface as Unknown — caller prints help and exits 1.
@@ -190,6 +207,29 @@ fn parse_auto_opts(args: &[String]) -> AutoOpts {
             }
             "--hostname" if i + 1 < args.len() => {
                 opts.hostname = args[i + 1].clone();
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    opts
+}
+
+fn parse_suggest_opts(args: &[String]) -> SuggestOpts {
+    let mut opts = SuggestOpts::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-u" | "--upstream" if i + 1 < args.len() => {
+                opts.upstream = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "-d" | "--domain" if i + 1 < args.len() => {
+                opts.domain = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "-w" | "--write" if i + 1 < args.len() => {
+                opts.write = Some(args[i + 1].clone());
                 i += 2;
             }
             _ => i += 1,
@@ -305,6 +345,7 @@ pub fn print_help() {
             {bin} auto --upstream :3000  one-shot dev mode: TLS in front of upstream, no config files\n  \
             {bin} top [opts]             live TUI dashboard\n  \
             {bin} init [opts]            generate zion.toml from prompts (or flags)\n  \
+            {bin} suggest [opts]         synthesize a validated zion.toml from a detected/declared backend\n  \
             {bin} doctor                 run environment diagnostic checks\n  \
             {bin} bootstrap              dump detected platform as JSON (for CI / automation)\n  \
             {bin} --version              print version\n  \
@@ -351,6 +392,33 @@ mod tests {
     #[test]
     fn empty_argv_is_daemon() {
         assert!(matches!(parse_argv(&argv(&[])), Command::Daemon));
+    }
+
+    #[test]
+    fn parse_suggest_flags() {
+        match parse_argv(&argv(&[
+            "suggest",
+            "--upstream",
+            ":3000",
+            "--domain",
+            "x.example.com",
+            "--write",
+            "out.toml",
+        ])) {
+            Command::Suggest(o) => {
+                assert_eq!(o.upstream.as_deref(), Some(":3000"));
+                assert_eq!(o.domain.as_deref(), Some("x.example.com"));
+                assert_eq!(o.write.as_deref(), Some("out.toml"));
+            }
+            _ => panic!("expected Suggest"),
+        }
+        // Bare `suggest` → all None (scan localhost, print to stdout).
+        match parse_argv(&argv(&["suggest"])) {
+            Command::Suggest(o) => {
+                assert!(o.upstream.is_none() && o.domain.is_none() && o.write.is_none())
+            }
+            _ => panic!("expected Suggest"),
+        }
     }
 
     #[test]
