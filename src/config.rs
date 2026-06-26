@@ -450,8 +450,12 @@ fn default_max_entries() -> usize {
     10_000
 }
 fn default_ttl() -> u64 {
-    31_536_000
-} // 1 year
+    // Conservative heuristic-freshness default (RFC 9111 §4.2.2) for a
+    // static_cache route that names no explicit lifetime: cache for 1 hour, not
+    // a year. A header-less origin response must not be frozen (the audiolibri
+    // staleness root cause) — set `ttl_seconds` explicitly for longer/immutable.
+    3600
+} // 1 hour
 
 // ============================================================================
 // ROUTE CONFIG
@@ -752,7 +756,9 @@ pub fn build_router(config: &ZionConfig) -> Result<Router<Arc<ResolvedRoute>>, S
                     .clone(),
             )
         } else if route.mode == RouteMode::StaticCache {
-            // Legacy: create default immutable cache profile
+            // Default in-RAM profile for a profile-less static_cache route:
+            // conservative 1h TTL (default_ttl), NOT immutable. Name an explicit
+            // [cache_profile] with a longer ttl_seconds for content-hashed assets.
             Some(CacheProfile {
                 mode: CacheMode::Memory,
                 max_entries: default_max_entries(),
@@ -1459,7 +1465,9 @@ mode = "static_cache"
         let router = build_router(&config).unwrap();
         let route = router.at("/_next/static/chunk.js").unwrap();
         assert!(route.value.cache.is_some());
-        assert_eq!(route.value.cache.as_ref().unwrap().ttl_seconds, 31_536_000);
+        // Profile-less static_cache route → conservative 1h default (was 1 year;
+        // the audiolibri staleness fix). Operators set ttl_seconds for longer.
+        assert_eq!(route.value.cache.as_ref().unwrap().ttl_seconds, 3600);
     }
 
     #[test]
