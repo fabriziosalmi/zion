@@ -1455,7 +1455,9 @@ async fn handle_static_cache(
     // explicit profile uses the ~1-year content-hashed default).
     let (cache_ttl, cache_max) = match &rule.cache {
         Some(cp) => (cp.ttl_seconds, cp.max_entries),
-        None => (31_536_000, 10_000),
+        // Conservative fallback (1h) for a static_cache route with no resolved
+        // profile — never the old 1-year freeze. See config::default_ttl.
+        None => (3600, 10_000),
     };
 
     // RFC 9111 §3.5: capture whether the request is authenticated BEFORE `req`
@@ -2005,6 +2007,23 @@ mod tests {
                 "{m} outside early data must pass"
             );
         }
+    }
+
+    // ── RFC 9111 §4.2.2: conservative default freshness + immutable opt-in ──
+    #[test]
+    fn profile_cache_control_immutable_is_opt_in_via_explicit_year() {
+        // The conservative 1h default → plain max-age, NOT immutable (so a
+        // header-less response can't be frozen — the audiolibri staleness fix).
+        assert_eq!(
+            profile_cache_control(3600).to_str().unwrap(),
+            "public, max-age=3600"
+        );
+        // `immutable` is emitted ONLY when an operator explicitly sets a >= 1-year
+        // TTL — the deliberate "content-hashed, never revalidate" opt-in.
+        assert!(profile_cache_control(31_536_000)
+            .to_str()
+            .unwrap()
+            .contains("immutable"));
     }
 
     #[test]
