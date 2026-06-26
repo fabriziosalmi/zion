@@ -570,6 +570,18 @@ pub fn parse_schema(raw: &str, label: &str) -> Result<ZionConfig, String> {
     toml::from_str(raw).map_err(|e| format!("Invalid TOML in {label}: {e}"))
 }
 
+/// Full validation of a config from an in-memory string — the same schema AND
+/// semantic checks `load_config` runs (route refs, CIDRs, cert-file existence,
+/// …), minus the file read. Used by the admin API's `POST /admin/config`, where
+/// the pushed body must be fully deployable (real cert paths and all), unlike
+/// `zion suggest` which only needs the schema-level [`parse_schema`].
+pub fn validate_str(raw: &str, label: &str) -> Result<ZionConfig, String> {
+    let config: ZionConfig =
+        toml::from_str(raw).map_err(|e| format!("Invalid TOML in {label}: {e}"))?;
+    validate_config(&config, label)?;
+    Ok(config)
+}
+
 /// An upstream URL must parse AND use http/https. A scheme-less `host:port` or
 /// an `ftp://`/`ws://` URL parses as a valid `Uri` but fails cryptically at the
 /// first proxied request, so reject it at startup with an actionable message.
