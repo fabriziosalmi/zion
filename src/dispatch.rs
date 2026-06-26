@@ -1312,6 +1312,71 @@ fn origin_freshness(headers: &hyper::HeaderMap) -> Option<u64> {
     None
 }
 
+/// RFC 9111 storability decision for zion's **shared** cache: `true` if a 200
+/// response may be stored under the path key, `false` if it must be streamed
+/// straight through (bypass). Pure + unit-tested — the policy gate that keeps
+/// the cache RFC-correct. Bypass when ANY holds:
+/// - effective freshness lifetime is 0, or the object already arrived stale
+///   (`Age >= lifetime`) — §4.2;
+/// - the response is marked `private` / `no-store` / `no-cache` (§3.2, §5.2.2);
+/// - the request carried `Authorization` and the response does NOT explicitly
+///   opt in via `public` / `s-maxage` / `must-revalidate` (**§3.5** — without
+///   this a shared cache leaks one user's authenticated body to another);
+/// - `Vary` nominates a content-negotiation / personalization header a
+///   path-only key can't separate (§4.1); `Accept-Encoding` is treated as safe
+///   (the entry stores raw bytes + its `Content-Encoding`).
+fn is_shared_cacheable(
+    req_authenticated: bool,
+    resp_headers: &hyper::HeaderMap,
+    effective_ttl: u64,
+    initial_age: u64,
+) -> bool {
+    if effective_ttl == 0 || initial_age >= effective_ttl {
+        return false;
+    }
+
+    let cc = resp_headers
+        .get(hyper::header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase());
+
+    // §3.2 / §5.2.2: origin forbids shared storage.
+    if let Some(cc) = &cc {
+        if cc.contains("private") || cc.contains("no-store") || cc.contains("no-cache") {
+            return false;
+        }
+    }
+
+    // §3.5: a response to an authenticated request is storable in a shared
+    // cache ONLY when the origin explicitly allows it.
+    if req_authenticated {
+        let opted_in = cc
+            .as_deref()
+            .map(|cc| {
+                cc.contains("public") || cc.contains("s-maxage") || cc.contains("must-revalidate")
+            })
+            .unwrap_or(false);
+        if !opted_in {
+            return false;
+        }
+    }
+
+    // §4.1: content negotiation / personalization a path-only key can't split.
+    // Exact token match — `Accept-Encoding` is safe, bare `Accept` is not.
+    let unsafe_vary = resp_headers
+        .get(hyper::header::VARY)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            let v_lower = v.to_ascii_lowercase();
+            v_lower.split(',').any(|token| {
+                let t = token.trim();
+                t == "accept" || t == "negotiate" || t == "authorization" || t == "cookie"
+            }) || v_lower == "*"
+        })
+        .unwrap_or(false);
+    !unsafe_vary
+}
+
 /// Age (seconds) the response already carried on arrival, from the upstream
 /// `Age` header (the shield Varnish stamps it). Seeds the entry's age so the
 /// `Age` zion emits reflects the object's true age across all cache tiers,
@@ -1377,6 +1442,11 @@ async fn handle_static_cache(
         Some(cp) => (cp.ttl_seconds, cp.max_entries),
         None => (31_536_000, 10_000),
     };
+
+    // RFC 9111 §3.5: capture whether the request is authenticated BEFORE `req`
+    // is consumed by the upstream fetch — the storability gate below needs it
+    // to avoid caching one user's authenticated response in the shared cache.
+    let req_authenticated = req.headers().contains_key(hyper::header::AUTHORIZATION);
 
     // Use full path+query as cache key to prevent cache poisoning:
     // /api?user=alice and /api?user=bob must NOT share a cache entry.
@@ -1450,39 +1520,6 @@ async fn handle_static_cache(
     if resp.status() == StatusCode::OK {
         let (parts, body) = resp.into_parts();
 
-        // S-04: Skip caching if upstream uses content negotiation or personalization.
-        // Caching content-negotiated responses with path-only key would serve wrong
-        // content types or personalized data to other clients.
-        let has_unsafe_vary = parts
-            .headers
-            .get(hyper::header::VARY)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| {
-                // Check for content-negotiation headers that make path-only
-                // caching unsafe. Use exact token matching to avoid false positives:
-                // "Accept-Encoding" is safe (cache stores raw bytes), but "Accept"
-                // means the upstream varies on media type which IS unsafe.
-                let v_lower = v.to_ascii_lowercase();
-                v_lower.split(',').any(|token| {
-                    let t = token.trim();
-                    t == "accept" || t == "negotiate" || t == "authorization" || t == "cookie"
-                }) || v_lower == "*"
-            })
-            .unwrap_or(false);
-
-        // Never cache (or serve from a shared cache) a response the origin
-        // marked private / no-store / no-cache — that could leak one client's
-        // response to another. Stream it straight through instead.
-        let cc_forbids_cache = parts
-            .headers
-            .get(hyper::header::CACHE_CONTROL)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| {
-                let v = v.to_ascii_lowercase();
-                v.contains("private") || v.contains("no-store") || v.contains("no-cache")
-            })
-            .unwrap_or(false);
-
         // Honor the origin's freshness instead of blanket-applying the profile
         // TTL: a short origin `max-age`/`s-maxage` shortens the lifetime, the
         // profile TTL is the ceiling. Seed the entry's age from the upstream
@@ -1492,11 +1529,15 @@ async fn handle_static_cache(
             .map(|o| o.min(cache_ttl))
             .unwrap_or(cache_ttl);
 
-        // Skip caching when content-negotiated, origin-forbidden, or already
-        // non-fresh (max-age=0, or arrived older than its lifetime → would be
-        // stale the instant it's stored). Stream straight through instead.
-        if has_unsafe_vary || cc_forbids_cache || effective_ttl == 0 || initial_age >= effective_ttl
-        {
+        // RFC 9111 storability gate (Vary §4.1 / private-no-store §3.2 / §3.5
+        // authenticated-request / freshness §4.2). On a bypass, stream the body
+        // straight through without populating the shared cache.
+        if !is_shared_cacheable(
+            req_authenticated,
+            &parts.headers,
+            effective_ttl,
+            initial_age,
+        ) {
             // Stream the body straight to the client without caching.
             // Drop the inflight sender (no `true` sent): waiters fall through
             // to a fresh fetch, since cache will not be populated for this key.
@@ -1811,6 +1852,102 @@ mod tests {
         // "max-age" must not falsely match inside "s-maxage".
         let h = hdr(hyper::header::CACHE_CONTROL, "s-maxage=42");
         assert_eq!(origin_freshness(&h), Some(42));
+    }
+
+    // ── RFC 9111 shared-cache storability gate (is_shared_cacheable) ──
+    // The cache-policy correctness suite. TTL constant kept generous so only the
+    // directive under test decides the outcome.
+    const TTL: u64 = 300;
+
+    #[test]
+    fn cacheable_anonymous_fresh_plain_200() {
+        // Anonymous request, no caching directives, fresh → storable (the
+        // common static-asset case must keep working).
+        assert!(is_shared_cacheable(false, &hyper::HeaderMap::new(), TTL, 0));
+    }
+
+    #[test]
+    fn bypass_when_zero_ttl_or_born_stale() {
+        // §4.2: lifetime 0, or arrived with Age >= lifetime → never store.
+        assert!(!is_shared_cacheable(false, &hyper::HeaderMap::new(), 0, 0));
+        assert!(!is_shared_cacheable(
+            false,
+            &hyper::HeaderMap::new(),
+            TTL,
+            TTL
+        ));
+        assert!(!is_shared_cacheable(
+            false,
+            &hyper::HeaderMap::new(),
+            TTL,
+            TTL + 1
+        ));
+    }
+
+    #[test]
+    fn bypass_when_response_forbids_shared_storage() {
+        // §3.2 / §5.2.2: private / no-store / no-cache → never store.
+        for d in ["private", "no-store", "no-cache", "public, private"] {
+            let h = hdr(hyper::header::CACHE_CONTROL, d);
+            assert!(
+                !is_shared_cacheable(false, &h, TTL, 0),
+                "should bypass: {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn p0_bypass_authenticated_request_without_explicit_optin() {
+        // RFC 9111 §3.5 — THE P0. An authenticated request's response must NOT
+        // be stored in the shared cache unless the origin explicitly opts in.
+        // No directives → bypass (don't leak user A's body to user B).
+        assert!(!is_shared_cacheable(true, &hyper::HeaderMap::new(), TTL, 0));
+        // A plain `max-age` is NOT a §3.5 opt-in — still bypass.
+        let h = hdr(hyper::header::CACHE_CONTROL, "max-age=300");
+        assert!(
+            !is_shared_cacheable(true, &h, TTL, 0),
+            "max-age alone is not a §3.5 shared-cache opt-in for authenticated requests"
+        );
+    }
+
+    #[test]
+    fn p0_caches_authenticated_request_only_on_explicit_optin() {
+        // §3.5 explicit opt-ins that DO permit shared storage of an
+        // authenticated response: public / s-maxage / must-revalidate.
+        for d in [
+            "public",
+            "s-maxage=60",
+            "must-revalidate",
+            "public, max-age=300",
+        ] {
+            let h = hdr(hyper::header::CACHE_CONTROL, d);
+            assert!(
+                is_shared_cacheable(true, &h, TTL, 0),
+                "should cache (opt-in): {d}"
+            );
+        }
+        // …but a forbidding directive still wins over auth opt-in logic.
+        let h = hdr(hyper::header::CACHE_CONTROL, "private");
+        assert!(!is_shared_cacheable(true, &h, TTL, 0));
+    }
+
+    #[test]
+    fn bypass_unsafe_vary_but_allow_accept_encoding() {
+        // §4.1: a path-only key can't separate these variants → bypass.
+        for v in [
+            "Accept",
+            "Cookie",
+            "Authorization",
+            "*",
+            "Accept-Encoding, Accept",
+        ] {
+            let h = hdr(hyper::header::VARY, v);
+            assert!(!is_shared_cacheable(false, &h, TTL, 0), "unsafe vary: {v}");
+        }
+        // Accept-Encoding alone is safe — the entry stores raw bytes + its
+        // Content-Encoding, so it isn't a path-key collision.
+        let h = hdr(hyper::header::VARY, "Accept-Encoding");
+        assert!(is_shared_cacheable(false, &h, TTL, 0));
     }
 
     #[test]
