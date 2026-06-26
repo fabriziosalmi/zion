@@ -93,6 +93,88 @@ fn rebuild(
     Ok(snap)
 }
 
+/// Where a reload's new config comes from. The file watcher pushes
+/// [`ConfigSource::File`]; the admin API (`POST /admin/config`, #26) will push
+/// [`ConfigSource::Body`] — both flow through the single [`reload_now`] entry.
+pub(crate) enum ConfigSource {
+    /// Re-read + validate `zion.toml` from disk (the watcher / `POST /admin/reload`).
+    File(PathBuf),
+    /// Validate a full TOML body pushed in-memory (`POST /admin/config`).
+    #[allow(dead_code)] // wired by the admin API in a later #26 phase
+    Body(String),
+}
+
+/// The single reload entry point shared by the file watcher and (later) the
+/// admin API. Resolves + validates the new config, rebuilds the
+/// `ResolvedAppConfig` (preserving upstream health), atomically swaps it into
+/// `state_config`, bumps the global generation, and notifies listeners. Returns
+/// the new generation on success. Any failure (parse, semantic validation,
+/// rebuild) leaves the live snapshot untouched and returns a diagnostic.
+///
+/// Sync + side-effecting on shared state (all thread-safe: `ArcSwap`, an atomic,
+/// a watch channel) — callers run it via `spawn_blocking` so the `File` read
+/// doesn't block an async worker.
+pub(crate) fn reload_now(
+    source: ConfigSource,
+    state_config: &Arc<ArcSwap<ResolvedAppConfig>>,
+    conn_limit_max: usize,
+    change_notifier: Option<&tokio::sync::watch::Sender<u64>>,
+    boot_tls_cert_path: Option<&str>,
+    boot_tls_key_path: Option<&str>,
+) -> Result<u64, String> {
+    // 1. Resolve + validate the new config (file read or in-memory body).
+    let new_config = match source {
+        ConfigSource::File(path) => config::load_config(&path.to_string_lossy())?,
+        ConfigSource::Body(body) => config::validate_str(&body, "admin push")?,
+    };
+
+    // Warn if [tls] paths changed: the TLS file-watcher still points at the
+    // boot-time paths, so a cert/key path change needs a restart to take hold.
+    if let Some(boot_cert) = boot_tls_cert_path {
+        if new_config.tls.cert_path != boot_cert {
+            logging::warn(
+                "reload",
+                &format!(
+                    "tls.cert_path changed ({boot_cert} → {}) — restart required for the TLS watcher to use the new path",
+                    new_config.tls.cert_path
+                ),
+            );
+        }
+    }
+    if let Some(boot_key) = boot_tls_key_path {
+        if new_config.tls.key_path != boot_key {
+            logging::warn(
+                "reload",
+                &format!(
+                    "tls.key_path changed ({boot_key} → {}) — restart required for the TLS watcher to use the new path",
+                    new_config.tls.key_path
+                ),
+            );
+        }
+    }
+
+    // 2. Rebuild on the current thread. The catch_unwind guards a deeper panic
+    // escaping validation — effective in debug/test (panic=unwind); a no-op in
+    // release (panic=abort aborts before unwinding). See PANIC DOCTRINE in main.
+    let previous = state_config.load_full();
+    let snapshot = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rebuild(&new_config, &previous, conn_limit_max)
+    })) {
+        Ok(Ok(snap)) => snap,
+        Ok(Err(e)) => return Err(format!("rebuild rejected new config: {e}")),
+        Err(_) => return Err("rebuild panicked (router construction failed)".to_string()),
+    };
+
+    // 3. Atomic swap + generation bump + best-effort notify.
+    state_config.store(Arc::new(snapshot));
+    let gen = CONFIG_GENERATION.fetch_add(1, Ordering::Release) + 1;
+    if let Some(tx) = change_notifier {
+        // Only fails when there are no live receivers — not our problem.
+        let _ = tx.send(gen);
+    }
+    Ok(gen)
+}
+
 /// Spawn the config-file watcher. Returns immediately; the actual
 /// watching runs on a tokio task and a debounce-and-reload task.
 ///
@@ -195,102 +277,40 @@ pub(crate) fn spawn_config_watcher(
             signal.notified().await;
             tokio::time::sleep(Duration::from_secs(2)).await;
 
-            let path = config_path.clone();
-            let parsed =
-                tokio::task::spawn_blocking(move || config::load_config(&path.to_string_lossy()))
-                    .await;
+            // Re-read + apply through the shared reload entry point, off-thread
+            // so the file read doesn't block this async task. All the
+            // load → rebuild → swap → bump → notify → TLS-path-warn logic now
+            // lives in `reload_now` (shared with the admin API, #26).
+            let src = ConfigSource::File(config_path.clone());
+            let sc = state_config.clone();
+            let cn = change_notifier.clone();
+            let boot_cert = boot_tls_cert_path.clone();
+            let boot_key = boot_tls_key_path.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                reload_now(
+                    src,
+                    &sc,
+                    conn_limit_max,
+                    cn.as_ref(),
+                    boot_cert.as_deref(),
+                    boot_key.as_deref(),
+                )
+            })
+            .await;
 
-            match parsed {
-                Ok(Ok(new_config)) => {
-                    // Rebuild on the current thread (fast: matchit
-                    // construction is microseconds, Aho-Corasick is
-                    // already cached per-mode in OnceLock).
-                    // `try_build` returns a structured error for routine
-                    // failures (bad pattern, unknown profile). The catch_unwind
-                    // guards a deeper panic escaping validation — but note the
-                    // release profile sets `panic = "abort"` (Cargo.toml), under
-                    // which a panic aborts before unwinding, so this catch is a
-                    // no-op in release (it only fires in debug/test, panic=
-                    // unwind). The operative release doctrine is therefore "no
-                    // reachable panic on the reload path" + the boot panic hook.
-                    // See the PANIC DOCTRINE note in main.rs.
-                    let previous = state_config.load_full();
-                    let rebuild_result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            rebuild(&new_config, &previous, conn_limit_max)
-                        }));
-                    let new_snapshot = match rebuild_result {
-                        Ok(Ok(snap)) => snap,
-                        Ok(Err(e)) => {
-                            logging::warn(
-                                "config_watcher",
-                                &format!(
-                                    "rebuild rejected new config ({e}), keeping previous snapshot"
-                                ),
-                            );
-                            continue;
-                        }
-                        Err(_) => {
-                            logging::warn(
-                                "config_watcher",
-                                "rebuild panicked (router construction failed), keeping previous snapshot",
-                            );
-                            continue;
-                        }
-                    };
-                    state_config.store(Arc::new(new_snapshot));
-                    let gen = CONFIG_GENERATION.fetch_add(1, Ordering::Release) + 1;
-                    if let Some(tx) = change_notifier.as_ref() {
-                        // Best-effort: sending into a watch channel only
-                        // fails if there are no live receivers. We don't
-                        // care — the supervisor's missing receiver is the
-                        // operator's problem to debug, not a reason to
-                        // refuse the reload.
-                        let _ = tx.send(gen);
-                    }
-                    logging::info(
-                        "config_watcher",
-                        &format!("reload OK (gen {} → {})", gen - 1, gen),
-                    );
-                    // Warn if TLS paths changed — the TLS file-watcher is
-                    // still monitoring the boot-time paths. Changing
-                    // [tls] cert_path/key_path in zion.toml does NOT
-                    // re-point the watcher; a restart is required.
-                    if let Some(ref boot_cert) = boot_tls_cert_path {
-                        if new_config.tls.cert_path != *boot_cert {
-                            logging::warn(
-                                "config_watcher",
-                                &format!(
-                                    "tls.cert_path changed ({} → {}) — restart required for TLS watcher to use new path",
-                                    boot_cert, new_config.tls.cert_path
-                                ),
-                            );
-                        }
-                    }
-                    if let Some(ref boot_key) = boot_tls_key_path {
-                        if new_config.tls.key_path != *boot_key {
-                            logging::warn(
-                                "config_watcher",
-                                &format!(
-                                    "tls.key_path changed ({} → {}) — restart required for TLS watcher to use new path",
-                                    boot_key, new_config.tls.key_path
-                                ),
-                            );
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    logging::warn(
-                        "config_watcher",
-                        &format!("reload REJECTED ({e}), keeping previous snapshot"),
-                    );
-                }
-                Err(join_err) => {
-                    logging::warn(
-                        "config_watcher",
-                        &format!("reload task panicked: {join_err}, keeping previous snapshot"),
-                    );
-                }
+            match result {
+                Ok(Ok(gen)) => logging::info(
+                    "config_watcher",
+                    &format!("reload OK (gen {} → {})", gen - 1, gen),
+                ),
+                Ok(Err(e)) => logging::warn(
+                    "config_watcher",
+                    &format!("reload REJECTED ({e}), keeping previous snapshot"),
+                ),
+                Err(join_err) => logging::warn(
+                    "config_watcher",
+                    &format!("reload task panicked: {join_err}, keeping previous snapshot"),
+                ),
             }
         }
     });
@@ -710,5 +730,69 @@ mod tests {
             msg.contains("Invalid TOML"),
             "malformed TOML should produce a parse-error message, got: {msg}"
         );
+    }
+
+    // ── reload_now: the shared reload entry point (#26 Phase 1) ──
+
+    #[test]
+    fn reload_now_body_validates_swaps_and_bumps() {
+        use arc_swap::ArcSwap;
+        // `validate_str` (full validation) checks cert-file EXISTENCE, so create
+        // temp files and point the pushed body at them.
+        let dir = std::env::temp_dir().join("zion-reload-now-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("c.crt");
+        let key = dir.join("k.key");
+        std::fs::write(&cert, b"-").unwrap();
+        std::fs::write(&key, b"-").unwrap();
+        // TOML *literal* strings (single quotes) for the paths so a Windows
+        // backslash path isn't mangled as an escape sequence in a basic string.
+        let body = format!(
+            "[server]\nlisten_http=\"0.0.0.0:8080\"\nlisten_https=\"0.0.0.0:8443\"\n\
+             [tls]\ncert_path='{}'\nkey_path='{}'\n\
+             [upstreams]\napi=\"http://api:8000\"\n\
+             [[route]]\npath=\"/api/{{*rest}}\"\nupstream=\"api\"\n",
+            cert.display(),
+            key.display()
+        );
+
+        let v0 = parse_inline(&body);
+        let snap0 = ResolvedAppConfig::try_build(&v0, TEST_CONN_LIMIT_MAX).unwrap();
+        let store = Arc::new(ArcSwap::from_pointee(snap0));
+        let before = current_generation();
+
+        let gen = reload_now(
+            ConfigSource::Body(body),
+            &store,
+            TEST_CONN_LIMIT_MAX,
+            None,
+            None,
+            None,
+        )
+        .expect("a valid body must reload");
+        assert!(gen > before, "generation must advance: {gen} !> {before}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_now_rejects_invalid_body_and_keeps_snapshot() {
+        use arc_swap::ArcSwap;
+        let v0 = parse_inline(TOML_V1);
+        let snap0 = ResolvedAppConfig::try_build(&v0, TEST_CONN_LIMIT_MAX).unwrap();
+        let store = Arc::new(ArcSwap::from_pointee(snap0));
+        let live_before = store.load_full();
+
+        let r = reload_now(
+            ConfigSource::Body("this is not valid toml [".into()),
+            &store,
+            TEST_CONN_LIMIT_MAX,
+            None,
+            None,
+            None,
+        );
+        assert!(r.is_err(), "an invalid body must be rejected");
+        // The live snapshot is untouched — same Arc.
+        assert!(Arc::ptr_eq(&live_before, &store.load_full()));
     }
 }
