@@ -20,6 +20,7 @@ use std::sync::Arc;
 // ============================================================================
 
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ZionConfig {
     pub server: ServerConfig,
     pub tls: TlsConfig,
@@ -77,6 +78,7 @@ pub struct ZionConfig {
 /// to TOML for review/diffability.
 #[cfg(feature = "sovereign-aimp")]
 #[derive(Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AimpConfig {
     /// Master switch. False or absent block = mesh disabled.
     #[serde(default)]
@@ -137,6 +139,7 @@ fn default_aimp_inbound_claim_burst() -> u32 {
 // ============================================================================
 
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen_http: String,
     pub listen_https: String,
@@ -203,6 +206,7 @@ fn default_rate_window() -> u64 {
 // ============================================================================
 
 #[derive(Deserialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CorsConfig {
     /// Allowed origins. Empty = CORS disabled (default).
     /// Use `["*"]` for any origin, or `["https://app.example.com"]`.
@@ -247,6 +251,7 @@ fn default_cors_max_age() -> u64 {
 /// every value of that header is replaced by `<redacted:N>` where
 /// `N` is the byte length of the original value.
 #[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct AccessLogConfig {
     /// Header names to include in the access-log event. Lowercased
     /// at deserialise time so case-insensitive matching against
@@ -291,6 +296,7 @@ where
 // ============================================================================
 
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Default cert (used when no SNI match, or single-FQDN mode)
     pub cert_path: String,
@@ -316,6 +322,7 @@ pub struct TlsConfig {
 }
 
 #[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct SniCert {
     pub server_name: String,
     pub cert_path: String,
@@ -327,6 +334,7 @@ pub struct SniCert {
 /// READ by acme.rs, which is feature-gated; hence the targeted allow.
 #[allow(dead_code)]
 #[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct AcmeConfig {
     /// Contact email for Let's Encrypt (required).
     pub email: String,
@@ -369,6 +377,7 @@ fn default_alpn() -> Vec<String> {
 
 #[derive(Deserialize, Clone, Debug)]
 #[allow(dead_code)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     pub url: Option<String>,
     #[serde(default)]
@@ -427,6 +436,7 @@ pub use crate::waf::{WafMode, WafProfile};
 
 #[derive(Deserialize, Clone, Debug)]
 #[allow(dead_code)]
+#[serde(deny_unknown_fields)]
 pub struct CacheProfile {
     #[serde(default = "default_cache_mode")]
     pub mode: CacheMode,
@@ -462,6 +472,7 @@ fn default_ttl() -> u64 {
 // ============================================================================
 
 #[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     pub path: String,
     pub upstream: String,
@@ -1341,6 +1352,48 @@ mtls_fingerprint = false
                 "should reject upstream URL: {bad}"
             );
         }
+    }
+
+    #[test]
+    fn example_config_parses_with_deny_unknown_fields() {
+        // The documented reference config MUST always deserialize — this also
+        // guards `deny_unknown_fields` against drift between zion.example.toml
+        // and the config structs (a new TOML key without a struct field, or a
+        // renamed field, fails here loudly instead of in production).
+        let toml = include_str!("../zion.example.toml");
+        let parsed: Result<ZionConfig, _> = toml::from_str(toml);
+        assert!(
+            parsed.is_ok(),
+            "zion.example.toml failed to parse: {:?}",
+            parsed.err()
+        );
+    }
+
+    #[test]
+    fn unknown_config_key_is_rejected() {
+        // deny_unknown_fields: a misspelled key must fail fast at load, not be
+        // silently ignored (the #1 operability footgun this closes).
+        let toml = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+listen_htttp = "oops typo"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstreams]
+be = "http://127.0.0.1:8000"
+[[route]]
+path = "/{*rest}"
+upstream = "be"
+"#;
+        let parsed: Result<ZionConfig, _> = toml::from_str(toml);
+        assert!(parsed.is_err(), "an unknown config key must be rejected");
+        let e = parsed.err().unwrap().to_string();
+        assert!(
+            e.contains("listen_htttp") || e.contains("unknown field"),
+            "error should name the unknown field, got: {e}"
+        );
     }
 
     #[test]
