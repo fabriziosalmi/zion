@@ -1287,9 +1287,9 @@ async fn process_request_inner(
 /// because nosniff was set).
 #[inline]
 /// Cache-Control to emit for a cached asset when the upstream did not set one:
-/// the profile TTL as a public max-age, or `immutable` for the ~1-year default
-/// (which marks content-hashed assets). Replaces the old blanket "immutable"
-/// stamp that ignored the profile TTL and clobbered the origin's policy.
+/// the profile TTL as a public max-age, or `immutable` ONLY when the operator
+/// explicitly set a ttl >= 1 year (content-hashed assets opt in). The default
+/// is now a conservative 1h, so a header-less response is never frozen.
 fn profile_cache_control(ttl_seconds: u64) -> hyper::header::HeaderValue {
     if ttl_seconds >= 31_536_000 {
         hyper::header::HeaderValue::from_static(CACHE_CONTROL_IMMUTABLE)
@@ -1452,7 +1452,7 @@ async fn handle_static_cache(
     }
 
     // Cache TTL / capacity from the profile (mode=StaticCache without an
-    // explicit profile uses the ~1-year content-hashed default).
+    // explicit profile uses the conservative 1h default; see config::default_ttl).
     let (cache_ttl, cache_max) = match &rule.cache {
         Some(cp) => (cp.ttl_seconds, cp.max_entries),
         // Conservative fallback (1h) for a static_cache route with no resolved
