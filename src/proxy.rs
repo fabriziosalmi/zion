@@ -245,10 +245,6 @@ pub async fn proxy_pass(
     send_request(client, req).await
 }
 
-/// Like [`send_request`] but surfaces the transport error to the caller
-/// instead of collapsing it into a 502, so [`proxy_pass_ha`] can decide
-/// whether to fail over to another upstream.
-#[inline]
 /// Strip hop-by-hop headers from an upstream RESPONSE before relaying it to the
 /// client (RFC 9110 §7.6.1). These are meaningful only on the upstream→zion hop;
 /// hyper frames the client connection itself, so forwarding the upstream's
@@ -285,6 +281,10 @@ fn scrub_response_hop_by_hop(headers: &mut hyper::HeaderMap) {
     headers.remove("Keep-Alive");
 }
 
+/// Like [`send_request`] but surfaces the transport error to the caller
+/// instead of collapsing it into a 502, so [`proxy_pass_ha`] can decide
+/// whether to fail over to another upstream.
+#[inline]
 async fn send_request_try(
     client: &HttpClient,
     req: Request<ZionBody>,
@@ -692,9 +692,13 @@ async fn send_ws_upgrade(
         }
     };
 
-    // If upstream didn't 101, return that response as-is
+    // If upstream didn't 101, return that response as-is — but still strip
+    // hop-by-hop headers (RFC 9110 §7.6.1), same as the normal proxy return
+    // paths. A declined WS upgrade is a normal HTTP response and must not leak
+    // the upstream's Connection/Keep-Alive/Transfer-Encoding to the client.
     if upstream_resp.status() != StatusCode::SWITCHING_PROTOCOLS {
-        let (parts, body) = upstream_resp.into_parts();
+        let (mut parts, body) = upstream_resp.into_parts();
+        scrub_response_hop_by_hop(&mut parts.headers);
         return Ok(Response::from_parts(parts, body.boxed()));
     }
 
