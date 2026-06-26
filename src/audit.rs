@@ -446,12 +446,19 @@ async fn writer_loop(
     };
     if let Ok((signed, new_prev)) = sign_event(&key, init, prev_hash.clone()) {
         if let Ok(line) = serde_json::to_string(&signed) {
-            let _ = file.write_all(line.as_bytes()).await;
-            let _ = file.write_all(b"\n").await;
-            prev_hash = new_prev;
+            if file.write_all(line.as_bytes()).await.is_err()
+                || file.write_all(b"\n").await.is_err()
+                || file.flush().await.is_err()
+            {
+                crate::logging::error(
+                    "audit",
+                    "audit chain-init write/flush failed — the on-disk log may be unreliable",
+                );
+            } else {
+                prev_hash = new_prev;
+            }
         }
     }
-    let _ = file.flush().await;
 
     let mut seq: u64 = 1;
     while let Some(mut event) = rx.recv().await {
@@ -475,8 +482,16 @@ async fn writer_loop(
                     seq += 1;
                     // Flush each event — durability over throughput. Audit
                     // logs are low-rate; if this becomes a bottleneck we
-                    // can batch on a 100ms timer.
-                    let _ = file.flush().await;
+                    // can batch on a 100ms timer. A flush failure means the
+                    // event is NOT durable — surface it and stop, rather than
+                    // silently advancing the chain over un-persisted data.
+                    if file.flush().await.is_err() {
+                        crate::logging::error(
+                            "audit",
+                            "audit log flush failed — events may not be durable, exiting writer",
+                        );
+                        break;
+                    }
                 }
             }
             Err(e) => {
@@ -485,7 +500,9 @@ async fn writer_loop(
             }
         }
     }
-    let _ = file.flush().await;
+    if file.flush().await.is_err() {
+        crate::logging::warn("audit", "final audit log flush failed on writer shutdown");
+    }
 }
 
 fn now_iso8601() -> String {
