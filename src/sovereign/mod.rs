@@ -320,6 +320,7 @@ fn lookup6(ip: u128, ranges: &[CidrEntry6]) -> IpClass {
 /// the sovereign gate is never invoked — zero overhead.
 #[allow(dead_code)] // region/signals/signal_listen reserved for Phase 2/3
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SovereignConfig {
     /// Master switch. Default: false.
     #[serde(default)]
@@ -356,6 +357,7 @@ pub struct SovereignConfig {
 /// by default. The local WAF / rate-limiter / auth gates stay
 /// authoritative; this only adds a deny on top.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnforceConfig {
     /// Master switch. Default: false (signals-only).
     #[serde(default)]
@@ -394,6 +396,7 @@ impl Default for EnforceConfig {
 /// Bounded by `max_concurrent`: at the ceiling the tarpit sheds back to an
 /// immediate `403`, so it can never become a self-inflicted resource sink.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TarpitConfig {
     /// Master switch. Default: false (denies stay immediate 403s). Only
     /// takes effect when `[sovereign.enforce] enabled = true`.

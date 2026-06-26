@@ -1397,6 +1397,38 @@ upstream = "be"
     }
 
     #[test]
+    fn unknown_key_in_cross_module_subtable_is_rejected() {
+        // deny_unknown_fields reaches the cross-module sub-tables too (here
+        // [audit], whose struct lives in audit.rs) — a typo there is no longer
+        // silently ignored either.
+        let toml = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstreams]
+be = "http://127.0.0.1:8000"
+[[route]]
+path = "/{*rest}"
+upstream = "be"
+[audit]
+enabledd = true
+"#;
+        let parsed: Result<ZionConfig, _> = toml::from_str(toml);
+        assert!(
+            parsed.is_err(),
+            "an unknown key in [audit] must be rejected"
+        );
+        let e = parsed.err().unwrap().to_string();
+        assert!(
+            e.contains("enabledd") || e.contains("unknown field"),
+            "error should name the unknown sub-table field, got: {e}"
+        );
+    }
+
+    #[test]
     fn parse_named_upstream() {
         let config: ZionConfig = toml::from_str(profile_toml()).unwrap();
         let api = config.upstream.get("api").unwrap();
