@@ -774,6 +774,17 @@ pub fn build_router(config: &ZionConfig) -> Result<Router<Arc<ResolvedRoute>>, S
                 ..WafProfile::default()
             })
         } else {
+            // Footgun guard: `max_body_mb` is enforced by the WAF body gate, so
+            // on a WAF-off route it has no effect. Surface it at boot rather
+            // than silently dropping the operator's intended size cap (a no-WAF
+            // route otherwise streams the body to the upstream, hyper-framed).
+            if route.max_body_mb.is_some() {
+                eprintln!(
+                    "  ⚠ route '{}': max_body_mb is set but WAF is off (no waf=true / waf_profile) \
+                     — the body-size cap is NOT enforced; enable WAF or remove max_body_mb",
+                    route.path
+                );
+            }
             None
         };
 

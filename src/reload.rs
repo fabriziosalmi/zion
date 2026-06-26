@@ -206,9 +206,14 @@ pub(crate) fn spawn_config_watcher(
                     // construction is microseconds, Aho-Corasick is
                     // already cached per-mode in OnceLock).
                     // `try_build` returns a structured error for routine
-                    // failures (bad pattern, unknown profile). The
-                    // catch_unwind around it stays as defense-in-depth
-                    // against any deeper panic that escapes validation.
+                    // failures (bad pattern, unknown profile). The catch_unwind
+                    // guards a deeper panic escaping validation — but note the
+                    // release profile sets `panic = "abort"` (Cargo.toml), under
+                    // which a panic aborts before unwinding, so this catch is a
+                    // no-op in release (it only fires in debug/test, panic=
+                    // unwind). The operative release doctrine is therefore "no
+                    // reachable panic on the reload path" + the boot panic hook.
+                    // See the PANIC DOCTRINE note in main.rs.
                     let previous = state_config.load_full();
                     let rebuild_result =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
