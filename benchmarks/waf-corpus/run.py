@@ -16,7 +16,10 @@ from pathlib import Path
 BASE = sys.argv[1] if len(sys.argv) > 1 else "https://127.0.0.1:4431"
 LABEL = sys.argv[2] if len(sys.argv) > 2 else "zion"
 URL = BASE + "/api/v1/data"
-CORPUS = json.loads((Path(__file__).parent / "corpus.json").read_text())
+# Corpus file: $WAF_CORPUS (default v1). v2 is the larger sourced set.
+import os
+CORPUS_FILE = os.environ.get("WAF_CORPUS", "corpus.json")
+CORPUS = json.loads((Path(__file__).parent / CORPUS_FILE).read_text())
 CTX = ssl.create_default_context(); CTX.check_hostname = False; CTX.verify_mode = ssl.CERT_NONE
 
 

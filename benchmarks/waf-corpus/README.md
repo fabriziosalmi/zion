@@ -49,4 +49,35 @@ high-precision posture the design claims, now measured.
 
 The point of #0: every WAF-pattern change can now be scored as a Δ in detection
 **at constant 0% FP**, instead of asserted. Plug the holes, re-run, watch the
-number move.
+number move. (v1 + the cmdi/ssrf/deser/sqli rounds landed aggressive at **85.3%**
+against this hand-curated set.)
+
+## corpus-v2 — sourced from public corpora (the honest set)
+
+`corpus-v2.json` — **~1,060 malicious** payloads extracted (deduped, balanced,
+capped per class) from **OWASP CRS** regression tests (Apache-2.0, positive-
+detection stages only) and **PayloadsAllTheThings** (MIT) `Intruder/*.txt`, plus
+**136 benign**. Regenerate with `build-corpus-v2.py` (clone both repos under
+`corpora/` first). Run it: `WAF_CORPUS=corpus-v2.json python3 run.py …`.
+
+### Baseline (v0.4.4, after the v1-driven pattern rounds)
+
+| Profile | Detection | False positives |
+|---|--:|--:|
+| balanced | **16.8%** (178/1058) | **0.0%** (0/136) |
+| aggressive | **30.9%** (327/1058) | **0.0%** (0/136) |
+
+**This is the number that matters.** v1 was a textbook set and flattered the WAF
+(85%); against ~1k real-world payloads with encodings, bracket/case evasion, and
+obfuscation, the substring scanner catches **~31%** (XSS holds best at 78%; path
+/ php / java / generic / ldap / ssrf are 3–17%) — at an unchanged **0% false
+positives**. That gap *is* the finding: a fast zero-regex gate, not a
+comprehensive WAF.
+
+**Strategic note for plugging v2 holes:** most v2 misses are *evasions*
+(`/bi%5Bn%5D/bash` → `/bi[n]/bash`, double-encoding, case/comment obfuscation),
+not missing literals. Enumerating patterns has diminishing returns against
+infinite encodings — the high-leverage work is **normalization** (decode
+nested/percent/bracket forms, collapse obfuscation before the scan) and, beyond
+that, semantic/positive-security analysis. Track v2 as the real regression
+number; raise it by improving the normalizer, not just the pattern lists.
