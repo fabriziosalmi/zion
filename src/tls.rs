@@ -161,6 +161,19 @@ fn load_certified_key(cert_path: &str, key_path: &str) -> Result<Arc<CertifiedKe
     Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
 }
 
+/// Map the configured `min_version` to the rustls protocol-version list.
+/// **Fail-safe by design (RFC 8446):** only the exact literal `"1.2"` opens the
+/// TLS 1.2 floor; ANY other value — a typo, an empty string, `"1.3"`, `"tls1.2"`
+/// — collapses to TLS-1.3-only. A misconfiguration can therefore never silently
+/// *weaken* the floor, only fail closed to the stronger setting. Pure +
+/// unit-tested.
+fn protocol_versions(min_version: &str) -> Vec<&'static rustls::SupportedProtocolVersion> {
+    match min_version {
+        "1.2" => vec![&rustls::version::TLS12, &rustls::version::TLS13],
+        _ => vec![&rustls::version::TLS13],
+    }
+}
+
 /// Build a ServerConfig from TlsConfig.
 /// Automatically selects single-cert or multi-SNI resolver based on config.
 /// Returns Err on cert/key load failure so callers can handle gracefully.
@@ -197,11 +210,8 @@ pub fn load_tls_config(tls: &TlsConfig) -> Result<ServerConfig, String> {
         })
     };
 
-    // TLS version selection
-    let versions: Vec<&'static rustls::SupportedProtocolVersion> = match tls.min_version.as_str() {
-        "1.2" => vec![&rustls::version::TLS12, &rustls::version::TLS13],
-        _ => vec![&rustls::version::TLS13],
-    };
+    // TLS version selection (fail-safe: only "1.2" opens the 1.2 floor).
+    let versions = protocol_versions(tls.min_version.as_str());
 
     // mTLS: client certificate verification (downstream)
     let client_auth_mode = tls.client_auth.as_str();
@@ -703,6 +713,31 @@ mod tests {
         let mode = "optional";
         assert_ne!(mode, "none");
         assert_ne!(mode, "required");
+    }
+
+    // ── TLS version floor (protocol_versions) — RFC 8446 fail-safe ──
+    #[test]
+    fn protocol_versions_floor_opens_only_on_exact_1_2() {
+        let v = super::protocol_versions("1.2");
+        assert_eq!(v.len(), 2, "the 1.2 floor enables TLS 1.2 + 1.3");
+        assert!(v
+            .iter()
+            .any(|p| p.version == rustls::ProtocolVersion::TLSv1_2));
+        assert!(v
+            .iter()
+            .any(|p| p.version == rustls::ProtocolVersion::TLSv1_3));
+    }
+
+    #[test]
+    fn protocol_versions_fail_safe_to_tls13_only() {
+        // Anything that isn't EXACTLY "1.2" — "1.3", empty, a typo, trailing
+        // space — must collapse to TLS-1.3-only. A misconfig can never silently
+        // weaken the floor; it fails closed to the stronger setting.
+        for s in ["1.3", "", "tls1.2", "1.2 ", "TLS1.2", "1", "1.30"] {
+            let v = super::protocol_versions(s);
+            assert_eq!(v.len(), 1, "min_version {s:?} must yield 1.3-only");
+            assert_eq!(v[0].version, rustls::ProtocolVersion::TLSv1_3);
+        }
     }
 
     // ── Client cert fingerprint (X-Client-Cert-Fingerprint) ──
