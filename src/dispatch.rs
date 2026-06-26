@@ -24,8 +24,12 @@ use crate::{
     cache, config, health, logging, metrics, observability, proxy, security, waf, AppState,
 };
 use crate::{
-    empty_response, generate_request_id, inject_security_headers, text_response, REQUEST_COUNTER,
+    empty_response, generate_request_id, inject_security_headers, method_not_allowed,
+    text_response, REQUEST_COUNTER,
 };
+// `unauthorized` is only referenced from the JWT/OIDC auth gate.
+#[cfg(feature = "auth")]
+use crate::unauthorized;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
@@ -228,7 +232,9 @@ async fn process_request_inner(
             | hyper::Method::HEAD
             | hyper::Method::OPTIONS
     ) {
-        return Ok(empty_response(StatusCode::METHOD_NOT_ALLOWED));
+        return Ok(method_not_allowed(
+            "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+        ));
     }
 
     // Gate: 0-RTT replay protection (RFC 8470 — 425 Too Early).
@@ -430,7 +436,7 @@ async fn process_request_inner(
                 return Ok(empty_response(StatusCode::FORBIDDEN));
             }
             if *req.method() != hyper::Method::POST {
-                return Ok(empty_response(StatusCode::METHOD_NOT_ALLOWED));
+                return Ok(method_not_allowed("POST"));
             }
             let prefix = req.uri().query().and_then(|q| {
                 q.split('&')
@@ -613,9 +619,9 @@ async fn process_request_inner(
                                 }
                             }
                             Err(auth::AuthError::Expired) => {
-                                return Ok(text_response(
-                                    StatusCode::UNAUTHORIZED,
+                                return Ok(unauthorized(
                                     "token expired",
+                                    "Bearer error=\"invalid_token\", error_description=\"token expired\"",
                                 ));
                             }
                             Err(_) => {
@@ -624,18 +630,15 @@ async fn process_request_inner(
                         }
                     }
                     None => {
-                        return Ok(text_response(
-                            StatusCode::UNAUTHORIZED,
+                        return Ok(unauthorized(
                             "invalid authorization",
+                            "Bearer error=\"invalid_token\"",
                         ));
                     }
                 }
             }
             None => {
-                return Ok(text_response(
-                    StatusCode::UNAUTHORIZED,
-                    "authorization required",
-                ));
+                return Ok(unauthorized("authorization required", "Bearer"));
             }
         }
     }
