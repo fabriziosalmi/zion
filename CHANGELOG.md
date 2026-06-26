@@ -4,6 +4,44 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-06-26
+
+A correctness, conformance & operability release — the summer "diamond"
+program, waves 1-2 (14 PRs since 0.4.5), each gap verified in code and each
+security-relevant decision covered by a CI-run unit test.
+
+### Security
+- Shared cache no longer reuses a response to an **authenticated** request
+  (`Authorization`) without an explicit opt-in (`public`/`s-maxage`/
+  `must-revalidate`) — RFC 9111 §3.5, closes a cross-user disclosure on
+  cache-enabled routes (#235).
+
+### Conformance (HTTP RFC 9110/9111, TLS RFC 8446/8470)
+- `405` responses now carry `Allow`; `401` carry `WWW-Authenticate` — RFC 9110
+  MUSTs (#237).
+- Hop-by-hop headers (incl. any field named in `Connection`) are stripped from
+  upstream **responses**, not just requests — RFC 9110 §7.6.1 (#238).
+- Header-less responses get a **conservative 1-hour** heuristic freshness
+  instead of a 1-year `immutable` freeze; `immutable` is now opt-in via an
+  explicit long `ttl_seconds` — RFC 9111 §4.2.2, closes the cache-staleness
+  family (#239).
+- The 0-RTT **425** replay gate and the TLS version floor are now covered by
+  CI-run unit tests; the TLS-conformance doc no longer lists tests that never
+  existed (#236).
+
+### Operability & solidity
+- **Unknown config keys are rejected** (`deny_unknown_fields`) instead of
+  silently ignored — root and every sub-table (#244, #246).
+- `zion doctor` now validates the **deployment**: it parses+validates the
+  config, probes upstream reachability, and warns when rate-limiting or WAF
+  coverage is off (#245, #247).
+- Non-`http(s)` upstream URLs are rejected at startup (#241); audit-log
+  flush/write failures are surfaced, not swallowed (#243); request-path errors
+  go through structured logging instead of `eprintln!` (#242); a latent
+  process-abort (`unreachable!`) was removed from the cache hot path (#240).
+- `max_body_mb` set on a WAF-off route now warns at boot instead of silently
+  no-op'ing; the release panic doctrine is documented (#248).
+
 ## [0.4.5] - 2026-06-26
 
 A WAF detection-coverage patch, driven by a larger sourced corpus.
