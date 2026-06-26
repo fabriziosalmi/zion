@@ -720,12 +720,25 @@ fn main() -> error::ZionResult<()> {
         }
     }
 
+    // ── PANIC DOCTRINE (release) ──
+    // The release profile is `panic = "abort"` (Cargo.toml): a panic aborts the
+    // process — it does NOT unwind, so `catch_unwind` is a no-op in release and
+    // a single reachable panic on the request path would drop every in-flight
+    // connection. The doctrine that makes this safe is therefore, in order:
+    //   1. NO reachable panic on the request/reload hot path — `unwrap`/`expect`/
+    //      indexing there is a bug to eliminate, not to catch (audited: none
+    //      reachable with attacker-controlled input as of the W2 hardening).
+    //   2. This boot panic hook: every panic emits a structured last-gasp JSON
+    //      (stderr + file) so a sidecar / next-boot probe self-reports the death.
+    // Switching to `panic = "unwind"` + a request-path catch_unwind→500 is a
+    // deliberate trade (binary size, unwind-safety across the unsafe libc/io_uring
+    // FFI) — a separate decision, not adopted here.
+    //
     // 0a-pre. Install the panic hook BEFORE any worker thread is spawned so
     //         every panic — boot, async worker, anywhere — emits a structured
     //         JSON record to stderr and to a last-gasp file (so a sidecar /
-    //         next-boot probe can self-report the previous death). The
-    //         release profile is `panic = "abort"`; this runs once before
-    //         abort. The path is overridable via ZION_LAST_GASP_PATH.
+    //         next-boot probe can self-report the previous death). This runs
+    //         once before abort. The path is overridable via ZION_LAST_GASP_PATH.
     let last_gasp = std::env::var_os("ZION_LAST_GASP_PATH")
         .map(std::path::PathBuf::from)
         .or_else(|| Some(std::path::PathBuf::from("/var/lib/zion/last_panic.jsonl")));
