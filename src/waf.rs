@@ -458,6 +458,47 @@ const AGGRESSIVE_EXTRA_PATTERNS: &[&str] = &[
     "\") or (\"",
     "') or ('",
     "'--",
+    // ── corpus-v2 round: high-frequency real-world misses (FP-checked vs the
+    //    136-payload benign set; all aggressive-tier). ──
+    // PHP stream wrappers (RCE/LFI vectors)
+    "expect://",
+    "data://",
+    "zip://",
+    "compress.",
+    "ssh2.",
+    // Java gadget / reflection class refs (FP on stack traces → aggressive)
+    "java.io.",
+    "java.net.url",
+    "java.lang.process",
+    "java.lang.reflect",
+    "java.lang.class",
+    // Command injection: Windows + bare-metachar sleep
+    "| sleep",
+    "& sleep",
+    "net view",
+    "net user",
+    "dir c:",
+    // Django/ORM + NoSQL lookup injection
+    "__startswith",
+    "__endswith",
+    "__contains\"",
+    "__regex",
+    // SSRF: container/loopback hostnames
+    "host.docker.internal",
+    // PHP open tags + dangerous funcs (decoded form — high-frequency in corpus)
+    "<?php",
+    "<?=",
+    "system(",
+    "shell_exec(",
+    "passthru(",
+    "base64_decode(",
+    "phpinfo(",
+    // Perl/Ruby SSTI interpolation seen across generic
+    "@{[",
+    // SSRF: more internal/abusable URI schemes
+    "file://",
+    "jar:",
+    "ftp://",
 ];
 
 static BALANCED_SCANNER: OnceLock<AhoCorasick> = OnceLock::new();
@@ -1598,6 +1639,54 @@ mod tests {
             WafVerdict::Allow,
             "false positive on empty function"
         );
+    }
+
+    #[test]
+    fn denies_corpus_v2_round_aggressive() {
+        // The corpus-v2 (OWASP CRS + PayloadsAllTheThings) round: high-frequency
+        // real-world misses added to the aggressive set. One assertion per family.
+        let p = aggressive_profile();
+        for body in [
+            &br#"{"x":"<?php system('id'); ?>"}"#[..],   // php tag + func
+            &br#"{"x":"shell_exec('ls')"}"#[..],         // php dangerous func
+            &br#"{"x":"java.lang.Process"}"#[..],        // java gadget class
+            &br#"{"x":"java.io.PrintStream"}"#[..],      // java io class
+            &br#"{"x":"file:///etc/passwd"}"#[..],       // ssrf/lfi scheme
+            &br#"{"x":"jar:http://evil.co/b.zip!a"}"#[..], // ssrf jar scheme
+            &br#"{"x":"& net view"}"#[..],               // windows cmdi
+            &br#"{"x":"| sleep 15"}"#[..],               // metachar sleep
+            &br#"{"name__startswith":"a"}"#[..],         // django/orm lookup injection
+            &br#"{"x":"compress.bzip2://file.bz2"}"#[..], // php stream wrapper
+            &br#"{"x":"@{[ system 'id' ]}"}"#[..],       // perl ssti
+        ] {
+            assert_eq!(
+                validate_request("POST", Some("application/json"), body, &p),
+                WafVerdict::Deny("injection pattern detected"),
+                "corpus-v2 round should block: {:?}",
+                std::str::from_utf8(body).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn allows_corpus_v2_round_benign_aggressive() {
+        // Precision guards for the corpus-v2 round: legit prose that name-drops
+        // "system", "file", "java", "process" must NOT trip (the patterns are
+        // anchored to call/scheme syntax, not bare words).
+        let p = aggressive_profile();
+        for body in [
+            &br#"{"q":"how does the file system handle large uploads"}"#[..],
+            &br#"{"q":"a java tutorial for beginners with process diagrams"}"#[..],
+            &br#"{"q":"please ftp the file later, the system looks healthy"}"#[..],
+            &br#"{"q":"sort results by startswith then by name"}"#[..],
+        ] {
+            assert_eq!(
+                validate_request("POST", Some("application/json"), body, &p),
+                WafVerdict::Allow,
+                "false positive on benign prose: {:?}",
+                std::str::from_utf8(body).unwrap()
+            );
+        }
     }
 
     #[test]
