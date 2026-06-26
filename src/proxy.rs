@@ -395,7 +395,10 @@ pub async fn proxy_pass_ha(
             Ok(resp) => return Ok(resp),
             Err(e) => {
                 let connect = e.is_connect();
-                eprintln!("  failover: upstream {url} error (connect={connect}): {e}");
+                crate::logging::warn(
+                    "proxy",
+                    &format!("failover: upstream {url} error (connect={connect}): {e}"),
+                );
                 // Eagerly eject: mark unhealthy and bring the next probe
                 // forward (`next_probe_at_us = 0` == due now) so the upstream
                 // rejoins rotation the moment it recovers.
@@ -476,7 +479,7 @@ pub async fn proxy_pass_stream(
             Ok(Response::from_parts(parts, body.boxed()))
         }
         Err(e) => {
-            eprintln!("  stream proxy error: {e}");
+            crate::logging::warn("proxy", &format!("stream proxy error: {e}"));
             Ok(Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .header("Content-Type", "text/event-stream")
@@ -519,14 +522,17 @@ async fn send_request(
             crate::metrics::METRICS
                 .upstream_duration
                 .observe(upstream_start.elapsed());
-            eprintln!("  proxy error: {e}");
+            crate::logging::warn("proxy", &format!("upstream error: {e}"));
             Ok(bad_gateway())
         }
         Err(_elapsed) => {
             crate::metrics::METRICS
                 .upstream_duration
                 .observe(upstream_start.elapsed());
-            eprintln!("  proxy upstream timeout after {UPSTREAM_REQUEST_TIMEOUT:?}");
+            crate::logging::warn(
+                "proxy",
+                &format!("upstream timeout after {UPSTREAM_REQUEST_TIMEOUT:?}"),
+            );
             Ok(gateway_timeout())
         }
     }
@@ -576,7 +582,10 @@ pub async fn proxy_websocket(
     let tcp_stream = match tokio::net::TcpStream::connect(&connect_target).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("  ws upstream connect failed ({connect_target}): {e}");
+            crate::logging::warn(
+                "ws",
+                &format!("upstream connect failed ({connect_target}): {e}"),
+            );
             return Ok(bad_gateway());
         }
     };
@@ -626,7 +635,10 @@ pub async fn proxy_websocket(
         let tls_stream = match connector.connect(server_name, tcp_stream).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("  ws upstream TLS handshake failed ({connect_target}): {e}");
+                crate::logging::warn(
+                    "ws",
+                    &format!("upstream TLS handshake failed ({connect_target}): {e}"),
+                );
                 return Ok(bad_gateway());
             }
         };
@@ -635,7 +647,7 @@ pub async fn proxy_websocket(
         let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("  ws upstream handshake failed: {e}");
+                crate::logging::warn("ws", &format!("upstream handshake failed: {e}"));
                 return Ok(bad_gateway());
             }
         };
@@ -651,7 +663,7 @@ pub async fn proxy_websocket(
     let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("  ws upstream handshake failed: {e}");
+            crate::logging::warn("ws", &format!("upstream handshake failed: {e}"));
             return Ok(bad_gateway());
         }
     };
@@ -675,7 +687,7 @@ async fn send_ws_upgrade(
     let upstream_resp = match sender.send_request(req).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("  ws upstream request failed: {e}");
+            crate::logging::warn("ws", &format!("upstream request failed: {e}"));
             return Ok(bad_gateway());
         }
     };
@@ -702,7 +714,7 @@ async fn send_ws_upgrade(
     let upstream_upgraded = match hyper::upgrade::on(upstream_resp).await {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("  ws upstream upgrade failed: {e}");
+            crate::logging::warn("ws", &format!("upstream upgrade failed: {e}"));
             return Ok(bad_gateway());
         }
     };
