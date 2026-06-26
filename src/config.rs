@@ -548,6 +548,23 @@ pub fn load_config(path: &str) -> Result<ZionConfig, String> {
     Ok(config)
 }
 
+/// An upstream URL must parse AND use http/https. A scheme-less `host:port` or
+/// an `ftp://`/`ws://` URL parses as a valid `Uri` but fails cryptically at the
+/// first proxied request, so reject it at startup with an actionable message.
+/// Returns `Some(error)` on rejection, `None` when valid.
+fn validate_upstream_url(label: &str, url: &str) -> Option<String> {
+    match url.parse::<hyper::Uri>() {
+        Err(_) => Some(format!("{label} '{url}' is not a valid URL")),
+        Ok(uri) => match uri.scheme_str() {
+            Some("http") | Some("https") => None,
+            other => Some(format!(
+                "{label} '{url}' must use http:// or https:// (got {})",
+                other.unwrap_or("no scheme")
+            )),
+        },
+    }
+}
+
 /// Validate config at startup — fail fast with actionable error messages.
 fn validate_config(config: &ZionConfig, path: &str) -> Result<(), String> {
     let mut errors: Vec<String> = Vec::new();
@@ -668,9 +685,17 @@ fn validate_config(config: &ZionConfig, path: &str) -> Result<(), String> {
             }
         }
     }
+    // Both upstream styles must use http/https (legacy flat map + structured).
     for (name, url) in &config.upstreams {
-        if url.parse::<hyper::Uri>().is_err() {
-            errors.push(format!("upstreams.{name} '{url}' is not a valid URL"));
+        if let Some(e) = validate_upstream_url(&format!("upstreams.{name}"), url) {
+            errors.push(e);
+        }
+    }
+    for (name, up) in &config.upstream {
+        for url in up.get_urls() {
+            if let Some(e) = validate_upstream_url(&format!("upstream.{name}"), &url) {
+                errors.push(e);
+            }
         }
     }
 
@@ -1298,6 +1323,24 @@ mtls_fingerprint = false
             config.upstreams.get("backend"),
             Some(&"http://127.0.0.1:8000".to_string())
         );
+    }
+
+    #[test]
+    fn validate_upstream_url_accepts_http_and_https() {
+        assert!(validate_upstream_url("u", "http://127.0.0.1:8000").is_none());
+        assert!(validate_upstream_url("u", "https://backend.internal").is_none());
+    }
+
+    #[test]
+    fn validate_upstream_url_rejects_non_http_and_schemeless() {
+        // These parse as a Uri (or fail) but must be rejected at startup so the
+        // operator gets a clear error instead of a cryptic first-request failure.
+        for bad in ["ftp://host/", "ws://host/", "tcp://h:9", "example.com:9000"] {
+            assert!(
+                validate_upstream_url("u", bad).is_some(),
+                "should reject upstream URL: {bad}"
+            );
+        }
     }
 
     #[test]
