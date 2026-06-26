@@ -597,6 +597,41 @@ pub(crate) fn text_response(status: StatusCode, text: &'static str) -> Response<
         .unwrap()
 }
 
+/// 405 Method Not Allowed with the mandatory `Allow` header (RFC 9110 §15.5.6:
+/// "The origin server MUST generate an Allow header field in a 405"). `allow`
+/// is the comma-separated method list valid at that resource, e.g.
+/// `"GET, HEAD, POST"`. Static value → header parse is infallible.
+pub(crate) fn method_not_allowed(allow: &'static str) -> Response<ZionBody> {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header(hyper::header::ALLOW, allow)
+        .body(
+            Full::new(EMPTY_BYTES.clone())
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
+/// 401 Unauthorized with the mandatory `WWW-Authenticate` challenge (RFC 9110
+/// §15.5.2: "The server generating a 401 response MUST send a WWW-Authenticate
+/// header field"). `challenge` is the scheme + optional params, e.g. `"Bearer"`
+/// or `Bearer error="invalid_token"` (RFC 6750 §3). Static values → infallible.
+// Only the `--features auth` gate emits 401s today; keep it building (and
+// unit-tested) without the feature.
+#[cfg_attr(not(feature = "auth"), allow(dead_code))]
+pub(crate) fn unauthorized(text: &'static str, challenge: &'static str) -> Response<ZionBody> {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(hyper::header::WWW_AUTHENTICATE, challenge)
+        .body(
+            Full::new(Bytes::from_static(text.as_bytes()))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
 fn main() -> error::ZionResult<()> {
     // ── Subcommand dispatch ──
     // Default (no args) → run the daemon, preserving every existing
@@ -1999,6 +2034,33 @@ fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
 /// Inject security headers — delegates to security module.
 pub(crate) fn inject_security_headers(resp: &mut Response<ZionBody>) {
     security::inject_security_headers(resp);
+}
+
+#[cfg(test)]
+mod response_header_tests {
+    use super::*;
+
+    #[test]
+    fn method_not_allowed_carries_allow_header() {
+        // RFC 9110 §15.5.6 MUST: a 405 carries the Allow header.
+        let resp = method_not_allowed("GET, HEAD, POST");
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            resp.headers().get(hyper::header::ALLOW).unwrap(),
+            "GET, HEAD, POST"
+        );
+    }
+
+    #[test]
+    fn unauthorized_carries_www_authenticate() {
+        // RFC 9110 §15.5.2 MUST: a 401 carries the WWW-Authenticate challenge.
+        let resp = unauthorized("authorization required", "Bearer");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get(hyper::header::WWW_AUTHENTICATE).unwrap(),
+            "Bearer"
+        );
+    }
 }
 
 #[cfg(test)]
