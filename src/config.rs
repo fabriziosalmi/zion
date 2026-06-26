@@ -559,6 +559,17 @@ pub fn load_config(path: &str) -> Result<ZionConfig, String> {
     Ok(config)
 }
 
+/// Schema-level round-trip: does this config string deserialize into the typed
+/// `ZionConfig` (serde + `deny_unknown_fields`)? This is what `zion suggest`
+/// self-validates against before emitting — the issue-#133 guarantee that the
+/// *parser* never rejects a generated config. It deliberately does NOT run
+/// `validate_config` (which checks runtime facts like cert-file existence): a
+/// suggested config carries placeholder cert paths the operator fills in, so
+/// file existence isn't a schema concern.
+pub fn parse_schema(raw: &str, label: &str) -> Result<ZionConfig, String> {
+    toml::from_str(raw).map_err(|e| format!("Invalid TOML in {label}: {e}"))
+}
+
 /// An upstream URL must parse AND use http/https. A scheme-less `host:port` or
 /// an `ftp://`/`ws://` URL parses as a valid `Uri` but fails cryptically at the
 /// first proxied request, so reject it at startup with an actionable message.

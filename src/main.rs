@@ -66,6 +66,7 @@ mod reload;
 mod security;
 #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
 mod sovereign;
+mod suggest;
 mod tarpit;
 mod tls;
 #[cfg(feature = "tui")]
@@ -688,6 +689,9 @@ fn main() -> error::ZionResult<()> {
         }
         cli::Command::Doctor => {
             std::process::exit(doctor::run());
+        }
+        cli::Command::Suggest(opts) => {
+            std::process::exit(suggest::run(opts));
         }
         cli::Command::AcmeSoak => {
             #[cfg(feature = "acme")]
