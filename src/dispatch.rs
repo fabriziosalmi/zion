@@ -1506,6 +1506,66 @@ fn cache_only_if_cached_miss() -> Response<ZionBody> {
         .unwrap()
 }
 
+/// Strip a weak-ETag `W/` prefix for the weak comparison `If-None-Match` uses
+/// (RFC 9110 §8.8.3.2).
+fn strip_weak(etag: &str) -> &str {
+    etag.strip_prefix("W/").unwrap_or(etag)
+}
+
+/// Does a client conditional request match this cached entry — i.e. can we
+/// answer 304 Not Modified? RFC 9110 §13.1: `If-None-Match` takes precedence
+/// (weak comparison; `*` matches any stored entry); otherwise `If-Modified-Since`
+/// is honored as an exact echo of the stored `Last-Modified` (the dominant
+/// browser revalidation pattern — full HTTP-date comparison is a follow-up).
+fn client_conditional_hit(req_headers: &hyper::HeaderMap, meta: &cache::CachedMeta) -> bool {
+    if let Some(inm) = req_headers
+        .get(hyper::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        let inm = inm.trim();
+        if inm == "*" {
+            return true;
+        }
+        let stored = match meta.etag.as_ref().and_then(|e| e.to_str().ok()) {
+            Some(e) => strip_weak(e.trim()),
+            None => return false,
+        };
+        return inm.split(',').any(|t| strip_weak(t.trim()) == stored);
+    }
+    if let (Some(ims), Some(lm)) = (
+        req_headers
+            .get(hyper::header::IF_MODIFIED_SINCE)
+            .and_then(|v| v.to_str().ok()),
+        meta.last_modified.as_ref().and_then(|v| v.to_str().ok()),
+    ) {
+        return ims.trim() == lm.trim();
+    }
+    false
+}
+
+/// 304 Not Modified from a cache hit — preserved validators + freshness, no body
+/// (RFC 9110 §15.4.5).
+fn not_modified_response(hit: &cache::CacheHit) -> Response<ZionBody> {
+    let mut builder = Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header("Cache-Control", profile_cache_control(hit.max_age_secs))
+        .header("X-Zion-Cache", "HIT")
+        .header(hyper::header::AGE, hit.age_secs);
+    if let Some(etag) = &hit.meta.etag {
+        builder = builder.header(hyper::header::ETAG, etag.clone());
+    }
+    if let Some(lm) = &hit.meta.last_modified {
+        builder = builder.header(hyper::header::LAST_MODIFIED, lm.clone());
+    }
+    builder
+        .body(
+            Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
 async fn handle_static_cache(
     req: Request<ZionBody>,
     state: Arc<AppState>,
@@ -1577,6 +1637,12 @@ async fn handle_static_cache(
     // unless the client demanded a fresh response (`no-cache` / `no-store`).
     if !rcc_no_cache && !rcc_no_store {
         if let Some(hit) = state.static_cache.get(&cache_key) {
+            // Client conditional request (RFC 9110 §13): a matching
+            // If-None-Match / If-Modified-Since → 304 Not Modified, skipping the
+            // body entirely.
+            if client_conditional_hit(req.headers(), &hit.meta) {
+                return Ok(not_modified_response(&hit));
+            }
             return Ok(cache_hit_response(hit));
         }
     }
@@ -1677,10 +1743,16 @@ async fn handle_static_cache(
         // Without Content-Encoding, gzip-compressed bodies are served garbled.
         let content_type = parts.headers.get(hyper::header::CONTENT_TYPE).cloned();
         let content_encoding = parts.headers.get(hyper::header::CONTENT_ENCODING).cloned();
+        // Preserve validators for conditional requests (client If-None-Match →
+        // 304; origin revalidation in a later phase).
+        let etag = parts.headers.get(hyper::header::ETAG).cloned();
+        let last_modified = parts.headers.get(hyper::header::LAST_MODIFIED).cloned();
         let meta = cache::CachedMeta {
             content_type,
             content_encoding,
             status: parts.status,
+            etag,
+            last_modified,
         };
 
         let (sender, receiver) =
@@ -2128,6 +2200,68 @@ mod tests {
         assert_eq!(cc("no-store, no-cache"), (true, true, false));
         // Case-insensitive directive names.
         assert_eq!(cc("No-Store"), (true, false, false));
+    }
+
+    #[test]
+    fn client_conditional_304_matching() {
+        let meta = |etag: Option<&str>, lm: Option<&str>| cache::CachedMeta {
+            content_type: None,
+            content_encoding: None,
+            status: hyper::StatusCode::OK,
+            etag: etag.map(|e| e.parse().unwrap()),
+            last_modified: lm.map(|l| l.parse().unwrap()),
+        };
+        let req = |name: hyper::header::HeaderName, val: &str| {
+            let mut h = hyper::HeaderMap::new();
+            h.insert(name, val.parse().unwrap());
+            h
+        };
+        use hyper::header::{IF_MODIFIED_SINCE, IF_NONE_MATCH};
+        // If-None-Match exact, weak (either side), list, and `*` → 304.
+        assert!(client_conditional_hit(
+            &req(IF_NONE_MATCH, "\"abc\""),
+            &meta(Some("\"abc\""), None)
+        ));
+        assert!(client_conditional_hit(
+            &req(IF_NONE_MATCH, "W/\"abc\""),
+            &meta(Some("\"abc\""), None)
+        ));
+        assert!(client_conditional_hit(
+            &req(IF_NONE_MATCH, "\"abc\""),
+            &meta(Some("W/\"abc\""), None)
+        ));
+        assert!(client_conditional_hit(
+            &req(IF_NONE_MATCH, "\"x\", \"abc\""),
+            &meta(Some("\"abc\""), None)
+        ));
+        assert!(client_conditional_hit(
+            &req(IF_NONE_MATCH, "*"),
+            &meta(Some("\"abc\""), None)
+        ));
+        // Non-match, or no stored ETag → not 304.
+        assert!(!client_conditional_hit(
+            &req(IF_NONE_MATCH, "\"other\""),
+            &meta(Some("\"abc\""), None)
+        ));
+        assert!(!client_conditional_hit(
+            &req(IF_NONE_MATCH, "\"abc\""),
+            &meta(None, None)
+        ));
+        // If-Modified-Since: exact echo of stored Last-Modified → 304; differ → not.
+        let d = "Sun, 06 Nov 1994 08:49:37 GMT";
+        assert!(client_conditional_hit(
+            &req(IF_MODIFIED_SINCE, d),
+            &meta(None, Some(d))
+        ));
+        assert!(!client_conditional_hit(
+            &req(IF_MODIFIED_SINCE, "Mon, 07 Nov 1994 00:00:00 GMT"),
+            &meta(None, Some(d))
+        ));
+        // No conditional headers → not 304.
+        assert!(!client_conditional_hit(
+            &hyper::HeaderMap::new(),
+            &meta(Some("\"abc\""), None)
+        ));
     }
 
     // ── RFC 8470 §5.2: 0-RTT early-data replay gate (early_data_rejected) ──
