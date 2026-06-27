@@ -1097,20 +1097,29 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         config_path.clone().into(),
         state.config.clone(),
         platform.conn_limit,
-        Some(config_change_tx),
+        // Cloned: the admin API (below) shares the SAME change channel so an
+        // admin push notifies the listener supervisor exactly like a file edit.
+        Some(config_change_tx.clone()),
         Some(config.tls.cert_path.clone()),
         Some(config.tls.key_path.clone()),
     );
 
-    // 5b. Admin API listener (#26 Phase 2) — read-only, loopback by default.
-    // listen + auth were validated at config load. Phase 2 only enforces the
+    // 5b. Admin API listener (#26 Phase 2/3) — loopback by default.
+    // listen + auth were validated at config load. Phases 2-3 only enforce the
     // `internal-ip` gate; `mtls` is accepted by the schema but NOT yet enforced
     // (Phase 4), so refuse to spawn rather than serve admin with an unenforced
     // auth claim — fail safe.
     if let Some(ref admin_cfg) = config.admin {
         match admin_cfg.listen.parse::<std::net::SocketAddr>() {
             Ok(addr) if admin_cfg.auth == "internal-ip" => {
-                admin::spawn_admin_listener(state.clone(), addr);
+                let ctx = std::sync::Arc::new(admin::AdminReloadCtx {
+                    conn_limit_max: platform.conn_limit,
+                    change_notifier: Some(config_change_tx.clone()),
+                    config_path: config_path.clone().into(),
+                    boot_tls_cert: Some(config.tls.cert_path.clone()),
+                    boot_tls_key: Some(config.tls.key_path.clone()),
+                });
+                admin::spawn_admin_listener(state.clone(), addr, ctx);
             }
             Ok(_) => logging::error(
                 "admin",
