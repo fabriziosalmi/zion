@@ -4,6 +4,45 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-06-27
+
+A usability release: a runtime **admin API** and a config bootstrapper
+(`zion suggest`), plus the wave-2 consolidation fixes and a new WAF regression
+gate. 9 PRs since 0.4.6; every endpoint smoke-verified end-to-end and every
+security-relevant decision covered by a CI-run unit test.
+
+### Added
+- **Admin API** (`[admin]` section, off by default) — a dedicated,
+  loopback-by-default listener for runtime config management, the programmatic
+  counterpart to the file watcher. `GET /admin/config` returns the live snapshot;
+  `POST /admin/config` pushes a full new TOML body and `POST /admin/reload`
+  re-reads from disk — both flow through the **same** validate → atomic-swap →
+  bump-generation → notify path as a file edit, returning the new config
+  generation synchronously. Rate-limited (`admin.rate_limit_rps`, default 10),
+  audited (a `config_reload` event per write), and authorized by either
+  `internal-ip` (loopback) or `mtls` — a required client certificate chaining to
+  `tls.client_ca_path`, so the listener can safely bind a routable interface. New
+  `zion_admin_rejects_total` metric. Full contract in `docs/deploy/admin-api.md`
+  (#254, #255, #256, #257, #258).
+- **`zion suggest`** — deterministic `zion.toml` synthesis: detect a local
+  backend (or take `--upstream`), emit a TLS + WAF-protected config that
+  self-validates against the schema before it is written. Zero dependencies, no
+  ML (#253).
+
+### Fixed
+- Hop-by-hop headers are scrubbed on the WebSocket **non-101** upgrade path too,
+  not only the 101 path (#250).
+- Adversarial re-review (round 2): a `[cors]` example that `deny_unknown_fields`
+  would reject is corrected; the audit-log writer now self-heals after a
+  transient write failure instead of disabling itself; and `zion doctor` bounds
+  its upstream DNS probe (#251).
+
+### CI / Internal
+- The WAF detection / false-positive corpus is now a **nightly + on-WAF-change**
+  regression gate that hard-fails on any benign false positive (#252).
+- `reload_now(ConfigSource)` extracts the shared reload entry point used by both
+  the file watcher and the admin API (#254).
+
 ## [0.4.6] - 2026-06-26
 
 A correctness, conformance & operability release — the summer "diamond"
