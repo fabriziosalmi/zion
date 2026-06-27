@@ -26,6 +26,11 @@ pub struct CachedMeta {
     pub content_type: Option<HeaderValue>,
     pub content_encoding: Option<HeaderValue>,
     pub status: StatusCode,
+    /// Validators preserved for conditional requests (RFC 9110 §8.8). `etag`
+    /// answers a client `If-None-Match` (→ 304) and seeds origin revalidation;
+    /// `last_modified` backs `If-Modified-Since`.
+    pub etag: Option<HeaderValue>,
+    pub last_modified: Option<HeaderValue>,
 }
 
 /// Result of a cache hit — body + preserved metadata.
@@ -606,6 +611,8 @@ mod tests {
             content_type: Some(HeaderValue::from_static("text/css")),
             content_encoding: None,
             status: StatusCode::OK,
+            etag: None,
+            last_modified: None,
         }
     }
 
@@ -640,6 +647,8 @@ mod tests {
             content_type: Some(HeaderValue::from_static("application/javascript")),
             content_encoding: None,
             status: StatusCode::OK,
+            etag: None,
+            last_modified: None,
         };
         cache.insert("/a.js", Bytes::from("v2"), meta2, 3600, 0, 100);
         let hit = cache.get("/a.js").unwrap();
@@ -750,6 +759,8 @@ mod tests {
             content_type: None,
             content_encoding: None,
             status: StatusCode::OK,
+            etag: None,
+            last_modified: None,
         };
         cache.insert("/no-ct", Bytes::from("data"), meta, 3600, 0, 100);
         let hit = cache.get("/no-ct").unwrap();
@@ -763,6 +774,8 @@ mod tests {
             content_type: None,
             content_encoding: None,
             status: StatusCode::NOT_MODIFIED,
+            etag: None,
+            last_modified: None,
         };
         cache.insert("/304", Bytes::new(), meta, 3600, 0, 100);
         let hit = cache.get("/304").unwrap();
