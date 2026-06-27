@@ -89,6 +89,11 @@ pub struct AdminConfig {
     /// or `"mtls"` (opt-in, Phase 4). Unknown values are rejected at validation.
     #[serde(default = "default_admin_auth")]
     pub auth: String,
+    /// Global request rate limit (req/s) for the admin listener — defense in
+    /// depth that bounds the expensive reload path against loops / abuse. Must
+    /// be > 0. Default 10.
+    #[serde(default = "default_admin_rate_limit")]
+    pub rate_limit_rps: u32,
 }
 
 fn default_admin_listen() -> String {
@@ -96,6 +101,9 @@ fn default_admin_listen() -> String {
 }
 fn default_admin_auth() -> String {
     "internal-ip".to_string()
+}
+fn default_admin_rate_limit() -> u32 {
+    10
 }
 
 /// `[sovereign_aimp]` block — gossip control plane.
@@ -773,6 +781,9 @@ fn validate_config(config: &ZionConfig, path: &str) -> Result<(), String> {
                 "admin.auth '{}' must be \"internal-ip\" or \"mtls\"",
                 admin.auth
             ));
+        }
+        if admin.rate_limit_rps == 0 {
+            errors.push("admin.rate_limit_rps must be > 0".to_string());
         }
     }
 
@@ -1527,6 +1538,7 @@ enabledd = true
         let admin = cfg.admin.expect("[admin] present → Some");
         assert_eq!(admin.listen, "127.0.0.1:9180");
         assert_eq!(admin.auth, "internal-ip");
+        assert_eq!(admin.rate_limit_rps, 10);
 
         // A bogus auth mode is rejected by validate_str (semantic validation).
         let bad = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
@@ -1536,6 +1548,16 @@ enabledd = true
         assert!(
             err.contains("admin.auth"),
             "bad admin.auth must be rejected, got: {err}"
+        );
+
+        // rate_limit_rps = 0 is rejected too.
+        let zero = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n[admin]\nrate_limit_rps=0\n";
+        let err = validate_str(zero, "test").err().unwrap_or_default();
+        assert!(
+            err.contains("admin.rate_limit_rps"),
+            "rate_limit_rps=0 must be rejected, got: {err}"
         );
     }
 

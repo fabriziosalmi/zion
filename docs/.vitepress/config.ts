@@ -100,6 +100,7 @@ export default defineConfig({
           { text: 'Deployment', link: '/deploy/' },
           { text: 'Observability', link: '/deploy/observability' },
           { text: 'Hot-reload', link: '/deploy/hot-reload' },
+          { text: 'Admin API', link: '/deploy/admin-api' },
         ]
       }
     ],
