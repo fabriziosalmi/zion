@@ -64,6 +64,7 @@ export default defineConfig({
         items: [
           { text: 'What is Zion?', link: '/guide/' },
           { text: 'Quick Start', link: '/guide/quickstart' },
+          { text: 'CLI reference', link: '/guide/cli' },
           { text: 'Architecture', link: '/guide/architecture' },
         ]
       },
