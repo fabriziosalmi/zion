@@ -13,9 +13,15 @@
 //! `[admin]` section ⇒ no listener (zero overhead, zero attack surface).
 //!
 //! Deliberately NOT trusting `X-Forwarded-For` / `X-Client-Cert-*` here: admin
-//! authorization is not transitive through a forwarding proxy. Plain HTTP on
-//! loopback for now; mTLS (`auth = "mtls"`) is a planned follow-up and currently
-//! refuses to spawn rather than serve under an unenforced auth mode.
+//! authorization is not transitive through a forwarding proxy.
+//!
+//! Two auth modes (`[admin].auth`):
+//! - `internal-ip` (default): plain HTTP; each request is authorized iff the
+//!   connection peer is an internal IP.
+//! - `mtls`: TLS with a **required** client cert chaining to `tls.client_ca_path`.
+//!   A completed handshake IS the authorization — only CA-signed clients ever
+//!   reach the HTTP layer, so the peer's IP no longer matters and the listener
+//!   can safely bind a routable interface.
 
 use crate::audit::{self, AuditEvent};
 use crate::reload::{reload_now, ConfigSource};
@@ -30,6 +36,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_rustls::TlsAcceptor;
 
 /// A pushed config body is capped — a `zion.toml` is small; anything larger is
 /// almost certainly a mistake or an attack, not a config.
@@ -92,6 +100,14 @@ pub(crate) struct AdminReloadCtx {
     pub(crate) rate_limiter: AdminRateLimiter,
 }
 
+/// How the admin listener authorizes connections.
+pub(crate) enum AdminAuth {
+    /// Plain HTTP; authorize per-request on the peer being an internal IP.
+    InternalIp,
+    /// TLS with a required client cert — a completed handshake is authorization.
+    Mtls(Arc<TlsAcceptor>),
+}
+
 /// Spawn the admin listener. Returns immediately; the accept loop runs on a
 /// tokio task. A bind failure is logged and the task exits (the data plane is
 /// untouched — the admin listener is independent by design).
@@ -99,6 +115,7 @@ pub(crate) fn spawn_admin_listener(
     state: Arc<AppState>,
     listen: SocketAddr,
     ctx: Arc<AdminReloadCtx>,
+    auth: AdminAuth,
 ) {
     tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(listen).await {
@@ -111,28 +128,39 @@ pub(crate) fn spawn_admin_listener(
                 return;
             }
         };
+        let mode = match auth {
+            AdminAuth::InternalIp => "internal-ip auth",
+            AdminAuth::Mtls(_) => "mTLS (required client cert)",
+        };
         crate::logging::info(
             "admin",
-            &format!("admin API on {listen} (GET/POST /admin/config, POST /admin/reload; internal-ip auth)"),
+            &format!("admin API on {listen} (GET/POST /admin/config, POST /admin/reload; {mode})"),
         );
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
                     let st = state.clone();
                     let cx = ctx.clone();
-                    tokio::spawn(async move {
-                        let io = TokioIo::new(stream);
-                        // Connection-level idle bound so a stuck admin client
-                        // can't pin a task forever.
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            hyper::server::conn::http1::Builder::new().serve_connection(
-                                io,
-                                service_fn(move |req| handle(req, peer, st.clone(), cx.clone())),
-                            ),
-                        )
-                        .await;
-                    });
+                    match &auth {
+                        AdminAuth::InternalIp => {
+                            tokio::spawn(serve_admin(stream, peer, st, cx, false));
+                        }
+                        AdminAuth::Mtls(acceptor) => {
+                            let acc = acceptor.clone();
+                            tokio::spawn(async move {
+                                // The handshake performs client-cert verification;
+                                // failure (missing / untrusted cert) drops the
+                                // connection before any request is served.
+                                match acc.accept(stream).await {
+                                    Ok(tls) => serve_admin(tls, peer, st, cx, true).await,
+                                    Err(e) => crate::logging::warn(
+                                        "admin",
+                                        &format!("admin mTLS handshake failed from {peer}: {e}"),
+                                    ),
+                                }
+                            });
+                        }
+                    }
                 }
                 Err(e) => crate::logging::warn("admin", &format!("admin accept error: {e}")),
             }
@@ -140,18 +168,43 @@ pub(crate) fn spawn_admin_listener(
     });
 }
 
-/// Service handler: enforce internal-ip auth on the *connection peer* (never a
-/// forwarded header), then route. Infallible — always produces a response.
+/// Serve one admin connection over any stream (plain TCP or a TLS stream). The
+/// 30 s timeout bounds a stuck client so it can't pin a task forever.
+async fn serve_admin<S>(
+    stream: S,
+    peer: SocketAddr,
+    state: Arc<AppState>,
+    ctx: Arc<AdminReloadCtx>,
+    is_mtls: bool,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(stream);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        hyper::server::conn::http1::Builder::new().serve_connection(
+            io,
+            service_fn(move |req| handle(req, peer, state.clone(), ctx.clone(), is_mtls)),
+        ),
+    )
+    .await;
+}
+
+/// Service handler. Authorization: in `mtls` mode the completed TLS handshake
+/// already verified the client cert, so the connection is authorized regardless
+/// of peer IP; otherwise the peer must be an internal IP (never a forwarded
+/// header). Infallible — always produces a response.
 async fn handle(
     req: Request<hyper::body::Incoming>,
     peer: SocketAddr,
     state: Arc<AppState>,
     ctx: Arc<AdminReloadCtx>,
+    is_mtls: bool,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
-    let internal = crate::security::is_internal_ip(&peer.ip());
-    // Rate-limit only requests that pass the gate (a non-internal flood gets the
-    // cheap 403 below and shouldn't be able to starve a real operator's tokens).
-    if internal && !ctx.rate_limiter.allow() {
+    let authorized = is_mtls || crate::security::is_internal_ip(&peer.ip());
+    // Rate-limit only authorized requests (an unauthorized flood gets the cheap
+    // 403 below and shouldn't be able to starve a real operator's tokens).
+    if authorized && !ctx.rate_limiter.allow() {
         return Ok(json(
             StatusCode::TOO_MANY_REQUESTS,
             br#"{"error":"rate limited"}"#,
@@ -159,7 +212,7 @@ async fn handle(
     }
     // Write endpoints (async + stateful) are handled here; the auth gate, the
     // read (GET /admin/config) and 404 stay in the pure, unit-tested `respond`.
-    if internal && req.method() == Method::POST {
+    if authorized && req.method() == Method::POST {
         match req.uri().path() {
             // Push a full new config body → validate + atomic-swap via reload_now.
             "/admin/config" => {
@@ -180,7 +233,7 @@ async fn handle(
             _ => {}
         }
     }
-    Ok(respond(req.method(), req.uri().path(), internal, || {
+    Ok(respond(req.method(), req.uri().path(), authorized, || {
         snapshot_body(&state)
     }))
 }

@@ -161,6 +161,52 @@ fn load_certified_key(cert_path: &str, key_path: &str) -> Result<Arc<CertifiedKe
     Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
 }
 
+/// Build a TLS acceptor for the admin listener's `auth = "mtls"` mode (#26): the
+/// daemon's own server cert/key on the server side, and a **required** client-cert
+/// verifier rooted at `ca_path`. Deliberately minimal — TLS 1.3 only, no SNI, no
+/// 0-RTT, no session tickets: the admin listener is single-purpose. A client that
+/// can't present a cert chaining to `ca_path` never completes the handshake, so
+/// the HTTP layer above only ever sees authorized peers.
+pub(crate) fn admin_mtls_acceptor(
+    cert_path: &str,
+    key_path: &str,
+    ca_path: &str,
+) -> Result<TlsAcceptor, String> {
+    // Server identity (reuses the daemon's cert/key).
+    let cert_file =
+        std::fs::File::open(cert_path).map_err(|e| format!("admin TLS cert {cert_path}: {e}"))?;
+    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("admin TLS cert PEM: {e}"))?;
+    let key_file =
+        std::fs::File::open(key_path).map_err(|e| format!("admin TLS key {key_path}: {e}"))?;
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+        .map_err(|e| format!("admin TLS key PEM: {e}"))?
+        .ok_or_else(|| "admin TLS key: no private key in PEM".to_string())?;
+
+    // Client CA → REQUIRED verifier (no `allow_unauthenticated`: a client cert
+    // chaining to this CA is mandatory).
+    let ca_file =
+        std::fs::File::open(ca_path).map_err(|e| format!("admin client CA {ca_path}: {e}"))?;
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut BufReader::new(ca_file)) {
+        let cert = cert.map_err(|e| format!("admin client CA PEM: {e}"))?;
+        root_store
+            .add(cert)
+            .map_err(|e| format!("admin client CA add: {e}"))?;
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+        .build()
+        .map_err(|e| format!("admin client verifier: {e}"))?;
+
+    let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("admin TLS config: {e}"))?;
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
 /// Map the configured `min_version` to the rustls protocol-version list.
 /// **Fail-safe by design (RFC 8446):** only the exact literal `"1.2"` opens the
 /// TLS 1.2 floor; ANY other value — a typo, an empty string, `"1.3"`, `"tls1.2"`
@@ -713,6 +759,16 @@ mod tests {
         let mode = "optional";
         assert_ne!(mode, "none");
         assert_ne!(mode, "required");
+    }
+
+    #[test]
+    fn admin_mtls_acceptor_errors_on_missing_files() {
+        // No real cert fixtures in unit tests (certs are generated, not
+        // committed); the mTLS happy path is covered by the reproducible smoke
+        // in the PR. Here we assert the builder fails cleanly (Err, not panic)
+        // when the cert/key/CA paths don't exist.
+        let r = super::admin_mtls_acceptor("/no/cert.pem", "/no/key.pem", "/no/ca.pem");
+        assert!(r.is_err(), "missing cert/key/ca must yield Err");
     }
 
     // ── TLS version floor (protocol_versions) — RFC 8446 fail-safe ──

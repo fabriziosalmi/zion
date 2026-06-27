@@ -1104,31 +1104,52 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         Some(config.tls.key_path.clone()),
     );
 
-    // 5b. Admin API listener (#26 Phase 2/3) — loopback by default.
-    // listen + auth were validated at config load. Phases 2-3 only enforce the
-    // `internal-ip` gate; `mtls` is accepted by the schema but NOT yet enforced
-    // (Phase 4), so refuse to spawn rather than serve admin with an unenforced
-    // auth claim — fail safe.
+    // 5b. Admin API listener (#26) — loopback by default. listen + auth were
+    // validated at config load (auth ∈ {internal-ip, mtls}; mtls ⇒ client_ca_path
+    // is set). `internal-ip` gates on the peer IP over plain HTTP; `mtls` requires
+    // a client cert chaining to `tls.client_ca_path` (the handshake is the auth).
     if let Some(ref admin_cfg) = config.admin {
         match admin_cfg.listen.parse::<std::net::SocketAddr>() {
-            Ok(addr) if admin_cfg.auth == "internal-ip" => {
-                let ctx = std::sync::Arc::new(admin::AdminReloadCtx {
-                    conn_limit_max: platform.conn_limit,
-                    change_notifier: Some(config_change_tx.clone()),
-                    config_path: config_path.clone().into(),
-                    boot_tls_cert: Some(config.tls.cert_path.clone()),
-                    boot_tls_key: Some(config.tls.key_path.clone()),
-                    rate_limiter: admin::AdminRateLimiter::new(admin_cfg.rate_limit_rps),
-                });
-                admin::spawn_admin_listener(state.clone(), addr, ctx);
+            Ok(addr) => {
+                let auth = match admin_cfg.auth.as_str() {
+                    "mtls" => match config.tls.client_ca_path.as_deref() {
+                        Some(ca) => match tls::admin_mtls_acceptor(
+                            &config.tls.cert_path,
+                            &config.tls.key_path,
+                            ca,
+                        ) {
+                            Ok(acc) => Some(admin::AdminAuth::Mtls(std::sync::Arc::new(acc))),
+                            Err(e) => {
+                                logging::error(
+                                    "admin",
+                                    &format!("mTLS acceptor: {e} — admin API NOT spawned"),
+                                );
+                                None
+                            }
+                        },
+                        // Guarded by validation; defensive.
+                        None => {
+                            logging::error(
+                                "admin",
+                                "admin.auth=mtls requires tls.client_ca_path — admin API NOT spawned",
+                            );
+                            None
+                        }
+                    },
+                    _ => Some(admin::AdminAuth::InternalIp),
+                };
+                if let Some(auth) = auth {
+                    let ctx = std::sync::Arc::new(admin::AdminReloadCtx {
+                        conn_limit_max: platform.conn_limit,
+                        change_notifier: Some(config_change_tx.clone()),
+                        config_path: config_path.clone().into(),
+                        boot_tls_cert: Some(config.tls.cert_path.clone()),
+                        boot_tls_key: Some(config.tls.key_path.clone()),
+                        rate_limiter: admin::AdminRateLimiter::new(admin_cfg.rate_limit_rps),
+                    });
+                    admin::spawn_admin_listener(state.clone(), addr, ctx, auth);
+                }
             }
-            Ok(_) => logging::error(
-                "admin",
-                &format!(
-                    "admin.auth = '{}' is not yet enforced (mTLS lands in #26 Phase 4) — admin API NOT spawned",
-                    admin_cfg.auth
-                ),
-            ),
             Err(e) => logging::error("admin", &format!("admin.listen invalid: {e}")),
         }
     }

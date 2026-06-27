@@ -66,15 +66,34 @@ The `generation` in every success response is the new value of the `config_gener
 
 ## Authentication
 
-| Mode | Status | Behaviour |
-|---|---|---|
-| `internal-ip` | **default, enforced** | The connection **peer** must be a loopback / private-range IP (the same gate as `/_zion/snapshot.json`). |
-| `mtls` | **planned (not yet enforced)** | Reserved. Until it ships, a listener configured with `auth = "mtls"` **refuses to spawn** rather than serve under an auth mode it doesn't yet enforce — fail-safe. |
+| Mode | Behaviour |
+|---|---|
+| `internal-ip` (default) | Plain HTTP. The connection **peer** must be a loopback / private-range IP (the same gate as `/_zion/snapshot.json`). |
+| `mtls` | TLS with a **required** client certificate chaining to `tls.client_ca_path`. A completed handshake **is** the authorization — only CA-signed clients ever reach the HTTP layer, so the peer's IP no longer matters and the listener can safely bind a routable interface. Requires `tls.client_ca_path` (validated at load). |
 
-Authorization is checked on the **TCP connection peer**, never on a forwarded header. `X-Forwarded-For` and `X-Client-Cert-*` are deliberately **not trusted** here: admin auth is not transitive through a proxy. If you put the admin listener behind something, that something owns the authentication.
+For `internal-ip`, authorization is checked on the **TCP connection peer**, never on a forwarded header — `X-Forwarded-For` and `X-Client-Cert-*` are deliberately **not trusted** (admin auth is not transitive through a proxy). For `mtls`, the client cert is verified by rustls against the configured CA during the handshake; a missing or untrusted cert drops the connection before any request is served.
+
+### Enabling mTLS
+
+```toml
+[tls]
+cert_path = "/etc/ssl/zion/server.crt"   # the admin listener reuses the daemon's server cert
+key_path  = "/etc/ssl/zion/server.key"
+client_ca_path = "/etc/ssl/zion/admin-ca.crt"   # CA that signs operator client certs
+
+[admin]
+listen = "0.0.0.0:9180"   # safe to expose: the handshake is the gate
+auth = "mtls"
+```
+
+```console
+# A client cert signed by admin-ca is mandatory; without it the handshake fails.
+$ curl --cert operator.crt --key operator.key -k https://zion-host:9180/admin/config
+{"config_generation":7, ...}
+```
 
 ::: warning
-`internal-ip` trusts every host in the loopback and private ranges. On a shared network, bind to `127.0.0.1` (the default) and reach it via an SSH tunnel or a sidecar — do not bind the admin listener to a routable interface until `mtls` lands.
+With `internal-ip`, `127.0.0.1` (the default) is the safe bind: it trusts every host in the loopback and private ranges, so on a shared network reach it via an SSH tunnel or a sidecar rather than binding a routable interface. Use `mtls` when you need the admin API reachable across the network.
 :::
 
 ## Rate limiting
