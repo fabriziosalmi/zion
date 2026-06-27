@@ -1467,6 +1467,45 @@ fn cache_hit_response(hit: cache::CacheHit) -> Response<ZionBody> {
         .unwrap()
 }
 
+/// Parse the REQUEST's `Cache-Control` for the directives a shared cache honors
+/// (RFC 9111 §5.2.1): returns `(no_store, no_cache, only_if_cached)`. `no-cache`
+/// and `max-age=0` both mean "don't serve a stored response without
+/// revalidation", so they're folded together.
+fn parse_request_cache_control(headers: &hyper::HeaderMap) -> (bool, bool, bool) {
+    let cc = headers
+        .get(hyper::header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let has = |d: &str| cc.split(',').any(|t| t.trim() == d);
+    let max_age_zero = cc.split(',').any(|t| {
+        t.trim()
+            .strip_prefix("max-age=")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|v| v == 0)
+            .unwrap_or(false)
+    });
+    (
+        has("no-store"),
+        has("no-cache") || max_age_zero,
+        has("only-if-cached"),
+    )
+}
+
+/// 504 for `Cache-Control: only-if-cached` on a cache miss — the cache must NOT
+/// contact the origin, so an absent entry is a gateway timeout (§5.2.1.7).
+fn cache_only_if_cached_miss() -> Response<ZionBody> {
+    Response::builder()
+        .status(StatusCode::GATEWAY_TIMEOUT)
+        .header("X-Zion-Cache", "MISS")
+        .body(
+            Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
 async fn handle_static_cache(
     req: Request<ZionBody>,
     state: Arc<AppState>,
@@ -1507,6 +1546,13 @@ async fn handle_static_cache(
     // to avoid caching one user's authenticated response in the shared cache.
     let req_authenticated = req.headers().contains_key(hyper::header::AUTHORIZATION);
 
+    // RFC 9111 §5.2.1: request Cache-Control. `no-store` bypasses the cache
+    // (read + write); `no-cache` / `max-age=0` force a fresh response (don't
+    // serve a stored one — without conditional revalidation that's a re-fetch);
+    // `only-if-cached` answers from cache or 504, never contacting the origin.
+    let (rcc_no_store, rcc_no_cache, rcc_only_if_cached) =
+        parse_request_cache_control(req.headers());
+
     // Cache key = full path+query (so /api?user=alice and /api?user=bob never
     // share an entry — cache-poisoning guard) PLUS the canonical Accept-Encoding
     // set, so encoding variants don't cross-contaminate (RFC 9111 §4.1). The
@@ -1519,9 +1565,20 @@ async fn handle_static_cache(
         .unwrap_or_else(|| req.uri().path());
     let cache_key = format!("{pq}\u{1f}{}", accept_encoding_key(req.headers()));
 
-    // RAM hit — zero-copy serve with preserved Content-Type and Content-Encoding
-    if let Some(hit) = state.static_cache.get(&cache_key) {
-        return Ok(cache_hit_response(hit));
+    // only-if-cached (§5.2.1.7): serve from cache or 504 — never fetch.
+    if rcc_only_if_cached {
+        return Ok(match state.static_cache.get(&cache_key) {
+            Some(hit) => cache_hit_response(hit),
+            None => cache_only_if_cached_miss(),
+        });
+    }
+
+    // RAM hit — zero-copy serve with preserved Content-Type and Content-Encoding,
+    // unless the client demanded a fresh response (`no-cache` / `no-store`).
+    if !rcc_no_cache && !rcc_no_store {
+        if let Some(hit) = state.static_cache.get(&cache_key) {
+            return Ok(cache_hit_response(hit));
+        }
     }
 
     // Own cache key before consuming req — use Arc directly (cache stores Arc<str>)
@@ -1593,14 +1650,17 @@ async fn handle_static_cache(
             .unwrap_or(cache_ttl);
 
         // RFC 9111 storability gate (Vary §4.1 / private-no-store §3.2 / §3.5
-        // authenticated-request / freshness §4.2). On a bypass, stream the body
-        // straight through without populating the shared cache.
-        if !is_shared_cacheable(
-            req_authenticated,
-            &parts.headers,
-            effective_ttl,
-            initial_age,
-        ) {
+        // authenticated-request / freshness §4.2). A request `Cache-Control:
+        // no-store` (§5.2.1.5) also forbids storing the response. On a bypass,
+        // stream the body straight through without populating the shared cache.
+        if rcc_no_store
+            || !is_shared_cacheable(
+                req_authenticated,
+                &parts.headers,
+                effective_ttl,
+                initial_age,
+            )
+        {
             // Stream the body straight to the client without caching.
             // Drop the inflight sender (no `true` sent): waiters fall through
             // to a fresh fetch, since cache will not be populated for this key.
@@ -2046,6 +2106,28 @@ mod tests {
         // A normal q-value is not a refusal.
         assert_eq!(key("gzip;q=1.0"), "gzip");
         assert_eq!(key("identity"), "identity");
+    }
+
+    #[test]
+    fn request_cache_control_directives() {
+        // (no_store, no_cache, only_if_cached)
+        let cc = |v: &str| {
+            let mut h = hyper::HeaderMap::new();
+            if !v.is_empty() {
+                h.insert(hyper::header::CACHE_CONTROL, v.parse().unwrap());
+            }
+            parse_request_cache_control(&h)
+        };
+        assert_eq!(cc(""), (false, false, false));
+        assert_eq!(cc("no-store"), (true, false, false));
+        assert_eq!(cc("no-cache"), (false, true, false));
+        // max-age=0 folds into no-cache (force revalidation); max-age=60 doesn't.
+        assert_eq!(cc("max-age=0"), (false, true, false));
+        assert_eq!(cc("max-age=60"), (false, false, false));
+        assert_eq!(cc("only-if-cached"), (false, false, true));
+        assert_eq!(cc("no-store, no-cache"), (true, true, false));
+        // Case-insensitive directive names.
+        assert_eq!(cc("No-Store"), (true, false, false));
     }
 
     // ── RFC 8470 §5.2: 0-RTT early-data replay gate (early_data_rejected) ──
