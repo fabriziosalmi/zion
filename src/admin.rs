@@ -1,18 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Admin API — a dedicated, loopback-by-default listener for runtime config
-//! inspection (and, in later #26 phases, push + reload).
+//! inspection, push, and reload. The programmatic counterpart to the file
+//! watcher: same reload engine, a different trigger. See `docs/deploy/admin-api.md`.
 //!
-//! Phase 2 is **read-only**: `GET /admin/config` returns the live snapshot JSON
-//! — the SAME source of truth as `/_zion/snapshot.json` (`metrics::snapshot_json`)
-//! — gated to internal IPs (`auth = "internal-ip"`, the default). The listener
-//! is **physically separate** from the public `:443`, so a routing accident
-//! can't expose `/admin/*`. Absent `[admin]` section ⇒ no listener (zero
-//! overhead, zero attack surface).
+//! - `GET  /admin/config` → live snapshot JSON (same source as `/_zion/snapshot.json`).
+//! - `POST /admin/config` → push a full TOML body → validate + atomic-swap (`reload_now`).
+//! - `POST /admin/reload` → re-read `zion.toml` from disk.
+//!
+//! Gated to internal IPs (`auth = "internal-ip"`, the default), rate-limited,
+//! and — writes only — audited. The listener is **physically separate** from
+//! the public `:443`, so a routing accident can't expose `/admin/*`. Absent
+//! `[admin]` section ⇒ no listener (zero overhead, zero attack surface).
 //!
 //! Deliberately NOT trusting `X-Forwarded-For` / `X-Client-Cert-*` here: admin
 //! authorization is not transitive through a forwarding proxy. Plain HTTP on
-//! loopback for now; mTLS is Phase 4.
+//! loopback for now; mTLS (`auth = "mtls"`) is a planned follow-up and currently
+//! refuses to spawn rather than serve under an unenforced auth mode.
 
+use crate::audit::{self, AuditEvent};
 use crate::reload::{reload_now, ConfigSource};
 use crate::AppState;
 use bytes::Bytes;
@@ -22,23 +27,69 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A pushed config body is capped — a `zion.toml` is small; anything larger is
 /// almost certainly a mistake or an attack, not a config.
 const MAX_ADMIN_BODY: usize = 1 << 20; // 1 MiB
 
+/// A tiny global fixed-window rate limiter for the admin listener. Loopback +
+/// single-tenant, so a per-IP table would be overkill — one global window
+/// bounds the expensive reload path against accidental loops / abuse (defense
+/// in depth on top of the internal-ip gate). Approximate by design.
+pub(crate) struct AdminRateLimiter {
+    limit: u32,
+    window_sec: AtomicU64,
+    count: AtomicU32,
+}
+
+impl AdminRateLimiter {
+    pub(crate) fn new(limit: u32) -> Self {
+        Self {
+            limit,
+            window_sec: AtomicU64::new(0),
+            count: AtomicU32::new(0),
+        }
+    }
+
+    /// Consume one token for the current 1 s window; `false` ⇒ over the limit.
+    fn allow(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let start = self.window_sec.load(Ordering::Acquire);
+        if now > start
+            && self
+                .window_sec
+                .compare_exchange(start, now, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            // We claimed the new window; this request is its first.
+            self.count.store(1, Ordering::Release);
+            return true;
+        }
+        // Same window (or another thread just rolled it): count this request.
+        // fetch_add returns the PREVIOUS count `p`; the new count is `p + 1`, so
+        // "new count <= limit" is exactly `p < limit`.
+        self.count.fetch_add(1, Ordering::AcqRel) < self.limit
+    }
+}
+
 /// Everything `reload_now` needs that isn't in `AppState`, captured at boot and
 /// shared with the admin handler so `POST /admin/config` / `/admin/reload` flow
 /// through the EXACT same reload path as the file watcher (atomic swap, health
-/// preservation, generation bump, notify).
+/// preservation, generation bump, notify). Also carries the listener's rate
+/// limiter.
 pub(crate) struct AdminReloadCtx {
     pub(crate) conn_limit_max: usize,
     pub(crate) change_notifier: Option<tokio::sync::watch::Sender<u64>>,
     pub(crate) config_path: PathBuf,
     pub(crate) boot_tls_cert: Option<String>,
     pub(crate) boot_tls_key: Option<String>,
+    pub(crate) rate_limiter: AdminRateLimiter,
 }
 
 /// Spawn the admin listener. Returns immediately; the accept loop runs on a
@@ -98,6 +149,14 @@ async fn handle(
     ctx: Arc<AdminReloadCtx>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let internal = crate::security::is_internal_ip(&peer.ip());
+    // Rate-limit only requests that pass the gate (a non-internal flood gets the
+    // cheap 403 below and shouldn't be able to starve a real operator's tokens).
+    if internal && !ctx.rate_limiter.allow() {
+        return Ok(json(
+            StatusCode::TOO_MANY_REQUESTS,
+            br#"{"error":"rate limited"}"#,
+        ));
+    }
     // Write endpoints (async + stateful) are handled here; the auth gate, the
     // read (GET /admin/config) and 404 stay in the pure, unit-tested `respond`.
     if internal && req.method() == Method::POST {
@@ -108,12 +167,15 @@ async fn handle(
                     Ok(toml) => reload_via(ConfigSource::Body(toml), &state, &ctx).await,
                     Err(e) => Err(e),
                 };
+                audit_write(&state, peer, "/admin/config", "config push", &result);
                 return Ok(reload_response(result));
             }
             // Re-read zion.toml from disk (skip the watcher's 2s debounce).
             "/admin/reload" => {
                 let src = ConfigSource::File(ctx.config_path.clone());
-                return Ok(reload_response(reload_via(src, &state, &ctx).await));
+                let result = reload_via(src, &state, &ctx).await;
+                audit_write(&state, peer, "/admin/reload", "config reload", &result);
+                return Ok(reload_response(result));
             }
             _ => {}
         }
@@ -121,6 +183,32 @@ async fn handle(
     Ok(respond(req.method(), req.uri().path(), internal, || {
         snapshot_body(&state)
     }))
+}
+
+/// Emit one audit event per admin write — who (connection peer), what (action +
+/// endpoint), outcome (new generation, or the rejection reason). This is the
+/// tamper-evident record of every config change made through the API.
+fn audit_write(
+    state: &AppState,
+    peer: SocketAddr,
+    path: &str,
+    action: &str,
+    result: &Result<u64, String>,
+) {
+    let detail = match result {
+        Ok(gen) => format!("admin {action} accepted → generation {gen}"),
+        Err(e) => format!("admin {action} rejected: {e}"),
+    };
+    state.audit.emit(AuditEvent {
+        seq: 0,
+        ts: String::new(),
+        kind: audit::kind::CONFIG_RELOAD,
+        trace_id: None,
+        remote_ip: Some(peer.ip().to_string()),
+        method: Some("POST".to_string()),
+        path: Some(path.to_string()),
+        detail: Some(detail),
+    });
 }
 
 /// Read the request body as a UTF-8 string, capped at `MAX_ADMIN_BODY`. The Err
@@ -260,6 +348,16 @@ mod tests {
     fn non_internal_peer_is_forbidden() {
         let r = respond(&Method::GET, "/admin/config", false, snap);
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn rate_limiter_enforces_limit_within_window() {
+        // Three rapid calls land in the same 1 s window (nanoseconds apart):
+        // the first two are allowed, the third is over the limit.
+        let rl = AdminRateLimiter::new(2);
+        assert!(rl.allow());
+        assert!(rl.allow());
+        assert!(!rl.allow());
     }
 
     #[test]

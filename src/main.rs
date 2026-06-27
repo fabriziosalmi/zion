@@ -1118,6 +1118,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                     config_path: config_path.clone().into(),
                     boot_tls_cert: Some(config.tls.cert_path.clone()),
                     boot_tls_key: Some(config.tls.key_path.clone()),
+                    rate_limiter: admin::AdminRateLimiter::new(admin_cfg.rate_limit_rps),
                 });
                 admin::spawn_admin_listener(state.clone(), addr, ctx);
             }
