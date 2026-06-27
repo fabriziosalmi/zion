@@ -1376,20 +1376,62 @@ fn is_shared_cacheable(
         }
     }
 
-    // §4.1: content negotiation / personalization a path-only key can't split.
-    // Exact token match — `Accept-Encoding` is safe, bare `Accept` is not.
-    let unsafe_vary = resp_headers
+    // §4.1: a stored response that varies must be matched on the varied headers.
+    // We fold `Accept-Encoding` into the cache key (see `accept_encoding_key`),
+    // so a response varying SOLELY on Accept-Encoding is safe to store. Any other
+    // varied header (Accept, Cookie, Accept-Language, User-Agent, `*`, …) we can't
+    // key on — don't store it, or we'd serve one variant to every requester.
+    let vary_safe = resp_headers
         .get(hyper::header::VARY)
         .and_then(|v| v.to_str().ok())
         .map(|v| {
-            let v_lower = v.to_ascii_lowercase();
-            v_lower.split(',').any(|token| {
-                let t = token.trim();
-                t == "accept" || t == "negotiate" || t == "authorization" || t == "cookie"
-            }) || v_lower == "*"
+            v.split(',')
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty())
+                .all(|t| t.eq_ignore_ascii_case("accept-encoding"))
         })
-        .unwrap_or(false);
-    !unsafe_vary
+        .unwrap_or(true); // no Vary → safe
+    vary_safe
+}
+
+/// Canonical `Accept-Encoding` fragment for the cache key (RFC 9111 §4.1, the
+/// Accept-Encoding case). Requests that accept the same set of codings share a
+/// cache entry; a different set gets its own — so a client that only accepts
+/// `identity` is never served a `gzip` body. Tokens are lowercased, `q=0`
+/// (explicitly refused) dropped, deduplicated, and sorted so header order
+/// doesn't fragment the cache. An absent header yields an empty fragment.
+fn accept_encoding_key(headers: &hyper::HeaderMap) -> String {
+    let raw = headers
+        .get(hyper::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut codings: Vec<&str> = raw
+        .split(',')
+        .filter_map(|tok| {
+            let mut it = tok.split(';');
+            let name = it.next().unwrap_or("").trim();
+            if name.is_empty() {
+                return None;
+            }
+            // Drop a coding the client explicitly refuses (q=0 / q=0.0).
+            let refused = it.any(|p| {
+                p.trim()
+                    .strip_prefix("q=")
+                    .and_then(|q| q.trim().parse::<f32>().ok())
+                    .map(|q| q <= 0.0)
+                    .unwrap_or(false)
+            });
+            if refused {
+                None
+            } else {
+                Some(name)
+            }
+        })
+        .collect();
+    codings.sort_unstable();
+    codings.dedup();
+    codings.join(",")
 }
 
 /// Age (seconds) the response already carried on arrival, from the upstream
@@ -1465,16 +1507,20 @@ async fn handle_static_cache(
     // to avoid caching one user's authenticated response in the shared cache.
     let req_authenticated = req.headers().contains_key(hyper::header::AUTHORIZATION);
 
-    // Use full path+query as cache key to prevent cache poisoning:
-    // /api?user=alice and /api?user=bob must NOT share a cache entry.
-    let cache_key = req
+    // Cache key = full path+query (so /api?user=alice and /api?user=bob never
+    // share an entry — cache-poisoning guard) PLUS the canonical Accept-Encoding
+    // set, so encoding variants don't cross-contaminate (RFC 9111 §4.1). The
+    // 0x1F unit separator can't occur in a valid request target, so the suffix
+    // can never collide with a real path.
+    let pq = req
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or_else(|| req.uri().path());
+    let cache_key = format!("{pq}\u{1f}{}", accept_encoding_key(req.headers()));
 
     // RAM hit — zero-copy serve with preserved Content-Type and Content-Encoding
-    if let Some(hit) = state.static_cache.get(cache_key) {
+    if let Some(hit) = state.static_cache.get(&cache_key) {
         return Ok(cache_hit_response(hit));
     }
 
@@ -1950,21 +1996,56 @@ mod tests {
 
     #[test]
     fn bypass_unsafe_vary_but_allow_accept_encoding() {
-        // §4.1: a path-only key can't separate these variants → bypass.
+        // §4.1: only `Accept-Encoding` is folded into the cache key, so any OTHER
+        // varied header (incl. ones the old block-list missed, like
+        // Accept-Language / User-Agent) is uncacheable — we can't key on it.
         for v in [
             "Accept",
             "Cookie",
             "Authorization",
             "*",
             "Accept-Encoding, Accept",
+            "Accept-Language",
+            "User-Agent",
+            "Accept-Encoding, Accept-Language",
         ] {
             let h = hdr(hyper::header::VARY, v);
             assert!(!is_shared_cacheable(false, &h, TTL, 0), "unsafe vary: {v}");
         }
-        // Accept-Encoding alone is safe — the entry stores raw bytes + its
-        // Content-Encoding, so it isn't a path-key collision.
-        let h = hdr(hyper::header::VARY, "Accept-Encoding");
-        assert!(is_shared_cacheable(false, &h, TTL, 0));
+        // Vary on Accept-Encoding (alone, any case, repeated) IS safe — the key
+        // now incorporates the canonical Accept-Encoding set.
+        for v in [
+            "Accept-Encoding",
+            "accept-encoding",
+            "Accept-Encoding, accept-encoding",
+        ] {
+            let h = hdr(hyper::header::VARY, v);
+            assert!(is_shared_cacheable(false, &h, TTL, 0), "safe vary: {v}");
+        }
+    }
+
+    #[test]
+    fn accept_encoding_key_canonicalizes() {
+        let key = |v: &str| {
+            let mut h = hyper::HeaderMap::new();
+            if !v.is_empty() {
+                h.insert(hyper::header::ACCEPT_ENCODING, v.parse().unwrap());
+            }
+            accept_encoding_key(&h)
+        };
+        // Absent header → empty fragment.
+        assert_eq!(key(""), "");
+        // Lowercased, sorted, order-independent.
+        assert_eq!(key("gzip, br"), "br,gzip");
+        assert_eq!(key("br, gzip"), "br,gzip");
+        assert_eq!(key("GZIP"), "gzip");
+        // q=0 = explicitly refused → dropped (so an identity-only client that
+        // refuses gzip never shares the gzip variant's entry).
+        assert_eq!(key("gzip;q=0, br"), "br");
+        assert_eq!(key("gzip;q=0"), "");
+        // A normal q-value is not a refusal.
+        assert_eq!(key("gzip;q=1.0"), "gzip");
+        assert_eq!(key("identity"), "identity");
     }
 
     // ── RFC 8470 §5.2: 0-RTT early-data replay gate (early_data_rejected) ──
