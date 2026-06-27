@@ -69,6 +69,33 @@ pub struct ZionConfig {
     // Legacy compat: flat upstreams map (just URLs)
     #[serde(default)]
     pub upstreams: HashMap<String, String>,
+
+    /// Admin API (#26). Absent block ⇒ no admin listener spawned (zero
+    /// overhead, zero attack surface). When present, a dedicated loopback
+    /// listener serves runtime config inspection / push.
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
+}
+
+/// `[admin]` block — the runtime admin API listener (#26). Loopback +
+/// internal-ip-gated by default; production turns on mTLS (Phase 4).
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    /// Listen address. Default `127.0.0.1:9180` (loopback only).
+    #[serde(default = "default_admin_listen")]
+    pub listen: String,
+    /// Auth mode: `"internal-ip"` (default — same gate as `/_zion/snapshot.json`)
+    /// or `"mtls"` (opt-in, Phase 4). Unknown values are rejected at validation.
+    #[serde(default = "default_admin_auth")]
+    pub auth: String,
+}
+
+fn default_admin_listen() -> String {
+    "127.0.0.1:9180".to_string()
+}
+fn default_admin_auth() -> String {
+    "internal-ip".to_string()
 }
 
 /// `[sovereign_aimp]` block — gossip control plane.
@@ -730,6 +757,22 @@ fn validate_config(config: &ZionConfig, path: &str) -> Result<(), String> {
             if let Some(e) = validate_upstream_url(&format!("upstream.{name}"), &url) {
                 errors.push(e);
             }
+        }
+    }
+
+    // [admin] — listen must be a real socket address; auth a known mode.
+    if let Some(ref admin) = config.admin {
+        if admin.listen.parse::<std::net::SocketAddr>().is_err() {
+            errors.push(format!(
+                "admin.listen '{}' is not a valid socket address (e.g. 127.0.0.1:9180)",
+                admin.listen
+            ));
+        }
+        if !matches!(admin.auth.as_str(), "internal-ip" | "mtls") {
+            errors.push(format!(
+                "admin.auth '{}' must be \"internal-ip\" or \"mtls\"",
+                admin.auth
+            ));
         }
     }
 
@@ -1469,6 +1512,30 @@ enabledd = true
         assert!(
             e.contains("enabledd") || e.contains("unknown field"),
             "error should name the unknown sub-table field, got: {e}"
+        );
+    }
+
+    #[test]
+    fn admin_config_defaults_and_validation() {
+        // Present-but-empty [admin] → loopback defaults.
+        let cfg: ZionConfig = toml::from_str(
+            "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n[admin]\n",
+        )
+        .unwrap();
+        let admin = cfg.admin.expect("[admin] present → Some");
+        assert_eq!(admin.listen, "127.0.0.1:9180");
+        assert_eq!(admin.auth, "internal-ip");
+
+        // A bogus auth mode is rejected by validate_str (semantic validation).
+        let bad = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n[admin]\nauth=\"bogus\"\n";
+        let err = validate_str(bad, "test").err().unwrap_or_default();
+        assert!(
+            err.contains("admin.auth"),
+            "bad admin.auth must be rejected, got: {err}"
         );
     }
 
