@@ -785,6 +785,13 @@ fn validate_config(config: &ZionConfig, path: &str) -> Result<(), String> {
         if admin.rate_limit_rps == 0 {
             errors.push("admin.rate_limit_rps must be > 0".to_string());
         }
+        // mTLS needs a client CA to verify presented certs against.
+        if admin.auth == "mtls" && config.tls.client_ca_path.is_none() {
+            errors.push(
+                "admin.auth = \"mtls\" requires tls.client_ca_path (the CA that signs admin client certs)"
+                    .to_string(),
+            );
+        }
     }
 
     if errors.is_empty() {
@@ -1558,6 +1565,17 @@ enabledd = true
         assert!(
             err.contains("admin.rate_limit_rps"),
             "rate_limit_rps=0 must be rejected, got: {err}"
+        );
+
+        // auth = "mtls" without tls.client_ca_path is rejected (nothing to
+        // verify client certs against).
+        let mtls_no_ca = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n[admin]\nauth=\"mtls\"\n";
+        let err = validate_str(mtls_no_ca, "test").err().unwrap_or_default();
+        assert!(
+            err.contains("client_ca_path"),
+            "auth=mtls without client_ca_path must be rejected, got: {err}"
         );
     }
 
