@@ -35,6 +35,7 @@ pub static AUDIT_EVENTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static AUDIT_EVENTS_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static TRACES_EMITTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static TRACES_INVALID_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub static ADMIN_REJECTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Render the observability counters in Prometheus text format. Called from
 /// `metrics::render`. Keeps the metrics module unaware of tracing internals.
@@ -65,6 +66,11 @@ pub fn render_counters(out: &mut bytes::BytesMut) {
             "zion_traces_invalid_total",
             "Inbound traceparent headers rejected as malformed.",
             TRACES_INVALID_TOTAL.load(Ordering::Relaxed),
+        ),
+        (
+            "zion_admin_rejects_total",
+            "Admin API config pushes rejected (invalid TOML / failed validation).",
+            ADMIN_REJECTS_TOTAL.load(Ordering::Relaxed),
         ),
     ] {
         out.extend_from_slice(b"# HELP ");

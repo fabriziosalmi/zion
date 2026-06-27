@@ -13,19 +13,42 @@
 //! authorization is not transitive through a forwarding proxy. Plain HTTP on
 //! loopback for now; mTLS is Phase 4.
 
+use crate::reload::{reload_now, ConfigSource};
 use crate::AppState;
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+/// A pushed config body is capped — a `zion.toml` is small; anything larger is
+/// almost certainly a mistake or an attack, not a config.
+const MAX_ADMIN_BODY: usize = 1 << 20; // 1 MiB
+
+/// Everything `reload_now` needs that isn't in `AppState`, captured at boot and
+/// shared with the admin handler so `POST /admin/config` / `/admin/reload` flow
+/// through the EXACT same reload path as the file watcher (atomic swap, health
+/// preservation, generation bump, notify).
+pub(crate) struct AdminReloadCtx {
+    pub(crate) conn_limit_max: usize,
+    pub(crate) change_notifier: Option<tokio::sync::watch::Sender<u64>>,
+    pub(crate) config_path: PathBuf,
+    pub(crate) boot_tls_cert: Option<String>,
+    pub(crate) boot_tls_key: Option<String>,
+}
 
 /// Spawn the admin listener. Returns immediately; the accept loop runs on a
 /// tokio task. A bind failure is logged and the task exits (the data plane is
 /// untouched — the admin listener is independent by design).
-pub(crate) fn spawn_admin_listener(state: Arc<AppState>, listen: SocketAddr) {
+pub(crate) fn spawn_admin_listener(
+    state: Arc<AppState>,
+    listen: SocketAddr,
+    ctx: Arc<AdminReloadCtx>,
+) {
     tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(listen).await {
             Ok(l) => l,
@@ -39,12 +62,13 @@ pub(crate) fn spawn_admin_listener(state: Arc<AppState>, listen: SocketAddr) {
         };
         crate::logging::info(
             "admin",
-            &format!("admin API on {listen} (read-only; internal-ip auth)"),
+            &format!("admin API on {listen} (GET/POST /admin/config, POST /admin/reload; internal-ip auth)"),
         );
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
                     let st = state.clone();
+                    let cx = ctx.clone();
                     tokio::spawn(async move {
                         let io = TokioIo::new(stream);
                         // Connection-level idle bound so a stuck admin client
@@ -53,7 +77,7 @@ pub(crate) fn spawn_admin_listener(state: Arc<AppState>, listen: SocketAddr) {
                             std::time::Duration::from_secs(30),
                             hyper::server::conn::http1::Builder::new().serve_connection(
                                 io,
-                                service_fn(move |req| handle(req, peer, st.clone())),
+                                service_fn(move |req| handle(req, peer, st.clone(), cx.clone())),
                             ),
                         )
                         .await;
@@ -71,11 +95,109 @@ async fn handle(
     req: Request<hyper::body::Incoming>,
     peer: SocketAddr,
     state: Arc<AppState>,
+    ctx: Arc<AdminReloadCtx>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let internal = crate::security::is_internal_ip(&peer.ip());
+    // Write endpoints (async + stateful) are handled here; the auth gate, the
+    // read (GET /admin/config) and 404 stay in the pure, unit-tested `respond`.
+    if internal && req.method() == Method::POST {
+        match req.uri().path() {
+            // Push a full new config body → validate + atomic-swap via reload_now.
+            "/admin/config" => {
+                let result = match read_body_string(req).await {
+                    Ok(toml) => reload_via(ConfigSource::Body(toml), &state, &ctx).await,
+                    Err(e) => Err(e),
+                };
+                return Ok(reload_response(result));
+            }
+            // Re-read zion.toml from disk (skip the watcher's 2s debounce).
+            "/admin/reload" => {
+                let src = ConfigSource::File(ctx.config_path.clone());
+                return Ok(reload_response(reload_via(src, &state, &ctx).await));
+            }
+            _ => {}
+        }
+    }
     Ok(respond(req.method(), req.uri().path(), internal, || {
         snapshot_body(&state)
     }))
+}
+
+/// Read the request body as a UTF-8 string, capped at `MAX_ADMIN_BODY`. The Err
+/// is a human message routed to a 400.
+async fn read_body_string(req: Request<hyper::body::Incoming>) -> Result<String, String> {
+    let collected = Limited::new(req.into_body(), MAX_ADMIN_BODY)
+        .collect()
+        .await
+        .map_err(|_| format!("request body exceeds {MAX_ADMIN_BODY} bytes (or stream error)"))?;
+    String::from_utf8(collected.to_bytes().to_vec())
+        .map_err(|_| "request body is not valid UTF-8".to_string())
+}
+
+/// Apply a config (file or body) through the shared `reload_now`, off the async
+/// worker (it does a file read + a CPU rebuild).
+async fn reload_via(
+    source: ConfigSource,
+    state: &Arc<AppState>,
+    ctx: &Arc<AdminReloadCtx>,
+) -> Result<u64, String> {
+    let sc = state.config.clone();
+    let clm = ctx.conn_limit_max;
+    let cn = ctx.change_notifier.clone();
+    let bc = ctx.boot_tls_cert.clone();
+    let bk = ctx.boot_tls_key.clone();
+    tokio::task::spawn_blocking(move || {
+        reload_now(source, &sc, clm, cn.as_ref(), bc.as_deref(), bk.as_deref())
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("reload task panicked: {e}")))
+}
+
+/// Turn a reload outcome into the HTTP response: 200 + `{"generation":N}` on
+/// success; 400 + `{"error":...}` on rejection (+ bump the reject counter).
+fn reload_response(result: Result<u64, String>) -> Response<Full<Bytes>> {
+    match result {
+        Ok(gen) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json; charset=utf-8")
+            .header("Cache-Control", "no-store")
+            .body(Full::new(Bytes::from(format!(
+                "{{\"generation\":{gen}}}\n"
+            ))))
+            .unwrap(),
+        Err(e) => {
+            crate::observability::ADMIN_REJECTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            crate::logging::warn("admin", &format!("config push rejected: {e}"));
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/json; charset=utf-8")
+                .body(Full::new(Bytes::from(format!(
+                    "{{\"error\":{}}}\n",
+                    json_string(&e)
+                ))))
+                .unwrap()
+        }
+    }
+}
+
+/// Minimal JSON string literal (quoted + escaped) for embedding an arbitrary
+/// error message (TOML errors carry quotes + newlines) in a JSON body.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// The auth + routing decision, pulled out so it's unit-testable without an
@@ -138,6 +260,30 @@ mod tests {
     fn non_internal_peer_is_forbidden() {
         let r = respond(&Method::GET, "/admin/config", false, snap);
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn reload_response_ok_is_200() {
+        let r = reload_response(Ok(7));
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers().get("Cache-Control").unwrap(), "no-store");
+    }
+
+    #[test]
+    fn reload_response_err_is_400_and_bumps_counter() {
+        let before = crate::observability::ADMIN_REJECTS_TOTAL.load(Ordering::Relaxed);
+        let r = reload_response(Err("bad config".to_string()));
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            crate::observability::ADMIN_REJECTS_TOTAL.load(Ordering::Relaxed) > before,
+            "a rejected push must bump zion_admin_rejects_total"
+        );
+    }
+
+    #[test]
+    fn json_string_escapes_quotes_and_newlines() {
+        // TOML errors carry quotes + newlines; the JSON body must stay valid.
+        assert_eq!(json_string("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
     }
 
     #[test]
