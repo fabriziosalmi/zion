@@ -74,6 +74,7 @@ export default defineConfig({
           { text: 'TLS & SNI', link: '/config/tls' },
           { text: 'ACME (auto-renewal)', link: '/config/acme' },
           { text: 'Routing', link: '/config/routing' },
+          { text: 'Caching', link: '/config/caching' },
           { text: 'WAF', link: '/config/waf' },
           { text: 'CORS', link: '/config/cors' },
           { text: 'Authentication', link: '/config/auth' },
