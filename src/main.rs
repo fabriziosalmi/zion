@@ -42,6 +42,7 @@
 #![allow(clippy::needless_borrow)]
 
 mod acme;
+mod admin;
 mod audit;
 mod auth;
 mod bootstrap;
@@ -1100,6 +1101,27 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         Some(config.tls.cert_path.clone()),
         Some(config.tls.key_path.clone()),
     );
+
+    // 5b. Admin API listener (#26 Phase 2) — read-only, loopback by default.
+    // listen + auth were validated at config load. Phase 2 only enforces the
+    // `internal-ip` gate; `mtls` is accepted by the schema but NOT yet enforced
+    // (Phase 4), so refuse to spawn rather than serve admin with an unenforced
+    // auth claim — fail safe.
+    if let Some(ref admin_cfg) = config.admin {
+        match admin_cfg.listen.parse::<std::net::SocketAddr>() {
+            Ok(addr) if admin_cfg.auth == "internal-ip" => {
+                admin::spawn_admin_listener(state.clone(), addr);
+            }
+            Ok(_) => logging::error(
+                "admin",
+                &format!(
+                    "admin.auth = '{}' is not yet enforced (mTLS lands in #26 Phase 4) — admin API NOT spawned",
+                    admin_cfg.auth
+                ),
+            ),
+            Err(e) => logging::error("admin", &format!("admin.listen invalid: {e}")),
+        }
+    }
 
     // 6. Spawn ACME auto-renewal task (if configured)
     if let Some(ref acme_config) = config.tls.acme {
