@@ -185,6 +185,23 @@ max_entries = 1000
 ttl_seconds = 60         # 1 minute (SSR pages)
 
 # ============================================================================
+# ADMIN API (#26) — runtime config management on a dedicated listener,
+# physically separate from :443. Endpoints: GET /admin/config (live snapshot),
+# POST /admin/config (push a full TOML body), POST /admin/reload (re-read from
+# disk). Off by default — with no [admin] block, no listener is spawned.
+# Uncomment to enable. Full contract: docs/deploy/admin-api.md
+# ============================================================================
+
+# [admin]
+# listen = "127.0.0.1:9180"   # loopback only (default); safe to expose only with mtls
+# auth = "internal-ip"        # "internal-ip" (peer-IP gate, plain HTTP) | "mtls"
+# rate_limit_rps = 10         # global req/s ceiling on the listener (default 10)
+#
+# # auth = "mtls" requires a client cert chaining to tls.client_ca_path (set it in
+# # [tls]); a completed handshake is the authorization, so the listener can then
+# # bind a routable interface, e.g. listen = "0.0.0.0:9180".
+
+# ============================================================================
 # ROUTES (matched via Radix Tree in ~15ns)
 # ============================================================================
 
