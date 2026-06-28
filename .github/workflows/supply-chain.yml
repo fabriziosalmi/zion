@@ -55,7 +55,7 @@ jobs:
       # generate dep info … .d: No such file" — a /tmp race during the
       # install build). A downloaded binary sidesteps it and is faster.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@873c7452cadb7c034694a1282227095d93fbdf92 # v2.79.14
+        uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2.82.5
         with:
           tool: cargo-audit
       - name: Run cargo-audit
@@ -93,16 +93,27 @@ jobs:
   # cargo-vet baseline" for the standing operator workflow.
   vet:
     name: cargo-vet
-    runs-on: [self-hosted, Linux, X64]
+    # GitHub-hosted: the self-hosted runner's network corrupts the cargo-vet
+    # tarball in transit (sha256 mismatch on a download that verifies clean
+    # elsewhere; cargo-audit/cargo-deny use different URLs and are unaffected).
+    # Pure-CI audit — no self-hosted HW needed — so use a reliable network.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      # Prebuilt binary (see cargo-audit note) — avoids the flaky
-      # source-build of the tool on the self-hosted runners.
-      - name: Install cargo-vet
-        uses: taiki-e/install-action@873c7452cadb7c034694a1282227095d93fbdf92 # v2.79.14
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          tool: cargo-vet
+          shared-key: cargo-vet-tool
+      # Build from crates.io rather than a prebuilt binary: the baseline
+      # `imports.lock` is generated locally with cargo-vet 0.10.2, whose
+      # publisher-entry schema (optional `user-id`) the only prebuilt the
+      # tool ecosystem ships — 0.10.0 — cannot parse ("missing field
+      # `user-id`"). mozilla/cargo-vet never cut a GitHub release for 0.10.1+,
+      # so source-build is the only way to get a version matching the lock.
+      # Keep this pin in lockstep with the version used to regenerate the
+      # baseline (see docs/security/supply-chain.md).
+      - name: Install cargo-vet
+        run: cargo install --locked cargo-vet@0.10.2
       - name: Run cargo-vet
         run: cargo vet --locked
 
@@ -132,7 +143,7 @@ jobs:
       # the self-hosted runners is the flaky step (intermittent "No such file or
       # directory (os error 2)" mid-compile). Mirrors the cargo-audit/cargo-vet jobs.
       - name: Install cargo-geiger
-        uses: taiki-e/install-action@873c7452cadb7c034694a1282227095d93fbdf92 # v2.79.14
+        uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2.82.5
         with:
           tool: cargo-geiger
       - name: Geiger report

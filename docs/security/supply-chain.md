@@ -207,6 +207,36 @@ on every PR. A red `cargo-vet` check means a transitive change
 introduced a crate that fails this gate; the PR author resolves via
 one of the three paths above.
 
+### Keep the CI cargo-vet version in lockstep with the lock
+
+`imports.lock` (and the rest of the baseline) is written by whatever
+`cargo-vet` you run locally, and its on-disk schema evolves between
+releases. CI must run a `cargo-vet` that can read what your local one
+wrote — a newer CI tool reads an older lock fine, but an **older** CI
+tool rejects a newer lock with a hard parse error, e.g.:
+
+```
+ERROR × Failed to parse toml file
+  ╰─▶ missing field `user-id` for key `publisher.<crate>` at imports.lock:NNNN
+```
+
+That is not a real audit failure — it's a version skew. Two rules keep
+it from happening:
+
+1. CI builds `cargo-vet` from crates.io at a **pinned** version
+   (`cargo install --locked cargo-vet@X.Y.Z` in the `vet` job), not a
+   prebuilt binary. There is no prebuilt for releases past `0.10.0`
+   (mozilla/cargo-vet cut no GitHub release for `0.10.1`+), so
+   `install-action`/`cargo-binstall` can only ever fetch `0.10.0` — too
+   old for a lock written by a current local tool.
+2. When you bump your local `cargo-vet` and regenerate the baseline,
+   bump the pin in `supply-chain.yml`'s `vet` job to the same version in
+   the same PR. `cargo vet --version` locally tells you the number to use.
+
+The job runs on a GitHub-hosted runner (not the self-hosted pool), whose
+network reliably fetches the crates.io source — the self-hosted runners
+were observed corrupting the download (sha256 mismatch).
+
 ## Reporting a supply-chain issue
 
 If a published artifact fails any of the verification steps above, treat it
