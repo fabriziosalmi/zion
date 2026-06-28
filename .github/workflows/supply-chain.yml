@@ -93,12 +93,17 @@ jobs:
   # cargo-vet baseline" for the standing operator workflow.
   vet:
     name: cargo-vet
-    runs-on: [self-hosted, Linux, X64]
+    # GitHub-hosted: the self-hosted runner's network corrupts the cargo-vet
+    # release tarball in transit (consistent sha256 mismatch on a download
+    # whose upstream asset verifies clean locally; cargo-audit/cargo-deny use
+    # different URLs and are unaffected). Pure-CI audit — no self-hosted HW
+    # needed — so run it on a runner with a reliable network instead.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       # Prebuilt binary (see cargo-audit note) — avoids the flaky
-      # source-build of the tool on the self-hosted runners.
+      # source-build of the tool.
       - name: Install cargo-vet
         uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2.82.5
         with:
