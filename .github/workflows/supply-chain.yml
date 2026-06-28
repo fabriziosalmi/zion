@@ -94,20 +94,26 @@ jobs:
   vet:
     name: cargo-vet
     # GitHub-hosted: the self-hosted runner's network corrupts the cargo-vet
-    # release tarball in transit (consistent sha256 mismatch on a download
-    # whose upstream asset verifies clean locally; cargo-audit/cargo-deny use
-    # different URLs and are unaffected). Pure-CI audit — no self-hosted HW
-    # needed — so run it on a runner with a reliable network instead.
+    # tarball in transit (sha256 mismatch on a download that verifies clean
+    # elsewhere; cargo-audit/cargo-deny use different URLs and are unaffected).
+    # Pure-CI audit — no self-hosted HW needed — so use a reliable network.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      # Prebuilt binary (see cargo-audit note) — avoids the flaky
-      # source-build of the tool.
-      - name: Install cargo-vet
-        uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2.82.5
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          tool: cargo-vet
+          shared-key: cargo-vet-tool
+      # Build from crates.io rather than a prebuilt binary: the baseline
+      # `imports.lock` is generated locally with cargo-vet 0.10.2, whose
+      # publisher-entry schema (optional `user-id`) the only prebuilt the
+      # tool ecosystem ships — 0.10.0 — cannot parse ("missing field
+      # `user-id`"). mozilla/cargo-vet never cut a GitHub release for 0.10.1+,
+      # so source-build is the only way to get a version matching the lock.
+      # Keep this pin in lockstep with the version used to regenerate the
+      # baseline (see docs/security/supply-chain.md).
+      - name: Install cargo-vet
+        run: cargo install --locked cargo-vet@0.10.2
       - name: Run cargo-vet
         run: cargo vet --locked
 
