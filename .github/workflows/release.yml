@@ -366,7 +366,7 @@ jobs:
       # ── Provenance: bind the cryptographic hash of every archive to the
       # workflow run identity (GitHub OIDC -> Fulcio -> Rekor). SLSA v1.0 L3.
       - name: Generate SLSA build provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: "dist/${{ steps.stage.outputs.archive }}"
 
@@ -443,7 +443,7 @@ jobs:
           cat SHA256SUMS
 
       - name: Attest SHA256SUMS + SBOM
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
             dist/SHA256SUMS
@@ -565,7 +565,7 @@ jobs:
           push-to-registry: true
 
       - name: Attest container provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.push.outputs.digest }}
