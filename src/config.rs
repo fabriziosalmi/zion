@@ -655,6 +655,16 @@ fn validate_upstream_url(label: &str, url: &str) -> Option<String> {
 /// accepted and folded; anything else non-canonical is rejected. Returns
 /// `Some(error)` on rejection, `None` when valid.
 fn validate_host_entry(label: &str, host: &str) -> Option<String> {
+    // Wildcards (`*.example.com`) are planned (ADR-0010, follow-up) but not yet
+    // routed. Reject them at load rather than silently inserting an exact key
+    // that no normalized request authority can ever match — a config that
+    // "loads but never matches" is worse than a clear error.
+    if host.contains('*') {
+        return Some(format!(
+            "{label} host '{host}': wildcard hosts are not yet supported — \
+             list exact hostnames (see ADR-0010)"
+        ));
+    }
     let lower = host.to_ascii_lowercase();
     if crate::security::normalize_host(host).as_deref() == Some(lower.as_str()) {
         None
@@ -1645,6 +1655,13 @@ mtls_fingerprint = false
                 "should reject host: {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn validate_host_entry_rejects_wildcards_until_supported() {
+        // Wildcards must fail loudly at load, not load-and-never-match (ADR-0010).
+        assert!(validate_host_entry("r", "*.example.com").is_some());
+        assert!(validate_host_entry("r", "api.*.example.com").is_some());
     }
 
     #[test]
