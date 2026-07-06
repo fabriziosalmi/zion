@@ -4,6 +4,14 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-06
+
+The migration release: `zion import nginx` converts an existing nginx config
+into a validated Zion config with an honest findings report, building on the
+v0.5.0 host-routing primitive (`server_name` → `hosts`). Design: ADR-0011.
+Hardened pre-merge by an adversarial review (26 confirmed findings, all
+fixed, each pinned by a regression test).
+
 ### Added
 - **`zion import nginx <conf>`** (ADR-0011): convert the reverse-proxy subset
   of an nginx config into a `zion.toml`, with the `suggest` guarantee extended
