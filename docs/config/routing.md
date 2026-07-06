@@ -37,6 +37,54 @@ upstream = "frontend"
 
 More specific routes take priority over wildcards. `/api/v1/events/stream` matches before `/api/{*rest}`.
 
+## Host-Based Routing (Virtual Hosting)
+
+Bind a route to one or more `hosts` to serve different backends for different domains on the same listener — the `Host` header (HTTP/1) or `:authority` (HTTP/2) selects the route. A route **without** `hosts` is *shared*: it matches every host and acts as a fallback.
+
+```toml
+# api.example.com → API backend
+[[route]]
+hosts = ["api.example.com"]
+path = "/{*rest}"
+upstream = "api"
+
+# app.example.com and any *.example.com subdomain → frontend
+[[route]]
+hosts = ["app.example.com", "*.example.com"]
+path = "/{*rest}"
+upstream = "frontend"
+
+# Shared: no `hosts`, reachable on every domain
+[[route]]
+path = "/healthz"
+upstream = "api"
+internal_only = true
+```
+
+The same path now serves different backends per host — `api.example.com/` and `app.example.com/` route independently, which a path-only router cannot express.
+
+### Matching Precedence
+
+For a request authority, Zion resolves in this order:
+
+1. **Exact host** — matches a route bound to exactly that host.
+2. **Wildcard** — `*.example.com` matches any subdomain (`foo.example.com`, `a.b.example.com`) but **not** the apex `example.com`. The most specific wildcard wins (`*.api.example.com` before `*.example.com`).
+3. **Shared** — routes with no `hosts`; also the fallback when the selected host tree has no matching path.
+
+An exact host beats a wildcard, and a matched host never falls through to *another* host's routes — only to the shared layer.
+
+### Host Normalization
+
+Authorities are normalized before matching: lowercased, port stripped (`api.example.com:8443` → `api.example.com`), and a trailing FQDN dot removed. Config `hosts` entries must be canonical bare hostnames — no scheme, path, port, or trailing dot (uppercase is folded). Only leading-label wildcards (`*.example.com`) are supported.
+
+### Relationship to TLS SNI
+
+`hosts` (L7 routing) is independent of [`[[tls.sni]]`](./tls) (which certificate to present). SNI picks the cert during the TLS handshake; `hosts` picks the backend from the decrypted request. A direct-IP or unknown-SNI client still routes via `hosts` (or the shared layer) using the `Host` header.
+
+### Performance
+
+Host routing is **opt-in and zero-cost when unused**: with no `hosts` anywhere, lookups skip authority extraction and behave exactly as the path-only router. When active, a lookup adds one hash-map probe plus authority normalization, and the thread-local route cache is keyed on `(host, path)` so different domains never share a cache slot.
+
 ## Route Modes
 
 | Mode | Behavior |
@@ -120,5 +168,6 @@ Zion validates all routes at boot:
 - Every `cache_profile` reference must point to an existing `[cache_profile.<name>]`
 - All upstream URLs must be valid URIs
 - Path patterns must be valid radix tree patterns
+- Every `hosts` entry must be a canonical bare hostname or a `*.<domain>` wildcard
 
 If validation fails, Zion prints all errors and exits with code 1.
