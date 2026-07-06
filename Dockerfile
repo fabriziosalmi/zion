@@ -19,10 +19,16 @@
 # Pinned to match rust-toolchain.toml. MSRV (Cargo.toml rust-version=1.82)
 # only applies to the no-default-features build; this image bakes a full
 # default-features binary so we need the same compiler we ship with.
-FROM --platform=$BUILDPLATFORM rust:1.96-bookworm@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9 AS builder
+#
+# `--platform=$TARGETPLATFORM` (NOT $BUILDPLATFORM): the builder runs on the
+# *target* architecture, so `cargo build` below produces a binary for that
+# arch. Under `docker buildx --platform linux/amd64,linux/arm64` the arm64 leg
+# runs under QEMU emulation on an amd64 runner — slower, but correct. Building
+# on $BUILDPLATFORM instead would compile a host-arch (amd64) binary and stamp
+# it into BOTH manifests, leaving the arm64 image unable to exec on real ARM.
+FROM --platform=$TARGETPLATFORM rust:1.96-bookworm@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9 AS builder
 
-# Build arg flowed through by `docker buildx build --platform=...`.
-# Lets us cross-compile on the native runner architecture.
+# Populated by buildx from the active `--platform` entry.
 ARG TARGETPLATFORM
 ARG TARGETARCH
 ARG TARGETVARIANT
@@ -33,10 +39,11 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 
 WORKDIR /build
 
-# Native build deps for aws-lc-rs / mimalloc (CMake + clang).
-# musl-tools/cross-toolchains are intentionally NOT installed here — the
-# CI release pipeline cross-compiles via cargo-zigbuild on the host runner;
-# this Dockerfile compiles natively on the target arch under buildx.
+# Native build deps for aws-lc-rs / mimalloc (CMake + clang). No cross
+# toolchains needed: the builder is the target arch (FROM $TARGETPLATFORM), so
+# `cargo build` compiles natively — under QEMU for the non-host arch. (The
+# standalone release-artifact binaries take a different, cross-compiled path
+# via cargo-zigbuild in release.yml; this Dockerfile is self-contained.)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         cmake pkg-config build-essential clang ca-certificates && \

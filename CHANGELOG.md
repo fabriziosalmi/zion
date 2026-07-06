@@ -15,6 +15,17 @@ All notable changes to Zion Edge Gateway are documented here.
   README demo is an animated SVG recorded from a real run (`record-demo.sh`),
   so it cannot drift from what the code actually does.
 
+### Fixed
+- **arm64 container image now ships an arm64 binary.** The multi-arch image
+  (v0.4.7–v0.6.0) built its binary on `$BUILDPLATFORM` and stamped that single
+  host-arch (x86-64) binary into *both* the amd64 and arm64 manifests, so the
+  `linux/arm64` image could not exec on ARM hosts (Graviton, Apple Silicon).
+  The Dockerfile builder now runs on `$TARGETPLATFORM` so `cargo build`
+  produces a binary for the target arch, and `release.yml` gained a step that
+  extracts the binary from each published arch variant and fails the release
+  (before signing) unless the ELF matches — this class of bug is invisible to
+  a manifest inspection.
+
 ## [0.6.0] - 2026-07-06
 
 The migration release: `zion import nginx` converts an existing nginx config
