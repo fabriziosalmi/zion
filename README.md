@@ -150,7 +150,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 ```
 
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-42 modules, ~31,300 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+47 modules, ~35,800 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Features
 
@@ -245,7 +245,7 @@ MODE=full bash benchmarks/baseline/run-baseline.sh   # → benchmarks/baseline/z
 ## Testing
 
 ```bash
-# Unit tests (670) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
+# Unit tests (741) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
 cargo test
 
 # Integration tests (23 — requires a running Zion + backend)
