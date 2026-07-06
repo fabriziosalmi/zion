@@ -56,6 +56,12 @@ fn bad_tls_material_exits_3() {
     fs::write(&cert, b"not a real certificate\n").unwrap();
     fs::write(&key, b"not a real key\n").unwrap();
     let cfg = dir.join("zion.toml");
+    // Forward-slash the paths: a Windows path (`C:\Users\...`) embedded in a
+    // TOML basic string would be an invalid escape and fail config PARSING
+    // (exit 2) before ever reaching TLS load (exit 3). Windows file APIs
+    // accept forward slashes, so this keeps the test cross-platform.
+    let cert_toml = cert.display().to_string().replace('\\', "/");
+    let key_toml = key.display().to_string().replace('\\', "/");
     fs::write(
         &cfg,
         format!(
@@ -65,8 +71,8 @@ listen_http = "127.0.0.1:18091"
 listen_https = "127.0.0.1:18491"
 
 [tls]
-cert_path = "{cert}"
-key_path = "{key}"
+cert_path = "{cert_toml}"
+key_path = "{key_toml}"
 hot_reload = false
 
 [upstreams]
@@ -75,9 +81,7 @@ backend = "http://127.0.0.1:9099"
 [[route]]
 path = "/{{*rest}}"
 upstream = "backend"
-"#,
-            cert = cert.display(),
-            key = key.display(),
+"#
         ),
     )
     .unwrap();
