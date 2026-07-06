@@ -898,6 +898,13 @@ impl Default for HostRouter {
 }
 
 impl HostRouter {
+    /// Whether any host-bound route exists. Callers gate authority extraction
+    /// and cache-key hashing on this, so a hostless deployment pays nothing.
+    #[inline]
+    pub fn host_routing_active(&self) -> bool {
+        self.active
+    }
+
     /// Resolve `(host, path)` to a route, per ADR-0010's hostless-as-shared-layer
     /// rule: consult the exact-host tree first, then fall back to the shared
     /// `default` tree. `host` is the normalized request authority

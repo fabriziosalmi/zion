@@ -2037,9 +2037,19 @@ async fn handle_http(
                 )
                 .unwrap());
         }
-        // Fallback: proxy to upstream (for external ACME clients like certbot)
+        // Fallback: proxy to upstream (for external ACME clients like certbot).
+        // Honor host routing here too so a host-bound route is reachable on :80.
+        // Resolve inside a block so the borrow of `req` ends before it is moved.
         let cfg = state.cfg();
-        if let Some(rule) = cfg.router.at(None, path) {
+        let rule = {
+            let host = if cfg.router.host_routing_active() {
+                security::request_host(&req)
+            } else {
+                None
+            };
+            cfg.router.at(host.as_deref(), path).cloned()
+        };
+        if let Some(rule) = rule {
             return proxy::proxy_pass(
                 &state.http_client,
                 req,

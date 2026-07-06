@@ -192,6 +192,25 @@ fn early_data_rejected(is_early_data: bool, method: &hyper::Method) -> bool {
     is_early_data && !matches!(*method, hyper::Method::GET | hyper::Method::HEAD)
 }
 
+/// Thread-local route-cache key. Folds the normalized host into the key when a
+/// host is present (host routing active) so two authorities that share a path
+/// never collide — the ADR-0010 cache invariant. A collision would let one
+/// host's request reuse another host's cached `ResolvedRoute`, bypassing a
+/// per-route WAF/auth profile or an `internal_only` gate. With `host = None`
+/// the key is the bare path hash, byte-identical to the pre-host-routing key,
+/// so hostless deployments are unchanged. `str`'s `Hash` writes a terminator,
+/// so `(host, path)` can never alias a different host/path split.
+#[inline]
+fn route_cache_key(host: Option<&str>, path: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = fnv::FnvHasher::default();
+    if let Some(host) = host {
+        host.hash(&mut h);
+    }
+    path.hash(&mut h);
+    h.finish()
+}
+
 async fn process_request_inner(
     mut req: Request<ZionBody>,
     state: Arc<AppState>,
@@ -473,26 +492,35 @@ async fn process_request_inner(
 
     let rule = {
         let path = req.uri().path();
-        // FNV hash of path for O(1) thread-local lookup
-        let path_hash = {
-            use std::hash::{Hash, Hasher};
-            let mut h = fnv::FnvHasher::default();
-            path.hash(&mut h);
-            h.finish()
+
+        // Host-based routing (ADR-0010): extract the normalized authority only
+        // when a route is host-bound — hostless deployments skip this entirely.
+        // The URI :authority (HTTP/2 / absolute-form) wins over the Host header
+        // (HTTP/1 origin-form).
+        let host_cow = if cfg.router.host_routing_active() {
+            crate::security::request_host(&req)
+        } else {
+            None
         };
+        let host = host_cow.as_deref();
+
+        // Cache key folds the host in when present, so two authorities sharing a
+        // path never collide (ADR-0010 cache invariant); with no host it is the
+        // bare path hash — byte-identical to the pre-host-routing key.
+        let cache_key = route_cache_key(host, path);
 
         // Thread-local cache hit (~5ns) — touch promotes to MRU
-        let cached = ROUTE_CACHE.with(|cache| cache.borrow_mut().get(path_hash));
+        let cached = ROUTE_CACHE.with(|cache| cache.borrow_mut().get(cache_key));
 
         if let Some(route) = cached {
             route
         } else {
             // Radix tree fallback (~30ns)
-            match cfg.router.at(None, path) {
+            match cfg.router.at(host, path) {
                 Some(matched) => {
                     let route = matched.clone();
                     ROUTE_CACHE.with(|cache| {
-                        cache.borrow_mut().insert(path_hash, route.clone());
+                        cache.borrow_mut().insert(cache_key, route.clone());
                     });
                     route
                 }
@@ -2015,6 +2043,37 @@ mod route_cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_cache_key_is_host_scoped() {
+        // The load-bearing ADR-0010 cache invariant: two authorities that share
+        // a path MUST get distinct keys, or a thread-local cache hit would
+        // cross-wire their routes (bypassing a per-host WAF/auth/internal gate).
+        let a = route_cache_key(Some("api.example.com"), "/x");
+        let b = route_cache_key(Some("app.example.com"), "/x");
+        assert_ne!(a, b, "same path, different host must not collide");
+
+        // A hostless key equals the bare path hash — byte-identical to the
+        // pre-host-routing behavior, so hostless deployments are unchanged.
+        let none = route_cache_key(None, "/x");
+        let bare = {
+            use std::hash::{Hash, Hasher};
+            let mut h = fnv::FnvHasher::default();
+            "/x".hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(
+            none, bare,
+            "hostless key must match the legacy path-only key"
+        );
+        assert_ne!(
+            none, a,
+            "a host-scoped key must differ from the hostless key"
+        );
+
+        // The key is stable for the same (host, path).
+        assert_eq!(a, route_cache_key(Some("api.example.com"), "/x"));
+    }
 
     fn hdr(name: hyper::header::HeaderName, val: &str) -> hyper::HeaderMap {
         let mut h = hyper::HeaderMap::new();

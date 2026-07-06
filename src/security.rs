@@ -363,6 +363,24 @@ pub fn normalize_host(raw: &str) -> Option<Cow<'_, str>> {
     }
 }
 
+/// Extract and normalize the request authority for host routing (ADR-0010):
+/// the URI `:authority` (HTTP/2 / absolute-form) when present, otherwise the
+/// `Host` header (HTTP/1 origin-form). Returns the canonical routing key via
+/// [`normalize_host`], or `None` when the authority is absent or invalid.
+/// Callers gate this behind `HostRouter::host_routing_active` so a hostless
+/// deployment never pays for the extraction.
+pub fn request_host<B>(req: &hyper::Request<B>) -> Option<Cow<'_, str>> {
+    req.uri()
+        .authority()
+        .map(|a| a.as_str())
+        .or_else(|| {
+            req.headers()
+                .get(hyper::header::HOST)
+                .and_then(|h| h.to_str().ok())
+        })
+        .and_then(normalize_host)
+}
+
 /// Check if an IP is internal (loopback, private RFC1918, link-local).
 #[inline]
 pub fn is_internal_ip(ip: &std::net::IpAddr) -> bool {
