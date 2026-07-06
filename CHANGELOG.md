@@ -4,6 +4,17 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Equivalence harness for `zion import`** (`tests/equivalence/`): starts real
+  nginx and real Zion side by side on the original and converted configs,
+  replays a request corpus against both, and diffs the routing decision per
+  request — proving the converted config routes like the nginx it came from,
+  and that the intentional divergences are exactly the ones the import report
+  declared. Runs from the published container image or a locally built binary
+  (`ZION_BIN`); wired into CI (`equivalence.yml`) in the latter mode. The
+  README demo is an animated SVG recorded from a real run (`record-demo.sh`),
+  so it cannot drift from what the code actually does.
+
 ## [0.6.0] - 2026-07-06
 
 The migration release: `zion import nginx` converts an existing nginx config

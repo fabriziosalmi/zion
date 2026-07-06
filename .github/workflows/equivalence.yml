@@ -1,0 +1,48 @@
+# Equivalence harness: prove `zion import nginx` routes like the nginx it
+# converted, on real instances. Runs the branch binary (ZION_BIN mode), so a
+# mapper regression is caught before merge.
+name: equivalence
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "src/import/**"
+      - "src/config.rs"
+      - "tests/equivalence/**"
+      - ".github/workflows/equivalence.yml"
+  pull_request:
+    paths:
+      - "src/import/**"
+      - "src/config.rs"
+      - "tests/equivalence/**"
+      - ".github/workflows/equivalence.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: equivalence-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  equivalence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # ubuntu-latest ships a recent stable Rust; the importer is default-
+      # features and MSRV-1.82, so the runner toolchain is fine (same choice
+      # as acme-soak.yml — one less action on the critical path).
+      - name: Build zion (default features)
+        run: |
+          rustc --version && cargo --version
+          cargo build --release --locked --bin zion
+
+      - name: Run the equivalence harness (branch binary vs real nginx)
+        env:
+          ZION_BIN: target/release/zion
+          NO_COLOR: "1"
+        run: ./tests/equivalence/run.sh multi-vhost

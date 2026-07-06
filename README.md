@@ -69,6 +69,30 @@ Unattended (CI / container init):
     --upstream frontend=127.0.0.1:3000
 ```
 
+### Migrating from nginx
+
+Already running nginx? Convert an existing config instead of hand-writing one:
+
+```bash
+zion import nginx /etc/nginx/sites-enabled/app.conf -o zion.toml
+```
+
+`import` translates the reverse-proxy subset of nginx into a **validated**
+`zion.toml` and prints an honest findings report — every directive lands in
+exactly one bucket (convert / partial / auto / unsupported), and anything Zion
+cannot express faithfully is flagged loudly, never silently mistranslated
+([ADR-0011](docs/adr/0011-zion-import-nginx.md)).
+
+The claim is not taken on faith. The **equivalence harness** starts real nginx
+and real Zion side by side on the original and converted configs, replays a
+request corpus against both, and diffs the routing decision request by request
+— the intentional differences are exactly the ones the report declared:
+
+![zion import equivalence harness](docs/assets/zion-import-equivalence.svg)
+
+Reproduce it yourself (`docker`, `curl`, `openssl`): `./tests/equivalence/run.sh`
+— see [tests/equivalence/](tests/equivalence/).
+
 ### Build flavors
 
 The default build is a lean daemon; opt into what you need:
