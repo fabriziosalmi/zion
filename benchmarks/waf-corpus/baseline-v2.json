@@ -1,0 +1,57 @@
+{
+  "by_class": {
+    "cmdi": {
+      "detected": 14,
+      "total": 130
+    },
+    "crlf": {
+      "detected": 21,
+      "total": 55
+    },
+    "generic": {
+      "detected": 14,
+      "total": 130
+    },
+    "java": {
+      "detected": 2,
+      "total": 130
+    },
+    "ldap": {
+      "detected": 1,
+      "total": 32
+    },
+    "nosql": {
+      "detected": 0,
+      "total": 26
+    },
+    "path": {
+      "detected": 23,
+      "total": 130
+    },
+    "php": {
+      "detected": 7,
+      "total": 130
+    },
+    "sqli": {
+      "detected": 8,
+      "total": 130
+    },
+    "ssi": {
+      "detected": 1,
+      "total": 10
+    },
+    "ssrf": {
+      "detected": 2,
+      "total": 25
+    },
+    "xss": {
+      "detected": 85,
+      "total": 130
+    }
+  },
+  "corpus": "corpus-v2.json",
+  "overall": {
+    "detected": 178,
+    "total": 1058
+  }
+}

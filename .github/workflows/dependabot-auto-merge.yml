@@ -1,0 +1,53 @@
+# Auto-merge green Dependabot PRs so the queue stops rotting.
+#
+# Why this exists: the supply-chain gate (cargo-vet exemptions per version)
+# makes every bump a manual chore, so PRs pile up — and a genuinely-bad bump
+# (e.g. one that trips cargo-audit/deny with a fresh advisory) hides in the
+# same pile as trivial patch bumps. This workflow enables GitHub's native
+# auto-merge for the SAFE, low-risk classes; it uses `--auto`, so a PR merges
+# ONLY once all required checks pass. A bump that fails cargo-vet / audit /
+# deny is never merged by this — it waits for a human, now visible in a queue
+# that otherwise stays empty.
+#
+# Scope (deliberately conservative):
+#   * cargo   — patch and minor only. Major bumps wait for a human.
+#   * actions — patch and minor (pinned by SHA elsewhere; low blast radius).
+#   * docker  — patch and minor (base-image digests).
+# A major version bump of anything is left for manual review.
+#
+# Requires: repo setting "Allow auto-merge" enabled, and branch protection
+# with required status checks (ci-success). Without those, the merge step is a
+# no-op that logs and exits 0 — it never blocks.
+name: dependabot-auto-merge
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@d7267f607e9d3fb96fc2fbe83e0af444713e90b7 # v2.3.0
+
+      - name: Enable auto-merge for safe classes
+        # Patch/minor for any ecosystem = safe. Major = human review.
+        if: >-
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.update-type == 'version-update:semver-minor'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          # --auto merges only after required checks go green; a vet/audit/deny
+          # failure keeps the PR open for a human. If the repo doesn't allow
+          # auto-merge, log and exit 0 rather than failing the run.
+          gh pr merge --auto --squash "$PR_URL" || {
+            echo "::notice::auto-merge not enabled or not permitted — leaving PR for manual merge"
+            exit 0
+          }

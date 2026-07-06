@@ -3,11 +3,14 @@ name: waf-corpus
 # WAF detection / false-positive regression gate.
 #
 # Fires the frozen attack+benign corpora (benchmarks/waf-corpus/) at a live,
-# WAF-protected zion route and asserts the precision invariant: run.py exits
-# non-zero if ANY benign payload is blocked (a false positive is a hard fail).
-# Detection rate per class is printed for visibility (a recall *drop* shows in
-# the log even though it isn't a hard gate — recall is the thing we improve, FP
-# is the thing we must never regress).
+# WAF-protected zion route and asserts TWO invariants (run.py exits non-zero on
+# either):
+#   * precision — ANY benign payload blocked is a false positive, a hard fail.
+#   * recall ratchet — per-class detection may not drop below the committed
+#     baseline-*.json counts. Detection is deterministic for a fixed corpus, so
+#     a drop is a real regression; this closes the gap where the WAF's recall
+#     could rot to zero with CI staying green. Refresh a baseline after a
+#     genuine recall improvement with WAF_EMIT_BASELINE=<file>.
 #
 # Was a manual/local gate; this turns it into an automated nightly + a gate on
 # any change to the WAF or the corpus. Mirrors integration.yml's setup
@@ -94,12 +97,18 @@ jobs:
           echo "--- zion.log ---";    cat zion.log || true
           exit 1
 
-      - name: WAF corpus v1 (balanced) — hard-fails on any false positive
+      # Two regression gates now, not one: 0% false positives (precision) AND
+      # the recall ratchet — per-class detection may not drop below the
+      # committed baseline. A silent WAF recall regression is a red build.
+      - name: WAF corpus v1 (balanced) — 0% FP + recall ratchet
+        env:
+          WAF_BASELINE: benchmarks/waf-corpus/baseline-v1.json
         run: python3 benchmarks/waf-corpus/run.py https://127.0.0.1:4431 "balanced / v1"
 
-      - name: WAF corpus v2 (balanced, sourced) — hard-fails on any false positive
+      - name: WAF corpus v2 (balanced, sourced) — 0% FP + recall ratchet
         env:
           WAF_CORPUS: corpus-v2.json
+          WAF_BASELINE: benchmarks/waf-corpus/baseline-v2.json
         run: python3 benchmarks/waf-corpus/run.py https://127.0.0.1:4431 "balanced / v2"
 
       - name: Dump daemon logs on failure
