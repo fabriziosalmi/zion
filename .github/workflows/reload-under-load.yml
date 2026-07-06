@@ -1,0 +1,57 @@
+# Reload-under-load: prove a config hot-swap under concurrent traffic drops no
+# in-flight connections. The ArcSwap swap must be invisible to live requests.
+name: reload-under-load
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "src/reload.rs"
+      - "src/dispatch.rs"
+      - "src/config.rs"
+      - "src/admin.rs"
+      - "src/main.rs"
+      - "tests/reload-under-load/**"
+      - ".github/workflows/reload-under-load.yml"
+  pull_request:
+    paths:
+      - "src/reload.rs"
+      - "src/dispatch.rs"
+      - "src/config.rs"
+      - "src/admin.rs"
+      - "src/main.rs"
+      - "tests/reload-under-load/**"
+      - ".github/workflows/reload-under-load.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: reload-under-load-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  reload-under-load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: integration # share the integration job's compiled deps
+
+      - name: Build zion (release)
+        run: cargo build --release --locked --bin zion
+
+      - name: Build bench backend (release)
+        run: cargo build --release --locked --manifest-path benchmarks/backend/Cargo.toml
+
+      - name: Reload under load (0 dropped connections across live swaps)
+        env:
+          NO_COLOR: "1"
+          DURATION: "15"
+          WORKERS: "24"
+          RELOADS: "30"
+        run: ./tests/reload-under-load/run.sh

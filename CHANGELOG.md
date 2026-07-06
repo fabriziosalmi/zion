@@ -5,6 +5,12 @@ All notable changes to Zion Edge Gateway are documented here.
 ## [Unreleased]
 
 ### Added
+- **Reload-under-load harness** (`tests/reload-under-load/`): proves a config
+  hot-swap under concurrent traffic drops no in-flight connections. Sustained
+  N-worker load hits a live Zion while `POST /admin/reload` fires many real
+  atomic swaps mid-flight; the run fails on a single dropped/errored request or
+  if the config generation didn't advance during the load. Wired into CI
+  (`reload-under-load.yml`) on any change to the reload/dispatch/config path.
 - **Automatic HTTPS via Let's Encrypt is on by default in the release binary
   and official container.** A new `dist` feature bundle (`acme` + `init`) is
   what the container and release artifacts build with, so the shipped binary
