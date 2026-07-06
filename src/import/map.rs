@@ -85,14 +85,28 @@ pub fn map_model(model: &NginxModel, findings: &mut Vec<Finding>) -> ZionDoc {
     //    resolve hosts, apply the all-names-invalid hijack guard.
     let mut kept: Vec<(&Server, Option<Vec<String>>)> = Vec::new();
     for server in &model.servers {
-        if is_redirect_server(server) {
-            findings.push(Finding::new(
-                Status::Auto,
-                server.line,
-                "server",
-                "http→https redirect server — built into Zion's :80 handler; dropped",
-            ));
-            continue;
+        match redirect_server_kind(server) {
+            RedirectKind::SameHost301 => {
+                findings.push(Finding::new(
+                    Status::Auto,
+                    server.line,
+                    "server",
+                    "http→https same-host redirect server — built into Zion's :80 \
+                     handler; dropped",
+                ));
+                continue;
+            }
+            RedirectKind::SameHostOtherCode => {
+                findings.push(Finding::new(
+                    Status::Partial,
+                    server.line,
+                    "server",
+                    "http→https same-host redirect server dropped — note nginx used \
+                     302/307/308, Zion's built-in redirect is a 301",
+                ));
+                continue;
+            }
+            RedirectKind::No => {}
         }
         match server_hosts(server, findings) {
             HostsOutcome::Skip => continue,
@@ -114,10 +128,54 @@ pub fn map_model(model: &NginxModel, findings: &mut Vec<Finding>) -> ZionDoc {
         }
     }
 
+    // 1b. Scope deltas the hostless-as-shared mapping cannot avoid — state
+    //     them loudly (ADR-0011 honesty contract).
+    let has_named = kept.iter().any(|(_, h)| h.is_some());
+    for (s, h) in &kept {
+        if h.is_none() && has_named && !s.locations.is_empty() {
+            findings.push(Finding::new(
+                Status::Partial,
+                s.line,
+                "server",
+                "default-vhost routes become hostless SHARED routes: nginx served \
+                 them only for unmatched Hosts, but Zion's shared layer is also the \
+                 path-miss fallback under every named host — internal endpoints \
+                 parked here become reachable via all hostnames; review",
+            ));
+        }
+    }
+    // The same host in several server blocks: nginx sends ALL of that host's
+    // traffic to the first block; Zion merges the route sets.
+    {
+        let mut seen_hosts: Vec<&str> = Vec::new();
+        let mut flagged: Vec<&str> = Vec::new();
+        for (s, h) in &kept {
+            for host in h.as_deref().unwrap_or(&[]) {
+                if seen_hosts.contains(&host.as_str()) {
+                    if !flagged.contains(&host.as_str()) {
+                        flagged.push(host);
+                        findings.push(Finding::new(
+                            Status::Partial,
+                            s.line,
+                            "server_name",
+                            format!(
+                                "host '{host}' appears in more than one server block — \
+                                 nginx routes all its traffic to the first block only; \
+                                 Zion merges the blocks' routes under this host"
+                            ),
+                        ));
+                    }
+                } else {
+                    seen_hosts.push(host);
+                }
+            }
+        }
+    }
+
     // 2. Plain-HTTP servers: Zion always terminates TLS — one global finding.
     let plain: Vec<u32> = kept
         .iter()
-        .filter(|(s, _)| !s.listens.iter().any(|l| l.ssl))
+        .filter(|(s, _)| !server_is_tls(s))
         .map(|(s, _)| s.line)
         .collect();
     if !plain.is_empty() {
@@ -167,24 +225,58 @@ pub fn map_model(model: &NginxModel, findings: &mut Vec<Finding>) -> ZionDoc {
 
 // ── Server classification ───────────────────────────────────────────────
 
-/// The canonical redirect pair member: plain-HTTP server whose only job is
-/// `return 301 https://…` (no locations). Zion's :80 handler does exactly
-/// this, so the server is dropped as "auto".
-fn is_redirect_server(server: &Server) -> bool {
-    if server.listens.iter().any(|l| l.ssl) || !server.locations.is_empty() {
-        return false;
+/// Legacy `ssl on;` (nginx < 1.15) marks every listener of the server as TLS.
+fn ssl_on(server: &Server) -> bool {
+    server
+        .directives
+        .iter()
+        .any(|d| d.name == "ssl" && d.args.first().map(String::as_str) == Some("on"))
+}
+
+/// TLS server = any `listen … ssl` flag, or the legacy server-level `ssl on;`.
+fn server_is_tls(server: &Server) -> bool {
+    server.listens.iter().any(|l| l.ssl) || ssl_on(server)
+}
+
+enum RedirectKind {
+    /// `return 301 https://$host$request_uri` (or `$server_name`/`$http_host`)
+    /// on a plain server with no locations — exactly Zion's built-in behavior.
+    SameHost301,
+    /// Same shape but 302/307/308 — droppable, with the code delta stated.
+    SameHostOtherCode,
+    No,
+}
+
+/// The canonical redirect pair member. The target must be a SAME-HOST
+/// redirect: a cross-host target (`https://new.example.com$request_uri`, a
+/// domain migration) is NOT equivalent to Zion's :80 handler, which redirects
+/// to the original request host — those servers are kept so their `return`
+/// surfaces as an unsupported finding instead of being silently rewritten
+/// into a self-redirect.
+fn redirect_server_kind(server: &Server) -> RedirectKind {
+    if server_is_tls(server) || !server.locations.is_empty() {
+        return RedirectKind::No;
     }
-    server.directives.iter().any(|d| {
-        d.name == "return"
-            && matches!(
-                d.args.first().map(String::as_str),
-                Some("301") | Some("302") | Some("307") | Some("308")
-            )
-            && d.args
-                .get(1)
-                .map(|t| t.starts_with("https://"))
-                .unwrap_or(false)
-    })
+    const SAME_HOST_TARGETS: [&str; 3] = [
+        "https://$host$request_uri",
+        "https://$server_name$request_uri",
+        "https://$http_host$request_uri",
+    ];
+    for d in &server.directives {
+        if d.name != "return" {
+            continue;
+        }
+        let code = d.args.first().map(String::as_str);
+        let target = d.args.get(1).map(String::as_str).unwrap_or("");
+        if SAME_HOST_TARGETS.contains(&target) {
+            match code {
+                Some("301") => return RedirectKind::SameHost301,
+                Some("302") | Some("307") | Some("308") => return RedirectKind::SameHostOtherCode,
+                _ => {}
+            }
+        }
+    }
+    RedirectKind::No
 }
 
 enum HostsOutcome {
@@ -263,10 +355,15 @@ fn server_hosts(server: &Server, findings: &mut Vec<Finding>) -> HostsOutcome {
         if dropped > 0 {
             findings.push(Finding::new(
                 Status::Unsupported,
-                line,
-                "server_name",
-                "every server_name was unconvertible — server skipped (emitting its \
-                 routes hostless would capture traffic for all hosts)",
+                server.line,
+                "server",
+                format!(
+                    "every server_name was unconvertible — the whole server block \
+                     ({} listen(s), {} location(s) and their directives) is skipped: \
+                     emitting its routes hostless would capture traffic for all hosts",
+                    server.listens.len(),
+                    server.locations.len(),
+                ),
             ));
             return HostsOutcome::Skip;
         }
@@ -281,6 +378,12 @@ fn server_hosts(server: &Server, findings: &mut Vec<Finding>) -> HostsOutcome {
              unmatched hosts fall through to Zion's shared layer",
         ));
     }
+    findings.push(Finding::new(
+        Status::Convert,
+        line,
+        "server_name",
+        format!("hosts = [{}]", hosts.join(", ")),
+    ));
     HostsOutcome::Hosts(hosts)
 }
 
@@ -317,8 +420,11 @@ fn map_listens(
     let mut http_port: Option<u16> = None;
     let mut https_port: Option<u16> = None;
     for (server, _) in kept {
+        // Legacy `ssl on;` upgrades every listener of this server to TLS.
+        let forced_tls = ssl_on(server);
         for l in &server.listens {
-            let (host_part, port) = match split_listen(&l.addr, l.ssl) {
+            let tls = l.ssl || forced_tls;
+            let (host_part, port) = match split_listen(&l.addr, tls) {
                 Some(hp) => hp,
                 None => {
                     findings.push(Finding::new(
@@ -340,21 +446,34 @@ fn map_listens(
                     ));
                 }
             }
-            let slot = if l.ssl {
-                &mut https_port
+            let (slot, label) = if tls {
+                (&mut https_port, "https")
             } else {
-                &mut http_port
+                (&mut http_port, "http")
             };
             match slot {
-                None => *slot = Some(port),
-                Some(p) if *p == port => {}
+                None => {
+                    *slot = Some(port);
+                    findings.push(Finding::new(
+                        Status::Convert,
+                        l.line,
+                        "listen",
+                        format!("server.listen_{label} = \"0.0.0.0:{port}\""),
+                    ));
+                }
+                Some(p) if *p == port => findings.push(Finding::new(
+                    Status::Convert,
+                    l.line,
+                    "listen",
+                    format!("port {port} (already mapped)"),
+                )),
                 Some(p) => findings.push(Finding::new(
                     Status::Unsupported,
                     l.line,
                     "listen",
                     format!(
                         "Zion has a single {} listener (:{p} already taken) — port {port} not mapped",
-                        if l.ssl { "HTTPS" } else { "HTTP" }
+                        if tls { "HTTPS" } else { "HTTP" }
                     ),
                 )),
             }
@@ -464,16 +583,22 @@ fn map_tls(
                     }
                 }
                 "ssl_protocols" => {
+                    // Exactly ONE finding per directive (report contract).
                     let protos: Vec<&str> = d.args.iter().map(String::as_str).collect();
-                    if protos.iter().any(|p| *p == "TLSv1" || *p == "TLSv1.1") {
+                    let legacy = protos.iter().any(|p| *p == "TLSv1" || *p == "TLSv1.1");
+                    let v12 = protos.contains(&"TLSv1.2");
+                    let v13 = protos.contains(&"TLSv1.3");
+                    if legacy {
+                        // Floor as low as Zion goes so 1.2 clients keep working.
+                        doc.tls_min12 = true;
                         findings.push(Finding::new(
                             Status::Partial,
                             d.line,
                             "ssl_protocols",
-                            "TLS 1.0/1.1 requested — Zion's floor is TLS 1.2",
+                            "TLS 1.0/1.1 requested — Zion's floor is 1.2; emitted \
+                             min_version = \"1.2\"",
                         ));
-                    }
-                    if protos.contains(&"TLSv1.2") {
+                    } else if v12 {
                         doc.tls_min12 = true;
                         findings.push(Finding::new(
                             Status::Convert,
@@ -481,28 +606,56 @@ fn map_tls(
                             "ssl_protocols",
                             "tls.min_version = \"1.2\"",
                         ));
+                    } else if v13 {
+                        findings.push(Finding::new(
+                            Status::Convert,
+                            d.line,
+                            "ssl_protocols",
+                            "TLS 1.3-only is Zion's default",
+                        ));
+                    } else {
+                        findings.push(Finding::new(
+                            Status::Unsupported,
+                            d.line,
+                            "ssl_protocols",
+                            format!(
+                                "no supported protocol in [{}] — Zion emits its \
+                                 default (TLS 1.3)",
+                                protos.join(", ")
+                            ),
+                        ));
                     }
                 }
                 _ => {}
             }
         }
-        if let (Some(cert), Some(key)) = (cert, key) {
-            let mut exact = Vec::new();
-            let mut wildcard = Vec::new();
-            for h in hosts.as_deref().unwrap_or(&[]) {
-                if h.starts_with("*.") {
-                    wildcard.push(h.clone());
-                } else {
-                    exact.push(h.clone());
+        match (cert, key) {
+            (Some(cert), Some(key)) => {
+                let mut exact = Vec::new();
+                let mut wildcard = Vec::new();
+                for h in hosts.as_deref().unwrap_or(&[]) {
+                    if h.starts_with("*.") {
+                        wildcard.push(h.clone());
+                    } else {
+                        exact.push(h.clone());
+                    }
                 }
+                entries.push(CertEntry {
+                    cert,
+                    key,
+                    line,
+                    exact,
+                    wildcard,
+                });
             }
-            entries.push(CertEntry {
-                cert,
-                key,
+            (None, None) => {}
+            (Some(_), None) | (None, Some(_)) => findings.push(Finding::new(
+                Status::Unsupported,
                 line,
-                exact,
-                wildcard,
-            });
+                "ssl_certificate",
+                "ssl_certificate without ssl_certificate_key (or vice versa) — \
+                 incomplete pair ignored; placeholder paths emitted",
+            )),
         }
     }
 
@@ -524,7 +677,7 @@ fn map_tls(
         Status::Convert,
         entries[default_idx].line,
         "ssl_certificate",
-        "default [tls] certificate",
+        "default [tls] certificate pair (ssl_certificate + ssl_certificate_key)",
     ));
 
     let default_cert = doc.tls_cert.clone();
@@ -678,6 +831,19 @@ impl<'a> UpstreamReg<'a> {
             }
             let mut urls = Vec::new();
             for s in &pool.servers {
+                if s.addr.starts_with("unix:") {
+                    findings.push(Finding::new(
+                        Status::Unsupported,
+                        s.line,
+                        "server",
+                        format!(
+                            "unix domain socket member '{}' — Zion upstreams are \
+                             TCP http(s) only; member omitted",
+                            s.addr
+                        ),
+                    ));
+                    continue;
+                }
                 let mut down = false;
                 for flag in &s.flags {
                     match flag.as_str() {
@@ -791,8 +957,16 @@ struct Aggregates {
     used_zones: Vec<String>,
 }
 
+/// Server-level state locations may inherit. nginx inheritance for the
+/// header-array directives (`proxy_set_header`, `add_header`) is
+/// REPLACE-not-merge: a location that declares any of its own inherits none
+/// of the server's — the `has_*` flags carry that rule to `map_location`.
 struct ServerCtx {
     csp: Option<String>,
+    has_add_header: bool,
+    websocket: bool,
+    has_set_header: bool,
+    hdr_annotations: Vec<String>,
     waf: bool,
     connect_ms: Option<u64>,
 }
@@ -808,17 +982,21 @@ fn map_server(
 ) {
     let mut ctx = ServerCtx {
         csp: None,
+        has_add_header: false,
+        websocket: false,
+        has_set_header: false,
+        hdr_annotations: Vec::new(),
         waf: false,
         connect_ms: None,
     };
 
     for d in &server.directives {
         match d.name.as_str() {
-            // Consumed by map_tls / is_redirect_server.
+            // Consumed by map_tls / redirect_server_kind.
             "ssl_certificate" | "ssl_certificate_key" | "ssl_protocols" => {}
-            "client_max_body_size" => map_body_size(d, doc, &mut ctx, findings),
-            "set_real_ip_from" => {
-                if let Some(cidr) = d.args.first() {
+            "client_max_body_size" => map_body_size(d, doc, &mut ctx.waf, findings),
+            "set_real_ip_from" => match d.args.first() {
+                Some(cidr) if valid_cidr(cidr) => {
                     if !doc.trusted_proxies.contains(cidr) {
                         doc.trusted_proxies.push(cidr.clone());
                     }
@@ -829,7 +1007,22 @@ fn map_server(
                         "server.trusted_proxies",
                     ));
                 }
-            }
+                Some(other) => findings.push(Finding::new(
+                    Status::Unsupported,
+                    d.line,
+                    "set_real_ip_from",
+                    format!(
+                        "'{other}' is not an IP address or CIDR — not emitted \
+                         (Zion would silently ignore it at runtime)"
+                    ),
+                )),
+                None => findings.push(Finding::new(
+                    Status::Unsupported,
+                    d.line,
+                    "set_real_ip_from",
+                    "missing address",
+                )),
+            },
             "real_ip_header" => {
                 let hdr = d.args.first().map(String::as_str).unwrap_or("");
                 if hdr.eq_ignore_ascii_case("x-forwarded-for") {
@@ -851,12 +1044,30 @@ fn map_server(
             }
             "limit_req" => map_limit_req(d, agg, model, findings),
             "limit_conn" => map_limit_conn(d, agg, model, findings),
-            "add_header" => map_add_header(d, &mut ctx.csp, findings),
+            "add_header" => {
+                ctx.has_add_header = true;
+                map_add_header(d, &mut ctx.csp, findings);
+            }
             "proxy_set_header" => {
-                classify_set_header(d, &mut false, &mut Vec::new(), findings);
+                // Inherited by locations that declare none of their own —
+                // including the websocket idiom and the Host behavior note.
+                ctx.has_set_header = true;
+                classify_set_header(d, &mut ctx.websocket, &mut ctx.hdr_annotations, findings);
             }
             "proxy_connect_timeout" => {
                 map_connect_timeout(d, &mut ctx.connect_ms, findings);
+            }
+            "ssl" => {
+                if d.args.first().map(String::as_str) == Some("on") {
+                    findings.push(Finding::new(
+                        Status::Convert,
+                        d.line,
+                        "ssl",
+                        "legacy `ssl on` — this server's listeners are treated as TLS",
+                    ));
+                } else {
+                    findings.push(Finding::unsupported_directive(d));
+                }
             }
             "ssl_ciphers"
             | "ssl_prefer_server_ciphers"
@@ -929,9 +1140,14 @@ fn map_location(
 
     let mut annotations: Vec<String> = Vec::new();
     let mut proxy: Option<(String, String, Option<String>, u32)> = None; // scheme, target, uri part, line
-    let mut websocket = false;
-    let mut csp = ctx.csp.clone();
-    let mut connect_ms = ctx.connect_ms;
+                                                                         // Location-scoped header state — inherits from the server ONLY when the
+                                                                         // location declares no directive of that family (nginx replace-not-merge).
+    let mut loc_ws = false;
+    let mut loc_has_set_header = false;
+    let mut loc_hdr_annotations: Vec<String> = Vec::new();
+    let mut loc_csp: Option<String> = None;
+    let mut loc_has_add_header = false;
+    let mut loc_connect: Option<u64> = None;
     let mut route_waf = ctx.waf;
     let mut static_only = Vec::new();
 
@@ -944,6 +1160,17 @@ fn map_location(
                         d.line,
                         "proxy_pass",
                         format!("variable target '{url}' — Zion upstreams are static"),
+                    ));
+                }
+                Some(url) if is_unix_target(url) => {
+                    findings.push(Finding::new(
+                        Status::Unsupported,
+                        d.line,
+                        "proxy_pass",
+                        format!(
+                            "unix domain socket target '{url}' — Zion upstreams \
+                             are TCP http(s) only; route skipped"
+                        ),
                     ));
                 }
                 Some(url) => match split_proxy_pass(url) {
@@ -963,7 +1190,8 @@ fn map_location(
                 )),
             },
             "proxy_set_header" => {
-                classify_set_header(d, &mut websocket, &mut annotations, findings)
+                loc_has_set_header = true;
+                classify_set_header(d, &mut loc_ws, &mut loc_hdr_annotations, findings)
             }
             "proxy_http_version" => findings.push(Finding::new(
                 Status::Auto,
@@ -971,7 +1199,7 @@ fn map_location(
                 "proxy_http_version",
                 "backend protocol is managed by Zion",
             )),
-            "proxy_connect_timeout" => map_connect_timeout(d, &mut connect_ms, findings),
+            "proxy_connect_timeout" => map_connect_timeout(d, &mut loc_connect, findings),
             "proxy_read_timeout"
             | "proxy_send_timeout"
             | "send_timeout"
@@ -990,18 +1218,15 @@ fn map_location(
                 "proxy_buffering",
                 "no buffering knob — for SSE endpoints use `mode = \"sse_stream\"`",
             )),
-            "add_header" => map_add_header(d, &mut csp, findings),
+            "add_header" => {
+                loc_has_add_header = true;
+                map_add_header(d, &mut loc_csp, findings);
+            }
             "limit_req" => map_limit_req(d, agg, model, findings),
             "limit_conn" => map_limit_conn(d, agg, model, findings),
             "client_max_body_size" => {
                 // Location-scoped cap: contributes to the shared imported profile.
-                let mut tmp = ServerCtx {
-                    csp: None,
-                    waf: route_waf,
-                    connect_ms: None,
-                };
-                map_body_size(d, doc, &mut tmp, findings);
-                route_waf = tmp.waf;
+                map_body_size(d, doc, &mut route_waf, findings);
             }
             "root" | "alias" | "try_files" | "index" | "autoindex" => {
                 static_only.push(d.line);
@@ -1083,6 +1308,27 @@ fn map_location(
         None => return,
     };
 
+    // Resolve inheritance (nginx replace-not-merge): a location with its own
+    // proxy_set_header/add_header set inherits nothing from the server's.
+    let websocket = if loc_has_set_header {
+        loc_ws
+    } else {
+        ctx.websocket
+    };
+    let mut hdr_annotations = if loc_has_set_header {
+        loc_hdr_annotations
+    } else {
+        ctx.hdr_annotations.clone()
+    };
+    annotations.append(&mut hdr_annotations);
+    let mut csp = if loc_has_add_header {
+        loc_csp
+    } else {
+        ctx.csp.clone()
+    };
+    // Timeouts: the location-level value overrides the server-level one.
+    let connect_ms = loc_connect.or(ctx.connect_ms);
+
     if let Some(uri) = uri {
         // Replacing `/` with `/` under `location /` is the identity — fine.
         let noop = uri == "/" && loc.modifier == LocMod::Prefix && loc.pattern == "/";
@@ -1140,6 +1386,12 @@ fn map_location(
     }
 
     let upstream = reg.resolve(&scheme, &target, connect_ms, pline, findings);
+    findings.push(Finding::new(
+        Status::Convert,
+        pline,
+        "proxy_pass",
+        format!("route '{path}' → upstream '{upstream}'"),
+    ));
     if !static_only.is_empty() {
         annotations.push(
             "this location also served static content in nginx — that part needs a \
@@ -1234,6 +1486,16 @@ fn location_path(loc: &Location, findings: &mut Vec<Finding>) -> Option<String> 
     Some(path)
 }
 
+/// nginx's unix-socket target syntax: `proxy_pass http://unix:/path[:/uri]`.
+/// Zion upstreams are TCP-only, so these must be loud findings — a naive
+/// split would emit a "valid" http URL whose hostname is literally `unix`.
+fn is_unix_target(url: &str) -> bool {
+    url.strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .map(|rest| rest.starts_with("unix:"))
+        .unwrap_or(false)
+}
+
 /// `http://host[:port][/uri]` → (scheme, authority, Some(uri) if present).
 fn split_proxy_pass(url: &str) -> Option<(String, String, Option<String>)> {
     let (scheme, rest) = if let Some(r) = url.strip_prefix("http://") {
@@ -1259,12 +1521,7 @@ fn split_proxy_pass(url: &str) -> Option<(String, String, Option<String>)> {
 
 // ── Shared directive mappers ────────────────────────────────────────────
 
-fn map_body_size(
-    d: &Directive,
-    doc: &mut ZionDoc,
-    ctx: &mut ServerCtx,
-    findings: &mut Vec<Finding>,
-) {
+fn map_body_size(d: &Directive, doc: &mut ZionDoc, waf: &mut bool, findings: &mut Vec<Finding>) {
     let raw = match d.args.first() {
         Some(a) => a,
         None => return,
@@ -1277,7 +1534,7 @@ fn map_body_size(
             "0 = unlimited — Zion has no body cap unless a WAF profile sets one",
         )),
         Some(mb) => {
-            ctx.waf = true;
+            *waf = true;
             let prev = doc.waf_body_mb;
             doc.waf_body_mb = Some(prev.map_or(mb, |p| p.max(mb)));
             let mut detail = format!(
@@ -1594,9 +1851,40 @@ fn finish_aggregates(
             ));
         }
     }
+    for z in &model.conn_zones {
+        if !agg.used_zones.contains(&z.name) {
+            findings.push(Finding::new(
+                Status::Auto,
+                z.line,
+                "limit_conn_zone",
+                format!("zone '{}' is never referenced — dropped", z.name),
+            ));
+        }
+    }
 }
 
 // ── Unit parsers ────────────────────────────────────────────────────────
+
+/// A `set_real_ip_from` value must be an IP address or CIDR — Zion parses
+/// `trusted_proxies` leniently at boot (invalid entries are skipped), so an
+/// unvalidated pass-through would become a silent runtime drop.
+fn valid_cidr(s: &str) -> bool {
+    let (ip, prefix) = match s.split_once('/') {
+        Some((i, p)) => (i, Some(p)),
+        None => (s, None),
+    };
+    let addr: std::net::IpAddr = match ip.parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    match prefix {
+        None => true,
+        Some(p) => p
+            .parse::<u8>()
+            .map(|n| n <= if addr.is_ipv4() { 32 } else { 128 })
+            .unwrap_or(false),
+    }
+}
 
 /// nginx size → megabytes, rounding up. `0` means unlimited (caller decides).
 fn parse_size_mb(raw: &str) -> Option<u64> {

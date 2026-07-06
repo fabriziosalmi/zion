@@ -132,13 +132,26 @@ pub(crate) fn convert(src: &str, base_dir: Option<&Path>) -> Result<Conversion, 
     Ok(Conversion { toml, findings })
 }
 
-/// Splice resolved `include` directives in place, depth-guarded. An include
-/// that cannot be resolved is left in the tree — the mapper turns it into an
-/// unsupported finding instead of aborting the whole import.
+/// Splice resolved `include` directives in place, guarded on depth AND on the
+/// total number of spliced directives — depth alone would let a wide include
+/// fan-out (each file including many others) amplify a small input into
+/// unbounded memory. An include that cannot be resolved is left in the tree —
+/// the mapper turns it into an unsupported finding instead of aborting the
+/// whole import.
 fn resolve_includes(
     items: Vec<Directive>,
     base: &Path,
     depth: u32,
+) -> Result<Vec<Directive>, String> {
+    let mut budget: usize = 100_000;
+    resolve_includes_inner(items, base, depth, &mut budget)
+}
+
+fn resolve_includes_inner(
+    items: Vec<Directive>,
+    base: &Path,
+    depth: u32,
+    budget: &mut usize,
 ) -> Result<Vec<Directive>, String> {
     const MAX_INCLUDE_DEPTH: u32 = 16;
     if depth > MAX_INCLUDE_DEPTH {
@@ -154,8 +167,13 @@ fn resolve_includes(
                             .map_err(|e| format!("include {}: {e}", file.display()))?;
                         let sub = nginx::parse(&src)
                             .map_err(|e| format!("include {}: {e}", file.display()))?;
+                        *budget = budget.checked_sub(sub.len()).ok_or_else(|| {
+                            "include expansion exceeds the directive budget \
+                             (100000) — refusing to continue"
+                                .to_string()
+                        })?;
                         let sub_base = file.parent().unwrap_or(base).to_path_buf();
-                        out.extend(resolve_includes(sub, &sub_base, depth + 1)?);
+                        out.extend(resolve_includes_inner(sub, &sub_base, depth + 1, budget)?);
                     }
                     continue;
                 }
@@ -167,7 +185,7 @@ fn resolve_includes(
             }
         }
         if let Some(block) = d.block.take() {
-            d.block = Some(resolve_includes(block, base, depth)?);
+            d.block = Some(resolve_includes_inner(block, base, depth, budget)?);
         }
         out.push(d);
     }
@@ -300,6 +318,15 @@ pub fn run(opts: ImportOpts) -> i32 {
         }
     };
 
+    // The report file is written BEFORE the config is emitted so that exit 1
+    // keeps its contract: fatal means nothing was emitted.
+    if let Some(path) = &opts.report {
+        if let Err(e) = std::fs::write(path, report_text(&conversion.findings, true)) {
+            eprintln!("zion import: cannot write report {path}: {e} — nothing emitted");
+            return 1;
+        }
+    }
+
     match &opts.output {
         Some(path) => {
             if let Err(e) = std::fs::write(path, &conversion.toml) {
@@ -311,14 +338,8 @@ pub fn run(opts: ImportOpts) -> i32 {
         None => print!("{}", conversion.toml),
     }
 
-    // Findings that need eyes go to stderr; the full log to --report.
+    // Findings that need eyes go to stderr; the full log went to --report.
     eprint!("{}", report_text(&conversion.findings, false));
-    if let Some(path) = &opts.report {
-        if let Err(e) = std::fs::write(path, report_text(&conversion.findings, true)) {
-            eprintln!("zion import: cannot write report {path}: {e}");
-            return 1;
-        }
-    }
 
     let needs_eyes = conversion
         .findings
@@ -652,6 +673,260 @@ mod tests {
         assert!(wildcard_match("a*b*.conf", "aXbY.conf"));
         assert!(!wildcard_match("*.conf", "site.confx"));
         assert!(!wildcard_match("a*.conf", "b.conf"));
+    }
+
+    // ── Regression tests for the adversarial-review findings ────────────
+
+    fn ok(src: &str) -> Conversion {
+        match convert(src, None) {
+            Ok(c) => c,
+            Err(ConvertError::Parse(e)) => panic!("parse error: {e}"),
+            Err(ConvertError::NoRoutes(f)) => {
+                panic!("no routes; findings:\n{}", report_text(&f, true))
+            }
+            Err(ConvertError::Internal(e)) => panic!("internal: {e}"),
+        }
+    }
+
+    #[test]
+    fn server_level_websocket_idiom_is_inherited() {
+        // nginx inherits proxy_set_header into locations with none of their
+        // own — the idiom at server level must actually flip the route mode.
+        let c = ok("server { listen 80; server_name ws.example.com; \
+             proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection \"upgrade\"; \
+             location / { proxy_pass http://127.0.0.1:3000; } }");
+        assert!(c.toml.contains("mode = \"websocket\""));
+    }
+
+    #[test]
+    fn location_set_header_blocks_inheritance() {
+        // Replace-not-merge: a location with its OWN proxy_set_header set
+        // inherits nothing — no websocket mode from the server level.
+        let c = ok("server { listen 80; \
+             proxy_set_header Upgrade $http_upgrade; \
+             location / { proxy_set_header X-Real-IP $remote_addr; proxy_pass http://127.0.0.1:3000; } }");
+        assert!(!c.toml.contains("mode = \"websocket\""));
+    }
+
+    #[test]
+    fn add_header_inheritance_is_replace_not_merge() {
+        let c = ok("server { listen 80; \
+             add_header Content-Security-Policy \"default-src 'self'\"; \
+             location /a/ { proxy_pass http://127.0.0.1:1; } \
+             location /b/ { add_header X-Other v; proxy_pass http://127.0.0.1:2; } }");
+        let routes: Vec<&str> = c.toml.split("[[route]]").skip(1).collect();
+        assert!(
+            routes[0].contains("csp = "),
+            "location /a/ inherits the server CSP"
+        );
+        assert!(
+            !routes[1].contains("csp = "),
+            "location /b/ declares its own add_header — inherits nothing"
+        );
+    }
+
+    #[test]
+    fn location_connect_timeout_overrides_server() {
+        let c = ok("server { listen 80; proxy_connect_timeout 30s; \
+             location / { proxy_connect_timeout 5s; proxy_pass http://127.0.0.1:1; } }");
+        assert!(c.toml.contains("connect_timeout_ms = 5000"));
+        assert!(!c.toml.contains("connect_timeout_ms = 30000"));
+    }
+
+    #[test]
+    fn cross_host_redirect_is_not_dropped_as_auto() {
+        // A domain-migration redirect is NOT Zion's built-in same-host
+        // redirect; the server must be kept and its `return` flagged.
+        let c = ok("server { listen 80; server_name old.example.com; \
+             return 301 https://new.example.com$request_uri; } \
+             server { listen 80; server_name a.example.com; \
+             location / { proxy_pass http://127.0.0.1:1; } }");
+        assert!(has_finding(&c, Status::Unsupported, "return", ""));
+        assert!(!c
+            .findings
+            .iter()
+            .any(|f| f.status == Status::Auto && f.directive == "server"));
+    }
+
+    #[test]
+    fn same_host_302_redirect_dropped_with_code_delta() {
+        let c = ok(
+            "server { listen 80; return 302 https://$host$request_uri; } \
+             server { listen 443 ssl; server_name s.example.com; \
+             ssl_certificate /c.pem; ssl_certificate_key /k.pem; \
+             location / { proxy_pass http://127.0.0.1:1; } }",
+        );
+        assert!(has_finding(&c, Status::Partial, "server", "301"));
+    }
+
+    #[test]
+    fn legacy_ssl_on_marks_listeners_tls() {
+        let c = ok("server { listen 443; ssl on; server_name s.example.com; \
+             ssl_certificate /c.pem; ssl_certificate_key /k.pem; \
+             location / { proxy_pass http://127.0.0.1:1; } }");
+        assert!(c.toml.contains("listen_https = \"0.0.0.0:443\""));
+        assert!(has_finding(&c, Status::Convert, "ssl", "legacy"));
+        assert!(
+            !has_finding(&c, Status::Partial, "server", "plain-HTTP"),
+            "an `ssl on` server is not plain HTTP"
+        );
+    }
+
+    #[test]
+    fn unix_socket_targets_are_loud_not_garbage() {
+        let c = ok(
+            "upstream app { server unix:/run/php.sock; server 127.0.0.1:9000; } \
+             server { listen 80; \
+             location / { proxy_pass http://app; } \
+             location /direct/ { proxy_pass http://unix:/run/gunicorn.sock; } }",
+        );
+        assert!(
+            !c.toml.contains("unix"),
+            "no unix pseudo-URL may be emitted"
+        );
+        assert!(has_finding(
+            &c,
+            Status::Unsupported,
+            "server",
+            "unix domain socket"
+        ));
+        assert!(has_finding(
+            &c,
+            Status::Unsupported,
+            "proxy_pass",
+            "unix domain socket"
+        ));
+    }
+
+    #[test]
+    fn default_vhost_scope_widening_is_stated() {
+        let c = ok("server { listen 80; server_name a.example.com; \
+             location / { proxy_pass http://127.0.0.1:1; } } \
+             server { listen 80 default_server; server_name _; \
+             location /admin/ { proxy_pass http://127.0.0.1:2; } }");
+        assert!(has_finding(
+            &c,
+            Status::Partial,
+            "server",
+            "path-miss fallback"
+        ));
+    }
+
+    #[test]
+    fn duplicate_host_across_servers_is_flagged() {
+        let c = ok("server { listen 80; server_name a.example.com; \
+             location / { proxy_pass http://127.0.0.1:1; } } \
+             server { listen 80; server_name a.example.com; \
+             location /x/ { proxy_pass http://127.0.0.1:2; } }");
+        assert!(has_finding(
+            &c,
+            Status::Partial,
+            "server_name",
+            "more than one server block"
+        ));
+    }
+
+    #[test]
+    fn incomplete_cert_pair_is_flagged() {
+        let c = ok("server { listen 443 ssl; server_name s.example.com; \
+             ssl_certificate /only-cert.pem; \
+             location / { proxy_pass http://127.0.0.1:1; } }");
+        assert!(has_finding(
+            &c,
+            Status::Unsupported,
+            "ssl_certificate",
+            "incomplete pair"
+        ));
+        assert!(
+            c.toml.contains("/etc/ssl/zion/zion.crt"),
+            "placeholder used"
+        );
+    }
+
+    #[test]
+    fn invalid_cidr_is_flagged_not_emitted() {
+        let c = ok("server { listen 80; set_real_ip_from not-a-cidr; \
+             set_real_ip_from 10.0.0.0/8; \
+             location / { proxy_pass http://127.0.0.1:1; } }");
+        assert!(has_finding(
+            &c,
+            Status::Unsupported,
+            "set_real_ip_from",
+            "not-a-cidr"
+        ));
+        assert!(c.toml.contains("trusted_proxies = [\"10.0.0.0/8\"]"));
+    }
+
+    #[test]
+    fn unused_conn_zone_gets_a_finding() {
+        let c = ok("limit_conn_zone $binary_remote_addr zone=unusedz:10m; \
+             server { listen 80; location / { proxy_pass http://127.0.0.1:1; } }");
+        assert!(has_finding(&c, Status::Auto, "limit_conn_zone", "unusedz"));
+    }
+
+    #[test]
+    fn ssl_protocols_one_finding_per_directive() {
+        // Legacy-only: floor to 1.2 and say so, in ONE finding.
+        let c = ok("server { listen 443 ssl; server_name s.example.com; \
+             ssl_certificate /c.pem; ssl_certificate_key /k.pem; \
+             ssl_protocols TLSv1 TLSv1.1; \
+             location / { proxy_pass http://127.0.0.1:1; } }");
+        assert!(c.toml.contains("min_version = \"1.2\""));
+        assert_eq!(
+            c.findings
+                .iter()
+                .filter(|f| f.directive == "ssl_protocols")
+                .count(),
+            1
+        );
+        // 1.3-only: Zion's default, convert.
+        let c = ok("server { listen 443 ssl; ssl_protocols TLSv1.3; \
+             location / { proxy_pass http://127.0.0.1:1; } }");
+        assert!(has_finding(&c, Status::Convert, "ssl_protocols", "default"));
+        // Nothing Zion can speak: loud, and --strict-visible.
+        let c = ok("server { listen 443 ssl; ssl_protocols SSLv3; \
+             location / { proxy_pass http://127.0.0.1:1; } }");
+        assert!(has_finding(
+            &c,
+            Status::Unsupported,
+            "ssl_protocols",
+            "SSLv3"
+        ));
+    }
+
+    #[test]
+    fn happy_path_core_directives_are_accounted() {
+        let c = ok("server { listen 443 ssl; server_name h.example.com; \
+             ssl_certificate /c.pem; ssl_certificate_key /k.pem; \
+             location = /health { proxy_pass http://127.0.0.1:1; } }");
+        for directive in [
+            "listen",
+            "server_name",
+            "proxy_pass",
+            "ssl_certificate",
+            "location",
+        ] {
+            assert!(
+                c.findings.iter().any(|f| f.directive == directive),
+                "{directive} must land in a finding bucket"
+            );
+        }
+    }
+
+    #[test]
+    fn http_level_mappable_directive_gets_truthful_detail() {
+        let c = ok("http { client_max_body_size 64m; \
+             server { listen 80; location / { proxy_pass http://127.0.0.1:1; } } }");
+        assert!(has_finding(
+            &c,
+            Status::Unsupported,
+            "client_max_body_size",
+            "move it into the server block"
+        ));
+        assert!(
+            !c.toml.contains("max_body_mb"),
+            "http-level cap must not half-apply"
+        );
     }
 
     #[test]

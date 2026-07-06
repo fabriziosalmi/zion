@@ -96,7 +96,7 @@ fn render_upstream(out: &mut String, up: &UpstreamOut) {
 
 fn render_route(out: &mut String, route: &RouteOut) {
     for note in &route.annotations {
-        out.push_str(&format!("# UNSUPPORTED: {note}\n"));
+        out.push_str(&format!("# UNSUPPORTED: {}\n", comment_safe(note)));
     }
     out.push_str("[[route]]\n");
     kv(out, "path", &route.path);
@@ -126,6 +126,17 @@ fn render_route(out: &mut String, route: &RouteOut) {
 
 fn kv(out: &mut String, key: &str, value: &str) {
     out.push_str(&format!("{key} = {}\n", toml_str(value)));
+}
+
+/// Annotation text is interpolated into `#` comment lines and may carry
+/// input-derived content (e.g. a proxy_pass URI part). A newline — legal
+/// inside an nginx quoted string — would end the comment and inject raw TOML
+/// into the emitted config, so every control character is flattened to a
+/// space before rendering.
+fn comment_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// TOML basic-string escaping: backslash, double quote, and control chars.
@@ -163,6 +174,46 @@ pub fn self_validate(toml: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn annotations_cannot_inject_toml() {
+        // A crafted nginx value carrying a newline must not break out of the
+        // `# UNSUPPORTED:` comment line (that would inject arbitrary TOML).
+        let doc = ZionDoc {
+            listen_http: "0.0.0.0:80".into(),
+            listen_https: "0.0.0.0:443".into(),
+            rate_limit: None,
+            max_conn_per_ip: None,
+            trusted_proxies: Vec::new(),
+            tls_cert: "/c".into(),
+            tls_key: "/k".into(),
+            tls_min12: false,
+            sni: Vec::new(),
+            waf_body_mb: None,
+            upstreams: vec![super::super::map::UpstreamOut {
+                name: "b".into(),
+                urls: vec!["http://127.0.0.1:1".into()],
+                connect_timeout_ms: None,
+                keepalive: None,
+            }],
+            routes: vec![super::super::map::RouteOut {
+                path: "/{*rest}".into(),
+                hosts: None,
+                upstream: "b".into(),
+                websocket: false,
+                csp: None,
+                waf: false,
+                annotations: vec!["evil\ninternal_only = false\n[admin]".into()],
+            }],
+        };
+        let toml = render(&doc);
+        assert!(
+            !toml.contains("\ninternal_only"),
+            "injection broke out of the comment"
+        );
+        assert!(toml.contains("# UNSUPPORTED: evil internal_only = false [admin]"));
+        self_validate(&toml).expect("sanitized output must still validate");
+    }
 
     #[test]
     fn toml_string_escaping() {

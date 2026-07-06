@@ -234,17 +234,24 @@ fn parse_auto_opts(args: &[String]) -> AutoOpts {
     opts
 }
 
+// A value for a value-taking flag must not itself look like a flag — this is
+// what makes `zion import nginx x.conf -o --strict` keep `--strict` as the
+// flag it is instead of writing a file literally named "--strict".
+fn flag_value(args: &[String], i: usize) -> Option<&String> {
+    args.get(i + 1).filter(|v| !v.starts_with('-'))
+}
+
 fn parse_import_opts(args: &[String]) -> ImportOpts {
     let mut opts = ImportOpts::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "-o" | "--output" if i + 1 < args.len() => {
-                opts.output = Some(args[i + 1].clone());
+            "-o" | "--output" if flag_value(args, i).is_some() => {
+                opts.output = flag_value(args, i).cloned();
                 i += 2;
             }
-            "--report" if i + 1 < args.len() => {
-                opts.report = Some(args[i + 1].clone());
+            "--report" if flag_value(args, i).is_some() => {
+                opts.report = flag_value(args, i).cloned();
                 i += 2;
             }
             "--strict" => {
@@ -507,6 +514,16 @@ mod tests {
                 assert_eq!(o.source, "nginx");
                 assert_eq!(o.input.as_deref(), Some("-"));
                 assert!(!o.strict);
+            }
+            _ => panic!("expected Import"),
+        }
+        // A value-taking flag never swallows a following flag: here `-o` is
+        // dangling, so output stays stdout and --strict is still honored.
+        match parse_argv(&argv(&["import", "nginx", "x.conf", "-o", "--strict"])) {
+            Command::Import(o) => {
+                assert_eq!(o.output, None);
+                assert!(o.strict);
+                assert_eq!(o.input.as_deref(), Some("x.conf"));
             }
             _ => panic!("expected Import"),
         }

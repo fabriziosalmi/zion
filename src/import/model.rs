@@ -30,6 +30,7 @@ pub struct ReqZone {
 pub struct ConnZone {
     pub name: String,
     pub key: String,
+    pub line: u32,
 }
 
 #[derive(Debug)]
@@ -144,6 +145,30 @@ fn walk_top(items: Vec<Directive>, model: &mut NginxModel, findings: &mut Vec<Fi
                     d.line,
                     &d.name,
                     "nginx process management — Zion manages its own runtime",
+                ));
+            }
+            // Directives the mapper DOES support inside server{}/location{} —
+            // nginx inherits them from http{} downward, but v0 does not model
+            // that inheritance, so be truthful about why they're dropped
+            // instead of claiming they have no Zion equivalent.
+            "client_max_body_size"
+            | "proxy_connect_timeout"
+            | "proxy_set_header"
+            | "add_header"
+            | "limit_req"
+            | "limit_conn"
+            | "set_real_ip_from"
+            | "real_ip_header"
+            | "ssl_certificate"
+            | "ssl_certificate_key"
+            | "ssl_protocols"
+            | "proxy_http_version" => {
+                findings.push(Finding::new(
+                    Status::Unsupported,
+                    d.line,
+                    &d.name,
+                    "supported inside server{} — http-level inheritance is not \
+                     implemented; move it into the server block(s)",
                 ));
             }
             _ => findings.push(Finding::unsupported_directive(&d)),
@@ -354,7 +379,11 @@ fn extract_conn_zone(d: &Directive, model: &mut NginxModel, findings: &mut Vec<F
         }
     }
     match name {
-        Some(name) => model.conn_zones.push(ConnZone { name, key }),
+        Some(name) => model.conn_zones.push(ConnZone {
+            name,
+            key,
+            line: d.line,
+        }),
         None => findings.push(Finding::new(
             Status::Unsupported,
             d.line,

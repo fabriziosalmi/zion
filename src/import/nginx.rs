@@ -162,7 +162,10 @@ impl<'a> Lexer<'a> {
 
     /// Unquoted word: runs until whitespace or a structural character.
     /// `#` does NOT terminate a word (comments start only at token starts);
-    /// `\x` keeps both characters, matching crossplane's lexer.
+    /// `\x` keeps both characters, matching crossplane's lexer. A `${…}`
+    /// variable expansion is part of the word — nginx's lexer treats the
+    /// brace-form variable as word content, not as a block delimiter
+    /// (`return 301 https://example.com${request_uri};` is one arg).
     fn bare_word(&mut self) -> String {
         let mut out = String::new();
         loop {
@@ -175,6 +178,19 @@ impl<'a> Lexer<'a> {
                     out.push('\\');
                     if let Some(c) = self.bump() {
                         out.push(c);
+                    }
+                }
+                Some('$') => {
+                    self.bump();
+                    out.push('$');
+                    if self.chars.peek() == Some(&'{') {
+                        // Consume the brace-form variable through its `}`.
+                        while let Some(c) = self.bump() {
+                            out.push(c);
+                            if c == '}' {
+                                break;
+                            }
+                        }
                     }
                 }
                 Some(_) => {
@@ -364,6 +380,20 @@ mod tests {
     fn dollar_vars_pass_through() {
         let d = one("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;");
         assert_eq!(d.args[1], "$proxy_add_x_forwarded_for");
+    }
+
+    #[test]
+    fn brace_form_variables_stay_in_the_word() {
+        // nginx lexes `${name}` as word content, not a block open (a common
+        // idiom in redirects and proxy_pass targets).
+        let d = one("return 301 https://example.com${request_uri};");
+        assert_eq!(d.args, vec!["301", "https://example.com${request_uri}"]);
+        let d = one("set $x a${b}c;");
+        assert_eq!(d.args, vec!["$x", "a${b}c"]);
+        let d = one("proxy_pass http://backend${suffix};");
+        assert_eq!(d.args, vec!["http://backend${suffix}"]);
+        // Unterminated `${` must not panic; the parse simply errors.
+        assert!(parse("x a${b;").is_err());
     }
 
     #[test]
