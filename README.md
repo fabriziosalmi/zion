@@ -150,7 +150,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 ```
 
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-42 modules, ~30,600 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+42 modules, ~31,300 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Features
 
@@ -245,7 +245,7 @@ MODE=full bash benchmarks/baseline/run-baseline.sh   # → benchmarks/baseline/z
 ## Testing
 
 ```bash
-# Unit tests (657) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
+# Unit tests (670) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
 cargo test
 
 # Integration tests (23 — requires a running Zion + backend)
@@ -272,12 +272,12 @@ Every release is signed and carries SLSA v1.0 build provenance — see
 
 ```bash
 # Binary release (Sigstore-backed provenance via gh CLI)
-gh release download v0.4.7 -R fabriziosalmi/zion -p '*x86_64-unknown-linux-musl*' -p 'SHA256SUMS'
+gh release download v0.5.0 -R fabriziosalmi/zion -p '*x86_64-unknown-linux-musl*' -p 'SHA256SUMS'
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify zion-v0.4.7-x86_64-unknown-linux-musl.tar.gz --owner fabriziosalmi
+gh attestation verify zion-v0.5.0-x86_64-unknown-linux-musl.tar.gz --owner fabriziosalmi
 
 # Container image (cosign keyless)
-cosign verify ghcr.io/fabriziosalmi/zion:v0.4.7 \
+cosign verify ghcr.io/fabriziosalmi/zion:v0.5.0 \
     --certificate-identity-regexp "^https://github.com/fabriziosalmi/zion/\\.github/workflows/release\\.yml@refs/tags/v" \
     --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 ```

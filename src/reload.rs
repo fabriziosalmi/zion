@@ -617,17 +617,17 @@ mod tests {
 
         // Reader A sees the old routing table (route /api works,
         // /billing must not exist).
-        assert!(reader_a.router.at("/api/users").is_ok());
+        assert!(reader_a.router.at(None, "/api/users").is_some());
         assert!(
-            reader_a.router.at("/billing/invoice").is_err(),
+            reader_a.router.at(None, "/billing/invoice").is_none(),
             "in-flight reader must NOT see post-swap routes"
         );
 
         // A new reader (B) grabs the post-swap snapshot and sees both.
         let reader_b = store.load_full();
-        assert!(reader_b.router.at("/api/users").is_ok());
+        assert!(reader_b.router.at(None, "/api/users").is_some());
         assert!(
-            reader_b.router.at("/billing/invoice").is_ok(),
+            reader_b.router.at(None, "/billing/invoice").is_some(),
             "new reader must see the post-swap routing table"
         );
 
@@ -640,7 +640,7 @@ mod tests {
         // Reader A is still alive after B has loaded its snapshot —
         // ArcSwap's epoch GC does not yank a snapshot from under an
         // active reader.
-        assert!(reader_a.router.at("/api/users").is_ok());
+        assert!(reader_a.router.at(None, "/api/users").is_some());
     }
 
     #[test]
@@ -661,8 +661,8 @@ mod tests {
         store.store(Arc::new(snap_v1));
 
         let after = store.load_full();
-        assert!(after.router.at("/api/users").is_ok());
-        assert!(prev.router.at("/api/users").is_err()); // old snapshot still empty
+        assert!(after.router.at(None, "/api/users").is_some());
+        assert!(prev.router.at(None, "/api/users").is_none()); // old snapshot still empty
     }
 
     #[test]

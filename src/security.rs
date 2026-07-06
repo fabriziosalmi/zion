@@ -6,6 +6,7 @@
 
 use hyper::header::HeaderValue;
 use hyper::Response;
+use std::borrow::Cow;
 
 use crate::proxy::ZionBody;
 
@@ -309,6 +310,75 @@ pub fn is_valid_host(host: &str) -> bool {
             .as_bytes()
             .iter()
             .any(|&b| matches!(b, b'/' | b'\\' | b'@' | b'\n' | b'\r' | b'\0' | b' '))
+}
+
+/// Normalize a request authority — the URI `:authority` (HTTP/2, absolute-form)
+/// or `Host` header (HTTP/1, origin-form) — into a canonical host-routing key
+/// per ADR-0010: lowercased, `:port` stripped (IPv6-literal-safe), and any
+/// trailing FQDN dot removed. Returns `None` when the authority is empty or
+/// fails [`is_valid_host`]; the caller then routes via the hostless/shared
+/// layer rather than a bogus key.
+///
+/// Borrows when the input is already canonical (the common case — lowercase,
+/// no port) so the hot path allocates only when it must actually fold case.
+/// This is the single primitive both sides of the match go through: config
+/// `hosts` entries are validated to be fixed points of this function, and
+/// request authorities pass through it at lookup, so a config key and a request
+/// key are compared in the same normal form (no silent host mismatch).
+pub fn normalize_host(raw: &str) -> Option<Cow<'_, str>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    // Split off an optional `:port`, keeping an IPv6 literal's own colons intact.
+    let host = if raw.starts_with('[') {
+        // `[2001:db8::1]` or `[2001:db8::1]:443` → keep through the closing ']'.
+        let end = raw.find(']')?; // malformed literal (no ']') ⇒ no key ⇒ shared
+        &raw[..=end]
+    } else {
+        match raw.rsplit_once(':') {
+            // Exactly one colon and a numeric suffix ⇒ `host:port`. A bare
+            // (unbracketed) IPv6 literal has multiple colons and is left intact
+            // — it can't be a legal authority, so it just misses the map.
+            Some((h, p))
+                if !h.contains(':') && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                h
+            }
+            _ => raw,
+        }
+    };
+
+    let host = host.trim_end_matches('.'); // drop the root FQDN dot(s)
+    if host.is_empty() || !is_valid_host(host) {
+        return None;
+    }
+
+    // Borrow when already lowercase; allocate only to fold case.
+    if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        Some(Cow::Owned(host.to_ascii_lowercase()))
+    } else {
+        Some(Cow::Borrowed(host))
+    }
+}
+
+/// Extract and normalize the request authority for host routing (ADR-0010):
+/// the URI `:authority` (HTTP/2 / absolute-form) when present, otherwise the
+/// `Host` header (HTTP/1 origin-form). Returns the canonical routing key via
+/// [`normalize_host`], or `None` when the authority is absent or invalid.
+/// Callers gate this behind `HostRouter::host_routing_active` so a hostless
+/// deployment never pays for the extraction.
+pub fn request_host<B>(req: &hyper::Request<B>) -> Option<Cow<'_, str>> {
+    req.uri()
+        .authority()
+        .map(|a| a.as_str())
+        .or_else(|| {
+            req.headers()
+                .get(hyper::header::HOST)
+                .and_then(|h| h.to_str().ok())
+        })
+        .and_then(normalize_host)
 }
 
 /// Check if an IP is internal (loopback, private RFC1918, link-local).
@@ -635,5 +705,72 @@ mod proptests {
             prop_assert!(allowed_a <= 2 * rps as usize);
             prop_assert!(allowed_b <= 2 * rps as usize);
         }
+    }
+}
+
+#[cfg(test)]
+mod normalize_host_tests {
+    //! The normative host-normalization contract from ADR-0010. These lock the
+    //! primitive that both config `hosts` validation and the dispatch hot path
+    //! route through, so a config key and a request authority are always
+    //! compared in the same form.
+    use super::normalize_host;
+
+    /// Each row: raw authority → expected canonical key (`None` = route via the
+    /// hostless/shared layer). Mirrors the ADR-0010 contract table.
+    #[test]
+    fn contract_table() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("api.example.com", Some("api.example.com")), // plain
+            ("api.example.com:8443", Some("api.example.com")), // port stripped
+            ("API.Example.COM", Some("api.example.com")), // case-folded
+            ("api.example.com.", Some("api.example.com")), // trailing FQDN dot
+            ("api.example.com.:443", Some("api.example.com")), // dot + port
+            ("  api.example.com  ", Some("api.example.com")), // trimmed
+            ("[2001:db8::1]", Some("[2001:db8::1]")),     // v6 literal kept
+            ("[2001:db8::1]:443", Some("[2001:db8::1]")), // v6 literal, port off
+            ("", None),                                   // empty ⇒ shared
+            (":8443", None),                              // port only ⇒ shared
+            ("host/with/slash", None),                    // path char ⇒ invalid
+            ("user@host", None),                          // userinfo ⇒ invalid
+        ];
+        for (raw, want) in cases {
+            assert_eq!(
+                normalize_host(raw).as_deref(),
+                *want,
+                "normalize_host({raw:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn borrows_when_already_canonical() {
+        // No allocation when the input is already lowercase + portless.
+        assert!(matches!(
+            normalize_host("api.example.com"),
+            Some(std::borrow::Cow::Borrowed(_))
+        ));
+        // Allocates only to fold case.
+        assert!(matches!(
+            normalize_host("API.example.com"),
+            Some(std::borrow::Cow::Owned(_))
+        ));
+    }
+
+    #[test]
+    fn canonical_hosts_are_fixed_points() {
+        // The invariant config validation relies on: a canonical host normalizes
+        // to itself, so `hosts` entries accepted at load are exactly the keys the
+        // dispatcher will look up.
+        for h in ["api.example.com", "a.b.c.example.org", "[::1]"] {
+            assert_eq!(normalize_host(h).as_deref(), Some(h), "fixed point: {h}");
+        }
+    }
+
+    #[test]
+    fn unbracketed_v6_is_not_port_split() {
+        // A bare (illegal) IPv6 literal must not be mangled by the port splitter
+        // into a truncated key — it stays intact and simply misses the host map.
+        assert_eq!(normalize_host("::1").as_deref(), Some("::1"));
     }
 }

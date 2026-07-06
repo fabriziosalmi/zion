@@ -1,13 +1,17 @@
 # ============================================================================
-# MULTI-SITE EXAMPLE — 3 domains, 3 backends, auto-renew certs
+# MULTI-SITE EXAMPLE — 3 domains, host routing, auto-renew certs
 # ============================================================================
 #
-# This config serves:
-#   - api.example.com    → Go backend on :8000 (with WAF)
-#   - app.example.com    → Next.js on :3000 (with cache)
+# True virtual hosting (ADR-0010): each domain routes to its own backend by the
+# request Host / :authority, so the SAME path serves different backends per
+# domain. This config serves:
+#   - api.example.com    → Go backend on :8000 (WAF on every path)
+#   - app.example.com    → Next.js on :3000 (static assets cached)
+#   - *.example.com      → Next.js too (preview subdomains); exact hosts win
 #   - admin.example.com  → Admin panel on :4000 (internal only)
 #
-# Each domain has its own TLS certificate.
+# Each domain has its own TLS certificate (via [[tls.sni]]) AND its own routing
+# (via per-route `hosts`) — two separate layers.
 # Certificates are auto-renewed via ACME (Let's Encrypt).
 
 [server]
@@ -75,45 +79,56 @@ max_entries = 10000
 ttl_seconds = 31536000
 
 # ── Routes ───────────────────────────────────────────────────────
-# API backend (with WAF + CORS)
+# Routing is HOST-AWARE (ADR-0010): each [[route]] may bind to one or more
+# `hosts`. A route WITHOUT `hosts` is *shared* — it matches every host and
+# acts as a fallback. Precedence: exact host > `*.wildcard` > shared. This is
+# a separate layer from `[[tls.sni]]` above, which only picks the certificate.
+
+# ── api.example.com → API backend (WAF + CORS on every path) ─────
 [[route]]
-path = "/api/{*rest}"
+hosts = ["api.example.com"]
+path = "/{*rest}"
 upstream = "api"
 waf_profile = "strict"
 # CORS is configured PER ROUTE (there is no top-level [cors] table).
 cors = { allowed_origins = ["https://app.example.com"], allowed_headers = ["Content-Type", "Authorization"], max_age = 86400 }
 
-# Next.js static assets (cached in RAM)
 [[route]]
-path = "/_next/static/{*rest}"
-upstream = "frontend"
-cache_profile = "immutable"
-
-# WebSocket endpoint
-[[route]]
+hosts = ["api.example.com"]
 path = "/ws"
 upstream = "api"
 mode = "websocket"
 
-# SSE streaming
 [[route]]
+hosts = ["api.example.com"]
 path = "/events/stream"
 upstream = "api"
 mode = "sse_stream"
 
-# Admin panel (internal network only)
+# ── app.example.com (and any other *.example.com) → Next.js ──────
+# The wildcard also serves preview subdomains (pr-123.example.com, …). The
+# exact hosts above win over it, so api/admin are never caught here.
 [[route]]
-path = "/admin/{*rest}"
+hosts = ["app.example.com", "*.example.com"]
+path = "/_next/static/{*rest}"
+upstream = "frontend"
+cache_profile = "immutable"
+
+[[route]]
+hosts = ["app.example.com", "*.example.com"]
+path = "/{*rest}"
+upstream = "frontend"
+
+# ── admin.example.com → admin panel (internal network only) ──────
+[[route]]
+hosts = ["admin.example.com"]
+path = "/{*rest}"
 upstream = "admin"
 internal_only = true
 
-# Health + metrics (built-in, no upstream needed)
+# ── Shared route (no `hosts`) — reachable on every domain ────────
+# Written once, served for api/app/admin alike. Internal-only.
 [[route]]
 path = "/metrics"
 upstream = "api"
 internal_only = true
-
-# Catch-all → frontend
-[[route]]
-path = "/{*rest}"
-upstream = "frontend"

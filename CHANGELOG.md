@@ -4,6 +4,36 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-06
+
+Host-based L7 routing (virtual hosting) — Zion can now serve different backends
+for different domains on the same listener, matching nginx `server_name` /
+Caddy site blocks / Traefik `Host()`. Opt-in and zero-cost when unused; every
+step verified end-to-end and covered by CI-run unit tests. Design: ADR-0010.
+
+### Added
+- **Host-based routing** (`hosts` on `[[route]]`, ADR-0010). A route can bind to
+  one or more hosts (`hosts = ["api.example.com", "*.example.com"]`); a route
+  without `hosts` is *shared* and matches every host. Resolution precedence is
+  exact host > most-specific `*.` wildcard > shared layer, selected from the
+  request `Host` header (HTTP/1) or `:authority` (HTTP/2). The same path can now
+  serve different backends per domain — impossible with the previous path-only
+  router. Host entries are normalized (lowercased, port and trailing-dot
+  stripped) and validated at boot. See `docs/config/routing.md` and
+  `examples/multi-site.toml`.
+
+### Changed
+- The route lookup is now a `HostRouter` (a shared radix tree plus one tree per
+  exact host and per wildcard suffix) instead of a single global tree. When no
+  route declares `hosts` the hot path is byte-for-byte the old behavior at zero
+  added cost.
+
+### Security
+- The thread-local route cache is now keyed on `(host, path)` when host routing
+  is active. A path-only key would let one host's request reuse another host's
+  cached route, bypassing a per-route WAF/auth profile or an `internal_only`
+  gate; the host-scoped key closes that cross-host confusion.
+
 ## [0.4.7] - 2026-06-27
 
 A usability release: a runtime **admin API** and a config bootstrapper
