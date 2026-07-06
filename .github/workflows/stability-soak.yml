@@ -1,0 +1,112 @@
+# Stability soak — prove RSS + open FDs stay flat under stress (no leak).
+# The RSS/FD gauges are read from /proc, so this is Linux-only (they are 0 on
+# macOS/Windows; the harness hard-fails if it sees 0).
+#
+# Two jobs, one harness:
+#   * gate    — fast, on PRs/pushes touching the leak-prone paths; catches
+#               gross regressions (a per-request fd leak or RSS doubling).
+#   * nightly — long soak on a cron; the authoritative slope + fd verdict, with
+#               the samples uploaded as an artifact (feeds the dashboard's
+#               deriv(RSS[30m]) leak-watch). GitHub-hosted jobs can run up to
+#               6h, so the ~2h soak fits ubuntu-latest — no self-hosted runner.
+name: stability-soak
+
+on:
+  pull_request:
+    paths:
+      - "src/proxy.rs"
+      - "src/dispatch.rs"
+      - "src/reload.rs"
+      - "src/cache.rs"
+      - "src/tls.rs"
+      - "src/waf.rs"
+      - "src/security.rs"
+      - "src/connlimit.rs"
+      - "src/main.rs"
+      - "tests/stability-soak/**"
+      - ".github/workflows/stability-soak.yml"
+  push:
+    branches: [master]
+    paths:
+      - "src/proxy.rs"
+      - "src/dispatch.rs"
+      - "src/reload.rs"
+      - "src/cache.rs"
+      - "src/tls.rs"
+      - "src/waf.rs"
+      - "src/security.rs"
+      - "src/connlimit.rs"
+      - "src/main.rs"
+      - "tests/stability-soak/**"
+      - ".github/workflows/stability-soak.yml"
+  schedule:
+    - cron: "0 4 * * *" # nightly 04:00 UTC — the long soak
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "soak duration in seconds (overrides the default)"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stability-soak-${{ github.workflow }}-${{ github.ref }}
+  # Never cancel the scheduled master soak; do cancel superseded PR runs.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Fast gate on PRs/pushes: short soak, catches gross leaks only.
+  gate:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: integration
+      - name: Build zion (release)
+        run: cargo build --release --locked --bin zion
+      - name: Build bench backend (release)
+        run: cargo build --release --manifest-path benchmarks/backend/Cargo.toml
+      - name: Soak (fast gate — gross-leak catch)
+        env:
+          NO_COLOR: "1"
+          DURATION: "120"
+          WARMUP: "20"
+          WORKERS: "20"
+          RELOADS: "40"
+        run: ./tests/stability-soak/run.sh
+
+  # Nightly long soak: the authoritative RSS-slope + fd verdict.
+  nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: integration
+      - name: Build zion (release)
+        run: cargo build --release --locked --bin zion
+      - name: Build bench backend (release)
+        run: cargo build --release --manifest-path benchmarks/backend/Cargo.toml
+      - name: Soak (nightly — ~2h authoritative)
+        env:
+          NO_COLOR: "1"
+          DURATION: ${{ github.event.inputs.duration || '7200' }}
+          WARMUP: "600"
+          INTERVAL: "10"
+          WORKERS: "32"
+          RELOADS: "1200"
+          CARDINALITY: "50000"
+        run: ./tests/stability-soak/run.sh
+      - name: Upload soak samples
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: soak-samples
+          path: soak-samples.tsv
+          retention-days: 14

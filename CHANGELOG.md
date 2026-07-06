@@ -5,6 +5,16 @@ All notable changes to Zion Edge Gateway are documented here.
 ## [Unreleased]
 
 ### Added
+- **Stability soak** (`tests/stability-soak/`): drives a real Zion with the
+  traffic shapes that stress every leak-prone surface — random Host/path/XFF
+  high-cardinality load (route + response caches, WAF, per-IP rate map),
+  connection/bad-TLS churn (fd release), and A/B reload rotation (the ArcSwap
+  snapshot alloc/free lifecycle) — samples `zion_process_resident_memory_bytes`
+  + `zion_process_open_fds` over time, and fails if the post-warm-up RSS slope
+  is a significant, budget-breaking climb or the fd count grows without bound.
+  Fast PR gate + nightly ~2h soak (`stability-soak.yml`, samples uploaded as an
+  artifact). Linux-only (the /proc gauges are 0 elsewhere; the harness
+  hard-fails rather than pass vacuously).
 - **Reload-under-load harness** (`tests/reload-under-load/`): proves a config
   hot-swap under concurrent traffic drops no in-flight connections. Sustained
   N-worker load hits a live Zion while `POST /admin/reload` fires many real
