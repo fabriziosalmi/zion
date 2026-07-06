@@ -488,15 +488,15 @@ async fn process_request_inner(
             route
         } else {
             // Radix tree fallback (~30ns)
-            match cfg.router.at(path) {
-                Ok(m) => {
-                    let route = m.value.clone();
+            match cfg.router.at(None, path) {
+                Some(matched) => {
+                    let route = matched.clone();
                     ROUTE_CACHE.with(|cache| {
                         cache.borrow_mut().insert(path_hash, route.clone());
                     });
                     route
                 }
-                Err(_) => return Ok(empty_response(StatusCode::NOT_FOUND)),
+                None => return Ok(empty_response(StatusCode::NOT_FOUND)),
             }
         }
     };

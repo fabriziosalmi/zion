@@ -119,14 +119,12 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use config::ResolvedRoute;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
-use matchit::Router;
 use proxy::{HttpClient, ZionBody};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -189,8 +187,9 @@ use security::RateEntry;
 /// once at boot from `zion.toml`. The follow-up commit will wrap the
 /// `Arc` in `ArcSwap` and wire the watcher.
 pub(crate) struct ResolvedAppConfig {
-    /// Radix tree (matchit) of pre-resolved routes.
-    pub(crate) router: Router<Arc<ResolvedRoute>>,
+    /// Host-aware L7 router (ADR-0010): a shared radix tree plus one tree per
+    /// bound host. Hostless when no route declares `hosts` (zero extra cost).
+    pub(crate) router: config::HostRouter,
     /// Upstream URL → shared health/latency state. The `Arc<UpstreamHealth>`
     /// values are intentionally re-used across reloads when the URL is
     /// unchanged so the prober's accumulated state is preserved.
@@ -242,7 +241,7 @@ impl ResolvedAppConfig {
     #[cfg(test)]
     pub(crate) fn test_with_health(health_map: health::HealthMap) -> Self {
         Self {
-            router: matchit::Router::new(),
+            router: config::HostRouter::default(),
             health_map,
             trusted_proxies: security::TrustedProxies::from_config(&[]),
             xff_mode: proxy::XffMode::Append,
@@ -2040,8 +2039,7 @@ async fn handle_http(
         }
         // Fallback: proxy to upstream (for external ACME clients like certbot)
         let cfg = state.cfg();
-        if let Ok(m) = cfg.router.at(path) {
-            let rule = m.value;
+        if let Some(rule) = cfg.router.at(None, path) {
             return proxy::proxy_pass(
                 &state.http_client,
                 req,

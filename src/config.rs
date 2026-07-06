@@ -871,157 +871,85 @@ fn resolve_upstream(config: &ZionConfig, name: &str) -> Result<Vec<String>, Stri
     ))
 }
 
-/// Build a radix tree from config routes, pre-resolving all references.
-/// Routes are wrapped in Arc for zero-allocation cloning on the hot path.
-///
-/// Returns `Err` if any route references an unknown upstream, profile, or
-/// contains an invalid pattern. The caller (boot path or hot-reload) decides
-/// whether to abort or log-and-keep the previous snapshot.
-pub fn build_router(config: &ZionConfig) -> Result<Router<Arc<ResolvedRoute>>, String> {
-    let mut router = Router::new();
-    // Extra route aliases applied after every explicit route is inserted (so an
-    // explicit route always wins): a catch-all's bare prefix, and the
-    // trailing-slash-toggled variant of each explicit route.
-    let mut route_aliases: Vec<(String, Arc<ResolvedRoute>)> = Vec::new();
+/// Host-aware L7 router (ADR-0010). Holds the hostless/shared radix tree plus
+/// one tree per bound host; a route with no `hosts` lands in `default` and is
+/// reachable from every authority (the shared fallback layer). When no route
+/// declares `hosts`, `active` is false and lookups go straight to `default` —
+/// identical, and identically cheap, to the pre-host-routing single router.
+#[derive(Debug)]
+pub struct HostRouter {
+    /// Hostless / shared routes — matched for every authority.
+    default: Router<Arc<ResolvedRoute>>,
+    /// Exact-host radix trees, keyed by normalized authority.
+    by_host: HashMap<Box<str>, Router<Arc<ResolvedRoute>>>,
+    /// True iff at least one route is host-bound. Lets the hot path skip
+    /// authority extraction entirely in the common (hostless) deployment.
+    active: bool,
+}
 
-    for route in &config.route {
-        let upstream_url = resolve_upstream(config, &route.upstream)?;
+impl Default for HostRouter {
+    fn default() -> Self {
+        Self {
+            default: Router::new(),
+            by_host: HashMap::new(),
+            active: false,
+        }
+    }
+}
 
-        // Resolve WAF: named profile > legacy bool flag
-        let waf = if let Some(ref profile_name) = route.waf_profile {
-            Some(
-                config
-                    .waf_profile
-                    .get(profile_name)
-                    .ok_or_else(|| {
-                        format!(
-                            "Unknown waf_profile '{}' in route {}",
-                            profile_name, route.path
-                        )
-                    })?
-                    .clone(),
-            )
-        } else if route.waf {
-            // Legacy: create inline profile from max_body_mb
-            Some(WafProfile {
-                max_body_mb: route.max_body_mb.unwrap_or(10),
-                ..WafProfile::default()
-            })
-        } else {
-            // Footgun guard: `max_body_mb` is enforced by the WAF body gate, so
-            // on a WAF-off route it has no effect. Surface it at boot rather
-            // than silently dropping the operator's intended size cap (a no-WAF
-            // route otherwise streams the body to the upstream, hyper-framed).
-            if route.max_body_mb.is_some() {
-                eprintln!(
-                    "  ⚠ route '{}': max_body_mb is set but WAF is off (no waf=true / waf_profile) \
-                     — the body-size cap is NOT enforced; enable WAF or remove max_body_mb",
-                    route.path
-                );
+impl HostRouter {
+    /// Resolve `(host, path)` to a route, per ADR-0010's hostless-as-shared-layer
+    /// rule: consult the exact-host tree first, then fall back to the shared
+    /// `default` tree. `host` is the normalized request authority
+    /// ([`crate::security::normalize_host`]), or `None` when the authority is
+    /// absent/invalid — in which case only the shared layer is consulted.
+    #[inline]
+    pub fn at(&self, host: Option<&str>, path: &str) -> Option<&Arc<ResolvedRoute>> {
+        if self.active {
+            if let Some(h) = host {
+                if let Some(tree) = self.by_host.get(h) {
+                    if let Ok(m) = tree.at(path) {
+                        return Some(m.value);
+                    }
+                }
             }
-            None
-        };
+        }
+        self.default.at(path).ok().map(|m| m.value)
+    }
+}
 
-        // Resolve cache: named profile > legacy mode=static_cache
-        let cache = if let Some(ref profile_name) = route.cache_profile {
-            Some(
-                config
-                    .cache_profile
-                    .get(profile_name)
-                    .ok_or_else(|| {
-                        format!(
-                            "Unknown cache_profile '{}' in route {}",
-                            profile_name, route.path
-                        )
-                    })?
-                    .clone(),
-            )
-        } else if route.mode == RouteMode::StaticCache {
-            // Default in-RAM profile for a profile-less static_cache route:
-            // conservative 1h TTL (default_ttl), NOT immutable. Name an explicit
-            // [cache_profile] with a longer ttl_seconds for content-hashed assets.
-            Some(CacheProfile {
-                mode: CacheMode::Memory,
-                max_entries: default_max_entries(),
-                ttl_seconds: default_ttl(),
-            })
-        } else {
-            None
-        };
+/// Accumulates the routes of a single host-group into one radix tree, deferring
+/// the catch-all bare-prefix and trailing-slash aliases until every explicit
+/// route of the group is inserted (so an explicit route always wins a conflict).
+struct RouterBuilder {
+    router: Router<Arc<ResolvedRoute>>,
+    aliases: Vec<(String, Arc<ResolvedRoute>)>,
+}
 
-        // Pre-parse the FIRST upstream URI at startup for legacy fallback.
-        // In a true clustered setup with latency routing, we use the first to get the scheme.
-        let upstream_uri: hyper::Uri = upstream_url[0]
-            .parse()
-            .map_err(|e| format!("Invalid upstream URL '{}': {}", upstream_url[0], e))?;
-        let upstream_scheme = upstream_uri
-            .scheme()
-            .cloned()
-            .unwrap_or_else(|| "http".parse().unwrap());
-        let upstream_authority = upstream_uri
-            .authority()
-            .cloned()
-            .ok_or_else(|| format!("Upstream '{}' has no authority", upstream_url[0]))?;
+impl Default for RouterBuilder {
+    fn default() -> Self {
+        Self {
+            router: Router::new(),
+            aliases: Vec::new(),
+        }
+    }
+}
 
-        // Pre-parse CSP at startup for zero-cost injection at runtime
-        let csp = match route.csp.as_ref() {
-            Some(s) => Some(
-                hyper::header::HeaderValue::from_str(s)
-                    .map_err(|e| format!("Invalid CSP in route '{}': {}", route.path, e))?,
-            ),
-            None => None,
-        };
-
-        // Resolve auth profile at startup (feature-gated)
-        #[cfg(feature = "auth")]
-        let auth = match route.auth_profile.as_ref() {
-            Some(name) => {
-                let profile_config = config.auth_profile.get(name).ok_or_else(|| {
-                    format!("Auth profile '{}' not found (route '{}')", name, route.path)
-                })?;
-                let resolved = crate::auth::resolve_auth_profile(profile_config).map_err(|e| {
-                    format!("Auth profile '{}' (route '{}'): {}", name, route.path, e)
-                })?;
-                eprintln!(
-                    "  auth: route {} → profile '{}' (alg={})",
-                    route.path, name, profile_config.algorithm
-                );
-                Some(resolved)
-            }
-            None => None,
-        };
-
-        let cors = route
-            .cors
-            .as_ref()
-            .map(|c| Arc::new(crate::security::CorsHeaders::from_config(c)));
-
-        let resolved = Arc::new(ResolvedRoute {
-            upstream_url,
-            upstream_scheme,
-            upstream_authority,
-            mode: route.mode.clone(),
-            waf,
-            waf_shadow: route.waf_shadow,
-            cache,
-            internal_only: route.internal_only,
-            csp,
-            #[cfg(feature = "auth")]
-            auth,
-            cors,
-        });
-
+impl RouterBuilder {
+    /// Insert one explicit route and record its bare-prefix / trailing-slash
+    /// alias for the deferred second pass.
+    fn insert(&mut self, path: &str, resolved: Arc<ResolvedRoute>) -> Result<(), String> {
         // A matchit catch-all "<prefix>/{*name}" does NOT match the bare
         // "<prefix>" (nor the root "/" when the prefix is empty), so a
         // "/{*rest}" route silently 404s on "/" even though it is meant to be
         // the fallback for everything. Record the bare prefix so we can also
         // map it to this route in a second pass (after all explicit routes).
-        match catchall_bare_prefix(&route.path) {
+        match catchall_bare_prefix(path) {
             Some(bare) => {
-                router
-                    .insert(route.path.clone(), resolved.clone())
-                    .map_err(|e| format!("Bad route pattern '{}': {}", route.path, e))?;
-                route_aliases.push((bare, resolved));
+                self.router
+                    .insert(path.to_string(), resolved.clone())
+                    .map_err(|e| format!("Bad route pattern '{}': {}", path, e))?;
+                self.aliases.push((bare, resolved));
             }
             None => {
                 // Non-catch-all: also alias the trailing-slash-toggled variant
@@ -1029,35 +957,218 @@ pub fn build_router(config: &ZionConfig) -> Result<Router<Arc<ResolvedRoute>>, S
                 // them as distinct, so "/x/" would otherwise fall through to a
                 // different (often more permissive) route — e.g. a stricter
                 // per-route WAF profile silently downgraded.
-                match trailing_slash_variant(&route.path) {
+                match trailing_slash_variant(path) {
                     Some(variant) => {
-                        router
-                            .insert(route.path.clone(), resolved.clone())
-                            .map_err(|e| format!("Bad route pattern '{}': {}", route.path, e))?;
-                        route_aliases.push((variant, resolved));
+                        self.router
+                            .insert(path.to_string(), resolved.clone())
+                            .map_err(|e| format!("Bad route pattern '{}': {}", path, e))?;
+                        self.aliases.push((variant, resolved));
                     }
                     None => {
-                        router
-                            .insert(route.path.clone(), resolved)
-                            .map_err(|e| format!("Bad route pattern '{}': {}", route.path, e))?;
+                        self.router
+                            .insert(path.to_string(), resolved)
+                            .map_err(|e| format!("Bad route pattern '{}': {}", path, e))?;
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the deferred aliases and return the finished tree. Alias inserts
+    /// are best-effort: a conflict means an explicit route already owns the
+    /// slot — exactly the precedence we want (matchit specificity then makes an
+    /// exact prefix win over a less-specific parent catch-all, e.g. "/api" →
+    /// "/api/{*rest}", not the root "/{*rest}").
+    fn finish(mut self) -> Router<Arc<ResolvedRoute>> {
+        for (alias, resolved) in self.aliases {
+            let _ = self.router.insert(alias, resolved);
+        }
+        self.router
+    }
+}
+
+/// Build the host-aware router from config routes, pre-resolving all references.
+/// A route with `hosts` is inserted into each of its host trees; a route without
+/// `hosts` goes into the shared/default tree (ADR-0010, hostless-as-shared).
+///
+/// Returns `Err` if any route references an unknown upstream, profile, or
+/// contains an invalid pattern. The caller (boot path or hot-reload) decides
+/// whether to abort or log-and-keep the previous snapshot.
+pub fn build_router(config: &ZionConfig) -> Result<HostRouter, String> {
+    let mut default = RouterBuilder::default();
+    let mut by_host: HashMap<Box<str>, RouterBuilder> = HashMap::new();
+
+    for route in &config.route {
+        let resolved = resolve_route(config, route)?;
+        match &route.hosts {
+            // Shared route: reachable from every authority.
+            None => default.insert(&route.path, resolved)?,
+            // Host-bound: insert into each host's tree. Validation guarantees
+            // every entry is a canonical host, so normalize_host returns Some.
+            Some(hosts) => {
+                let mut seen = std::collections::HashSet::new();
+                for h in hosts {
+                    let key = crate::security::normalize_host(h)
+                        .ok_or_else(|| format!("route '{}': invalid host '{}'", route.path, h))?
+                        .into_owned();
+                    // A host repeated in one route's list must insert once, not
+                    // twice into the same tree (which matchit rejects as a dup).
+                    if !seen.insert(key.clone()) {
+                        continue;
+                    }
+                    by_host
+                        .entry(key.into_boxed_str())
+                        .or_default()
+                        .insert(&route.path, resolved.clone())?;
                 }
             }
         }
     }
 
-    // Apply the aliases (catch-all bare prefixes + trailing-slash variants).
-    // Insert unconditionally and ignore the result: if an explicit route
-    // already occupies the alias, matchit returns a conflict (so the explicit
-    // route keeps priority); otherwise the alias resolves to its route, and
-    // matchit's specificity rules make an exact prefix win over a less-specific
-    // parent catch-all (e.g. "/api" → "/api/{*rest}", not the root "/{*rest}").
-    for (alias, resolved) in route_aliases {
-        let _ = router.insert(alias, resolved);
-    }
+    let active = !by_host.is_empty();
+    let by_host = by_host
+        .into_iter()
+        .map(|(host, builder)| (host, builder.finish()))
+        .collect();
 
     print_routes_table(&config.route);
-    Ok(router)
+    Ok(HostRouter {
+        default: default.finish(),
+        by_host,
+        active,
+    })
+}
+
+/// Resolve one `[[route]]` into its fully pre-computed [`ResolvedRoute`]
+/// (upstream URLs, WAF/cache profiles, CSP, auth, CORS) — everything the hot
+/// path needs, computed once at build. Pure: no router insertion, so
+/// `build_router` can place the result into one or more host-scoped trees.
+fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<ResolvedRoute>, String> {
+    let upstream_url = resolve_upstream(config, &route.upstream)?;
+
+    // Resolve WAF: named profile > legacy bool flag
+    let waf = if let Some(ref profile_name) = route.waf_profile {
+        Some(
+            config
+                .waf_profile
+                .get(profile_name)
+                .ok_or_else(|| {
+                    format!(
+                        "Unknown waf_profile '{}' in route {}",
+                        profile_name, route.path
+                    )
+                })?
+                .clone(),
+        )
+    } else if route.waf {
+        // Legacy: create inline profile from max_body_mb
+        Some(WafProfile {
+            max_body_mb: route.max_body_mb.unwrap_or(10),
+            ..WafProfile::default()
+        })
+    } else {
+        // Footgun guard: `max_body_mb` is enforced by the WAF body gate, so
+        // on a WAF-off route it has no effect. Surface it at boot rather
+        // than silently dropping the operator's intended size cap (a no-WAF
+        // route otherwise streams the body to the upstream, hyper-framed).
+        if route.max_body_mb.is_some() {
+            eprintln!(
+                "  ⚠ route '{}': max_body_mb is set but WAF is off (no waf=true / waf_profile) \
+                     — the body-size cap is NOT enforced; enable WAF or remove max_body_mb",
+                route.path
+            );
+        }
+        None
+    };
+
+    // Resolve cache: named profile > legacy mode=static_cache
+    let cache = if let Some(ref profile_name) = route.cache_profile {
+        Some(
+            config
+                .cache_profile
+                .get(profile_name)
+                .ok_or_else(|| {
+                    format!(
+                        "Unknown cache_profile '{}' in route {}",
+                        profile_name, route.path
+                    )
+                })?
+                .clone(),
+        )
+    } else if route.mode == RouteMode::StaticCache {
+        // Default in-RAM profile for a profile-less static_cache route:
+        // conservative 1h TTL (default_ttl), NOT immutable. Name an explicit
+        // [cache_profile] with a longer ttl_seconds for content-hashed assets.
+        Some(CacheProfile {
+            mode: CacheMode::Memory,
+            max_entries: default_max_entries(),
+            ttl_seconds: default_ttl(),
+        })
+    } else {
+        None
+    };
+
+    // Pre-parse the FIRST upstream URI at startup for legacy fallback.
+    // In a true clustered setup with latency routing, we use the first to get the scheme.
+    let upstream_uri: hyper::Uri = upstream_url[0]
+        .parse()
+        .map_err(|e| format!("Invalid upstream URL '{}': {}", upstream_url[0], e))?;
+    let upstream_scheme = upstream_uri
+        .scheme()
+        .cloned()
+        .unwrap_or_else(|| "http".parse().unwrap());
+    let upstream_authority = upstream_uri
+        .authority()
+        .cloned()
+        .ok_or_else(|| format!("Upstream '{}' has no authority", upstream_url[0]))?;
+
+    // Pre-parse CSP at startup for zero-cost injection at runtime
+    let csp = match route.csp.as_ref() {
+        Some(s) => Some(
+            hyper::header::HeaderValue::from_str(s)
+                .map_err(|e| format!("Invalid CSP in route '{}': {}", route.path, e))?,
+        ),
+        None => None,
+    };
+
+    // Resolve auth profile at startup (feature-gated)
+    #[cfg(feature = "auth")]
+    let auth = match route.auth_profile.as_ref() {
+        Some(name) => {
+            let profile_config = config.auth_profile.get(name).ok_or_else(|| {
+                format!("Auth profile '{}' not found (route '{}')", name, route.path)
+            })?;
+            let resolved = crate::auth::resolve_auth_profile(profile_config)
+                .map_err(|e| format!("Auth profile '{}' (route '{}'): {}", name, route.path, e))?;
+            eprintln!(
+                "  auth: route {} → profile '{}' (alg={})",
+                route.path, name, profile_config.algorithm
+            );
+            Some(resolved)
+        }
+        None => None,
+    };
+
+    let cors = route
+        .cors
+        .as_ref()
+        .map(|c| Arc::new(crate::security::CorsHeaders::from_config(c)));
+
+    Ok(Arc::new(ResolvedRoute {
+        upstream_url,
+        upstream_scheme,
+        upstream_authority,
+        mode: route.mode.clone(),
+        waf,
+        waf_shadow: route.waf_shadow,
+        cache,
+        internal_only: route.internal_only,
+        csp,
+        #[cfg(feature = "auth")]
+        auth,
+        cors,
+    }))
 }
 
 /// If `path` is a matchit catch-all (`<prefix>/{*name}`), return the bare
@@ -1741,10 +1852,10 @@ enabledd = true
     fn build_router_with_legacy_upstreams() {
         let config: ZionConfig = toml::from_str(minimal_toml()).unwrap();
         let router = build_router(&config).unwrap();
-        let matched = router.at("/api/v1/users").unwrap();
-        assert_eq!(matched.value.upstream_url[0], "http://127.0.0.1:8000");
-        assert!(matched.value.waf.is_some()); // legacy waf=true
-        assert_eq!(matched.value.waf.as_ref().unwrap().max_body_mb, 10); // default
+        let matched = router.at(None, "/api/v1/users").unwrap();
+        assert_eq!(matched.upstream_url[0], "http://127.0.0.1:8000");
+        assert!(matched.waf.is_some()); // legacy waf=true
+        assert_eq!(matched.waf.as_ref().unwrap().max_body_mb, 10); // default
     }
 
     #[test]
@@ -1753,23 +1864,22 @@ enabledd = true
         let router = build_router(&config).unwrap();
 
         // API route with strict WAF
-        let api = router.at("/api/v1/test").unwrap();
-        assert_eq!(api.value.upstream_url[0], "http://127.0.0.1:8000");
-        let waf = api.value.waf.as_ref().unwrap();
+        let api = router.at(None, "/api/v1/test").unwrap();
+        assert_eq!(api.upstream_url[0], "http://127.0.0.1:8000");
+        let waf = api.waf.as_ref().unwrap();
         assert_eq!(waf.max_body_mb, 5);
         assert_eq!(waf.max_depth, 8);
 
         // Upload route with upload WAF
-        let upload = router.at("/upload").unwrap();
-        let waf = upload.value.waf.as_ref().unwrap();
+        let upload = router.at(None, "/upload").unwrap();
+        let waf = upload.waf.as_ref().unwrap();
         assert_eq!(waf.max_body_mb, 200);
         // Trailing-slash variant resolves to the SAME route (rank 18: without
         // the alias, "/upload/" falls through and loses the upload WAF profile).
         assert_eq!(
             router
-                .at("/upload/")
+                .at(None, "/upload/")
                 .expect("/upload/ should alias /upload")
-                .value
                 .waf
                 .as_ref()
                 .unwrap()
@@ -1778,36 +1888,36 @@ enabledd = true
         );
 
         // Static cache route
-        let statics = router.at("/_next/static/chunk.js").unwrap();
-        assert_eq!(statics.value.upstream_url[0], "http://127.0.0.1:3000");
-        let cache = statics.value.cache.as_ref().unwrap();
+        let statics = router.at(None, "/_next/static/chunk.js").unwrap();
+        assert_eq!(statics.upstream_url[0], "http://127.0.0.1:3000");
+        let cache = statics.cache.as_ref().unwrap();
         assert_eq!(cache.ttl_seconds, 86400);
         assert_eq!(cache.max_entries, 5000);
 
         // Catch-all has no WAF or cache
-        let catchall = router.at("/about").unwrap();
-        assert!(catchall.value.waf.is_none());
-        assert!(catchall.value.cache.is_none());
+        let catchall = router.at(None, "/about").unwrap();
+        assert!(catchall.waf.is_none());
+        assert!(catchall.cache.is_none());
 
         // Bare-prefix fallback: a catch-all "<prefix>/{*rest}" must also serve
         // its bare prefix. matchit alone would 404 these (regression guard for
         // the root-route bug found in the e2e harness).
         // Root "/{*rest}" → "/" resolves to the catch-all (no WAF/cache).
-        let root = router.at("/").expect("root '/' should match the catch-all");
-        assert!(root.value.waf.is_none());
-        assert!(root.value.cache.is_none());
+        let root = router
+            .at(None, "/")
+            .expect("root '/' should match the catch-all");
+        assert!(root.waf.is_none());
+        assert!(root.cache.is_none());
         // "/api/{*rest}" → bare "/api" resolves to the API route (strict WAF).
         assert!(router
-            .at("/api")
+            .at(None, "/api")
             .expect("/api should match its catch-all")
-            .value
             .waf
             .is_some());
         // "/_next/static/{*rest}" → bare "/_next/static" resolves to the cache route.
         assert!(router
-            .at("/_next/static")
+            .at(None, "/_next/static")
             .expect("/_next/static should match its catch-all")
-            .value
             .cache
             .is_some());
     }
@@ -1831,8 +1941,8 @@ max_body_mb = 500
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
         let router = build_router(&config).unwrap();
-        let route = router.at("/upload").unwrap();
-        assert_eq!(route.value.waf.as_ref().unwrap().max_body_mb, 500);
+        let route = router.at(None, "/upload").unwrap();
+        assert_eq!(route.waf.as_ref().unwrap().max_body_mb, 500);
     }
 
     #[test]
@@ -1853,11 +1963,11 @@ mode = "static_cache"
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
         let router = build_router(&config).unwrap();
-        let route = router.at("/_next/static/chunk.js").unwrap();
-        assert!(route.value.cache.is_some());
+        let route = router.at(None, "/_next/static/chunk.js").unwrap();
+        assert!(route.cache.is_some());
         // Profile-less static_cache route → conservative 1h default (was 1 year;
         // the audiolibri staleness fix). Operators set ttl_seconds for longer.
-        assert_eq!(route.value.cache.as_ref().unwrap().ttl_seconds, 3600);
+        assert_eq!(route.cache.as_ref().unwrap().ttl_seconds, 3600);
     }
 
     #[test]
@@ -1878,8 +1988,8 @@ internal_only = true
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
         let router = build_router(&config).unwrap();
-        let route = router.at("/metrics").unwrap();
-        assert!(route.value.internal_only);
+        let route = router.at(None, "/metrics").unwrap();
+        assert!(route.internal_only);
     }
 
     #[test]
@@ -1900,8 +2010,8 @@ mode = "sse_stream"
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
         let router = build_router(&config).unwrap();
-        let route = router.at("/events").unwrap();
-        assert_eq!(route.value.mode, RouteMode::SseStream);
+        let route = router.at(None, "/events").unwrap();
+        assert_eq!(route.mode, RouteMode::SseStream);
     }
 
     #[test]
@@ -2032,8 +2142,131 @@ upstream = "api"
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
         let router = build_router(&config).unwrap();
-        let route = router.at("/test").unwrap();
+        let route = router.at(None, "/test").unwrap();
         // New [upstream.X] takes precedence over [upstreams] legacy
-        assert_eq!(route.value.upstream_url[0], "http://new:9000");
+        assert_eq!(route.upstream_url[0], "http://new:9000");
+    }
+
+    // ── Host-based L7 routing (ADR-0010) ──────────────────────────────────
+
+    #[test]
+    fn host_router_exact_and_shared_fallback() {
+        // Two host-bound routes on the SAME path + a shared catch-all — exactly
+        // what path-only routing could not express (ADR-0010).
+        let toml_str = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+[tls]
+cert_path = "/tmp/c.pem"
+key_path = "/tmp/k.pem"
+[upstream.api]
+url = "http://127.0.0.1:8000"
+[upstream.app]
+url = "http://127.0.0.1:3000"
+[upstream.fallback]
+url = "http://127.0.0.1:9000"
+[[route]]
+path = "/{*rest}"
+hosts = ["api.example.com"]
+upstream = "api"
+[[route]]
+path = "/{*rest}"
+hosts = ["app.example.com"]
+upstream = "app"
+[[route]]
+path = "/{*rest}"
+upstream = "fallback"
+"#;
+        let config: ZionConfig = toml::from_str(toml_str).unwrap();
+        let router = build_router(&config).unwrap();
+        assert!(router.active);
+
+        // Same path, different host → different backend (the whole point).
+        assert_eq!(
+            router
+                .at(Some("api.example.com"), "/x")
+                .unwrap()
+                .upstream_url[0],
+            "http://127.0.0.1:8000"
+        );
+        assert_eq!(
+            router
+                .at(Some("app.example.com"), "/x")
+                .unwrap()
+                .upstream_url[0],
+            "http://127.0.0.1:3000"
+        );
+        // Unknown host → shared/default layer.
+        assert_eq!(
+            router
+                .at(Some("other.example.com"), "/x")
+                .unwrap()
+                .upstream_url[0],
+            "http://127.0.0.1:9000"
+        );
+        // No host (e.g. HTTP/1.0) → shared layer.
+        assert_eq!(
+            router.at(None, "/x").unwrap().upstream_url[0],
+            "http://127.0.0.1:9000"
+        );
+    }
+
+    #[test]
+    fn host_router_falls_back_to_shared_on_path_miss() {
+        // A host with its own tree still falls through to the shared layer for a
+        // path it doesn't define (hostless-as-shared-layer, decision #1).
+        let toml_str = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+[tls]
+cert_path = "/tmp/c.pem"
+key_path = "/tmp/k.pem"
+[upstream.api]
+url = "http://127.0.0.1:8000"
+[upstream.shared]
+url = "http://127.0.0.1:9000"
+[[route]]
+path = "/api/{*rest}"
+hosts = ["api.example.com"]
+upstream = "api"
+[[route]]
+path = "/health"
+upstream = "shared"
+"#;
+        let config: ZionConfig = toml::from_str(toml_str).unwrap();
+        let router = build_router(&config).unwrap();
+
+        // api.example.com/api/* → its own route.
+        assert_eq!(
+            router
+                .at(Some("api.example.com"), "/api/v1")
+                .unwrap()
+                .upstream_url[0],
+            "http://127.0.0.1:8000"
+        );
+        // api.example.com/health → NOT in api's tree → shared /health.
+        assert_eq!(
+            router
+                .at(Some("api.example.com"), "/health")
+                .unwrap()
+                .upstream_url[0],
+            "http://127.0.0.1:9000"
+        );
+        // A path in NO tree → 404 (None).
+        assert!(router.at(Some("api.example.com"), "/nope").is_none());
+    }
+
+    #[test]
+    fn hostless_config_is_not_active() {
+        // No route declares `hosts` ⇒ host routing inactive ⇒ the shared tree
+        // behaves exactly as the pre-ADR-0010 single router.
+        let config: ZionConfig = toml::from_str(minimal_toml()).unwrap();
+        let router = build_router(&config).unwrap();
+        assert!(!router.active);
+        // A host is simply ignored — everything resolves via the shared tree.
+        assert!(router.at(Some("whatever.example.com"), "/api/x").is_some());
+        assert!(router.at(None, "/api/x").is_some());
     }
 }
