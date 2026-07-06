@@ -53,6 +53,7 @@ mod connlimit;
 mod doctor;
 mod error;
 mod health;
+mod import;
 mod init;
 mod listener;
 mod logging;
@@ -692,6 +693,9 @@ fn main() -> error::ZionResult<()> {
         }
         cli::Command::Suggest(opts) => {
             std::process::exit(suggest::run(opts));
+        }
+        cli::Command::Import(opts) => {
+            std::process::exit(import::run(opts));
         }
         cli::Command::AcmeSoak => {
             #[cfg(feature = "acme")]

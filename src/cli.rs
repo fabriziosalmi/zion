@@ -38,6 +38,9 @@ pub enum Command {
     /// backend, or `--upstream` / `--domain` hints) and print it (or `--write`
     /// it). Deterministic, no ML, self-validated by the config parser (#133).
     Suggest(SuggestOpts),
+    /// Convert a foreign proxy config (nginx) into a validated `zion.toml`
+    /// with an honest findings report (ADR-0011). Self-validated like suggest.
+    Import(ImportOpts),
     /// Print version and exit 0.
     Version,
     /// Print help and exit 0.
@@ -78,6 +81,21 @@ pub struct SuggestOpts {
     pub domain: Option<String>,
     /// Write the (validated) config to this path instead of stdout.
     pub write: Option<String>,
+}
+
+/// Options for `zion import <source> <input>` (ADR-0011).
+#[derive(Debug, Clone, Default)]
+pub struct ImportOpts {
+    /// Source format. Only `nginx` today; empty = usage error.
+    pub source: String,
+    /// Input config path, or `-` for stdin.
+    pub input: Option<String>,
+    /// Write the converted config here instead of stdout.
+    pub output: Option<String>,
+    /// Write the full findings report here (stderr always gets the summary).
+    pub report: Option<String>,
+    /// Exit non-zero when any partial/unsupported finding exists.
+    pub strict: bool,
 }
 
 /// Options for `zion init`. All flags are additive — the wizard fills in
@@ -174,6 +192,7 @@ pub(crate) fn parse_argv(args: &[String]) -> Command {
         "bootstrap" => Command::Bootstrap,
         "auto" => Command::Auto(parse_auto_opts(&args[1..])),
         "suggest" => Command::Suggest(parse_suggest_opts(&args[1..])),
+        "import" => Command::Import(parse_import_opts(&args[1..])),
         "acme-soak" => Command::AcmeSoak,
         other => {
             // Anything else: surface as Unknown — caller prints help and exits 1.
@@ -208,6 +227,39 @@ fn parse_auto_opts(args: &[String]) -> AutoOpts {
             "--hostname" if i + 1 < args.len() => {
                 opts.hostname = args[i + 1].clone();
                 i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    opts
+}
+
+fn parse_import_opts(args: &[String]) -> ImportOpts {
+    let mut opts = ImportOpts::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--output" if i + 1 < args.len() => {
+                opts.output = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--report" if i + 1 < args.len() => {
+                opts.report = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--strict" => {
+                opts.strict = true;
+                i += 1;
+            }
+            // Positionals: first the source format, then the input path
+            // (`-` = stdin, so a leading dash alone is not a flag).
+            arg if !arg.starts_with('-') || arg == "-" => {
+                if opts.source.is_empty() {
+                    opts.source = arg.to_string();
+                } else if opts.input.is_none() {
+                    opts.input = Some(arg.to_string());
+                }
+                i += 1;
             }
             _ => i += 1,
         }
@@ -346,6 +398,7 @@ pub fn print_help() {
             {bin} top [opts]             live TUI dashboard\n  \
             {bin} init [opts]            generate zion.toml from prompts (or flags)\n  \
             {bin} suggest [opts]         synthesize a validated zion.toml from a detected/declared backend\n  \
+            {bin} import nginx <conf>    convert an nginx config to a validated zion.toml (honest findings report)\n  \
             {bin} doctor                 run environment diagnostic checks\n  \
             {bin} bootstrap              dump detected platform as JSON (for CI / automation)\n  \
             {bin} --version              print version\n  \
@@ -371,6 +424,12 @@ pub fn print_help() {
                 --https-port <N>         override HTTPS port (default 443)\n  \
                 --no-tls                 skip self-signed cert generation\n  \
                 --no-waf                 skip WAF on /api/* routes\n\
+        \n\
+        IMPORT OPTIONS:\n  \
+            {bin} import nginx <PATH|->  input config (`-` = stdin; `include` resolves relative to it)\n  \
+            -o, --output <PATH>          write the converted config (default stdout)\n  \
+                --report <PATH>          write the full findings report (stderr shows partial/unsupported)\n  \
+                --strict                 exit 2 if any partial/unsupported finding exists\n\
         \n\
         ENVIRONMENT:\n  \
             ZION_CONFIG=zion.toml        config path for the daemon\n  \
@@ -418,6 +477,43 @@ mod tests {
                 assert!(o.upstream.is_none() && o.domain.is_none() && o.write.is_none())
             }
             _ => panic!("expected Suggest"),
+        }
+    }
+
+    #[test]
+    fn parse_import_flags() {
+        match parse_argv(&argv(&[
+            "import",
+            "nginx",
+            "site.conf",
+            "-o",
+            "zion.toml",
+            "--report",
+            "report.txt",
+            "--strict",
+        ])) {
+            Command::Import(o) => {
+                assert_eq!(o.source, "nginx");
+                assert_eq!(o.input.as_deref(), Some("site.conf"));
+                assert_eq!(o.output.as_deref(), Some("zion.toml"));
+                assert_eq!(o.report.as_deref(), Some("report.txt"));
+                assert!(o.strict);
+            }
+            _ => panic!("expected Import"),
+        }
+        // `-` is stdin, not a flag.
+        match parse_argv(&argv(&["import", "nginx", "-"])) {
+            Command::Import(o) => {
+                assert_eq!(o.source, "nginx");
+                assert_eq!(o.input.as_deref(), Some("-"));
+                assert!(!o.strict);
+            }
+            _ => panic!("expected Import"),
+        }
+        // Bare `import` → empty source; run() prints usage and exits 1.
+        match parse_argv(&argv(&["import"])) {
+            Command::Import(o) => assert!(o.source.is_empty() && o.input.is_none()),
+            _ => panic!("expected Import"),
         }
     }
 
