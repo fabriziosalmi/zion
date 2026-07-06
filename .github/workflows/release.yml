@@ -527,6 +527,30 @@ jobs:
           build-args: |
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
 
+      # Guard against the "arm64 manifest carries an amd64 binary" class of
+      # bug (a Dockerfile that builds on $BUILDPLATFORM instead of
+      # $TARGETPLATFORM stamps one host-arch binary into every manifest). This
+      # is invisible to `imagetools inspect` — you have to look at the ELF.
+      - name: Verify each arch ships its own binary
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          REF="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          fail=0
+          for entry in amd64:x86-64 arm64:aarch64; do
+            arch="${entry%%:*}"; want="${entry##*:}"
+            docker create --platform "linux/${arch}" --name "verify-${arch}" "$REF" >/dev/null
+            docker cp "verify-${arch}:/usr/local/bin/zion" "/tmp/zion-${arch}" >/dev/null
+            docker rm "verify-${arch}" >/dev/null
+            got="$(file -b "/tmp/zion-${arch}")"
+            echo "linux/${arch}: ${got}"
+            case "$got" in
+              *"$want"*) ;;
+              *) echo "::error::linux/${arch} image binary is not ${want}"; fail=1 ;;
+            esac
+          done
+          [ "$fail" -eq 0 ] || { echo "multi-arch image is mislabeled — refusing to sign"; exit 1; }
+
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
