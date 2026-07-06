@@ -510,6 +510,18 @@ fn default_ttl() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     pub path: String,
+
+    /// Optional Host/authority bindings (ADR-0010). When set, this route is
+    /// served only for these hosts; when unset, the route is a *shared* route
+    /// matching every host (the hostless fallback layer). Entries are bare
+    /// hostnames — validated as fixed points of
+    /// [`crate::security::normalize_host`] (lowercase modulo case-folding, no
+    /// scheme/path/port/trailing dot) so a config key and a normalized request
+    /// authority compare in the same form. Parsed and validated here; wired
+    /// into the router in a follow-up.
+    #[serde(default)]
+    pub hosts: Option<Vec<String>>,
+
     pub upstream: String,
     #[serde(default)]
     pub mode: RouteMode,
@@ -634,6 +646,26 @@ fn validate_upstream_url(label: &str, url: &str) -> Option<String> {
     }
 }
 
+/// A route `hosts` entry must be a canonical bare host — a fixed point of
+/// [`crate::security::normalize_host`] (ADR-0010): lowercase modulo case
+/// folding, with no scheme, path, port, or trailing FQDN dot. That guarantees
+/// the host-routing key equals the normalized request authority the dispatcher
+/// will look up, so a subtly-different config entry (a stray `:443`, an
+/// uppercased or dotted FQDN) can never silently fail to match. Uppercase is
+/// accepted and folded; anything else non-canonical is rejected. Returns
+/// `Some(error)` on rejection, `None` when valid.
+fn validate_host_entry(label: &str, host: &str) -> Option<String> {
+    let lower = host.to_ascii_lowercase();
+    if crate::security::normalize_host(host).as_deref() == Some(lower.as_str()) {
+        None
+    } else {
+        Some(format!(
+            "{label} host '{host}' must be a bare hostname \
+             (no scheme, path, port, or trailing dot)"
+        ))
+    }
+}
+
 /// Validate config at startup — fail fast with actionable error messages.
 fn validate_config(config: &ZionConfig, path: &str) -> Result<(), String> {
     let mut errors: Vec<String> = Vec::new();
@@ -738,6 +770,24 @@ fn validate_config(config: &ZionConfig, path: &str) -> Result<(), String> {
                     "route '{}' references unknown auth_profile '{}'",
                     route.path, profile
                 ));
+            }
+        }
+
+        // Host bindings (ADR-0010): each entry must be a canonical bare host so
+        // the routing key matches the normalized request authority. An explicit
+        // empty list is meaningless — omit `hosts` for a shared route.
+        if let Some(hosts) = &route.hosts {
+            if hosts.is_empty() {
+                errors.push(format!(
+                    "route '{}' has `hosts = []` — omit `hosts` for a shared route, \
+                     or list at least one host",
+                    route.path
+                ));
+            }
+            for h in hosts {
+                if let Some(e) = validate_host_entry(&format!("route '{}'", route.path), h) {
+                    errors.push(e);
+                }
             }
         }
     }
@@ -1158,6 +1208,7 @@ mod tests {
     fn route(path: &str) -> RouteConfig {
         RouteConfig {
             path: path.into(),
+            hosts: None,
             upstream: "backend".into(),
             mode: RouteMode::Standard,
             internal_only: false,
@@ -1447,6 +1498,66 @@ mtls_fingerprint = false
                 "should reject upstream URL: {bad}"
             );
         }
+    }
+
+    #[test]
+    fn validate_host_entry_accepts_bare_and_folds_case() {
+        // A bare host is accepted; uppercase is folded (friendly); an IPv6
+        // literal is a valid host key.
+        assert!(validate_host_entry("r", "api.example.com").is_none());
+        assert!(validate_host_entry("r", "API.Example.COM").is_none());
+        assert!(validate_host_entry("r", "[::1]").is_none());
+    }
+
+    #[test]
+    fn validate_host_entry_rejects_non_canonical() {
+        // Anything that isn't a fixed point of normalize_host (modulo case) is
+        // rejected with an actionable error — a stray port, trailing dot,
+        // scheme, path, userinfo, or empty entry can never silently mis-match.
+        for bad in [
+            "api.example.com:8443",
+            "api.example.com.",
+            "https://api.example.com",
+            "api.example.com/x",
+            "user@api.example.com",
+            "",
+        ] {
+            assert!(
+                validate_host_entry("r", bad).is_some(),
+                "should reject host: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_route_hosts_field() {
+        // A route may bind one or more hosts; a route without `hosts` is shared.
+        let toml_str = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+[tls]
+cert_path = "/tmp/cert.pem"
+key_path = "/tmp/key.pem"
+[upstreams]
+backend = "http://127.0.0.1:8000"
+[[route]]
+path = "/api/{*rest}"
+upstream = "backend"
+hosts = ["api.example.com", "api2.example.com"]
+[[route]]
+path = "/{*rest}"
+upstream = "backend"
+"#;
+        let config: ZionConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.route[0].hosts,
+            Some(vec![
+                "api.example.com".to_string(),
+                "api2.example.com".to_string()
+            ])
+        );
+        assert!(config.route[1].hosts.is_none(), "shared route ⇒ hosts None");
     }
 
     #[test]
