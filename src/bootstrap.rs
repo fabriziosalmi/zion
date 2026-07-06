@@ -895,8 +895,10 @@ fn upgrade_hint(p: &Platform) -> String {
         return "rebuild with `--features tui` to unlock the live dashboard: `zion top`."
             .to_string();
     }
+    // ACME ships in the release binary/container (the `dist` bundle); only a
+    // lean local `cargo build` lacks it, so nudge that case toward the bundle.
     if !cfg!(feature = "acme") {
-        return "rebuild with `--features acme` for Let's Encrypt auto-renewal.".to_string();
+        return "rebuild with `--features dist` (or `--features acme`) for automatic HTTPS via Let's Encrypt.".to_string();
     }
     if !cfg!(feature = "http3") {
         return "rebuild with `--features http3` to serve HTTP/3 over QUIC.".to_string();

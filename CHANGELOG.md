@@ -5,14 +5,24 @@ All notable changes to Zion Edge Gateway are documented here.
 ## [Unreleased]
 
 ### Added
+- **Automatic HTTPS via Let's Encrypt is on by default in the release binary
+  and official container.** A new `dist` feature bundle (`acme` + `init`) is
+  what the container and release artifacts build with, so the shipped binary
+  can obtain and auto-renew real certificates out of the box. `zion init` on a
+  public domain now scaffolds a `[tls.acme]` block **and** a short-lived
+  (1-day) bootstrap cert, so `:443` binds immediately and ACME provisions the
+  real cert on first boot — Caddy-style auto-HTTPS with no manual cert step.
+  New `zion init` flags: `--acme`/`--no-acme`, `--email`, `--domain`
+  (repeatable); ACME defaults on for a public hostname, off for localhost/IP.
+  `zion auto` stays self-signed (dev/localhost). The default (lean) build and
+  `cargo install` are unchanged — `dist` is release-only so the MSRV-1.82 core
+  floor holds (acme/init pull an edition-2024 closure needing 1.88).
 - **Grafana dashboard** (`deploy/grafana/zion-overview.json`): an importable
   fleet overview built on the metrics Zion already exposes at `/metrics` — no
   exporter, no sidecar. Golden signals, security (WAF/rate-limit/tarpit),
   TLS/upstream, and a leak-watch row (RSS slope via `deriv` + open FDs per
   instance) for spotting a silent memory/descriptor leak in a long-running
   front door. `$instance` variable to focus one proxy or watch the whole fleet.
-
-### Added
 - **Equivalence harness for `zion import`** (`tests/equivalence/`): starts real
   nginx and real Zion side by side on the original and converted configs,
   replays a request corpus against both, and diffs the routing decision per

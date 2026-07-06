@@ -124,6 +124,14 @@ pub struct InitOpts {
     /// Add a WAF-enabled `/api/{*rest}` route when an upstream named "api"
     /// or "backend" is configured. Flip with `--no-waf`.
     pub with_waf: bool,
+    /// Automatic HTTPS via Let's Encrypt. `None` = heuristic (on for a public
+    /// hostname, off for localhost / an IP); `Some` forced by `--acme` /
+    /// `--no-acme`.
+    pub acme: Option<bool>,
+    /// Contact email for the Let's Encrypt account (required when ACME is on).
+    pub acme_email: Option<String>,
+    /// Domains to obtain a certificate for. Empty = the served hostname.
+    pub acme_domains: Vec<String>,
 }
 
 /// Options for `zion auto` (no-config dev mode). Bare minimum to point Zion
@@ -169,6 +177,9 @@ impl Default for InitOpts {
             https_port: None,
             with_tls: true,
             with_waf: true,
+            acme: None,
+            acme_email: None,
+            acme_domains: Vec::new(),
         }
     }
 }
@@ -356,6 +367,22 @@ fn parse_init_opts(args: &[String]) -> InitOpts {
                 opts.with_waf = false;
                 i += 1;
             }
+            "--acme" => {
+                opts.acme = Some(true);
+                i += 1;
+            }
+            "--no-acme" => {
+                opts.acme = Some(false);
+                i += 1;
+            }
+            "--email" if i + 1 < args.len() => {
+                opts.acme_email = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--domain" if i + 1 < args.len() => {
+                opts.acme_domains.push(args[i + 1].clone());
+                i += 2;
+            }
             _ => i += 1,
         }
     }
@@ -430,7 +457,10 @@ pub fn print_help() {
                 --http-port <N>          override HTTP port (default 80)\n  \
                 --https-port <N>         override HTTPS port (default 443)\n  \
                 --no-tls                 skip self-signed cert generation\n  \
-                --no-waf                 skip WAF on /api/* routes\n\
+                --no-waf                 skip WAF on /api/* routes\n  \
+                --acme / --no-acme       force automatic HTTPS on/off (default: on for a public hostname)\n  \
+                --email <ADDR>           Let's Encrypt contact email (required when ACME is on)\n  \
+                --domain <NAME>          domain to obtain a cert for (repeatable; default: the hostname)\n\
         \n\
         IMPORT OPTIONS:\n  \
             {bin} import nginx <PATH|->  input config (`-` = stdin; `include` resolves relative to it)\n  \

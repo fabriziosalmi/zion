@@ -1,9 +1,18 @@
-# ACME (Let's Encrypt auto-renewal)
+# Automatic HTTPS (ACME / Let's Encrypt)
 
-Zion can obtain and renew certificates automatically over [ACME](https://datatracker.ietf.org/doc/html/rfc8555) (RFC 8555) using the embedded [instant-acme](https://docs.rs/instant-acme/) client. Build with the `acme` feature:
+Zion obtains and renews certificates automatically over [ACME](https://datatracker.ietf.org/doc/html/rfc8555) (RFC 8555) using the embedded [instant-acme](https://docs.rs/instant-acme/) client. **The release binary and official container already include it** (the `dist` bundle); a local `cargo build` needs the feature:
 
 ```sh
-cargo build --release --features acme
+cargo build --release --features acme   # or --features dist (acme + init)
+```
+
+## The fast path: `zion init`
+
+On a public domain, the wizard sets everything up for you — a `[tls.acme]` block plus a short-lived bootstrap cert so `:443` binds while ACME provisions the real one on first boot:
+
+```sh
+zion init --hostname app.example.com --email ops@example.com
+ZION_CONFIG=zion.toml zion
 ```
 
 ## Configuration
@@ -14,10 +23,14 @@ email          = "ops@example.com"                 # account contact
 domains        = ["example.com", "www.example.com"]
 directory_url  = "https://acme-v02.api.letsencrypt.org/directory"
 renew_before_days = 30                              # renew when the cert expires within N days
-state_dir      = "/etc/zion/acme"                   # account key + issued certs
+state_dir      = "/var/lib/zion/acme"               # runtime-written: account key + issued certs
 ```
 
-Zion serves the **HTTP-01** challenge in-memory (no disk) on the HTTP listener — the token path `/.well-known/acme-challenge/{token}` is answered straight from a shared map, so port 80 must be reachable by the ACME server. A background task checks expiry every 12 hours and renews when within `renew_before_days`, then hot-reloads TLS via `ArcSwap` with no connection drop.
+Zion serves the **HTTP-01** challenge in-memory (no disk) on the HTTP listener — the token path `/.well-known/acme-challenge/{token}` is answered straight from a shared map, so port 80 must be reachable by the ACME server. (You do **not** need a route for it.) A background task checks expiry every 12 hours and renews when within `renew_before_days`, then hot-reloads TLS via `ArcSwap` with no connection drop.
+
+`cert_path`/`key_path` in `[tls]` still hold the certificate — ACME writes the obtained cert there. On a fresh host they need a bootstrap cert so the listener can bind; `zion init` generates a 1-day self-signed one that ACME immediately replaces. If you hand-write `[tls.acme]` with your own long-lived bootstrap cert, first issuance waits until that cert is within the renewal window — use `zion init` or a short-lived bootstrap cert to get a real cert immediately.
+
+`state_dir` is written at runtime by the (non-root) process, so it lives under `/var/lib/zion`, not `/etc`; the official container pre-creates it writable.
 
 ## Observability
 

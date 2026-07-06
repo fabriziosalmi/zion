@@ -93,12 +93,17 @@ alpn = ["h2", "http/1.1"]   # HTTP/2 + fallback
 # client_ca_path = "/etc/ssl/zion/client-ca.crt"
 # client_auth = "required"   # "none" (default) | "optional" | "required"
 
-# ACME auto-renewal (requires --features acme)
+# Automatic HTTPS via Let's Encrypt (ACME HTTP-01). Included in the release
+# binary and official container; for a local `cargo build`, add --features acme
+# (or --features dist). With [tls.acme] set, Zion obtains and auto-renews a real
+# certificate — the cert_path/key_path above only need a bootstrap cert so :443
+# binds (`zion init` on a public domain generates a short-lived one for you).
+# Needs port 80 reachable from the internet (HTTP-01) and a writable state_dir.
 # [tls.acme]
 # email = "ops@example.com"
 # domains = ["example.com", "www.example.com"]
-# directory_url = "https://acme-v02.api.letsencrypt.org/directory"
-# state_dir = "/var/lib/zion/acme"
+# directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"  # test against LE staging first; drop for production
+# state_dir = "/var/lib/zion/acme"   # runtime-written (account.json + certs); matches the code default
 # renew_before_days = 30
 
 # ============================================================================
@@ -205,10 +210,10 @@ ttl_seconds = 60         # 1 minute (SSR pages)
 # ROUTES (matched via Radix Tree in ~15ns)
 # ============================================================================
 
-[[route]]
-path = "/.well-known/acme-challenge/{*rest}"
-upstream = "api"
-mode = "standard"
+# NOTE: no /.well-known/acme-challenge route is needed. Built-in ACME answers
+# the HTTP-01 challenge in-memory on the :80 listener before routing — a route
+# here would only add a needless proxy hop. (You'd add one only if you run an
+# EXTERNAL certbot that writes tokens to a backend.)
 
 [[route]]
 path = "/api/v1/events/stream"

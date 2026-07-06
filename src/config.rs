@@ -393,7 +393,10 @@ fn default_acme_renew_days() -> u64 {
     30
 }
 fn default_acme_state_dir() -> String {
-    "/etc/zion/acme".to_string()
+    // /var/lib/zion (not /etc): this dir is written at RUNTIME (account.json +
+    // issued certs) by the non-root process; /etc is root-owned config. Matches
+    // what the container pre-creates as nonroot-writable and what init emits.
+    "/var/lib/zion/acme".to_string()
 }
 
 fn default_true() -> bool {

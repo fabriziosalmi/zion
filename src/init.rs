@@ -61,6 +61,30 @@ struct ResolvedInit {
     cert_path: String,
     key_path: String,
     with_waf: bool,
+    /// Automatic HTTPS via Let's Encrypt: emit `[tls.acme]` and stamp the
+    /// bootstrap cert short-lived so ACME issues a real cert on first boot.
+    acme: bool,
+    acme_email: Option<String>,
+    acme_domains: Vec<String>,
+}
+
+/// Does this hostname warrant automatic HTTPS? True for a public FQDN; false
+/// for `localhost`, an IP literal, an mDNS/`.local`/`.internal` name, or a
+/// bare single-label host (Let's Encrypt won't issue for any of those).
+fn looks_public(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.');
+    if h.is_empty() || h.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    if h.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    let lower = h.to_ascii_lowercase();
+    if lower.ends_with(".local") || lower.ends_with(".internal") {
+        return false;
+    }
+    // Must be a multi-label public name (has an interior dot).
+    h.contains('.')
 }
 
 /// Run the wizard. Returns the exit code the caller should use:
@@ -79,7 +103,13 @@ pub fn run(opts: InitOpts) -> i32 {
     let _ = print_scan_results(&detected, &style, &mut stderr);
 
     let resolved = if opts.non_interactive {
-        build_non_interactive(opts, &detected)
+        match build_non_interactive(opts, &detected) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("init: {e}");
+                return 2;
+            }
+        }
     } else {
         match build_interactive(opts, &detected, &style, &mut stderr) {
             Ok(r) => r,
@@ -106,13 +136,19 @@ pub fn run(opts: InitOpts) -> i32 {
     if resolved.gen_tls {
         match generate_tls_cert(&resolved) {
             CertOutcome::Generated => {
+                let note = if resolved.acme {
+                    "1-day bootstrap cert — ACME replaces it on first boot"
+                } else {
+                    "self-signed"
+                };
                 let _ = writeln!(
                     stderr,
-                    "  {}✓{} wrote {} + {} (self-signed, valid 365 days, CN={})",
+                    "  {}✓{} wrote {} + {} ({}, CN={})",
                     style.green(),
                     style.reset(),
                     resolved.cert_path,
                     resolved.key_path,
+                    note,
                     resolved.hostname,
                 );
             }
@@ -341,6 +377,29 @@ fn build_interactive<W: Write>(
         prompt_yn("generate self-signed TLS certificate?", true)?
     };
 
+    // Automatic HTTPS (ACME / Let's Encrypt). Offered only when we generate a
+    // cert AND the hostname is a public FQDN — LE can't validate localhost/IP.
+    let (acme, acme_email, acme_domains) = if gen_tls && looks_public(&hostname) {
+        let want = match opts.acme {
+            Some(v) => v,
+            None => prompt_yn("enable automatic HTTPS via Let's Encrypt?", true)?,
+        };
+        if want {
+            let default_email = opts.acme_email.clone().unwrap_or_default();
+            let email = prompt("  contact email for Let's Encrypt", &default_email)?;
+            let domains = if opts.acme_domains.is_empty() {
+                vec![hostname.clone()]
+            } else {
+                opts.acme_domains.clone()
+            };
+            (true, Some(email), domains)
+        } else {
+            (false, None, Vec::new())
+        }
+    } else {
+        (false, None, Vec::new())
+    };
+
     // WAF
     let with_waf = if !opts.with_waf {
         false
@@ -365,10 +424,16 @@ fn build_interactive<W: Write>(
         cert_path: "tls/server.crt".into(),
         key_path: "tls/server.key".into(),
         with_waf,
+        acme,
+        acme_email,
+        acme_domains,
     })
 }
 
-fn build_non_interactive(opts: InitOpts, detected: &[DetectedService]) -> ResolvedInit {
+fn build_non_interactive(
+    opts: InitOpts,
+    detected: &[DetectedService],
+) -> Result<ResolvedInit, String> {
     let hostname = opts.hostname.clone().unwrap_or_else(|| "localhost".into());
 
     let mut upstreams = opts.upstreams.clone();
@@ -384,18 +449,41 @@ fn build_non_interactive(opts: InitOpts, detected: &[DetectedService]) -> Resolv
         }
     }
 
-    ResolvedInit {
+    // ACME: explicit --acme/--no-acme wins; otherwise on when the cert is
+    // generated for a public host and a contact email is available.
+    let gen_tls = opts.with_tls;
+    let acme = opts
+        .acme
+        .unwrap_or_else(|| gen_tls && looks_public(&hostname) && opts.acme_email.is_some());
+    if acme {
+        if !gen_tls {
+            return Err("--acme requires TLS cert generation (drop --no-tls)".into());
+        }
+        if opts.acme_email.is_none() {
+            return Err("--email <addr> is required when automatic HTTPS is enabled".into());
+        }
+    }
+    let acme_domains = if opts.acme_domains.is_empty() {
+        vec![hostname.clone()]
+    } else {
+        opts.acme_domains.clone()
+    };
+
+    Ok(ResolvedInit {
         output: opts.output,
         force: opts.force,
         hostname,
         upstreams,
         http_port: opts.http_port.unwrap_or(80),
         https_port: opts.https_port.unwrap_or(443),
-        gen_tls: opts.with_tls,
+        gen_tls,
         cert_path: "tls/server.crt".into(),
         key_path: "tls/server.key".into(),
         with_waf: opts.with_waf,
-    }
+        acme,
+        acme_email: opts.acme_email.clone(),
+        acme_domains,
+    })
 }
 
 fn unique_name(existing: &[(String, String)], proposed: &str) -> String {
@@ -475,6 +563,24 @@ fn render_toml(r: &ResolvedInit) -> String {
     out.push_str(
         "\"\nhot_reload  = true\nmin_version = \"1.3\"\nalpn        = [\"h2\", \"http/1.1\"]\n\n",
     );
+
+    // Automatic HTTPS (ACME / Let's Encrypt). The cert_path/key_path above hold
+    // a short-lived bootstrap cert so :443 binds immediately; ACME replaces it
+    // with a real cert on first boot (needs :80 reachable from the internet).
+    if r.acme {
+        let email = r.acme_email.as_deref().unwrap_or("");
+        let domains = r
+            .acme_domains
+            .iter()
+            .map(|d| format!("\"{d}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str("# ── Automatic HTTPS (Let's Encrypt) ──────────────────────\n");
+        out.push_str(&format!(
+            "[tls.acme]\nemail             = \"{email}\"\ndomains           = [{domains}]\n\
+             # directory_url   = \"https://acme-staging-v02.api.letsencrypt.org/directory\"  # test against LE staging first\nrenew_before_days = 30\nstate_dir         = \"/var/lib/zion/acme\"\n\n"
+        ));
+    }
 
     // Upstreams (modern named-section format)
     out.push_str("# ── Upstreams ────────────────────────────────────────────\n");
@@ -567,16 +673,27 @@ enum CertOutcome {
 
 #[cfg(feature = "init")]
 fn generate_tls_cert(r: &ResolvedInit) -> CertOutcome {
-    use rcgen::generate_simple_self_signed;
-
     let mut sans = vec![r.hostname.clone()];
     if r.hostname != "localhost" {
         sans.push("localhost".to_string());
     }
 
-    let cert = match generate_simple_self_signed(sans) {
-        Ok(c) => c,
-        Err(e) => return CertOutcome::Failed(format!("rcgen: {e}")),
+    let (cert_pem, key_pem) = if r.acme {
+        // ACME path: stamp a SHORT-LIVED (1-day) bootstrap cert. This lets
+        // :443 bind immediately, and — because it's already inside the 30-day
+        // renew window — triggers ACME to obtain a real cert on first boot
+        // (rcgen's default not_after is year 4096, which would never expire
+        // and so would never trip the renewal check).
+        match generate_short_lived_cert(&sans) {
+            Ok(pair) => pair,
+            Err(e) => return CertOutcome::Failed(format!("rcgen: {e}")),
+        }
+    } else {
+        // Self-signed path: the long-lived cert is the real serving cert.
+        match rcgen::generate_simple_self_signed(sans) {
+            Ok(c) => (c.cert.pem(), c.signing_key.serialize_pem()),
+            Err(e) => return CertOutcome::Failed(format!("rcgen: {e}")),
+        }
     };
 
     // Ensure parent dir exists for both files.
@@ -589,14 +706,27 @@ fn generate_tls_cert(r: &ResolvedInit) -> CertOutcome {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    if let Err(e) = std::fs::write(&r.cert_path, cert.cert.pem()) {
+    if let Err(e) = std::fs::write(&r.cert_path, &cert_pem) {
         return CertOutcome::Failed(format!("write {}: {}", r.cert_path, e));
     }
-    if let Err(e) = std::fs::write(&r.key_path, cert.signing_key.serialize_pem()) {
+    if let Err(e) = std::fs::write(&r.key_path, &key_pem) {
         return CertOutcome::Failed(format!("write {}: {}", r.key_path, e));
     }
 
     CertOutcome::Generated
+}
+
+/// Build a self-signed cert valid for ~1 day, returned as (cert_pem, key_pem).
+/// Used only for the ACME bootstrap cert so first-boot issuance fires.
+#[cfg(feature = "init")]
+fn generate_short_lived_cert(sans: &[String]) -> Result<(String, String), rcgen::Error> {
+    let key = rcgen::KeyPair::generate()?;
+    let mut params = rcgen::CertificateParams::new(sans.to_vec())?;
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::hours(1);
+    params.not_after = now + time::Duration::days(1);
+    let cert = params.self_signed(&key)?;
+    Ok((cert.pem(), key.serialize_pem()))
 }
 
 #[cfg(not(feature = "init"))]
@@ -828,9 +958,100 @@ mod tests {
     }
 
     #[test]
+    fn looks_public_classifies_hosts() {
+        for h in ["example.com", "app.example.com", "a.b.co.uk"] {
+            assert!(looks_public(h), "{h} should be public");
+        }
+        for h in [
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "box",
+            "db.local",
+            "svc.internal",
+            "",
+        ] {
+            assert!(!looks_public(h), "{h} should NOT be public");
+        }
+    }
+
+    #[test]
+    fn acme_on_for_public_host_with_email() {
+        let opts = InitOpts {
+            non_interactive: true,
+            hostname: Some("app.example.com".into()),
+            acme_email: Some("ops@example.com".into()),
+            upstreams: vec![("backend".into(), "127.0.0.1:8000".into())],
+            ..InitOpts::default()
+        };
+        let r = build_non_interactive(opts, &[]).unwrap();
+        assert!(r.acme);
+        assert_eq!(r.acme_domains, vec!["app.example.com".to_string()]);
+        let toml = render_toml(&r);
+        assert!(toml.contains("[tls.acme]"));
+        assert!(toml.contains("email             = \"ops@example.com\""));
+        assert!(toml.contains("domains           = [\"app.example.com\"]"));
+        assert!(toml.contains("state_dir         = \"/var/lib/zion/acme\""));
+    }
+
+    #[test]
+    fn acme_render_passes_config_schema() {
+        // Same #133 guarantee as suggest/import: what init emits must parse
+        // against the real config schema (deny_unknown_fields), ACME included.
+        let opts = InitOpts {
+            non_interactive: true,
+            hostname: Some("app.example.com".into()),
+            acme_email: Some("ops@example.com".into()),
+            acme_domains: vec!["app.example.com".into(), "www.app.example.com".into()],
+            upstreams: vec![("backend".into(), "127.0.0.1:8000".into())],
+            ..InitOpts::default()
+        };
+        let toml = render_toml(&build_non_interactive(opts, &[]).unwrap());
+        crate::config::parse_schema(&toml, "init acme output")
+            .expect("init ACME output must satisfy the config schema");
+    }
+
+    #[test]
+    fn acme_off_for_localhost_and_no_email() {
+        // localhost never gets ACME even with an email present.
+        let opts = InitOpts {
+            non_interactive: true,
+            hostname: Some("localhost".into()),
+            acme_email: Some("ops@example.com".into()),
+            upstreams: vec![("backend".into(), "127.0.0.1:8000".into())],
+            ..InitOpts::default()
+        };
+        let r = build_non_interactive(opts, &[]).unwrap();
+        assert!(!r.acme);
+        assert!(!render_toml(&r).contains("[tls.acme]"));
+
+        // Public host but no email + no explicit --acme → heuristic off.
+        let opts = InitOpts {
+            non_interactive: true,
+            hostname: Some("app.example.com".into()),
+            upstreams: vec![("backend".into(), "127.0.0.1:8000".into())],
+            ..InitOpts::default()
+        };
+        assert!(!build_non_interactive(opts, &[]).unwrap().acme);
+    }
+
+    #[test]
+    fn explicit_acme_without_email_errors() {
+        let opts = InitOpts {
+            non_interactive: true,
+            hostname: Some("app.example.com".into()),
+            acme: Some(true),
+            upstreams: vec![("backend".into(), "127.0.0.1:8000".into())],
+            ..InitOpts::default()
+        };
+        let err = build_non_interactive(opts, &[]).unwrap_err();
+        assert!(err.contains("email"), "got: {err}");
+    }
+
+    #[test]
     fn build_non_interactive_uses_explicit_upstreams() {
         let opts = opts_with_upstreams(&[("backend", "127.0.0.1:8000")]);
-        let r = build_non_interactive(opts, &[]);
+        let r = build_non_interactive(opts, &[]).unwrap();
         assert_eq!(r.upstreams.len(), 1);
         assert_eq!(r.upstreams[0].0, "backend");
         assert_eq!(r.http_port, 80);
@@ -850,7 +1071,7 @@ mod tests {
             hint: "Node",
             suggested_name: "frontend",
         }];
-        let r = build_non_interactive(opts, &detected);
+        let r = build_non_interactive(opts, &detected).unwrap();
         assert_eq!(r.upstreams.len(), 1);
         assert_eq!(r.upstreams[0].0, "frontend");
         assert_eq!(r.upstreams[0].1, "127.0.0.1:3000");
@@ -862,7 +1083,7 @@ mod tests {
             non_interactive: true,
             ..InitOpts::default()
         };
-        let r = build_non_interactive(opts, &[]);
+        let r = build_non_interactive(opts, &[]).unwrap();
         assert_eq!(r.upstreams.len(), 1);
         assert_eq!(r.upstreams[0].1, "127.0.0.1:8080");
     }
@@ -883,6 +1104,9 @@ mod tests {
             cert_path: "tls/server.crt".into(),
             key_path: "tls/server.key".into(),
             with_waf: true,
+            acme: false,
+            acme_email: None,
+            acme_domains: Vec::new(),
         };
         let toml = render_toml(&r);
         // Essentials
@@ -916,6 +1140,9 @@ mod tests {
             cert_path: "tls/server.crt".into(),
             key_path: "tls/server.key".into(),
             with_waf: false,
+            acme: false,
+            acme_email: None,
+            acme_domains: Vec::new(),
         };
         let toml = render_toml(&r);
         assert!(!toml.contains("waf_profile"));
@@ -939,6 +1166,9 @@ mod tests {
             cert_path: "tls/server.crt".into(),
             key_path: "tls/server.key".into(),
             with_waf: true,
+            acme: false,
+            acme_email: None,
+            acme_domains: Vec::new(),
         };
         let toml = render_toml(&r);
         assert!(
@@ -966,6 +1196,9 @@ mod tests {
             cert_path: "tls/server.crt".into(),
             key_path: "tls/server.key".into(),
             with_waf: true,
+            acme: false,
+            acme_email: None,
+            acme_domains: Vec::new(),
         };
         let toml = render_toml(&r);
         // Only frontend → no /api/* route to attach

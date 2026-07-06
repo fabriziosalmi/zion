@@ -93,6 +93,23 @@ request corpus against both, and diffs the routing decision request by request
 Reproduce it yourself (`docker`, `curl`, `openssl`): `./tests/equivalence/run.sh`
 — see [tests/equivalence/](tests/equivalence/).
 
+### Automatic HTTPS (Let's Encrypt)
+
+The release binary and official container ship automatic HTTPS. Scaffold a
+production config for a public domain and Zion obtains and auto-renews a real
+certificate on first boot — no manual cert step:
+
+```bash
+zion init --hostname app.example.com --email ops@example.com
+ZION_CONFIG=zion.toml zion         # gets a real cert on boot; renews itself
+```
+
+`zion init` writes a `[tls.acme]` block and a short-lived bootstrap cert so
+`:443` binds instantly while ACME provisions the real one (needs port 80
+reachable for the HTTP-01 challenge). A local `cargo build` needs
+`--features acme` (or `--features dist`); the released artifacts already
+include it. See [ACME docs](https://fabriziosalmi.github.io/zion/config/acme).
+
 ### Build flavors
 
 The default build is a lean daemon; opt into what you need:
@@ -101,7 +118,8 @@ The default build is a lean daemon; opt into what you need:
 cargo build --release                            # bare daemon
 cargo build --release --features init            # + zion init wizard / zion auto dev mode
 cargo build --release --features tui             # + zion top live dashboard
-cargo build --release --features acme            # + Let's Encrypt auto-renewal (HTTP-01)
+cargo build --release --features dist            # release bundle: acme + init (what the container ships)
+cargo build --release --features acme            # + automatic HTTPS via Let's Encrypt (HTTP-01)
 cargo build --release --features auth            # + JWT/OIDC authentication gate
 cargo build --release --features http3           # + HTTP/3 QUIC listener
 cargo build --release --features otel            # + OpenTelemetry tracing + OTLP export
@@ -174,7 +192,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 ```
 
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-47 modules, ~35,900 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+47 modules, ~36,100 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Features
 
@@ -269,7 +287,7 @@ MODE=full bash benchmarks/baseline/run-baseline.sh   # → benchmarks/baseline/z
 ## Testing
 
 ```bash
-# Unit tests (741) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
+# Unit tests (746) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
 cargo test
 
 # Integration tests (23 — requires a running Zion + backend)

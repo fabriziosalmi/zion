@@ -222,17 +222,19 @@ jobs:
         run: brew install cmake gnu-tar
 
       # ── Build ──
+      # --features dist (acme + init): the redistributable bundle so the
+      # release artifacts ship automatic HTTPS and the init wizard.
       - name: Build (zigbuild)
         if: matrix.cross == 'zig' && !matrix.pgo
         shell: bash
         run: |
-          cargo zigbuild --release --locked --target ${{ matrix.target }}
+          cargo zigbuild --release --locked --features dist --target ${{ matrix.target }}
 
       - name: Build (native)
         if: matrix.cross == 'native' && !matrix.pgo
         shell: bash
         run: |
-          cargo build --release --locked --target ${{ matrix.target }}
+          cargo build --release --locked --features dist --target ${{ matrix.target }}
 
       # ── PGO build (issue #55) ─────────────────────────────────────────
       # Two-pass profile-guided build:
@@ -265,7 +267,7 @@ jobs:
           # exit (LLVM_PROFILE_FILE controls the filename pattern,
           # set in pgo-collect.sh).
           RUSTFLAGS="-Cprofile-generate=${PGO_DIR}" \
-            cargo build --release --locked --target ${{ matrix.target }}
+            cargo build --release --locked --features dist --target ${{ matrix.target }}
 
       - name: PGO workload — collect profraws
         if: matrix.pgo
@@ -306,7 +308,7 @@ jobs:
           # that have no profile data so future workload tweaks can fix
           # gaps before they bite.
           RUSTFLAGS="-Cprofile-use=${PGO_DIR}/merged.profdata -Cllvm-args=-pgo-warn-missing-function" \
-            cargo build --release --locked --target ${{ matrix.target }}
+            cargo build --release --locked --features dist --target ${{ matrix.target }}
 
       # ── Strip + stage artifact ──
       - name: Stage artifact
