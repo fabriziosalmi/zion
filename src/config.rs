@@ -655,22 +655,38 @@ fn validate_upstream_url(label: &str, url: &str) -> Option<String> {
 /// accepted and folded; anything else non-canonical is rejected. Returns
 /// `Some(error)` on rejection, `None` when valid.
 fn validate_host_entry(label: &str, host: &str) -> Option<String> {
-    // Wildcards (`*.example.com`) are planned (ADR-0010, follow-up) but not yet
-    // routed. Reject them at load rather than silently inserting an exact key
-    // that no normalized request authority can ever match — a config that
-    // "loads but never matches" is worse than a clear error.
+    // A leading-label wildcard `*.example.com` is valid: validate the domain
+    // after `*.` as a canonical bare host (ADR-0010).
+    if let Some(domain) = host.strip_prefix("*.") {
+        if domain.is_empty() || domain.contains('*') {
+            return Some(format!(
+                "{label} host '{host}': a wildcard must be `*.<domain>` with a \
+                 concrete domain (e.g. `*.example.com`)"
+            ));
+        }
+        return bare_host_error(label, host, domain);
+    }
+    // Any other use of `*` (embedded or trailing) is not supported.
     if host.contains('*') {
         return Some(format!(
-            "{label} host '{host}': wildcard hosts are not yet supported — \
-             list exact hostnames (see ADR-0010)"
+            "{label} host '{host}': only leading-label wildcards `*.<domain>` are \
+             supported (not embedded or trailing `*`)"
         ));
     }
-    let lower = host.to_ascii_lowercase();
-    if crate::security::normalize_host(host).as_deref() == Some(lower.as_str()) {
+    bare_host_error(label, host, host)
+}
+
+/// Shared fixed-point check for a bare host: `candidate` must be canonical under
+/// [`crate::security::normalize_host`] (modulo case folding). `original` is the
+/// raw entry, used only in the error message. Returns `Some(error)` on
+/// rejection, `None` when valid.
+fn bare_host_error(label: &str, original: &str, candidate: &str) -> Option<String> {
+    let lower = candidate.to_ascii_lowercase();
+    if crate::security::normalize_host(candidate).as_deref() == Some(lower.as_str()) {
         None
     } else {
         Some(format!(
-            "{label} host '{host}' must be a bare hostname \
+            "{label} host '{original}' must be a bare hostname \
              (no scheme, path, port, or trailing dot)"
         ))
     }
@@ -881,19 +897,25 @@ fn resolve_upstream(config: &ZionConfig, name: &str) -> Result<Vec<String>, Stri
     ))
 }
 
-/// Host-aware L7 router (ADR-0010). Holds the hostless/shared radix tree plus
-/// one tree per bound host; a route with no `hosts` lands in `default` and is
-/// reachable from every authority (the shared fallback layer). When no route
-/// declares `hosts`, `active` is false and lookups go straight to `default` —
-/// identical, and identically cheap, to the pre-host-routing single router.
+/// Host-aware L7 router (ADR-0010). Holds the hostless/shared radix tree, one
+/// tree per exact bound host, and one tree per `*.suffix` wildcard. A route with
+/// no `hosts` lands in `default` and is reachable from every authority (the
+/// shared fallback layer). When no route declares `hosts`, `active` is false and
+/// lookups go straight to `default` — identical, and identically cheap, to the
+/// pre-host-routing single router. Precedence: exact host > most-specific
+/// wildcard > shared.
 #[derive(Debug)]
 pub struct HostRouter {
     /// Hostless / shared routes — matched for every authority.
     default: Router<Arc<ResolvedRoute>>,
     /// Exact-host radix trees, keyed by normalized authority.
     by_host: HashMap<Box<str>, Router<Arc<ResolvedRoute>>>,
-    /// True iff at least one route is host-bound. Lets the hot path skip
-    /// authority extraction entirely in the common (hostless) deployment.
+    /// Wildcard trees keyed by their dotted suffix (`*.example.com` →
+    /// `.example.com`), sorted longest-suffix-first so the most specific wins.
+    /// A request host matches when it `ends_with` the suffix.
+    wildcards: Vec<(String, Router<Arc<ResolvedRoute>>)>,
+    /// True iff at least one route is host-bound (exact or wildcard). Lets the
+    /// hot path skip authority extraction entirely in the hostless deployment.
     active: bool,
 }
 
@@ -902,6 +924,7 @@ impl Default for HostRouter {
         Self {
             default: Router::new(),
             by_host: HashMap::new(),
+            wildcards: Vec::new(),
             active: false,
         }
     }
@@ -916,17 +939,32 @@ impl HostRouter {
     }
 
     /// Resolve `(host, path)` to a route, per ADR-0010's hostless-as-shared-layer
-    /// rule: consult the exact-host tree first, then fall back to the shared
-    /// `default` tree. `host` is the normalized request authority
-    /// ([`crate::security::normalize_host`]), or `None` when the authority is
-    /// absent/invalid — in which case only the shared layer is consulted.
+    /// rule with precedence exact > wildcard > shared: an exact-host tree wins;
+    /// otherwise the most-specific matching `*.suffix` wildcard; then the shared
+    /// `default` tree. On a path-miss within the selected host tree we still fall
+    /// through to shared (shared routes are reachable from every host). `host` is
+    /// the normalized request authority ([`crate::security::normalize_host`]), or
+    /// `None` when absent/invalid — then only the shared layer is consulted.
     #[inline]
     pub fn at(&self, host: Option<&str>, path: &str) -> Option<&Arc<ResolvedRoute>> {
         if self.active {
             if let Some(h) = host {
                 if let Some(tree) = self.by_host.get(h) {
+                    // Exact host wins outright (nginx-style); path-miss → shared.
                     if let Ok(m) = tree.at(path) {
                         return Some(m.value);
+                    }
+                } else {
+                    // No exact host: the most-specific matching wildcard, if any.
+                    // `wildcards` is sorted longest-suffix-first, so the first
+                    // `ends_with` hit is the most specific one.
+                    for (suffix, tree) in &self.wildcards {
+                        if h.ends_with(suffix.as_str()) {
+                            if let Ok(m) = tree.at(path) {
+                                return Some(m.value);
+                            }
+                            break; // most-specific wildcard chosen; fall to shared
+                        }
                     }
                 }
             }
@@ -1016,43 +1054,70 @@ pub fn build_router(config: &ZionConfig) -> Result<HostRouter, String> {
     let mut default = RouterBuilder::default();
     let mut by_host: HashMap<Box<str>, RouterBuilder> = HashMap::new();
 
+    let mut wild: HashMap<String, RouterBuilder> = HashMap::new();
+
     for route in &config.route {
         let resolved = resolve_route(config, route)?;
         match &route.hosts {
             // Shared route: reachable from every authority.
             None => default.insert(&route.path, resolved)?,
-            // Host-bound: insert into each host's tree. Validation guarantees
-            // every entry is a canonical host, so normalize_host returns Some.
+            // Host-bound. Validation guarantees each entry is either a canonical
+            // exact host or a `*.<canonical-domain>` wildcard.
             Some(hosts) => {
-                let mut seen = std::collections::HashSet::new();
+                let mut seen_exact = std::collections::HashSet::new();
+                let mut seen_wild = std::collections::HashSet::new();
                 for h in hosts {
-                    let key = crate::security::normalize_host(h)
-                        .ok_or_else(|| format!("route '{}': invalid host '{}'", route.path, h))?
-                        .into_owned();
-                    // A host repeated in one route's list must insert once, not
-                    // twice into the same tree (which matchit rejects as a dup).
-                    if !seen.insert(key.clone()) {
-                        continue;
+                    if let Some(rest) = h.strip_prefix("*.") {
+                        // Wildcard: the match key is the dotted, normalized
+                        // suffix (`*.example.com` → `.example.com`).
+                        let domain = crate::security::normalize_host(rest).ok_or_else(|| {
+                            format!("route '{}': invalid wildcard host '{}'", route.path, h)
+                        })?;
+                        let suffix = format!(".{domain}");
+                        // A suffix repeated in one route's list inserts once.
+                        if !seen_wild.insert(suffix.clone()) {
+                            continue;
+                        }
+                        wild.entry(suffix)
+                            .or_default()
+                            .insert(&route.path, resolved.clone())?;
+                    } else {
+                        let key = crate::security::normalize_host(h)
+                            .ok_or_else(|| format!("route '{}': invalid host '{}'", route.path, h))?
+                            .into_owned();
+                        // A host repeated in one route's list must insert once,
+                        // not twice into the same tree (matchit rejects a dup).
+                        if !seen_exact.insert(key.clone()) {
+                            continue;
+                        }
+                        by_host
+                            .entry(key.into_boxed_str())
+                            .or_default()
+                            .insert(&route.path, resolved.clone())?;
                     }
-                    by_host
-                        .entry(key.into_boxed_str())
-                        .or_default()
-                        .insert(&route.path, resolved.clone())?;
                 }
             }
         }
     }
 
-    let active = !by_host.is_empty();
+    let active = !by_host.is_empty() || !wild.is_empty();
     let by_host = by_host
         .into_iter()
         .map(|(host, builder)| (host, builder.finish()))
         .collect();
+    // Longest suffix first so the most specific wildcard wins at lookup; the
+    // content tiebreak keeps the order deterministic across rebuilds.
+    let mut wildcards: Vec<(String, Router<Arc<ResolvedRoute>>)> = wild
+        .into_iter()
+        .map(|(suffix, builder)| (suffix, builder.finish()))
+        .collect();
+    wildcards.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
 
     print_routes_table(&config.route);
     Ok(HostRouter {
         default: default.finish(),
         by_host,
+        wildcards,
         active,
     })
 }
@@ -1658,10 +1723,24 @@ mtls_fingerprint = false
     }
 
     #[test]
-    fn validate_host_entry_rejects_wildcards_until_supported() {
-        // Wildcards must fail loudly at load, not load-and-never-match (ADR-0010).
-        assert!(validate_host_entry("r", "*.example.com").is_some());
-        assert!(validate_host_entry("r", "api.*.example.com").is_some());
+    fn validate_host_entry_wildcards() {
+        // Leading-label wildcards are accepted (domain case-folded)...
+        assert!(validate_host_entry("r", "*.example.com").is_none());
+        assert!(validate_host_entry("r", "*.API.example.com").is_none());
+        // ...but the domain must be canonical, and embedded / trailing / bare
+        // `*` (or an empty domain / a port) is rejected.
+        for bad in [
+            "*.",
+            "*.example.com:8443",
+            "api.*.example.com",
+            "www.example.*",
+            "*",
+        ] {
+            assert!(
+                validate_host_entry("r", bad).is_some(),
+                "should reject wildcard host: {bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -2292,5 +2371,69 @@ upstream = "shared"
         // A host is simply ignored — everything resolves via the shared tree.
         assert!(router.at(Some("whatever.example.com"), "/api/x").is_some());
         assert!(router.at(None, "/api/x").is_some());
+    }
+
+    #[test]
+    fn host_router_wildcard_and_precedence() {
+        fn url<'a>(r: &'a HostRouter, host: &str, path: &str) -> &'a str {
+            r.at(Some(host), path)
+                .expect("route should resolve")
+                .upstream_url[0]
+                .as_str()
+        }
+        let toml_str = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+[tls]
+cert_path = "/tmp/c.pem"
+key_path = "/tmp/k.pem"
+[upstream.exact]
+url = "http://127.0.0.1:8000"
+[upstream.wild]
+url = "http://127.0.0.1:8001"
+[upstream.deep]
+url = "http://127.0.0.1:8002"
+[upstream.shared]
+url = "http://127.0.0.1:9000"
+[[route]]
+path = "/{*rest}"
+hosts = ["api.example.com"]
+upstream = "exact"
+[[route]]
+path = "/{*rest}"
+hosts = ["*.example.com"]
+upstream = "wild"
+[[route]]
+path = "/{*rest}"
+hosts = ["*.api.example.com"]
+upstream = "deep"
+[[route]]
+path = "/{*rest}"
+upstream = "shared"
+"#;
+        let config: ZionConfig = toml::from_str(toml_str).unwrap();
+        let router = build_router(&config).unwrap();
+        assert!(router.active);
+
+        // Exact host beats any wildcard.
+        assert_eq!(
+            url(&router, "api.example.com", "/x"),
+            "http://127.0.0.1:8000"
+        );
+        // A subdomain with no exact entry matches the wildcard.
+        assert_eq!(
+            url(&router, "foo.example.com", "/x"),
+            "http://127.0.0.1:8001"
+        );
+        // The most-specific wildcard wins (`*.api.example.com` > `*.example.com`).
+        assert_eq!(
+            url(&router, "v1.api.example.com", "/x"),
+            "http://127.0.0.1:8002"
+        );
+        // The apex (no leading label) does NOT match `*.example.com` → shared.
+        assert_eq!(url(&router, "example.com", "/x"), "http://127.0.0.1:9000");
+        // An unrelated host → shared.
+        assert_eq!(url(&router, "other.org", "/x"), "http://127.0.0.1:9000");
     }
 }
