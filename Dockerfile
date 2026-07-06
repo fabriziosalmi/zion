@@ -63,7 +63,7 @@ RUN mkdir -p src benches && \
     # for the application build below.
     awk '/^\[\[bench\]\]/{b=1} b&&/^name[[:space:]]*=/{gsub(/[" ]/,"",$3); print $3; b=0}' Cargo.toml \
       | while IFS= read -r bench; do : > "benches/${bench}.rs"; done && \
-    cargo build --release --locked && \
+    cargo build --release --locked --features dist && \
     rm -rf src benches target/release/zion target/release/zion.d \
            target/release/deps/zion-* target/release/build/zion-*
 
@@ -73,7 +73,9 @@ RUN mkdir -p src benches && \
 COPY src/ src/
 COPY benches/ benches/
 COPY .cargo/ .cargo/
-RUN cargo build --release --locked && \
+# --features dist: the redistributable bundle (acme + init) so the official
+# image ships automatic HTTPS and the init wizard out of the box.
+RUN cargo build --release --locked --features dist && \
     strip target/release/zion && \
     # Best-effort canonicalization for reproducibility.
     touch -d "@${SOURCE_DATE_EPOCH}" target/release/zion

@@ -5589,6 +5589,7 @@ dependencies = [
  "serde_json",
  "simd-json",
  "socket2",
+ "time",
  "tokio",
  "tokio-rustls",
  "tokio-stream",

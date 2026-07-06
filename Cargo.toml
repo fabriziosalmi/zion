@@ -96,6 +96,10 @@ core_affinity = "0.8"
 instant-acme = { version = "0.8", features = ["hyper-rustls"], optional = true }
 rcgen = { version = "0.14", optional = true }
 base64 = { version = "0.22", optional = true }
+# Used by the init/acme cert generator to stamp a short-lived (1-day) bootstrap
+# cert so ACME issues a real cert on first boot. Already in the rcgen closure,
+# so it adds no net-new crate. Gated by acme/init only.
+time = { version = "0.3", optional = true, features = ["std"] }
 
 # Auth-gate JWT/OIDC (opt-in: cargo build --features auth)
 # v10 requires explicitly choosing a CryptoProvider; we pick aws_lc_rs to
@@ -197,12 +201,20 @@ io-uring-accept = ["io-uring"]
 # listener supervisor keeps using tokio's `AsyncReadExt` /
 # `AsyncWriteExt` — no behavioural change at runtime.
 io-uring-rw = ["io-uring-accept"]
-acme = ["instant-acme", "rcgen", "base64"]
+acme = ["instant-acme", "rcgen", "base64", "time"]
 auth = ["jsonwebtoken", "reqwest"]
 http3 = ["quinn", "h3", "h3-quinn"]
 reqwest = ["dep:reqwest"]
 tui = ["ratatui", "crossterm"]
-init = ["rcgen"]
+init = ["rcgen", "time"]
+# Redistributable bundle: what the official container + release artifacts
+# ship. It is NOT in `default` on purpose — acme/init pull an edition-2024
+# closure (time, rcgen, deranged) that raises the real build MSRV to 1.88,
+# and the MSRV-1.82 CI job (`--no-default-features`) wouldn't catch it. So the
+# lean default build (and `cargo install zion`) stays 1.82-clean, while the
+# artifacts an operator actually deploys carry auto-HTTPS + the init wizard.
+# Supply-chain cost is zero: cargo-deny/vet already audit --all-features.
+dist = ["acme", "init"]
 # Distributed tracing export to an OTLP collector (Tempo, Jaeger, Honeycomb,
 # Datadog Agent, etc). The base `tracing` integration is always-on; this
 # feature only enables the network exporter.

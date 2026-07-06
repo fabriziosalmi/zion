@@ -71,10 +71,8 @@ max_entries = 1000
 ttl_seconds = 60         # 1 minute
 
 # ── Routes ──
-
-[[route]]
-path = "/.well-known/acme-challenge/{*rest}"
-upstream = "api"
+# (No /.well-known/acme-challenge route: built-in ACME answers HTTP-01
+# in-memory on :80 before routing — a route would only add a proxy hop.)
 
 [[route]]
 path = "/api/v1/events/stream"
