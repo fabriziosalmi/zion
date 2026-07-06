@@ -150,12 +150,17 @@ fi
 gen0="$(val zion_config_generation)"; gen0="${gen0:-0}"
 
 # ── Generators ──
+# NB: each generator runs in a background subshell that INHERITS the EXIT trap.
+# Every generator (and any nested subshell) resets it first — otherwise a
+# short-lived inner subshell (e.g. g3's /dev/tcp probe) would fire cleanup on
+# its own exit and nuke $WORK + kill the daemons mid-run.
 rand() { echo $(( (RANDOM * 32768 + RANDOM) % CARDINALITY )); }
 randip() { echo "$(( RANDOM % 223 + 1 )).$(( RANDOM % 256 )).$(( RANDOM % 256 )).$(( RANDOM % 256 ))"; }
 
 # G1: high-cardinality load — fresh connection per request, random host/path/XFF,
 # alternating cached vs WAF-POST routes.
 g1() {
+    trap - EXIT
     local body; body="$(head -c 4096 /dev/zero | tr '\0' 'x')"
     while [ ! -f "$STOP" ]; do
         local h p ip
@@ -169,14 +174,16 @@ g1() {
 }
 # G3: bad-TLS / RST churn — open the TLS port and close immediately.
 g3() {
+    trap - EXIT
     while [ ! -f "$STOP" ]; do
         curl -sk -o /dev/null -m 0.2 "https://127.0.0.1:$HTTPS_PORT/" 2>/dev/null || true
-        (exec 3<>"/dev/tcp/127.0.0.1/$HTTPS_PORT" && printf 'GET / bad\r\n' >&3 && exec 3>&-) 2>/dev/null || true
+        { exec 3<>"/dev/tcp/127.0.0.1/$HTTPS_PORT" && printf 'GET / bad\r\n' >&3 && exec 3>&-; } 2>/dev/null || true
         sleep 0.05
     done
 }
 # G6: A/B reload rotation under load.
 g6() {
+    trap - EXIT
     local n=0 variant=a
     local interval; interval="$(awk "BEGIN{print ($DURATION-2)/$RELOADS}")"
     while [ "$n" -lt "$RELOADS" ] && [ ! -f "$STOP" ]; do
