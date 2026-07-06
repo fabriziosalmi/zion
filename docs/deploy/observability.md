@@ -63,7 +63,15 @@ scrape_configs:
       insecure_skip_verify: true  # if using self-signed certs
 ```
 
-### Grafana Dashboard Queries
+### Grafana Dashboard
+
+An importable dashboard covering the whole fleet — golden signals, security,
+TLS/upstream, and a **leak-watch** row (RSS slope + open FDs per instance) — is
+committed at [`deploy/grafana/zion-overview.json`](https://github.com/fabriziosalmi/zion/blob/master/deploy/grafana/zion-overview.json).
+Grafana → Dashboards → Import → upload the JSON → pick your Prometheus source.
+See [`deploy/grafana/README.md`](https://github.com/fabriziosalmi/zion/blob/master/deploy/grafana/README.md).
+
+The raw PromQL, if you'd rather build your own panels or alerts:
 
 ```text
 # Request rate
