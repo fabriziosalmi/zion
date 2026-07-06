@@ -1,0 +1,21 @@
+# Replay corpus: HOST PATH EXPECT_NGINX EXPECT_ZION
+# A row where the two expectations differ is a DOCUMENTED divergence: the
+# import report flags it with a partial finding, and the harness proves the
+# flag is truthful. `404` means "no backend answered (HTTP 404)".
+alpha.example.com    /                      alpha    alpha
+alpha.example.com    /some/deep/path        alpha    alpha
+ALPHA.EXAMPLE.COM    /case-folding          alpha    alpha
+beta.example.com     /                      beta     beta
+unknown.example.com  /                      default  default
+api.example.com      /status                health   health
+api.example.com      /v1/users              users    users
+api.example.com      /v1/users/42/profile   users    users
+api.example.com      /v1/orders             legacy   legacy
+# Documented divergence 1 (import finding: default-vhost scope widening):
+# nginx's api server has no matching location -> 404; Zion's shared layer is
+# also the path-miss fallback under named hosts -> default backend.
+api.example.com      /other                 404      default
+# Documented divergence 2 (import finding: string-prefix vs path segments):
+# nginx's prefix location /v1/users string-matches /v1/users999; Zion matches
+# on path segments, so it falls to the /v1/ route.
+api.example.com      /v1/users999           users    legacy
