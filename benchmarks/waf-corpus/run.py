@@ -6,9 +6,21 @@ Each payload is sent in BOTH vectors — query string (`?q=`) and JSON body
 block). Detection rate is on the malicious set; false-positive rate is on the
 benign set (legit traffic that must NOT be blocked).
 
+Two regression gates:
+  * false positives — ANY benign payload blocked is a hard fail (precision).
+  * detection ratchet — if a committed baseline exists ($WAF_BASELINE), the
+    per-class detected COUNT must not drop below its baseline (recall). This
+    closes the historical gap where recall could rot to zero with CI green.
+The ratchet is on integer counts, not percentages: detection is deterministic
+for a fixed corpus + engine, so a drop is a real regression, never noise. When
+recall genuinely improves, refresh the baseline with --emit-baseline.
+
 Usage:  python3 run.py [base_url] [label]
         base_url default https://127.0.0.1:4431 ; route /api/v1/data must have waf=true.
-Exit:   non-zero if any benign payload is blocked (a false positive is a hard fail).
+Env:    WAF_CORPUS    corpus file (default corpus.json; v2 = corpus-v2.json)
+        WAF_BASELINE  path to a per-class baseline json; enables the recall gate
+        WAF_EMIT_BASELINE  path to WRITE the current counts as a new baseline
+Exit:   1 if any benign payload is blocked, OR any class regresses below baseline.
 """
 import json, ssl, sys, urllib.parse, urllib.request, urllib.error, collections
 from pathlib import Path
@@ -19,6 +31,8 @@ URL = BASE + "/api/v1/data"
 # Corpus file: $WAF_CORPUS (default v1). v2 is the larger sourced set.
 import os
 CORPUS_FILE = os.environ.get("WAF_CORPUS", "corpus.json")
+BASELINE_FILE = os.environ.get("WAF_BASELINE")
+EMIT_BASELINE = os.environ.get("WAF_EMIT_BASELINE")
 CORPUS = json.loads((Path(__file__).parent / CORPUS_FILE).read_text())
 CTX = ssl.create_default_context(); CTX.check_hostname = False; CTX.verify_mode = ssl.CERT_NONE
 
@@ -70,4 +84,37 @@ if fp:
     print(f"\n── FALSE POSITIVES ({len(fp)} benign blocked — should be 0) ──")
     for p, sq, sb in fp:
         print(f"  q={sq} b={sb}  {p[:72]}")
-sys.exit(1 if fp else 0)
+
+# Emit mode: write the current per-class counts as a fresh baseline and exit
+# (still honoring the FP hard-fail). Use after a genuine recall improvement.
+current = {cat: {"detected": by_cat[cat][0], "total": by_cat[cat][1]} for cat in by_cat}
+if EMIT_BASELINE:
+    payload = {"corpus": CORPUS_FILE,
+               "overall": {"detected": det, "total": tot},
+               "by_class": current}
+    Path(EMIT_BASELINE).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    print(f"\nwrote baseline → {EMIT_BASELINE} (overall {det}/{tot})")
+
+# Recall ratchet: no class may detect fewer than its baseline count.
+regressions = []
+if BASELINE_FILE:
+    base = json.loads(Path(BASELINE_FILE).read_text())
+    if base.get("corpus") not in (None, CORPUS_FILE):
+        print(f"\n::warning:: baseline is for corpus '{base.get('corpus')}', running '{CORPUS_FILE}'")
+    for cat, b in base.get("by_class", {}).items():
+        got = current.get(cat, {}).get("detected", 0)
+        if got < b["detected"]:
+            regressions.append((cat, got, b["detected"]))
+    base_overall = base.get("overall", {}).get("detected")
+    if base_overall is not None and det < base_overall:
+        regressions.append(("OVERALL", det, base_overall))
+    if regressions:
+        print(f"\n── RECALL REGRESSION ({len(regressions)} class(es) below baseline) ──")
+        for cat, got, want in regressions:
+            print(f"  {cat:9} detected {got} < baseline {want}")
+        print("  detection dropped — this is a silent-WAF-regression gate. If the")
+        print("  drop is intentional, refresh with WAF_EMIT_BASELINE=<file>.")
+    else:
+        print(f"\nrecall ratchet OK vs {Path(BASELINE_FILE).name}")
+
+sys.exit(1 if (fp or regressions) else 0)
