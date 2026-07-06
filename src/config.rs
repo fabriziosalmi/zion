@@ -1003,7 +1003,7 @@ impl RouterBuilder {
             Some(bare) => {
                 self.router
                     .insert(path.to_string(), resolved.clone())
-                    .map_err(|e| format!("Bad route pattern '{}': {}", path, e))?;
+                    .map_err(|e| format!("Bad route pattern '{path}': {e}"))?;
                 self.aliases.push((bare, resolved));
             }
             None => {
@@ -1016,13 +1016,13 @@ impl RouterBuilder {
                     Some(variant) => {
                         self.router
                             .insert(path.to_string(), resolved.clone())
-                            .map_err(|e| format!("Bad route pattern '{}': {}", path, e))?;
+                            .map_err(|e| format!("Bad route pattern '{path}': {e}"))?;
                         self.aliases.push((variant, resolved));
                     }
                     None => {
                         self.router
                             .insert(path.to_string(), resolved)
-                            .map_err(|e| format!("Bad route pattern '{}': {}", path, e))?;
+                            .map_err(|e| format!("Bad route pattern '{path}': {e}"))?;
                     }
                 }
             }
