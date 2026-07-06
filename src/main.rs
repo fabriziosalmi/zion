@@ -634,7 +634,20 @@ pub(crate) fn unauthorized(text: &'static str, challenge: &'static str) -> Respo
         .unwrap()
 }
 
-fn main() -> error::ZionResult<()> {
+fn main() {
+    // Map a structured boot failure to its conventional exit code so process
+    // supervisors (systemd Restart=, k8s restartPolicy) can branch: a config
+    // error (2) must NOT trigger a restart loop, a bind error (4) should. The
+    // default `fn main() -> Result` termination collapses every error to exit
+    // 1 — hence this explicit boundary. The `kind=` prefix gives log scrapers
+    // a stable field without parsing the message.
+    if let Err(e) = run() {
+        eprintln!("zion: fatal [{}] {}", e.kind(), e);
+        std::process::exit(e.to_exit_code());
+    }
+}
+
+fn run() -> error::ZionResult<()> {
     // ── Subcommand dispatch ──
     // Default (no args) → run the daemon, preserving every existing
     // systemd / Docker invocation path. Subcommands like `top`, `--version`,
@@ -791,6 +804,45 @@ fn main() -> error::ZionResult<()> {
     runtime.block_on(async_main(platform))
 }
 
+/// Warn loudly when the config uses a section whose behaviour is compiled out.
+/// The silent footgun this closes: an operator sets `auth_profile` on a route
+/// (or `[tls.acme]`) but built the binary without the matching feature, so the
+/// section parses and validates yet does *nothing* — routes believed to be
+/// authenticated serve unauthenticated, certs believed to auto-renew don't.
+/// Sections gated on the struct field itself (`[sovereign_aimp]`, sovereign
+/// geo) already hard-fail at parse via `deny_unknown_fields`, so they need no
+/// warning here — only the parse-clean-but-inert ones do.
+fn warn_feature_config_gaps(config: &config::ZionConfig) {
+    #[cfg(not(feature = "auth"))]
+    {
+        let uses_auth = !config.auth_profile.is_empty()
+            || config.route.iter().any(|r| r.auth_profile.is_some());
+        if uses_auth {
+            logging::warn(
+                "config",
+                "auth_profile is configured but this binary was built WITHOUT \
+                 `--features auth` — authentication is NOT enforced and those \
+                 routes serve UNAUTHENTICATED. Rebuild with `--features auth`.",
+            );
+        }
+    }
+    #[cfg(not(feature = "acme"))]
+    {
+        if config.tls.acme.is_some() {
+            logging::warn(
+                "config",
+                "[tls.acme] is configured but this binary was built WITHOUT \
+                 `--features acme` — certificates will NOT be obtained or \
+                 auto-renewed. Rebuild with `--features acme`, or manage certs \
+                 externally.",
+            );
+        }
+    }
+    // In a build where every referenced feature is present, both blocks above
+    // compile out and `config` is otherwise unused here.
+    let _ = config;
+}
+
 async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult<()> {
     eprintln!("ZION EDGE GATEWAY — initializing...");
     bootstrap::print_report(platform);
@@ -808,6 +860,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         &config.server.log_format,
     ));
     logging::info("config", &format!("loaded from {config_path}"));
+    warn_feature_config_gaps(&config);
 
     // 2. (config-derived state is now built later via ResolvedAppConfig::build —
     //  the standalone `let router = …` step was removed in favour of a single

@@ -74,7 +74,8 @@ impl ZionError {
     ///   * `4` — bind/listener problem (port already used or no permission)
     ///   * `5` — runtime subsystem (ACME, auth, audit) failed
     ///   * `1` — anything else
-    #[allow(dead_code)] // wired by main when adopting structured exit codes
+    ///
+    /// Wired at the `main()` boundary so supervisors can branch on the code.
     pub fn to_exit_code(&self) -> i32 {
         match self {
             ZionError::Config(_) => 2,
@@ -86,9 +87,9 @@ impl ZionError {
     }
 
     /// Stable, lowercase identifier for structured logs / metrics labels.
-    /// Mirrors the variant name minus the payload. Currently consumed by
-    /// the test suite and reserved for the audit-log integration point.
-    #[allow(dead_code)]
+    /// Mirrors the variant name minus the payload. Emitted as the `kind=`
+    /// field in the `main()` fatal line and reserved for the audit-log
+    /// integration point.
     pub fn kind(&self) -> &'static str {
         match self {
             ZionError::Config(_) => "config",
