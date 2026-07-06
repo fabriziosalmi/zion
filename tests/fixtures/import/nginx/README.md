@@ -16,7 +16,7 @@ auto / unsupported):
 | `02-wordpress.conf` | Container WP, uploads, timeouts | hosts (2 names); `client_max_body_size 64m` → waf_profile partial; `proxy_connect_timeout` → `connect_timeout_ms` | `proxy_read_timeout`/`proxy_buffering` → unsupported; regex dotfile-deny location → unsupported (skipped) |
 | `03-api-gateway.conf` | One vhost, many locations, one limit_req zone | exact + prefix locations → distinct routes/upstreams; single `limit_req` policy → global `rate_limit_rps` partial | `add_header X-Gateway` → unsupported |
 | `04-static-plus-proxy.conf` | SPA static + `/api` proxied | `/api/` route (its `proxy_pass http://…:5000/` URI part under non-`/` location → unsupported finding, authority-only emission) | `root`/`index`/`try_files`/`expires`/`access_log off` → unsupported |
-| `05-multi-vhost.conf` | 3 server blocks incl. `default_server _` | per-host routes on the same path; `_` catch-all → hostless shared route | — |
+| `05-multi-vhost.conf` | 3 server blocks incl. `default_server _` | per-host routes on the same path; `_` catch-all → hostless shared route | partial: default-vhost scope widening (Zion's shared layer is also the path-miss fallback under named hosts) |
 | `06-upstream-lb.conf` | upstream pool | `urls` (3 backends); `keepalive 32` → keepalive | `least_conn`/`weight`/`backup`/`proxy_next_upstream` → unsupported |
 | `07-tls-termination.conf` | TLS + redirect pair | ssl cert/key → `[tls]`/`[[tls.sni]]`; `ssl_protocols TLSv1.2 …` → `min_version = "1.2"`; https upstream; port-80 `return 301 https://…` server → auto (dropped) | `ssl_ciphers`/`proxy_ssl_verify off`/HSTS `add_header` → auto/unsupported per table |
 | `08-wildcard-vhost.conf` | `*.tenants` wildcard + apex | wildcard + exact hosts; shared wildcard cert via SNI | — |

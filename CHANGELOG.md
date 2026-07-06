@@ -4,6 +4,26 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Added
+- **`zion import nginx <conf>`** (ADR-0011): convert the reverse-proxy subset
+  of an nginx config into a `zion.toml`, with the `suggest` guarantee extended
+  — the output is self-validated (schema, reference integrity, router build)
+  before it is emitted. Every input directive lands in exactly one finding
+  bucket (convert / partial / auto / unsupported); anything Zion cannot
+  express faithfully (regex locations, `proxy_pass` prefix rewriting, static
+  file serving, per-location rate limits) becomes a loud finding plus an
+  inline `# UNSUPPORTED:` annotation, never a silent guess. Hand-rolled
+  tolerant parser (crossplane/`ngx_conf_read_token` lexer semantics, `include`
+  resolution, no directive whitelist), zero new dependencies, ungated, MSRV
+  1.82. Golden corpus of 10 real-world configs under
+  `tests/fixtures/import/nginx/` is the executable spec. Flags: `-o/--output`,
+  `--report`, `--strict` (exit 2 on partial/unsupported findings — a CI gate).
+- `config::validate_semantics`: the filesystem-free layer of config validation
+  (listen addresses, route→upstream/profile references, ADR-0010 host rules,
+  upstream URL schemes, `[admin]` invariants), split out of `validate_config`
+  behavior-preservingly so `import` can fully check a config that carries
+  placeholder cert paths.
+
 ## [0.5.0] - 2026-07-06
 
 Host-based L7 routing (virtual hosting) — Zion can now serve different backends
