@@ -46,7 +46,9 @@ jobs:
         run: cargo build --release --locked --bin zion
 
       - name: Build bench backend (release)
-        run: cargo build --release --locked --manifest-path benchmarks/backend/Cargo.toml
+        # No --locked: the bench backend's Cargo.lock is not maintained in
+        # lockstep (matches integration.yml).
+        run: cargo build --release --manifest-path benchmarks/backend/Cargo.toml
 
       - name: Reload under load (0 dropped connections across live swaps)
         env:
