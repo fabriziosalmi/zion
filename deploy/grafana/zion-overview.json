@@ -1,0 +1,206 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source scraping Zion's /metrics endpoint",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "panel", "id": "timeseries", "name": "Time series", "version": "" },
+    { "type": "panel", "id": "stat", "name": "Stat", "version": "" }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "name": "Config reloads",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "enable": true,
+        "iconColor": "blue",
+        "expr": "changes(zion_config_generation{instance=~\"$instance\"}[1m]) > 0",
+        "titleFormat": "config hot-reload",
+        "step": "60s"
+      }
+    ]
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "tags": ["zion", "reverse-proxy", "edge"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "label": "Data source"
+      },
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(zion_requests_total, instance)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "label": "Instance",
+        "sort": 1
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "title": "Zion — Edge Overview",
+  "uid": "zion-overview",
+  "panels": [
+    { "type": "row", "title": "Fleet at a glance", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "collapsed": false, "id": 100 },
+
+    { "id": 1, "type": "stat", "title": "Requests/s", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [ { "refId": "A", "expr": "sum(rate(zion_requests_total{instance=~\"$instance\"}[5m]))", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] },
+
+    { "id": 2, "type": "stat", "title": "5xx error ratio", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 0.01 }, { "color": "red", "value": 0.05 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area" },
+      "targets": [ { "refId": "A", "expr": "sum(rate(zion_requests_by_status{class=\"5xx\",instance=~\"$instance\"}[5m])) / clamp_min(sum(rate(zion_requests_total{instance=~\"$instance\"}[5m])), 1)", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] },
+
+    { "id": 3, "type": "stat", "title": "p99 latency", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "s", "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 0.1 }, { "color": "red", "value": 0.5 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [ { "refId": "A", "expr": "histogram_quantile(0.99, sum(rate(zion_request_duration_seconds_bucket{instance=~\"$instance\"}[5m])) by (le))", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] },
+
+    { "id": 4, "type": "stat", "title": "Active connections", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [ { "refId": "A", "expr": "sum(zion_active_connections{instance=~\"$instance\"})", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] },
+
+    { "id": 5, "type": "stat", "title": "Cache hit ratio", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 0.3 }, { "color": "green", "value": 0.7 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [ { "refId": "A", "expr": "sum(zion_cache_hits{instance=~\"$instance\"}) / clamp_min(sum(zion_cache_hits{instance=~\"$instance\"}) + sum(zion_cache_misses{instance=~\"$instance\"}), 1)", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] },
+
+    { "id": 6, "type": "stat", "title": "Config generation (reloads)", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "blue", "value": null } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" }, "colorMode": "value", "graphMode": "none" },
+      "targets": [ { "refId": "A", "expr": "max(zion_config_generation{instance=~\"$instance\"})", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] },
+
+    { "type": "row", "title": "Traffic", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }, "collapsed": false, "id": 101 },
+
+    { "id": 10, "type": "timeseries", "title": "Request rate by instance", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [ { "refId": "A", "expr": "sum by (instance) (rate(zion_requests_total{instance=~\"$instance\"}[5m]))", "legendFormat": "{{instance}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] },
+
+    { "id": 11, "type": "timeseries", "title": "Responses by status class", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 40, "stacking": { "mode": "normal" } } } },
+      "targets": [ { "refId": "A", "expr": "sum by (class) (rate(zion_requests_by_status{instance=~\"$instance\"}[5m]))", "legendFormat": "{{class}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] },
+
+    { "id": 12, "type": "timeseries", "title": "Request latency (p50 / p95 / p99)", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0 } } },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum(rate(zion_request_duration_seconds_bucket{instance=~\"$instance\"}[5m])) by (le))", "legendFormat": "p50", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum(rate(zion_request_duration_seconds_bucket{instance=~\"$instance\"}[5m])) by (le))", "legendFormat": "p95", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum(rate(zion_request_duration_seconds_bucket{instance=~\"$instance\"}[5m])) by (le))", "legendFormat": "p99", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ] },
+
+    { "type": "row", "title": "Security", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 }, "collapsed": false, "id": 102 },
+
+    { "id": 20, "type": "timeseries", "title": "WAF — denied vs shadow would-block", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 15 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(zion_waf_denied{instance=~\"$instance\"}[5m]))", "legendFormat": "denied (blocking)", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "sum(rate(zion_waf_shadow_would_block{instance=~\"$instance\"}[5m]))", "legendFormat": "would-block (shadow)", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ] },
+
+    { "id": 21, "type": "timeseries", "title": "Rate limit / enforcement / per-IP rejects", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 15 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(zion_rate_limited{instance=~\"$instance\"}[5m]))", "legendFormat": "rate-limited", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "sum(rate(zion_enforcement_denied_total{instance=~\"$instance\"}[5m]))", "legendFormat": "enforcement 403", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "C", "expr": "sum(rate(zion_connections_rejected_per_ip{instance=~\"$instance\"}[5m]))", "legendFormat": "per-IP conn reject", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ] },
+
+    { "id": 22, "type": "timeseries", "title": "Tarpit — active held + shed rate", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(zion_tarpit_active{instance=~\"$instance\"})", "legendFormat": "held now", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "sum(rate(zion_tarpit_shed_total{instance=~\"$instance\"}[5m]))", "legendFormat": "shed/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ] },
+
+    { "type": "row", "title": "Upstream, TLS & connections", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 }, "collapsed": false, "id": 103 },
+
+    { "id": 30, "type": "timeseries", "title": "Upstream latency (p95 / p99)", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0 } } },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum(rate(zion_upstream_duration_seconds_bucket{instance=~\"$instance\"}[5m])) by (le))", "legendFormat": "p95", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "histogram_quantile(0.99, sum(rate(zion_upstream_duration_seconds_bucket{instance=~\"$instance\"}[5m])) by (le))", "legendFormat": "p99", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ] },
+
+    { "id": 31, "type": "timeseries", "title": "TLS — handshake error rate + p95 duration", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(zion_tls_handshake_errors{instance=~\"$instance\"}[5m]))", "legendFormat": "errors/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum(rate(zion_tls_handshake_duration_seconds_bucket{instance=~\"$instance\"}[5m])) by (le))", "legendFormat": "handshake p95 (s)", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ] },
+
+    { "id": 32, "type": "timeseries", "title": "Connections — accept rate + active", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(zion_connections_total{instance=~\"$instance\"}[5m]))", "legendFormat": "accepted/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "sum(zion_active_connections{instance=~\"$instance\"})", "legendFormat": "active", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ] },
+
+    { "type": "row", "title": "Fleet health — leak watch (dogfooding-critical)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 }, "collapsed": false, "id": 104 },
+
+    { "id": 40, "type": "timeseries", "title": "Resident memory (RSS) per instance", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 33 },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [ { "refId": "A", "expr": "zion_process_resident_memory_bytes{instance=~\"$instance\"}", "legendFormat": "{{instance}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] },
+
+    { "id": 41, "type": "timeseries", "title": "RSS leak slope (deriv over 30m) — sustained + under flat traffic = leak", "description": "A persistently positive slope while request rate is flat is the silent memory-leak signal. Yellow ~1 KB/s, red ~10 KB/s sustained.", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 33 },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 10, "thresholdsStyle": { "mode": "line" } }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1024 }, { "color": "red", "value": 10240 } ] } } },
+      "targets": [ { "refId": "A", "expr": "deriv(zion_process_resident_memory_bytes{instance=~\"$instance\"}[30m])", "legendFormat": "{{instance}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] },
+
+    { "id": 42, "type": "timeseries", "title": "Open file descriptors per instance", "description": "FDs climbing without bound is a descriptor leak; alert as it approaches the soft limit `zion doctor` reports.", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 33 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [ { "refId": "A", "expr": "zion_process_open_fds{instance=~\"$instance\"}", "legendFormat": "{{instance}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] },
+
+    { "id": 43, "type": "timeseries", "title": "ACME renewals vs failures", "description": "Requires --features acme. Any sustained failure rate means certs will eventually expire.", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(zion_acme_renewals_total{instance=~\"$instance\"}[1h]))", "legendFormat": "renewals/h", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "sum(rate(zion_acme_renewal_failures_total{instance=~\"$instance\"}[1h]))", "legendFormat": "failures/h", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ] },
+
+    { "id": 44, "type": "timeseries", "title": "Sovereign classifications rate", "description": "Requires --features geo-ita/geo-eu.", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [ { "refId": "A", "expr": "sum by (class) (rate(zion_sovereign_classifications_total{instance=~\"$instance\"}[5m]))", "legendFormat": "{{class}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] }
+  ]
+}

@@ -5,6 +5,14 @@ All notable changes to Zion Edge Gateway are documented here.
 ## [Unreleased]
 
 ### Added
+- **Grafana dashboard** (`deploy/grafana/zion-overview.json`): an importable
+  fleet overview built on the metrics Zion already exposes at `/metrics` — no
+  exporter, no sidecar. Golden signals, security (WAF/rate-limit/tarpit),
+  TLS/upstream, and a leak-watch row (RSS slope via `deriv` + open FDs per
+  instance) for spotting a silent memory/descriptor leak in a long-running
+  front door. `$instance` variable to focus one proxy or watch the whole fleet.
+
+### Added
 - **Equivalence harness for `zion import`** (`tests/equivalence/`): starts real
   nginx and real Zion side by side on the original and converted configs,
   replays a request corpus against both, and diffs the routing decision per
