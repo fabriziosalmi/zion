@@ -9,6 +9,7 @@ $ zion                          # run the gateway daemon (default)
 $ zion auto --upstream :3000    # one-shot dev mode — TLS in front of a backend, no files
 $ zion init                     # scaffold a zion.toml (interactive or flags)
 $ zion suggest                  # synthesize a validated zion.toml from a detected backend
+$ zion import nginx site.conf   # convert an nginx config to a validated zion.toml
 $ zion top                      # live TUI dashboard
 $ zion doctor                   # environment diagnostics
 $ zion bootstrap                # dump detected platform as JSON (CI / automation)
@@ -86,6 +87,43 @@ $ zion suggest > zion.toml
 
 If no backend is found and no `--upstream` is given, `suggest` exits non-zero with
 a hint rather than emitting a guess.
+
+## `zion import` — migrate an nginx config
+
+`import` converts the reverse-proxy subset of an nginx config into a
+`zion.toml`, with the same guarantee as `suggest`: **the output is
+self-validated (schema + reference integrity + router build) before it is
+emitted** — never a config the daemon would reject. `include` directives are
+resolved relative to the input file (`conf.d/*.conf` globs supported).
+
+The design principle is **honesty over completeness** (ADR-0011): every input
+directive lands in exactly one finding bucket, and anything Zion cannot
+express faithfully — regex locations, `proxy_pass` prefix rewriting, static
+file serving, per-location rate limits — becomes a loud finding plus an inline
+`# UNSUPPORTED:` annotation, never a silent guess. The converted config goes
+to stdout, the findings report to stderr, so piping stays clean.
+
+| Flag | Meaning |
+|---|---|
+| *(positional)* `nginx <path\|->` | source format and input (`-` = stdin) |
+| `-o, --output <path>` | write the converted config to a file instead of stdout |
+| `--report <path>` | write the full findings report (stderr shows only partial/unsupported) |
+| `--strict` | exit 2 if any partial/unsupported finding exists (CI gate) |
+
+```console
+$ zion import nginx /etc/nginx/sites-enabled/app.conf -o zion.toml
+  wrote zion.toml
+  zion import nginx: 14 findings — 6 convert, 2 partial, 4 auto, 2 unsupported
+   line  status       directive         detail
+      8  partial      server            1 plain-HTTP server(s) …
+     24  unsupported  proxy_set_header  Host $host — Zion re-derives Host from the upstream authority …
+```
+
+Findings statuses: `convert` (faithful), `partial` (converted with a stated
+semantic delta), `auto` (Zion does it built-in — e.g. `X-Forwarded-For`
+headers, the `:80`→HTTPS redirect), `unsupported` (needs a human decision).
+Exit codes: `0` converted, `1` fatal (unparseable input / nothing convertible),
+`2` strict-mode findings.
 
 ## `zion top` — live dashboard
 

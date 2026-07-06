@@ -693,32 +693,40 @@ fn bare_host_error(label: &str, original: &str, candidate: &str) -> Option<Strin
 }
 
 /// Validate config at startup — fail fast with actionable error messages.
+/// Semantic checks first ([`semantic_errors`]), then deploy-time facts
+/// ([`deploy_errors`]: referenced files must exist on disk).
 fn validate_config(config: &ZionConfig, path: &str) -> Result<(), String> {
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors = semantic_errors(config);
+    errors.extend(deploy_errors(config));
+    finish_validation(errors, path)
+}
 
-    // Server addresses must parse
-    if config
-        .server
-        .listen_http
-        .parse::<std::net::SocketAddr>()
-        .is_err()
-    {
-        errors.push(format!(
-            "server.listen_http '{}' is not a valid address",
-            config.server.listen_http
-        ));
+/// Semantic validation only — every check that can run on an in-memory
+/// `ZionConfig` without touching the filesystem: listen addresses,
+/// route→upstream/profile reference integrity, host bindings (ADR-0010),
+/// upstream URL schemes, `[admin]` invariants. `zion import` (ADR-0011) runs
+/// this on top of [`parse_schema`]: an imported config carries placeholder
+/// cert paths, so the deploy-time file checks cannot apply, but a dangling
+/// reference or a malformed host must still refuse to emit.
+pub fn validate_semantics(config: &ZionConfig, label: &str) -> Result<(), String> {
+    finish_validation(semantic_errors(config), label)
+}
+
+fn finish_validation(errors: Vec<String>, label: &str) -> Result<(), String> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "config validation failed ({}):\n  - {}",
+            label,
+            errors.join("\n  - ")
+        ))
     }
-    if config
-        .server
-        .listen_https
-        .parse::<std::net::SocketAddr>()
-        .is_err()
-    {
-        errors.push(format!(
-            "server.listen_https '{}' is not a valid address",
-            config.server.listen_https
-        ));
-    }
+}
+
+/// Deploy-time checks: files the config references must exist on disk.
+fn deploy_errors(config: &ZionConfig) -> Vec<String> {
+    let mut errors: Vec<String> = Vec::new();
 
     // TLS cert files must exist
     if !std::path::Path::new(&config.tls.cert_path).exists() {
@@ -748,6 +756,41 @@ fn validate_config(config: &ZionConfig, path: &str) -> Result<(), String> {
                 i, sni.key_path
             ));
         }
+    }
+
+    errors
+}
+
+/// Filesystem-free semantic checks; see [`validate_semantics`].
+fn semantic_errors(config: &ZionConfig) -> Vec<String> {
+    let mut errors: Vec<String> = Vec::new();
+
+    // Server addresses must parse
+    if config
+        .server
+        .listen_http
+        .parse::<std::net::SocketAddr>()
+        .is_err()
+    {
+        errors.push(format!(
+            "server.listen_http '{}' is not a valid address",
+            config.server.listen_http
+        ));
+    }
+    if config
+        .server
+        .listen_https
+        .parse::<std::net::SocketAddr>()
+        .is_err()
+    {
+        errors.push(format!(
+            "server.listen_https '{}' is not a valid address",
+            config.server.listen_https
+        ));
+    }
+
+    // SNI entries need a subject to match on (file existence is deploy-time)
+    for (i, sni) in config.tls.sni.iter().enumerate() {
         if sni.server_name.is_empty() {
             errors.push(format!("tls.sni[{i}] server_name is empty"));
         }
@@ -870,16 +913,7 @@ fn validate_config(config: &ZionConfig, path: &str) -> Result<(), String> {
         }
     }
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        let msg = format!(
-            "config validation failed ({}):\n  - {}",
-            path,
-            errors.join("\n  - ")
-        );
-        Err(msg)
-    }
+    errors
 }
 
 /// Resolve upstream name to URLs. Checks new `[upstream.X]` first, then legacy `[upstreams]`.
@@ -1051,6 +1085,15 @@ impl RouterBuilder {
 /// contains an invalid pattern. The caller (boot path or hot-reload) decides
 /// whether to abort or log-and-keep the previous snapshot.
 pub fn build_router(config: &ZionConfig) -> Result<HostRouter, String> {
+    let router = build_router_quiet(config)?;
+    print_routes_table(&config.route);
+    Ok(router)
+}
+
+/// [`build_router`] without the boot-banner routes table — for callers that
+/// build a router as a validation step, not to serve traffic (`zion import`'s
+/// self-validation gate, ADR-0011).
+pub fn build_router_quiet(config: &ZionConfig) -> Result<HostRouter, String> {
     let mut default = RouterBuilder::default();
     let mut by_host: HashMap<Box<str>, RouterBuilder> = HashMap::new();
 
@@ -1113,7 +1156,6 @@ pub fn build_router(config: &ZionConfig) -> Result<HostRouter, String> {
         .collect();
     wildcards.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
 
-    print_routes_table(&config.route);
     Ok(HostRouter {
         default: default.finish(),
         by_host,
@@ -1902,6 +1944,56 @@ enabledd = true
             err.contains("client_ca_path"),
             "auth=mtls without client_ca_path must be rejected, got: {err}"
         );
+    }
+
+    /// The `validate_semantics` / `validate_config` split (ADR-0011): the
+    /// semantic layer runs every filesystem-free check, while cert-file
+    /// existence stays a deploy-time concern. A config with placeholder cert
+    /// paths (what `zion import`/`zion suggest` emit) must pass semantics but
+    /// fail full validation on a machine where those files don't exist.
+    #[test]
+    fn validate_semantics_skips_files_keeps_references() {
+        let placeholder_certs = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+
+[tls]
+cert_path = "/etc/ssl/zion/definitely-not-here.crt"
+key_path = "/etc/ssl/zion/definitely-not-here.key"
+
+[upstreams]
+backend = "http://127.0.0.1:8000"
+
+[[route]]
+path = "/{*rest}"
+upstream = "backend"
+"#;
+        let cfg = parse_schema(placeholder_certs, "test").expect("schema-valid");
+        validate_semantics(&cfg, "test").expect("placeholder certs pass semantics");
+        let err = match validate_str(placeholder_certs, "test") {
+            Err(e) => e,
+            Ok(_) => panic!("full validation must fail on missing cert files"),
+        };
+        assert!(err.contains("does not exist"), "got: {err}");
+
+        // A dangling upstream reference is a SEMANTIC error — caught without
+        // touching the filesystem.
+        let dangling = placeholder_certs.replace("upstream = \"backend\"", "upstream = \"ghost\"");
+        let cfg = parse_schema(&dangling, "test").expect("schema-valid");
+        let err = match validate_semantics(&cfg, "test") {
+            Err(e) => e,
+            Ok(()) => panic!("dangling upstream must fail semantics"),
+        };
+        assert!(err.contains("unknown upstream 'ghost'"), "got: {err}");
+
+        // A malformed hosts entry too (ADR-0010 host rules live in semantics).
+        let bad_host = placeholder_certs.replace(
+            "upstream = \"backend\"",
+            "upstream = \"backend\"\nhosts = [\"https://nope.example.com\"]",
+        );
+        let cfg = parse_schema(&bad_host, "test").expect("schema-valid");
+        assert!(validate_semantics(&cfg, "test").is_err());
     }
 
     #[test]
