@@ -33,9 +33,16 @@ log on disk, off by default) are out of scope and tracked in their own issues.
 
 - **RSS:** least-squares slope over the post-warm-up window (the first `WARMUP`
   seconds are excluded — RSS legitimately ramps as caches and pools fill;
-  that's bounded, not a leak). FAIL only if the slope is **both** statistically
-  significant (`|m| > 3·SE`) **and** over budget (≥ `RSS_BUDGET_BPS` and a 24h
-  extrapolation ≥ `RSS_BUDGET_PCT`% of steady RSS). A noise-band trend passes.
+  that's bounded, not a leak). But a bounded ramp can still be *mid-climb* at
+  the window's end on a short gate, so the whole-window slope alone would flag
+  it. The discriminator: a bounded process **decelerates** toward a plateau,
+  a leak **sustains** its slope. So we also fit the **tail** (last 60% of
+  samples) and FAIL only if the tail slope is (1) statistically significant
+  (`> 3·SE`), (2) over budget (≥ `RSS_BUDGET_BPS` and a 24h extrapolation ≥
+  `RSS_BUDGET_PCT`% of steady RSS), **and** (3) still ~as steep as the overall
+  slope (`tail/overall ≥ 0.5` — i.e. not settling). A decelerating ramp or a
+  noise-band trend passes. The raw per-sample table is printed to the log so
+  the curve shape is auditable, not just the summary slope.
 - **fds:** bounded range and no decile-over-decile drift — a leaked socket
   shows as a clean upward staircase.
 - **reloads:** the config generation must have advanced under load (else the

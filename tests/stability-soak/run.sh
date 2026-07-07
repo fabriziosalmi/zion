@@ -220,7 +220,20 @@ gen1="$(val zion_config_generation)"; gen1="${gen1:-0}"
 # Copy samples out for CI artifact upload.
 cp "$WORK/samples.tsv" "$ROOT/soak-samples.tsv" 2>/dev/null || true
 
-# ── Analysis: least-squares RSS slope (post-warmup) + significance; fd bound. ──
+# ── Raw samples: printed so the curve shape is visible in the CI log even on a
+#    failure (the shape — ramp-then-plateau vs sustained climb — is what tells a
+#    bounded working-set from a real leak; don't make a reader guess from a slope). ──
+step "samples (t=s  rss=MiB  fd  gen)"
+awk 'NR==1{next}{printf "    %5ds  %8.1f  %4d  %d\n", $1, $2/1048576, $3, $4}' "$WORK/samples.tsv"
+
+# ── Analysis: RSS slope (post-warmup) with a ramp-vs-leak discriminator; fd bound. ──
+# A BOUNDED process (caches fill, the mimalloc working-set settles, ArcSwap
+# reload churn allocates+frees) RAMPS then PLATEAUS — its RSS slope DECELERATES.
+# A genuine leak keeps climbing at a SUSTAINED slope. Fitting only the whole
+# post-warmup window can't tell them apart (both show a positive slope), so we
+# also fit the TAIL (last 60%) and flag a leak only when the tail slope is
+# significant, over budget, AND still ~as steep as the overall slope
+# (tail/overall >= 0.5 — i.e. still climbing at the end, not settling).
 step "analysis"
 awk -v warmup="$WARMUP" -v budget_bps="$RSS_BUDGET_BPS" -v budget_pct="$RSS_BUDGET_PCT" \
     -v fd_margin="$FD_MARGIN" -v fd_drift="$FD_DRIFT" -v gen0="$gen0" -v gen1="$gen1" -v reloads="$RELOADS" '
@@ -229,41 +242,43 @@ NR==1 { next }                                   # header
     t=$1; rss=$2; fd=$3
     if (t < warmup) next                          # exclude the warm-up ramp
     n++; X[n]=t; Yr[n]=rss; Yf[n]=fd
-    Sx+=t; Sy+=rss; Sxx+=t*t; Sxy+=t*rss; Syy+=rss*rss
-    if (rss>rmax||rmax==0) rmax=rss
     if (fd>fmax||fmax==0) fmax=fd
     if (fmin==0||fd<fmin) fmin=fd
 }
 END {
     if (n < 8) { printf "  FAIL — only %d post-warmup samples (need >=8); soak too short\n", n; exit 1 }
-    # centered sums
-    Sxx_c=Sxx - Sx*Sx/n; Sxy_c=Sxy - Sx*Sy/n; Syy_c=Syy - Sy*Sy/n
-    m = Sxy_c/Sxx_c                               # bytes/sec
-    Se2 = Syy_c - m*Sxy_c                          # residual sum of squares
-    var_m = (Se2/(n-2))/Sxx_c; if (var_m<0) var_m=0
-    se_m = sqrt(var_m)
-    # median RSS via mid element (X already time-ordered; use Yr array)
-    # (approximate steady RSS with the mean; robust enough vs budget %)
-    med = Sy/n
-    growth24 = m*86400.0
-    pct = (med>0)? 100.0*growth24/med : 0
+    # overall least-squares slope over [1..n]
+    Sx=0;Sy=0;Sxx=0;Sxy=0;Syy=0
+    for(i=1;i<=n;i++){Sx+=X[i];Sy+=Yr[i];Sxx+=X[i]*X[i];Sxy+=X[i]*Yr[i];Syy+=Yr[i]*Yr[i]}
+    Sxxc=Sxx-Sx*Sx/n; Sxyc=Sxy-Sx*Sy/n; Syyc=Syy-Sy*Sy/n
+    m=Sxyc/Sxxc; Se2=Syyc-m*Sxyc; vm=(Se2/(n-2))/Sxxc; if(vm<0)vm=0; se_m=sqrt(vm)
+    med=Sy/n; pct=(med>0)?100.0*m*86400.0/med:0
+    # tail least-squares slope over [ts..n] = last 60% of post-warmup samples
+    ts=int(n*0.4)+1; if(ts<1)ts=1; nt=n-ts+1
+    Tx=0;Ty=0;Txx=0;Txy=0;Tyy=0
+    for(i=ts;i<=n;i++){Tx+=X[i];Ty+=Yr[i];Txx+=X[i]*X[i];Txy+=X[i]*Yr[i];Tyy+=Yr[i]*Yr[i]}
+    Txxc=Txx-Tx*Tx/nt; Txyc=Txy-Tx*Ty/nt; Tyyc=Tyy-Ty*Ty/nt
+    mt=Txyc/Txxc; TSe2=Tyyc-mt*Txyc; vmt=(nt>2)?(TSe2/(nt-2))/Txxc:0; if(vmt<0)vmt=0; se_mt=sqrt(vmt)
+    medt=Ty/nt; pctt=(medt>0)?100.0*mt*86400.0/medt:0
+    ratio=(m>0)?mt/m:0
     # fd stats: first-decile vs last-decile mean drift
     d=int(n/10); if (d<1) d=1
     for(i=1;i<=d;i++){ ff+=Yf[i] } ff/=d
     for(i=n-d+1;i<=n;i++){ fl+=Yf[i] } fl/=d
     fd_range = fmax - fmin; fd_dr = fl - ff
 
-    printf "  samples (post-warmup): %d over %ds\n", n, (X[n]-X[1])
-    printf "  RSS: mean %.1f MiB, slope %.1f B/s (SE %.1f, 3-sigma %.1f), 24h extrapolation %.2f MiB = %.2f%%\n", \
-        med/1048576.0, m, se_m, 3*se_m, growth24/1048576.0, pct
+    printf "  samples (post-warmup): %d over %ds (tail %d)\n", n, (X[n]-X[1]), nt
+    printf "  RSS: mean %.1f MiB | overall slope %.1f B/s (%.2f%%/24h) | tail slope %.1f B/s (3-sigma %.1f, %.2f%%/24h) | tail/overall %.2f\n", \
+        med/1048576.0, m, pct, mt, 3*se_mt, pctt, ratio
     printf "  fd : min %d, max %d, range %d, decile drift %.1f\n", fmin, fmax, fd_range, fd_dr
     printf "  reloads: generation %d -> %d (%d swaps under load)\n", gen0, gen1, gen1-gen0
 
     fail=0
-    significant = (m > 3*se_m)                     # slope clearly above noise (positive)
-    over_budget = (m >= budget_bps) && (pct >= budget_pct)
-    if (significant && over_budget) {
-        printf "  %sRSS LEAK: slope %.1f B/s is significant AND over budget (>= %d B/s and >= %d%%/24h)%s\n", "", m, budget_bps, budget_pct, ""
+    significant = (mt > 3*se_mt)                   # tail slope clearly above noise
+    over_budget = (mt >= budget_bps) && (pctt >= budget_pct)
+    sustained   = (ratio >= 0.5)                   # not decelerating toward a plateau
+    if (significant && over_budget && sustained) {
+        printf "  RSS LEAK: tail slope %.1f B/s is significant, over budget (>= %d B/s and >= %d%%/24h), and SUSTAINED (tail/overall %.2f >= 0.5 — still climbing at the end, not a bounded ramp)\n", mt, budget_bps, budget_pct, ratio
         fail=1
     }
     if (fd_range > fd_margin) { printf "  FD range %d exceeds margin %d (unbounded fd growth?)\n", fd_range, fd_margin; fail=1 }
@@ -276,7 +291,7 @@ rc=$?
 
 step "result"
 if [ "$rc" -eq 0 ]; then
-    echo "  ${G}${B}PASS${N} — RSS slope within budget and statistically flat; open fds bounded; leak surfaces stressed."
+    echo "  ${G}${B}PASS${N} — RSS bounded (tail slope within budget or decelerating to a plateau); open fds bounded; leak surfaces stressed."
 else
     echo "  ${R}${B}FAIL${N} — see the analysis above; samples at soak-samples.tsv"
 fi

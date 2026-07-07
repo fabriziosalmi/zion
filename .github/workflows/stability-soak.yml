@@ -73,8 +73,11 @@ jobs:
       - name: Soak (fast gate — gross-leak catch)
         env:
           NO_COLOR: "1"
-          DURATION: "120"
-          WARMUP: "20"
+          # Longer than a pure smoke so the mimalloc working-set + cache-fill
+          # ramp has room to plateau before the tail window — the tail-slope
+          # leak criterion needs the steady state to be inside the run.
+          DURATION: "180"
+          WARMUP: "45"
           WORKERS: "20"
           RELOADS: "40"
         run: ./tests/stability-soak/run.sh
