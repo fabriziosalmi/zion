@@ -20,7 +20,7 @@ Cross-references:
 * [Hardening guide](hardening.md) — runtime config knobs the operator
   flips for the deployment-side rows.
 * [Supply chain](supply-chain.md) — SLSA L3 provenance, cosign, SBOM.
-* [Architecture decisions](../adr/README.md) — load-bearing engineering
+* [Architecture decisions](../adr/) — load-bearing engineering
   choices, dated and indexed.
 
 ---

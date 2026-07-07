@@ -107,9 +107,13 @@ The early data flag is consumed via an `AtomicBool` on first request per connect
 
 TLS handshakes are limited to 10 seconds. Connections that do not complete the handshake within this window are dropped. Failed handshakes are counted in `zion_tls_handshake_errors`.
 
-## ACME Auto-Renewal
+## ACME auto-renewal
 
-> Requires build with `cargo build --release --features acme`
+> The full guide — first-boot issuance, the bootstrap cert, HTTP-01, renewal and
+> revocation — lives on the dedicated [Automatic HTTPS (ACME)](./acme) page. This
+> section is a quick reference for the `[tls.acme]` block.
+>
+> Requires build with `cargo build --release --features acme`.
 
 Zion can automatically obtain and renew TLS certificates from Let's Encrypt (or any ACME-compatible CA).
 

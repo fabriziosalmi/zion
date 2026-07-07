@@ -1,6 +1,11 @@
-# Observability
+# Metrics & health endpoints
 
-## Health Endpoints
+The operator-facing monitoring surface: health probes, the authoritative
+Prometheus metric reference, the scrape config, and the Grafana dashboard. For
+tracing, histogram exemplars, and the audit/mesh telemetry internals, see
+[Observability internals](../guide/observability).
+
+## Health endpoints
 
 Zion exposes built-in endpoints that bypass routing and upstream forwarding:
 

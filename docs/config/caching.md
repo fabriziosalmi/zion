@@ -112,13 +112,13 @@ $ curl -sX POST 'http://127.0.0.1/_zion/cache/purge?prefix=/static/app.js'
 
 | Behaviour | RFC | Status |
 |---|---|---|
-| `private` / `no-store` / `no-cache` response directives | 9111 §3.2, §5.2.2 | ✅ |
-| Authenticated-request storage opt-in | 9111 §3.5 | ✅ |
-| `Vary` matching (Accept-Encoding) | 9111 §4.1 | ✅ (Accept-Encoding; others → uncached) |
-| Origin-driven freshness (`max-age` / `s-maxage`) + `Age` | 9111 §4.2 | ✅ |
-| Request `Cache-Control` (no-cache/no-store/max-age=0/only-if-cached) | 9111 §5.2.1 | ✅ |
-| Client conditional → `304` (If-None-Match / If-Modified-Since) | 9110 §13 | ✅ |
-| Origin-side revalidation (stale → conditional GET) | 9111 §4.3 | ◷ roadmap |
+| `private` / `no-store` / `no-cache` response directives | 9111 §3.2, §5.2.2 | Yes |
+| Authenticated-request storage opt-in | 9111 §3.5 | Yes |
+| `Vary` matching (Accept-Encoding) | 9111 §4.1 | Yes (Accept-Encoding; others → uncached) |
+| Origin-driven freshness (`max-age` / `s-maxage`) + `Age` | 9111 §4.2 | Yes |
+| Request `Cache-Control` (no-cache/no-store/max-age=0/only-if-cached) | 9111 §5.2.1 | Yes |
+| Client conditional → `304` (If-None-Match / If-Modified-Since) | 9110 §13 | Yes |
+| Origin-side revalidation (stale → conditional GET) | 9111 §4.3 | Roadmap |
 
 See also [Hot-reload](/deploy/hot-reload) (cache survives config reloads) and the
 [two-level-cache ADR](/adr/0003-two-level-cache-with-generation).

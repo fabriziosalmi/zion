@@ -1,0 +1,21 @@
+# gitleaks configuration for Zion.
+#
+# Extends the upstream default ruleset and allowlists exactly one thing: the
+# benchmark self-signed TLS material. Those are throwaway `CN=bench.local` keys
+# generated on demand by `benchmarks/certs/generate.sh` (SAN bench.local /
+# localhost / 127.0.0.1) — never production secrets. One such key was committed
+# once (commit ad2c337, 2026-04-12) before `benchmarks/certs/*.key` was
+# gitignored; it is self-signed, superseded (a different key from the current
+# local one), and worthless to anyone, but it remains in git history, so we
+# allowlist the path to keep the full-history scan green rather than rewrite
+# history for a test key.
+title = "Zion"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Benchmark self-signed test certs (CN=bench.local) — not production secrets"
+paths = [
+  '''benchmarks/certs/.*''',
+]
