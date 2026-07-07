@@ -2,7 +2,7 @@
 
 Zion routes requests using a radix tree (via the [`matchit`](https://crates.io/crates/matchit) crate -- the same engine used by Axum). Route lookup is ~15ns regardless of route count.
 
-## Route Patterns
+## Route patterns
 
 Routes are defined as `[[route]]` entries in `zion.toml`. Order does not matter -- the radix tree handles priority automatically.
 
@@ -27,7 +27,7 @@ path = "/{*rest}"
 upstream = "frontend"
 ```
 
-### Path Syntax
+### Path syntax
 
 | Pattern | Matches | Example |
 |---|---|---|
@@ -37,7 +37,7 @@ upstream = "frontend"
 
 More specific routes take priority over wildcards. `/api/v1/events/stream` matches before `/api/{*rest}`.
 
-## Host-Based Routing (Virtual Hosting)
+## Host-based routing (virtual hosting)
 
 Bind a route to one or more `hosts` to serve different backends for different domains on the same listener — the `Host` header (HTTP/1) or `:authority` (HTTP/2) selects the route. A route **without** `hosts` is *shared*: it matches every host and acts as a fallback.
 
@@ -63,7 +63,7 @@ internal_only = true
 
 The same path now serves different backends per host — `api.example.com/` and `app.example.com/` route independently, which a path-only router cannot express.
 
-### Matching Precedence
+### Matching precedence
 
 For a request authority, Zion resolves in this order:
 
@@ -73,7 +73,7 @@ For a request authority, Zion resolves in this order:
 
 An exact host beats a wildcard, and a matched host never falls through to *another* host's routes — only to the shared layer.
 
-### Host Normalization
+### Host normalization
 
 Authorities are normalized before matching: lowercased, port stripped (`api.example.com:8443` → `api.example.com`), and a trailing FQDN dot removed. Config `hosts` entries must be canonical bare hostnames — no scheme, path, port, or trailing dot (uppercase is folded). Only leading-label wildcards (`*.example.com`) are supported.
 
@@ -85,7 +85,7 @@ Authorities are normalized before matching: lowercased, port stripped (`api.exam
 
 Host routing is **opt-in and zero-cost when unused**: with no `hosts` anywhere, lookups skip authority extraction and behave exactly as the path-only router. When active, a lookup adds one hash-map probe plus authority normalization, and the thread-local route cache is keyed on `(host, path)` so different domains never share a cache slot.
 
-## Route Modes
+## Route modes
 
 | Mode | Behavior |
 |---|---|
@@ -94,7 +94,7 @@ Host routing is **opt-in and zero-cost when unused**: with no `hosts` anywhere, 
 | `static_cache` | Serves from in-memory cache on hit; fetches and caches on miss |
 | `websocket` | Explicit WebSocket mode (also auto-detected via `Upgrade: websocket` header on any route) |
 
-## Upstream Resolution
+## Upstream resolution
 
 Routes reference upstreams by name. Two formats are supported:
 
@@ -114,7 +114,7 @@ If both formats define the same name, the `[upstream.<name>]` format takes prece
 
 At startup, all upstream URLs are pre-parsed into `Scheme` + `Authority`. No URI parsing occurs on the hot path.
 
-## Internal-Only Routes
+## Internal-only routes
 
 ```toml
 [[route]]
@@ -130,7 +130,7 @@ When `internal_only = true`, requests from non-private IPs receive `403 Forbidde
 - `169.254.0.0/16` (link-local)
 - `::1` (IPv6 loopback)
 
-## Content-Security-Policy (Per-Route)
+## Content-Security-Policy (per-route)
 
 You can set a per-route `Content-Security-Policy` header:
 
@@ -153,13 +153,13 @@ upstream = "frontend"
 
 The CSP string is **pre-parsed** into a `HeaderValue` at startup — zero cost on the hot path (just a header clone).
 
-### When to Use
+### When to use
 
 - **Admin panels / internal tools**: Lock down with a strict CSP (`default-src 'self'`)
 - **SPA frontends**: Leave unset and let the frontend's own CSP pass through
 - **APIs**: Usually not needed (no HTML rendering)
 
-## Startup Validation
+## Startup validation
 
 Zion validates all routes at boot:
 

@@ -45,7 +45,7 @@ features:
 
 <div class="benchmark-highlight">
 
-## Performance at a Glance
+## Performance at a glance
 
 <div class="stat-grid">
   <div class="stat-card">
@@ -85,7 +85,7 @@ Native benchmark on Apple M4, 5 runs x 10s, c=100. Rust backend. Tracked per-com
 | HTTP/3 QUIC | Patch | No | Yes | Yes | Yes | No | **Feature-gated** |
 | JWT/OIDC auth | No | No | Yes | Yes | Yes | No | **Feature-gated** |
 
-## Quick Start
+## Quick start
 
 ```bash
 cargo build --release

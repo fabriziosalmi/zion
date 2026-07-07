@@ -31,7 +31,7 @@ wire-up over a few release cycles — see [Future expansion](#future-expansion).
 
 ## How the build works
 
-```
+```text
             ┌────────────────────────────────────────────────────────┐
             │ Phase 1: instrumented build                            │
             │   RUSTFLAGS="-Cprofile-generate=$PGO_DIR"              │

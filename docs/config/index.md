@@ -90,7 +90,7 @@ top-level `[cors]` section — see [CORS](./cors). Keys:
 | `allowed_headers` | string[] | `["Content-Type", "Authorization", "X-Requested-With"]` | Additional allowed headers |
 | `max_age` | u64 | `86400` | Pre-flight cache duration in seconds |
 
-## Environment Variables
+## Environment variables
 
 | Variable | Description |
 |---|---|

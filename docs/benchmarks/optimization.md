@@ -1,4 +1,4 @@
-# Optimization Log
+# Optimization log
 
 Changes made to improve throughput and latency, with rationale. Throughput claims reference the [`benchmarks/baseline/`](https://github.com/fabriziosalmi/zion/tree/master/benchmarks/baseline) harness.
 
@@ -12,14 +12,14 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | Connection pool pre-warming | Fires GET to all upstreams before accept loop starts |
 | Thread-local route lookup cache | FNV hash of path maps to cached `Arc<ResolvedRoute>` (~5ns vs ~30ns radix tree) |
 
-## Compiler / Build
+## Compiler / build
 
 | Change | Rationale |
 |---|---|
 | `target-cpu=native` (.cargo/config.toml) | Unlocks NEON/AES-CE on Apple Silicon, AVX2/AES-NI on x86_64 |
 | PGO build script (`bench-pgo.sh`) | Two-phase profile-guided optimization for 10-20% additional throughput |
 
-## Hot Path Allocation Elimination
+## Hot path allocation elimination
 
 | Change | Rationale |
 |---|---|
@@ -28,7 +28,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | WAF content-type: borrow from `parts.headers` | Eliminates `to_owned()` clone on POST/PUT/PATCH |
 | Cache key: `Arc::from()` direct | Skips intermediate `String` allocation on cache miss |
 
-## Lock / Contention Reduction
+## Lock / contention reduction
 
 | Change | Rationale |
 |---|---|
@@ -37,7 +37,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | Histogram: non-cumulative differential buckets | 3 atomic ops per observation instead of 17; prefix sums at render time |
 | HTTP builder: `Arc<AutoBuilder>` | Per-connection clone is ref-count bump, not deep copy |
 
-## Data Structures
+## Data structures
 
 | Change | Rationale |
 |---|---|
@@ -46,7 +46,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | Host validation: single-pass byte scan | Replaces 8 separate `contains()` calls |
 | CORS origin: FNV hash set | O(1) lookup replaces `Vec` linear scan; case-insensitive via pre-lowercased storage |
 
-## WAF Pipeline
+## WAF pipeline
 
 | Change | Rationale |
 |---|---|
@@ -140,7 +140,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | Thread-local route LRU | FNV hash of path; O(1) get/insert/evict via intrusive doubly-linked list (capacity 256 per worker). Replaces a previous "first 256 then no more inserts" map that could be locked out by a flood of distinct paths. |
 | Connection pool pre-warming | Fires GET to all upstreams at startup |
 
-## Hyper Tuning
+## Hyper tuning
 
 | Change | Rationale |
 |---|---|

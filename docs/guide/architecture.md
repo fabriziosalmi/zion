@@ -3,9 +3,9 @@
 Zion is a single async Rust binary built on Tokio, Hyper, and rustls. <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
 ~15,900 lines across 21 source files.
 
-## Module Map
+## Module map
 
-```
+```text
 src/
 ├── main.rs        # Entrypoint, HTTPS/HTTP listeners, connection handling, mTLS fingerprint extraction
 ├── dispatch.rs    # Request pipeline: routing (LRU + radix), WAF gates, cache, CORS, metrics; thread-local route LRU lives here
@@ -30,9 +30,9 @@ src/
 └── logging.rs     # Structured logging (text/JSON)
 ```
 
-## Request Lifecycle
+## Request lifecycle
 
-```
+```text
 Client
   │
   ├─ HTTP :80 ──────► ACME challenge proxy OR 301 → HTTPS
@@ -128,7 +128,7 @@ Client
   Client
 ```
 
-## Design Decisions
+## Design decisions
 
 | Decision | Rationale |
 |---|---|
@@ -151,11 +151,11 @@ Client
 | `SO_BUSY_POLL` (Linux) | Spin-poll NIC queue 50us for lower p99 latency |
 | Semaphore for connection limit | Bound from detected RAM: `(RAM_MB / 4) * 1024 / 50`, clamped 1k-100k |
 
-## Concurrency Model
+## Concurrency model
 
 Zion uses Tokio's multi-threaded runtime. Worker count is set to available CPU cores (N-1 on machines with >4 cores), pinned to physical cores via `core_affinity`. Each accepted connection is a spawned task. Total concurrent connections are bounded by a Tokio semaphore.
 
-## Optional Features
+## Optional features
 
 | Feature | Flag | Description |
 |---------|------|-------------|

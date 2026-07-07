@@ -2,7 +2,7 @@
 
 The WAF is configured per-route via named profiles. Each profile controls the **detection mode** (which Aho-Corasick pattern set is scanned), the **entropy gate** (threshold + kill-switch), and the body inspection limits (size, JSON depth, string length, content-type allow-list).
 
-## Defining Profiles
+## Defining profiles
 
 ```toml
 [waf_profile.strict]
@@ -29,7 +29,7 @@ allowed_content_types = ["multipart/form-data", "application/octet-stream"]
 entropy_check = false        # binary uploads are high-entropy by nature
 ```
 
-## Assigning Profiles to Routes
+## Assigning profiles to routes
 
 ```toml
 [[route]]
@@ -43,7 +43,7 @@ upstream = "api"
 waf_profile = "upload"
 ```
 
-## Profile Parameters
+## Profile parameters
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -56,7 +56,7 @@ waf_profile = "upload"
 | `entropy_check` | bool | `true` | Enable Gate 4 (Shannon entropy). Disable on routes that legitimately accept high-entropy bodies (binary uploads, encrypted blobs). |
 | `entropy_threshold` | f64 | `6.5` | Bits/byte. Bodies above this are denied. Default sits above pure base64 (theoretical max 6.0); random/encrypted blobs land at 7.5–8.0. |
 
-## Detection Modes
+## Detection modes
 
 `mode` selects which pattern set Gate 3 scans. Both modes share the same fail-fast pipeline; only the Aho-Corasick automaton differs.
 
@@ -67,7 +67,7 @@ waf_profile = "upload"
 
 The two automata are built lazily (on first hit per process) and cached; switching profiles costs nothing at request time. A request denied by an aggressive-only pattern returns the same `400` body and `waf_denied` metric as a balanced denial — there is no separate counter.
 
-## Content-Type Enforcement
+## Content-Type enforcement
 
 When `deny_unknown_content_types = true` (default):
 
@@ -78,7 +78,7 @@ When `deny_unknown_content_types = true` (default):
 
 When set to `false`, requests with unlisted content types pass through without body inspection.
 
-## Legacy Configuration
+## Legacy configuration
 
 The older inline syntax is still supported:
 
@@ -92,7 +92,7 @@ max_body_mb = 10
 
 This creates an implicit profile with default values and the specified `max_body_mb`. Named profiles are recommended for new configurations.
 
-## WAF Behavior by HTTP Method
+## WAF behavior by HTTP method
 
 | Method | Body inspected | Gates applied |
 |---|---|---|
@@ -102,7 +102,7 @@ This creates an implicit profile with default values and the specified `max_body
 
 Empty bodies on POST/PUT/PATCH are allowed without inspection.
 
-## Tuning Guidelines
+## Tuning guidelines
 
 | Use case | `mode` | `max_body_mb` | `max_depth` | `entropy_check` | `deny_unknown_content_types` |
 |---|---|---|---|---|---|
@@ -114,11 +114,11 @@ Empty bodies on POST/PUT/PATCH are allowed without inspection.
 
 See [WAF Pipeline](/security/) for the full per-gate description and the source-of-truth pattern listing.
 
-## WAF Pipeline (5-Gate Architecture)
+## WAF pipeline (5-Gate architecture)
 
 Every request with a body passes through a **5-gate pipeline** in strict order. Each gate is O(N) or O(1). The pipeline **fail-fasts** — the first gate that triggers a violation returns `400 Bad Request` (or `413 Payload Too Large` for Gate 1) without executing subsequent gates.
 
-```
+```text
 Request → Gate 1 → Gate 2 → Gate 3 → Gate 4 → Gate 5 → Allow
               │         │         │         │         │
             Size    Content-  Injection  Entropy    JSON
@@ -135,7 +135,7 @@ Request → Gate 1 → Gate 2 → Gate 3 → Gate 4 → Gate 5 → Allow
 
 GET, HEAD, OPTIONS requests skip Gates 2–5 (no body to inspect). DELETE bodies are inspected (RFC 9110 allows them and some APIs use them).
 
-## Built-in Injection Patterns
+## Built-in injection patterns
 
 Gate 3 uses an [Aho-Corasick](https://en.wikipedia.org/wiki/Aho%E2%80%93Corasick_algorithm) automaton — a single O(N) pass over the body that scans all patterns simultaneously. No regex, no backtracking, no ReDoS risk.
 
@@ -175,11 +175,11 @@ Before declaring a body clean, Gate 3 runs the scanner over a **normalised** cop
 
 Earlier docs claimed Zion "rejects requests on detection of double encoding." That has never been the behaviour and would have been wrong: legitimate URLs can contain double-encoded characters (e.g., search queries about URL encoding itself). What Zion actually does is *re-scan after each decode pass*.
 
-## Extending the Pattern Set
+## Extending the pattern set
 
 Patterns are compiled into the binary at build time via two `OnceLock<AhoCorasick>` automata (one per mode), built lazily on first hit. To add custom patterns:
 
-### Step 1: Edit `src/waf.rs`
+### Step 1: edit `src/waf.rs`
 
 The two constants live near the top of the file:
 
@@ -204,13 +204,13 @@ const AGGRESSIVE_EXTRA_PATTERNS: &[&str] = &[
 
 The runtime entry point is `scanner_for(mode)` (replaced the older `get_scanner()` helper); both automata are accessed through it.
 
-### Step 2: Rebuild
+### Step 2: rebuild
 
 ```bash
 cargo build --release
 ```
 
-### Guidelines for Custom Patterns
+### Guidelines for custom patterns
 
 | Do | Don't |
 |---|---|
@@ -218,6 +218,6 @@ cargo build --release
 | Use lowercase (matching is ASCII case-insensitive) | Use regex syntax — not supported |
 | Test with `cargo test --release --bin zion` after adding | Match legitimate API payloads (run your real corpus through the scanner before committing) |
 
-### Performance Impact
+### Performance impact
 
 The Aho-Corasick automaton scans all patterns in a single pass regardless of count. Adding 10 or 100 patterns adds no per-request CPU cost — the automaton state machine grows in memory (≈50 bytes per pattern) but scan throughput stays O(N) in body length.

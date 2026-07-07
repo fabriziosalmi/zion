@@ -34,7 +34,7 @@ defined in [0000-template.md](0000-template.md).
 When in doubt, write one. The cost of a stale ADR is "delete it";
 the cost of a missing ADR is a multi-week archaeology trip.
 
-## When NOT to write an ADR
+## When not to write an ADR
 
 - Pure refactors with no observable contract change.
 - Bug fixes.

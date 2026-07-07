@@ -1,4 +1,4 @@
-# Threat Model — STRIDE
+# Threat model — STRIDE
 
 This document maps each major external surface of Zion to the six STRIDE
 categories — **S**poofing, **T**ampering, **R**epudiation, **I**nformation
