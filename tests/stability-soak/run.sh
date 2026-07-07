@@ -133,7 +133,14 @@ step "starting bench backend + zion (soak: ${DURATION}s, warmup ${WARMUP}s, $WOR
 ZION_CONFIG="$WORK/zion.toml" "$ZION_BIN" > "$WORK/zion.log" 2>&1 & echo $! > "$WORK/zion.pid"; disown
 
 metrics="https://127.0.0.1:$HTTPS_PORT/metrics"
-val() { curl -sk -m 3 "$metrics" 2>/dev/null | awk -v k="$1" '$1==k{print $2; exit}'; }
+# Trailing `|| true` is load-bearing: under `set -euo pipefail`, a transient
+# curl failure (a reload in flight, or a reset from the g3 bad-TLS churn) makes
+# this pipeline exit non-zero, and an assignment like `rss="$(val ...)"` in the
+# sampler would then propagate that status and trip `set -e` — killing the MAIN
+# shell mid-run, which fires the EXIT trap → cleanup() → `rm -rf $WORK`, and the
+# still-running g6 generator dies with "zion.toml: No such file". Swallow it so
+# `val` always succeeds and returns "" on failure (callers default with :-0).
+val() { curl -sk -m 3 "$metrics" 2>/dev/null | awk -v k="$1" '$1==k{print $2; exit}' || true; }
 for i in $(seq 1 30); do
     [ "$(curl -sk -o /dev/null -w '%{http_code}' -m 2 "https://127.0.0.1:$HTTPS_PORT/api/v1/data" 2>/dev/null || echo 000)" = 200 ] && break
     [ "$i" = 30 ] && { echo "::error::zion not ready"; tail -20 "$WORK/zion.log" >&2; exit 1; }
