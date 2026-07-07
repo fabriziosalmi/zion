@@ -1012,6 +1012,31 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "init")]
+    fn bootstrap_cert_is_short_lived() {
+        // The linchpin of Caddy-style auto-HTTPS: the ACME bootstrap cert MUST
+        // be short-lived (~1 day) so the boot-time expiry check trips first-boot
+        // issuance. rcgen's default not_after is year 4096 — that would bind
+        // :443 but SILENTLY never provision a real cert. Guard the 1-day window
+        // against a regression, using the SAME parser (`cert_expiry_secs`) the
+        // renewal task consults, so this also proves the cert trips issuance.
+        let (cert_pem, _key) =
+            generate_short_lived_cert(&["app.example.com".to_string()]).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("zion-bootstrap-{}.crt", std::process::id()));
+        std::fs::write(&path, cert_pem).unwrap();
+        let secs = crate::tls::cert_expiry_secs(path.to_str().unwrap())
+            .expect("bootstrap cert must parse");
+        let _ = std::fs::remove_file(&path);
+        assert!(secs > 0, "bootstrap cert already expired: {secs}s");
+        assert!(
+            secs < 2 * 86400,
+            "bootstrap cert not short-lived ({secs}s ~ {} days) — first-boot ACME issuance won't fire",
+            secs / 86400
+        );
+    }
+
+    #[test]
     fn acme_off_for_localhost_and_no_email() {
         // localhost never gets ACME even with an email present.
         let opts = InitOpts {

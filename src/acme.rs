@@ -668,6 +668,44 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "acme")]
+    fn expiry_check_fires_for_short_lived_cert_not_long() {
+        // Boot-time linchpin of auto-HTTPS: a near-expiry cert (the 1-day ACME
+        // bootstrap cert `zion init` stamps) must read as "renewal needed" so
+        // first-boot issuance fires; a long-lived cert must not. Same threshold
+        // the background renewal task runs.
+        let mk = |days: i64| -> String {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut p = rcgen::CertificateParams::new(vec!["t.example.com".to_string()]).unwrap();
+            let now = time::OffsetDateTime::now_utc();
+            p.not_before = now - time::Duration::hours(1);
+            p.not_after = now + time::Duration::days(days);
+            p.self_signed(&key).unwrap().pem()
+        };
+        let dir = std::env::temp_dir();
+        let short = dir.join(format!("zion-acme-short-{}.crt", std::process::id()));
+        let long = dir.join(format!("zion-acme-long-{}.crt", std::process::id()));
+        std::fs::write(&short, mk(1)).unwrap();
+        std::fs::write(&long, mk(365)).unwrap();
+
+        assert!(
+            check_cert_expiry(short.to_str().unwrap(), 30),
+            "1-day bootstrap cert must read as renewal-needed (fires first-boot ACME)"
+        );
+        assert!(
+            !check_cert_expiry(long.to_str().unwrap(), 30),
+            "365-day cert must not trigger renewal"
+        );
+        assert!(
+            check_cert_expiry("/nonexistent/zion-no-such.crt", 30),
+            "an unreadable cert must renew to be safe"
+        );
+
+        let _ = std::fs::remove_file(&short);
+        let _ = std::fs::remove_file(&long);
+    }
+
+    #[test]
     fn challenge_empty_store_returns_none() {
         let store = new_challenge_store();
         assert_eq!(
