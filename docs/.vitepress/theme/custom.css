@@ -1,321 +1,282 @@
-/* Zion Docs — Apple-native design system
- *
- * Design principles:
- * - SF Pro-inspired typography (system font stack)
- * - Generous whitespace, clean hierarchy
- * - Subtle gradients, no harsh borders
- * - Muted color palette with vibrant accents
- * - Smooth transitions everywhere
- */
+/* ═══════════════════════════════════════════════════════════════════════
+   Zion Docs — "Datasheet" design system.
 
-/* ── Typography: system font stack (SF Pro on macOS, Segoe on Windows) ── */
+   A precision instrument, documented like one. Near-monochrome with gold as
+   rare, functional punctuation; a transitional serif for headings (authority,
+   not decoration), a system sans for reading, JetBrains Mono for data & code.
+   Left-aligned, hairline-ruled, disciplined. No glow, no gradient text.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── Fonts ─────────────────────────────────────────────────────────── */
 :root {
-  --vp-font-family-base: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI',
-    Roboto, 'Helvetica Neue', Arial, sans-serif;
-  --vp-font-family-mono: 'SF Mono', 'Fira Code', 'JetBrains Mono', 'Cascadia Code',
-    Menlo, Monaco, Consolas, monospace;
-
-  /* Color palette — Apple-inspired blues */
-  --vp-c-brand-1: #0071e3;
-  --vp-c-brand-2: #0077ed;
-  --vp-c-brand-3: #006edb;
-  --vp-c-brand-soft: rgba(0, 113, 227, 0.12);
-
-  /* Backgrounds */
-  --vp-c-bg: #fbfbfd;
-  --vp-c-bg-alt: #f5f5f7;
-  --vp-c-bg-soft: #f5f5f7;
-  --vp-c-bg-elv: #ffffff;
-
-  /* Text */
-  --vp-c-text-1: #1d1d1f;
-  --vp-c-text-2: #6e6e73;
-  --vp-c-text-3: #86868b;
-
-  /* Borders — subtle */
-  --vp-c-border: rgba(0, 0, 0, 0.06);
-  --vp-c-divider: rgba(0, 0, 0, 0.06);
-  --vp-c-gutter: rgba(0, 0, 0, 0.04);
-
-  /* Layout */
-  --vp-nav-height: 64px;
-  --vp-sidebar-width: 272px;
-
-  /* Shadows */
-  --apple-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.06);
-  --apple-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08), 0 2px 4px rgba(0, 0, 0, 0.04);
-  --apple-shadow-lg: 0 8px 30px rgba(0, 0, 0, 0.08), 0 4px 8px rgba(0, 0, 0, 0.04);
+  --font-serif: 'Source Serif 4 Variable', 'Charter', 'Iowan Old Style', Palatino, Georgia, serif;
+  --vp-font-family-base: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --vp-font-family-mono: 'JetBrains Mono Variable', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
 }
 
-/* Dark mode */
+/* ── Palette — light (default) ─────────────────────────────────────── */
+:root {
+  --vp-c-bg:      #f7f6f1;   /* warm paper, not pure white */
+  --vp-c-bg-alt:  #f1f0ea;   /* nav / sidebar / footer */
+  --vp-c-bg-soft: #efeee7;
+  --vp-c-bg-elv:  #ffffff;
+
+  --vp-c-text-1:  #1a1a12;   /* ink, warm */
+  --vp-c-text-2:  #5f5f56;
+  --vp-c-text-3:  #8b8b81;
+
+  --vp-c-brand-1: #93700a;   /* gold, darkened for contrast on paper */
+  --vp-c-brand-2: #7a5c05;
+  --vp-c-brand-3: #93700a;
+  --vp-c-brand-soft: rgba(147,112,10,.10);
+
+  --vp-c-border:  rgba(26,26,18,.16);
+  --vp-c-divider: rgba(26,26,18,.10);
+  --vp-c-gutter:  rgba(26,26,18,.06);
+
+  --zn-hair:  rgba(26,26,18,.075);
+  --zn-panel: #ffffff;
+  --zn-gold:  #93700a;
+  --zn-good:  #2f8a45;
+
+  --vp-nav-height: 56px;
+  --vp-sidebar-width: 256px;
+  --vp-layout-max-width: 1152px;
+}
+
+/* ── Palette — dark ────────────────────────────────────────────────── */
 .dark {
-  --vp-c-bg: #000000;
-  --vp-c-bg-alt: #161617;
-  --vp-c-bg-soft: #1c1c1e;
-  --vp-c-bg-elv: #1c1c1e;
-  --vp-c-text-1: #f5f5f7;
-  --vp-c-text-2: #a1a1a6;
-  --vp-c-text-3: #6e6e73;
-  --vp-c-border: rgba(255, 255, 255, 0.08);
-  --vp-c-divider: rgba(255, 255, 255, 0.06);
-  --vp-c-brand-soft: rgba(0, 113, 227, 0.16);
-  --apple-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
-  --apple-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
-  --apple-shadow-lg: 0 8px 30px rgba(0, 0, 0, 0.5);
+  --vp-c-bg:      #0b0b0d;   /* near-black ground, from the logo */
+  --vp-c-bg-alt:  #0f0f12;
+  --vp-c-bg-soft: #131317;
+  --vp-c-bg-elv:  #131317;
+
+  --vp-c-text-1:  #eae9e3;   /* warm off-white */
+  --vp-c-text-2:  #93938a;
+  --vp-c-text-3:  #5c5c54;
+
+  --vp-c-brand-1: #d7a326;   /* refined brass gold */
+  --vp-c-brand-2: #e8b846;
+  --vp-c-brand-3: #d7a326;
+  --vp-c-brand-soft: rgba(215,163,38,.13);
+
+  --vp-c-border:  rgba(234,233,227,.14);
+  --vp-c-divider: rgba(234,233,227,.10);
+  --vp-c-gutter:  rgba(234,233,227,.06);
+
+  --zn-hair:  rgba(234,233,227,.07);
+  --zn-panel: #131317;
+  --zn-gold:  #d7a326;
+  --zn-good:  #6bbf7b;
 }
 
-/* ── Global ── */
+/* ── Base ──────────────────────────────────────────────────────────── */
+html { font-size: 16px; }
 body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  text-rendering: optimizeLegibility;
+  font-feature-settings: "kern" 1;
+  letter-spacing: -0.003em;
 }
+.tnum, .vp-doc table td:first-child { font-variant-numeric: tabular-nums; }
 
-/* ── Navigation — frosted glass ── */
-.VPNav {
-  backdrop-filter: saturate(180%) blur(20px) !important;
-  -webkit-backdrop-filter: saturate(180%) blur(20px) !important;
-  background: rgba(251, 251, 253, 0.72) !important;
-  border-bottom: 0.5px solid rgba(0, 0, 0, 0.08) !important;
+/* ── Nav bar — hairline, quiet ─────────────────────────────────────── */
+.VPNavBar {
+  border-bottom: 1px solid var(--vp-c-border) !important;
 }
-
-.dark .VPNav {
-  background: rgba(0, 0, 0, 0.72) !important;
-  border-bottom: 0.5px solid rgba(255, 255, 255, 0.08) !important;
+.VPNavBar.has-sidebar .content { border-left: 0; }
+.VPNavBar .title {
+  font-family: var(--vp-font-family-mono) !important;
+  font-weight: 600 !important;
+  font-size: 15px !important;
+  letter-spacing: 0.01em !important;
 }
-
-/* ── Hero section — Apple keynote style ── */
-.VPHero .name {
-  background: linear-gradient(135deg, #1d1d1f 0%, #0071e3 100%) !important;
-  -webkit-background-clip: text !important;
-  background-clip: text !important;
-  -webkit-text-fill-color: transparent !important;
-  font-weight: 700 !important;
-  letter-spacing: -0.03em !important;
+.VPNavBarMenuLink, .VPNavBarMenuGroup .text, .VPFlyout .text {
+  font-family: var(--vp-font-family-mono) !important;
+  font-size: 13px !important;
+  letter-spacing: 0.01em !important;
 }
+.VPNavBar .VPImage.logo { color: var(--zn-gold); }
 
-.dark .VPHero .name {
-  background: linear-gradient(135deg, #f5f5f7 0%, #2997ff 100%) !important;
-  -webkit-background-clip: text !important;
-  background-clip: text !important;
+/* ── Sidebar — mono labels, gold active bar ────────────────────────── */
+.VPSidebar { padding-top: 24px; }
+.VPSidebarItem.level-0 > .item > .text,
+.VPSidebarItem.level-0 > .item .VPSidebarItem-collapse .text {
+  font-family: var(--vp-font-family-mono) !important;
+  font-size: 11px !important;
+  letter-spacing: 0.16em !important;
+  text-transform: uppercase !important;
+  color: var(--vp-c-text-3) !important;
+  font-weight: 500 !important;
 }
-
-.VPHero .text {
-  font-weight: 700 !important;
-  letter-spacing: -0.02em !important;
-  color: var(--vp-c-text-1) !important;
-}
-
-.VPHero .tagline {
-  font-size: 1.15rem !important;
-  line-height: 1.6 !important;
-  color: var(--vp-c-text-2) !important;
-  max-width: 520px !important;
+.VPSidebarItem.level-1 .text,
+.VPSidebarItem.level-2 .text {
+  font-size: 13.5px !important;
   font-weight: 400 !important;
 }
-
-/* ── Hero actions — pill buttons ── */
-.VPHero .actions .VPButton {
-  border-radius: 980px !important;
-  padding: 0.6rem 1.5rem !important;
-  font-weight: 500 !important;
-  font-size: 0.95rem !important;
-  letter-spacing: -0.01em !important;
-  transition: all 0.3s cubic-bezier(0.25, 0.1, 0.25, 1) !important;
-}
-
-.VPHero .actions .VPButton.brand {
-  background: var(--vp-c-brand-1) !important;
-  border-color: transparent !important;
-  box-shadow: 0 2px 8px rgba(0, 113, 227, 0.3) !important;
-}
-
-.VPHero .actions .VPButton.brand:hover {
-  background: var(--vp-c-brand-2) !important;
-  box-shadow: 0 4px 16px rgba(0, 113, 227, 0.4) !important;
-  transform: translateY(-1px) !important;
-}
-
-.VPHero .actions .VPButton.alt {
-  border-radius: 980px !important;
-  background: transparent !important;
-  border: 1.5px solid var(--vp-c-border) !important;
-  color: var(--vp-c-brand-1) !important;
-}
-
-.VPHero .actions .VPButton.alt:hover {
-  background: var(--vp-c-brand-soft) !important;
-  border-color: var(--vp-c-brand-1) !important;
-}
-
-/* ── Feature cards — glass morphism ── */
-.VPFeatures .VPFeature {
-  border-radius: 20px !important;
-  border: 1px solid var(--vp-c-border) !important;
-  background: var(--vp-c-bg-elv) !important;
-  box-shadow: var(--apple-shadow-sm) !important;
-  transition: all 0.3s cubic-bezier(0.25, 0.1, 0.25, 1) !important;
-  padding: 28px !important;
-}
-
-.VPFeatures .VPFeature:hover {
-  box-shadow: var(--apple-shadow-md) !important;
-  transform: translateY(-2px) !important;
-  border-color: var(--vp-c-brand-soft) !important;
-}
-
-.VPFeatures .VPFeature .title {
-  font-weight: 600 !important;
-  font-size: 1.05rem !important;
-  letter-spacing: -0.01em !important;
+.VPSidebarItem.is-active > .item .link .text {
   color: var(--vp-c-text-1) !important;
+  font-weight: 500 !important;
+}
+.VPSidebarItem.level-1.is-active > .item,
+.VPSidebarItem.level-2.is-active > .item {
+  position: relative;
+}
+.VPSidebarItem.is-active > .item .indicator {
+  background-color: var(--zn-gold) !important;
+  width: 3px !important;
 }
 
-.VPFeatures .VPFeature .details {
-  font-size: 0.88rem !important;
-  line-height: 1.6 !important;
-  color: var(--vp-c-text-2) !important;
-}
-
-/* ── Sidebar — cleaner ── */
-.VPSidebar {
-  border-right: 0.5px solid var(--vp-c-border) !important;
-  background: var(--vp-c-bg) !important;
-}
-
-.VPSidebarItem .text {
-  font-weight: 450 !important;
-  font-size: 0.9rem !important;
-}
-
-.VPSidebarItem.is-active > .item > .link > .text {
-  color: var(--vp-c-brand-1) !important;
+/* ── Document content ──────────────────────────────────────────────── */
+.vp-doc { --vp-code-block-bg: var(--zn-panel); }
+.vp-doc h1, .vp-doc h2, .vp-doc h3, .vp-doc h4 {
+  font-family: var(--font-serif) !important;
   font-weight: 600 !important;
+  letter-spacing: -0.012em !important;
 }
-
-/* ── Content — reading optimized ── */
-.vp-doc h1 {
-  font-weight: 700 !important;
-  letter-spacing: -0.03em !important;
-  font-size: 2rem !important;
-}
-
+.vp-doc h1 { font-size: 2.15rem; line-height: 1.12; margin-bottom: .5rem; }
 .vp-doc h2 {
-  font-weight: 600 !important;
-  letter-spacing: -0.02em !important;
-  padding-bottom: 0.5rem !important;
-  border-bottom: 0.5px solid var(--vp-c-divider) !important;
+  font-size: 1.42rem; line-height: 1.2;
+  margin-top: 2.6rem; padding-top: 1.6rem;
+  border-top: 1px solid var(--vp-c-divider);
 }
-
-.vp-doc h3 {
-  font-weight: 600 !important;
-  letter-spacing: -0.01em !important;
-}
-
-.vp-doc p {
-  line-height: 1.7 !important;
-}
-
-/* ── Code blocks — refined ── */
-.vp-doc div[class*='language-'] {
-  border-radius: 12px !important;
-  border: 1px solid var(--vp-c-border) !important;
-  box-shadow: var(--apple-shadow-sm) !important;
-}
-
-.vp-doc :not(pre) > code {
-  border-radius: 6px !important;
-  padding: 2px 6px !important;
-  background: var(--vp-c-bg-soft) !important;
-  font-size: 0.88em !important;
-}
-
-/* ── Tables — clean Apple style ── */
-.vp-doc table {
-  border-collapse: separate !important;
-  border-spacing: 0 !important;
-  border-radius: 12px !important;
-  overflow: hidden !important;
-  border: 1px solid var(--vp-c-border) !important;
-  box-shadow: var(--apple-shadow-sm) !important;
-}
-
-.vp-doc th {
-  background: var(--vp-c-bg-soft) !important;
-  font-weight: 600 !important;
-  font-size: 0.85rem !important;
-  text-transform: none !important;
-  letter-spacing: 0 !important;
-  padding: 12px 16px !important;
-}
-
-.vp-doc td {
-  padding: 10px 16px !important;
-  font-size: 0.9rem !important;
-  border-bottom: 0.5px solid var(--vp-c-divider) !important;
-}
-
-.vp-doc tr:last-child td {
-  border-bottom: none !important;
-}
-
-/* ── Tip/Warning boxes — softer ── */
-.vp-doc .custom-block {
-  border-radius: 12px !important;
-  border: 1px solid var(--vp-c-border) !important;
-  box-shadow: none !important;
-}
-
-/* ── Footer — minimal ── */
-.VPFooter {
-  border-top: 0.5px solid var(--vp-c-border) !important;
-}
-
-/* ── Smooth scrolling ── */
-html {
-  scroll-behavior: smooth;
-}
-
-/* ── Selection color ── */
-::selection {
-  background: rgba(0, 113, 227, 0.2);
-}
-
-/* ── Homepage custom sections (markdown below features) ── */
-.vp-doc .benchmark-highlight {
-  background: linear-gradient(135deg, var(--vp-c-bg-soft) 0%, var(--vp-c-bg) 100%);
-  border-radius: 20px;
-  padding: 2rem 2.5rem;
-  border: 1px solid var(--vp-c-border);
-  margin: 2rem 0;
-}
-
-.vp-doc .stat-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 1.5rem;
-  margin: 1.5rem 0;
-}
-
-.vp-doc .stat-card {
-  background: var(--vp-c-bg-elv);
-  border-radius: 16px;
-  padding: 1.5rem;
-  border: 1px solid var(--vp-c-border);
-  box-shadow: var(--apple-shadow-sm);
-  text-align: center;
-}
-
-.vp-doc .stat-card .number {
-  font-size: 2rem;
-  font-weight: 700;
-  letter-spacing: -0.03em;
+.vp-doc h3 { font-size: 1.18rem; margin-top: 1.8rem; }
+.vp-doc p, .vp-doc li { font-size: 15.5px; line-height: 1.72; }
+.vp-doc p { max-width: 68ch; }
+.vp-doc a {
   color: var(--vp-c-brand-1);
-  line-height: 1.2;
+  font-weight: 500;
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color .15s;
+}
+.vp-doc a:hover { border-bottom-color: currentColor; }
+
+/* inline code — gold, restrained */
+.vp-doc :not(pre) > code {
+  font-size: 0.84em;
+  color: var(--vp-c-brand-1);
+  background: var(--vp-c-brand-soft);
+  border-radius: 5px;
+  padding: 2px 6px;
+  font-weight: 450;
+}
+.vp-doc h1 code, .vp-doc h2 code, .vp-doc h3 code { font-size: 0.85em; background: none; padding: 0; color: inherit; }
+
+/* ── Code blocks — a panel, mono, hairline ─────────────────────────── */
+.vp-doc div[class*='language-'] {
+  border: 1px solid var(--vp-c-border);
+  border-radius: 8px;
+  background: var(--zn-panel);
+}
+.vp-doc [class*='language-'] code { font-size: 13.5px; line-height: 1.7; }
+.vp-doc [class*='language-'] .lang { color: var(--vp-c-text-3); font-family: var(--vp-font-family-mono); }
+.vp-doc [class*='language-'] > span.lang { text-transform: lowercase; letter-spacing: .04em; }
+
+/* ── Tables — hairline, mono headers ───────────────────────────────── */
+.vp-doc table { display: table; width: 100%; border-collapse: collapse; margin: 1.2rem 0; }
+.vp-doc tr { border: 0; background: transparent !important; }
+.vp-doc th {
+  font-family: var(--vp-font-family-mono);
+  font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--vp-c-text-3); font-weight: 500;
+  text-align: left; padding: 8px 14px 8px 0;
+  border: 0; border-bottom: 1px solid var(--vp-c-border);
+}
+.vp-doc td {
+  padding: 9px 14px 9px 0; font-size: 14px; color: var(--vp-c-text-2);
+  border: 0; border-bottom: 1px solid var(--zn-hair);
 }
 
-.vp-doc .stat-card .label {
-  font-size: 0.85rem;
-  color: var(--vp-c-text-2);
-  margin-top: 0.25rem;
+/* ── Custom blocks — a single gold rule ────────────────────────────── */
+.vp-doc .custom-block {
+  border: 1px solid var(--vp-c-border);
+  border-left: 2px solid var(--zn-gold);
+  border-radius: 6px;
+  background: var(--vp-c-bg-soft);
+  font-size: 14.5px;
+}
+.vp-doc .custom-block .custom-block-title {
+  font-family: var(--vp-font-family-mono);
+  font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--zn-gold);
+}
+.vp-doc .custom-block.tip { border-left-color: var(--zn-gold); }
+.vp-doc .custom-block.warning { border-left-color: #c98a1a; }
+.vp-doc .custom-block.danger { border-left-color: #c0562f; }
+
+/* ── Footer ────────────────────────────────────────────────────────── */
+.VPFooter {
+  border-top: 1px solid var(--vp-c-border) !important;
+  background: var(--vp-c-bg-alt) !important;
+}
+.VPFooter .message, .VPFooter .copyright {
+  font-family: var(--vp-font-family-mono) !important;
+  font-size: 12px !important;
+  color: var(--vp-c-text-3) !important;
+}
+
+/* selection + scrollbars */
+::selection { background: var(--vp-c-brand-soft); }
+
+/* ═══════════════════════════════════════════════════════════════════
+   Home — the datasheet masthead. Raw HTML in index.md, scoped to .ds-home.
+   ═══════════════════════════════════════════════════════════════════ */
+.VPHome { padding-top: 0 !important; padding-bottom: 0 !important; }
+/* the home renders inside VitePress's reading-width container — free it */
+.VPHome .vp-doc.container { max-width: 100% !important; padding: 0 !important; }
+.ds-home { max-width: var(--vp-layout-max-width); margin: 0 auto; padding: 0 32px; }
+.ds-home a { text-decoration: none; color: inherit; }
+
+/* masthead */
+.ds-mast { border-bottom: 1px solid var(--vp-c-border); }
+.ds-mast-in { display: grid; grid-template-columns: 1fr 300px; }
+.ds-lead { padding: 60px 40px 56px 0; border-right: 1px solid var(--vp-c-border); }
+.ds-idx { font-family: var(--vp-font-family-mono); font-size: 12px; letter-spacing: .18em; text-transform: uppercase; color: var(--zn-gold); }
+.ds-lead h1 {
+  font-family: var(--font-serif); font-weight: 600;
+  font-size: clamp(32px, 4.6vw, 50px); line-height: 1.08; letter-spacing: -0.014em;
+  margin: 18px 0 0; max-width: 15ch; color: var(--vp-c-text-1); text-wrap: balance;
+}
+.ds-lead p { margin: 20px 0 0; max-width: 54ch; color: var(--vp-c-text-2); font-size: 16.5px; line-height: 1.62; }
+.ds-lead p b { color: var(--vp-c-text-1); font-weight: 600; }
+.ds-acts { margin-top: 28px; display: flex; gap: 10px; flex-wrap: wrap; }
+.ds-btn {
+  font-family: var(--vp-font-family-mono); font-size: 13px;
+  padding: 9px 15px; border: 1px solid var(--vp-c-border); color: var(--vp-c-text-1) !important;
+  transition: border-color .15s, background .15s; border-radius: 4px;
+}
+.ds-btn:hover { border-color: var(--zn-gold); }
+.ds-btn.pri { border-color: var(--zn-gold); color: var(--zn-gold) !important; }
+.ds-btn.pri:hover { background: var(--vp-c-brand-soft); }
+
+.ds-spec { padding: 26px 0 26px 40px; }
+.ds-spec .cap { font-family: var(--vp-font-family-mono); font-size: 11px; letter-spacing: .2em; text-transform: uppercase; color: var(--vp-c-text-3); padding-bottom: 11px; border-bottom: 1px solid var(--vp-c-border); }
+.ds-row { display: flex; justify-content: space-between; align-items: baseline; gap: 14px; padding: 10px 0; border-bottom: 1px solid var(--zn-hair); }
+.ds-row dt { font-family: var(--vp-font-family-mono); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--vp-c-text-3); margin: 0; }
+.ds-row dd { margin: 0; font-family: var(--vp-font-family-mono); font-size: 12.5px; color: var(--vp-c-text-1); }
+.ds-row dd .u { color: var(--zn-gold); }
+
+/* sections */
+.ds-sec { border-bottom: 1px solid var(--vp-c-border); }
+.ds-sec-in { display: grid; grid-template-columns: 190px 1fr; }
+.ds-sec-label { padding: 38px 40px 38px 0; border-right: 1px solid var(--vp-c-border); }
+.ds-sec-label .n { font-family: var(--vp-font-family-mono); font-size: 12px; color: var(--zn-gold); }
+.ds-sec-label h2 { font-family: var(--font-serif); font-weight: 600; font-size: 21px; letter-spacing: -0.01em; margin: 8px 0 0; border: 0; padding: 0; }
+.ds-sec-label p { font-size: 13px; color: var(--vp-c-text-2); margin: 10px 0 0; max-width: 24ch; line-height: 1.5; }
+.ds-sec-body { padding: 38px 0 38px 40px; }
+.ds-cap { display: grid; grid-template-columns: 126px 1fr; gap: 22px; padding: 17px 0; border-bottom: 1px solid var(--zn-hair); align-items: baseline; }
+.ds-cap:first-child { padding-top: 0; }
+.ds-cap:last-child { border-bottom: 0; padding-bottom: 0; }
+.ds-cap .t { font-family: var(--vp-font-family-mono); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: var(--vp-c-text-1); }
+.ds-cap .t small { display: block; font-size: 11px; letter-spacing: .03em; text-transform: none; color: var(--vp-c-text-3); margin-top: 4px; }
+.ds-cap .d { color: var(--vp-c-text-2); font-size: 14.5px; line-height: 1.56; }
+.ds-cap .d b { color: var(--vp-c-text-1); font-weight: 600; }
+.ds-cap .d code { font-family: var(--vp-font-family-mono); font-size: .84em; color: var(--vp-c-brand-1); }
+
+@media (max-width: 820px) {
+  .ds-mast-in, .ds-sec-in { grid-template-columns: 1fr; }
+  .ds-lead, .ds-sec-label { border-right: 0; border-bottom: 1px solid var(--vp-c-border); padding: 36px 0; }
+  .ds-spec, .ds-sec-body { padding-left: 0; }
+  .ds-cap { grid-template-columns: 1fr; gap: 5px; }
 }

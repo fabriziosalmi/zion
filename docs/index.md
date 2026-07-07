@@ -1,112 +1,62 @@
 ---
 layout: home
-hero:
-  name: Zion
-  text: Edge Gateway
-  tagline: High-performance TLS reverse proxy with built-in WAF. Written in Rust. Single binary. Zero dependencies.
-  image:
-    src: /logo.svg
-    alt: Zion Edge Gateway
-  actions:
-    - theme: brand
-      text: Get Started
-      link: /guide/quickstart
-    - theme: alt
-      text: View Benchmarks
-      link: /benchmarks/
-    - theme: alt
-      text: GitHub
-      link: https://github.com/fabriziosalmi/zion
-
-features:
-  - title: 233K req/s
-    details: Peak throughput on Apple M4 with TLS 1.3 end-to-end. 107K req/s API proxy, 103K with full WAF pipeline active (CV 0.5%). Zero errors.
-  - title: Zero-Regex WAF
-    details: Aho-Corasick automaton in a single O(N) pass over the body. Two pattern sets — balanced (default, ~100 high-precision patterns) and aggressive (opt-in, +~140 broad-substring patterns). Per-profile entropy gate (default 6.5 bits/byte, JSON-string-aware).
-  - title: Two-Level Cache
-    details: "L1 thread-local with O(1) LRU (intrusive doubly-linked list) + L2 shared DashMap. Generation-based coherence. Watch-channel singleflight (race-free even when the fetcher completes between subscribe and await)."
-  - title: TLS 1.3 + Hot-Reload
-    details: rustls + hardware crypto (AES-NI/NEON). Multi-SNI, session tickets, 0-RTT. Certificate hot-reload via ArcSwap with zero downtime.
-  - title: HTTP/1.1 + H2 + H3
-    details: Full protocol support including HTTP/2 upstream multiplexing, WebSocket proxy, SSE streaming, HTTP/3 QUIC (feature-gated). ACME auto-renewal.
-  - title: Prometheus Native
-    details: "/metrics, /healthz, /readyz built-in. Lock-free sharded counters, differential latency histograms. X-Request-ID + W3C traceparent propagation."
-  - title: Hardware-Aware
-    details: "Auto-detects CPU cores, L1d cache, AES-NI/NEON. Pins workers to cores. TCP_FASTOPEN, SO_REUSEPORT, SO_BUSY_POLL, io_uring single-shot accept."
-  - title: Single Binary, TOML Config
-    details: "No runtime dependencies. ~4MB release binary. Validates config at startup. Graceful shutdown with 30s drain. systemd + Docker ready."
-  - title: kTLS Offload (experimental)
-    details: "Post-handshake socket flip into in-kernel TLS, toward sendfile-class zero-copy for static cache hits. Wired but not yet exercised end-to-end in CI. Linux 5.10+ with CONFIG_TLS=y. Feature-gated (`--features ktls`)."
-  - title: ML-Augmented WAF (experimental)
-    details: "Optional 16-dim ONNX model on the WAF hot path, 200µs p99 budget. Score travels with the request as a signal, not a hard gate. Ships no bundled model. Feature-gated (`--features ml-waf`)."
-  - title: AIMP Mesh (v0.2.x)
-    details: "Ed25519-signed UDP gossip of WAF rule deltas + IP reputation across a fleet. Source-bound revocation, replay LRU, LWW merge, periodic anti-entropy. No central control plane. Feature-gated (`--features sovereign-aimp`)."
+title: Zion Edge Gateway
+titleTemplate: TLS reverse proxy · WAF · RAM cache, in Rust
+description: One auditable Rust binary at the edge — TLS 1.3 termination, a zero-regex WAF, and a two-level RAM cache. No sidecars, no GeoIP database, no control plane.
 ---
 
-<div class="benchmark-highlight">
+<div class="ds-home">
+  <header class="ds-mast"><div class="ds-mast-in">
+    <div class="ds-lead">
+      <div class="ds-idx">Edge gateway · Rust</div>
+      <h1>One binary at the boundary of your network.</h1>
+      <p>Zion terminates <b>TLS&nbsp;1.3</b>, inspects every request with a <b>zero-regex WAF</b>, serves hot paths from a <b>two-level RAM cache</b>, and proxies the rest — one auditable executable in place of nginx, a WAF module, a cache, and a geo-tagger. Explicit knobs, not a black box.</p>
+      <div class="ds-acts">
+        <a class="ds-btn pri" href="/zion/guide/quickstart">Read the guide</a>
+        <a class="ds-btn" href="/zion/guide/cli">zion import nginx</a>
+        <a class="ds-btn" href="https://github.com/fabriziosalmi/zion">Source</a>
+      </div>
+    </div>
+    <aside class="ds-spec">
+      <div class="cap">Specification</div>
+      <dl>
+        <div class="ds-row"><dt>Version</dt><dd class="tnum">0.6.2</dd></div>
+        <div class="ds-row"><dt>Language</dt><dd>Rust · MSRV 1.82</dd></div>
+        <div class="ds-row"><dt>Binary</dt><dd class="tnum">~4 MB · static</dd></div>
+        <div class="ds-row"><dt>TLS proxy</dt><dd class="tnum">108<span class="u">k</span> req/s</dd></div>
+        <div class="ds-row"><dt>Cache hit</dt><dd class="tnum">222<span class="u">k</span> req/s</dd></div>
+        <div class="ds-row"><dt>Runtime deps</dt><dd>none</dd></div>
+        <div class="ds-row"><dt>License</dt><dd>Apache-2.0</dd></div>
+      </dl>
+    </aside>
+  </div></header>
 
-## Performance at a glance
+  <section class="ds-sec"><div class="ds-sec-in">
+    <div class="ds-sec-label">
+      <div class="n">§1</div>
+      <h2>Capabilities</h2>
+      <p>Sharp primitives, each cheap enough to leave on under load.</p>
+    </div>
+    <div class="ds-sec-body">
+      <div class="ds-cap"><div class="t">TLS<small>termination</small></div><div class="d">rustls on aws-lc-rs with hardware AES. Multi-SNI, session tickets, 0-RTT. Certificates swap via <code>ArcSwap</code> with <b>zero dropped connections</b> on reload.</div></div>
+      <div class="ds-cap"><div class="t">WAF<small>inspection</small></div><div class="d">Aho-Corasick in a single <b>O(N)</b> pass — five gates, Shannon entropy, simd-json structural limits. A shadow mode logs without blocking.</div></div>
+      <div class="ds-cap"><div class="t">Cache<small>two-level</small></div><div class="d">L1 thread-local intrusive LRU + L2 sharded <code>DashMap</code>, generation coherence, request coalescing. No stale read after an update.</div></div>
+      <div class="ds-cap"><div class="t">Protocol<small>1.1 / 2 / 3</small></div><div class="d">HTTP/2 upstream multiplexing, WebSocket pipe, zero-buffer SSE, HTTP/3 QUIC (feature-gated). ACME auto-HTTPS on by default in the release build.</div></div>
+      <div class="ds-cap"><div class="t">Edge<small>sovereign</small></div><div class="d">Per-IP rate limit <b>and</b> concurrent-connection cap, IT/EU origin tagging with no GeoIP database, Ed25519-signed mesh reputation, an L7 tarpit.</div></div>
+      <div class="ds-cap"><div class="t">Ops<small>observable</small></div><div class="d">Prometheus <code>/metrics</code>, hot config reload, a live <code>zion top</code> TUI. Cosign-signed container, CycloneDX SBOM, SLSA provenance.</div></div>
+    </div>
+  </div></section>
 
-<div class="stat-grid">
-  <div class="stat-card">
-    <div class="number">233K</div>
-    <div class="label">req/s HTML (TLS 1.3)</div>
-  </div>
-  <div class="stat-card">
-    <div class="number">210K</div>
-    <div class="label">req/s cache hit</div>
-  </div>
-  <div class="stat-card">
-    <div class="number">107K</div>
-    <div class="label">req/s API proxy</div>
-  </div>
-  <div class="stat-card">
-    <div class="number">103K</div>
-    <div class="label">req/s WAF POST</div>
-  </div>
+  <section class="ds-sec"><div class="ds-sec-in">
+    <div class="ds-sec-label">
+      <div class="n">§2</div>
+      <h2>Start</h2>
+      <p>From zero to a running daemon in about a minute.</p>
+    </div>
+    <div class="ds-sec-body">
+      <div class="ds-cap"><div class="t">Install<small>quickstart</small></div><div class="d">Build the release binary, run <code>zion auto</code> for an ephemeral cert + config, and you have TLS in front of a backend. → <a href="/zion/guide/quickstart">Quick start</a></div></div>
+      <div class="ds-cap"><div class="t">Migrate<small>from nginx</small></div><div class="d">Convert an existing config with <code>zion import nginx</code> — a validated <code>zion.toml</code> and an honest findings report. → <a href="/zion/guide/">Guide</a></div></div>
+      <div class="ds-cap"><div class="t">Configure<small>reference</small></div><div class="d">One hot-reloaded TOML file: routes, upstreams, WAF profiles, TLS, ACME, CORS. → <a href="/zion/config/">Configuration</a></div></div>
+    </div>
+  </div></section>
 </div>
-
-Native benchmark on Apple M4, 5 runs x 10s, c=100. Rust backend. Tracked per-commit in [bench-history.json](https://github.com/fabriziosalmi/zion/blob/master/benchmarks/bench-history.json). [Full results](/benchmarks/)
-
-</div>
-
-## Why Zion?
-
-|  | nginx | HAProxy | Envoy | Caddy | Traefik | Pingora | **Zion** |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| Language | C | C | C++ | Go | Go | Rust | **Rust** |
-| Memory safety | No | No | No | GC | GC | Yes | **Yes** |
-| Built-in WAF | No | No | No | No | No | No | **Aho-Corasick, dual-mode** |
-| RAM cache | No | Yes | No | No | No | No | **L1+L2** |
-| TLS hot-reload | Signal | Signal | xDS | Auto | File watch | Custom | **ArcSwap** |
-| Config format | Custom | Custom | YAML/xDS | JSON/API | YAML/API | Rust code | **TOML** |
-| Binary size | ~1.5MB | ~3MB | ~40MB | ~40MB | ~100MB | Library | **~4MB** |
-| Singleflight | No | No | No | No | No | No | **Yes** |
-| HTTP/3 QUIC | Patch | No | Yes | Yes | Yes | No | **Feature-gated** |
-| JWT/OIDC auth | No | No | Yes | Yes | Yes | No | **Feature-gated** |
-
-## Quick start
-
-```bash
-cargo build --release
-ZION_CONFIG=zion.toml ./target/release/zion
-```
-
-```toml
-[server]
-listen_https = "0.0.0.0:443"
-
-[tls]
-cert_path = "/etc/ssl/zion/tls.crt"
-key_path = "/etc/ssl/zion/tls.key"
-
-[upstreams]
-backend = "http://127.0.0.1:8000"
-
-[[route]]
-path = "/api/{*rest}"
-upstream = "backend"
-waf = true
-```
-
-[Full configuration reference](/config/)
