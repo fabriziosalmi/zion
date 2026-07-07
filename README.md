@@ -42,7 +42,7 @@ cargo build --release --features init,tui
 
 ---
 
-## Quick Start
+## Quick start
 
 Fastest path — TLS in front of a dev backend, one command:
 
@@ -63,7 +63,7 @@ ZION_CONFIG=zion.toml ./target/release/zion        # run
 Unattended (CI / container init):
 
 ```bash
-./zion init -y \
+./target/release/zion init -y \
     --hostname api.example.com \
     --upstream backend=127.0.0.1:8000 \
     --upstream frontend=127.0.0.1:3000
@@ -227,21 +227,21 @@ Zion is the **operator's toolkit at the edge** — sharp, composable primitives
 with explicit knobs, each cheap enough to leave on under load. Defence is
 layered, outside-in:
 
-| Layer | Primitive | Status |
-|---|---|---|
-| **L7 — pre-routing** | Zero-cost edge gates before any work: URI-length cap, method whitelist, XFF-spoof-resistant client-IP resolution. | ✅ shipping |
-| **L7 — admission** | Per-IP **rate** limiter (`429` over budget) **and** per-IP **concurrent-connection** cap (enforced at accept, before the TLS handshake) — the lever a slow/backed flood actually hits. | ✅ shipping |
-| **L7 — inspection** | WAF: zero-regex Aho-Corasick O(N) single-pass, entropy, simd-json limits, 5 gates. | ✅ shipping |
-| **Origin tagging** | IT/EU range classification (`--features geo-ita` / `geo-eu`), IPv4 + IPv6 — O(log N) over baked CIDR data, **no GeoIP DB, no syscall**. Answers "% EU vs non-EU traffic" out of the box. | ✅ shipping |
-| **Fleet signal** | AIMP mesh: Ed25519-signed gossip of blocks + reputation, source-bound revocation, no control plane. Reputation rides upstream as `X-Zion-Mesh-Score`. | ✅ shipping (advisory) |
-| **Tag-driven enforcement** | `[sovereign.enforce]` promotes the tag / mesh score from *signal* to an opt-in `403` deny (e.g. `deny = ["unknown"]` blocks non-EU sources; or deny above a reputation threshold). Off by default. | ✅ shipping |
-| **L7 tarpit** | `[sovereign.enforce.tarpit]` escalates a deny from a cheap `403` to a *held* connection, so a flood pays wall-clock + socket budget; a global ceiling sheds back to `403` so it can't self-DoS. Off by default. | ✅ shipping |
+| Layer | Primitive |
+|---|---|
+| **L7 — pre-routing** | Zero-cost edge gates before any work: URI-length cap, method whitelist, XFF-spoof-resistant client-IP resolution. |
+| **L7 — admission** | Per-IP **rate** limiter (`429` over budget) **and** per-IP **concurrent-connection** cap (enforced at accept, before the TLS handshake) — the lever a slow/backed flood actually hits. |
+| **L7 — inspection** | WAF: zero-regex Aho-Corasick O(N) single-pass, entropy, simd-json limits, 5 gates. |
+| **Origin tagging** | IT/EU range classification (`--features geo-ita` / `geo-eu`), IPv4 + IPv6 — O(log N) over baked CIDR data, **no GeoIP DB, no syscall**. Answers "% EU vs non-EU traffic" out of the box. |
+| **Fleet signal** | AIMP mesh: Ed25519-signed gossip of blocks + reputation, source-bound revocation, no control plane. Reputation rides upstream as `X-Zion-Mesh-Score` — an advisory signal, not a gate. |
+| **Tag-driven enforcement** | `[sovereign.enforce]` promotes the tag / mesh score from *signal* to an opt-in `403` deny (e.g. `deny = ["unknown"]` blocks non-EU sources; or deny above a reputation threshold). Off by default. |
+| **L7 tarpit** | `[sovereign.enforce.tarpit]` escalates a deny from a cheap `403` to a *held* connection, so a flood pays wall-clock + socket budget; a global ceiling sheds back to `403` so it can't self-DoS. Off by default. |
 
 The design rule: tagging and reputation never *silently* gate — the operator
 opts a signal into enforcement explicitly; the local rate-limiter / WAF / auth
 stay authoritative.
 
-## Live Dashboard (`zion top`)
+## Live dashboard (`zion top`)
 
 With a daemon running, `zion top` opens an htop-style TUI: traffic counters,
 latency quantiles (p50/p95/p99), status-class breakdown, cache hit rate, an RPS
@@ -285,13 +285,15 @@ MODE=full bash benchmarks/baseline/run-baseline.sh   # → benchmarks/baseline/z
 
 ## Testing
 
-```bash
-# Unit tests (740) <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
-cargo test
+<!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
+**740 unit tests** run on every change; **23 integration tests** need a running Zion + a backend.
 
-# Integration tests (23 — requires a running Zion + backend)
-# 1. cd benchmarks/backend && cargo run --release &
-# 2. ZION_CONFIG=tests/zion-test.toml ./target/release/zion &
+```bash
+cargo test                          # unit tests
+
+# integration tests (start a backend + Zion first):
+#   cd benchmarks/backend && cargo run --release &
+#   ZION_CONFIG=tests/zion-test.toml ./target/release/zion &
 cargo test --test integration -- --ignored --test-threads=1
 ```
 

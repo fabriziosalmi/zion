@@ -25,7 +25,7 @@ external scan whose green status is the operational evidence.
 | ID | Requirement | Implementation | Test / Evidence |
 |---|---|---|---|
 | 1.1.4 | Threat model documented | [threat-model.md](threat-model.md) | Doc reviewed; STRIDE table covers all surfaces, including [§10 Mesh (AIMP)](threat-model.md#10-mesh-aimp-integration) for `--features sovereign-aimp` |
-| 1.1.7 | Architecture documented | [adr/](../adr/) (8 ADRs) | ADR index in [adr/README.md](../adr/README.md); mesh integration captured in [ADR-0008](../adr/0008-mesh-aimp-integration.md) |
+| 1.1.7 | Architecture documented | [adr/](../adr/) (10 ADRs) | ADR index in [adr/](../adr/); mesh integration captured in [ADR-0008](../adr/0008-mesh-aimp-integration.md) |
 | 1.4.5 | Data classification documented | [redact](../../src/audit.rs) policy + [`zion.toml`] `[redact]` block | proptest `redact_drops_secret_values` |
 | 1.5.2 | Serialization rejected for untrusted input | `simd-json` validation gate in [waf.rs](../../src/waf.rs) | unit tests `denies_long_string_value`, `denies_deep_nesting` |
 
@@ -88,7 +88,7 @@ to the binary path. Enabling `--features auth` brings:
 |---|---|---|---|
 | 9.1.1 | TLS for all client traffic | HTTPS listener mandatory; HTTP listener optional + redirects | `tls.rs` config validation |
 | 9.1.2 | Strong ciphersuite list | rustls default + optional FIPS subset | [docs/security/fips.md](fips.md) |
-| 9.1.3 | TLS configuration external evidence | Pending [ssllabs.com](https://www.ssllabs.com/ssltest/) test against canonical deploy — tracked in `tls-conformance.md` |
+| 9.1.3 | TLS configuration external evidence | External [SSL Labs](https://www.ssllabs.com/ssltest/) scan against the canonical deploy (pending) | tracked in [`tls-conformance.md`](tls-conformance.md) |
 | 9.2.1 | TLS for outbound calls | hyper-rustls with webpki-roots | upstream connectivity tests |
 | 9.2.4 | Authenticated peer-to-peer (mesh) | Ed25519-signed `AimpEnvelope` over Noise AEAD ([aimp_cp.rs](../../src/aimp_cp.rs)) | [threat-model.md §10 Spoofing/Tampering](threat-model.md#10-mesh-aimp-integration) |
 

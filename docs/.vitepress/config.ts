@@ -1,4 +1,11 @@
 import { defineConfig } from 'vitepress'
+import { readFileSync } from 'node:fs'
+
+// Single source of truth for the version shown in the nav: read it from
+// Cargo.toml at build time so the docs can never drift from the crate again.
+const version =
+  readFileSync(new URL('../../Cargo.toml', import.meta.url), 'utf-8')
+    .match(/^version\s*=\s*"([^"]+)"/m)?.[1] ?? '0.0.0'
 
 export default defineConfig({
   title: 'Zion Edge Gateway',
@@ -8,12 +15,16 @@ export default defineConfig({
     ['link', { rel: 'icon', type: 'image/svg+xml', href: '/zion/logo.svg' }],
     ['meta', { name: 'theme-color', content: '#0071e3' }],
     ['meta', { property: 'og:title', content: 'Zion Edge Gateway' }],
-    ['meta', { property: 'og:description', content: 'High-performance TLS reverse proxy with built-in WAF. 235K req/s. Rust.' }],
+    ['meta', { property: 'og:description', content: 'High-performance TLS reverse proxy with built-in WAF, written in Rust.' }],
     ['meta', { property: 'og:type', content: 'website' }],
   ],
 
   lastUpdated: true,
   cleanUrls: true,
+
+  // Internal working notes (homelab topology, bench-rig hosts) are gitignored
+  // and must never render on the public site even if present in a local tree.
+  srcExclude: ['internal/**'],
 
   // Many docs (security/asvs.md, perf/roadmap.md, the ADRs) deep-link
   // to source files outside the docs/ tree (e.g. ../../src/dispatch.rs,
@@ -50,7 +61,7 @@ export default defineConfig({
         ]
       },
       {
-        text: 'v0.2.2',
+        text: `v${version}`,
         items: [
           { text: 'Changelog', link: 'https://github.com/fabriziosalmi/zion/blob/master/CHANGELOG.md' },
           { text: 'Releases', link: 'https://github.com/fabriziosalmi/zion/releases' },
@@ -85,26 +96,59 @@ export default defineConfig({
       {
         text: 'Security',
         items: [
-          { text: 'WAF Pipeline', link: '/security/' },
+          { text: 'WAF pipeline', link: '/security/' },
           { text: 'Hardening', link: '/security/hardening' },
+          { text: 'Threat model (STRIDE)', link: '/security/threat-model' },
+          { text: 'OWASP ASVS L2', link: '/security/asvs' },
+          { text: 'Compliance mapping', link: '/security/compliance-mapping' },
+          { text: 'FIPS 140-3', link: '/security/fips' },
+          { text: 'TLS conformance', link: '/security/tls-conformance' },
+          { text: 'Supply chain', link: '/security/supply-chain' },
         ]
       },
       {
         text: 'Performance',
         items: [
           { text: 'Benchmarks', link: '/benchmarks/' },
-          { text: 'Optimization Log', link: '/benchmarks/optimization' },
+          { text: 'Optimization log', link: '/benchmarks/optimization' },
+          { text: 'Microbenchmarks', link: '/perf/microbench' },
+          { text: 'PGO build', link: '/perf/pgo' },
+          { text: 'Mesh overhead', link: '/perf/mesh-overhead' },
+          { text: 'Roadmap', link: '/perf/roadmap' },
         ]
       },
       {
         text: 'Operations',
         items: [
           { text: 'Deployment', link: '/deploy/' },
-          { text: 'Observability', link: '/deploy/observability' },
+          { text: 'Monitoring (Prometheus/Grafana)', link: '/deploy/observability' },
+          { text: 'Observability internals', link: '/guide/observability' },
           { text: 'Hot-reload', link: '/deploy/hot-reload' },
           { text: 'Admin API', link: '/deploy/admin-api' },
         ]
-      }
+      },
+      {
+        text: 'Mesh',
+        items: [
+          { text: 'AIMP integration', link: '/mesh/integration' },
+        ]
+      },
+      {
+        text: 'ADRs / Design',
+        items: [
+          { text: 'Overview', link: '/adr/' },
+          { text: '0001 · ArcSwap config hot-reload', link: '/adr/0001-arcswap-config-hot-reload' },
+          { text: '0002 · Aho-Corasick over regex', link: '/adr/0002-aho-corasick-over-regex' },
+          { text: '0003 · Two-level cache + generation', link: '/adr/0003-two-level-cache-with-generation' },
+          { text: '0004 · HMAC-chained audit log', link: '/adr/0004-hmac-chained-audit-log' },
+          { text: '0005 · Distroless + cosign/SLSA', link: '/adr/0005-distroless-with-cosign-slsa' },
+          { text: '0006 · tracing + optional OTLP', link: '/adr/0006-tracing-with-optional-otlp' },
+          { text: '0007 · Two-tier MSRV', link: '/adr/0007-bicapa-msrv' },
+          { text: '0008 · Mesh AIMP integration', link: '/adr/0008-mesh-aimp-integration' },
+          { text: '0010 · Host-based L7 routing', link: '/adr/0010-host-based-l7-routing' },
+          { text: '0011 · zion import (nginx)', link: '/adr/0011-zion-import-nginx' },
+        ]
+      },
     ],
 
     socialLinks: [

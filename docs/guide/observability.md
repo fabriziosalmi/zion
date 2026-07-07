@@ -1,4 +1,9 @@
-# Observability
+# Observability internals
+
+> Looking for the operator how-to — health probes, Prometheus scrape config, the
+> Grafana dashboard, and the full metric reference? See
+> [Metrics & health endpoints](../deploy/observability). This page is the
+> feature/internals reference.
 
 Zion's observability stack covers four concerns:
 
@@ -86,7 +91,7 @@ specific curated-ASN roles that override it.
 **Reading "% EU vs non-EU traffic"** — sum the EU-family classes over the
 grand total. In PromQL:
 
-```promql
+```text
 sum(zion_sovereign_classifications_total{class=~"eu|gov_eu|residential_eu|datacenter_eu"})
   / ignoring(class) sum(zion_sovereign_classifications_total)
 ```

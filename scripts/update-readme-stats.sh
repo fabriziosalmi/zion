@@ -15,7 +15,8 @@
 #     30 modules, ~20,600 lines of Rust. See [arch ...]
 #     <!-- zion-stats:modules-lines (kept in sync ...) -->
 #
-#     # Unit tests (421) <!-- zion-stats:test-count ... -->
+#     <!-- zion-stats:test-count (kept in sync ...) -->
+#     **421 unit tests** run on every change; ...
 #
 # Usage:
 #   bash scripts/update-readme-stats.sh             # rewrite README in place
@@ -113,11 +114,13 @@ if n1 != 1:
         f"(expected exactly 1). README structure changed — update the regex."
     )
 
-# Pattern 2: "# Unit tests (N) <!-- zion-stats:test-count ... -->"
+# Pattern 2: the marker on its own line, then "**N unit tests**" in prose
+# (the marker lives outside the code fence so it stays invisible on GitHub).
 tests_re = re.compile(
-    r"# Unit tests \(\d+\)(\s*<!-- zion-stats:test-count[^>]*-->)"
+    r"(<!-- zion-stats:test-count[^>]*-->\n)"
+    r"\*\*\d+ unit tests\*\*"
 )
-new_tests_line = rf"# Unit tests ({tests})\1"
+new_tests_line = rf"\g<1>**{tests} unit tests**"
 src_new, n2 = tests_re.subn(new_tests_line, src_new)
 if n2 != 1:
     sys.exit(
