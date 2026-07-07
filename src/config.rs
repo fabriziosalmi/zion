@@ -128,15 +128,13 @@ pub struct AimpConfig {
     /// a fresh keypair is generated and written on first boot.
     #[serde(default)]
     pub identity_path: String,
-    /// Score threshold above which the AIMP→XDP reconciler installs
+    /// Score threshold above which an AIMP→XDP reconciler would install
     /// an LPM-trie drop. Range \[0,1\]. Default 0.95 = only escalate to
     /// kernel-level drop on high-confidence threats.
     ///
-    /// Read by [`crate::aimp_xdp_sync::spawn`] when the operator wires
-    /// the XDP handle at boot. Currently the reconciler is feature-gated
-    /// behind `xdp + sovereign-aimp`, but the XDP attach itself is opt-in
-    /// at boot and not yet wired from `async_main`. The field is kept so
-    /// the TOML schema is stable when that wire lands.
+    /// Reserved: the XDP reconciler is not shipped (the in-kernel
+    /// pre-filter track is frozen — see issue #53). The field is kept so
+    /// the TOML schema stays stable if that work is ever picked up.
     #[allow(dead_code)]
     #[serde(default = "default_aimp_xdp_threshold")]
     pub xdp_block_threshold: f32,

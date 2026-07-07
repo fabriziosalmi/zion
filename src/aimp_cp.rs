@@ -804,14 +804,12 @@ async fn run_anti_entropy(
 
 // ── Cross-track wire (Track B3: CRDT update → data plane) ────────────
 //
-// (Track B3 v0 lived here as `spawn_xdp_sync(cp, Arc<XdpHandle>, ...)`.
-//  Removed for v0.2.x because the function references `crate::xdp::*`,
-//  which is fine inside the zion *binary* but breaks the example
-//  crates in `examples/aimp_*.rs` — those use `#[path = "../src/aimp_cp.rs"]`
-//  to embed this file as a private module, and their crate root has
-//  no `xdp` module to satisfy the path. The reconciler will land back
-//  in its own file `src/aimp_xdp_sync.rs` (only declared in main.rs)
-//  in the next PR, so examples never see it.)
+// (Track B3 v0 once lived here as `spawn_xdp_sync(cp, Arc<XdpHandle>, ...)`,
+//  reconciling AIMP reputation into an XDP LPM-trie drop. The in-kernel
+//  pre-filter track (XDP / eBPF demux) is frozen — see issue #53 — so the
+//  reconciler and its `src/xdp.rs` / `src/aimp_xdp_sync.rs` modules were
+//  removed. AIMP still gossips reputation; enforcement stays in the
+//  userspace WAF/rate-limit path.)
 
 // ── Helpers ──────────────────────────────────────────────────────────
 

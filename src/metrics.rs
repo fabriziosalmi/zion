@@ -563,8 +563,7 @@ impl Metrics {
     #[cfg(target_os = "linux")]
     pub fn sample_resource_gauges(&self) {
         // `/proc/self/status` exposes `VmRSS:\t<N> kB` — the resident set
-        // size directly in kibibytes. This is the same file bpf_demux.rs
-        // already reads for capability probing, so no new syscall surface.
+        // size directly in kibibytes.
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
             if let Some(kib) = status
                 .lines()
@@ -1117,10 +1116,6 @@ pub fn snapshot_json(
             // NUMA topology — 1 unless built with `--features numa-aware`
             // on a multi-socket Linux box (issue #50).
             "numa_nodes": platform.numa_nodes,
-            // Whether the running kernel supports io_uring rw surface
-            // (≥ 5.19). Independent of build features — even non-Linux
-            // hosts surface this, always as `false`. (issue #51)
-            "has_io_uring_rw_kernel": platform.has_io_uring_rw_kernel,
         },
         "metrics": {
             "requests_total": m.requests_total.load(Relaxed),

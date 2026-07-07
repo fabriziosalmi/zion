@@ -216,9 +216,8 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 **Operations** — fail-fast config validation, graceful 30 s drain, [adaptive upstream recovery](#) (decorrelated-jitter backoff: a recovered origin returns in ~1.4 s vs up to 30 s), boot-time platform auto-detection + performance-tier calibration, `zion doctor` diagnostics, TCP tuning (NODELAY / DEFER_ACCEPT / FASTOPEN / QUICKACK), systemd unit + Docker HEALTHCHECK.
 
 **Opt-in tracks (feature-gated, default-off)**
-- **XDP pre-filter** (`--features xdp`, Linux) — eBPF LPM-trie source drop at the NIC driver layer; blocked IPs never reach the TLS handshake.
-- **kTLS offload** (`--features ktls`, Linux 5.10+) — flips the socket into in-kernel TLS after handshake, unlocking `sendfile`-class zero-copy for cache hits.
-- **ML-augmented WAF** (`--features ml-waf`) — 16-dim tract-onnx scorer on the WAF hot path (200 µs p99 budget), advisory metric/header — never a hard gate.
+- **kTLS offload** (`--features ktls`, Linux 5.10+) — *experimental*: flips the socket into in-kernel TLS after handshake toward `sendfile`-class zero-copy. The offload is wired but not yet exercised end-to-end in CI (issue #52).
+- **ML-augmented WAF** (`--features ml-waf`) — *experimental*: 16-dim tract-onnx scorer on the WAF hot path (200 µs p99 budget), advisory metric/header — never a hard gate. Ships no bundled model.
 - **AIMP serverless mesh** (`--features sovereign-aimp`) — Ed25519-signed UDP gossip of WAF deltas + IP reputation across a fleet, no central control plane.
 
 ## Sovereign edge & DDoS resistance
@@ -229,7 +228,6 @@ layered, outside-in:
 
 | Layer | Primitive | Status |
 |---|---|---|
-| **L3/4 — NIC** | XDP eBPF LPM-trie source drop (`--features xdp`); blocked IPs never reach the handshake. AIMP-synced blocklist feeds the trie. | ✅ shipping |
 | **L7 — pre-routing** | Zero-cost edge gates before any work: URI-length cap, method whitelist, XFF-spoof-resistant client-IP resolution. | ✅ shipping |
 | **L7 — admission** | Per-IP **rate** limiter (`429` over budget) **and** per-IP **concurrent-connection** cap (enforced at accept, before the TLS handshake) — the lever a slow/backed flood actually hits. | ✅ shipping |
 | **L7 — inspection** | WAF: zero-regex Aho-Corasick O(N) single-pass, entropy, simd-json limits, 5 gates. | ✅ shipping |
