@@ -22,7 +22,7 @@ Zion is a TLS reverse proxy with a built-in WAF, written in Rust. One binary, on
 | ML-augmented WAF (experimental) | 16-dim ONNX model on the WAF hot path, 200µs p99 budget. Score is a signal, never a hard gate; ships no bundled model. `--features ml-waf` |
 | AIMP mesh (v0.2.x) | Ed25519-signed UDP gossip of WAF + IP-reputation deltas across a fleet. Anti-entropy convergence. `--features sovereign-aimp` |
 
-## When to Use Zion
+## When to use Zion
 
 - You need a TLS termination proxy with integrated request inspection
 - You are proxying to internal HTTP services (APIs, SSR frameworks, SPAs)

@@ -14,7 +14,7 @@ upstream = "backend"
 cors     = { allowed_origins = ["https://app.example.com", "https://admin.example.com"], allowed_headers = ["Content-Type", "Authorization", "X-Requested-With"], max_age = 86400 }
 ```
 
-### Wildcard Origin
+### Wildcard origin
 
 ```toml
 [[route]]
@@ -33,17 +33,17 @@ When `*` is present, `Access-Control-Allow-Origin: *` is returned for all reques
 | `allowed_headers` | string[] | `["Content-Type", "Authorization", "X-Requested-With"]` | Headers allowed in requests |
 | `max_age` | u64 | `86400` (24 hours) | Seconds the browser may cache pre-flight results |
 
-## Allowed Methods
+## Allowed methods
 
 The following methods are always permitted when CORS is enabled:
 
-```
+```text
 GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS
 ```
 
 This list is not configurable -- it matches Zion's method whitelist.
 
-## Pre-flight Handling
+## Pre-flight handling
 
 When CORS is enabled and the request is `OPTIONS` with a matching `Origin` header:
 
@@ -54,7 +54,7 @@ When CORS is enabled and the request is `OPTIONS` with a matching `Origin` heade
 
 For non-OPTIONS requests with a matching origin, Zion adds `Access-Control-Allow-Origin` to the proxied response.
 
-## Origin Matching
+## Origin matching
 
 - Origins are compared as exact string matches against the `Origin` request header
 - If the origin is not in the allowed list, no CORS headers are added (browser enforces the restriction)

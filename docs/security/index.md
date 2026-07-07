@@ -1,12 +1,12 @@
-# WAF Pipeline
+# WAF pipeline
 
 Zion's WAF is a 5-gate pipeline. Each gate is fail-fast: the first denial terminates inspection and returns `400 Bad Request` (or `413` for size violations). No gate uses regex; pattern matching uses the [Aho-Corasick](https://en.wikipedia.org/wiki/Aho%E2%80%93Corasick_algorithm) algorithm — a deterministic finite automaton, no backtracking, immune to ReDoS by construction.
 
 The Aho-Corasick automaton has two pattern sets, selected per-profile via `mode = "balanced" | "aggressive"`. See [WAF Configuration → Detection Modes](../config/waf.md#detection-modes) for the full breakdown of what lives in each set.
 
-## Gate Architecture
+## Gate architecture
 
-```
+```text
 Request Body
     │
     ▼
@@ -64,7 +64,7 @@ GET, HEAD, OPTIONS skip Gates 2–5 (no body to inspect). DELETE bodies are insp
 
 Earlier versions of this page advertised a sixth "fixed-length profiling" gate and a SIMD pre-filter using `memchr3`. Neither was ever implemented; the descriptions have been removed to keep docs and code in lock-step.
 
-## Pattern Categories (Gate 3)
+## Pattern categories (Gate 3)
 
 The exact pattern lists are in [`src/waf.rs`](https://github.com/fabriziosalmi/zion/blob/master/src/waf.rs) (`BALANCED_PATTERNS` and `AGGRESSIVE_EXTRA_PATTERNS`). Summary by family:
 
@@ -84,7 +84,7 @@ The exact pattern lists are in [`src/waf.rs`](https://github.com/fabriziosalmi/z
 | NoSQL operators | — | `$gt`, `$ne`, `$regex`, `$where`, `$lookup`, `db.collection`, `.find({` |
 | Deserialization (RCE) | — | Java (`Runtime.getRuntime`, `ProcessBuilder`, `ObjectInputStream`); Python (`pickle.loads`, `__reduce__`, `__import__(`, `subprocess.call`, `os.system(`, `os.popen(`) |
 
-## Aho-Corasick Properties
+## Aho-Corasick properties
 
 - **Algorithm**: Aho-Corasick multi-pattern matching (DFA).
 - **Complexity**: O(N) where N is body length, regardless of pattern count. Adding patterns grows automaton memory (~50 bytes per pattern) but does not change scan time.
@@ -92,7 +92,7 @@ The exact pattern lists are in [`src/waf.rs`](https://github.com/fabriziosalmi/z
 - **Case sensitivity**: ASCII case-insensitive.
 - **No regex**: deterministic finite automaton, no backtracking.
 
-## Entropy Analysis (Gate 4)
+## Entropy analysis (Gate 4)
 
 Shannon entropy is a heuristic for "this body looks obfuscated / encrypted / packed rather than human text or normal JSON." The default threshold sits intentionally above the theoretical maximum of pure base64 (6.0 bits/byte) so that JWTs, signed URLs, and base64 payloads pass; only near-random / encrypted blobs (~7.5–8.0 bits/byte) are flagged.
 
@@ -108,7 +108,7 @@ For `application/json` content-types, the calculation is restricted to bytes **i
 
 The threshold is per-profile (`entropy_threshold`); the gate can be turned off per-profile (`entropy_check = false`).
 
-## JSON Validation (Gate 5)
+## JSON validation (Gate 5)
 
 Two-phase validation for `application/json` bodies:
 

@@ -2,7 +2,7 @@
 
 Zion applies security defaults that can be overridden via configuration.
 
-## Response Headers
+## Response headers
 
 Every HTTPS response includes these security headers (stored as static `HeaderValue` constants):
 
@@ -15,21 +15,21 @@ Every HTTPS response includes these security headers (stored as static `HeaderVa
 | `Permissions-Policy` | `camera=(), microphone=(), geolocation=(), payment=()` | Disable browser APIs |
 | `Server` | *(removed)* | No server identification |
 
-## Method Whitelist
+## Method whitelist
 
 Only these HTTP methods are accepted. All others return `405 Method Not Allowed`:
 
-```
+```http
 GET  POST  PUT  PATCH  DELETE  HEAD  OPTIONS
 ```
 
 This blocks `TRACE` (cross-site tracing), `CONNECT` (proxy tunneling), and non-standard methods before any processing occurs.
 
-## URI Length Limit
+## URI length limit
 
 Requests with URI paths exceeding **8,192 bytes** return `414 URI Too Long`.
 
-## Header Limits
+## Header limits
 
 Hyper is configured with reduced header limits compared to defaults:
 
@@ -38,7 +38,7 @@ Hyper is configured with reduced header limits compared to defaults:
 | Max header count | 64 | 100 |
 | Max header buffer | 16 KB | 400 KB |
 
-## Rate Limiting
+## Rate limiting
 
 Per-IP rate limiting using `DashMap` with atomic counters:
 
@@ -59,17 +59,17 @@ When `rate_limit_rps = 0` (default), rate limiting is disabled — the code retu
 | Upstream connect | 3 seconds (configurable) | Fail fast on dead upstreams |
 | Connection pool idle | 30 seconds | Reclaim unused upstream connections |
 
-## Connection Limit
+## Connection limit
 
 Maximum concurrent connections are bounded by a `Semaphore` sized to available RAM:
 
-```
+```text
 conn_limit = (RAM_MB / 4) * 1024 / 50    # ~50KB per TLS connection estimate
 ```
 
 Clamped to 1,000–100,000. Connections beyond the limit are silently dropped at the TCP level.
 
-## HTTP to HTTPS Redirect
+## HTTP to HTTPS redirect
 
 Port 80 serves only two purposes:
 
@@ -80,18 +80,18 @@ The `Host` header is validated before use in the redirect URL:
 - Must be non-empty and <= 253 characters
 - Must not contain `/`, `\`, `@`, newlines, or spaces
 
-## Internal-Only Routes
+## Internal-only routes
 
 Routes marked with `internal_only = true` are restricted to private IPs:
 
-```
+```text
 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12,
 192.168.0.0/16, 169.254.0.0/16, ::1
 ```
 
 External requests receive `403 Forbidden`.
 
-## Linux-Specific Options
+## Linux-specific options
 
 On Linux, Zion enables additional socket options when the kernel supports them:
 
@@ -99,22 +99,22 @@ On Linux, Zion enables additional socket options when the kernel supports them:
 - `TCP_FASTOPEN`: TFO for returning clients (requires kernel support)
 - `SO_REUSEPORT`: Kernel-level connection distribution across listeners
 
-## 0-RTT Replay Protection
+## 0-RTT replay protection
 
 TLS 1.3 0-RTT is enabled but gated by HTTP method. Non-idempotent methods (`POST`, `PUT`, `PATCH`, `DELETE`) on early data receive `425 Too Early` (RFC 8470). Only `GET` and `HEAD` are allowed on 0-RTT data.
 
 See [TLS Configuration → 0-RTT Replay Protection](../config/tls.md#_0-rtt-replay-protection) for details.
 
-## Hop-by-Hop Header Stripping
+## Hop-by-hop header stripping
 
 Zion strips the following hop-by-hop headers from upstream responses before forwarding to clients (RFC 7230 §6.1):
 
-```
+```text
 Connection, Keep-Alive, Proxy-Authenticate, Proxy-Authorization,
 TE, Trailer, Transfer-Encoding, Upgrade
 ```
 
-## X-Forwarded-For Policy (`xff_mode`)
+## X-Forwarded-For policy (`xff_mode`)
 
 Outbound XFF behaviour is configured at `[server]` level. The default (`append`) preserves the prior behaviour and is correct when Zion sits behind a sanitising edge (CDN/ALB) that has already vetted the inbound chain. When Zion is the **front edge**, the default is unsafe: a client can send `X-Forwarded-For: 1.2.3.4` and the leftmost entry in the chain forwarded to your upstream will be that attacker-controlled value. Downstream apps that read `XFF[0]` for ACL or audit will be tricked.
 
@@ -131,11 +131,11 @@ xff_mode = "rewrite"   # one of: "append" | "rewrite" | "drop"
 
 `X-Real-IP` is **always** set from the resolved client IP and never trusted from inbound headers, regardless of `xff_mode`. The "resolved client IP" is the output of `TrustedProxies::resolve_client_ip`: the rightmost X-Forwarded-For entry that is not a trusted-proxy CIDR, or the TCP peer IP when no proxies are configured.
 
-## mTLS Client Certificate Forwarding
+## mTLS client certificate forwarding
 
 When the TLS listener is configured with client-certificate verification (`client_ca_path` set, `client_auth = "required"` or `"optional"`), Zion extracts a stable identifier from the leaf peer certificate and forwards it to upstreams as:
 
-```
+```http
 X-Client-Cert-Fingerprint: sha256:<64 hex chars>
 ```
 

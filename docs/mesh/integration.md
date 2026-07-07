@@ -209,7 +209,7 @@ checklist:
 5. **Clock skew?** AIMP envelopes include a timestamp; large skews
    may cause replays to be rejected. NTP is required.
 
-## Deferred / Tracked
+## Deferred / tracked
 
 Items listed in ADR-0008 "Negative consequences" or referenced above:
 

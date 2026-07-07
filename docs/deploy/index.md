@@ -94,7 +94,7 @@ docker run -d \
   --name zion zion
 ```
 
-## Config Validation
+## Config validation
 
 Zion validates the entire configuration at startup and exits with code 1 on any error. Checked items:
 
@@ -112,7 +112,7 @@ Run a dry validation by starting Zion and checking exit code:
 ZION_CONFIG=./zion.toml ./zion && echo "Config OK"
 ```
 
-## Graceful Shutdown
+## Graceful shutdown
 
 Zion handles `SIGINT` (Ctrl+C) and `SIGTERM`:
 
@@ -122,7 +122,7 @@ Zion handles `SIGINT` (Ctrl+C) and `SIGTERM`:
 
 This works by acquiring all semaphore permits (connection limit). When all active connections release their permits, the drain is complete.
 
-## Certificate Renewal
+## Certificate renewal
 
 With `hot_reload = true` (default), certificate renewal requires no restart:
 

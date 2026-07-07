@@ -8,7 +8,7 @@ Zion supports per-route JWT validation as an optional authentication gate. Token
 
 ## Configuration
 
-### HMAC (Symmetric)
+### HMAC (symmetric)
 
 For internal microservices using shared secrets:
 
@@ -21,7 +21,7 @@ audience = "api.internal"
 forward_claims = true
 ```
 
-### OIDC (Asymmetric)
+### OIDC (asymmetric)
 
 For external identity providers (Auth0, Keycloak, Okta):
 
@@ -34,7 +34,7 @@ audience = "api.example.com"
 forward_claims = true
 ```
 
-### Route Assignment
+### Route assignment
 
 ```toml
 [[route]]
@@ -55,7 +55,7 @@ waf = true
 | `audience` | string | — | Expected `aud` claim (optional) |
 | `forward_claims` | bool | `true` | Inject `X-Auth-Subject` and `X-Auth-Email` headers to upstream |
 
-## Supported Algorithms
+## Supported algorithms
 
 | Algorithm | Type | Use Case |
 |-----------|------|----------|
@@ -70,7 +70,7 @@ waf = true
 3. **Expired token**: Returns `401 Unauthorized` with body `token expired`
 4. **Valid token**: Request proceeds to upstream with optional claim headers
 
-### Claim Forwarding
+### Claim forwarding
 
 When `forward_claims = true`, decoded claims are injected as headers:
 
@@ -79,18 +79,18 @@ When `forward_claims = true`, decoded claims are injected as headers:
 | `X-Auth-Subject` | `sub` | User ID / subject |
 | `X-Auth-Email` | `email` | User email (if present in token) |
 
-### JWKS Refresh
+### JWKS refresh
 
 - JWKS is fetched at startup and refreshed every **1 hour**
 - On fetch failure, retries with **exponential backoff** (5s, 10s, 20s, ... up to 1h)
 - HTTP client failure is retried indefinitely (never gives up permanently)
 - Clock skew tolerance: **30 seconds** (leeway for distributed systems)
 
-## Bearer Token Extraction
+## Bearer token extraction
 
 The `Authorization` header is parsed case-insensitively per [RFC 6750 Section 2.1](https://datatracker.ietf.org/doc/html/rfc6750#section-2.1):
 
-```
+```http
 Authorization: Bearer eyJhbGciOiJSUzI1NiJ9...
 Authorization: bearer eyJhbGciOiJSUzI1NiJ9...    # also accepted
 Authorization: BEARER eyJhbGciOiJSUzI1NiJ9...    # also accepted

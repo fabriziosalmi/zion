@@ -61,7 +61,7 @@ The `(bench TODO)` rows will land alongside [#72 (Bench: --features
 mesh cost at idle and at saturation)](https://github.com/fabriziosalmi/zion/issues/72)
 once the mesh has a saturation workload to measure against.
 
-## What's NOT measured here
+## What's not measured here
 
 - **Tracing span overhead** — `tracing::info_span!` is gated by the
   active subscriber. Under `RUST_LOG=warn` (production default) the

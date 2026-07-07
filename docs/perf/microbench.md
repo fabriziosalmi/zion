@@ -12,7 +12,7 @@ changes* (NUMA sharding, io_uring, kTLS, BPF, scanner tweaks).
 
 ## Layout
 
-```
+```text
 benches/
   waf_streaming.rs       — buffered vs StreamingScanner, 1KB→10MB sweep
   sovereign.rs           — record_classification + classify

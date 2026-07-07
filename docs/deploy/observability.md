@@ -22,11 +22,11 @@ always respond even under load. `/metrics`, `/_zion/snapshot.json`, and
 `/_zion/cache/purge` are restricted to internal source IPs (external clients get
 `403`).
 
-## Prometheus Metrics
+## Prometheus metrics
 
 `GET /metrics` returns counters in Prometheus text exposition format (`text/plain; version=0.0.4`).
 
-### Counter Reference
+### Counter reference
 
 This table is the authoritative list — every counter `/metrics` emits appears
 here. All are lock-free atomic `u64` (a `fetch_add` with `Relaxed` ordering,
@@ -118,7 +118,7 @@ output they also carry trace-ID exemplars.
 | `zion_upstream_duration_seconds` | Time spent waiting on the upstream |
 | `zion_tls_handshake_duration_seconds` | TLS handshake duration |
 
-### Runtime Resource Gauges
+### Runtime resource gauges
 
 `/metrics` also exposes process self-introspection gauges, so you can watch the daemon's own footprint live — and catch a slow leak (for example ~1 MB per 1000 connections) by its RSS slope, without restarting under a profiler.
 
@@ -130,7 +130,7 @@ output they also carry trace-ID exemplars.
 
 The two `process_*` gauges are sampled from `/proc/self` **once per scrape** — the `/metrics` render is cached for one second, so the two small file reads never run on the hot connection path. The same values are surfaced in `/_zion/snapshot.json` and the `zion top` TUI ("rss" / "open fds" rows). They are Linux-only; on macOS/Windows they render as `0` so one dashboard works across hosts. Run `zion doctor` to confirm the host actually exposes `/proc/self/status` — a hardened container runtime that masks `/proc` will report `0` here, and the check warns you up front.
 
-### Prometheus Scrape Config
+### Prometheus scrape config
 
 ```yaml
 scrape_configs:
@@ -142,7 +142,7 @@ scrape_configs:
       insecure_skip_verify: true  # if using self-signed certs
 ```
 
-### Grafana Dashboard
+### Grafana dashboard
 
 An importable dashboard covering the whole fleet — golden signals, security,
 TLS/upstream, a **leak-watch** row (RSS slope + open FDs per instance), protocols
@@ -205,7 +205,7 @@ Every HTTPS response includes an `X-Request-ID` header for request tracing.
 
 The counter is a global atomic `u64`, ensuring uniqueness across all concurrent requests.
 
-## Structured Logging
+## Structured logging
 
 Configure log format in `[server]`:
 
@@ -214,15 +214,15 @@ Configure log format in `[server]`:
 log_format = "json"   # or "text" (default)
 ```
 
-### Text Format (default, development)
+### Text format (default, development)
 
-```
+```text
 config loaded from zion.toml
   route /api/{*rest} -> backend [waf=strict, cache=off]
 ZION ONLINE.
 ```
 
-### JSON Format (production)
+### JSON format (production)
 
 ```json
 {"ts":"1712000000","level":"info","event":"config","msg":"loaded from zion.toml"}
@@ -238,7 +238,7 @@ JSON logs are structured for ingestion by Loki, ELK, Datadog, or any log aggrega
 | `event` | Event category (e.g., `config`, `health`, `shutdown`, `tls`) |
 | `msg` | Human-readable message |
 
-## Upstream Health Monitoring
+## Upstream health monitoring
 
 Zion runs a background health checker that pings all unique upstream URLs every 30 seconds:
 

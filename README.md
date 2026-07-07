@@ -183,7 +183,7 @@ survives. See [zion.example.toml](zion.example.toml) for the full reference and
 
 ## Architecture
 
-```
+```text
 Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) -> Proxy/Cache -> Upstream
                          |                                |
                     URI limit                  Aho-Corasick (~100 balanced / ~240 aggressive)

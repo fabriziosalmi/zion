@@ -8,7 +8,7 @@
 - A TLS certificate and key (PEM format)
 - An upstream HTTP service to proxy to
 
-## Build from Source
+## Build from source
 
 ```bash
 git clone https://github.com/fabriziosalmi/zion.git
@@ -18,7 +18,7 @@ cargo build --release
 
 The binary is at `target/release/zion` (~5 MB).
 
-## Minimal Configuration
+## Minimal configuration
 
 Create `zion.toml`:
 
@@ -44,7 +44,7 @@ path = "/{*rest}"
 upstream = "backend"
 ```
 
-## Generate a Self-Signed Certificate (dev only)
+## Generate a self-signed certificate (dev only)
 
 ```bash
 mkdir -p /etc/ssl/zion
@@ -66,7 +66,7 @@ ZION_CONFIG=/etc/zion/zion.toml ./target/release/zion
 
 On startup, Zion prints a platform detection matrix and route table:
 
-```
+```text
 ZION EDGE GATEWAY -- initializing...
   ┌────────────────────────────────────────────┐
   │ PLATFORM DETECTION                         │
@@ -98,7 +98,7 @@ curl -I http://localhost/
 # => 301 Moved Permanently, Location: https://...
 ```
 
-## Next Steps
+## Next steps
 
 - [Configuration Reference](/config/) -- all TOML sections
 - [WAF Configuration](/config/waf) -- profiles and tuning

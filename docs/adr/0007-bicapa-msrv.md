@@ -53,7 +53,7 @@ binaries with.
   toolchain. Any transitive dep change that breaks the floor fails CI.
 - **Negative**: README / Cargo.toml carry a small "1.82 core / 1.88 full"
   caveat instead of a single number. We documented it explicitly:
-  ```
+  ```toml
   # MSRV is the *core* default-features build (TLS proxy + WAF + cache
   # + metrics). Opt-in features (acme, auth, init, http3) pull
   # crypto/i18n crates that have their own, faster-moving MSRV.

@@ -1,4 +1,4 @@
-# Supply Chain Security
+# Supply chain security
 
 Every Zion release ships with cryptographic evidence — provenance, SBOM, and
 signatures — that lets a consumer verify *what* they're running and *where it
@@ -215,7 +215,7 @@ releases. CI must run a `cargo-vet` that can read what your local one
 wrote — a newer CI tool reads an older lock fine, but an **older** CI
 tool rejects a newer lock with a hard parse error, e.g.:
 
-```
+```text
 ERROR × Failed to parse toml file
   ╰─▶ missing field `user-id` for key `publisher.<crate>` at imports.lock:NNNN
 ```

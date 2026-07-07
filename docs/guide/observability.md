@@ -49,7 +49,7 @@ To verify export end-to-end without a collector, point `OTEL_EXPORTER_OTLP_ENDPO
 
 `/metrics` is now OpenMetrics-compatible. Histogram buckets gain a per-bucket exemplar suffix that links to the latest slow request:
 
-```
+```text
 zion_request_duration_seconds_bucket{le="0.512"} 17 # {trace_id="0af7651916cd43dd8448eb211c80319c"} 0.481234 1714896000.123
 ```
 
@@ -73,7 +73,7 @@ classified against the baked-in CIDR dataset (an O(log N) binary search
 + one relaxed `fetch_add` — no allocation, no syscall, no external GeoIP
 DB) and tallied:
 
-```
+```text
 zion_sovereign_classifications_total{class="eu"}              42891
 zion_sovereign_classifications_total{class="gov_eu"}            317
 zion_sovereign_classifications_total{class="residential_eu"}  18044
@@ -108,7 +108,7 @@ mesh-reputation threshold) into a hard `403` deny — e.g. `deny =
 classes pass (the sovereign allowlist *by complement*). Denials are
 counted, split by reason:
 
-```
+```text
 zion_enforcement_denied_total{reason="class"}       1043
 zion_enforcement_denied_total{reason="mesh_score"}    77
 ```
@@ -123,7 +123,7 @@ pays wall-clock and socket budget. A hard global ceiling (`max_concurrent`)
 sheds back to an immediate `403` at capacity, and is clamped at config-load
 to ¼ of the global connection pool so held connections can't pin admission.
 
-```
+```text
 zion_tarpit_active        12     # gauge: connections currently held
 zion_tarpit_total       4310     # counter: total ever held
 zion_tarpit_shed_total   118     # counter: shed to immediate 403 at the ceiling

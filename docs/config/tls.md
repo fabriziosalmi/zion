@@ -2,7 +2,7 @@
 
 Zion terminates TLS using [rustls](https://github.com/rustls/rustls) with the aws-lc-rs cryptography backend. No OpenSSL dependency.
 
-## Basic Configuration
+## Basic configuration
 
 ```toml
 [tls]
@@ -12,7 +12,7 @@ key_path = "/etc/ssl/zion/tls.key"
 
 Both files must be PEM-encoded. The certificate file should contain the full chain (leaf + intermediates).
 
-## TLS Version Control
+## TLS version control
 
 ```toml
 [tls]
@@ -22,7 +22,7 @@ min_version = "1.3"   # Default: TLS 1.3 only (fastest handshake)
 
 TLS 1.3 is the default because it has a shorter handshake (1-RTT vs 2-RTT) and mandatory forward secrecy. Set `"1.2"` only if you need to support older clients.
 
-## ALPN Negotiation
+## ALPN negotiation
 
 ```toml
 [tls]
@@ -30,7 +30,7 @@ alpn = ["h2", "http/1.1"]   # Default: HTTP/2 preferred
 # alpn = ["http/1.1"]       # HTTP/1.1 only
 ```
 
-## Multi-Domain SNI
+## Multi-domain SNI
 
 For multiple domains on the same IP, add `[[tls.sni]]` entries:
 
@@ -59,7 +59,7 @@ Zion selects the resolver mode at boot:
 
 If the client's SNI does not match any entry, the default certificate is used as fallback.
 
-## Hot-Reload
+## Hot-reload
 
 ```toml
 [tls]
@@ -76,7 +76,7 @@ When enabled, Zion watches the certificate directory using `notify` (inotify on 
 
 If the reload fails (bad cert, missing file), the previous configuration is retained and an error is logged. No downtime in any case.
 
-## Session Resumption & 0-RTT
+## Session resumption & 0-RTT
 
 Zion configures aggressive session resumption by default:
 
@@ -88,7 +88,7 @@ Zion configures aggressive session resumption by default:
 
 Each cached/ticketed session avoids a full ECDHE key exchange (~1ms saved per resumed handshake).
 
-### 0-RTT Replay Protection
+### 0-RTT replay protection
 
 TLS 1.3 0-RTT allows clients to send data in the first flight on resumed connections, saving ~35% handshake latency. However, early data can be **replayed** by network attackers.
 
@@ -103,7 +103,7 @@ When a non-idempotent request arrives on early data, Zion responds with `425 Too
 
 The early data flag is consumed via an `AtomicBool` on first request per connection — only the first request can be 0-RTT, all subsequent requests on the same connection proceed normally.
 
-## TLS Handshake Timeout
+## TLS handshake timeout
 
 TLS handshakes are limited to 10 seconds. Connections that do not complete the handshake within this window are dropped. Failed handshakes are counted in `zion_tls_handshake_errors`.
 
@@ -134,7 +134,7 @@ renew_before_days = 30
 | `state_dir` | `/var/lib/zion/acme` | Directory for account credentials and cert/state persistence |
 | `renew_before_days` | `30` | Start renewal this many days before expiry |
 
-### How It Works
+### How it works
 
 1. Background task checks certificate expiry every 12 hours
 2. If cert expires within `renew_before_days`, initiates ACME order
@@ -143,11 +143,11 @@ renew_before_days = 30
 5. Writes cert + key to `cert_path` / `key_path`
 6. Hot-reloads TLS via `ArcSwap` — zero downtime
 
-### Account Persistence
+### Account persistence
 
 ACME account credentials are saved to `state_dir/account.json` on first run. Subsequent runs reuse the existing account.
 
-### Staging / Testing
+### Staging / testing
 
 For testing, use the Let's Encrypt staging environment:
 
