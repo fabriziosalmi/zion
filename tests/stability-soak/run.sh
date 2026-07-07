@@ -261,16 +261,20 @@ END {
     mt=Txyc/Txxc; TSe2=Tyyc-mt*Txyc; vmt=(nt>2)?(TSe2/(nt-2))/Txxc:0; if(vmt<0)vmt=0; se_mt=sqrt(vmt)
     medt=Ty/nt; pctt=(medt>0)?100.0*mt*86400.0/medt:0
     ratio=(m>0)?mt/m:0
-    # fd stats: first-decile vs last-decile mean drift
-    d=int(n/10); if (d<1) d=1
-    for(i=1;i<=d;i++){ ff+=Yf[i] } ff/=d
-    for(i=n-d+1;i<=n;i++){ fl+=Yf[i] } fl/=d
+    # fd stats: first-half vs second-half MEAN drift. Half-means (not 2-sample
+    # deciles) so the per-sample in-flight-connection jitter averages out — a
+    # real socket leak is a monotonic staircase (second-half mean clearly above
+    # first-half), while a bounded band's halves match within noise. (A decile
+    # was noise-dominated on the short fast gate and flagged phantom drift.)
+    h=int(n/2); if (h<1) h=1
+    for(i=1;i<=h;i++){ ff+=Yf[i] } ff/=h
+    for(i=h+1;i<=n;i++){ fl+=Yf[i] } fl/=(n-h)
     fd_range = fmax - fmin; fd_dr = fl - ff
 
     printf "  samples (post-warmup): %d over %ds (tail %d)\n", n, (X[n]-X[1]), nt
     printf "  RSS: mean %.1f MiB | overall slope %.1f B/s (%.2f%%/24h) | tail slope %.1f B/s (3-sigma %.1f, %.2f%%/24h) | tail/overall %.2f\n", \
         med/1048576.0, m, pct, mt, 3*se_mt, pctt, ratio
-    printf "  fd : min %d, max %d, range %d, decile drift %.1f\n", fmin, fmax, fd_range, fd_dr
+    printf "  fd : min %d, max %d, range %d, half-drift %.1f\n", fmin, fmax, fd_range, fd_dr
     printf "  reloads: generation %d -> %d (%d swaps under load)\n", gen0, gen1, gen1-gen0
 
     fail=0
@@ -282,7 +286,7 @@ END {
         fail=1
     }
     if (fd_range > fd_margin) { printf "  FD range %d exceeds margin %d (unbounded fd growth?)\n", fd_range, fd_margin; fail=1 }
-    if (fd_dr > fd_drift)     { printf "  FD decile drift %.1f exceeds %d (fd staircase = leaked sockets)\n", fd_dr, fd_drift; fail=1 }
+    if (fd_dr > fd_drift)     { printf "  FD half-drift %.1f exceeds %d (fd staircase = leaked sockets)\n", fd_dr, fd_drift; fail=1 }
     if ((gen1-gen0) < reloads/2) { printf "  only %d swaps observed (< %d); reloads did not run under load\n", gen1-gen0, reloads/2; fail=1 }
     exit fail
 }

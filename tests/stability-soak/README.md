@@ -43,8 +43,10 @@ log on disk, off by default) are out of scope and tracked in their own issues.
   slope (`tail/overall ≥ 0.5` — i.e. not settling). A decelerating ramp or a
   noise-band trend passes. The raw per-sample table is printed to the log so
   the curve shape is auditable, not just the summary slope.
-- **fds:** bounded range and no decile-over-decile drift — a leaked socket
-  shows as a clean upward staircase.
+- **fds:** bounded range and no first-half-to-second-half mean drift — a leaked
+  socket shows as a clean upward staircase; the half-means average out the
+  per-sample in-flight-connection jitter (a 2-sample decile was noise-dominated
+  on the short gate and flagged phantom drift).
 - **reloads:** the config generation must have advanced under load (else the
   swaps didn't overlap the traffic and the Arc lifecycle wasn't tested).
 
