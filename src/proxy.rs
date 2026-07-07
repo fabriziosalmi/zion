@@ -752,28 +752,39 @@ async fn send_ws_upgrade(
     // The previous implementation only had the 24h cap, allowing idle
     // connections to hold resources indefinitely (Slowloris-style exhaustion).
     tokio::spawn(async move {
-        if let Ok(client_upgraded) = on_client_upgrade.await {
-            let mut c = hyper_util::rt::TokioIo::new(client_upgraded);
-            let mut u = hyper_util::rt::TokioIo::new(upstream_upgraded);
-
-            let max_session = std::time::Duration::from_secs(24 * 60 * 60);
-            let idle_timeout = std::time::Duration::from_secs(5 * 60);
-
-            let session_deadline = tokio::time::Instant::now() + max_session;
-
-            let ws_pipe = async {
-                // copy_bidirectional runs until either side closes or errors.
-                // The idle timeout tears down completely silent sessions.
-                let _ = tokio::time::timeout(
-                    idle_timeout,
-                    tokio::io::copy_bidirectional(&mut c, &mut u),
-                )
-                .await;
+        // Bound the upgrade handoff itself. `on_client_upgrade` normally
+        // resolves near-instantly (right after the 101 is written), but a
+        // client that vanishes in that window can otherwise leave this future
+        // pending forever — pinning `upstream_upgraded`'s socket FD for the
+        // whole process lifetime, since the idle/session timeouts below only
+        // start once the upgrade has resolved. A short cap guarantees the
+        // upstream socket is released when the handoff never completes.
+        const UPGRADE_HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        let client_upgraded =
+            match tokio::time::timeout(UPGRADE_HANDOFF_TIMEOUT, on_client_upgrade).await {
+                Ok(Ok(c)) => c,
+                // Timed out or the upgrade errored → return, dropping
+                // `upstream_upgraded` and freeing its FD.
+                _ => return,
             };
+        let mut c = hyper_util::rt::TokioIo::new(client_upgraded);
+        let mut u = hyper_util::rt::TokioIo::new(upstream_upgraded);
 
-            // Cap total session at the absolute deadline.
-            let _ = tokio::time::timeout_at(session_deadline, ws_pipe).await;
-        }
+        let max_session = std::time::Duration::from_secs(24 * 60 * 60);
+        let idle_timeout = std::time::Duration::from_secs(5 * 60);
+
+        let session_deadline = tokio::time::Instant::now() + max_session;
+
+        let ws_pipe = async {
+            // copy_bidirectional runs until either side closes or errors.
+            // The idle timeout tears down completely silent sessions.
+            let _ =
+                tokio::time::timeout(idle_timeout, tokio::io::copy_bidirectional(&mut c, &mut u))
+                    .await;
+        };
+
+        // Cap total session at the absolute deadline.
+        let _ = tokio::time::timeout_at(session_deadline, ws_pipe).await;
     });
 
     Ok(resp)
