@@ -101,22 +101,19 @@ remaining headroom is *cross-socket cache traffic on shared
 `DashMap`s* — `state.rate_map`, `state.inflight`, and the L2 cache
 shards.
 
-Why deferred:
+**Shipped (scaffold):** the `numa-aware` feature ([`src/numa.rs`](../../src/numa.rs),
+`NumaAwareMap`) splits those maps into per-NUMA-node shards routed by the
+calling thread's node. It reads `/sys/devices/system/node/` directly (no
+`libnuma` dep) and degrades transparently to a single shard on single-socket
+boxes, macOS, and Windows — so the code path is always compiled and correct;
+`bootstrap` surfaces the detected node count on `/metrics`.
 
-- Real NUMA topology is Linux-only (`libnuma`, `hwloc`); we'd need a
-  cross-platform fallback (single-shard on macOS/Windows) and a
-  feature flag to opt in.
-- `dashmap::DashMap` doesn't expose per-shard placement controls; we'd
-  need to fork or replace with a custom sharded lock-free hash.
-- The win is multi-socket-only. Single-socket boxes (which most users
-  have) gain nothing; the test harness would need a CI-runnable
-  multi-socket simulation.
-
-Path forward: write a microbenchmark that mimics
-`state.rate_map`/`state.inflight` access patterns under cross-thread
-contention, then reach for `papaya` or a custom sharded map only if
-the bench shows the expected delta on bare-metal Linux dual-socket
-hardware.
+**Still WIP:** the *measured* dual-socket win. `dashmap::DashMap` doesn't expose
+per-shard memory placement, so the current wrapper shards by node but doesn't
+yet pin each shard's allocation to that node's memory. Path forward: run
+[`benches/numa.rs`](../../benches/numa.rs) on bare-metal Linux dual-socket
+hardware to confirm the +5–10%, then, if the shard-routing alone doesn't land
+it, reach for `papaya` or a custom node-pinned sharded map.
 
 ### io_uring read/write vectored, splice/sendfile (estimate: 1–2% on large payloads)
 

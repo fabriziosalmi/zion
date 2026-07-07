@@ -27,7 +27,7 @@ external scan whose green status is the operational evidence.
 | 1.1.4 | Threat model documented | [threat-model.md](threat-model.md) | Doc reviewed; STRIDE table covers all surfaces, including [§10 Mesh (AIMP)](threat-model.md#10-mesh-aimp-integration) for `--features sovereign-aimp` |
 | 1.1.7 | Architecture documented | [adr/](../adr/) (8 ADRs) | ADR index in [adr/README.md](../adr/README.md); mesh integration captured in [ADR-0008](../adr/0008-mesh-aimp-integration.md) |
 | 1.4.5 | Data classification documented | [redact](../../src/audit.rs) policy + [`zion.toml`] `[redact]` block | proptest `redact_drops_secret_values` |
-| 1.5.2 | Serialization rejected for untrusted input | `simd-json` validation gate in [waf.rs](../../src/waf.rs) | `denies_long_string_value`, fuzz target `redact_query_string` |
+| 1.5.2 | Serialization rejected for untrusted input | `simd-json` validation gate in [waf.rs](../../src/waf.rs) | unit tests `denies_long_string_value`, `denies_deep_nesting` |
 
 ## V2 — Authentication
 
@@ -59,7 +59,7 @@ to the binary path. Enabling `--features auth` brings:
 
 | ID | Requirement | Implementation | Test / Evidence |
 |---|---|---|---|
-| 5.1.1 | Server validates all input | WAF 5-gate pipeline ([waf.rs](../../src/waf.rs)) | 60+ unit tests, 4 proptest properties, 3 fuzz targets |
+| 5.1.1 | Server validates all input | WAF 5-gate pipeline ([waf.rs](../../src/waf.rs)) | 117 unit tests in `waf.rs` |
 | 5.1.2 | HTTP parameter pollution defence | `matchit` exact-path routing; query rebuilt by [proxy.rs](../../src/proxy.rs) | unit test `denies_double_encoded_traversal` |
 | 5.1.3 | URI length limited | `MAX_URI_LEN = 8192` ([dispatch.rs](../../src/dispatch.rs)) | unit test `uri_too_long_returns_414` |
 | 5.1.4 | Header count limited | `max_headers = 64` on hyper builder ([main.rs](../../src/main.rs)) | hyper-level enforcement |

@@ -40,15 +40,26 @@ import the JSON.
   file descriptors per instance, plus an **RSS leak-slope** panel
   (`deriv(...[30m])`): a persistently positive slope while request rate is flat
   is the silent memory-leak signal a front door must never hide. ACME
-  renewals-vs-failures and sovereign classifications round it out (both no-ops
-  unless the matching feature is built in).
+  renewals-vs-failures and sovereign classifications round it out.
+- **Protocols & tarpit detail** — WebSocket upgrade rate, and tarpit requests
+  held/s plus mean hold time (`rate(zion_tarpit_held_ms_total)/rate(zion_tarpit_total)`).
+- **Mesh — AIMP fleet gossip** — mesh claims emitted/received/score-hits, claims
+  dropped by reason (signature / replay / rate / other), and gossip bandwidth
+  in/out. Flat at 0 unless the node runs `--features sovereign-aimp`.
+- **Reliability & internals** — panics/s (must stay flat 0), audit-log events vs
+  **dropped** (alert on any drop — the HMAC chain has gaps), trace emit/invalid,
+  and admin-API rejects.
+
+Every metric Zion exposes at `/metrics` has a panel here.
 
 ## Note on optional metrics
 
-Some panels reference metrics that only appear with a feature: `zion_acme_*`
-(`--features acme`) and `zion_sovereign_*` (`--features geo-ita`/`geo-eu`).
-Those panels stay empty on a default build — that's expected, not a
-misconfiguration.
+Two panels depend on a feature and read absent on a default build (that's
+expected, not a misconfiguration): `zion_sovereign_classifications_total`
+(`--features geo-ita`/`geo-eu`) is genuinely `#[cfg]`-gated. The `zion_acme_*`
+and `zion_mesh_*` metrics are **always emitted** — they render as a flat `0`
+line until you build with `--features acme` / `sovereign-aimp` respectively, so
+their panels show zero rather than "no data".
 
 The raw PromQL for each panel is also listed in
 [`docs/deploy/observability.md`](../../docs/deploy/observability.md) if you'd

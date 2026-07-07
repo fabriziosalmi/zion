@@ -56,8 +56,10 @@ anti_entropy_secs = 60                     # 0 to disable
 inbound_claims_per_sec = 0                 # 0 = no cap
 inbound_claim_burst    = 256               # headroom, used when cap > 0
 
-# Reconciler threshold for XDP→kernel drop install (0.0–1.0).
-# Default 0.95: only the highest-confidence consensus drops to LPM-trie.
+# RESERVED / inert: the AIMP→XDP reconciler is not shipped — the in-kernel
+# pre-filter track is frozen (issue #53). The key is kept so the TOML schema
+# stays stable if that work is ever picked up; setting it has no effect today.
+# (It would be the score above which a consensus block installs an LPM-trie drop.)
 xdp_block_threshold = 0.95
 ```
 

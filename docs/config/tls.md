@@ -127,7 +127,7 @@ renew_before_days = 30
 | `email` | *(required)* | Contact email for Let's Encrypt notifications |
 | `domains` | *(required)* | List of domains to request certificates for |
 | `directory_url` | LE production | ACME directory URL |
-| `state_dir` | *(required)* | Directory for account credentials and state |
+| `state_dir` | `/var/lib/zion/acme` | Directory for account credentials and cert/state persistence |
 | `renew_before_days` | `30` | Start renewal this many days before expiry |
 
 ### How It Works

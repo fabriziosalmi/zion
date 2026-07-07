@@ -1,21 +1,26 @@
 # CORS
 
-CORS is disabled by default. To enable it, add an `[cors]` section with at least one origin.
+CORS is disabled by default and is configured **per route** — there is no
+top-level `[cors]` table (the config parser rejects unknown top-level keys, so a
+`[cors]` section fails to load). Add a `cors = { … }` inline table to any
+`[[route]]` with at least one origin.
 
 ## Configuration
 
 ```toml
-[cors]
-allowed_origins = ["https://app.example.com", "https://admin.example.com"]
-allowed_headers = ["Content-Type", "Authorization", "X-Requested-With"]
-max_age = 86400
+[[route]]
+path     = "/api/{*rest}"
+upstream = "backend"
+cors     = { allowed_origins = ["https://app.example.com", "https://admin.example.com"], allowed_headers = ["Content-Type", "Authorization", "X-Requested-With"], max_age = 86400 }
 ```
 
 ### Wildcard Origin
 
 ```toml
-[cors]
-allowed_origins = ["*"]
+[[route]]
+path     = "/public/{*rest}"
+upstream = "backend"
+cors     = { allowed_origins = ["*"] }
 ```
 
 When `*` is present, `Access-Control-Allow-Origin: *` is returned for all requests. This is suitable for public APIs but not recommended for authenticated endpoints.

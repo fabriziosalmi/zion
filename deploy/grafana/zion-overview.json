@@ -201,6 +201,70 @@
     { "id": 44, "type": "timeseries", "title": "Sovereign classifications rate", "description": "Requires --features geo-ita/geo-eu.", "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
       "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
-      "targets": [ { "refId": "A", "expr": "sum by (class) (rate(zion_sovereign_classifications_total{instance=~\"$instance\"}[5m]))", "legendFormat": "{{class}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] }
+      "targets": [ { "refId": "A", "expr": "sum by (class) (rate(zion_sovereign_classifications_total{instance=~\"$instance\"}[5m]))", "legendFormat": "{{class}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] },
+
+    { "type": "row", "title": "Protocols & tarpit detail", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 }, "collapsed": false, "id": 105 },
+
+    { "id": 50, "type": "timeseries", "title": "WebSocket upgrades/s", "description": "Rate of completed WebSocket upgrades (bidirectional TLS-to-upstream pipes). zion_websocket_upgrades.", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 50 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [ { "refId": "A", "expr": "sum by (instance) (rate(zion_websocket_upgrades{instance=~\"$instance\"}[5m]))", "legendFormat": "{{instance}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] },
+
+    { "id": 51, "type": "timeseries", "title": "Tarpit — requests held/s + mean hold time", "description": "zion_tarpit_total is requests held by the L7 tarpit before rejection; mean hold = rate(zion_tarpit_held_ms_total) / rate(zion_tarpit_total).", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 50 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": [ { "matcher": { "id": "byName", "options": "mean hold (ms)" }, "properties": [ { "id": "unit", "value": "ms" }, { "id": "custom.axisPlacement", "value": "right" } ] } ] },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(zion_tarpit_total{instance=~\"$instance\"}[5m]))", "legendFormat": "held/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "sum(rate(zion_tarpit_held_ms_total{instance=~\"$instance\"}[5m])) / clamp_min(sum(rate(zion_tarpit_total{instance=~\"$instance\"}[5m])), 1)", "legendFormat": "mean hold (ms)", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ] },
+
+    { "type": "row", "title": "Mesh — AIMP fleet gossip", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 58 }, "collapsed": false, "id": 106 },
+
+    { "id": 60, "type": "timeseries", "title": "Mesh claims — emitted / received / score hits", "description": "Requires --features sovereign-aimp (metrics render as 0 otherwise). Claims published from this node, claims received+merged, and dispatcher score-lookups that found a mesh score for the client IP.", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 59 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(zion_mesh_claims_emitted_total{instance=~\"$instance\"}[5m]))", "legendFormat": "emitted/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "sum(rate(zion_mesh_claims_received_total{instance=~\"$instance\"}[5m]))", "legendFormat": "received/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "C", "expr": "sum(rate(zion_mesh_score_lookups_total{instance=~\"$instance\"}[5m]))", "legendFormat": "score hits/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ] },
+
+    { "id": 61, "type": "timeseries", "title": "Mesh claims dropped by reason", "description": "Inbound gossip envelopes rejected: signature (bad Ed25519 sig), replay (seen before), rate (per-source cap), other. A spike in signature/replay is a probing peer.", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 59 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 40, "stacking": { "mode": "normal" } } } },
+      "targets": [ { "refId": "A", "expr": "sum by (reason) (rate(zion_mesh_claims_dropped_total{instance=~\"$instance\"}[5m]))", "legendFormat": "{{reason}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] },
+
+    { "id": 62, "type": "timeseries", "title": "Gossip bandwidth (in / out)", "description": "Bytes on the UDP gossip socket. zion_mesh_gossip_bytes_in_total / _out_total.", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 59 },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(zion_mesh_gossip_bytes_in_total{instance=~\"$instance\"}[5m]))", "legendFormat": "in", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "sum(rate(zion_mesh_gossip_bytes_out_total{instance=~\"$instance\"}[5m]))", "legendFormat": "out", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ] },
+
+    { "type": "row", "title": "Reliability & internals", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 }, "collapsed": false, "id": 107 },
+
+    { "id": 70, "type": "timeseries", "title": "Panics/s (must stay flat 0)", "description": "zion_panics_total — the panic hook fired. Any non-zero rate is a bug to page on immediately.", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 68 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10, "thresholdsStyle": { "mode": "line" } }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 0.0001 } ] } } },
+      "targets": [ { "refId": "A", "expr": "sum by (instance) (rate(zion_panics_total{instance=~\"$instance\"}[5m]))", "legendFormat": "{{instance}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } } ] },
+
+    { "id": 71, "type": "timeseries", "title": "Audit log — events/s + dropped/s", "description": "zion_audit_events_total written vs zion_audit_events_dropped_total (bounded channel full). Alert on any sustained dropped rate — the audit chain has gaps.", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 68 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(zion_audit_events_total{instance=~\"$instance\"}[5m]))", "legendFormat": "events/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "sum(rate(zion_audit_events_dropped_total{instance=~\"$instance\"}[5m]))", "legendFormat": "dropped/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ] },
+
+    { "id": 72, "type": "timeseries", "title": "Tracing + admin API rejects", "description": "zion_traces_emitted_total / zion_traces_invalid_total (bad inbound traceparent) and zion_admin_rejects_total (admin API auth/rate-limit rejects).", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 68 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(zion_traces_emitted_total{instance=~\"$instance\"}[5m]))", "legendFormat": "traces/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "sum(rate(zion_traces_invalid_total{instance=~\"$instance\"}[5m]))", "legendFormat": "invalid traceparent/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "C", "expr": "sum(rate(zion_admin_rejects_total{instance=~\"$instance\"}[5m]))", "legendFormat": "admin rejects/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ] }
   ]
 }

@@ -62,8 +62,8 @@ waf_profile = "upload"
 
 | Mode | Patterns | Use case |
 |---|---|---|
-| `balanced` (default) | ~120 high-precision: anchored SQLi/XSS tags, specific SSRF endpoints, exact-string CVEs (Log4Shell, XXE), specific PHP wrappers. | User-content APIs (comments, code paste, MDN-style docs, base64-bearing payloads). |
-| `aggressive` | balanced + ~70 broad-substring patterns: `alert(`, `eval(`, `confirm(`, `document.cookie`, `innerhtml`, `$gt`/`$ne`/`$regex`, `os.system(`, `pickle.loads`, `Runtime.getRuntime`, generic event handlers (`onclick=`, `onmouseover=`, …). | Admin panels, internal tooling, API surfaces where the FP cost is acceptable. |
+| `balanced` (default) | ~100 high-precision: anchored SQLi/XSS tags, specific SSRF endpoints, exact-string CVEs (Log4Shell, XXE), specific PHP wrappers. | User-content APIs (comments, code paste, MDN-style docs, base64-bearing payloads). |
+| `aggressive` | balanced + ~140 broad-substring patterns: `alert(`, `eval(`, `confirm(`, `document.cookie`, `innerhtml`, `$gt`/`$ne`/`$regex`, `os.system(`, `pickle.loads`, `Runtime.getRuntime`, generic event handlers (`onclick=`, `onmouseover=`, …). | Admin panels, internal tooling, API surfaces where the FP cost is acceptable. |
 
 The two automata are built lazily (on first hit per process) and cached; switching profiles costs nothing at request time. A request denied by an aggressive-only pattern returns the same `400` body and `waf_denied` metric as a balanced denial — there is no separate counter.
 
