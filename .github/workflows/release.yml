@@ -544,6 +544,12 @@ jobs:
             docker create --platform "linux/${arch}" --name "verify-${arch}" "$REF" >/dev/null
             docker cp "verify-${arch}:/usr/local/bin/zion" "/tmp/zion-${arch}" >/dev/null
             docker rm "verify-${arch}" >/dev/null
+            # Drop the locally-stored image before the next platform. `docker
+            # create --platform X image@<manifest-list-digest>` pulls the X image
+            # but stores it under the *manifest-list* digest; the next platform
+            # would then hit "cannot overwrite digest <same>" and abort. Removing
+            # it frees that digest slot so each arch pulls cleanly.
+            docker image rm "$REF" >/dev/null 2>&1 || true
             got="$(file -b "/tmp/zion-${arch}")"
             echo "linux/${arch}: ${got}"
             case "$got" in
