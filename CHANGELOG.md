@@ -4,6 +4,25 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-07
+
+### Documentation
+- **README + docs synced 1:1 with the code** after a five-surface audit
+  (features / metrics / CLI / config / capability claims). Highlights: WAF
+  pattern counts corrected everywhere (aggressive set had doubled to ~240, docs
+  still said ~190); CORS re-documented as the per-route `cors = { … }` table it
+  actually is (the old top-level `[cors]` examples failed to load under
+  `deny_unknown_fields`); `cache_profile.ttl_seconds` default fixed (1 hour, not
+  1 year); the config reference tables completed (`xff_mode`, `trusted_proxies`,
+  `max_connections_per_ip`, upstream `urls`/mTLS, `client_auth`, WAF
+  `mode`/`entropy`/`streaming`); CLI feature-gates and missing `zion init` ACME
+  flags documented; `numa-aware` added to the build-flavor lists.
+- **Grafana dashboard now covers every metric `/metrics` emits.** New rows:
+  Protocols & tarpit detail (WebSocket upgrades, tarpit hold time), Mesh — AIMP
+  fleet gossip (claims / drops-by-reason / gossip bandwidth), and Reliability &
+  internals (panics, dropped audit events, admin rejects). The metrics reference
+  in `docs/deploy/observability.md` was expanded from ~12 to all ~40 series.
+
 ### Added
 - **Stability soak** (`tests/stability-soak/`): drives a real Zion with the
   traffic shapes that stress every leak-prone surface — random Host/path/XFF

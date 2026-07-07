@@ -50,7 +50,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 
 | Change | Rationale |
 |---|---|
-| Two pattern sets selected per profile via `mode` | `balanced` (default, ~120 high-precision patterns) or `aggressive` (~190, broader recall). Categories: SQLi, XSS, CMDi, path traversal, SSRF/cloud-metadata, LDAP, XXE, SSTI, CRLF, Log4Shell, prototype pollution; NoSQL, deserialization, generic XSS handlers, JS API sinks live in aggressive |
+| Two pattern sets selected per profile via `mode` | `balanced` (default, ~100 high-precision patterns) or `aggressive` (~240, broader recall). Categories: SQLi, XSS, CMDi, path traversal, SSRF/cloud-metadata, LDAP, XXE, SSTI, CRLF, Log4Shell, prototype pollution; NoSQL, deserialization, generic XSS handlers, JS API sinks live in aggressive |
 | Aho-Corasick (no regex) | O(N) single-pass, no backtracking, case-insensitive, ReDoS-immune by construction |
 | Normalisation: iterative re-scan | URL-decode (`%XX`, `+`), SQL comment strip (`/* … */`), JSON unicode (`\uXXXX`); decode loop runs up to 3 passes (catches single, double, triple encoding) and re-scans after each pass |
 | Buffer shrink-to-fit (>64KB) | Prevents permanent memory inflation from adversarial large bodies |

@@ -33,13 +33,16 @@ The config file (and the cert files it references) are **hot-reloaded** — see
 Put TLS + HTTP/2 in front of a local backend with no config files at all — a
 self-signed cert is generated in memory. Ideal for local development.
 
+**Requires a build with `--features init`** (or `dist`). A lean build prints
+"zion auto requires the `init` feature" and exits `2`.
+
 ```console
 $ zion auto --upstream :3000          # 127.0.0.1:3000 behind https://localhost:8443
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-u, --upstream HOST:PORT` | — | backend to proxy (`:3000` → `127.0.0.1:3000`) |
+| `-u, --upstream HOST:PORT` | `127.0.0.1:3000` | backend to proxy (`:3000` → `127.0.0.1:3000`) |
 | `--http-port <N>` | 8080 | HTTP listen port |
 | `--https-port <N>` | 8443 | HTTPS listen port |
 | `--hostname <H>` | localhost | SAN for the self-signed cert |
@@ -47,6 +50,9 @@ $ zion auto --upstream :3000          # 127.0.0.1:3000 behind https://localhost:
 ## `zion init` — scaffold a config
 
 Generate a `zion.toml` interactively (prompts) or non-interactively from flags.
+The subcommand runs on a lean build, but **self-signed cert generation needs
+`--features init`** (or `dist`); without it the wizard writes the config and
+points you at `openssl` for the cert.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -58,6 +64,9 @@ Generate a `zion.toml` interactively (prompts) or non-interactively from flags.
 | `--http-port <N>` / `--https-port <N>` | 80 / 443 | listener ports |
 | `--no-tls` | — | skip self-signed cert generation |
 | `--no-waf` | — | skip WAF on `/api/*` routes |
+| `--acme` / `--no-acme` | heuristic | force automatic HTTPS on/off (default: on for a public hostname, off for localhost/IP) |
+| `--email <ADDR>` | — | Let's Encrypt contact email (required when ACME is on) |
+| `--domain <NAME>` | the hostname | domain to obtain a cert for (repeatable) |
 
 ## `zion suggest` — synthesize from a detected backend
 
@@ -71,9 +80,9 @@ set real `[tls]` cert paths.
 
 | Flag | Meaning |
 |---|---|
-| `--upstream <host:port>` | upstream hint (`:3000`, `3000`, `127.0.0.1:3000`, `api.internal:8080`); a bare port binds `127.0.0.1` |
-| `--domain <name>` | domain for the synthesized cert paths (default `localhost`) |
-| `--write <path>` | write to a file instead of stdout |
+| `-u, --upstream <host:port>` | upstream hint (`:3000`, `3000`, `127.0.0.1:3000`, `api.internal:8080`); a bare port binds `127.0.0.1` |
+| `-d, --domain <name>` | domain for the synthesized cert paths (default `localhost`) |
+| `-w, --write <path>` | write to a file instead of stdout |
 
 ```console
 $ zion suggest --upstream :3000 --domain app.example.com --write zion.toml
@@ -128,6 +137,9 @@ Exit codes: `0` converted, `1` fatal (unparseable input / nothing convertible),
 ## `zion top` — live dashboard
 
 A terminal dashboard that polls a running Zion's snapshot endpoint.
+
+**Requires a build with `--features tui`.** A lean build prints a rebuild hint
+and exits `2` (`dist` does not include `tui` — build with `--features tui`).
 
 | Flag | Default | Meaning |
 |---|---|---|

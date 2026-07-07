@@ -126,6 +126,7 @@ cargo build --release --features otel            # + OpenTelemetry tracing + OTL
 cargo build --release --features fips            # + FIPS 140-3 build (aws-lc-rs validated backend)
 cargo build --release --features geo-ita         # + Italian / EU sovereign edge classification
 cargo build --release --features io-uring-accept # Linux 5.19+: single-shot accept
+cargo build --release --features numa-aware      # + per-NUMA-node DashMap sharding (Linux multi-socket)
 
 # "max" build
 cargo build --release --features init,tui,acme,auth,http3,otel
@@ -185,7 +186,7 @@ survives. See [zion.example.toml](zion.example.toml) for the full reference and
 ```
 Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) -> Proxy/Cache -> Upstream
                          |                                |
-                    URI limit                  Aho-Corasick (~100 balanced / ~190 aggressive)
+                    URI limit                  Aho-Corasick (~100 balanced / ~240 aggressive)
                     Method whitelist           Entropy analysis (JSON-string-only)
                     Rate limiter               simd-json validation
                     CORS pre-flight            Depth/size limits
@@ -207,13 +208,13 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 
 **Cache** — two-level RAM cache: L1 thread-local (O(1) intrusive-LRU) + L2 sharded DashMap, generation-based coherence (no stale data after update), request coalescing (singleflight: N concurrent misses → 1 upstream fetch). Honors the origin's `Cache-Control`, emits `Age` and an `X-Zion-Cache: HIT|MISS|BYPASS` decision header, and exposes a `POST /_zion/cache/purge` flush for deploys.
 
-**WAF (zero-regex, O(N) single-pass)** — Aho-Corasick scanner, two pattern sets (`balanced` ~100 high-precision / `aggressive` ~190 broad-recall), Shannon-entropy analysis (JSON-string-only), simd-json structural limits, Content-Type enforcement, iterative normalization (URL-decode / SQL-comment / unicode), mTLS `X-Client-Cert-Fingerprint` forwarding, and a shadow mode (log + count, never block).
+**WAF (zero-regex, O(N) single-pass)** — Aho-Corasick scanner, two pattern sets (`balanced` ~100 high-precision / `aggressive` ~240 broad-recall), Shannon-entropy analysis (JSON-string-only), simd-json structural limits, Content-Type enforcement, iterative normalization (URL-decode / SQL-comment / unicode), mTLS `X-Client-Cert-Fingerprint` forwarding, and a shadow mode (log + count, never block).
 
 **Security** — HSTS preload, nosniff, frame-deny, Referrer-Policy, Permissions-Policy, per-route CSP; `Server`/hop-by-hop stripping (RFC 7230); URI-length cap + 7-method whitelist; per-IP rate limit **and** per-IP concurrent-connection cap (enforced at accept); CORS (FNV O(1)); header-bomb limits (64 headers / 16 KB).
 
 **Observability** — `/healthz` · `/readyz` fast-path (~1 µs), `/metrics` Prometheus (lock-free sharded counters), `X-Request-ID` + W3C `traceparent` propagation, structured text/JSON logs, and the `zion top` live TUI.
 
-**Operations** — fail-fast config validation, graceful 30 s drain, [adaptive upstream recovery](#) (decorrelated-jitter backoff: a recovered origin returns in ~1.4 s vs up to 30 s), boot-time platform auto-detection + performance-tier calibration, `zion doctor` diagnostics, TCP tuning (NODELAY / DEFER_ACCEPT / FASTOPEN / QUICKACK), systemd unit + Docker HEALTHCHECK.
+**Operations** — fail-fast config validation, graceful 30 s drain, adaptive upstream recovery (decorrelated-jitter backoff: a recovered origin returns in ~1.4 s vs up to 30 s), boot-time platform auto-detection + performance-tier calibration, `zion doctor` diagnostics, TCP tuning (NODELAY / DEFER_ACCEPT / FASTOPEN / QUICKACK), systemd unit + Docker HEALTHCHECK.
 
 **Opt-in tracks (feature-gated, default-off)**
 - **kTLS offload** (`--features ktls`, Linux 5.10+) — *experimental*: flips the socket into in-kernel TLS after handshake toward `sendfile`-class zero-copy. The offload is wired but not yet exercised end-to-end in CI (issue #52).
@@ -312,12 +313,12 @@ Every release is signed and carries SLSA v1.0 build provenance — see
 
 ```bash
 # Binary release (Sigstore-backed provenance via gh CLI)
-gh release download v0.6.0 -R fabriziosalmi/zion -p '*x86_64-unknown-linux-musl*' -p 'SHA256SUMS'
+gh release download v0.6.1 -R fabriziosalmi/zion -p '*x86_64-unknown-linux-musl*' -p 'SHA256SUMS'
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify zion-v0.6.0-x86_64-unknown-linux-musl.tar.gz --owner fabriziosalmi
+gh attestation verify zion-v0.6.1-x86_64-unknown-linux-musl.tar.gz --owner fabriziosalmi
 
 # Container image (cosign keyless)
-cosign verify ghcr.io/fabriziosalmi/zion:v0.6.0 \
+cosign verify ghcr.io/fabriziosalmi/zion:v0.6.1 \
     --certificate-identity-regexp "^https://github.com/fabriziosalmi/zion/\\.github/workflows/release\\.yml@refs/tags/v" \
     --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 ```

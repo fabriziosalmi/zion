@@ -85,8 +85,8 @@ Client
   │  Gate 1: Body size enforcement (O(1))               │
   │  Gate 2: Content-Type validation (delimiter-aware)  │
   │  Gate 3: Aho-Corasick scan — pattern set selected   │
-  │           per profile mode (balanced ~120 /         │
-  │           aggressive ~190); raw + iterative         │
+  │           per profile mode (balanced ~100 /         │
+  │           aggressive ~240); raw + iterative         │
   │           normalisation (URL-decode, SQL comment    │
   │           strip, JSON unicode), up to 3 passes      │
   │  Gate 4: Entropy analysis (Shannon ≥256 bytes;      │
@@ -163,6 +163,18 @@ Zion uses Tokio's multi-threaded runtime. Worker count is set to available CPU c
 | JWT/OIDC auth | `--features auth` | Per-route JWT validation (HMAC, RSA, ECDSA, JWKS) |
 | HTTP/3 QUIC | `--features http3` | UDP listener on same port, Alt-Svc advertisement |
 | io_uring accept | `--features io-uring-accept` | Linux 5.19+, single-shot accept on a dedicated thread |
+| NUMA-aware sharding | `--features numa-aware` | Per-NUMA-node DashMap shards (Linux multi-socket; single-shard fallback elsewhere) |
+| Init wizard / dev mode | `--features init` | `zion init` / `zion auto` scaffolding + self-signed cert |
+| Live TUI | `--features tui` | `zion top` dashboard |
+| OpenTelemetry export | `--features otel` | OTLP trace exporter |
+| FIPS 140-3 | `--features fips` | aws-lc-rs FIPS-validated backend |
+| Sovereign geo | `--features geo-ita` / `geo-eu` | Baked-in IT/EU ASN+CIDR classification |
+| AIMP mesh *(experimental)* | `--features sovereign-aimp` | Ed25519-signed fleet gossip of WAF/reputation |
+| kTLS offload *(experimental)* | `--features ktls` | In-kernel TLS after handshake; wired, not yet exercised e2e in CI |
+| ML-augmented WAF *(experimental)* | `--features ml-waf` | ONNX scorer on the WAF hot path; ships no bundled model |
+
+The release bundle is `--features dist` (= `acme` + `init`). The full flag list
+and lean/`cargo install` defaults live in the README "Build flavors" section.
 
 Build with multiple features:
 ```bash

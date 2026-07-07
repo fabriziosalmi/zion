@@ -27,8 +27,8 @@ Request Body
     ▼
 ┌─ Gate 3: Aho-Corasick Injection Scanner ─────────┐
 │  Pattern set selected by profile mode:           │
-│    balanced   → ~120 high-precision patterns     │
-│    aggressive → ~190 (balanced + ~70 broad-      │
+│    balanced   → ~100 high-precision patterns     │
+│    aggressive → ~240 (balanced + ~140 broad-     │
 │                  substring patterns)              │
 │  Two passes: raw body, then iteratively-         │
 │    normalised body (URL-decode, SQL comment      │

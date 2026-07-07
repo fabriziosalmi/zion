@@ -22,7 +22,7 @@ features:
   - title: 233K req/s
     details: Peak throughput on Apple M4 with TLS 1.3 end-to-end. 107K req/s API proxy, 103K with full WAF pipeline active (CV 0.5%). Zero errors.
   - title: Zero-Regex WAF
-    details: Aho-Corasick automaton in a single O(N) pass over the body. Two pattern sets — balanced (default, ~120 high-precision patterns) and aggressive (opt-in, +~70 broad-substring patterns). Per-profile entropy gate (default 6.5 bits/byte, JSON-string-aware).
+    details: Aho-Corasick automaton in a single O(N) pass over the body. Two pattern sets — balanced (default, ~100 high-precision patterns) and aggressive (opt-in, +~140 broad-substring patterns). Per-profile entropy gate (default 6.5 bits/byte, JSON-string-aware).
   - title: Two-Level Cache
     details: "L1 thread-local with O(1) LRU (intrusive doubly-linked list) + L2 shared DashMap. Generation-based coherence. Watch-channel singleflight (race-free even when the fetcher completes between subscribe and await)."
   - title: TLS 1.3 + Hot-Reload

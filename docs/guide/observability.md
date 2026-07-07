@@ -50,7 +50,7 @@ zion_request_duration_seconds_bucket{le="0.512"} 17 # {trace_id="0af7651916cd43d
 
 The exemplar update cost is 4 relaxed atomic stores on a cache line we just touched — measurable in benchmarks at sub-percent overhead, hidden by the existing histogram observation cost.
 
-Five new counters are exposed alongside the existing ones:
+Six reliability counters are exposed alongside the existing ones:
 
 | Counter | Meaning |
 |---|---|
@@ -59,6 +59,7 @@ Five new counters are exposed alongside the existing ones:
 | `zion_audit_events_dropped_total` | Audit events dropped because the writer queue was full. Non-zero values mean either the disk is slow or `audit.queue_depth` is too small. |
 | `zion_traces_emitted_total` | Request spans observed (one per request). |
 | `zion_traces_invalid_total` | Inbound `traceparent` headers rejected as malformed. |
+| `zion_admin_rejects_total` | Admin-API requests rejected (auth or rate-limit) at `[admin]`. |
 
 ## Sovereign IP classification (`--features geo-ita` / `geo-eu`)
 
@@ -286,6 +287,7 @@ Counters wired today (issue #69):
 | `zion_mesh_claims_received_total` | counter | Inbound envelopes that passed *all* policy gates and merged into local state. |
 | `zion_mesh_claims_dropped_total{reason="signature"}` | counter | Inbound envelopes rejected on Ed25519 signature verification. |
 | `zion_mesh_claims_dropped_total{reason="replay"}` | counter | Inbound envelopes rejected as duplicates (seen-signature filter). |
+| `zion_mesh_claims_dropped_total{reason="rate"}` | counter | Inbound envelopes rejected by the per-source claim rate-cap (flood protection). |
 | `zion_mesh_claims_dropped_total{reason="other"}` | counter | Other rejections — timestamp skew (past/future), magic-prefix mismatch, payload decode error, revocation by non-original source. |
 | `zion_mesh_score_lookups_total` | counter | Dispatcher hits that found a mesh score for the client IP — the `X-Zion-Mesh-Score` header rate. |
 | `zion_mesh_gossip_bytes_in_total` | counter | Total bytes received on the gossip socket (covers malformed packets too). |
