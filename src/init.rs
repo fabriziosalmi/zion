@@ -1020,10 +1020,8 @@ mod tests {
         // :443 but SILENTLY never provision a real cert. Guard the 1-day window
         // against a regression, using the SAME parser (`cert_expiry_secs`) the
         // renewal task consults, so this also proves the cert trips issuance.
-        let (cert_pem, _key) =
-            generate_short_lived_cert(&["app.example.com".to_string()]).unwrap();
-        let path =
-            std::env::temp_dir().join(format!("zion-bootstrap-{}.crt", std::process::id()));
+        let (cert_pem, _key) = generate_short_lived_cert(&["app.example.com".to_string()]).unwrap();
+        let path = std::env::temp_dir().join(format!("zion-bootstrap-{}.crt", std::process::id()));
         std::fs::write(&path, cert_pem).unwrap();
         let secs = crate::tls::cert_expiry_secs(path.to_str().unwrap())
             .expect("bootstrap cert must parse");
