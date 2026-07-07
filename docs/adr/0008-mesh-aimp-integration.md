@@ -99,8 +99,7 @@ delegated authority.
 
 ## References
 
-- Source: [`src/aimp_cp.rs`](../../src/aimp_cp.rs),
-  [`src/aimp_xdp_sync.rs`](../../src/aimp_xdp_sync.rs)
+- Source: [`src/aimp_cp.rs`](../../src/aimp_cp.rs)
 - AIMP project: <https://github.com/fabriziosalmi/aimp>
 - AIMP security model: <https://github.com/fabriziosalmi/aimp/blob/master/SECURITY.md>
 - Operator-facing integration guide:

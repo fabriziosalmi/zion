@@ -35,12 +35,10 @@ features:
     details: "Auto-detects CPU cores, L1d cache, AES-NI/NEON. Pins workers to cores. TCP_FASTOPEN, SO_REUSEPORT, SO_BUSY_POLL, io_uring single-shot accept."
   - title: Single Binary, TOML Config
     details: "No runtime dependencies. ~4MB release binary. Validates config at startup. Graceful shutdown with 30s drain. systemd + Docker ready."
-  - title: XDP Pre-Filter (v0.2.x)
-    details: "eBPF LPM-trie drop at the NIC driver layer. Blocked source IPs never reach the userspace TLS handshake. Feature-gated (`--features xdp`); default-off."
-  - title: kTLS Offload (v0.2.x)
-    details: "Post-handshake socket flip into in-kernel TLS. Removes the userspace AEAD trip and unlocks sendfile-class zero-copy for static cache hits. Linux 5.10+ with CONFIG_TLS=y. Feature-gated (`--features ktls`)."
-  - title: ML-Augmented WAF (v0.2.x)
-    details: "Optional 16-dim ONNX model on the WAF hot path, 200µs p99 budget. Score travels with the request as a signal, not a hard gate. Feature-gated (`--features ml-waf`)."
+  - title: kTLS Offload (experimental)
+    details: "Post-handshake socket flip into in-kernel TLS, toward sendfile-class zero-copy for static cache hits. Wired but not yet exercised end-to-end in CI. Linux 5.10+ with CONFIG_TLS=y. Feature-gated (`--features ktls`)."
+  - title: ML-Augmented WAF (experimental)
+    details: "Optional 16-dim ONNX model on the WAF hot path, 200µs p99 budget. Score travels with the request as a signal, not a hard gate. Ships no bundled model. Feature-gated (`--features ml-waf`)."
   - title: AIMP Mesh (v0.2.x)
     details: "Ed25519-signed UDP gossip of WAF rule deltas + IP reputation across a fleet. Source-bound revocation, replay LRU, LWW merge, periodic anti-entropy. No central control plane. Feature-gated (`--features sovereign-aimp`)."
 ---

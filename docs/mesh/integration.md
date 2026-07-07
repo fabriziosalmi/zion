@@ -2,8 +2,7 @@
 
 Architectural decision: [ADR-0008](../adr/0008-mesh-aimp-integration.md).
 Threat-model addendum: [`docs/security/threat-model.md`](../security/threat-model.md) §10.
-Source: [`src/aimp_cp.rs`](../../src/aimp_cp.rs),
-[`src/aimp_xdp_sync.rs`](../../src/aimp_xdp_sync.rs).
+Source: [`src/aimp_cp.rs`](../../src/aimp_cp.rs).
 
 This guide is for operators wiring zion's mesh layer into a fleet —
 deployment topology, peer discovery, key management, and the

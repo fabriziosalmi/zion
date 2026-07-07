@@ -39,6 +39,20 @@ All notable changes to Zion Edge Gateway are documented here.
   README demo is an animated SVG recorded from a real run (`record-demo.sh`),
   so it cannot drift from what the code actually does.
 
+### Removed
+- **Froze the in-kernel deep-tech cluster to keep the shipped surface honest.**
+  The probe-only feature flags `io-uring-rw` and `bpf-demux` and the never-wired
+  `xdp` flag are gone, along with their dead modules (`src/xdp.rs`,
+  `src/bpf_demux.rs`, `src/memfd.rs`, `src/aimp_xdp_sync.rs`), the `aya`/`aya-log`
+  dependencies, the standalone `bpf/` and `xdp/` eBPF crates, and the
+  `xdp_smoke` example. These tracks never carried a runtime data path — they
+  only surfaced kernel-capability probes — so shipping them as feature flags
+  overstated what Zion does. The design work is retained as research on issues
+  #51/#52/#53. The working `io-uring-accept` accept thread is unaffected.
+  `ktls` and `ml-waf` remain but are now labelled **experimental** in the docs
+  and feature comments (kTLS is wired but not exercised end-to-end in CI;
+  `ml-waf` ships no bundled model).
+
 ### Fixed
 - **arm64 container image now ships an arm64 binary.** The multi-arch image
   (v0.4.7–v0.6.0) built its binary on `$BUILDPLATFORM` and stamped that single

@@ -119,7 +119,7 @@ where it touches build provenance).
 | CM-2 | Baseline configuration | `zion.toml` is the single source of truth; [`zion.example.toml`](../../zion.example.toml) is the documented baseline | Operator's GitOps-managed baseline |
 | CM-3 | Configuration change control | Hot-reload watcher (notify-rs) + structured `config_reload` audit events; failed reloads rolled back to last good snapshot | Change-approval workflow |
 | CM-6 | Configuration settings | All settings live in `zion.toml` + env vars; no hidden runtime mutation | Operator's CIS-benchmark mapping |
-| CM-7 | Least functionality | All optional features (`acme`, `auth`, `http3`, `tui`, `xdp`, `ktls`, `numa-aware`, `bpf-demux`, `io-uring-rw`, `sovereign-aimp`) are off by default | Operator opts in only to features they need |
+| CM-7 | Least functionality | All optional features (`acme`, `auth`, `http3`, `tui`, `ktls`, `numa-aware`, `ml-waf`, `sovereign-aimp`) are off by default | Operator opts in only to features they need |
 | CM-8 | System component inventory | CycloneDX SBOM per release artefact; SLSA in-toto attestation | Operator merges SBOM into asset inventory |
 
 ### IA — Identification and Authentication

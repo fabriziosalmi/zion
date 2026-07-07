@@ -274,13 +274,6 @@ async fn tcp_read_terminates_cleanly_on_so_linger_zero_close() {
             );
         }
     }
-
-    // Sanity: the io_uring rw kernel probe (issue #51) is callable
-    // without panicking from inside an async test. The full
-    // IoUringStream adapter is deferred — when it lands, this test
-    // (along with `tcp_read_terminates_cleanly_on_peer_close`) will
-    // be re-pointed at it to pin the same recoverability contract.
-    let _kernel_ready = zion::uring::probe_io_uring_rw_supported();
 }
 
 fn tempdir(label: &str) -> std::path::PathBuf {

@@ -461,8 +461,7 @@ fleet to drop a benign IP at XDP / kernel level.
   itself revocation-key-signed would close the loop; tracked
   alongside [#68](https://github.com/fabriziosalmi/zion/issues/68).
 
-Source: [`src/aimp_cp.rs`](../../src/aimp_cp.rs),
-[`src/aimp_xdp_sync.rs`](../../src/aimp_xdp_sync.rs).
+Source: [`src/aimp_cp.rs`](../../src/aimp_cp.rs).
 
 ---
 

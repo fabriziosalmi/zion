@@ -122,22 +122,6 @@ criteria = "safe-to-deploy"
 version = "0.4.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.aya]]
-version = "0.13.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.aya-log]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.aya-log-common]]
-version = "0.1.15"
-criteria = "safe-to-deploy"
-
-[[exemptions.aya-obj]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.base64ct]]
 version = "1.8.3"
 criteria = "safe-to-deploy"
