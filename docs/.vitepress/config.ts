@@ -13,9 +13,9 @@ export default defineConfig({
   base: '/zion/',
   head: [
     ['link', { rel: 'icon', type: 'image/svg+xml', href: '/zion/logo.svg' }],
-    ['meta', { name: 'theme-color', content: '#0071e3' }],
+    ['meta', { name: 'theme-color', content: '#0b0b0d' }],
     ['meta', { property: 'og:title', content: 'Zion Edge Gateway' }],
-    ['meta', { property: 'og:description', content: 'High-performance TLS reverse proxy with built-in WAF, written in Rust.' }],
+    ['meta', { property: 'og:description', content: 'One auditable Rust binary at the edge — TLS 1.3, a zero-regex WAF, and a two-level RAM cache. No sidecars, no control plane.' }],
     ['meta', { property: 'og:type', content: 'website' }],
   ],
 
