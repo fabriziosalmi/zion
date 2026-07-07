@@ -67,8 +67,7 @@ pub mod sovereign;
 #[doc(hidden)]
 pub mod numa;
 
-/// io_uring accept thread + capability probe (issue #51). The full
-/// `IoUringStream` adapter is deferred to a follow-up; this exposure
-/// is for the chaos test (`tests/chaos.rs`) and external diagnostics.
+/// io_uring accept thread (issue #51, `--features io-uring-accept`).
+/// Exposed for the chaos test (`tests/chaos.rs`) and external diagnostics.
 #[doc(hidden)]
 pub mod uring;

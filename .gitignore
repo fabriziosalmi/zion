@@ -29,9 +29,9 @@ TODO.md
 zion.toml
 GEMINI_IMPRO.md
 
-# Build outputs (release tarballs at repo root only — we use a top-level
-# `zion-*` glob so it does NOT match the eBPF source crate at
-# `xdp/zion-xdp-prog/`).
+# Build outputs (release tarballs at repo root only — the leading `/`
+# anchors the `zion-*` glob to the repo root so it doesn't match nested
+# crates or source dirs).
 /zion-*
 *.tar.gz
 

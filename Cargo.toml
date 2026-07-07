@@ -139,10 +139,6 @@ tracing-opentelemetry = { version = "0.33", default-features = false, optional =
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 io-uring = { version = "0.7", optional = true }
-# XDP / eBPF userspace loader (Track A — `--features xdp`).
-# Aya is pure-Rust (no libbpf C dep) and ships its own BTF loader.
-aya = { version = "0.13", optional = true }
-aya-log = { version = "0.2", optional = true }
 # kTLS post-handshake offload (Track A — `--features ktls`).
 # Bridges a rustls ServerConnection to the kernel's TLS_TX/RX so that
 # subsequent record encrypt/decrypt happens in-kernel (sendfile-style
@@ -187,20 +183,6 @@ optional = true
 [features]
 default = []
 io-uring-accept = ["io-uring"]
-# v0.2 perf-ceiling — io_uring read/write vectored (issue #51).
-#
-# Wires the boot-time probe (kernel >= 5.19, where IORING_OP_READV_FIXED
-# and the rest of the rw surface we'd target are stable) and reserves
-# the feature gate. The full `IoUringStream<R, W>` adapter that
-# replaces the tokio-driven read/write half of accepted connections is
-# tracked on a follow-up — it requires a careful tokio-reactor
-# integration we don't paper over with a delegating stub.
-#
-# Until that follow-up lands, this feature only enables the boot
-# capability probe and the kernel-version structured log line. The
-# listener supervisor keeps using tokio's `AsyncReadExt` /
-# `AsyncWriteExt` — no behavioural change at runtime.
-io-uring-rw = ["io-uring-accept"]
 acme = ["instant-acme", "rcgen", "base64", "time"]
 auth = ["jsonwebtoken", "reqwest"]
 http3 = ["quinn", "h3", "h3-quinn"]
@@ -233,29 +215,11 @@ geo-eu  = ["geo-ita"]              # 🇪🇺 EU superset (includes geo-ita)
 sovereign-signals = []             # Gossip mesh for signal sharing (Phase 3)
 
 # ── Experimental tracks ───────────────────────────────────────────────
-# Track A — XDP pre-filter: drops blacklisted CIDRs at the NIC driver
-# layer before the kernel network stack. Linux-only. Requires CAP_NET_ADMIN
-# at runtime; the eBPF program is shipped separately under `xdp/` and
-# loaded from disk (or embedded — see xdp.rs::EBPF_OBJECT_PATH).
-xdp = ["dep:aya", "dep:aya-log"]
-# v0.2 perf-ceiling — SO_REUSEPORT + BPF demux for unified :443 (issue
-# #53). Loads a small `SK_REUSEPORT` program that overrides the
-# kernel's default reuseport hash on the SO_REUSEPORT group bound on
-# :443 so connection→worker affinity can be steered from userspace
-# (gossip-driven, NUMA-aware, etc — all follow-up). The runtime
-# listener wire-up that consumes the loader is deferred — see
-# CHANGELOG. Linux >= 5.7 (when SO_ATTACH_REUSEPORT_EBPF gained UDP
-# support, matching the issue's QUIC integration requirement).
-bpf-demux = ["dep:aya"]
 # Track A — kTLS post-handshake offload. Linux >= 5.10 + CONFIG_TLS.
 # Switches established rustls server connections to in-kernel TLS_TX/RX.
-#
-# Now depends on `io-uring-rw` per the issue #52 spec — the io_uring rw
-# adapter is the natural buddy for sendfile-style zero-copy on
-# cacheable static responses. The runtime adapter itself is deferred
-# (see #51 Deferred), but the dependency keeps the feature graph
-# honest: enabling kTLS implies opting into the io_uring rw track.
-ktls = ["io-uring-rw", "dep:ktls"]
+# EXPERIMENTAL: the offload is wired but not yet exercised end-to-end
+# over a socket in CI — see src/ktls.rs and issue #52.
+ktls = ["dep:ktls"]
 # v0.2 perf-ceiling — NUMA-aware DashMap sharding (issue #50).
 # Splits `rate_map` and `inflight` into per-node shards, routed by the
 # calling thread's NUMA node. Single-socket / non-Linux: transparent

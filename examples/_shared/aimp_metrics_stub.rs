@@ -14,8 +14,7 @@
 //! match `AtomicU64` at compile time. A trait-object shim would
 //! require changing the source.
 //!
-//! Pattern matches `xdp/zion-xdp-prog/` and `aimp_xdp_sync.rs` —
-//! examples deliberately keep their dependency surface minimal so
+//! Examples deliberately keep their dependency surface minimal so
 //! they ship in a microVM without zion's full module tree.
 
 #![allow(dead_code)]

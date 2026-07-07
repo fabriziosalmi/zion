@@ -1,6 +1,0 @@
-[toolchain]
-# eBPF programs need nightly for `build-std` (core for the bpfel target).
-# Pinned to the same nightly as `xdp/zion-xdp-prog/` so a single
-# `rustup toolchain install` covers both.
-channel = "nightly-2026-01-15"
-components = ["rust-src", "rustfmt", "clippy"]
