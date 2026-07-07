@@ -4,6 +4,27 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-07-07
+
+### Fixed
+- **Release container image is signed again.** The `release.yml` "verify each
+  arch ships its own binary" step (added in v0.6.0's arm64 fix, first exercised
+  by v0.6.1) aborted on the second architecture with `cannot overwrite digest`
+  — `docker create --platform` stores the pulled image under the manifest-list
+  digest, so the next platform collides. That failure gated cosign signing +
+  SBOM attestation, so v0.6.1's container shipped unsigned. Fixed by removing the
+  local image between platform iterations; the multi-arch image now verifies both
+  arches and is cosign-signed + SBOM-attested. (v0.6.1's binaries/tarballs were
+  unaffected.)
+
+### Added
+- **Tests for the ACME bootstrap-cert linchpin.** `zion init`'s Caddy-style
+  auto-HTTPS relies on a ~1-day bootstrap cert so first-boot issuance fires
+  (rcgen's default not_after is year 4096, which would bind `:443` but silently
+  never issue). Added `init::bootstrap_cert_is_short_lived` (parses the cert via
+  the same `tls::cert_expiry_secs` the daemon reads at boot) and
+  `acme::expiry_check_fires_for_short_lived_cert_not_long`.
+
 ## [0.6.1] - 2026-07-07
 
 ### Documentation

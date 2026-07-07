@@ -313,12 +313,12 @@ Every release is signed and carries SLSA v1.0 build provenance — see
 
 ```bash
 # Binary release (Sigstore-backed provenance via gh CLI)
-gh release download v0.6.1 -R fabriziosalmi/zion -p '*x86_64-unknown-linux-musl*' -p 'SHA256SUMS'
+gh release download v0.6.2 -R fabriziosalmi/zion -p '*x86_64-unknown-linux-musl*' -p 'SHA256SUMS'
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify zion-v0.6.1-x86_64-unknown-linux-musl.tar.gz --owner fabriziosalmi
+gh attestation verify zion-v0.6.2-x86_64-unknown-linux-musl.tar.gz --owner fabriziosalmi
 
 # Container image (cosign keyless)
-cosign verify ghcr.io/fabriziosalmi/zion:v0.6.1 \
+cosign verify ghcr.io/fabriziosalmi/zion:v0.6.2 \
     --certificate-identity-regexp "^https://github.com/fabriziosalmi/zion/\\.github/workflows/release\\.yml@refs/tags/v" \
     --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 ```
