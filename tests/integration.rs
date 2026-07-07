@@ -407,10 +407,10 @@ integration_test!(t19_http_redirects_to_https, {
 
 // ── Unified-port co-existence (issue #53) ──────────────────────────────────
 //
-// The `bpf-demux` track (issue #53) requires TCP HTTPS and UDP QUIC to
-// coexist on the same port without conflict. This is a kernel-level
-// invariant — TCP and UDP are independent L4 protocols and the kernel
-// demuxes them before port routing — but the test pins the *Zion-side*
+// Unified :443 requires TCP HTTPS and UDP QUIC to coexist on the same
+// port without conflict. This is a kernel-level invariant — TCP and UDP
+// are independent L4 protocols and the kernel demuxes them before port
+// routing — but the test pins the *Zion-side*
 // half: the daemon binds both listeners cleanly and TCP requests
 // continue to work even when the QUIC listener is also active.
 //

@@ -8,8 +8,8 @@ Zion's benchmarks live in three places, by altitude:
 | [`benches/e2e/`](https://github.com/fabriziosalmi/zion/tree/master/benches/e2e) | Distributed 2-node rig (load box → SUT over a real NIC) — the network-realistic numbers. | `benches/e2e/RESULTS.md` |
 | [`benches/`](https://github.com/fabriziosalmi/zion/tree/master/benches) | Rust `cargo bench` microbenches (Criterion): WAF scan, cache lookup, traceparent, audit HMAC, sovereign lookup, NUMA. | criterion baseline |
 
-Specialised one-offs (`bench-pgo.sh`, `bench-mesh.sh`, `bench-xdp-ktls.sh`,
-`bench-profile.sh`) live under [`benchmarks/`](https://github.com/fabriziosalmi/zion/tree/master/benchmarks).
+Specialised one-offs (`bench-pgo.sh`, `bench-mesh.sh`, `bench-profile.sh`) live
+under [`benchmarks/`](https://github.com/fabriziosalmi/zion/tree/master/benchmarks).
 
 ## Honest snapshot
 

@@ -21,7 +21,6 @@ See [`baseline/README.md`](baseline/README.md) for prerequisites and knobs.
 |---|---|---|
 | `bench-pgo.sh` | Two-phase PGO build (profile → optimized) | ~10–20 min |
 | `bench-mesh.sh` | `--features sovereign-aimp` mesh cost (idle/lookup/3-node) — issue #72 | ~10 min |
-| `bench-xdp-ktls.sh` | XDP + kTLS A/B (Track A, Linux) | varies |
 | `bench-profile.sh` | CPU flamegraph profiling via `samply` | ~3 min |
 
 ## Distributed rig + microbenches

@@ -1,5 +1,0 @@
-[toolchain]
-# eBPF programs need nightly for `build-std` (core for the bpfel target).
-# Pinned to a recent nightly that aya-ebpf 0.1 is known to build under.
-channel = "nightly-2026-01-15"
-components = ["rust-src", "rustfmt", "clippy"]
