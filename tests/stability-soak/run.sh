@@ -261,11 +261,12 @@ END {
     mt=Txyc/Txxc; TSe2=Tyyc-mt*Txyc; vmt=(nt>2)?(TSe2/(nt-2))/Txxc:0; if(vmt<0)vmt=0; se_mt=sqrt(vmt)
     medt=Ty/nt; pctt=(medt>0)?100.0*mt*86400.0/medt:0
     ratio=(m>0)?mt/m:0
-    # fd stats: first-half vs second-half MEAN drift. Half-means (not 2-sample
-    # deciles) so the per-sample in-flight-connection jitter averages out — a
-    # real socket leak is a monotonic staircase (second-half mean clearly above
-    # first-half), while a bounded band's halves match within noise. (A decile
-    # was noise-dominated on the short fast gate and flagged phantom drift.)
+    # fd stats: first-half vs second-half MEAN drift. Half-means rather than
+    # 2-sample deciles, so the per-sample in-flight-connection jitter averages
+    # out: a real socket leak is a monotonic staircase whose second-half mean
+    # sits clearly above the first-half, while a bounded band has matching
+    # halves within noise. A 2-sample decile was noise-dominated on the short
+    # gate and flagged phantom drift.
     h=int(n/2); if (h<1) h=1
     for(i=1;i<=h;i++){ ff+=Yf[i] } ff/=h
     for(i=h+1;i<=n;i++){ fl+=Yf[i] } fl/=(n-h)
