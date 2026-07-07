@@ -74,12 +74,19 @@ jobs:
         env:
           NO_COLOR: "1"
           # Longer than a pure smoke so the mimalloc working-set + cache-fill
-          # ramp has room to plateau before the tail window — the tail-slope
-          # leak criterion needs the steady state to be inside the run.
+          # ramp has room to plateau before the tail window.
           DURATION: "180"
           WARMUP: "45"
           WORKERS: "20"
           RELOADS: "40"
+          # GROSS-leak budget. At ~3 min the mimalloc segment cache (warmed by
+          # the reload churn) is still settling — its residual tail slope runs
+          # ~30 KB/s and varies run-to-run, which is NOT a leak. So the fast
+          # gate only catches gross regressions (a per-request/-reload leak or
+          # RSS doubling ≈ 400+ KB/s over the run); the FD bound stays tight for
+          # socket leaks. The nightly (2h, 600 B/s budget, 10 min warmup) is the
+          # authoritative moderate-slope verdict once the working set is settled.
+          RSS_BUDGET_BPS: "150000"
         run: ./tests/stability-soak/run.sh
 
   # Nightly long soak: the authoritative RSS-slope + fd verdict.
