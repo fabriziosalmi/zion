@@ -42,6 +42,20 @@ if [[ "$OLD" == "$NEW" ]]; then
   exec scripts/check-version-sync.sh
 fi
 
+# Validate that NEW is strictly newer than OLD using semver comparison.
+# Split into major.minor.patch and compare numerically.
+IFS='.' read -r OLD_MAJOR OLD_MINOR OLD_PATCH <<< "$OLD"
+IFS='.' read -r NEW_MAJOR NEW_MINOR NEW_PATCH <<< "$NEW"
+
+# Strip prerelease/build metadata for numeric comparison (only compare core version)
+OLD_PATCH="${OLD_PATCH%%[-+]*}"
+NEW_PATCH="${NEW_PATCH%%[-+]*}"
+
+if (( 1000000 * NEW_MAJOR + 1000 * NEW_MINOR + NEW_PATCH <= 1000000 * OLD_MAJOR + 1000 * OLD_MINOR + OLD_PATCH )); then
+  echo "error: new version '$NEW' is not newer than current '$OLD'" >&2
+  exit 2
+fi
+
 echo "Bumping $OLD → $NEW"
 
 # Portable in-place sed (works on both BSD/macOS and GNU).
