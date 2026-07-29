@@ -8,6 +8,10 @@
 //! unsupported), and anything Zion cannot express faithfully is flagged
 //! loudly instead of silently mistranslated.
 
+// Consumed by the Traefik front-end (ADR-0012); allow(dead_code) is
+// transient and comes off when `traefik.rs` lands.
+#[allow(dead_code)]
+mod compose;
 mod emit;
 mod map;
 mod model;
