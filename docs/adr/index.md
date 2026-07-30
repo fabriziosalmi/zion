@@ -22,6 +22,7 @@ defined in [0000-template.md](0000-template.md).
 | 0008  | [Embed AIMP as the mesh control-plane bus](0008-mesh-aimp-integration.md) | accepted |
 | 0010  | [Host-based L7 routing (virtual hosting)](0010-host-based-l7-routing.md) | accepted |
 | 0011  | [`zion import` — nginx config migration, honesty over completeness](0011-zion-import-nginx.md) | accepted |
+| 0012  | [`zion import traefik` — a second front-end on the neutral seam](0012-zion-import-traefik.md) | accepted |
 
 ## When to write a new ADR
 
