@@ -8,6 +8,7 @@
 //! unsupported), and anything Zion cannot express faithfully is flagged
 //! loudly instead of silently mistranslated.
 
+mod caddy;
 mod compose;
 mod emit;
 mod map;
@@ -263,15 +264,17 @@ fn wildcard_match(pattern: &str, name: &str) -> bool {
 pub fn run(opts: ImportOpts) -> i32 {
     let source = opts.source.as_str();
     match source {
-        "nginx" | "traefik" => {}
+        "nginx" | "traefik" | "caddy" => {}
         "" => {
             eprintln!(
-                "usage: zion import <nginx|traefik> <path|-> [-o zion.toml] [--report file] [--strict] [--var KEY=VALUE]..."
+                "usage: zion import <nginx|traefik|caddy> <path|-> [-o zion.toml] [--report file] [--strict] [--var KEY=VALUE]..."
             );
             return 1;
         }
         other => {
-            eprintln!("zion import: unsupported source '{other}' (supported: nginx, traefik)");
+            eprintln!(
+                "zion import: unsupported source '{other}' (supported: nginx, traefik, caddy)"
+            );
             return 1;
         }
     }
@@ -307,6 +310,7 @@ pub fn run(opts: ImportOpts) -> i32 {
 
     let converted = match source {
         "traefik" => traefik::convert(&src, base_dir.as_deref(), &opts.vars),
+        "caddy" => caddy::convert(&src, base_dir.as_deref(), &opts.vars),
         _ => convert(&src, base_dir.as_deref()),
     };
     let conversion = match converted {

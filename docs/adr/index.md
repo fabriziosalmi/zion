@@ -23,6 +23,7 @@ defined in [0000-template.md](0000-template.md).
 | 0010  | [Host-based L7 routing (virtual hosting)](0010-host-based-l7-routing.md) | accepted |
 | 0011  | [`zion import` — nginx config migration, honesty over completeness](0011-zion-import-nginx.md) | accepted |
 | 0012  | [`zion import traefik` — a second front-end on the neutral seam](0012-zion-import-traefik.md) | accepted |
+| 0013  | [`zion import caddy` — third front-end, own Caddyfile parser](0013-zion-import-caddy.md) | accepted |
 
 ## When to write a new ADR
 

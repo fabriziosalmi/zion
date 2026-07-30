@@ -1,0 +1,20 @@
+# Anonymized: a reusable security snippet imported into a site — exercises
+# snippet capture + `import` inlining, plus two path-routed backends.
+(security) {
+    header {
+        X-Frame-Options        "DENY"
+        X-Content-Type-Options "nosniff"
+    }
+}
+
+example.com {
+    import security
+
+    handle /api/* {
+        reverse_proxy api:9000
+    }
+
+    handle {
+        reverse_proxy site:3000
+    }
+}
