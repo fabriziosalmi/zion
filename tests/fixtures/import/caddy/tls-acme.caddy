@@ -1,0 +1,7 @@
+# Anonymized: a single reverse-proxied site with Caddy-managed TLS (ACME).
+# `tls <email>` → Zion emits a placeholder cert and a `partial` finding that
+# points at [tls.acme] / `zion init`. The host default resolves with no --var.
+{$SITE:app.localhost} {
+    reverse_proxy backend:8080
+    tls ops@example.com
+}

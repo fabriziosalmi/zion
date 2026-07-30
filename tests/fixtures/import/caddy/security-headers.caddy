@@ -1,0 +1,35 @@
+# Anonymized Caddy site: a global security-header block + per-handler CSP over
+# two backends. The interesting result is that the header block "evaporates" —
+# Zion injects the same security headers built-in, so they land in `auto`.
+{$DOMAIN:localhost} {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options    "nosniff"
+        X-Frame-Options           "DENY"
+        Referrer-Policy           "strict-origin-when-cross-origin"
+        X-XSS-Protection          "1; mode=block"
+        Permissions-Policy        "geolocation=(), camera=(), microphone=()"
+        -Server
+    }
+
+    handle /api/* {
+        reverse_proxy api:8000
+        header {
+            Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+        }
+    }
+
+    handle {
+        reverse_proxy web:3000
+        header {
+            Content-Security-Policy "default-src 'self'; script-src 'self'"
+        }
+    }
+
+    encode gzip zstd
+
+    log {
+        output stdout
+        format json
+    }
+}

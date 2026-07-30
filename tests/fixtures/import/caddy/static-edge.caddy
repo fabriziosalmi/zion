@@ -1,0 +1,7 @@
+# Product edge: a static file server. Zion serves nothing from disk, so `root`
+# and `file_server` are `unsupported` and no convertible route is emitted.
+example.com {
+    root * /srv/www
+    file_server
+    encode gzip
+}

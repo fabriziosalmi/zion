@@ -441,7 +441,7 @@ pub fn print_help() {
             {bin} top [opts]             live TUI dashboard\n  \
             {bin} init [opts]            generate zion.toml from prompts (or flags)\n  \
             {bin} suggest [opts]         synthesize a validated zion.toml from a detected/declared backend\n  \
-            {bin} import <nginx|traefik> convert an nginx or Traefik-compose config to a validated zion.toml (honest findings)\n  \
+            {bin} import <nginx|traefik|caddy> convert an nginx / Traefik-compose / Caddyfile config to a validated zion.toml (honest findings)\n  \
             {bin} doctor                 run environment diagnostic checks\n  \
             {bin} bootstrap              dump detected platform as JSON (for CI / automation)\n  \
             {bin} --version              print version\n  \
