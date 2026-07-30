@@ -8,14 +8,12 @@
 //! unsupported), and anything Zion cannot express faithfully is flagged
 //! loudly instead of silently mistranslated.
 
-// Consumed by the Traefik front-end (ADR-0012); allow(dead_code) is
-// transient and comes off when `traefik.rs` lands.
-#[allow(dead_code)]
 mod compose;
 mod emit;
 mod map;
 mod model;
 mod nginx;
+mod traefik;
 
 use std::fmt;
 use std::io::Read;
@@ -102,6 +100,7 @@ pub(crate) struct Conversion {
     pub findings: Vec<Finding>,
 }
 
+#[derive(Debug)]
 pub(crate) enum ConvertError {
     /// Input could not be parsed (with file/line context).
     Parse(String),
@@ -126,7 +125,7 @@ pub(crate) fn convert(src: &str, base_dir: Option<&Path>) -> Result<Conversion, 
     if doc.routes.is_empty() {
         return Err(ConvertError::NoRoutes(findings));
     }
-    let toml = emit::render(&doc);
+    let toml = emit::render(&doc, "nginx");
     emit::self_validate(&toml).map_err(|e| {
         ConvertError::Internal(format!(
             "emitted config failed self-validation — this is an importer bug, \
@@ -262,16 +261,17 @@ fn wildcard_match(pattern: &str, name: &str) -> bool {
 /// internal self-validation failure — nothing emitted); 2 `--strict` and at
 /// least one partial/unsupported finding exists.
 pub fn run(opts: ImportOpts) -> i32 {
-    match opts.source.as_str() {
-        "nginx" => {}
+    let source = opts.source.as_str();
+    match source {
+        "nginx" | "traefik" => {}
         "" => {
             eprintln!(
-                "usage: zion import nginx <path|-> [-o zion.toml] [--report file] [--strict]"
+                "usage: zion import <nginx|traefik> <path|-> [-o zion.toml] [--report file] [--strict] [--var KEY=VALUE]..."
             );
             return 1;
         }
         other => {
-            eprintln!("zion import: unsupported source '{other}' (supported: nginx)");
+            eprintln!("zion import: unsupported source '{other}' (supported: nginx, traefik)");
             return 1;
         }
     }
@@ -305,14 +305,18 @@ pub fn run(opts: ImportOpts) -> i32 {
         }
     };
 
-    let conversion = match convert(&src, base_dir.as_deref()) {
+    let converted = match source {
+        "traefik" => traefik::convert(&src, base_dir.as_deref(), &opts.vars),
+        _ => convert(&src, base_dir.as_deref()),
+    };
+    let conversion = match converted {
         Ok(c) => c,
         Err(ConvertError::Parse(e)) => {
             eprintln!("zion import: {input}: {e}");
             return 1;
         }
         Err(ConvertError::NoRoutes(findings)) => {
-            eprint!("{}", report_text(&findings, true));
+            eprint!("{}", report_text(&findings, true, source));
             eprintln!("zion import: no convertible routes — nothing emitted");
             return 1;
         }
@@ -325,7 +329,7 @@ pub fn run(opts: ImportOpts) -> i32 {
     // The report file is written BEFORE the config is emitted so that exit 1
     // keeps its contract: fatal means nothing was emitted.
     if let Some(path) = &opts.report {
-        if let Err(e) = std::fs::write(path, report_text(&conversion.findings, true)) {
+        if let Err(e) = std::fs::write(path, report_text(&conversion.findings, true, source)) {
             eprintln!("zion import: cannot write report {path}: {e} — nothing emitted");
             return 1;
         }
@@ -343,7 +347,7 @@ pub fn run(opts: ImportOpts) -> i32 {
     }
 
     // Findings that need eyes go to stderr; the full log went to --report.
-    eprint!("{}", report_text(&conversion.findings, false));
+    eprint!("{}", report_text(&conversion.findings, false, source));
 
     let needs_eyes = conversion
         .findings
@@ -359,11 +363,11 @@ pub fn run(opts: ImportOpts) -> i32 {
 /// Render the findings report. `full` includes convert/auto entries; the
 /// stderr variant shows only what needs a human (partial/unsupported) plus
 /// the counts.
-fn report_text(findings: &[Finding], full: bool) -> String {
+fn report_text(findings: &[Finding], full: bool, source: &str) -> String {
     let count = |s: Status| findings.iter().filter(|f| f.status == s).count();
     let mut out = String::new();
     out.push_str(&format!(
-        "zion import nginx: {} findings — {} convert, {} partial, {} auto, {} unsupported\n",
+        "zion import {source}: {} findings — {} convert, {} partial, {} auto, {} unsupported\n",
         findings.len(),
         count(Status::Convert),
         count(Status::Partial),
@@ -402,7 +406,10 @@ mod tests {
             Ok(c) => c,
             Err(ConvertError::Parse(e)) => panic!("{name}: parse error: {e}"),
             Err(ConvertError::NoRoutes(f)) => {
-                panic!("{name}: no routes; findings:\n{}", report_text(&f, true))
+                panic!(
+                    "{name}: no routes; findings:\n{}",
+                    report_text(&f, true, "nginx")
+                )
             }
             Err(ConvertError::Internal(e)) => panic!("{name}: internal: {e}"),
         }
@@ -646,9 +653,7 @@ mod tests {
         std::fs::write(sub.join("b.conf"), "server { listen 80; server_name b.example.com; location = /b { proxy_pass http://127.0.0.1:9002; } }").unwrap();
         std::fs::write(sub.join("notes.txt"), "not nginx").unwrap();
         let src = "include conf.d/*.conf;";
-        let c = convert(src, Some(&dir))
-            .ok()
-            .expect("convert with includes");
+        let c = convert(src, Some(&dir)).expect("convert with includes");
         assert!(c.toml.contains("http://127.0.0.1:9001"));
         assert!(c.toml.contains("http://127.0.0.1:9002"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -660,7 +665,6 @@ mod tests {
             "include /nonexistent/mime.types;\nserver { listen 80; location / { proxy_pass http://127.0.0.1:9001; } }",
             Some(Path::new("/")),
         )
-        .ok()
         .expect("must still convert");
         assert!(has_finding(
             &c,
@@ -686,7 +690,7 @@ mod tests {
             Ok(c) => c,
             Err(ConvertError::Parse(e)) => panic!("parse error: {e}"),
             Err(ConvertError::NoRoutes(f)) => {
-                panic!("no routes; findings:\n{}", report_text(&f, true))
+                panic!("no routes; findings:\n{}", report_text(&f, true, "nginx"))
             }
             Err(ConvertError::Internal(e)) => panic!("internal: {e}"),
         }

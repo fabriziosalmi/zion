@@ -53,13 +53,6 @@ pub struct ComposeFile {
     pub services: Vec<Service>,
 }
 
-impl ComposeFile {
-    /// Look up a service by name.
-    pub fn service(&self, name: &str) -> Option<&Service> {
-        self.services.iter().find(|s| s.name == name)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub line: u32,
@@ -523,7 +516,9 @@ mod tests {
     use super::*;
 
     fn svc<'a>(f: &'a ComposeFile, name: &str) -> &'a Service {
-        f.service(name)
+        f.services
+            .iter()
+            .find(|s| s.name == name)
             .unwrap_or_else(|| panic!("no service {name}"))
     }
 
@@ -809,7 +804,7 @@ mod proptests {
         ) {
             let src = format!("services:\n  s:\n    labels:\n      - \"{key}={value}\"\n");
             let f = parse(&src).expect("well-formed compose must parse");
-            let s = f.service("s").expect("service s");
+            let s = f.services.iter().find(|x| x.name == "s").expect("service s");
             prop_assert_eq!(s.labels.len(), 1);
             prop_assert_eq!(&s.labels[0].key, &key);
             prop_assert_eq!(&s.labels[0].value, &value);
