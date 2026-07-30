@@ -653,9 +653,7 @@ mod tests {
         std::fs::write(sub.join("b.conf"), "server { listen 80; server_name b.example.com; location = /b { proxy_pass http://127.0.0.1:9002; } }").unwrap();
         std::fs::write(sub.join("notes.txt"), "not nginx").unwrap();
         let src = "include conf.d/*.conf;";
-        let c = convert(src, Some(&dir))
-            .ok()
-            .expect("convert with includes");
+        let c = convert(src, Some(&dir)).expect("convert with includes");
         assert!(c.toml.contains("http://127.0.0.1:9001"));
         assert!(c.toml.contains("http://127.0.0.1:9002"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -667,7 +665,6 @@ mod tests {
             "include /nonexistent/mime.types;\nserver { listen 80; location / { proxy_pass http://127.0.0.1:9001; } }",
             Some(Path::new("/")),
         )
-        .ok()
         .expect("must still convert");
         assert!(has_finding(
             &c,
