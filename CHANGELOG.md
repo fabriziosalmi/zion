@@ -4,6 +4,33 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-31
+
+### Changed
+- **Dependency refresh.** The rust-patch and rust-minor dependabot groups, plus
+  `tract-onnx`/`tract-nnef` 0.21.14 → 0.21.17 (rust-security group; ml-waf
+  feature only, off by default). CI tooling: `actions/checkout` v7,
+  `actions/upload-artifact` v7, `dependabot/fetch-metadata` v3, Docker base image
+  `rust` 1.97. MSRV-safe (the 1.82 core floor and 1.88 full floor are unchanged);
+  `cargo-vet` exemptions regenerated.
+
+### Security
+- **Advisory hygiene.** The dependency bumps **resolved** three ignored
+  advisories (`RUSTSEC-2026-0002` lru/ratatui, `-0186` memmap2, `-0217`
+  tract-nnef), now removed from `deny.toml`/`.cargo/audit.toml`. The
+  newly-published `RUSTSEC-2026-0009` (`time` 0.3.41 stack-exhaustion when
+  parsing untrusted RFC 2822 input) is feature-gated behind acme/init/ml-waf
+  (absent from the no-default-features core) and unreachable on Zion's request
+  path — documented and ignored until the transitive `time <0.3.42` constraint
+  lifts (the fix, `time >=0.3.47`, also needs Rust 1.85).
+
+### Documentation
+- **"Migrating to Zion" guide** — a dedicated page covering all three importer
+  front-ends (nginx / Traefik / Caddy), the honesty contract, `${}` resolution,
+  native `[tls.acme]`, `mode = "static"` site conversion, and the
+  verify-before-cutover workflow. The `cli.md` import section no longer claims
+  static serving is unsupported (it converts now).
+
 ## [0.7.0] - 2026-07-31
 
 ### Added

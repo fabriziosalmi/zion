@@ -1,6 +1,6 @@
 [package]
 name = "zion"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 # MSRV is the *core* default-features build (TLS proxy + WAF + cache + metrics).
 # Opt-in features (acme, auth, init, http3) pull crypto/i18n crates that have
