@@ -1,0 +1,15 @@
+# Pathological: a router rule with no matching loadbalancer port. The
+# importer must refuse to invent an upstream — the route is dropped with an
+# `unsupported` finding, leaving no convertible routes.
+services:
+  proxy:
+    image: traefik:v3.3
+    command:
+      - "--providers.docker=true"
+      - "--entrypoints.web.address=:80"
+  app:
+    image: example/app:latest
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.app.rule=Host(`a.example.com`)"
+      - "traefik.http.routers.app.entrypoints=web"

@@ -1,0 +1,17 @@
+# Anonymized HTTP-only Traefik stack (Docker provider, :80 behind an edge).
+# Mirrors the simplest fleet shape: one router, Host-OR-Host, no TLS.
+services:
+  proxy:
+    image: traefik:v3.3
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+  app:
+    image: example/app:latest
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.app.rule=Host(`a.example.com`) || Host(`b.example.com`)"
+      - "traefik.http.routers.app.entrypoints=web"
+      - "traefik.http.services.app.loadbalancer.server.port=8000"

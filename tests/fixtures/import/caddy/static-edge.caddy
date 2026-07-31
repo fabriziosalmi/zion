@@ -1,0 +1,7 @@
+# A static file server: `root` + `file_server` convert to a mode=static route
+# (ADR-0015). `encode` stays unsupported (Zion does not compress).
+example.com {
+    root * /srv/www
+    file_server
+    encode gzip
+}
