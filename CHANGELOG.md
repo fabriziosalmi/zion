@@ -4,6 +4,25 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-31
+
+### Changed
+- **Dependency refresh.** The rust-patch and rust-minor dependabot groups, plus
+  `tract-onnx`/`tract-nnef` 0.21.14 → 0.21.17 (rust-security group; ml-waf
+  feature only, off by default). CI tooling: `actions/checkout` v7,
+  `actions/upload-artifact` v7, `dependabot/fetch-metadata` v3, Docker base image
+  `rust` 1.97. MSRV-safe (the 1.82 core floor and 1.88 full floor are unchanged);
+  `cargo-vet` exemptions regenerated. Two now-unreachable advisory ignores were
+  reviewed and retained (`RUSTSEC-2026-0186`/`-0217` have no fixed upstream
+  release yet).
+
+### Documentation
+- **"Migrating to Zion" guide** — a dedicated page covering all three importer
+  front-ends (nginx / Traefik / Caddy), the honesty contract, `${}` resolution,
+  native `[tls.acme]`, `mode = "static"` site conversion, and the
+  verify-before-cutover workflow. The `cli.md` import section no longer claims
+  static serving is unsupported (it converts now).
+
 ## [0.7.0] - 2026-07-31
 
 ### Added
