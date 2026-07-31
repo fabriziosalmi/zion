@@ -12,6 +12,25 @@ export default defineConfig({
   description: 'High-performance TLS reverse proxy with built-in WAF, written in Rust',
   base: '/zion/',
   head: [
+    // Everything this site loads is first-party. 'unsafe-inline' is required
+    // because VitePress emits an inline appearance script and inline styles.
+    // Applied to the built site only: `vitepress dev` serves HMR over a
+    // websocket, which a strict connect-src would block as soon as the dev
+    // server is not same-origin (--host, or a custom server.hmr.port).
+    ...(process.env.NODE_ENV === 'production'
+      ? [
+          [
+            'meta',
+            {
+              'http-equiv': 'Content-Security-Policy',
+              content:
+                "default-src 'self'; script-src 'self' 'unsafe-inline'; " +
+                "style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
+                "font-src 'self'; connect-src 'self'; base-uri 'self'; form-action 'self'",
+            },
+          ] as [string, Record<string, string>],
+        ]
+      : []),
     ['link', { rel: 'icon', type: 'image/svg+xml', href: '/zion/logo.svg' }],
     ['meta', { name: 'theme-color', content: '#0b0b0d' }],
     ['meta', { property: 'og:title', content: 'Zion Edge Gateway' }],
@@ -156,7 +175,8 @@ export default defineConfig({
     ],
 
     footer: {
-      message: 'Released under the MIT License.',
+      message:
+        'Released under the MIT License. · <a href="https://fabriziosalmi.github.io/privacy">Privacy &amp; legal</a>',
       copyright: 'Built with Rust. Benchmarked with science.',
     },
 

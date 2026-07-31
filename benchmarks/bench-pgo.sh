@@ -14,6 +14,18 @@ cd "$(dirname "$0")/.."
 PGO_DIR="/tmp/zion-pgo"
 MERGED_PROF="${PGO_DIR}/merged.profdata"
 
+# Cleanup function for backgrounded processes
+cleanup() {
+  # Kill backgrounded processes if still running
+  [[ -n "${ZION_PID:-}" ]] && kill "$ZION_PID" 2>/dev/null || true
+  [[ -n "${BACKEND_PID:-}" ]] && kill "$BACKEND_PID" 2>/dev/null || true
+  wait "$ZION_PID" 2>/dev/null || true
+  wait "$BACKEND_PID" 2>/dev/null || true
+}
+
+# Ensure cleanup runs on exit (including errors)
+trap cleanup EXIT
+
 echo "┌─────────────────────────────────────────┐"
 echo "│  ZION PGO BUILD PIPELINE                │"
 echo "└─────────────────────────────────────────┘"
@@ -53,11 +65,9 @@ wrk -c 50 -d 10s -t 4 --timeout 5s -H "Host: bench.local" \
 wrk -c 50 -d 10s -t 4 --timeout 5s -H "Host: bench.local" \
     "https://127.0.0.1:4430/page" 2>/dev/null | tail -2
 
-# Stop servers
+# Stop servers (cleanup trap will handle this, but explicit kill is safer and faster)
 kill "$ZION_PID" 2>/dev/null || true
 kill "$BACKEND_PID" 2>/dev/null || true
-wait "$ZION_PID" 2>/dev/null || true
-wait "$BACKEND_PID" 2>/dev/null || true
 sleep 1
 
 # Merge profiles

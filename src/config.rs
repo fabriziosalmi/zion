@@ -523,9 +523,17 @@ pub struct RouteConfig {
     #[serde(default)]
     pub hosts: Option<Vec<String>>,
 
+    #[serde(default)]
     pub upstream: String,
     #[serde(default)]
     pub mode: RouteMode,
+    /// For `mode = "static"`: the directory served from disk. Files under it are
+    /// served safely (no `..` traversal, no dotfiles); anything outside 404s.
+    pub serve_dir: Option<String>,
+    /// For `mode = "static"`: serve `index.html` for any path that maps to no
+    /// file (single-page-app fallback). Off by default.
+    #[serde(default)]
+    pub spa_fallback: bool,
     #[serde(default)]
     pub internal_only: bool,
 
@@ -567,6 +575,8 @@ pub enum RouteMode {
     SseStream,
     StaticCache,
     Websocket,
+    /// Serve files from a local directory (`serve_dir`); no upstream. ADR-0015.
+    Static,
 }
 
 // ============================================================================
@@ -581,6 +591,13 @@ pub struct ResolvedRoute {
     pub upstream_scheme: hyper::http::uri::Scheme,
     pub upstream_authority: hyper::http::uri::Authority,
     pub mode: RouteMode,
+    /// For `RouteMode::Static`: the serve directory (not canonicalized here —
+    /// existence is a per-request check so an imported config validates offline).
+    pub serve_dir: Option<std::path::PathBuf>,
+    /// SPA fallback (serve `index.html` on a miss) for `RouteMode::Static`.
+    pub spa_fallback: bool,
+    /// Literal path prefix stripped before the on-disk file lookup.
+    pub static_prefix: String,
     pub waf: Option<WafProfile>,
     /// True iff the route is in WAF shadow mode (log + count, no block).
     pub waf_shadow: bool,
@@ -797,20 +814,41 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
         }
     }
 
+    // A [tls.acme] block must name at least one domain and a non-empty e-mail —
+    // an empty one would parse and build a router yet issue nothing at runtime.
+    if let Some(acme) = &config.tls.acme {
+        if acme.domains.is_empty() {
+            errors.push("[tls.acme] must list at least one domain".to_string());
+        }
+        if acme.email.trim().is_empty() {
+            errors.push("[tls.acme] email must not be empty".to_string());
+        }
+    }
+
     // Must have at least one route
     if config.route.is_empty() {
         errors.push("no [[route]] defined — at least one route is required".to_string());
     }
 
-    // Each route must reference a valid upstream
+    // Each route must reference a valid upstream — except a static route, which
+    // serves from disk and instead needs a serve_dir (ADR-0015).
     for route in &config.route {
-        let has_upstream = config.upstream.contains_key(&route.upstream)
-            || config.upstreams.contains_key(&route.upstream);
-        if !has_upstream {
-            errors.push(format!(
-                "route '{}' references unknown upstream '{}'",
-                route.path, route.upstream
-            ));
+        if route.mode == RouteMode::Static {
+            if route.serve_dir.as_deref().unwrap_or("").is_empty() {
+                errors.push(format!(
+                    "route '{}' is mode=static but has no serve_dir",
+                    route.path
+                ));
+            }
+        } else {
+            let has_upstream = config.upstream.contains_key(&route.upstream)
+                || config.upstreams.contains_key(&route.upstream);
+            if !has_upstream {
+                errors.push(format!(
+                    "route '{}' references unknown upstream '{}'",
+                    route.path, route.upstream
+                ));
+            }
         }
 
         // WAF profile reference must exist
@@ -1170,7 +1208,14 @@ pub fn build_router_quiet(config: &ZionConfig) -> Result<HostRouter, String> {
 /// path needs, computed once at build. Pure: no router insertion, so
 /// `build_router` can place the result into one or more host-scoped trees.
 fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<ResolvedRoute>, String> {
-    let upstream_url = resolve_upstream(config, &route.upstream)?;
+    // A static route (ADR-0015) serves from disk and needs no upstream — ignore
+    // any stray `upstream` field so `validate_semantics` and `build_router`
+    // agree (both skip the upstream for a static route).
+    let upstream_url = if route.mode == RouteMode::Static {
+        Vec::new()
+    } else {
+        resolve_upstream(config, &route.upstream)?
+    };
 
     // Resolve WAF: named profile > legacy bool flag
     let waf = if let Some(ref profile_name) = route.waf_profile {
@@ -1234,19 +1279,25 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
         None
     };
 
-    // Pre-parse the FIRST upstream URI at startup for legacy fallback.
-    // In a true clustered setup with latency routing, we use the first to get the scheme.
-    let upstream_uri: hyper::Uri = upstream_url[0]
-        .parse()
-        .map_err(|e| format!("Invalid upstream URL '{}': {}", upstream_url[0], e))?;
-    let upstream_scheme = upstream_uri
-        .scheme()
-        .cloned()
-        .unwrap_or_else(|| "http".parse().unwrap());
-    let upstream_authority = upstream_uri
-        .authority()
-        .cloned()
-        .ok_or_else(|| format!("Upstream '{}' has no authority", upstream_url[0]))?;
+    // Pre-parse the FIRST upstream URI at startup for legacy fallback. A static
+    // route has no upstream, so it gets placeholder parts the Static dispatch
+    // arm never reads.
+    let (upstream_scheme, upstream_authority) = if upstream_url.is_empty() {
+        ("http".parse().unwrap(), "127.0.0.1".parse().unwrap())
+    } else {
+        let upstream_uri: hyper::Uri = upstream_url[0]
+            .parse()
+            .map_err(|e| format!("Invalid upstream URL '{}': {}", upstream_url[0], e))?;
+        let scheme = upstream_uri
+            .scheme()
+            .cloned()
+            .unwrap_or_else(|| "http".parse().unwrap());
+        let authority = upstream_uri
+            .authority()
+            .cloned()
+            .ok_or_else(|| format!("Upstream '{}' has no authority", upstream_url[0]))?;
+        (scheme, authority)
+    };
 
     // Pre-parse CSP at startup for zero-cost injection at runtime
     let csp = match route.csp.as_ref() {
@@ -1280,11 +1331,34 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
         .as_ref()
         .map(|c| Arc::new(crate::security::CorsHeaders::from_config(c)));
 
+    // Static file serving (ADR-0015): the serve dir + the literal prefix to
+    // strip from the request path. Not canonicalized here — existence is a
+    // per-request check so an imported config validates offline.
+    let (serve_dir, static_prefix) = if route.mode == RouteMode::Static {
+        let dir = route
+            .serve_dir
+            .as_ref()
+            .ok_or_else(|| format!("route '{}' is mode=static but has no serve_dir", route.path))?;
+        let prefix = route
+            .path
+            .split("{*")
+            .next()
+            .unwrap_or("/")
+            .trim_end_matches('/')
+            .to_string();
+        (Some(std::path::PathBuf::from(dir)), prefix)
+    } else {
+        (None, String::new())
+    };
+
     Ok(Arc::new(ResolvedRoute {
         upstream_url,
         upstream_scheme,
         upstream_authority,
         mode: route.mode.clone(),
+        serve_dir,
+        spa_fallback: route.spa_fallback,
+        static_prefix,
         waf,
         waf_shadow: route.waf_shadow,
         cache,
@@ -1401,6 +1475,7 @@ fn render_route_tags(route: &RouteConfig, color: bool) -> String {
         RouteMode::SseStream => tags.push(format!("{cyan}sse{reset}")),
         RouteMode::Websocket => tags.push(format!("{cyan}ws{reset}")),
         RouteMode::StaticCache => tags.push(format!("{cyan}static{reset}")),
+        RouteMode::Static => tags.push(format!("{cyan}files{reset}")),
         RouteMode::Standard => {}
     }
     if route.waf || route.waf_profile.is_some() {
@@ -1447,6 +1522,8 @@ mod tests {
             hosts: None,
             upstream: "backend".into(),
             mode: RouteMode::Standard,
+            serve_dir: None,
+            spa_fallback: false,
             internal_only: false,
             waf_profile: None,
             cache_profile: None,
@@ -1457,6 +1534,77 @@ mod tests {
             waf_shadow: false,
             cors: None,
         }
+    }
+
+    #[test]
+    fn static_route_builds_without_an_upstream() {
+        let toml = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[[route]]
+path = "/assets/{*rest}"
+upstream = ""
+mode = "static"
+serve_dir = "/var/www/assets"
+spa_fallback = true
+"#;
+        let cfg = parse_schema(toml, "test").expect("parse");
+        validate_semantics(&cfg, "test").expect("semantics");
+        let router = build_router_quiet(&cfg).expect("build");
+        let r = router.at(None, "/assets/css/app.css").expect("route");
+        assert_eq!(r.mode, RouteMode::Static);
+        assert_eq!(
+            r.serve_dir.as_deref(),
+            Some(std::path::Path::new("/var/www/assets"))
+        );
+        assert!(r.spa_fallback);
+        assert_eq!(r.static_prefix, "/assets");
+    }
+
+    #[test]
+    fn static_route_without_serve_dir_is_rejected() {
+        let toml = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[[route]]
+path = "/{*rest}"
+upstream = ""
+mode = "static"
+"#;
+        let cfg = parse_schema(toml, "test").expect("parse");
+        assert!(validate_semantics(&cfg, "test").is_err());
+    }
+
+    #[test]
+    fn empty_acme_domains_are_rejected() {
+        // Backstop: an empty [tls.acme] domains list parses + builds a router
+        // but would issue nothing at runtime — validate_semantics must reject it.
+        let toml = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[tls.acme]
+email = "ops@example.com"
+domains = []
+[[route]]
+path = "/{*rest}"
+upstream = "b"
+[upstream.b]
+url = "http://127.0.0.1:8080"
+"#;
+        let cfg = parse_schema(toml, "test").expect("parse");
+        assert!(validate_semantics(&cfg, "test").is_err());
     }
 
     #[test]
