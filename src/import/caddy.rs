@@ -652,6 +652,10 @@ fn map_site(
     seen_upstreams: &mut BTreeSet<String>,
     findings: &mut Vec<Finding>,
 ) {
+    // A site with `root <dir>` + `file_server` serves files from disk
+    // (ADR-0015); it may coexist with proxy handlers as a static fallback.
+    let static_spec = detect_static(body);
+
     // Pass 1: site-level directives (headers, tls, encode, …). The site-level
     // header block yields a CSP that applies to every route unless a handler
     // overrides it.
@@ -676,12 +680,32 @@ fn map_site(
                 "log",
                 "structured JSON logging to stdout is built in",
             )),
-            "root" | "file_server" => findings.push(Finding::new(
-                Status::Unsupported,
-                node.line,
-                node.name.clone(),
-                "Zion serves nothing from disk (static serving is the product edge)",
-            )),
+            "root" | "file_server" => {
+                if static_spec.is_some() {
+                    findings.push(Finding::new(
+                        Status::Convert,
+                        node.line,
+                        node.name.clone(),
+                        "→ mode=static — files served from disk (ADR-0015)",
+                    ));
+                } else {
+                    findings.push(Finding::new(
+                        Status::Unsupported,
+                        node.line,
+                        node.name.clone(),
+                        "static serving needs both `root <dir>` and `file_server`",
+                    ));
+                }
+            }
+            "try_files" => {
+                let spa = static_spec.as_ref().map(|s| s.1).unwrap_or(false);
+                findings.push(Finding::new(
+                    if spa { Status::Convert } else { Status::Unsupported },
+                    node.line,
+                    "try_files",
+                    "SPA fallback (`… /index.html`) → spa_fallback; other try_files forms are unsupported",
+                ));
+            }
             "respond" => findings.push(Finding::new(
                 Status::Unsupported,
                 node.line,
@@ -742,7 +766,40 @@ fn map_site(
         }
     }
 
+    // A static site/route (root + file_server) becomes a catch-all mode=static
+    // route, emitted AFTER the proxy routes so a more-specific handler wins.
+    if let Some((dir, spa)) = static_spec {
+        doc.routes.push(RouteOut {
+            path: "/{*rest}".to_string(),
+            hosts: if hosts.is_empty() {
+                None
+            } else {
+                Some(hosts.to_vec())
+            },
+            upstream: String::new(),
+            websocket: false,
+            csp: site_csp.clone(),
+            waf: false,
+            serve_dir: Some(dir),
+            spa_fallback: spa,
+            annotations: Vec::new(),
+        });
+    }
+
     apply_site_acme(body, hosts, acme_email, cli_acme_email, doc, findings);
+}
+
+/// A site's `root <dir>` + `file_server` → `(serve_dir, spa_fallback)`, or
+/// `None` if it serves no files. `try_files … /index.html` sets the SPA flag.
+fn detect_static(body: &[Node]) -> Option<(String, bool)> {
+    if !body.iter().any(|n| n.name == "file_server") {
+        return None;
+    }
+    let dir = body.iter().find(|n| n.name == "root")?.args.last()?.clone();
+    let spa = body
+        .iter()
+        .any(|n| n.name == "try_files" && n.args.iter().any(|a| a.contains("index.html")));
+    Some((dir, spa))
 }
 
 /// Map a `header` block. Security headers Zion already injects → `auto`;
@@ -1089,6 +1146,8 @@ fn push_route(
         websocket: false,
         csp: csp.map(str::to_string),
         waf: false,
+        serve_dir: None,
+        spa_fallback: false,
         annotations: Vec::new(),
     });
 }
@@ -1356,14 +1415,29 @@ mod tests {
     }
 
     #[test]
-    fn file_server_site_has_no_routes() {
+    fn static_site_converts_to_mode_static() {
         let src = "example.com {\n  root * /var/www\n  file_server\n}";
-        match convert_str(src, &[]) {
-            Err(ConvertError::NoRoutes(f)) => assert!(f
-                .iter()
-                .any(|x| x.status == Status::Unsupported && x.directive == "file_server")),
-            other => panic!("expected NoRoutes, got {:?}", other.map(|c| c.toml)),
-        }
+        let c = convert_str(src, &[]).expect("static site should convert");
+        assert!(c.toml.contains("mode = \"static\""));
+        assert!(c.toml.contains("serve_dir = \"/var/www\""));
+        assert!(c.toml.contains("path = \"/{*rest}\""));
+        assert!(c
+            .findings
+            .iter()
+            .any(|f| f.status == Status::Convert && f.directive == "file_server"));
+    }
+
+    #[test]
+    fn hybrid_static_plus_proxy() {
+        // The Tier B shape: an API proxied, everything else served from disk
+        // with an SPA fallback.
+        let src = "example.com {\n  handle /api/* {\n    reverse_proxy api:8000\n  }\n  root * /srv\n  file_server\n  try_files {path} /index.html\n}";
+        let c = convert_str(src, &[]).expect("convert");
+        assert!(c.toml.contains("[upstream.api]") && c.toml.contains("http://api:8000"));
+        assert!(c.toml.contains("path = \"/api/{*rest}\""));
+        assert!(c.toml.contains("mode = \"static\""));
+        assert!(c.toml.contains("serve_dir = \"/srv\""));
+        assert!(c.toml.contains("spa_fallback = true"));
     }
 
     #[test]
@@ -1462,13 +1536,16 @@ mod tests {
     }
 
     #[test]
-    fn golden_static_edge_refuses() {
-        match convert(&fixture("static-edge.caddy"), None, &[], None) {
-            Err(ConvertError::NoRoutes(f)) => assert!(f
-                .iter()
-                .any(|x| x.status == Status::Unsupported && x.directive == "file_server")),
-            other => panic!("expected NoRoutes, got {:?}", other.map(|c| c.toml)),
-        }
+    fn golden_static_edge_converts() {
+        let c = convert(&fixture("static-edge.caddy"), None, &[], None)
+            .expect("static site converts to mode=static");
+        assert!(c.toml.contains("mode = \"static\""));
+        assert!(c.toml.contains("serve_dir = \"/srv/www\""));
+        // `encode` is still unsupported (Zion does not compress).
+        assert!(c
+            .findings
+            .iter()
+            .any(|f| f.status == Status::Unsupported && f.directive == "encode"));
     }
 }
 

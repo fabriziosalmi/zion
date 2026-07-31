@@ -64,6 +64,11 @@ pub struct RouteOut {
     pub csp: Option<String>,
     /// Attach the shared `imported` WAF profile (body cap) in shadow mode.
     pub waf: bool,
+    /// `mode = "static"` serve directory (ADR-0015). When `Some`, the route
+    /// serves files from disk instead of proxying and `upstream` is ignored.
+    pub serve_dir: Option<String>,
+    /// SPA fallback for a static route (serve `index.html` on a miss).
+    pub spa_fallback: bool,
     /// Rendered as `# UNSUPPORTED: …` comment lines above the route.
     pub annotations: Vec<String>,
 }
@@ -1417,6 +1422,8 @@ fn map_location(
         websocket,
         csp,
         waf: route_waf,
+        serve_dir: None,
+        spa_fallback: false,
         annotations,
     });
 }

@@ -600,6 +600,8 @@ fn build_route(
         websocket: false,
         csp: None,
         waf: false,
+        serve_dir: None,
+        spa_fallback: false,
         annotations: Vec::new(),
     });
 }

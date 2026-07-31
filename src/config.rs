@@ -523,6 +523,7 @@ pub struct RouteConfig {
     #[serde(default)]
     pub hosts: Option<Vec<String>>,
 
+    #[serde(default)]
     pub upstream: String,
     #[serde(default)]
     pub mode: RouteMode,
