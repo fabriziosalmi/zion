@@ -51,6 +51,14 @@ path = "/_next/static/{*rest}"
 upstream = "backend"
 mode = "static_cache"
 
+# Static file serving from disk (ADR-0015). Regression guard for the dispatch
+# 503 gap: a mode=static route has no upstream, so it must skip the
+# upstream-health gate and reach the file server.
+[[route]]
+path = "/assets/{*rest}"
+mode = "static"
+serve_dir = "./tests/fixtures/static"
+
 # Internal-only (metrics)
 [[route]]
 path = "/metrics"

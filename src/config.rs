@@ -814,6 +814,17 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
         }
     }
 
+    // A [tls.acme] block must name at least one domain and a non-empty e-mail —
+    // an empty one would parse and build a router yet issue nothing at runtime.
+    if let Some(acme) = &config.tls.acme {
+        if acme.domains.is_empty() {
+            errors.push("[tls.acme] must list at least one domain".to_string());
+        }
+        if acme.email.trim().is_empty() {
+            errors.push("[tls.acme] email must not be empty".to_string());
+        }
+    }
+
     // Must have at least one route
     if config.route.is_empty() {
         errors.push("no [[route]] defined — at least one route is required".to_string());
@@ -1197,8 +1208,10 @@ pub fn build_router_quiet(config: &ZionConfig) -> Result<HostRouter, String> {
 /// path needs, computed once at build. Pure: no router insertion, so
 /// `build_router` can place the result into one or more host-scoped trees.
 fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<ResolvedRoute>, String> {
-    // A static route (ADR-0015) serves from disk and needs no upstream.
-    let upstream_url = if route.mode == RouteMode::Static && route.upstream.is_empty() {
+    // A static route (ADR-0015) serves from disk and needs no upstream — ignore
+    // any stray `upstream` field so `validate_semantics` and `build_router`
+    // agree (both skip the upstream for a static route).
+    let upstream_url = if route.mode == RouteMode::Static {
         Vec::new()
     } else {
         resolve_upstream(config, &route.upstream)?
@@ -1565,6 +1578,30 @@ key_path = "/k"
 path = "/{*rest}"
 upstream = ""
 mode = "static"
+"#;
+        let cfg = parse_schema(toml, "test").expect("parse");
+        assert!(validate_semantics(&cfg, "test").is_err());
+    }
+
+    #[test]
+    fn empty_acme_domains_are_rejected() {
+        // Backstop: an empty [tls.acme] domains list parses + builds a router
+        // but would issue nothing at runtime — validate_semantics must reject it.
+        let toml = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[tls.acme]
+email = "ops@example.com"
+domains = []
+[[route]]
+path = "/{*rest}"
+upstream = "b"
+[upstream.b]
+url = "http://127.0.0.1:8080"
 "#;
         let cfg = parse_schema(toml, "test").expect("parse");
         assert!(validate_semantics(&cfg, "test").is_err());
