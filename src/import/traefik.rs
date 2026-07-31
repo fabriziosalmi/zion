@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use super::map::{RouteOut, UpstreamOut, ZionDoc};
+use super::map::{AcmeOut, RouteOut, UpstreamOut, ZionDoc};
 use super::{compose, emit, Conversion, ConvertError, Finding, Status};
 
 /// Placeholder cert paths, mirroring the nginx path's convention (map.rs):
@@ -53,13 +53,14 @@ pub(super) fn convert(
     src: &str,
     base_dir: Option<&Path>,
     cli_vars: &[(String, String)],
+    cli_acme_email: Option<&str>,
 ) -> Result<Conversion, ConvertError> {
     let file = compose::parse(src)
         .map_err(|e| ConvertError::Parse(format!("line {}: {}", e.line, e.msg)))?;
     let env = Env::load(base_dir, cli_vars);
 
     let mut findings = Vec::new();
-    let doc = build(&file, &env, &mut findings);
+    let doc = build(&file, &env, cli_acme_email, &mut findings);
     findings.sort_by_key(|f| f.line);
 
     if doc.routes.is_empty() {
@@ -220,7 +221,12 @@ struct StaticCfg {
     acme_email: Option<String>,
 }
 
-fn build(file: &compose::ComposeFile, env: &Env, findings: &mut Vec<Finding>) -> ZionDoc {
+fn build(
+    file: &compose::ComposeFile,
+    env: &Env,
+    cli_acme_email: Option<&str>,
+    findings: &mut Vec<Finding>,
+) -> ZionDoc {
     let mut doc = ZionDoc {
         listen_http: "0.0.0.0:80".to_string(),
         listen_https: "0.0.0.0:443".to_string(),
@@ -231,14 +237,17 @@ fn build(file: &compose::ComposeFile, env: &Env, findings: &mut Vec<Finding>) ->
         tls_key: PLACEHOLDER_KEY.to_string(),
         tls_min12: false,
         sni: Vec::new(),
+        acme: None,
         waf_body_mb: None,
         upstreams: Vec::new(),
         routes: Vec::new(),
     };
 
     let statics = parse_static(file, env, &mut doc, findings);
+    let acme_email = statics.acme_email.as_deref().or(cli_acme_email);
 
     let mut seen_upstreams: BTreeSet<String> = BTreeSet::new();
+    let mut acme_wanted = false;
     for svc in &file.services {
         if is_traefik_service(svc) {
             continue;
@@ -249,18 +258,43 @@ fn build(file: &compose::ComposeFile, env: &Env, findings: &mut Vec<Finding>) ->
             // explicitly-enabled containers are routed.
             continue;
         }
+        if routing.routers.values().any(|r| r.certresolver.is_some()) {
+            acme_wanted = true;
+        }
         for (rname, r) in &routing.routers {
             build_route(
                 svc,
                 rname,
                 r,
                 &routing,
-                &statics,
+                acme_email,
                 env,
                 &mut doc,
                 &mut seen_upstreams,
                 findings,
             );
+        }
+    }
+
+    // A certresolver + a known e-mail → a real [tls.acme] block. The ACME
+    // domains are the union of the imported route hosts; the bootstrap cert
+    // stays in [tls] so :443 binds before the first issuance.
+    if acme_wanted {
+        if let Some(email) = acme_email {
+            let mut domains: Vec<String> = doc
+                .routes
+                .iter()
+                .filter_map(|r| r.hosts.clone())
+                .flatten()
+                .collect();
+            domains.sort();
+            domains.dedup();
+            if !domains.is_empty() {
+                doc.acme = Some(AcmeOut {
+                    email: email.to_string(),
+                    domains,
+                });
+            }
         }
     }
     doc
@@ -463,7 +497,7 @@ fn build_route(
     rname: &str,
     router: &Router,
     routing: &Routing,
-    statics: &StaticCfg,
+    acme_email: Option<&str>,
     env: &Env,
     doc: &mut ZionDoc,
     seen_upstreams: &mut BTreeSet<String>,
@@ -519,17 +553,25 @@ fn build_route(
 
     // TLS is a listener concern in Zion; a placeholder cert lets :443 bind.
     if let Some((resolver, cl)) = &router.certresolver {
-        let email = statics.acme_email.as_deref().unwrap_or("you@example.com");
-        findings.push(Finding::new(
-            Status::Partial,
-            *cl,
-            format!("routers.{rname}.tls.certresolver={resolver}"),
-            format!(
-                "Traefik ACME → Zion emits a placeholder cert. For automatic HTTPS add \
-                 [tls.acme] (email = \"{email}\", domains = the route hosts) or run `zion init`; \
-                 if the origin is a certificate manager, point [tls] at its cert instead"
-            ),
-        ));
+        match acme_email {
+            Some(email) => findings.push(Finding::new(
+                Status::Convert,
+                *cl,
+                format!("routers.{rname}.tls.certresolver={resolver}"),
+                format!(
+                    "Traefik ACME → [tls.acme] (email = \"{email}\"); the route hosts become the \
+                     ACME domains, on the [tls] bootstrap cert until first issuance"
+                ),
+            )),
+            None => findings.push(Finding::new(
+                Status::Partial,
+                *cl,
+                format!("routers.{rname}.tls.certresolver={resolver}"),
+                "Traefik ACME → placeholder cert. Pass `--acme-email you@example.com` to emit \
+                 [tls.acme], or point [tls] at an existing certificate manager's cert"
+                    .to_string(),
+            )),
+        }
     } else if router.tls {
         findings.push(Finding::new(
             Status::Partial,
@@ -757,7 +799,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        convert(src, None, &cli)
+        convert(src, None, &cli, None)
     }
 
     // ── variable resolution ──
@@ -925,7 +967,7 @@ services:
     }
 
     #[test]
-    fn tls_certresolver_is_partial_not_silent() {
+    fn tls_certresolver_emits_acme() {
         let src = r#"
 services:
   traefik:
@@ -949,8 +991,11 @@ services:
             .iter()
             .find(|f| f.directive.contains("certresolver"))
             .expect("certresolver finding");
-        assert_eq!(tls.status, Status::Partial);
+        assert_eq!(tls.status, Status::Convert);
         assert!(tls.detail.contains("ops@example.com"));
+        assert!(c.toml.contains("[tls.acme]"));
+        assert!(c.toml.contains("email = \"ops@example.com\""));
+        assert!(c.toml.contains("domains = [\"app.io\"]"));
         assert!(c.toml.contains("http://fe:3000"));
     }
 
@@ -975,7 +1020,7 @@ services:
 
     #[test]
     fn golden_http_only() {
-        let c = convert(&fixture("http-only.yml"), None, &[]).expect("convert");
+        let c = convert(&fixture("http-only.yml"), None, &[], None).expect("convert");
         assert!(c.toml.contains("[upstream.app]"));
         assert!(c.toml.contains("http://app:8000"));
         assert!(c
@@ -986,7 +1031,7 @@ services:
 
     #[test]
     fn golden_tls_default_host_defaults_and_tls_is_partial() {
-        let c = convert(&fixture("tls-default.yml"), None, &[]).expect("convert");
+        let c = convert(&fixture("tls-default.yml"), None, &[], None).expect("convert");
         assert!(c.toml.contains("http://web:8080"));
         assert!(c.toml.contains("hosts = [\"localhost\"]"));
         assert!(c
@@ -1009,20 +1054,21 @@ services:
             ("PUBLIC_FQDN".to_string(), "app.example.com".to_string()),
             ("ACME_EMAIL".to_string(), "ops@example.com".to_string()),
         ];
-        let c = convert(&fixture("acme-certresolver.yml"), None, &vars).expect("convert");
+        let c = convert(&fixture("acme-certresolver.yml"), None, &vars, None).expect("convert");
         assert!(c.toml.contains("[upstream.frontend]") && c.toml.contains("http://frontend:3000"));
         assert!(c.toml.contains("[upstream.backend]") && c.toml.contains("http://backend:8000"));
         assert!(c.toml.contains("path = \"/api/{*rest}\""));
-        // certresolver → partial, twice, echoing the discovered ACME email.
-        let partials: Vec<_> = c
+        // certresolver → convert (×2) and a real [tls.acme] block is emitted.
+        let cr: Vec<_> = c
             .findings
             .iter()
             .filter(|f| f.directive.contains("certresolver"))
             .collect();
-        assert_eq!(partials.len(), 2);
-        assert!(partials
-            .iter()
-            .all(|f| f.status == Status::Partial && f.detail.contains("ops@example.com")));
+        assert_eq!(cr.len(), 2);
+        assert!(cr.iter().all(|f| f.status == Status::Convert));
+        assert!(c.toml.contains("[tls.acme]"));
+        assert!(c.toml.contains("email = \"ops@example.com\""));
+        assert!(c.toml.contains("domains = [\"app.example.com\"]"));
         // the /.well-known/acme-challenge router is dropped as `auto`.
         assert!(c
             .findings
@@ -1032,7 +1078,7 @@ services:
 
     #[test]
     fn golden_acme_without_vars_refuses() {
-        match convert(&fixture("acme-certresolver.yml"), None, &[]) {
+        match convert(&fixture("acme-certresolver.yml"), None, &[], None) {
             Err(ConvertError::NoRoutes(f)) => {
                 assert!(f.iter().any(|x| x.detail.contains("PUBLIC_FQDN")))
             }
@@ -1042,7 +1088,7 @@ services:
 
     #[test]
     fn golden_label_without_service_refuses() {
-        match convert(&fixture("label-without-service.yml"), None, &[]) {
+        match convert(&fixture("label-without-service.yml"), None, &[], None) {
             Err(ConvertError::NoRoutes(f)) => {
                 assert!(f.iter().any(|x| x.status == Status::Unsupported
                     && x.detail.contains("loadbalancer.server.port")))
@@ -1059,7 +1105,7 @@ services:
         std::fs::create_dir_all(&dir).unwrap();
         let compose = HTTP_ONLY.replace("Host(`a.io`) || Host(`b.io`)", "Host(`${SITE}`)");
         std::fs::write(dir.join(".env"), "SITE=env.example.com\n").unwrap();
-        let c = convert(&compose, Some(dir.as_path()), &[]).expect("convert via .env");
+        let c = convert(&compose, Some(dir.as_path()), &[], None).expect("convert via .env");
         assert!(c.toml.contains("hosts = [\"env.example.com\"]"));
         let _ = std::fs::remove_dir_all(&dir);
     }

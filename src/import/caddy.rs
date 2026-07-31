@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
-use super::map::{RouteOut, UpstreamOut, ZionDoc};
+use super::map::{AcmeOut, RouteOut, UpstreamOut, ZionDoc};
 use super::{emit, Conversion, ConvertError, Finding, Status};
 
 /// Placeholder cert paths (mirrors the nginx/Traefik convention): schema
@@ -49,12 +49,13 @@ pub(super) fn convert(
     src: &str,
     base_dir: Option<&Path>,
     cli_vars: &[(String, String)],
+    cli_acme_email: Option<&str>,
 ) -> Result<Conversion, ConvertError> {
     let file = parse(src).map_err(|e| ConvertError::Parse(e.to_string()))?;
     let env = Env::load(base_dir, cli_vars);
 
     let mut findings = Vec::new();
-    let doc = build(&file, &env, &mut findings);
+    let doc = build(&file, &env, cli_acme_email, &mut findings);
     findings.sort_by_key(|f| f.line);
 
     if doc.routes.is_empty() {
@@ -504,7 +505,12 @@ fn unquote(s: &str) -> &str {
 
 // ── Mapper ────────────────────────────────────────────────────────────────
 
-fn build(file: &Caddyfile, env: &Env, findings: &mut Vec<Finding>) -> ZionDoc {
+fn build(
+    file: &Caddyfile,
+    env: &Env,
+    cli_acme_email: Option<&str>,
+    findings: &mut Vec<Finding>,
+) -> ZionDoc {
     let mut doc = ZionDoc {
         listen_http: "0.0.0.0:80".to_string(),
         listen_https: "0.0.0.0:443".to_string(),
@@ -515,6 +521,7 @@ fn build(file: &Caddyfile, env: &Env, findings: &mut Vec<Finding>) -> ZionDoc {
         tls_key: PLACEHOLDER_KEY.to_string(),
         tls_min12: false,
         sni: Vec::new(),
+        acme: None,
         waf_body_mb: None,
         upstreams: Vec::new(),
         routes: Vec::new(),
@@ -534,6 +541,7 @@ fn build(file: &Caddyfile, env: &Env, findings: &mut Vec<Finding>) -> ZionDoc {
             &hosts,
             env,
             &acme_email,
+            cli_acme_email,
             &mut doc,
             &mut seen_upstreams,
             findings,
@@ -639,6 +647,7 @@ fn map_site(
     hosts: &[String],
     env: &Env,
     acme_email: &Option<String>,
+    cli_acme_email: Option<&str>,
     doc: &mut ZionDoc,
     seen_upstreams: &mut BTreeSet<String>,
     findings: &mut Vec<Finding>,
@@ -654,7 +663,7 @@ fn map_site(
                     site_csp = Some(csp);
                 }
             }
-            "tls" => map_tls(node, acme_email, doc, findings),
+            "tls" => map_tls(node, doc, findings),
             "encode" => findings.push(Finding::new(
                 Status::Unsupported,
                 node.line,
@@ -732,6 +741,8 @@ fn map_site(
             _ => {}
         }
     }
+
+    apply_site_acme(body, hosts, acme_email, cli_acme_email, doc, findings);
 }
 
 /// Map a `header` block. Security headers Zion already injects → `auto`;
@@ -787,18 +798,9 @@ fn map_header(node: &Node, findings: &mut Vec<Finding>) -> Option<String> {
 
 /// `tls email` / `tls { … }` / `tls internal` → placeholder cert + `partial`
 /// (ACME deferred). `tls <cert> <key>` (explicit files) → convert.
-fn map_tls(
-    node: &Node,
-    acme_email: &Option<String>,
-    doc: &mut ZionDoc,
-    findings: &mut Vec<Finding>,
-) {
-    // Explicit cert + key files.
-    if node.args.len() == 2
-        && !node.args[0].contains('@')
-        && node.args[0] != "internal"
-        && node.args[1] != "internal"
-    {
+fn map_tls(node: &Node, doc: &mut ZionDoc, findings: &mut Vec<Finding>) {
+    // Explicit cert + key files → a real cert.
+    if is_explicit_cert(node) {
         doc.tls_cert = node.args[0].clone();
         doc.tls_key = node.args[1].clone();
         findings.push(Finding::new(
@@ -823,23 +825,84 @@ fn map_tls(
             }
         }
     }
-    let email = node
-        .args
+    // ACME-managed TLS (`tls <email>` / `internal` / bare) is decided at the
+    // site level in `apply_site_acme`, which can see the site hosts.
+}
+
+fn is_explicit_cert(node: &Node) -> bool {
+    node.args.len() == 2
+        && !node.args[0].contains('@')
+        && node.args[0] != "internal"
+        && node.args[1] != "internal"
+}
+
+/// Decide automatic HTTPS for a site: emit `[tls.acme]` when the site uses
+/// ACME-managed TLS (a `tls` directive that isn't explicit cert files, or the
+/// operator opting in with `--acme-email`) and a contact e-mail is known.
+fn apply_site_acme(
+    body: &[Node],
+    hosts: &[String],
+    global_email: &Option<String>,
+    cli_acme_email: Option<&str>,
+    doc: &mut ZionDoc,
+    findings: &mut Vec<Finding>,
+) {
+    let tls_node = body.iter().find(|n| n.name == "tls");
+    if tls_node.map(is_explicit_cert).unwrap_or(false) {
+        return; // a real cert, not ACME (map_tls handled it)
+    }
+    if tls_node.is_none() && cli_acme_email.is_none() {
+        return; // no ACME intent — the operator supplies TLS
+    }
+    let public: Vec<String> = hosts
         .iter()
-        .find(|a| a.contains('@'))
+        .filter(|h| *h != "localhost" && h.parse::<std::net::IpAddr>().is_err())
         .cloned()
-        .or_else(|| acme_email.clone())
-        .unwrap_or_else(|| "you@example.com".to_string());
-    findings.push(Finding::new(
-        Status::Partial,
-        node.line,
-        "tls",
-        format!(
-            "Caddy manages this certificate (ACME/internal) → Zion emits a placeholder cert. \
-             Add [tls.acme] (email = \"{email}\", domains = the route hosts) or run `zion init`; \
-             if the origin is a certificate manager, point [tls] at its cert instead"
-        ),
-    ));
+        .collect();
+    if public.is_empty() {
+        return; // localhost / IP only — no public cert
+    }
+    let line = tls_node.map(|n| n.line).unwrap_or(0);
+    let email = tls_node
+        .and_then(|n| n.args.iter().find(|a| a.contains('@')).cloned())
+        .or_else(|| cli_acme_email.map(String::from))
+        .or_else(|| global_email.clone());
+    match email {
+        Some(email) => {
+            findings.push(Finding::new(
+                Status::Convert,
+                line,
+                "tls (ACME)",
+                format!(
+                    "automatic HTTPS → [tls.acme] (email = \"{email}\") for {}",
+                    public.join(", ")
+                ),
+            ));
+            match &mut doc.acme {
+                Some(acme) => {
+                    for h in &public {
+                        if !acme.domains.contains(h) {
+                            acme.domains.push(h.clone());
+                        }
+                    }
+                }
+                None => {
+                    doc.acme = Some(AcmeOut {
+                        email,
+                        domains: public,
+                    })
+                }
+            }
+        }
+        None => findings.push(Finding::new(
+            Status::Partial,
+            line,
+            "tls (ACME)",
+            "Caddy auto-HTTPS → placeholder cert. Pass `--acme-email you@example.com` to emit \
+             [tls.acme], or point [tls] at an existing certificate manager's cert"
+                .to_string(),
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1102,7 +1165,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        convert(src, None, &cli)
+        convert(src, None, &cli, None)
     }
 
     // ── lexer / parser ──
@@ -1257,17 +1320,31 @@ mod tests {
     }
 
     #[test]
-    fn tls_email_is_partial_with_placeholder() {
+    fn tls_email_emits_acme() {
         let src = "example.com {\n  reverse_proxy app:8080\n  tls ops@example.com\n}";
         let c = convert_str(src, &[]).expect("convert");
         let tls = c
             .findings
             .iter()
-            .find(|f| f.directive == "tls")
-            .expect("tls finding");
-        assert_eq!(tls.status, Status::Partial);
-        assert!(tls.detail.contains("ops@example.com"));
+            .find(|f| f.directive == "tls (ACME)")
+            .expect("acme finding");
+        assert_eq!(tls.status, Status::Convert);
+        assert!(c.toml.contains("[tls.acme]"));
+        assert!(c.toml.contains("email = \"ops@example.com\""));
+        assert!(c.toml.contains("domains = [\"example.com\"]"));
+        // The bootstrap cert stays so :443 binds before issuance.
         assert!(c.toml.contains("cert_path = \"/etc/ssl/zion/zion.crt\""));
+    }
+
+    #[test]
+    fn acme_email_flag_opts_in_without_a_tls_directive() {
+        // The nis2 swap case: implicit auto-HTTPS, no e-mail in the Caddyfile;
+        // --acme-email supplies it and we emit a real [tls.acme].
+        let src = "app.example.com {\n  reverse_proxy web:3000\n}";
+        let c = convert(src, None, &[], Some("ops@example.com")).expect("convert");
+        assert!(c.toml.contains("[tls.acme]"));
+        assert!(c.toml.contains("email = \"ops@example.com\""));
+        assert!(c.toml.contains("domains = [\"app.example.com\"]"));
     }
 
     #[test]
@@ -1332,7 +1409,7 @@ mod tests {
 
     #[test]
     fn golden_security_headers() {
-        let c = convert(&fixture("security-headers.caddy"), None, &[]).expect("convert");
+        let c = convert(&fixture("security-headers.caddy"), None, &[], None).expect("convert");
         assert!(c.toml.contains("[upstream.api]") && c.toml.contains("http://api:8000"));
         assert!(c.toml.contains("[upstream.web]") && c.toml.contains("http://web:3000"));
         assert!(c.toml.contains("path = \"/api/{*rest}\""));
@@ -1356,22 +1433,24 @@ mod tests {
     }
 
     #[test]
-    fn golden_tls_acme_is_partial() {
-        let c = convert(&fixture("tls-acme.caddy"), None, &[]).expect("convert");
+    fn golden_tls_acme_emits_acme() {
+        let c = convert(&fixture("tls-acme.caddy"), None, &[], None).expect("convert");
         assert!(c.toml.contains("http://backend:8080"));
-        assert!(c.toml.contains("hosts = [\"app.localhost\"]"));
+        assert!(c.toml.contains("hosts = [\"app.example.com\"]"));
         let tls = c
             .findings
             .iter()
-            .find(|f| f.directive == "tls")
-            .expect("tls");
-        assert_eq!(tls.status, Status::Partial);
-        assert!(tls.detail.contains("ops@example.com"));
+            .find(|f| f.directive == "tls (ACME)")
+            .expect("acme finding");
+        assert_eq!(tls.status, Status::Convert);
+        assert!(c.toml.contains("[tls.acme]"));
+        assert!(c.toml.contains("email = \"ops@example.com\""));
+        assert!(c.toml.contains("domains = [\"app.example.com\"]"));
     }
 
     #[test]
     fn golden_snippet_import() {
-        let c = convert(&fixture("snippet-import.caddy"), None, &[]).expect("convert");
+        let c = convert(&fixture("snippet-import.caddy"), None, &[], None).expect("convert");
         assert!(c.toml.contains("http://api:9000"));
         assert!(c.toml.contains("http://site:3000"));
         assert!(c.toml.contains("hosts = [\"example.com\"]"));
@@ -1384,7 +1463,7 @@ mod tests {
 
     #[test]
     fn golden_static_edge_refuses() {
-        match convert(&fixture("static-edge.caddy"), None, &[]) {
+        match convert(&fixture("static-edge.caddy"), None, &[], None) {
             Err(ConvertError::NoRoutes(f)) => assert!(f
                 .iter()
                 .any(|x| x.status == Status::Unsupported && x.directive == "file_server")),

@@ -99,6 +99,10 @@ pub struct ImportOpts {
     /// `--var KEY=VALUE` overrides for `${...}` expansion (traefik front-end);
     /// these win over a `.env` next to the compose file.
     pub vars: Vec<(String, String)>,
+    /// `--acme-email EMAIL`: emit a `[tls.acme]` block for automatic HTTPS when
+    /// the source uses ACME (Traefik certresolver / Caddy auto-HTTPS). Without
+    /// it, ACME-managed TLS imports to a placeholder cert + a partial finding.
+    pub acme_email: Option<String>,
 }
 
 /// Options for `zion init`. All flags are additive — the wizard fills in
@@ -276,6 +280,10 @@ fn parse_import_opts(args: &[String]) -> ImportOpts {
                 if let Some((k, v)) = flag_value(args, i).and_then(|kv| kv.split_once('=')) {
                     opts.vars.push((k.to_string(), v.to_string()));
                 }
+                i += 2;
+            }
+            "--acme-email" if flag_value(args, i).is_some() => {
+                opts.acme_email = flag_value(args, i).cloned();
                 i += 2;
             }
             // Positionals: first the source format, then the input path
