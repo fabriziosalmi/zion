@@ -1223,11 +1223,7 @@ version = "2.0.18"
 criteria = "safe-to-deploy"
 
 [[exemptions.time]]
-version = "0.3.54"
-criteria = "safe-to-deploy"
-
-[[exemptions.time-macros]]
-version = "0.2.32"
+version = "0.1.44"
 criteria = "safe-to-deploy"
 
 [[exemptions.tinystr]]
@@ -1343,31 +1339,31 @@ version = "0.3.23"
 criteria = "safe-to-deploy"
 
 [[exemptions.tract-core]]
-version = "0.21.14"
+version = "0.21.17"
 criteria = "safe-to-deploy"
 
 [[exemptions.tract-data]]
-version = "0.21.15"
+version = "0.21.17"
 criteria = "safe-to-deploy"
 
 [[exemptions.tract-hir]]
-version = "0.21.14"
+version = "0.21.17"
 criteria = "safe-to-deploy"
 
 [[exemptions.tract-linalg]]
-version = "0.21.14"
+version = "0.21.17"
 criteria = "safe-to-deploy"
 
 [[exemptions.tract-nnef]]
-version = "0.21.14"
+version = "0.21.17"
 criteria = "safe-to-deploy"
 
 [[exemptions.tract-onnx]]
-version = "0.21.14"
+version = "0.21.17"
 criteria = "safe-to-deploy"
 
 [[exemptions.tract-onnx-opl]]
-version = "0.21.14"
+version = "0.21.17"
 criteria = "safe-to-deploy"
 
 [[exemptions.transpose]]
