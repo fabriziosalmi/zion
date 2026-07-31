@@ -39,7 +39,9 @@ pub fn sanitize(tail: &str) -> Option<PathBuf> {
             || seg.starts_with('.')
             || seg.contains('/')
             || seg.contains('\\')
-            || seg.contains('\0')
+            || seg.contains(':') // Windows drive letter / alternate data stream
+            || seg.chars().any(|c| c.is_control()) // NUL, CR/LF, tab, other control
+            || is_reserved_windows_name(&seg)
         {
             return None;
         }
@@ -66,6 +68,19 @@ fn percent_decode(seg: &str) -> Option<String> {
         i += 1;
     }
     String::from_utf8(out).ok()
+}
+
+/// Reserved Windows device names (`CON`, `NUL`, `COM1`…). Harmless to reject on
+/// Unix; on Windows opening one of these by name is a footgun, so refuse them
+/// regardless of the build target (defense in depth).
+fn is_reserved_windows_name(seg: &str) -> bool {
+    let stem = seg.split('.').next().unwrap_or(seg);
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.len() == 4
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0')
 }
 
 fn hex(c: u8) -> Option<u8> {
@@ -141,21 +156,39 @@ async fn resolve_file(canon_root: &Path, rel: &Path) -> Option<PathBuf> {
 }
 
 async fn read_file(path: &Path, method: &Method) -> Response<ZionBody> {
+    // HEAD needs only the length — never read the bytes into memory (a HEAD to a
+    // huge file would otherwise be a cheap memory-amplification DoS).
+    if method == Method::HEAD {
+        let len = match tokio::fs::metadata(path).await {
+            Ok(m) => m.len(),
+            Err(_) => return resp(StatusCode::NOT_FOUND),
+        };
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, mime_for(path))
+            .header(hyper::header::CONTENT_LENGTH, len)
+            .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+            .unwrap();
+    }
+    // Cap the whole-file in-memory read (streaming is a deferred follow-up,
+    // ADR-0015): refuse an oversized file rather than buffering it whole, which
+    // would be a memory-amplification DoS under concurrency.
+    const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+    match tokio::fs::metadata(path).await {
+        Ok(m) if m.len() > MAX_FILE_BYTES => return resp(StatusCode::PAYLOAD_TOO_LARGE),
+        Ok(_) => {}
+        Err(_) => return resp(StatusCode::NOT_FOUND),
+    }
     let data = match tokio::fs::read(path).await {
         Ok(d) => d,
         Err(_) => return resp(StatusCode::NOT_FOUND),
     };
     let len = data.len();
-    let body = if method == Method::HEAD {
-        Bytes::new()
-    } else {
-        Bytes::from(data)
-    };
     Response::builder()
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, mime_for(path))
         .header(hyper::header::CONTENT_LENGTH, len)
-        .body(Full::new(body).map_err(|n| match n {}).boxed())
+        .body(Full::new(Bytes::from(data)).map_err(|n| match n {}).boxed())
         .unwrap()
 }
 
@@ -236,6 +269,24 @@ mod tests {
         assert_eq!(sanitize("a%00b"), None); // NUL
         assert_eq!(sanitize("a\\b"), None); // backslash (Windows sep)
         assert_eq!(sanitize("%ff%fe"), None); // invalid UTF-8
+    }
+
+    #[test]
+    fn windows_hazards_and_control_chars_refused() {
+        // F5: drive letter / alternate-data-stream colon + reserved device names.
+        assert_eq!(sanitize("C:/x"), None);
+        assert_eq!(sanitize("file.txt:$DATA"), None);
+        assert_eq!(sanitize("CON"), None);
+        assert_eq!(sanitize("nul.txt"), None);
+        assert_eq!(sanitize("COM1"), None);
+        assert_eq!(sanitize("lpt9.log"), None);
+        // F6: decoded control chars (newline, tab) as filename bytes.
+        assert_eq!(sanitize("a%0ab"), None);
+        assert_eq!(sanitize("a%09b"), None);
+        // ...but ordinary names that merely contain those substrings are fine.
+        assert!(sanitize("common.css").is_some()); // "com" prefix, not COM1
+        assert!(sanitize("com10.txt").is_some()); // COM10 is not reserved
+        assert!(sanitize("nulls.json").is_some());
     }
 
     #[test]
@@ -322,5 +373,19 @@ mod serve_tests {
         // Following the symlink must not escape the canonical root.
         assert_eq!(get(&root.0, "leak", false).await.0, StatusCode::NOT_FOUND);
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[tokio::test]
+    async fn head_returns_length_without_reading_the_body() {
+        // F2: HEAD must report Content-Length without buffering the file.
+        let root = root("head");
+        let r = serve(&root.0, "css/main.css", false, &Method::HEAD).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            r.headers().get(hyper::header::CONTENT_LENGTH).unwrap(),
+            "6" // "body{}" is 6 bytes
+        );
+        let body = r.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
     }
 }

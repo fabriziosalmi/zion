@@ -294,7 +294,7 @@ fn parse(src: &str) -> Result<Caddyfile, ParseError> {
     // A leading `{` (before any site) is the global options block.
     if let (Kind::Open, _) = lx.peek_kind()? {
         lx.next_tok()?;
-        file.global = parse_block(&mut lx)?;
+        file.global = parse_block(&mut lx, 0)?;
     }
 
     loop {
@@ -318,7 +318,7 @@ fn parse(src: &str) -> Result<Caddyfile, ParseError> {
                 match lx.peek_kind()? {
                     (Kind::Open, _) => {
                         lx.next_tok()?;
-                        let body = parse_block(&mut lx)?;
+                        let body = parse_block(&mut lx, 0)?;
                         if heads.len() == 1
                             && heads[0].starts_with('(')
                             && heads[0].ends_with(')')
@@ -353,8 +353,14 @@ fn parse(src: &str) -> Result<Caddyfile, ParseError> {
     Ok(file)
 }
 
-/// Parse directives until the matching `}` (which it consumes).
-fn parse_block(lx: &mut Lexer) -> Result<Vec<Node>, ParseError> {
+/// Parse directives until the matching `}` (which it consumes). `depth` bounds
+/// block nesting so a pathological `a {`×N input errors with a line number
+/// instead of overflowing the stack.
+fn parse_block(lx: &mut Lexer, depth: u32) -> Result<Vec<Node>, ParseError> {
+    const MAX_NEST_DEPTH: u32 = 64;
+    if depth > MAX_NEST_DEPTH {
+        return Err(perr(lx.peek_kind()?.1, "blocks nested too deeply"));
+    }
     let mut nodes = Vec::new();
     loop {
         match lx.peek_kind()? {
@@ -385,7 +391,7 @@ fn parse_block(lx: &mut Lexer) -> Result<Vec<Node>, ParseError> {
                 let block = match lx.peek_kind()? {
                     (Kind::Open, _) => {
                         lx.next_tok()?;
-                        Some(parse_block(lx)?)
+                        Some(parse_block(lx, depth + 1)?)
                     }
                     _ => None,
                 };
@@ -620,6 +626,10 @@ fn resolve_hosts(site: &Site, env: &Env, findings: &mut Vec<Finding>) -> Vec<Str
         }
         hosts.push(host.to_string());
     }
+    // Dedupe (e.g. `example.com, example.com:443`) preserving order — duplicate
+    // ACME domains / route hosts otherwise leak into the emitted config.
+    let mut seen = std::collections::BTreeSet::new();
+    hosts.retain(|h| seen.insert(h.clone()));
     hosts
 }
 
@@ -769,21 +779,50 @@ fn map_site(
     // A static site/route (root + file_server) becomes a catch-all mode=static
     // route, emitted AFTER the proxy routes so a more-specific handler wins.
     if let Some((dir, spa)) = static_spec {
-        doc.routes.push(RouteOut {
-            path: "/{*rest}".to_string(),
-            hosts: if hosts.is_empty() {
-                None
-            } else {
-                Some(hosts.to_vec())
-            },
-            upstream: String::new(),
-            websocket: false,
-            csp: site_csp.clone(),
-            waf: false,
-            serve_dir: Some(dir),
-            spa_fallback: spa,
-            annotations: Vec::new(),
-        });
+        let route_hosts = if hosts.is_empty() {
+            None
+        } else {
+            Some(hosts.to_vec())
+        };
+        // F2: a bare `handle` / `reverse_proxy` may already own the catch-all at
+        // this (path, hosts); matchit rejects a duplicate route, so drop the
+        // static fallback (the proxy handler covers everything in Caddy too).
+        let collides = doc
+            .routes
+            .iter()
+            .any(|r| r.serve_dir.is_none() && r.path == "/{*rest}" && r.hosts == route_hosts);
+        if collides {
+            findings.push(Finding::new(
+                Status::Partial,
+                0,
+                "file_server",
+                "a catch-all proxy handler already covers this site — the static file_server fallback is dropped (unreachable behind it)",
+            ));
+        } else {
+            // F9: a hostless static catch-all lands in Zion's SHARED default
+            // layer (unlike Caddy, where a `:port` block does not apply to a
+            // host with its own site) — so it would serve files under EVERY
+            // authority. Flag it loudly.
+            if route_hosts.is_none() {
+                findings.push(Finding::new(
+                    Status::Partial,
+                    0,
+                    "file_server (hostless)",
+                    "a hostless static site becomes a shared fallback across ALL hosts in Zion; scope it to a host, or a request to another host with no match will be served these files",
+                ));
+            }
+            doc.routes.push(RouteOut {
+                path: "/{*rest}".to_string(),
+                hosts: route_hosts,
+                upstream: String::new(),
+                websocket: false,
+                csp: site_csp.clone(),
+                waf: false,
+                serve_dir: Some(dir),
+                spa_fallback: spa,
+                annotations: Vec::new(),
+            });
+        }
     }
 
     apply_site_acme(body, hosts, acme_email, cli_acme_email, doc, findings);
@@ -796,6 +835,11 @@ fn detect_static(body: &[Node]) -> Option<(String, bool)> {
         return None;
     }
     let dir = body.iter().find(|n| n.name == "root")?.args.last()?.clone();
+    // The last `root` arg must be a real directory, not a matcher (`root *`,
+    // `root @m /d`) or empty — otherwise there is no serve dir to convert.
+    if dir.is_empty() || dir == "*" || dir.starts_with('@') || dir.contains('*') {
+        return None;
+    }
     let spa = body
         .iter()
         .any(|n| n.name == "try_files" && n.args.iter().any(|a| a.contains("index.html")));
@@ -806,7 +850,6 @@ fn detect_static(body: &[Node]) -> Option<(String, bool)> {
 /// `Content-Security-Policy` → returned as a route/site CSP (convert);
 /// HSTS → `partial` (Zion's value is fixed); the rest → `unsupported`.
 fn map_header(node: &Node, findings: &mut Vec<Finding>) -> Option<String> {
-    let mut csp = None;
     // Fields come either as a block or as inline `header Field value` args.
     let fields: Vec<(String, u32)> = match &node.block {
         Some(block) => block.iter().map(|n| (n.name.clone(), n.line)).collect(),
@@ -816,11 +859,25 @@ fn map_header(node: &Node, findings: &mut Vec<Finding>) -> Option<String> {
             .map(|f| vec![(f.clone(), node.line)])
             .unwrap_or_default(),
     };
-    let csp_value = |n: &Node| n.args.first().cloned().unwrap_or_default();
-    if let Some(block) = &node.block {
-        for n in block {
-            if n.name.eq_ignore_ascii_case("Content-Security-Policy") {
-                csp = Some(csp_value(n));
+    // Capture Content-Security-Policy from EITHER the block form
+    // (`header { Content-Security-Policy "…" }`) or the inline one-liner
+    // (`header Content-Security-Policy "…"`) — the inline form was silently lost.
+    let mut csp = None;
+    match &node.block {
+        Some(block) => {
+            for n in block {
+                if n.name.eq_ignore_ascii_case("Content-Security-Policy") {
+                    csp = n.args.first().cloned();
+                }
+            }
+        }
+        None => {
+            if node
+                .args
+                .first()
+                .is_some_and(|f| f.eq_ignore_ascii_case("Content-Security-Policy"))
+            {
+                csp = node.args.get(1).cloned();
             }
         }
     }
@@ -886,9 +943,18 @@ fn map_tls(node: &Node, doc: &mut ZionDoc, findings: &mut Vec<Finding>) {
     // site level in `apply_site_acme`, which can see the site hosts.
 }
 
+/// A crude e-mail shape check — has an `@`, no path separator, a dotted domain.
+/// Distinguishes `ops@example.com` from a cert path like `/etc/ssl/git@h.crt`.
+fn looks_like_email(s: &str) -> bool {
+    match s.split_once('@') {
+        Some((user, domain)) => !user.is_empty() && !s.contains('/') && domain.contains('.'),
+        None => false,
+    }
+}
+
 fn is_explicit_cert(node: &Node) -> bool {
     node.args.len() == 2
-        && !node.args[0].contains('@')
+        && !looks_like_email(&node.args[0])
         && node.args[0] != "internal"
         && node.args[1] != "internal"
 }
@@ -921,9 +987,10 @@ fn apply_site_acme(
     }
     let line = tls_node.map(|n| n.line).unwrap_or(0);
     let email = tls_node
-        .and_then(|n| n.args.iter().find(|a| a.contains('@')).cloned())
+        .and_then(|n| n.args.iter().find(|a| looks_like_email(a)).cloned())
         .or_else(|| cli_acme_email.map(String::from))
-        .or_else(|| global_email.clone());
+        .or_else(|| global_email.clone())
+        .filter(|e| looks_like_email(e));
     match email {
         Some(email) => {
             findings.push(Finding::new(
@@ -1438,6 +1505,88 @@ mod tests {
         assert!(c.toml.contains("mode = \"static\""));
         assert!(c.toml.contains("serve_dir = \"/srv\""));
         assert!(c.toml.contains("spa_fallback = true"));
+    }
+
+    // ── adversarial-review regressions (draconian, one per finding) ──
+
+    #[test]
+    fn deeply_nested_blocks_error_not_stack_overflow() {
+        // F1: a pathological nest must return Err, never overflow the stack
+        // (if it overflowed, this test process would abort).
+        let src = "a {\n".repeat(500);
+        assert!(parse(&src).is_err());
+    }
+
+    #[test]
+    fn catchall_proxy_plus_file_server_does_not_double_route() {
+        // F2: a bare `handle` (catch-all proxy) + `file_server` must NOT emit two
+        // `/{*rest}` routes (matchit rejects the dup → self_validate would fail).
+        let src = "example.com {\n  handle {\n    reverse_proxy web:3000\n  }\n  root * /srv\n  file_server\n}";
+        let c = convert_str(src, &[]).expect("should convert, not internal-error");
+        assert_eq!(c.toml.matches("path = \"/{*rest}\"").count(), 1);
+        assert!(c.toml.contains("http://web:3000") && !c.toml.contains("mode = \"static\""));
+        assert!(c
+            .findings
+            .iter()
+            .any(|f| f.status == Status::Partial && f.directive == "file_server"));
+    }
+
+    #[test]
+    fn inline_header_csp_is_captured() {
+        // F3: the one-liner `header CSP "…"` form must set route.csp.
+        let src = "example.com {\n  header Content-Security-Policy \"default-src 'self'\"\n  reverse_proxy app:80\n}";
+        let c = convert_str(src, &[]).expect("convert");
+        assert!(c.toml.contains("csp = \"default-src 'self'\""));
+    }
+
+    #[test]
+    fn cert_path_containing_at_is_not_an_acme_email() {
+        // F4: a cert path with '@' must be explicit cert files, never ACME.
+        let src = "example.com {\n  reverse_proxy app:80\n  tls /etc/ssl/git@host.crt /etc/ssl/git@host.key\n}";
+        let c = convert_str(src, &[]).expect("convert");
+        assert!(c.toml.contains("cert_path = \"/etc/ssl/git@host.crt\""));
+        assert!(!c.toml.contains("[tls.acme]"));
+    }
+
+    #[test]
+    fn no_acme_without_a_real_email() {
+        // F5: `tls internal` (no e-mail anywhere) must not emit [tls.acme].
+        let src = "example.com {\n  reverse_proxy app:80\n  tls internal\n}";
+        let c = convert_str(src, &[]).expect("convert");
+        assert!(!c.toml.contains("[tls.acme]"));
+    }
+
+    #[test]
+    fn duplicate_site_addresses_are_deduped() {
+        // F6: `example.com, example.com:443` → one host, not two.
+        let src = "example.com, example.com:443 {\n  reverse_proxy app:80\n}";
+        let c = convert_str(src, &[]).expect("convert");
+        assert!(c.toml.contains("hosts = [\"example.com\"]"));
+        assert!(!c.toml.contains("\"example.com\", \"example.com\""));
+    }
+
+    #[test]
+    fn root_matcher_without_a_dir_is_not_static() {
+        // F8: `root *` (matcher, no dir) must not become serve_dir="*".
+        let src = "example.com {\n  root *\n  file_server\n}";
+        match convert_str(src, &[]) {
+            Ok(c) => assert!(!c.toml.contains("serve_dir = \"*\"")),
+            Err(ConvertError::NoRoutes(f)) => {
+                assert!(f.iter().any(|x| x.status == Status::Unsupported))
+            }
+            Err(e) => panic!("unexpected: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn hostless_static_site_is_flagged() {
+        // F9: a hostless static site becomes a shared cross-host fallback.
+        let src = ":443 {\n  root * /var/www\n  file_server\n}";
+        let c = convert_str(src, &[]).expect("convert");
+        assert!(c
+            .findings
+            .iter()
+            .any(|f| f.status == Status::Partial && f.directive.contains("hostless")));
     }
 
     #[test]
