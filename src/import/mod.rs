@@ -267,7 +267,7 @@ pub fn run(opts: ImportOpts) -> i32 {
         "nginx" | "traefik" | "caddy" => {}
         "" => {
             eprintln!(
-                "usage: zion import <nginx|traefik|caddy> <path|-> [-o zion.toml] [--report file] [--strict] [--var KEY=VALUE]..."
+                "usage: zion import <nginx|traefik|caddy> <path|-> [-o zion.toml] [--report file] [--strict] [--var KEY=VALUE]... [--acme-email EMAIL]"
             );
             return 1;
         }
@@ -309,8 +309,18 @@ pub fn run(opts: ImportOpts) -> i32 {
     };
 
     let converted = match source {
-        "traefik" => traefik::convert(&src, base_dir.as_deref(), &opts.vars),
-        "caddy" => caddy::convert(&src, base_dir.as_deref(), &opts.vars),
+        "traefik" => traefik::convert(
+            &src,
+            base_dir.as_deref(),
+            &opts.vars,
+            opts.acme_email.as_deref(),
+        ),
+        "caddy" => caddy::convert(
+            &src,
+            base_dir.as_deref(),
+            &opts.vars,
+            opts.acme_email.as_deref(),
+        ),
         _ => convert(&src, base_dir.as_deref()),
     };
     let conversion = match converted {

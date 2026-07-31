@@ -25,6 +25,10 @@ pub struct ZionDoc {
     pub tls_key: String,
     pub tls_min12: bool,
     pub sni: Vec<SniOut>,
+    /// Emit a `[tls.acme]` block for automatic HTTPS. The bootstrap cert stays
+    /// in `tls_cert`/`tls_key`; populated by the Traefik/Caddy front-ends when
+    /// the source uses ACME and a contact e-mail is known.
+    pub acme: Option<AcmeOut>,
     pub waf_body_mb: Option<u64>,
     pub upstreams: Vec<UpstreamOut>,
     pub routes: Vec<RouteOut>,
@@ -35,6 +39,12 @@ pub struct SniOut {
     pub server_name: String,
     pub cert: String,
     pub key: String,
+}
+
+#[derive(Debug)]
+pub struct AcmeOut {
+    pub email: String,
+    pub domains: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -76,6 +86,7 @@ pub fn map_model(model: &NginxModel, findings: &mut Vec<Finding>) -> ZionDoc {
         tls_key: PLACEHOLDER_KEY.to_string(),
         tls_min12: false,
         sni: Vec::new(),
+        acme: None,
         waf_body_mb: None,
         upstreams: Vec::new(),
         routes: Vec::new(),

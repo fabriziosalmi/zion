@@ -54,6 +54,22 @@ pub fn render(doc: &ZionDoc, source: &str) -> String {
     }
     out.push('\n');
 
+    if let Some(acme) = &doc.acme {
+        out.push_str("# Automatic HTTPS via ACME. The cert_path/key_path above are only a\n");
+        out.push_str("# bootstrap cert so :443 binds before the first issuance.\n");
+        out.push_str("[tls.acme]\n");
+        kv(&mut out, "email", &acme.email);
+        out.push_str(&format!(
+            "domains = [{}]\n",
+            acme.domains
+                .iter()
+                .map(|d| toml_str(d))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        out.push('\n');
+    }
+
     if let Some(mb) = doc.waf_body_mb {
         out.push_str("# Body cap imported from client_max_body_size. Shadow mode logs\n");
         out.push_str("# would-be blocks without enforcing; set waf_shadow = false on the\n");
@@ -191,6 +207,7 @@ mod tests {
             tls_key: "/k".into(),
             tls_min12: false,
             sni: Vec::new(),
+            acme: None,
             waf_body_mb: None,
             upstreams: vec![super::super::map::UpstreamOut {
                 name: "b".into(),
@@ -238,6 +255,7 @@ mod tests {
             tls_key: "/etc/ssl/zion/zion.key".into(),
             tls_min12: false,
             sni: Vec::new(),
+            acme: None,
             waf_body_mb: None,
             upstreams: vec![super::super::map::UpstreamOut {
                 name: "backend".into(),
@@ -276,6 +294,7 @@ mod tests {
                 cert: "/etc/ssl/b.crt".into(),
                 key: "/etc/ssl/b.key".into(),
             }],
+            acme: None,
             waf_body_mb: Some(64),
             upstreams: vec![super::super::map::UpstreamOut {
                 name: "pool".into(),
@@ -300,5 +319,47 @@ mod tests {
         assert!(toml.contains("waf_profile = \"imported\""));
         assert!(toml.contains("waf_shadow = true"));
         assert!(toml.contains("mode = \"websocket\""));
+    }
+
+    #[test]
+    fn acme_block_renders_and_validates() {
+        let doc = ZionDoc {
+            listen_http: "0.0.0.0:80".into(),
+            listen_https: "0.0.0.0:443".into(),
+            rate_limit: None,
+            max_conn_per_ip: None,
+            trusted_proxies: Vec::new(),
+            tls_cert: "/etc/ssl/zion/zion.crt".into(),
+            tls_key: "/etc/ssl/zion/zion.key".into(),
+            tls_min12: false,
+            sni: Vec::new(),
+            acme: Some(super::super::map::AcmeOut {
+                email: "ops@example.com".into(),
+                domains: vec!["app.example.com".into(), "www.app.example.com".into()],
+            }),
+            waf_body_mb: None,
+            upstreams: vec![super::super::map::UpstreamOut {
+                name: "backend".into(),
+                urls: vec!["http://127.0.0.1:8080".into()],
+                connect_timeout_ms: None,
+                keepalive: None,
+            }],
+            routes: vec![super::super::map::RouteOut {
+                path: "/{*rest}".into(),
+                hosts: Some(vec!["app.example.com".into()]),
+                upstream: "backend".into(),
+                websocket: false,
+                csp: None,
+                waf: false,
+                annotations: Vec::new(),
+            }],
+        };
+        let toml = render(&doc, "caddy");
+        assert!(toml.contains("[tls.acme]"));
+        assert!(toml.contains("email = \"ops@example.com\""));
+        assert!(toml.contains("domains = [\"app.example.com\", \"www.app.example.com\"]"));
+        // The bootstrap cert must still be present so :443 binds before issuance.
+        assert!(toml.contains("cert_path = \"/etc/ssl/zion/zion.crt\""));
+        self_validate(&toml).expect("[tls.acme] output must self-validate");
     }
 }
