@@ -1192,6 +1192,18 @@ async fn process_request_inner(
                 )
                 .await?
             }
+            config::RouteMode::Static => {
+                let dir = rule
+                    .serve_dir
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let path = req.uri().path();
+                let tail = path
+                    .strip_prefix(rule.static_prefix.as_str())
+                    .unwrap_or(path)
+                    .trim_start_matches('/');
+                crate::static_files::serve(dir, tail, rule.spa_fallback, req.method()).await
+            }
         }
     };
 
