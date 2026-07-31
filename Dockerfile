@@ -26,7 +26,7 @@
 # runs under QEMU emulation on an amd64 runner — slower, but correct. Building
 # on $BUILDPLATFORM instead would compile a host-arch (amd64) binary and stamp
 # it into BOTH manifests, leaving the arm64 image unable to exec on real ARM.
-FROM --platform=$TARGETPLATFORM rust:1.96-bookworm@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9 AS builder
+FROM --platform=$TARGETPLATFORM rust:1.97-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a AS builder
 
 # Populated by buildx from the active `--platform` entry.
 ARG TARGETPLATFORM
