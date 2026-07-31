@@ -68,6 +68,7 @@ mod reload;
 mod security;
 #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
 mod sovereign;
+mod static_files;
 mod suggest;
 mod tarpit;
 mod tls;

@@ -17,6 +17,7 @@ ignore = [
     "RUSTSEC-2026-0002",  # `lru` IterMut Stacked Borrows; tracked via `ratatui` upstream — review by 2026-08-01
     # ── Soundness issue in transitive dep (ml-waf feature only) ──
     "RUSTSEC-2026-0186",  # `memmap2 0.9.10` unchecked ptr offset (unsound); via `tract-onnx` (ml-waf, off by default), no fix yet — review by 2026-09-01
+    "RUSTSEC-2026-0217",  # `tract-nnef` int-overflow → OOB read on NNEF model load; via `tract-onnx` (ml-waf, off by default), no fix yet — review by 2026-09-01
     # ── Pulled in by aimp_node (--features sovereign-aimp, off by default) ──
     "RUSTSEC-2024-0437",  # `protobuf 2.x` recursion-DoS via prometheus 0.13.4 → aimp_node — review by 2026-09-01
     "RUSTSEC-2024-0320",  # `yaml-rust` unmaintained, via config 0.13.4 → aimp_node — review by 2026-09-01

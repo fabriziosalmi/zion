@@ -86,7 +86,7 @@ pub struct SuggestOpts {
 /// Options for `zion import <source> <input>` (ADR-0011).
 #[derive(Debug, Clone, Default)]
 pub struct ImportOpts {
-    /// Source format. Only `nginx` today; empty = usage error.
+    /// Source format: `nginx` or `traefik`; empty = usage error.
     pub source: String,
     /// Input config path, or `-` for stdin.
     pub input: Option<String>,
@@ -96,6 +96,13 @@ pub struct ImportOpts {
     pub report: Option<String>,
     /// Exit non-zero when any partial/unsupported finding exists.
     pub strict: bool,
+    /// `--var KEY=VALUE` overrides for `${...}` expansion (traefik front-end);
+    /// these win over a `.env` next to the compose file.
+    pub vars: Vec<(String, String)>,
+    /// `--acme-email EMAIL`: emit a `[tls.acme]` block for automatic HTTPS when
+    /// the source uses ACME (Traefik certresolver / Caddy auto-HTTPS). Without
+    /// it, ACME-managed TLS imports to a placeholder cert + a partial finding.
+    pub acme_email: Option<String>,
 }
 
 /// Options for `zion init`. All flags are additive — the wizard fills in
@@ -269,6 +276,16 @@ fn parse_import_opts(args: &[String]) -> ImportOpts {
                 opts.strict = true;
                 i += 1;
             }
+            "--var" if flag_value(args, i).is_some() => {
+                if let Some((k, v)) = flag_value(args, i).and_then(|kv| kv.split_once('=')) {
+                    opts.vars.push((k.to_string(), v.to_string()));
+                }
+                i += 2;
+            }
+            "--acme-email" if flag_value(args, i).is_some() => {
+                opts.acme_email = flag_value(args, i).cloned();
+                i += 2;
+            }
             // Positionals: first the source format, then the input path
             // (`-` = stdin, so a leading dash alone is not a flag).
             arg if !arg.starts_with('-') || arg == "-" => {
@@ -432,7 +449,7 @@ pub fn print_help() {
             {bin} top [opts]             live TUI dashboard\n  \
             {bin} init [opts]            generate zion.toml from prompts (or flags)\n  \
             {bin} suggest [opts]         synthesize a validated zion.toml from a detected/declared backend\n  \
-            {bin} import nginx <conf>    convert an nginx config to a validated zion.toml (honest findings report)\n  \
+            {bin} import <nginx|traefik|caddy> convert an nginx / Traefik-compose / Caddyfile config to a validated zion.toml (honest findings)\n  \
             {bin} doctor                 run environment diagnostic checks\n  \
             {bin} bootstrap              dump detected platform as JSON (for CI / automation)\n  \
             {bin} --version              print version\n  \

@@ -474,3 +474,15 @@ integration_test!(t30_unified_port_tcp_works_with_or_without_quic, {
         }
     }
 });
+
+// mode=static (ADR-0015): a static route serves from disk and has NO upstream,
+// so it must skip the upstream-health gate and reach the file server rather
+// than 503. Regression guard for the shipped-broken dispatch path.
+integration_test!(t31_static_route_serves_files_not_503, {
+    let (status, body, _) = get("/assets/hello.txt");
+    assert_eq!(status, 200, "static route must serve a file, not 503");
+    assert!(body.contains("STATIC-OK"), "unexpected body: {body}");
+    // the on-disk file server refuses traversal on the live server too.
+    let (st, _, _) = get("/assets/..%2f..%2f..%2fetc/passwd");
+    assert!(st == 403 || st == 404, "traversal must not leak (got {st})");
+});

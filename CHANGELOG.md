@@ -4,6 +4,45 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-31
+
+### Added
+- **`zion import` is now a three-front-end migration tool.** Alongside nginx
+  (v0.6.0) it converts **Traefik** (Docker-compose labels + static flags,
+  ADR-0012) and **Caddy** (its own zero-dependency Caddyfile parser, ADR-0013)
+  to a validated `zion.toml`, all on one neutral `ZionDoc` seam:
+  `zion import <nginx|traefik|caddy>`. A declared-subset Docker Compose reader
+  feeds the Traefik label source.
+- **Native `[tls.acme]` emission** (ADR-0014). HTTPS sources with a cert
+  resolver / ACME email import to Zion's real auto-HTTPS; the email comes from
+  the source config or `--acme-email`.
+- **`mode = "static"` — opt-in disk file serving** (ADR-0015). A new
+  `RouteMode::Static` + `serve_dir` + `spa_fallback` serves files from disk
+  behind a hardened path-safety core (`src/static_files.rs`: per-segment
+  percent-decode, dotfile / reserved-name refusal, `canonicalize` + containment,
+  GET/HEAD only, 64 MiB cap). This reverses the former "no disk serving" product
+  edge and unblocks the static-plus-proxy stacks.
+- **The importers map static serving to it**: Caddy `root` + `file_server`, and
+  nginx `root`/`try_files`/`index`/`alias` (ADR-0016), convert to
+  `mode = "static"` — a single-page-app build dir next to a proxied `/api`
+  imports in one pass. `serve_dir` is derived exactly: nginx `root` appends the
+  request URI while Zion strips the route prefix, so they cancel; `alias` maps
+  to `serve_dir` directly.
+
+### Fixed
+- **`mode = "static"` returned 503 for every request** — caught by a five-agent
+  adversarial review. The dispatch upstream-health gate ran before the
+  route-mode match and short-circuited on the (empty) static upstream, so the
+  file server was unreachable. Fixed to skip the gate for static routes; proven
+  live and guarded by an integration test. The same review fixed 15 more:
+  Caddyfile parser recursion depth cap, duplicate-route dedupe, inline
+  `header CSP` capture, HEAD-via-`metadata` + size cap, `U+007F` escaping, and
+  ACME/host dedupe edges.
+
+### Documentation
+- ADRs 0012–0016: the Traefik and Caddy front-ends, native `[tls.acme]`
+  emission, `mode = "static"`, and the nginx static mapping.
+
 ## [0.6.2] - 2026-07-07
 
 ### Fixed

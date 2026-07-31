@@ -1,0 +1,37 @@
+# Anonymized ACME stack: two services behind websecure with a certresolver,
+# plus an explicit ACME-challenge router on :80. Uses ${PUBLIC_FQDN} and
+# ${ACME_EMAIL} with no shell default, so a bare import reports them as
+# unresolved; pass `--var PUBLIC_FQDN=... --var ACME_EMAIL=...` (or a .env).
+services:
+  proxy:
+    image: traefik:v3
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.le.acme.httpchallenge=true"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+      - "--api.dashboard=false"
+  frontend:
+    image: example/frontend:latest
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.fe.rule=Host(`${PUBLIC_FQDN}`)"
+      - "traefik.http.routers.fe.entrypoints=websecure"
+      - "traefik.http.routers.fe.tls.certresolver=le"
+      - "traefik.http.services.fe.loadbalancer.server.port=3000"
+  backend:
+    image: example/backend:latest
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=Host(`${PUBLIC_FQDN}`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.api.entrypoints=websecure"
+      - "traefik.http.routers.api.tls.certresolver=le"
+      - "traefik.http.routers.api-acme.rule=Host(`${PUBLIC_FQDN}`) && PathPrefix(`/.well-known/acme-challenge`)"
+      - "traefik.http.routers.api-acme.entrypoints=web"
+      - "traefik.http.services.api.loadbalancer.server.port=8000"
