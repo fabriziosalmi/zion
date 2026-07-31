@@ -12,9 +12,17 @@ All notable changes to Zion Edge Gateway are documented here.
   feature only, off by default). CI tooling: `actions/checkout` v7,
   `actions/upload-artifact` v7, `dependabot/fetch-metadata` v3, Docker base image
   `rust` 1.97. MSRV-safe (the 1.82 core floor and 1.88 full floor are unchanged);
-  `cargo-vet` exemptions regenerated. Two now-unreachable advisory ignores were
-  reviewed and retained (`RUSTSEC-2026-0186`/`-0217` have no fixed upstream
-  release yet).
+  `cargo-vet` exemptions regenerated.
+
+### Security
+- **Advisory hygiene.** The dependency bumps **resolved** three ignored
+  advisories (`RUSTSEC-2026-0002` lru/ratatui, `-0186` memmap2, `-0217`
+  tract-nnef), now removed from `deny.toml`/`.cargo/audit.toml`. The
+  newly-published `RUSTSEC-2026-0009` (`time` 0.3.41 stack-exhaustion when
+  parsing untrusted RFC 2822 input) is feature-gated behind acme/init/ml-waf
+  (absent from the no-default-features core) and unreachable on Zion's request
+  path — documented and ignored until the transitive `time <0.3.42` constraint
+  lifts (the fix, `time >=0.3.47`, also needs Rust 1.85).
 
 ### Documentation
 - **"Migrating to Zion" guide** — a dedicated page covering all three importer
