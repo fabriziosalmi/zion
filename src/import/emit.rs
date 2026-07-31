@@ -128,9 +128,17 @@ fn render_route(out: &mut String, route: &RouteOut) {
                 .join(", ")
         ));
     }
-    kv(out, "upstream", &route.upstream);
-    if route.websocket {
-        kv(out, "mode", "websocket");
+    if let Some(dir) = &route.serve_dir {
+        kv(out, "mode", "static");
+        kv(out, "serve_dir", dir);
+        if route.spa_fallback {
+            out.push_str("spa_fallback = true\n");
+        }
+    } else {
+        kv(out, "upstream", &route.upstream);
+        if route.websocket {
+            kv(out, "mode", "websocket");
+        }
     }
     if let Some(csp) = &route.csp {
         kv(out, "csp", csp);
@@ -222,6 +230,8 @@ mod tests {
                 websocket: false,
                 csp: None,
                 waf: false,
+                serve_dir: None,
+                spa_fallback: false,
                 annotations: vec!["evil\ninternal_only = false\n[admin]".into()],
             }],
         };
@@ -270,6 +280,8 @@ mod tests {
                 websocket: false,
                 csp: None,
                 waf: false,
+                serve_dir: None,
+                spa_fallback: false,
                 annotations: vec!["demo annotation".into()],
             }],
         };
@@ -309,6 +321,8 @@ mod tests {
                 websocket: true,
                 csp: Some("default-src 'self'".into()),
                 waf: true,
+                serve_dir: None,
+                spa_fallback: false,
                 annotations: Vec::new(),
             }],
         };
@@ -351,6 +365,8 @@ mod tests {
                 websocket: false,
                 csp: None,
                 waf: false,
+                serve_dir: None,
+                spa_fallback: false,
                 annotations: Vec::new(),
             }],
         };
