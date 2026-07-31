@@ -985,6 +985,43 @@ struct ServerCtx {
     hdr_annotations: Vec<String>,
     waf: bool,
     connect_ms: Option<u64>,
+    /// Inherited docroot (`root <dir>`) that static locations serve from
+    /// (ADR-0015). nginx inheritance is replace-not-merge, but a location's own
+    /// `root`/`alias` simply overrides this at the location level.
+    root: Option<String>,
+    root_line: u32,
+    /// Inherited `index`. Zion serves `index.html` for directory requests, so a
+    /// non-default index becomes a partial finding when a static route uses it.
+    index: Option<String>,
+}
+
+/// Classify a static location's `try_files` fallback (its last argument) into
+/// `(spa_fallback, optional partial note)`. Zion's SPA fallback always serves
+/// the docroot's `index.html`, so a fallback to a *different* file converts with
+/// a note, a `=CODE` fallback means no SPA, and a named-location (`@name`)
+/// fallback is not modeled.
+fn classify_try_files(args: &[String]) -> (bool, Option<String>) {
+    match args.last() {
+        None => (
+            false,
+            Some("try_files has no fallback argument".to_string()),
+        ),
+        Some(last) if last.starts_with('=') => (false, None),
+        Some(last) if last.starts_with('@') => (
+            false,
+            Some(format!(
+                "try_files fallback to named location '{last}' is not modeled — \
+                 no SPA fallback set"
+            )),
+        ),
+        Some(last) if last == "/index.html" => (true, None),
+        Some(last) => (
+            true,
+            Some(format!(
+                "Zion's SPA fallback serves the docroot '/index.html', not '{last}'"
+            )),
+        ),
+    }
 }
 
 fn map_server(
@@ -1004,6 +1041,9 @@ fn map_server(
         hdr_annotations: Vec::new(),
         waf: false,
         connect_ms: None,
+        root: None,
+        root_line: 0,
+        index: None,
     };
 
     for d in &server.directives {
@@ -1108,22 +1148,69 @@ fn map_server(
                 &d.name,
                 "Zion auth profiles are JWT/OIDC, not basic auth",
             )),
-            "root" | "alias" | "try_files" | "index" | "autoindex" => {
-                findings.push(Finding::new(
+            // Inherited docroot context for static locations (ADR-0015). No
+            // finding here: it is consumed by a static location below, or
+            // reported as unused after the location loop.
+            "root" => match d.args.last() {
+                Some(dir) if !dir.is_empty() && !dir.contains('$') => {
+                    ctx.root = Some(dir.clone());
+                    ctx.root_line = d.line;
+                }
+                Some(_) => findings.push(Finding::new(
                     Status::Unsupported,
                     d.line,
-                    &d.name,
-                    "Zion serves no files from disk (it is a reverse proxy; \
-                     `mode = \"static_cache\"` caches upstream responses, it does \
-                     not serve a docroot)",
-                ));
-            }
+                    "root",
+                    "docroot contains an unresolved variable — not emitted",
+                )),
+                None => findings.push(Finding::new(
+                    Status::Unsupported,
+                    d.line,
+                    "root",
+                    "missing docroot path",
+                )),
+            },
+            "index" => ctx.index = d.args.first().cloned(),
+            "try_files" => findings.push(Finding::new(
+                Status::Partial,
+                d.line,
+                "try_files",
+                "server-level try_files is not modeled — move it into a `location` \
+                 to convert it to mode=static",
+            )),
+            "alias" => findings.push(Finding::new(
+                Status::Unsupported,
+                d.line,
+                "alias",
+                "server-level alias has no location prefix to serve",
+            )),
+            "autoindex" => findings.push(Finding::new(
+                Status::Unsupported,
+                d.line,
+                "autoindex",
+                "no directory listing — Zion serves index.html or 404",
+            )),
             _ => findings.push(Finding::unsupported_directive(d)),
         }
     }
 
+    // Static locations consume the inherited `ctx.root`; a docroot that none of
+    // them used is silently ignored by Zion — say so (ADR-0011 honesty).
+    let route_start = doc.routes.len();
     for loc in &server.locations {
         map_location(loc, hosts, &ctx, doc, reg, agg, findings, model);
+    }
+    if let Some(dir) = &ctx.root {
+        let used_static = doc.routes[route_start..]
+            .iter()
+            .any(|r| r.serve_dir.is_some());
+        if !used_static {
+            findings.push(Finding::new(
+                Status::Unsupported,
+                ctx.root_line,
+                "root",
+                format!("docroot '{dir}' set but no static location uses it — ignored"),
+            ));
+        }
     }
 }
 
@@ -1166,6 +1253,14 @@ fn map_location(
     let mut loc_connect: Option<u64> = None;
     let mut route_waf = ctx.waf;
     let mut static_only = Vec::new();
+    // Static-serving state (ADR-0015): a location with one of these and no
+    // proxy_pass becomes a mode=static route.
+    let mut loc_root: Option<String> = None;
+    let mut loc_alias: Option<String> = None;
+    let mut loc_index: Option<String> = None;
+    let mut loc_try_files: Option<(Vec<String>, u32)> = None;
+    let mut loc_autoindex: Option<u32> = None;
+    let mut static_bad: Option<(u32, &'static str)> = None; // unresolved/empty root|alias
 
     for d in &loc.directives {
         match d.name.as_str() {
@@ -1244,16 +1339,37 @@ fn map_location(
                 // Location-scoped cap: contributes to the shared imported profile.
                 map_body_size(d, doc, &mut route_waf, findings);
             }
-            "root" | "alias" | "try_files" | "index" | "autoindex" => {
+            // Static-serving directives: parsed into locals and resolved after
+            // the loop (a mode=static route if there is no proxy target).
+            "root" => {
                 static_only.push(d.line);
-                findings.push(Finding::new(
-                    Status::Unsupported,
-                    d.line,
-                    &d.name,
-                    "Zion serves no files from disk (it is a reverse proxy; \
-                     `mode = \"static_cache\"` caches upstream responses, it does \
-                     not serve a docroot)",
-                ));
+                match d.args.last() {
+                    Some(dir) if !dir.is_empty() && !dir.contains('$') => {
+                        loc_root = Some(dir.clone())
+                    }
+                    _ => static_bad = Some((d.line, "root")),
+                }
+            }
+            "alias" => {
+                static_only.push(d.line);
+                match d.args.last() {
+                    Some(dir) if !dir.is_empty() && !dir.contains('$') => {
+                        loc_alias = Some(dir.clone())
+                    }
+                    _ => static_bad = Some((d.line, "alias")),
+                }
+            }
+            "try_files" => {
+                static_only.push(d.line);
+                loc_try_files = Some((d.args.clone(), d.line));
+            }
+            "index" => {
+                static_only.push(d.line);
+                loc_index = d.args.first().cloned();
+            }
+            "autoindex" => {
+                static_only.push(d.line);
+                loc_autoindex = Some(d.line);
             }
             "expires" => findings.push(Finding::new(
                 Status::Unsupported,
@@ -1302,6 +1418,167 @@ fn map_location(
             }
             _ => findings.push(Finding::unsupported_directive(d)),
         }
+    }
+
+    // ── Static location → mode=static (ADR-0015) ────────────────────────────
+    // No proxy target, but an explicit static signal: serve files from disk.
+    // nginx `root` appends the whole request URI while Zion strips the route
+    // prefix, so `serve_dir = root joined with the location prefix` reproduces
+    // the same on-disk path; `alias` already strips the prefix, so it maps to
+    // `serve_dir` directly.
+    let has_static_signal = loc_try_files.is_some()
+        || loc_root.is_some()
+        || loc_alias.is_some()
+        || loc_index.is_some()
+        || loc_autoindex.is_some();
+    if proxy.is_none() && has_static_signal {
+        if let Some((line, kind)) = static_bad {
+            findings.push(Finding::new(
+                Status::Unsupported,
+                line,
+                kind,
+                "docroot is empty or contains an unresolved variable — not emitted",
+            ));
+            return;
+        }
+        if loc.modifier == LocMod::Exact {
+            findings.push(Finding::new(
+                Status::Unsupported,
+                loc.line,
+                "location",
+                format!(
+                    "exact-match static location '{}' is not converted — write it as \
+                     a prefix `mode=static` route by hand",
+                    loc.pattern
+                ),
+            ));
+            return;
+        }
+        let path = match location_path(loc, findings) {
+            Some(p) => p,
+            None => return,
+        };
+        // serve_dir: `alias` maps directly; `root` (own or inherited) joins the
+        // location prefix.
+        let serve_dir = if let Some(alias) = &loc_alias {
+            alias.trim_end_matches('/').to_string()
+        } else if let Some(root) = loc_root.as_ref().or(ctx.root.as_ref()) {
+            let root = root.trim_end_matches('/');
+            let prefix = loc.pattern.trim_matches('/');
+            if prefix.is_empty() {
+                root.to_string()
+            } else {
+                format!("{root}/{prefix}")
+            }
+        } else {
+            findings.push(Finding::new(
+                Status::Unsupported,
+                loc.line,
+                "location",
+                format!(
+                    "'{}': static location without a resolvable `root` or `alias` — skipped",
+                    loc.pattern
+                ),
+            ));
+            return;
+        };
+        let (spa_fallback, tf_note) = match &loc_try_files {
+            Some((args, _)) => classify_try_files(args),
+            None => (false, None),
+        };
+        // Same collision guard as the proxy path: a duplicate (host, path) would
+        // abort matchit at boot.
+        let route_hosts: Option<Vec<String>> = hosts.map(|h| h.to_vec());
+        let collision = doc.routes.iter().any(|r| {
+            r.path == path
+                && match (&r.hosts, &route_hosts) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => a.iter().any(|h| b.contains(h)),
+                    _ => false,
+                }
+        });
+        if collision {
+            findings.push(Finding::new(
+                Status::Unsupported,
+                loc.line,
+                "location",
+                format!(
+                    "'{}': duplicate path '{path}' for the same host — skipped",
+                    loc.pattern
+                ),
+            ));
+            return;
+        }
+        let signal = if loc_alias.is_some() {
+            "alias"
+        } else if loc_try_files.is_some() {
+            "try_files"
+        } else {
+            "root"
+        };
+        findings.push(Finding::new(
+            Status::Convert,
+            loc.line,
+            signal,
+            format!(
+                "route '{path}' → mode=static, serve_dir '{serve_dir}'{}",
+                if spa_fallback { " + spa_fallback" } else { "" }
+            ),
+        ));
+        if let Some(note) = tf_note {
+            let line = loc_try_files.as_ref().map(|(_, l)| *l).unwrap_or(loc.line);
+            findings.push(Finding::new(Status::Partial, line, "try_files", note));
+        }
+        if let Some(idx) = &loc_index {
+            if idx != "index.html" {
+                findings.push(Finding::new(
+                    Status::Partial,
+                    loc.line,
+                    "index",
+                    format!(
+                        "Zion serves 'index.html' for directory requests; custom index \
+                         '{idx}' is not honored"
+                    ),
+                ));
+            }
+        }
+        if let Some(line) = loc_autoindex {
+            findings.push(Finding::new(
+                Status::Partial,
+                line,
+                "autoindex",
+                "no directory listing — Zion serves index.html or 404",
+            ));
+        }
+        // CSP inheritance follows the same replace-not-merge rule as the proxy path.
+        let mut csp = if loc_has_add_header {
+            loc_csp.clone()
+        } else {
+            ctx.csp.clone()
+        };
+        if let Some(v) = &csp {
+            if hyper::header::HeaderValue::from_str(v).is_err() {
+                findings.push(Finding::new(
+                    Status::Unsupported,
+                    loc.line,
+                    "add_header",
+                    "Content-Security-Policy value is not a valid header value — dropped",
+                ));
+                csp = None;
+            }
+        }
+        doc.routes.push(RouteOut {
+            path,
+            hosts: route_hosts,
+            upstream: String::new(),
+            websocket: false,
+            csp,
+            waf: false,
+            serve_dir: Some(serve_dir),
+            spa_fallback,
+            annotations: Vec::new(),
+        });
+        return;
     }
 
     let (scheme, target, uri, pline) = match proxy {
