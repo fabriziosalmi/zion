@@ -1,5 +1,5 @@
-# Product edge: a static file server. Zion serves nothing from disk, so `root`
-# and `file_server` are `unsupported` and no convertible route is emitted.
+# A static file server: `root` + `file_server` convert to a mode=static route
+# (ADR-0015). `encode` stays unsupported (Zion does not compress).
 example.com {
     root * /srv/www
     file_server

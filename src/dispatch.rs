@@ -588,10 +588,17 @@ async fn process_request_inner(
     }
 
     // --- Gate: Upstream health check + Latency Routing (B-04) ---
-    // Select the healthy upstream with the lowest latency.
+    // Select the healthy upstream with the lowest latency. A `mode="static"`
+    // route serves from disk and has NO upstream, so it must skip this gate —
+    // otherwise `select_best_upstream` sees an empty list and 503s before the
+    // `RouteMode::Static` arm can run. The placeholder is only parsed into
+    // dyn_scheme/authority, which that arm never reads (WAF/auth/CSP/security
+    // headers still apply on the way down).
+    static EMPTY_UPSTREAM: String = String::new();
     let target_upstream_url =
         match health::select_best_upstream(&cfg.health_map, &rule.upstream_url) {
             Some(url) => url,
+            None if rule.mode == config::RouteMode::Static => &EMPTY_UPSTREAM,
             None => {
                 metrics::METRICS.record_status(503);
                 return Ok(text_response(
@@ -1192,6 +1199,19 @@ async fn process_request_inner(
                 )
                 .await?
             }
+            config::RouteMode::Static => match rule.serve_dir.as_deref() {
+                Some(dir) => {
+                    let path = req.uri().path();
+                    let tail = path
+                        .strip_prefix(rule.static_prefix.as_str())
+                        .unwrap_or(path)
+                        .trim_start_matches('/');
+                    crate::static_files::serve(dir, tail, rule.spa_fallback, req.method()).await
+                }
+                // Unreachable (resolve_route requires serve_dir) — fail CLOSED
+                // rather than serve the process CWD if a future refactor slips.
+                None => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+            },
         }
     };
 

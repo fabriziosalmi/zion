@@ -267,7 +267,7 @@ pub fn run(opts: ImportOpts) -> i32 {
         "nginx" | "traefik" | "caddy" => {}
         "" => {
             eprintln!(
-                "usage: zion import <nginx|traefik|caddy> <path|-> [-o zion.toml] [--report file] [--strict] [--var KEY=VALUE]..."
+                "usage: zion import <nginx|traefik|caddy> <path|-> [-o zion.toml] [--report file] [--strict] [--var KEY=VALUE]... [--acme-email EMAIL]"
             );
             return 1;
         }
@@ -309,8 +309,18 @@ pub fn run(opts: ImportOpts) -> i32 {
     };
 
     let converted = match source {
-        "traefik" => traefik::convert(&src, base_dir.as_deref(), &opts.vars),
-        "caddy" => caddy::convert(&src, base_dir.as_deref(), &opts.vars),
+        "traefik" => traefik::convert(
+            &src,
+            base_dir.as_deref(),
+            &opts.vars,
+            opts.acme_email.as_deref(),
+        ),
+        "caddy" => caddy::convert(
+            &src,
+            base_dir.as_deref(),
+            &opts.vars,
+            opts.acme_email.as_deref(),
+        ),
         _ => convert(&src, base_dir.as_deref()),
     };
     let conversion = match converted {
@@ -522,9 +532,16 @@ mod tests {
     #[test]
     fn corpus_04_static_spa_honesty() {
         let c = convert_fixture("04-static-plus-proxy.conf");
-        // Only /api converts; the URI part of its proxy_pass is dropped loudly.
+        // The SPA `location /` (inherited `root` + `try_files … /index.html`)
+        // now converts to a mode=static catch-all (ADR-0015); /api still proxies.
+        assert_eq!(c.toml.matches("[[route]]").count(), 2);
         assert!(c.toml.contains("path = \"/api/{*rest}\""));
-        assert_eq!(c.toml.matches("[[route]]").count(), 1);
+        assert!(c.toml.contains("mode = \"static\""));
+        assert!(c.toml.contains("serve_dir = \"/var/www/spa/dist\""));
+        assert!(c.toml.contains("spa_fallback = true"));
+        // try_files CONVERTS now — it is no longer an unsupported product edge.
+        assert!(has_finding(&c, Status::Convert, "try_files", "mode=static"));
+        // The /api proxy_pass URI part is still dropped loudly.
         assert!(has_finding(
             &c,
             Status::Unsupported,
@@ -532,13 +549,198 @@ mod tests {
             "URI part"
         ));
         assert!(c.toml.contains("# UNSUPPORTED: proxy_pass URI part"));
-        assert!(has_finding(&c, Status::Unsupported, "try_files", "files"));
+        // `/assets/` carries only expires/access_log (no static signal, no
+        // proxy) — still skipped; the catch-all serves it at runtime.
         assert!(has_finding(
             &c,
             Status::Unsupported,
             "location",
             "no convertible proxy target"
         ));
+    }
+
+    // ── 3a-nginx: root/try_files/index/alias → mode=static (ADR-0015) ────────
+    // Draconian, deterministic matrix. `conv_ok` converts an inline server and
+    // returns the single static route it produced (asserting there is exactly
+    // one), so each test pins serve_dir/spa_fallback exactly.
+
+    fn conv_ok(src: &str) -> Conversion {
+        convert(src, None).unwrap_or_else(|e| panic!("convert failed: {e:?}"))
+    }
+
+    #[test]
+    fn static_spa_catch_all_from_inherited_root() {
+        let c = conv_ok(
+            "server {\n  server_name a.test;\n  root /var/www/app;\n  \
+             location / { try_files $uri $uri/ /index.html; }\n}",
+        );
+        assert!(c.toml.contains("path = \"/{*rest}\""));
+        assert!(c.toml.contains("mode = \"static\""));
+        assert!(c.toml.contains("serve_dir = \"/var/www/app\""));
+        assert!(c.toml.contains("spa_fallback = true"));
+        assert!(has_finding(&c, Status::Convert, "try_files", "mode=static"));
+    }
+
+    #[test]
+    fn static_try_files_404_has_no_spa_fallback() {
+        let c = conv_ok(
+            "server {\n  server_name a.test;\n  root /srv;\n  \
+             location / { try_files $uri =404; }\n}",
+        );
+        assert!(c.toml.contains("mode = \"static\""));
+        assert!(c.toml.contains("serve_dir = \"/srv\""));
+        assert!(!c.toml.contains("spa_fallback"));
+    }
+
+    #[test]
+    fn static_subpath_root_joins_the_location_prefix() {
+        // nginx `root` appends the whole URI; Zion strips the route prefix — so
+        // serve_dir must be root + prefix to serve the same files.
+        let c = conv_ok(
+            "server {\n  server_name a.test;\n  \
+             location /assets/ { root /srv/app; try_files $uri =404; }\n}",
+        );
+        assert!(c.toml.contains("path = \"/assets/{*rest}\""));
+        assert!(c.toml.contains("serve_dir = \"/srv/app/assets\""));
+    }
+
+    #[test]
+    fn static_alias_maps_to_serve_dir_directly() {
+        // `alias` already strips the prefix (like Zion), so serve_dir = alias.
+        let c = conv_ok(
+            "server {\n  server_name a.test;\n  \
+             location /dl/ { alias /data/files/; }\n}",
+        );
+        assert!(c.toml.contains("path = \"/dl/{*rest}\""));
+        assert!(c.toml.contains("serve_dir = \"/data/files\""));
+        assert!(has_finding(&c, Status::Convert, "alias", "mode=static"));
+    }
+
+    #[test]
+    fn static_local_root_overrides_inherited() {
+        let c = conv_ok(
+            "server {\n  server_name a.test;\n  root /inherited;\n  \
+             location / { root /local; try_files $uri /index.html; }\n}",
+        );
+        assert!(c.toml.contains("serve_dir = \"/local\""));
+        assert!(!c.toml.contains("/inherited"));
+    }
+
+    #[test]
+    fn static_unresolved_root_variable_is_unsupported() {
+        let c = conv_ok(
+            "server {\n  server_name a.test;\n  \
+             location / { root /www/$host; try_files $uri /index.html; }\n  \
+             location /api/ { proxy_pass http://127.0.0.1:9000; }\n}",
+        );
+        assert!(has_finding(
+            &c,
+            Status::Unsupported,
+            "root",
+            "unresolved variable"
+        ));
+        assert!(!c.toml.contains("mode = \"static\""));
+        // the proxy route still converts
+        assert!(c.toml.contains("path = \"/api/{*rest}\""));
+    }
+
+    #[test]
+    fn static_named_fallback_is_partial_without_spa() {
+        let c = conv_ok(
+            "server {\n  server_name a.test;\n  root /srv;\n  \
+             location / { try_files $uri $uri/ @app; }\n}",
+        );
+        assert!(c.toml.contains("mode = \"static\""));
+        assert!(!c.toml.contains("spa_fallback"));
+        assert!(has_finding(
+            &c,
+            Status::Partial,
+            "try_files",
+            "named location"
+        ));
+    }
+
+    #[test]
+    fn static_custom_index_is_partial() {
+        let c = conv_ok(
+            "server {\n  server_name a.test;\n  \
+             location / { root /srv; index main.html; }\n}",
+        );
+        assert!(c.toml.contains("mode = \"static\""));
+        assert!(!c.toml.contains("spa_fallback"));
+        assert!(has_finding(&c, Status::Partial, "index", "index.html"));
+    }
+
+    #[test]
+    fn static_autoindex_is_partial() {
+        let c = conv_ok(
+            "server {\n  server_name a.test;\n  \
+             location /files/ { root /srv; autoindex on; }\n}",
+        );
+        assert!(c.toml.contains("path = \"/files/{*rest}\""));
+        assert!(has_finding(
+            &c,
+            Status::Partial,
+            "autoindex",
+            "directory listing"
+        ));
+    }
+
+    #[test]
+    fn static_exact_match_location_is_unsupported() {
+        let c = conv_ok(
+            "server {\n  server_name a.test;\n  \
+             location = /favicon.ico { root /srv; }\n  \
+             location /api/ { proxy_pass http://127.0.0.1:9000; }\n}",
+        );
+        assert!(has_finding(
+            &c,
+            Status::Unsupported,
+            "location",
+            "exact-match static"
+        ));
+        assert!(!c.toml.contains("mode = \"static\""));
+    }
+
+    #[test]
+    fn static_server_root_unused_by_proxy_only_is_reported() {
+        let c = conv_ok(
+            "server {\n  server_name a.test;\n  root /never/served;\n  \
+             location / { proxy_pass http://127.0.0.1:9000; }\n}",
+        );
+        assert!(!c.toml.contains("mode = \"static\""));
+        assert!(has_finding(
+            &c,
+            Status::Unsupported,
+            "root",
+            "no static location uses it"
+        ));
+    }
+
+    #[test]
+    fn static_and_proxy_coexist_in_one_server() {
+        let c = conv_ok(
+            "server {\n  server_name a.test;\n  root /var/www/app;\n  \
+             location / { try_files $uri /index.html; }\n  \
+             location /api/ { proxy_pass http://127.0.0.1:9000; }\n}",
+        );
+        assert_eq!(c.toml.matches("[[route]]").count(), 2);
+        assert!(c.toml.contains("mode = \"static\""));
+        assert!(c.toml.contains("path = \"/api/{*rest}\""));
+        assert!(c.toml.contains("upstream = \"127_0_0_1_9000\""));
+    }
+
+    #[test]
+    fn static_directory_serving_without_try_files() {
+        // Just `root` (+ no try_files): Zion serves index.html for the dir.
+        let c = conv_ok(
+            "server {\n  server_name a.test;\n  \
+             location / { root /srv/site; }\n}",
+        );
+        assert!(c.toml.contains("mode = \"static\""));
+        assert!(c.toml.contains("serve_dir = \"/srv/site\""));
+        assert!(!c.toml.contains("spa_fallback"));
+        assert!(has_finding(&c, Status::Convert, "root", "mode=static"));
     }
 
     #[test]

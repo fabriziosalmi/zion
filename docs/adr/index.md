@@ -24,6 +24,9 @@ defined in [0000-template.md](0000-template.md).
 | 0011  | [`zion import` — nginx config migration, honesty over completeness](0011-zion-import-nginx.md) | accepted |
 | 0012  | [`zion import traefik` — a second front-end on the neutral seam](0012-zion-import-traefik.md) | accepted |
 | 0013  | [`zion import caddy` — third front-end, own Caddyfile parser](0013-zion-import-caddy.md) | accepted |
+| 0014  | [Native `[tls.acme]` emission in the importer](0014-importer-tls-acme-emission.md) | accepted |
+| 0015  | [`mode = "static"` — opt-in disk file serving](0015-route-mode-static.md) | accepted |
+| 0016  | [nginx `root`/`try_files`/`index` → `mode = "static"`](0016-importer-nginx-static-mapping.md) | accepted |
 
 ## When to write a new ADR
 

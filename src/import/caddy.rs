@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
-use super::map::{RouteOut, UpstreamOut, ZionDoc};
+use super::map::{AcmeOut, RouteOut, UpstreamOut, ZionDoc};
 use super::{emit, Conversion, ConvertError, Finding, Status};
 
 /// Placeholder cert paths (mirrors the nginx/Traefik convention): schema
@@ -49,12 +49,13 @@ pub(super) fn convert(
     src: &str,
     base_dir: Option<&Path>,
     cli_vars: &[(String, String)],
+    cli_acme_email: Option<&str>,
 ) -> Result<Conversion, ConvertError> {
     let file = parse(src).map_err(|e| ConvertError::Parse(e.to_string()))?;
     let env = Env::load(base_dir, cli_vars);
 
     let mut findings = Vec::new();
-    let doc = build(&file, &env, &mut findings);
+    let doc = build(&file, &env, cli_acme_email, &mut findings);
     findings.sort_by_key(|f| f.line);
 
     if doc.routes.is_empty() {
@@ -293,7 +294,7 @@ fn parse(src: &str) -> Result<Caddyfile, ParseError> {
     // A leading `{` (before any site) is the global options block.
     if let (Kind::Open, _) = lx.peek_kind()? {
         lx.next_tok()?;
-        file.global = parse_block(&mut lx)?;
+        file.global = parse_block(&mut lx, 0)?;
     }
 
     loop {
@@ -317,7 +318,7 @@ fn parse(src: &str) -> Result<Caddyfile, ParseError> {
                 match lx.peek_kind()? {
                     (Kind::Open, _) => {
                         lx.next_tok()?;
-                        let body = parse_block(&mut lx)?;
+                        let body = parse_block(&mut lx, 0)?;
                         if heads.len() == 1
                             && heads[0].starts_with('(')
                             && heads[0].ends_with(')')
@@ -352,8 +353,14 @@ fn parse(src: &str) -> Result<Caddyfile, ParseError> {
     Ok(file)
 }
 
-/// Parse directives until the matching `}` (which it consumes).
-fn parse_block(lx: &mut Lexer) -> Result<Vec<Node>, ParseError> {
+/// Parse directives until the matching `}` (which it consumes). `depth` bounds
+/// block nesting so a pathological `a {`×N input errors with a line number
+/// instead of overflowing the stack.
+fn parse_block(lx: &mut Lexer, depth: u32) -> Result<Vec<Node>, ParseError> {
+    const MAX_NEST_DEPTH: u32 = 64;
+    if depth > MAX_NEST_DEPTH {
+        return Err(perr(lx.peek_kind()?.1, "blocks nested too deeply"));
+    }
     let mut nodes = Vec::new();
     loop {
         match lx.peek_kind()? {
@@ -384,7 +391,7 @@ fn parse_block(lx: &mut Lexer) -> Result<Vec<Node>, ParseError> {
                 let block = match lx.peek_kind()? {
                     (Kind::Open, _) => {
                         lx.next_tok()?;
-                        Some(parse_block(lx)?)
+                        Some(parse_block(lx, depth + 1)?)
                     }
                     _ => None,
                 };
@@ -504,7 +511,12 @@ fn unquote(s: &str) -> &str {
 
 // ── Mapper ────────────────────────────────────────────────────────────────
 
-fn build(file: &Caddyfile, env: &Env, findings: &mut Vec<Finding>) -> ZionDoc {
+fn build(
+    file: &Caddyfile,
+    env: &Env,
+    cli_acme_email: Option<&str>,
+    findings: &mut Vec<Finding>,
+) -> ZionDoc {
     let mut doc = ZionDoc {
         listen_http: "0.0.0.0:80".to_string(),
         listen_https: "0.0.0.0:443".to_string(),
@@ -515,6 +527,7 @@ fn build(file: &Caddyfile, env: &Env, findings: &mut Vec<Finding>) -> ZionDoc {
         tls_key: PLACEHOLDER_KEY.to_string(),
         tls_min12: false,
         sni: Vec::new(),
+        acme: None,
         waf_body_mb: None,
         upstreams: Vec::new(),
         routes: Vec::new(),
@@ -534,6 +547,7 @@ fn build(file: &Caddyfile, env: &Env, findings: &mut Vec<Finding>) -> ZionDoc {
             &hosts,
             env,
             &acme_email,
+            cli_acme_email,
             &mut doc,
             &mut seen_upstreams,
             findings,
@@ -612,6 +626,10 @@ fn resolve_hosts(site: &Site, env: &Env, findings: &mut Vec<Finding>) -> Vec<Str
         }
         hosts.push(host.to_string());
     }
+    // Dedupe (e.g. `example.com, example.com:443`) preserving order — duplicate
+    // ACME domains / route hosts otherwise leak into the emitted config.
+    let mut seen = std::collections::BTreeSet::new();
+    hosts.retain(|h| seen.insert(h.clone()));
     hosts
 }
 
@@ -639,10 +657,15 @@ fn map_site(
     hosts: &[String],
     env: &Env,
     acme_email: &Option<String>,
+    cli_acme_email: Option<&str>,
     doc: &mut ZionDoc,
     seen_upstreams: &mut BTreeSet<String>,
     findings: &mut Vec<Finding>,
 ) {
+    // A site with `root <dir>` + `file_server` serves files from disk
+    // (ADR-0015); it may coexist with proxy handlers as a static fallback.
+    let static_spec = detect_static(body);
+
     // Pass 1: site-level directives (headers, tls, encode, …). The site-level
     // header block yields a CSP that applies to every route unless a handler
     // overrides it.
@@ -654,7 +677,7 @@ fn map_site(
                     site_csp = Some(csp);
                 }
             }
-            "tls" => map_tls(node, acme_email, doc, findings),
+            "tls" => map_tls(node, doc, findings),
             "encode" => findings.push(Finding::new(
                 Status::Unsupported,
                 node.line,
@@ -667,12 +690,32 @@ fn map_site(
                 "log",
                 "structured JSON logging to stdout is built in",
             )),
-            "root" | "file_server" => findings.push(Finding::new(
-                Status::Unsupported,
-                node.line,
-                node.name.clone(),
-                "Zion serves nothing from disk (static serving is the product edge)",
-            )),
+            "root" | "file_server" => {
+                if static_spec.is_some() {
+                    findings.push(Finding::new(
+                        Status::Convert,
+                        node.line,
+                        node.name.clone(),
+                        "→ mode=static — files served from disk (ADR-0015)",
+                    ));
+                } else {
+                    findings.push(Finding::new(
+                        Status::Unsupported,
+                        node.line,
+                        node.name.clone(),
+                        "static serving needs both `root <dir>` and `file_server`",
+                    ));
+                }
+            }
+            "try_files" => {
+                let spa = static_spec.as_ref().map(|s| s.1).unwrap_or(false);
+                findings.push(Finding::new(
+                    if spa { Status::Convert } else { Status::Unsupported },
+                    node.line,
+                    "try_files",
+                    "SPA fallback (`… /index.html`) → spa_fallback; other try_files forms are unsupported",
+                ));
+            }
             "respond" => findings.push(Finding::new(
                 Status::Unsupported,
                 node.line,
@@ -732,13 +775,81 @@ fn map_site(
             _ => {}
         }
     }
+
+    // A static site/route (root + file_server) becomes a catch-all mode=static
+    // route, emitted AFTER the proxy routes so a more-specific handler wins.
+    if let Some((dir, spa)) = static_spec {
+        let route_hosts = if hosts.is_empty() {
+            None
+        } else {
+            Some(hosts.to_vec())
+        };
+        // F2: a bare `handle` / `reverse_proxy` may already own the catch-all at
+        // this (path, hosts); matchit rejects a duplicate route, so drop the
+        // static fallback (the proxy handler covers everything in Caddy too).
+        let collides = doc
+            .routes
+            .iter()
+            .any(|r| r.serve_dir.is_none() && r.path == "/{*rest}" && r.hosts == route_hosts);
+        if collides {
+            findings.push(Finding::new(
+                Status::Partial,
+                0,
+                "file_server",
+                "a catch-all proxy handler already covers this site — the static file_server fallback is dropped (unreachable behind it)",
+            ));
+        } else {
+            // F9: a hostless static catch-all lands in Zion's SHARED default
+            // layer (unlike Caddy, where a `:port` block does not apply to a
+            // host with its own site) — so it would serve files under EVERY
+            // authority. Flag it loudly.
+            if route_hosts.is_none() {
+                findings.push(Finding::new(
+                    Status::Partial,
+                    0,
+                    "file_server (hostless)",
+                    "a hostless static site becomes a shared fallback across ALL hosts in Zion; scope it to a host, or a request to another host with no match will be served these files",
+                ));
+            }
+            doc.routes.push(RouteOut {
+                path: "/{*rest}".to_string(),
+                hosts: route_hosts,
+                upstream: String::new(),
+                websocket: false,
+                csp: site_csp.clone(),
+                waf: false,
+                serve_dir: Some(dir),
+                spa_fallback: spa,
+                annotations: Vec::new(),
+            });
+        }
+    }
+
+    apply_site_acme(body, hosts, acme_email, cli_acme_email, doc, findings);
+}
+
+/// A site's `root <dir>` + `file_server` → `(serve_dir, spa_fallback)`, or
+/// `None` if it serves no files. `try_files … /index.html` sets the SPA flag.
+fn detect_static(body: &[Node]) -> Option<(String, bool)> {
+    if !body.iter().any(|n| n.name == "file_server") {
+        return None;
+    }
+    let dir = body.iter().find(|n| n.name == "root")?.args.last()?.clone();
+    // The last `root` arg must be a real directory, not a matcher (`root *`,
+    // `root @m /d`) or empty — otherwise there is no serve dir to convert.
+    if dir.is_empty() || dir == "*" || dir.starts_with('@') || dir.contains('*') {
+        return None;
+    }
+    let spa = body
+        .iter()
+        .any(|n| n.name == "try_files" && n.args.iter().any(|a| a.contains("index.html")));
+    Some((dir, spa))
 }
 
 /// Map a `header` block. Security headers Zion already injects → `auto`;
 /// `Content-Security-Policy` → returned as a route/site CSP (convert);
 /// HSTS → `partial` (Zion's value is fixed); the rest → `unsupported`.
 fn map_header(node: &Node, findings: &mut Vec<Finding>) -> Option<String> {
-    let mut csp = None;
     // Fields come either as a block or as inline `header Field value` args.
     let fields: Vec<(String, u32)> = match &node.block {
         Some(block) => block.iter().map(|n| (n.name.clone(), n.line)).collect(),
@@ -748,11 +859,25 @@ fn map_header(node: &Node, findings: &mut Vec<Finding>) -> Option<String> {
             .map(|f| vec![(f.clone(), node.line)])
             .unwrap_or_default(),
     };
-    let csp_value = |n: &Node| n.args.first().cloned().unwrap_or_default();
-    if let Some(block) = &node.block {
-        for n in block {
-            if n.name.eq_ignore_ascii_case("Content-Security-Policy") {
-                csp = Some(csp_value(n));
+    // Capture Content-Security-Policy from EITHER the block form
+    // (`header { Content-Security-Policy "…" }`) or the inline one-liner
+    // (`header Content-Security-Policy "…"`) — the inline form was silently lost.
+    let mut csp = None;
+    match &node.block {
+        Some(block) => {
+            for n in block {
+                if n.name.eq_ignore_ascii_case("Content-Security-Policy") {
+                    csp = n.args.first().cloned();
+                }
+            }
+        }
+        None => {
+            if node
+                .args
+                .first()
+                .is_some_and(|f| f.eq_ignore_ascii_case("Content-Security-Policy"))
+            {
+                csp = node.args.get(1).cloned();
             }
         }
     }
@@ -787,18 +912,9 @@ fn map_header(node: &Node, findings: &mut Vec<Finding>) -> Option<String> {
 
 /// `tls email` / `tls { … }` / `tls internal` → placeholder cert + `partial`
 /// (ACME deferred). `tls <cert> <key>` (explicit files) → convert.
-fn map_tls(
-    node: &Node,
-    acme_email: &Option<String>,
-    doc: &mut ZionDoc,
-    findings: &mut Vec<Finding>,
-) {
-    // Explicit cert + key files.
-    if node.args.len() == 2
-        && !node.args[0].contains('@')
-        && node.args[0] != "internal"
-        && node.args[1] != "internal"
-    {
+fn map_tls(node: &Node, doc: &mut ZionDoc, findings: &mut Vec<Finding>) {
+    // Explicit cert + key files → a real cert.
+    if is_explicit_cert(node) {
         doc.tls_cert = node.args[0].clone();
         doc.tls_key = node.args[1].clone();
         findings.push(Finding::new(
@@ -823,23 +939,94 @@ fn map_tls(
             }
         }
     }
-    let email = node
-        .args
+    // ACME-managed TLS (`tls <email>` / `internal` / bare) is decided at the
+    // site level in `apply_site_acme`, which can see the site hosts.
+}
+
+/// A crude e-mail shape check — has an `@`, no path separator, a dotted domain.
+/// Distinguishes `ops@example.com` from a cert path like `/etc/ssl/git@h.crt`.
+fn looks_like_email(s: &str) -> bool {
+    match s.split_once('@') {
+        Some((user, domain)) => !user.is_empty() && !s.contains('/') && domain.contains('.'),
+        None => false,
+    }
+}
+
+fn is_explicit_cert(node: &Node) -> bool {
+    node.args.len() == 2
+        && !looks_like_email(&node.args[0])
+        && node.args[0] != "internal"
+        && node.args[1] != "internal"
+}
+
+/// Decide automatic HTTPS for a site: emit `[tls.acme]` when the site uses
+/// ACME-managed TLS (a `tls` directive that isn't explicit cert files, or the
+/// operator opting in with `--acme-email`) and a contact e-mail is known.
+fn apply_site_acme(
+    body: &[Node],
+    hosts: &[String],
+    global_email: &Option<String>,
+    cli_acme_email: Option<&str>,
+    doc: &mut ZionDoc,
+    findings: &mut Vec<Finding>,
+) {
+    let tls_node = body.iter().find(|n| n.name == "tls");
+    if tls_node.map(is_explicit_cert).unwrap_or(false) {
+        return; // a real cert, not ACME (map_tls handled it)
+    }
+    if tls_node.is_none() && cli_acme_email.is_none() {
+        return; // no ACME intent — the operator supplies TLS
+    }
+    let public: Vec<String> = hosts
         .iter()
-        .find(|a| a.contains('@'))
+        .filter(|h| *h != "localhost" && h.parse::<std::net::IpAddr>().is_err())
         .cloned()
-        .or_else(|| acme_email.clone())
-        .unwrap_or_else(|| "you@example.com".to_string());
-    findings.push(Finding::new(
-        Status::Partial,
-        node.line,
-        "tls",
-        format!(
-            "Caddy manages this certificate (ACME/internal) → Zion emits a placeholder cert. \
-             Add [tls.acme] (email = \"{email}\", domains = the route hosts) or run `zion init`; \
-             if the origin is a certificate manager, point [tls] at its cert instead"
-        ),
-    ));
+        .collect();
+    if public.is_empty() {
+        return; // localhost / IP only — no public cert
+    }
+    let line = tls_node.map(|n| n.line).unwrap_or(0);
+    let email = tls_node
+        .and_then(|n| n.args.iter().find(|a| looks_like_email(a)).cloned())
+        .or_else(|| cli_acme_email.map(String::from))
+        .or_else(|| global_email.clone())
+        .filter(|e| looks_like_email(e));
+    match email {
+        Some(email) => {
+            findings.push(Finding::new(
+                Status::Convert,
+                line,
+                "tls (ACME)",
+                format!(
+                    "automatic HTTPS → [tls.acme] (email = \"{email}\") for {}",
+                    public.join(", ")
+                ),
+            ));
+            match &mut doc.acme {
+                Some(acme) => {
+                    for h in &public {
+                        if !acme.domains.contains(h) {
+                            acme.domains.push(h.clone());
+                        }
+                    }
+                }
+                None => {
+                    doc.acme = Some(AcmeOut {
+                        email,
+                        domains: public,
+                    })
+                }
+            }
+        }
+        None => findings.push(Finding::new(
+            Status::Partial,
+            line,
+            "tls (ACME)",
+            "Caddy auto-HTTPS → placeholder cert. Pass `--acme-email you@example.com` to emit \
+             [tls.acme], or point [tls] at an existing certificate manager's cert"
+                .to_string(),
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1026,6 +1213,8 @@ fn push_route(
         websocket: false,
         csp: csp.map(str::to_string),
         waf: false,
+        serve_dir: None,
+        spa_fallback: false,
         annotations: Vec::new(),
     });
 }
@@ -1102,7 +1291,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        convert(src, None, &cli)
+        convert(src, None, &cli, None)
     }
 
     // ── lexer / parser ──
@@ -1257,17 +1446,31 @@ mod tests {
     }
 
     #[test]
-    fn tls_email_is_partial_with_placeholder() {
+    fn tls_email_emits_acme() {
         let src = "example.com {\n  reverse_proxy app:8080\n  tls ops@example.com\n}";
         let c = convert_str(src, &[]).expect("convert");
         let tls = c
             .findings
             .iter()
-            .find(|f| f.directive == "tls")
-            .expect("tls finding");
-        assert_eq!(tls.status, Status::Partial);
-        assert!(tls.detail.contains("ops@example.com"));
+            .find(|f| f.directive == "tls (ACME)")
+            .expect("acme finding");
+        assert_eq!(tls.status, Status::Convert);
+        assert!(c.toml.contains("[tls.acme]"));
+        assert!(c.toml.contains("email = \"ops@example.com\""));
+        assert!(c.toml.contains("domains = [\"example.com\"]"));
+        // The bootstrap cert stays so :443 binds before issuance.
         assert!(c.toml.contains("cert_path = \"/etc/ssl/zion/zion.crt\""));
+    }
+
+    #[test]
+    fn acme_email_flag_opts_in_without_a_tls_directive() {
+        // The nis2 swap case: implicit auto-HTTPS, no e-mail in the Caddyfile;
+        // --acme-email supplies it and we emit a real [tls.acme].
+        let src = "app.example.com {\n  reverse_proxy web:3000\n}";
+        let c = convert(src, None, &[], Some("ops@example.com")).expect("convert");
+        assert!(c.toml.contains("[tls.acme]"));
+        assert!(c.toml.contains("email = \"ops@example.com\""));
+        assert!(c.toml.contains("domains = [\"app.example.com\"]"));
     }
 
     #[test]
@@ -1279,14 +1482,111 @@ mod tests {
     }
 
     #[test]
-    fn file_server_site_has_no_routes() {
+    fn static_site_converts_to_mode_static() {
         let src = "example.com {\n  root * /var/www\n  file_server\n}";
+        let c = convert_str(src, &[]).expect("static site should convert");
+        assert!(c.toml.contains("mode = \"static\""));
+        assert!(c.toml.contains("serve_dir = \"/var/www\""));
+        assert!(c.toml.contains("path = \"/{*rest}\""));
+        assert!(c
+            .findings
+            .iter()
+            .any(|f| f.status == Status::Convert && f.directive == "file_server"));
+    }
+
+    #[test]
+    fn hybrid_static_plus_proxy() {
+        // The Tier B shape: an API proxied, everything else served from disk
+        // with an SPA fallback.
+        let src = "example.com {\n  handle /api/* {\n    reverse_proxy api:8000\n  }\n  root * /srv\n  file_server\n  try_files {path} /index.html\n}";
+        let c = convert_str(src, &[]).expect("convert");
+        assert!(c.toml.contains("[upstream.api]") && c.toml.contains("http://api:8000"));
+        assert!(c.toml.contains("path = \"/api/{*rest}\""));
+        assert!(c.toml.contains("mode = \"static\""));
+        assert!(c.toml.contains("serve_dir = \"/srv\""));
+        assert!(c.toml.contains("spa_fallback = true"));
+    }
+
+    // ── adversarial-review regressions (draconian, one per finding) ──
+
+    #[test]
+    fn deeply_nested_blocks_error_not_stack_overflow() {
+        // F1: a pathological nest must return Err, never overflow the stack
+        // (if it overflowed, this test process would abort).
+        let src = "a {\n".repeat(500);
+        assert!(parse(&src).is_err());
+    }
+
+    #[test]
+    fn catchall_proxy_plus_file_server_does_not_double_route() {
+        // F2: a bare `handle` (catch-all proxy) + `file_server` must NOT emit two
+        // `/{*rest}` routes (matchit rejects the dup → self_validate would fail).
+        let src = "example.com {\n  handle {\n    reverse_proxy web:3000\n  }\n  root * /srv\n  file_server\n}";
+        let c = convert_str(src, &[]).expect("should convert, not internal-error");
+        assert_eq!(c.toml.matches("path = \"/{*rest}\"").count(), 1);
+        assert!(c.toml.contains("http://web:3000") && !c.toml.contains("mode = \"static\""));
+        assert!(c
+            .findings
+            .iter()
+            .any(|f| f.status == Status::Partial && f.directive == "file_server"));
+    }
+
+    #[test]
+    fn inline_header_csp_is_captured() {
+        // F3: the one-liner `header CSP "…"` form must set route.csp.
+        let src = "example.com {\n  header Content-Security-Policy \"default-src 'self'\"\n  reverse_proxy app:80\n}";
+        let c = convert_str(src, &[]).expect("convert");
+        assert!(c.toml.contains("csp = \"default-src 'self'\""));
+    }
+
+    #[test]
+    fn cert_path_containing_at_is_not_an_acme_email() {
+        // F4: a cert path with '@' must be explicit cert files, never ACME.
+        let src = "example.com {\n  reverse_proxy app:80\n  tls /etc/ssl/git@host.crt /etc/ssl/git@host.key\n}";
+        let c = convert_str(src, &[]).expect("convert");
+        assert!(c.toml.contains("cert_path = \"/etc/ssl/git@host.crt\""));
+        assert!(!c.toml.contains("[tls.acme]"));
+    }
+
+    #[test]
+    fn no_acme_without_a_real_email() {
+        // F5: `tls internal` (no e-mail anywhere) must not emit [tls.acme].
+        let src = "example.com {\n  reverse_proxy app:80\n  tls internal\n}";
+        let c = convert_str(src, &[]).expect("convert");
+        assert!(!c.toml.contains("[tls.acme]"));
+    }
+
+    #[test]
+    fn duplicate_site_addresses_are_deduped() {
+        // F6: `example.com, example.com:443` → one host, not two.
+        let src = "example.com, example.com:443 {\n  reverse_proxy app:80\n}";
+        let c = convert_str(src, &[]).expect("convert");
+        assert!(c.toml.contains("hosts = [\"example.com\"]"));
+        assert!(!c.toml.contains("\"example.com\", \"example.com\""));
+    }
+
+    #[test]
+    fn root_matcher_without_a_dir_is_not_static() {
+        // F8: `root *` (matcher, no dir) must not become serve_dir="*".
+        let src = "example.com {\n  root *\n  file_server\n}";
         match convert_str(src, &[]) {
-            Err(ConvertError::NoRoutes(f)) => assert!(f
-                .iter()
-                .any(|x| x.status == Status::Unsupported && x.directive == "file_server")),
-            other => panic!("expected NoRoutes, got {:?}", other.map(|c| c.toml)),
+            Ok(c) => assert!(!c.toml.contains("serve_dir = \"*\"")),
+            Err(ConvertError::NoRoutes(f)) => {
+                assert!(f.iter().any(|x| x.status == Status::Unsupported))
+            }
+            Err(e) => panic!("unexpected: {e:?}"),
         }
+    }
+
+    #[test]
+    fn hostless_static_site_is_flagged() {
+        // F9: a hostless static site becomes a shared cross-host fallback.
+        let src = ":443 {\n  root * /var/www\n  file_server\n}";
+        let c = convert_str(src, &[]).expect("convert");
+        assert!(c
+            .findings
+            .iter()
+            .any(|f| f.status == Status::Partial && f.directive.contains("hostless")));
     }
 
     #[test]
@@ -1332,7 +1632,7 @@ mod tests {
 
     #[test]
     fn golden_security_headers() {
-        let c = convert(&fixture("security-headers.caddy"), None, &[]).expect("convert");
+        let c = convert(&fixture("security-headers.caddy"), None, &[], None).expect("convert");
         assert!(c.toml.contains("[upstream.api]") && c.toml.contains("http://api:8000"));
         assert!(c.toml.contains("[upstream.web]") && c.toml.contains("http://web:3000"));
         assert!(c.toml.contains("path = \"/api/{*rest}\""));
@@ -1356,22 +1656,24 @@ mod tests {
     }
 
     #[test]
-    fn golden_tls_acme_is_partial() {
-        let c = convert(&fixture("tls-acme.caddy"), None, &[]).expect("convert");
+    fn golden_tls_acme_emits_acme() {
+        let c = convert(&fixture("tls-acme.caddy"), None, &[], None).expect("convert");
         assert!(c.toml.contains("http://backend:8080"));
-        assert!(c.toml.contains("hosts = [\"app.localhost\"]"));
+        assert!(c.toml.contains("hosts = [\"app.example.com\"]"));
         let tls = c
             .findings
             .iter()
-            .find(|f| f.directive == "tls")
-            .expect("tls");
-        assert_eq!(tls.status, Status::Partial);
-        assert!(tls.detail.contains("ops@example.com"));
+            .find(|f| f.directive == "tls (ACME)")
+            .expect("acme finding");
+        assert_eq!(tls.status, Status::Convert);
+        assert!(c.toml.contains("[tls.acme]"));
+        assert!(c.toml.contains("email = \"ops@example.com\""));
+        assert!(c.toml.contains("domains = [\"app.example.com\"]"));
     }
 
     #[test]
     fn golden_snippet_import() {
-        let c = convert(&fixture("snippet-import.caddy"), None, &[]).expect("convert");
+        let c = convert(&fixture("snippet-import.caddy"), None, &[], None).expect("convert");
         assert!(c.toml.contains("http://api:9000"));
         assert!(c.toml.contains("http://site:3000"));
         assert!(c.toml.contains("hosts = [\"example.com\"]"));
@@ -1383,13 +1685,16 @@ mod tests {
     }
 
     #[test]
-    fn golden_static_edge_refuses() {
-        match convert(&fixture("static-edge.caddy"), None, &[]) {
-            Err(ConvertError::NoRoutes(f)) => assert!(f
-                .iter()
-                .any(|x| x.status == Status::Unsupported && x.directive == "file_server")),
-            other => panic!("expected NoRoutes, got {:?}", other.map(|c| c.toml)),
-        }
+    fn golden_static_edge_converts() {
+        let c = convert(&fixture("static-edge.caddy"), None, &[], None)
+            .expect("static site converts to mode=static");
+        assert!(c.toml.contains("mode = \"static\""));
+        assert!(c.toml.contains("serve_dir = \"/srv/www\""));
+        // `encode` is still unsupported (Zion does not compress).
+        assert!(c
+            .findings
+            .iter()
+            .any(|f| f.status == Status::Unsupported && f.directive == "encode"));
     }
 }
 
