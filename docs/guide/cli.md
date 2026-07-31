@@ -97,25 +97,32 @@ $ zion suggest > zion.toml
 If no backend is found and no `--upstream` is given, `suggest` exits non-zero with
 a hint rather than emitting a guess.
 
-## `zion import` — migrate an nginx config
+## `zion import` — migrate an nginx, Traefik, or Caddy config
 
-`import` converts the reverse-proxy subset of an nginx config into a
-`zion.toml`, with the same guarantee as `suggest`: **the output is
-self-validated (schema + reference integrity + router build) before it is
-emitted** — never a config the daemon would reject. `include` directives are
-resolved relative to the input file (`conf.d/*.conf` globs supported).
+`import` converts a reverse-proxy config — **nginx**, **Traefik**
+(Docker-Compose labels), or **Caddy** — into a `zion.toml`, with the same
+guarantee as `suggest`: **the output is self-validated (schema + reference
+integrity + router build) before it is emitted** — never a config the daemon
+would reject. nginx `include` directives are resolved relative to the input
+file (`conf.d/*.conf` globs supported).
 
 The design principle is **honesty over completeness** (ADR-0011): every input
-directive lands in exactly one finding bucket, and anything Zion cannot
-express faithfully — regex locations, `proxy_pass` prefix rewriting, static
-file serving, per-location rate limits — becomes a loud finding plus an inline
-`# UNSUPPORTED:` annotation, never a silent guess. The converted config goes
-to stdout, the findings report to stderr, so piping stays clean.
+directive lands in exactly one finding bucket, and anything Zion cannot express
+faithfully — regex locations, path rewriting, per-location rate limits — becomes
+a loud finding plus an inline `# UNSUPPORTED:` annotation, never a silent guess.
+Static file serving (nginx `root`/`try_files`, Caddy `root`+`file_server`) now
+**converts** to `mode = "static"` (ADR-0015/0016). The converted config goes to
+stdout, the findings report to stderr, so piping stays clean.
+
+See the [Migrating to Zion](/guide/migrate) guide for the full per-front-end
+mapping, ACME emission, and static-site conversion.
 
 | Flag | Meaning |
 |---|---|
-| *(positional)* `nginx <path\|->` | source format and input (`-` = stdin) |
+| *(positional)* `<nginx\|traefik\|caddy> <path\|->` | source format and input (`-` = stdin) |
 | `-o, --output <path>` | write the converted config to a file instead of stdout |
+| `--var KEY=VALUE` | resolve a `${VAR}` in a Traefik/Caddy source (repeatable; `.env` next to the file is read too) |
+| `--acme-email <addr>` | contact address for the emitted `[tls.acme]` block when the source has none |
 | `--report <path>` | write the full findings report (stderr shows only partial/unsupported) |
 | `--strict` | exit 2 if any partial/unsupported finding exists (CI gate) |
 
