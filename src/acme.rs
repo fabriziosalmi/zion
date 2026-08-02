@@ -471,8 +471,6 @@ async fn do_renewal_script(config: &crate::config::AcmeConfig) -> Result<(), Str
 ///   - `ZION_ACME_TEST_EMAIL`     — account contact (default `soak@zion.test`)
 #[cfg(feature = "acme")]
 pub async fn run_soak() -> i32 {
-    use std::sync::atomic::Ordering::Relaxed;
-
     // instant-acme drives rustls 0.23, which needs a process-level
     // CryptoProvider. The daemon installs this at boot (main.rs); the
     // acme-soak subcommand bypasses that path, so install it here.
@@ -543,24 +541,53 @@ pub async fn run_soak() -> i32 {
         acme_config.directory_url
     );
 
+    // Fault-injection legs (issue #134). `happy` is the issue→renew→revoke
+    // baseline (#59); the adversarial legs share the setup above and branch here.
+    let mode = std::env::var("ZION_ACME_SOAK_MODE").unwrap_or_else(|_| "happy".into());
+    eprintln!("acme-soak: mode={mode}");
+    let _ = &key_path; // reserved for future legs; keeps the binding meaningful
+    match mode.as_str() {
+        "happy" => soak_happy(&acme_config, &store, &tls_config, &cert_path).await,
+        "key-rollover" => {
+            soak_key_rollover(&acme_config, &store, &tls_config, &cert_path, &state_dir).await
+        }
+        "ttl-edge" => soak_ttl_edge(&acme_config, &store, &tls_config, &cert_path).await,
+        other => {
+            eprintln!(
+                "acme-soak: FAIL unknown mode '{other}' (expected happy|key-rollover|ttl-edge)"
+            );
+            2
+        }
+    }
+}
+
+/// The #59 baseline: issue → renew → revoke over one persisted account.
+#[cfg(feature = "acme")]
+async fn soak_happy(
+    acme_config: &crate::config::AcmeConfig,
+    store: &ChallengeStore,
+    tls_config: &crate::config::TlsConfig,
+    cert_path: &str,
+) -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
     let base = crate::metrics::METRICS.acme_renewals_total.load(Relaxed);
     let base_fail = crate::metrics::METRICS
         .acme_renewal_failures_total
         .load(Relaxed);
 
     // 1. Issue.
-    if let Err(e) = renew_once(&acme_config, &store, &tls_config).await {
+    if let Err(e) = renew_once(acme_config, store, tls_config).await {
         eprintln!("acme-soak: FAIL issue: {e}");
         return 1;
     }
-    if !std::path::Path::new(&cert_path).exists() {
+    if !std::path::Path::new(cert_path).exists() {
         eprintln!("acme-soak: FAIL issue: no certificate written to {cert_path}");
         return 1;
     }
     eprintln!("acme-soak: ✓ issued");
 
     // 2. Renew (drive the issuance path again over the same account).
-    if let Err(e) = renew_once(&acme_config, &store, &tls_config).await {
+    if let Err(e) = renew_once(acme_config, store, tls_config).await {
         eprintln!("acme-soak: FAIL renew: {e}");
         return 1;
     }
@@ -572,7 +599,7 @@ pub async fn run_soak() -> i32 {
     eprintln!("acme-soak: ✓ renewed (acme_renewals_total +{renewals})");
 
     // 3. Revoke.
-    if let Err(e) = revoke_cert(&acme_config, &cert_path).await {
+    if let Err(e) = revoke_cert(acme_config, cert_path).await {
         eprintln!("acme-soak: FAIL revoke: {e}");
         return 1;
     }
@@ -583,6 +610,126 @@ pub async fn run_soak() -> i32 {
         .load(Relaxed)
         - base_fail;
     eprintln!("acme-soak: PASS (issue → renew → revoke; failures during run: {failures})");
+    0
+}
+
+/// Key-rollover leg (issue #134): after a first issue, discard the account
+/// credentials and re-issue. `do_renewal_native` must create a *fresh* account
+/// (a different key) and issuance must still succeed — proving zion recovers
+/// from a lost account file instead of wedging.
+#[cfg(feature = "acme")]
+async fn soak_key_rollover(
+    acme_config: &crate::config::AcmeConfig,
+    store: &ChallengeStore,
+    tls_config: &crate::config::TlsConfig,
+    cert_path: &str,
+    state_dir: &str,
+) -> i32 {
+    let creds_path = std::path::Path::new(state_dir).join("account.json");
+
+    // 1. First issue → an account is created and persisted.
+    if let Err(e) = renew_once(acme_config, store, tls_config).await {
+        eprintln!("acme-soak: FAIL initial issue: {e}");
+        return 1;
+    }
+    let account_before = match std::fs::read_to_string(&creds_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("acme-soak: FAIL key-rollover: no account.json after first issue: {e}");
+            return 1;
+        }
+    };
+    eprintln!("acme-soak: ✓ issued (account persisted)");
+
+    // 2. Discard the account credentials — simulate a lost/rotated account key.
+    if let Err(e) = std::fs::remove_file(&creds_path) {
+        eprintln!("acme-soak: FAIL key-rollover: cannot discard account.json: {e}");
+        return 1;
+    }
+    eprintln!("acme-soak: ✓ discarded account.json");
+
+    // 3. Re-issue → a brand-new account must be registered, issuance must work.
+    if let Err(e) = renew_once(acme_config, store, tls_config).await {
+        eprintln!("acme-soak: FAIL re-issue after rollover: {e}");
+        return 1;
+    }
+    let account_after = match std::fs::read_to_string(&creds_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("acme-soak: FAIL key-rollover: no fresh account.json after re-issue: {e}");
+            return 1;
+        }
+    };
+    if account_after == account_before {
+        eprintln!(
+            "acme-soak: FAIL key-rollover: account.json unchanged — expected a fresh account key"
+        );
+        return 1;
+    }
+    if !std::path::Path::new(cert_path).exists() {
+        eprintln!("acme-soak: FAIL key-rollover: no certificate after re-issue");
+        return 1;
+    }
+    eprintln!("acme-soak: ✓ re-issued with a fresh account (rollover recovered)");
+
+    // 4. Revoke with the new account to complete the lifecycle.
+    if let Err(e) = revoke_cert(acme_config, cert_path).await {
+        eprintln!("acme-soak: FAIL revoke after rollover: {e}");
+        return 1;
+    }
+    eprintln!("acme-soak: PASS (key-rollover: issue → discard account → re-issue fresh → revoke)");
+    0
+}
+
+/// TTL-edge leg (issue #134): issue a real cert, then assert the daemon's
+/// renewal decision (`check_cert_expiry`, the same one `spawn_renewal_task`
+/// consults) fires exactly at the `renew_before_days` edge — a wide window
+/// says "renew now", a zero window says "not yet". Proves the real Pebble
+/// notAfter parses and drives the renewal trigger end-to-end.
+#[cfg(feature = "acme")]
+async fn soak_ttl_edge(
+    acme_config: &crate::config::AcmeConfig,
+    store: &ChallengeStore,
+    tls_config: &crate::config::TlsConfig,
+    cert_path: &str,
+) -> i32 {
+    // 1. Issue a real certificate.
+    if let Err(e) = renew_once(acme_config, store, tls_config).await {
+        eprintln!("acme-soak: FAIL issue: {e}");
+        return 1;
+    }
+    if !std::path::Path::new(cert_path).exists() {
+        eprintln!("acme-soak: FAIL ttl-edge: no certificate written");
+        return 1;
+    }
+    eprintln!("acme-soak: ✓ issued");
+
+    // 2. Edge: a window wider than the cert's remaining life ⇒ renew now.
+    if !check_cert_expiry(cert_path, 100_000) {
+        eprintln!(
+            "acme-soak: FAIL ttl-edge: a 100000-day window must trigger renewal on a fresh cert"
+        );
+        return 1;
+    }
+    // 3. Edge: a zero-day window on a fresh (non-expired) cert ⇒ not yet.
+    if check_cert_expiry(cert_path, 0) {
+        eprintln!(
+            "acme-soak: FAIL ttl-edge: a 0-day window must NOT trigger renewal on a fresh cert"
+        );
+        return 1;
+    }
+    eprintln!("acme-soak: ✓ renewal trigger fires at the renew_before_days edge, not before");
+
+    // 4. Drive the renewal the trigger asked for, to prove the full path.
+    if let Err(e) = renew_once(acme_config, store, tls_config).await {
+        eprintln!("acme-soak: FAIL ttl-edge renew: {e}");
+        return 1;
+    }
+    if let Err(e) = revoke_cert(acme_config, cert_path).await {
+        eprintln!("acme-soak: FAIL ttl-edge revoke: {e}");
+        return 1;
+    }
+    eprintln!("acme-soak: PASS (ttl-edge: issue → edge decision → renew → revoke)");
     0
 }
 

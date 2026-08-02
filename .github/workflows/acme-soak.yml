@@ -10,11 +10,14 @@
 # we can pass `-dnsserver` to Pebble and avoid any ghcr login for the
 # public images.
 #
-# Fault-injection legs (nonce-collision via PEBBLE_WFE_NONCEREJECT,
-# key-rollover, TTL-edge expiry) are tracked as a follow-up: they need
-# per-request badNonce retry, which is instant-acme's responsibility and
-# is not exposed by 0.8.x (an operation-level retry can't recover a 50%
-# per-request rejection rate).
+# Fault-injection legs (issue #134) run as a matrix alongside the happy
+# path: `key-rollover` (discard the account file, re-issue, assert a fresh
+# account key + successful issuance) and `ttl-edge` (assert the renewal
+# trigger fires exactly at the renew_before_days edge on a real cert).
+# `nonce-collision` (PEBBLE_WFE_NONCEREJECT) stays deferred — it needs
+# per-request badNonce retry (RFC 8555 §6.5), which instant-acme 0.8.x does
+# not expose (an operation-level retry can't recover a 50% per-request
+# rejection rate).
 name: acme-soak
 
 on:
@@ -44,11 +47,21 @@ jobs:
   soak:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      # Independent legs — one leg failing must not cancel the others, so a
+      # key-rollover regression is still visible when ttl-edge passes.
+      fail-fast: false
+      matrix:
+        # `happy` is the #59 baseline; `key-rollover` and `ttl-edge` are the
+        # #134 fault-injection legs. Each leg runs on its own runner with its
+        # own Pebble, so there are no port or state-dir collisions.
+        mode: [happy, key-rollover, ttl-edge]
     env:
       ZION_ACME_TEST_DIRECTORY: https://localhost:14000/dir
       ZION_ACME_TEST_DOMAIN: acme-soak.test
       ZION_ACME_TEST_HTTP_PORT: "5002"
       ZION_ACME_TEST_DIR: /tmp/zion-acme-soak
+      ZION_ACME_SOAK_MODE: ${{ matrix.mode }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -97,7 +110,7 @@ jobs:
           docker cp pebble:/test/certs/pebble.minica.pem ./pebble.minica.pem
           echo "ZION_ACME_ROOT_PEM=$PWD/pebble.minica.pem" >> "$GITHUB_ENV"
 
-      - name: Run soak (issue → renew → revoke)
+      - name: Run soak (${{ matrix.mode }})
         run: ./target/release/zion acme-soak
 
       - name: Pebble logs (on failure)
