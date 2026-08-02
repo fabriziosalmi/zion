@@ -30,6 +30,7 @@ defined in [0000-template.md](0000-template.md).
 | 0017  | [Audit-log rotation with per-segment chain re-anchoring](0017-audit-log-rotation.md) | accepted |
 | 0018  | [Cache origin-side revalidation (RFC 9111 §4.3)](0018-cache-origin-revalidation.md) | accepted |
 | 0019  | [Static file conditional GET (ETag / Last-Modified → 304)](0019-static-conditional-get.md) | accepted |
+| 0020  | [Static file range requests (206 Partial Content)](0020-static-range-requests.md) | accepted |
 
 ## When to write a new ADR
 

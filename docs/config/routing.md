@@ -92,7 +92,7 @@ Host routing is **opt-in and zero-cost when unused**: with no `hosts` anywhere, 
 | `standard` | Standard reverse proxy with connection pooling |
 | `sse_stream` | Adds `Cache-Control: no-cache` and `X-Accel-Buffering: no` to response |
 | `static_cache` | Serves from in-memory cache on hit; fetches and caches on miss |
-| `static` | Serves files from disk under `serve_dir` (no upstream) behind a hardened path-safety core; GET/HEAD only. Emits a weak `ETag` + `Last-Modified` and answers `If-None-Match` / `If-Modified-Since` with **304 Not Modified**. `spa_fallback = true` serves `index.html` for an unmatched path. See [ADR-0015](/adr/0015-route-mode-static) / [ADR-0019](/adr/0019-static-conditional-get). |
+| `static` | Serves files from disk under `serve_dir` (no upstream) behind a hardened path-safety core; GET/HEAD only. Emits a weak `ETag` + `Last-Modified` and answers `If-None-Match` / `If-Modified-Since` with **304 Not Modified**; supports byte-range requests (`206 Partial Content` + `Accept-Ranges: bytes`, `416` when unsatisfiable). `spa_fallback = true` serves `index.html` for an unmatched path. See [ADR-0015](/adr/0015-route-mode-static) / [ADR-0019](/adr/0019-static-conditional-get) / [ADR-0020](/adr/0020-static-range-requests). |
 | `websocket` | Explicit WebSocket mode (also auto-detected via `Upgrade: websocket` header on any route) |
 
 ## Upstream resolution
