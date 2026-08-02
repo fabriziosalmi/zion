@@ -202,6 +202,8 @@ enabled = true
 path = "/var/log/zion/audit.jsonl"
 key_env = "ZION_AUDIT_HMAC_KEY"   # default; the secret never lives in zion.toml
 queue_depth = 4096                # bounded mpsc — events overflow ⇒ dropped + counted
+max_size_mb = 100                 # rotate the active segment at this size; null/0 ⇒ unbounded
+max_files   = 10                  # rotated segments to keep (oldest pruned first); 0 ⇒ keep all
 
 [redact]
 headers      = ["authorization", "cookie", "x-api-key"]
@@ -209,6 +211,12 @@ query_params = ["token", "api_key", "session"]
 ```
 
 The HMAC key is taken from the named environment variable. RFC 2104 recommends ≥ 32 bytes for HMAC-SHA256; shorter keys are accepted but Zion logs a warning at boot.
+
+### Rotation and disk usage
+
+The log is append-only, so it would grow without bound if left uncapped. By default the active segment **rotates** once it reaches `max_size_mb` (100 MB): the file is sealed as `audit.jsonl.<timestamp>` and a fresh segment is opened, so the on-disk ceiling is `max_size_mb × (max_files + 1)` — about **1.1 GB** with the defaults. The oldest rotated segments are pruned first; set `max_files = 0` to keep them all and manage retention out-of-band (e.g. shipping segments to cold storage), or `max_size_mb = 0` to disable rotation entirely (the pre-v0.7 behavior — then **watch disk usage yourself**).
+
+Each segment **re-anchors the HMAC chain at genesis** and opens with a `chain_rotate` marker (a `chain_init` marker for the first segment / a process restart), so every segment verifies independently — the same tamper-evidence model already used across restarts. To verify a full history, concatenate the segments in timestamp order before running the [verifier](#verification). A rotation that cannot rename (e.g. a read-only directory) is logged once and the writer continues on the current segment rather than dropping events — monitor the daemon log for `audit log rotation failed`.
 
 ### Wire format
 
@@ -218,7 +226,7 @@ One JSON object per line. Fields:
 |---|---|---|
 | `seq` | u64 | Monotonic within a process. Resets on restart. |
 | `ts` | string | RFC 3339 / ISO 8601 with microsecond precision. |
-| `kind` | string | `chain_init`, `auth_success`, `auth_failure`, `request_blocked`, `config_reload`, `admin_access`, `panic`. |
+| `kind` | string | `chain_init`, `chain_rotate` (segment boundary after rotation), `auth_success`, `auth_failure`, `request_blocked`, `config_reload`, `admin_access`, `panic`. |
 | `trace_id` | string | Optional. 32-char hex. |
 | `remote_ip`, `method`, `path`, `detail` | string | Optional. `path`'s query string is redacted per `[redact.query_params]`. |
 | `prev_hash` | string | 64-char hex. The HMAC of the previous record (or the genesis tag for `seq=0`). |

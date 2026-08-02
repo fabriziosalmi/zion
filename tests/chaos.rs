@@ -34,6 +34,7 @@ async fn audit_queue_overflow_drops_excess_events() {
         path: Some(path.to_string_lossy().into_owned()),
         key_env: "ZION_TEST_OVERFLOW_KEY".into(),
         queue_depth: 4,
+        ..Default::default()
     };
     let h = spawn_writer(&cfg);
 
@@ -104,6 +105,7 @@ async fn audit_writer_survives_burst_then_drains() {
         path: Some(path.to_string_lossy().into_owned()),
         key_env: "ZION_TEST_DRAIN_KEY".into(),
         queue_depth: 64,
+        ..Default::default()
     };
     let h = spawn_writer(&cfg);
 

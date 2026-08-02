@@ -54,6 +54,19 @@ pub struct AuditConfig {
     /// Pick a number large enough to absorb a fsync stall.
     #[serde(default = "default_queue_depth")]
     pub queue_depth: usize,
+    /// Rotate the active segment once it reaches this many megabytes. `None`
+    /// (or `0`) disables rotation — the log grows unbounded, the pre-rotation
+    /// behavior. Default 100 MB. The HMAC chain re-anchors at genesis in the
+    /// fresh segment (a `chain_rotate` marker records the boundary), so every
+    /// segment verifies independently — the same tamper-evidence model already
+    /// used at process restart.
+    #[serde(default = "default_max_size_mb")]
+    pub max_size_mb: Option<u64>,
+    /// How many rotated segments to keep on disk; the oldest are pruned first.
+    /// `0` keeps them all (operator manages retention out-of-band). Default 10,
+    /// so the on-disk ceiling is `max_size_mb * (max_files + 1)`.
+    #[serde(default = "default_max_files")]
+    pub max_files: usize,
 }
 
 fn default_key_env() -> String {
@@ -62,6 +75,14 @@ fn default_key_env() -> String {
 
 fn default_queue_depth() -> usize {
     4096
+}
+
+fn default_max_size_mb() -> Option<u64> {
+    Some(100)
+}
+
+fn default_max_files() -> usize {
+    10
 }
 
 /// `[redact]` block. Lists are case-insensitive. Empty = no redaction.
@@ -396,7 +417,13 @@ pub fn spawn_writer(cfg: &AuditConfig) -> AuditHandle {
     let key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
     let (tx, rx) = tokio::sync::mpsc::channel::<AuditEvent>(cfg.queue_depth);
 
-    tokio::spawn(writer_loop(path, key, rx));
+    // `max_size_mb = None` or `0` disables rotation (unbounded); otherwise the
+    // active segment rotates once it crosses the byte cap.
+    let max_size_bytes = cfg
+        .max_size_mb
+        .filter(|&mb| mb > 0)
+        .map(|mb| mb.saturating_mul(1024 * 1024));
+    tokio::spawn(writer_loop(path, key, rx, max_size_bytes, cfg.max_files));
 
     AuditHandle { inner: Some(tx) }
 }
@@ -405,63 +432,34 @@ async fn writer_loop(
     path: String,
     key: hmac::Key,
     mut rx: tokio::sync::mpsc::Receiver<AuditEvent>,
+    max_size_bytes: Option<u64>,
+    max_files: usize,
 ) {
     use tokio::io::AsyncWriteExt;
 
-    let file = match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await
-    {
-        Ok(f) => f,
-        Err(e) => {
-            crate::logging::error(
-                "audit",
-                &format!("cannot open audit log {path}: {e} — events will be dropped"),
-            );
-            return;
-        }
+    // Open the initial segment and anchor the chain. Mirrors the process-restart
+    // model: a fresh chain from genesis + a boundary marker (we never continue
+    // from an on-disk tail — that would mean trusting an unverified value).
+    let Some((mut file, mut prev_hash, mut bytes_written)) = open_and_anchor(
+        &path,
+        &key,
+        "chain_init",
+        "audit chain initialized at process start",
+    )
+    .await
+    else {
+        return; // fatal open error already logged
     };
-    let mut file = tokio::io::BufWriter::new(file);
-
-    // Bootstrap the chain. If the file already has content we don't try to
-    // continue from its tail — that would require trusting the on-disk
-    // value, which defeats tamper-evidence. Instead, every process restart
-    // starts a fresh chain anchored at the genesis tag and a `kind=
-    // chain_init` marker so verifiers can detect the boundary.
-    let mut prev_hash = genesis_hash(&key);
-    let init = AuditEvent {
-        seq: 0,
-        ts: now_iso8601(),
-        kind: "chain_init",
-        trace_id: None,
-        remote_ip: None,
-        method: None,
-        path: None,
-        detail: Some(format!(
-            "audit chain initialized at process start; genesis={}",
-            &prev_hash[..16]
-        )),
-    };
-    if let Ok((signed, new_prev)) = sign_event(&key, init, prev_hash.clone()) {
-        if let Ok(mut line) = serde_json::to_string(&signed) {
-            line.push('\n'); // one all-or-nothing record write (no orphaned line)
-            if file.write_all(line.as_bytes()).await.is_err() || file.flush().await.is_err() {
-                crate::logging::error(
-                    "audit",
-                    "audit chain-init write/flush failed — the on-disk log may be unreliable",
-                );
-            } else {
-                prev_hash = new_prev;
-            }
-        }
-    }
 
     let mut seq: u64 = 1;
     // Tracks whether flush is currently failing, so we log the degraded↔healthy
     // transition once instead of per-event.
     let mut flush_degraded = false;
+    // Once rotation becomes impossible (rename keeps failing), stop attempting
+    // it so the writer degrades to unbounded-with-a-warning instead of spinning
+    // (re-anchor → still over cap → rename fails → repeat).
+    let mut rotation_disabled = max_size_bytes.is_none();
+
     while let Some(mut event) = rx.recv().await {
         event.seq = seq;
         if event.ts.is_empty() {
@@ -482,6 +480,7 @@ async fn writer_loop(
                     }
                     prev_hash = new_prev;
                     seq += 1;
+                    bytes_written += line.len() as u64;
                     // Flush each event — durability over throughput. A flush
                     // failure (transient ENOSPC, slow network FS) does NOT kill
                     // the writer: the record stays buffered and a later flush
@@ -514,9 +513,203 @@ async fn writer_loop(
                 continue;
             }
         }
+
+        // Size-based rotation (RFC-agnostic disk hygiene, issue #288). Once the
+        // active segment crosses the cap, seal it and re-anchor into a fresh
+        // one. A rotation failure degrades to unbounded (logged once) rather
+        // than killing the writer or spinning on a rename that keeps failing.
+        if !rotation_disabled {
+            if let Some(max) = max_size_bytes {
+                if bytes_written >= max {
+                    let _ = file.flush().await;
+                    let _ = file.shutdown().await;
+                    match rotate_paths(&path, max_files).await {
+                        Ok(rotated_to) => match open_and_anchor(
+                            &path,
+                            &key,
+                            "chain_rotate",
+                            &format!("audit chain re-anchored after size rotation → {rotated_to}"),
+                        )
+                        .await
+                        {
+                            Some((f, ph, bw)) => {
+                                file = f;
+                                prev_hash = ph;
+                                bytes_written = bw;
+                                seq = 1;
+                                crate::logging::info(
+                                    "audit",
+                                    &format!("audit log rotated → {rotated_to}"),
+                                );
+                            }
+                            None => {
+                                crate::logging::error(
+                                    "audit",
+                                    "cannot reopen audit log after rotation — exiting writer",
+                                );
+                                return;
+                            }
+                        },
+                        Err(e) => {
+                            crate::logging::warn(
+                                "audit",
+                                &format!("audit log rotation failed ({e}) — continuing unbounded on the current segment; check the directory's permissions/disk"),
+                            );
+                            // The original file is still at `path` (rename
+                            // failed); reopen it so events keep flowing.
+                            match open_and_anchor(
+                                &path,
+                                &key,
+                                "chain_init",
+                                "audit chain re-anchored (rotation failed; resuming on the current segment)",
+                            )
+                            .await
+                            {
+                                Some((f, ph, bw)) => {
+                                    file = f;
+                                    prev_hash = ph;
+                                    bytes_written = bw;
+                                    seq = 1;
+                                }
+                                None => return,
+                            }
+                            rotation_disabled = true;
+                        }
+                    }
+                }
+            }
+        }
     }
     if file.flush().await.is_err() {
         crate::logging::warn("audit", "final audit log flush failed on writer shutdown");
+    }
+}
+
+/// Open (create + append) the segment at `path` and write a re-anchor marker so
+/// verifiers see the boundary — the same fresh-chain-from-genesis model used at
+/// process restart. Returns `(writer, chain_head_hash, current_segment_bytes)`,
+/// or `None` on a fatal open error (already logged). If the marker itself can't
+/// be written, the writer is still returned with the chain head at genesis
+/// (matching the pre-rotation degraded behavior).
+async fn open_and_anchor(
+    path: &str,
+    key: &hmac::Key,
+    kind: &'static str,
+    context: &str,
+) -> Option<(tokio::io::BufWriter<tokio::fs::File>, String, u64)> {
+    use tokio::io::AsyncWriteExt;
+
+    let file = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            crate::logging::error(
+                "audit",
+                &format!("cannot open audit log {path}: {e} — events will be dropped"),
+            );
+            return None;
+        }
+    };
+    // A pre-existing file (a restart onto an old segment) already carries bytes;
+    // count them so rotation still fires on schedule instead of never.
+    let existing = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let mut file = tokio::io::BufWriter::new(file);
+
+    let genesis = genesis_hash(key);
+    let init = AuditEvent {
+        seq: 0,
+        ts: now_iso8601(),
+        kind,
+        trace_id: None,
+        remote_ip: None,
+        method: None,
+        path: None,
+        detail: Some(format!("{context}; genesis={}", &genesis[..16])),
+    };
+    let mut head = genesis.clone();
+    let mut bytes = existing;
+    if let Ok((signed, new_prev)) = sign_event(key, init, genesis) {
+        if let Ok(mut line) = serde_json::to_string(&signed) {
+            line.push('\n'); // one all-or-nothing record write (no orphaned line)
+            if file.write_all(line.as_bytes()).await.is_ok() && file.flush().await.is_ok() {
+                head = new_prev;
+                bytes += line.len() as u64;
+            } else {
+                crate::logging::error(
+                    "audit",
+                    "audit chain-anchor write/flush failed — the on-disk log may be unreliable",
+                );
+            }
+        }
+    }
+    Some((file, head, bytes))
+}
+
+/// Seal the active segment: rename `path` → `path.<epoch_nanos>` (with a numeric
+/// suffix on the astronomically-unlikely collision) and prune the oldest rotated
+/// segments beyond `max_files`. The caller must have flushed + closed `path`.
+async fn rotate_paths(path: &str, max_files: usize) -> std::io::Result<String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut rotated = format!("{path}.{stamp}");
+    let mut n: u32 = 0;
+    while tokio::fs::try_exists(&rotated).await.unwrap_or(false) {
+        n += 1;
+        rotated = format!("{path}.{stamp}.{n}");
+    }
+    tokio::fs::rename(path, &rotated).await?;
+    prune_old_segments(path, max_files).await;
+    Ok(rotated)
+}
+
+/// Delete the oldest rotated segments so at most `max_files` remain (`0` keeps
+/// them all). A rotated segment is any sibling named `<basename>.<suffix>`;
+/// ordering is by modification time so it is robust to the suffix format. Prune
+/// failures are non-fatal — retention is best-effort, never a reason to drop an
+/// audit event.
+async fn prune_old_segments(path: &str, max_files: usize) {
+    if max_files == 0 {
+        return;
+    }
+    let p = std::path::Path::new(path);
+    let (dir, base) = match (p.parent(), p.file_name().and_then(|n| n.to_str())) {
+        (Some(d), Some(b)) => (d.to_path_buf(), b.to_string()),
+        _ => return,
+    };
+    let prefix = format!("{base}.");
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut segments: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // A rotated segment is `<base>.<suffix>`; the active `<base>` has no
+        // trailing dot and is excluded by the prefix test.
+        if name.starts_with(&prefix) {
+            let mtime = entry
+                .metadata()
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            segments.push((mtime, entry.path()));
+        }
+    }
+    if segments.len() <= max_files {
+        return;
+    }
+    segments.sort_by_key(|(t, _)| *t); // oldest first
+    let remove_n = segments.len() - max_files;
+    for (_, seg) in segments.into_iter().take(remove_n) {
+        let _ = tokio::fs::remove_file(&seg).await;
     }
 }
 
@@ -704,6 +897,7 @@ mod tests {
             path: Some(path.to_string_lossy().into_owned()),
             key_env: "ZION_TEST_AUDIT_KEY".into(),
             queue_depth: 16,
+            ..Default::default()
         };
         let h = spawn_writer(&cfg);
         assert!(h.emit(AuditEvent {
@@ -744,14 +938,179 @@ mod tests {
         panic!("writer did not emit two lines within 1s");
     }
 
+    // ── Rotation (issue #288) ────────────────────────────────────────────
+    // Drive `writer_loop` directly with a tiny *byte* cap (spawn_writer's
+    // MB→bytes conversion is bypassed) so rotation fires in a handful of
+    // events — deterministic and fast.
+
+    async fn run_writer(
+        dir: &std::path::Path,
+        max_bytes: Option<u64>,
+        max_files: usize,
+        n_events: usize,
+    ) -> std::path::PathBuf {
+        let path = dir.join("audit.log");
+        let key = hmac::Key::new(hmac::HMAC_SHA256, b"this-is-a-32-byte-test-secret!ab");
+        let (tx, rx) = tokio::sync::mpsc::channel::<AuditEvent>(256);
+        let jh = tokio::spawn(writer_loop(
+            path.to_string_lossy().into_owned(),
+            key,
+            rx,
+            max_bytes,
+            max_files,
+        ));
+        for i in 0..n_events {
+            tx.send(AuditEvent {
+                seq: 0,
+                ts: String::new(),
+                kind: "auth_success",
+                trace_id: None,
+                remote_ip: Some("10.0.0.5".into()),
+                method: None,
+                path: None,
+                detail: Some(format!(
+                    "event-{i}-with-padding-so-the-line-crosses-the-tiny-cap"
+                )),
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx); // close the channel → writer drains, final-flushes, and exits
+        jh.await.unwrap();
+        path
+    }
+
+    /// Rotated siblings only (`audit.log.<suffix>`); the active `audit.log` has
+    /// no trailing dot and is excluded.
+    fn rotated_segments(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("audit.log."))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    fn json_lines(p: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(p)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn rotation_seals_the_active_segment_at_the_byte_cap() {
+        let dir = tempdir();
+        let path = run_writer(&dir, Some(600), 10, 40).await;
+        assert!(
+            !rotated_segments(&dir).is_empty(),
+            "crossing the cap 40 times must produce rotated segments"
+        );
+        // The active segment stays bounded (cap + at most one over-cap event),
+        // not unbounded.
+        let active = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            active < 600 + 512,
+            "active segment is {active} bytes — should hover near the 600B cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_itself_loses_no_events() {
+        let dir = tempdir();
+        // max_files=0 → keep every segment, so this isolates rotation from
+        // pruning: crossing a segment boundary must never drop an event.
+        // (Pruning deliberately deletes old segments — covered separately.)
+        let path = run_writer(&dir, Some(500), 0, 50).await;
+        let mut files = rotated_segments(&dir);
+        files.push(path);
+        let total: usize = files
+            .iter()
+            .map(|f| {
+                std::fs::read_to_string(f)
+                    .unwrap()
+                    .lines()
+                    .filter(|l| l.contains(r#""kind":"auth_success""#))
+                    .count()
+            })
+            .sum();
+        assert_eq!(
+            total, 50,
+            "every event must survive rotation across segments"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_prunes_beyond_max_files() {
+        let dir = tempdir();
+        // cap=300B, keep only 2 rotated segments; 60 events → many rotations.
+        let _ = run_writer(&dir, Some(300), 2, 60).await;
+        let rotated = rotated_segments(&dir);
+        assert!(
+            !rotated.is_empty() && rotated.len() <= 2,
+            "max_files=2 must cap retained segments; got {}",
+            rotated.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn each_segment_reanchors_and_links_internally() {
+        let dir = tempdir();
+        let path = run_writer(&dir, Some(500), 10, 40).await;
+        let mut files = rotated_segments(&dir);
+        files.push(path);
+        for f in &files {
+            let lines = json_lines(f);
+            assert!(!lines.is_empty(), "no empty segments");
+            // Every segment opens with a re-anchor marker.
+            let k0 = lines[0]["kind"].as_str().unwrap();
+            assert!(
+                k0 == "chain_init" || k0 == "chain_rotate",
+                "segment {f:?} must open with a re-anchor marker, got {k0}"
+            );
+            // The chain links within the segment: each prev_hash == the prior hmac.
+            for w in lines.windows(2) {
+                assert_eq!(
+                    w[1]["prev_hash"].as_str().unwrap(),
+                    w[0]["hmac"].as_str().unwrap(),
+                    "chain must link line-to-line within a segment"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_rotation_when_the_cap_is_disabled() {
+        let dir = tempdir();
+        let path = run_writer(&dir, None, 10, 50).await;
+        assert!(
+            rotated_segments(&dir).is_empty(),
+            "max_size=None must never rotate"
+        );
+        // chain_init + 50 events, all in one segment.
+        assert_eq!(json_lines(&path).len(), 51);
+    }
+
     fn tempdir() -> std::path::PathBuf {
+        // A process-wide counter makes this collision-proof across the parallel
+        // `#[tokio::test]`s — nanos alone can repeat when two tests start within
+        // the clock's resolution, and a shared dir cross-contaminates line counts.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "zion-audit-test-{}",
+            "zion-audit-test-{}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            CTR.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
