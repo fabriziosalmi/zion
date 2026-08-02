@@ -163,11 +163,13 @@ fn stream_file(mut file: tokio::fs::File, limit: Option<u64>) -> ZionBody {
 }
 
 /// Serve `tail` from `root`. `method` gates to GET/HEAD; `spa_fallback` serves
-/// the root `index.html` for a miss (single-page apps).
+/// the root `index.html` for a miss (single-page apps); `precompressed` opts the
+/// route into `.br`/`.gz` sidecar content-negotiation.
 pub async fn serve(
     root: &Path,
     tail: &str,
     spa_fallback: bool,
+    precompressed: bool,
     method: &Method,
     req_headers: &HeaderMap,
 ) -> Response<ZionBody> {
@@ -184,14 +186,121 @@ pub async fn serve(
     };
 
     if let Some(path) = resolve_file(&canon_root, &rel).await {
-        return read_file(&path, method, req_headers).await;
+        return serve_resolved(&canon_root, &path, precompressed, method, req_headers).await;
     }
     if spa_fallback {
         if let Some(index) = resolve_file(&canon_root, Path::new("index.html")).await {
-            return read_file(&index, method, req_headers).await;
+            return serve_resolved(&canon_root, &index, precompressed, method, req_headers).await;
         }
     }
     resp(StatusCode::NOT_FOUND)
+}
+
+/// Serve an already-resolved file, applying precompressed-sidecar negotiation
+/// when the route enabled it. When `precompressed` is on and the client accepts a
+/// coding we have a sidecar for, the sidecar's *bytes* are served with the
+/// original file's `Content-Type`, plus `Content-Encoding` and `Vary:
+/// Accept-Encoding`; otherwise the identity file is served (still `Vary`, so a
+/// shared cache keys on `Accept-Encoding`). Brotli is preferred over gzip.
+async fn serve_resolved(
+    canon_root: &Path,
+    path: &Path,
+    precompressed: bool,
+    method: &Method,
+    req_headers: &HeaderMap,
+) -> Response<ZionBody> {
+    let mime = mime_for(path);
+    if precompressed {
+        if let Some(ae) = req_headers
+            .get(hyper::header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+        {
+            // Preference order: Brotli (better ratio) before gzip.
+            for (coding, ext) in [("br", "br"), ("gzip", "gz")] {
+                if accepts(ae, coding) {
+                    if let Some(side) = resolve_sidecar(canon_root, path, ext).await {
+                        let mut resp = read_file(&side, mime, method, req_headers).await;
+                        apply_negotiation_headers(&mut resp, Some(coding));
+                        return resp;
+                    }
+                }
+            }
+        }
+        // A precompressed route that serves identity must still advertise Vary.
+        let mut resp = read_file(path, mime, method, req_headers).await;
+        apply_negotiation_headers(&mut resp, None);
+        return resp;
+    }
+    read_file(path, mime, method, req_headers).await
+}
+
+/// Resolve the precompressed sidecar `<path>.<ext>`, applying the SAME
+/// canonicalize-under-root symlink guard as [`resolve_file`] — a sidecar that is
+/// a symlink out of the tree must never be served. `None` unless it exists as a
+/// regular file inside the root.
+async fn resolve_sidecar(canon_root: &Path, path: &Path, ext: &str) -> Option<PathBuf> {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(".");
+    os.push(ext);
+    let canon = tokio::fs::canonicalize(PathBuf::from(os)).await.ok()?;
+    if !canon.starts_with(canon_root) {
+        return None; // a symlink (or race) escaped the tree
+    }
+    if tokio::fs::metadata(&canon).await.ok()?.is_file() {
+        Some(canon)
+    } else {
+        None
+    }
+}
+
+/// Is `coding` acceptable per an `Accept-Encoding` value (RFC 9110 §12.5.3)? An
+/// **explicit** entry for the coding governs and overrides the wildcard — so
+/// `br;q=0` refuses Brotli even alongside `*;q=1`. Only when the coding is not
+/// listed explicitly does a `*` entry's q-value decide. A tiny parser: enough for
+/// static-asset negotiation, not a full preference ranking.
+fn accepts(accept_encoding: &str, coding: &str) -> bool {
+    let mut wildcard: Option<f32> = None;
+    for part in accept_encoding.split(',') {
+        let part = part.trim();
+        let (name, q) = match part.split_once(';') {
+            Some((n, params)) => (n.trim(), parse_q(params)),
+            None => (part, 1.0),
+        };
+        if name.eq_ignore_ascii_case(coding) {
+            return q > 0.0; // explicit entry wins, wildcard notwithstanding
+        }
+        if name == "*" {
+            wildcard = Some(q);
+        }
+    }
+    wildcard.is_some_and(|q| q > 0.0)
+}
+
+/// Extract the `q=` weight from `Accept-Encoding` element params (default 1.0).
+fn parse_q(params: &str) -> f32 {
+    for p in params.split(';') {
+        if let Some(v) = p.trim().strip_prefix("q=") {
+            return v.trim().parse().unwrap_or(1.0);
+        }
+    }
+    1.0
+}
+
+/// Stamp the content-negotiation headers on a static response: always `Vary:
+/// Accept-Encoding` (the route negotiates), plus `Content-Encoding` when a
+/// precompressed variant is what we served.
+fn apply_negotiation_headers(resp: &mut Response<ZionBody>, encoding: Option<&'static str>) {
+    let h = resp.headers_mut();
+    h.insert(
+        hyper::header::VARY,
+        HeaderValue::from_static("Accept-Encoding"),
+    );
+    if let Some(enc) = encoding {
+        h.insert(
+            hyper::header::CONTENT_ENCODING,
+            HeaderValue::from_static(enc),
+        );
+    }
 }
 
 /// Resolve `rel` under `canon_root` to an existing regular file, staying inside
@@ -219,13 +328,19 @@ async fn resolve_file(canon_root: &Path, rel: &Path) -> Option<PathBuf> {
     }
 }
 
-async fn read_file(path: &Path, method: &Method, req_headers: &HeaderMap) -> Response<ZionBody> {
+/// Serve `path`'s bytes with the given `mime` as the `Content-Type` (the caller
+/// passes the *original* file's type, so a precompressed sidecar keeps it).
+async fn read_file(
+    path: &Path,
+    mime: &'static str,
+    method: &Method,
+    req_headers: &HeaderMap,
+) -> Response<ZionBody> {
     let meta = match tokio::fs::metadata(path).await {
         Ok(m) => m,
         Err(_) => return resp(StatusCode::NOT_FOUND),
     };
     let (etag, last_modified) = validators(&meta);
-    let mime = mime_for(path);
     let total = meta.len();
 
     // Conditional request first (RFC 9110 §13.2.1 evaluation order): a fresh
@@ -738,6 +853,31 @@ mod tests {
             "stale date → declines"
         );
     }
+
+    // ── Accept-Encoding parsing (pure) ────────────────────────────────────────
+
+    #[test]
+    fn accept_encoding_matching() {
+        assert!(accepts("br, gzip", "br"));
+        assert!(accepts("gzip, deflate, br", "br"));
+        assert!(accepts("gzip", "gzip"));
+        assert!(accepts("BR", "br")); // case-insensitive token
+        assert!(accepts("*", "br")); // wildcard accepts anything
+        assert!(accepts("br;q=0.5", "br")); // weighted but > 0
+        assert!(accepts("identity, br ; q=1.0", "br")); // tolerate spaces
+
+        assert!(!accepts("gzip", "br")); // absent
+        assert!(!accepts("", "br")); // empty
+        assert!(!accepts("br;q=0", "br")); // explicitly refused
+        assert!(!accepts("gzip, *;q=0", "br")); // wildcard refused
+
+        // An explicit entry overrides the wildcard (RFC 9110 §12.5.3), in either
+        // order — a client can accept everything yet refuse Brotli.
+        assert!(!accepts("*;q=1, br;q=0", "br"));
+        assert!(!accepts("br;q=0, *;q=1", "br"));
+        assert!(accepts("*;q=0, br;q=1", "br")); // …or refuse all but Brotli
+        assert!(accepts("*;q=0, br", "br")); // explicit br (implicit q=1) wins
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -762,7 +902,7 @@ mod serve_tests {
     }
 
     async fn get(root: &Path, tail: &str, spa: bool) -> (StatusCode, String) {
-        let r = serve(root, tail, spa, &Method::GET, &HeaderMap::new()).await;
+        let r = serve(root, tail, spa, false, &Method::GET, &HeaderMap::new()).await;
         let status = r.status();
         let body = r.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&body).into_owned())
@@ -771,7 +911,7 @@ mod serve_tests {
     /// GET with a set of request headers; returns the full response so tests can
     /// inspect status + response headers (validators, 304, …).
     async fn get_h(root: &Path, tail: &str, req: HeaderMap) -> Response<ZionBody> {
-        serve(root, tail, false, &Method::GET, &req).await
+        serve(root, tail, false, false, &Method::GET, &req).await
     }
 
     fn one(k: hyper::header::HeaderName, v: &str) -> HeaderMap {
@@ -834,6 +974,7 @@ mod serve_tests {
         let r = serve(
             &root.0,
             "css/main.css",
+            false,
             false,
             &Method::HEAD,
             &HeaderMap::new(),
@@ -948,6 +1089,7 @@ mod serve_tests {
             &root.0,
             "css/main.css",
             false,
+            false,
             &Method::HEAD,
             &HeaderMap::new(),
         )
@@ -955,7 +1097,7 @@ mod serve_tests {
         let etag = first.headers().get(hyper::header::ETAG).unwrap().clone();
         let mut h = HeaderMap::new();
         h.insert(hyper::header::IF_NONE_MATCH, etag);
-        let second = serve(&root.0, "css/main.css", false, &Method::HEAD, &h).await;
+        let second = serve(&root.0, "css/main.css", false, false, &Method::HEAD, &h).await;
         assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
     }
 
@@ -1041,6 +1183,7 @@ mod serve_tests {
         let r = serve(
             &root.0,
             "css/main.css",
+            false,
             false,
             &Method::HEAD,
             &one(hyper::header::RANGE, "bytes=1-3"),
@@ -1133,5 +1276,120 @@ mod serve_tests {
         let got = collect(stream_file(capped, Some(limit as u64))).await;
         assert_eq!(got.len(), limit);
         assert_eq!(got, data[..limit], "limited stream stops on the exact byte");
+    }
+
+    // ── Precompressed sidecars (.br / .gz via Accept-Encoding) ────────────────
+    // css/main.css = "body{}"; tests write distinct sidecar bytes so the served
+    // variant is unambiguous.
+
+    async fn serve_prec(root: &Path, tail: &str, accept: Option<&str>) -> Response<ZionBody> {
+        let mut h = HeaderMap::new();
+        if let Some(a) = accept {
+            h.insert(
+                hyper::header::ACCEPT_ENCODING,
+                HeaderValue::from_str(a).unwrap(),
+            );
+        }
+        serve(root, tail, false, true, &Method::GET, &h).await // precompressed = true
+    }
+
+    #[tokio::test]
+    async fn precompressed_prefers_brotli_over_gzip() {
+        let root = root("prec-br");
+        std::fs::write(root.0.join("css/main.css.br"), b"BR-BYTES").unwrap();
+        std::fs::write(root.0.join("css/main.css.gz"), b"GZ-BYTES").unwrap();
+        let r = serve_prec(&root.0, "css/main.css", Some("gzip, br")).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            r.headers().get(hyper::header::CONTENT_ENCODING).unwrap(),
+            "br"
+        );
+        assert_eq!(
+            r.headers().get(hyper::header::VARY).unwrap(),
+            "Accept-Encoding"
+        );
+        // Content-Type is the ORIGINAL file's, never the sidecar's `.br`.
+        assert_eq!(
+            r.headers().get(hyper::header::CONTENT_TYPE).unwrap(),
+            "text/css; charset=utf-8"
+        );
+        assert_eq!(&body_bytes(r).await, b"BR-BYTES");
+    }
+
+    #[tokio::test]
+    async fn precompressed_gzip_when_brotli_sidecar_absent() {
+        let root = root("prec-gz");
+        std::fs::write(root.0.join("css/main.css.gz"), b"GZ-BYTES").unwrap();
+        // Client accepts both, but only the .gz sidecar exists.
+        let r = serve_prec(&root.0, "css/main.css", Some("br, gzip")).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            r.headers().get(hyper::header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+        assert_eq!(&body_bytes(r).await, b"GZ-BYTES");
+    }
+
+    #[tokio::test]
+    async fn precompressed_identity_when_no_acceptable_sidecar() {
+        let root = root("prec-id");
+        std::fs::write(root.0.join("css/main.css.gz"), b"GZ-BYTES").unwrap();
+        // Client accepts ONLY br, but only .gz exists → identity, still Vary.
+        let r = serve_prec(&root.0, "css/main.css", Some("br")).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(r.headers().get(hyper::header::CONTENT_ENCODING).is_none());
+        assert_eq!(
+            r.headers().get(hyper::header::VARY).unwrap(),
+            "Accept-Encoding"
+        );
+        assert_eq!(&body_bytes(r).await, b"body{}");
+    }
+
+    #[tokio::test]
+    async fn precompressed_no_accept_encoding_is_identity_with_vary() {
+        let root = root("prec-noae");
+        std::fs::write(root.0.join("css/main.css.br"), b"BR-BYTES").unwrap();
+        let r = serve_prec(&root.0, "css/main.css", None).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(r.headers().get(hyper::header::CONTENT_ENCODING).is_none());
+        assert_eq!(
+            r.headers().get(hyper::header::VARY).unwrap(),
+            "Accept-Encoding"
+        );
+        assert_eq!(&body_bytes(r).await, b"body{}");
+    }
+
+    #[tokio::test]
+    async fn precompressed_off_never_negotiates() {
+        // The sidecar exists and the client accepts br, but the route did NOT opt
+        // in → plain identity, no Vary, no Content-Encoding (zero behavior change).
+        let root = root("prec-off");
+        std::fs::write(root.0.join("css/main.css.br"), b"BR-BYTES").unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(
+            hyper::header::ACCEPT_ENCODING,
+            HeaderValue::from_static("br"),
+        );
+        let r = serve(&root.0, "css/main.css", false, false, &Method::GET, &h).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(r.headers().get(hyper::header::CONTENT_ENCODING).is_none());
+        assert!(r.headers().get(hyper::header::VARY).is_none());
+        assert_eq!(&body_bytes(r).await, b"body{}");
+    }
+
+    #[tokio::test]
+    async fn precompressed_symlink_sidecar_escaping_root_is_refused() {
+        // A .br sidecar that symlinks outside the tree must never be served —
+        // the same canonicalize-under-root guard as the primary file.
+        let root = root("prec-symlink");
+        let outside = std::env::temp_dir().join(format!("zion-prec-secret-{}", std::process::id()));
+        std::fs::write(&outside, b"TOP SECRET").unwrap();
+        std::os::unix::fs::symlink(&outside, root.0.join("css/main.css.br")).unwrap();
+        let r = serve_prec(&root.0, "css/main.css", Some("br")).await;
+        // Falls back to identity (never the symlinked secret).
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(r.headers().get(hyper::header::CONTENT_ENCODING).is_none());
+        assert_eq!(&body_bytes(r).await, b"body{}");
+        let _ = std::fs::remove_file(&outside);
     }
 }
