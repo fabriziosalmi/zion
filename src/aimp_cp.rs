@@ -616,12 +616,58 @@ impl ReceiverState {
             metrics.mesh_claims_received.fetch_add(1, Relaxed);
             self.bump_version();
         }
+        // Keep the reputation table bounded (issue #287). Only a *fresh* insert
+        // grows the map; an update, stale, or rejected claim cannot, so we prune
+        // on `Inserted` only.
+        if matches!(outcome, MergeOutcome::Inserted) {
+            prune_reputation(
+                &self.reputation,
+                MAX_REPUTATION_ENTRIES,
+                REPUTATION_TTL_SECS,
+            );
+        }
         outcome
     }
 
     fn bump_version(&mut self) {
         self.version = self.version.wrapping_add(1);
         let _ = self.update_tx.send(self.version);
+    }
+}
+
+/// Upper bound on the reputation table (issue #287). Entries are only added by a
+/// signature-verified merge and mesh is off by default, so this is not a
+/// request-reachable leak — but a long-lived mesh circulating claims for many
+/// distinct client IPs would otherwise grow the map without limit. ~100k IPs is
+/// a few MB.
+const MAX_REPUTATION_ENTRIES: usize = 100_000;
+/// Reputation older than this is stale and pruned first. A day is long enough
+/// that a still-active attacker keeps getting re-observed (each observation
+/// refreshes its `ts_secs`), so only genuinely idle IPs age out.
+const REPUTATION_TTL_SECS: u64 = 86_400;
+
+/// Bound the reputation table: drop entries older than `ttl_secs`, then, if
+/// still over `max_entries`, evict the oldest by timestamp down to a low-water
+/// mark (90% of the cap) so the O(n) cost amortizes over many inserts instead
+/// of firing on every one. A no-op while under the cap — the steady-state merge
+/// path pays only a `len()` check. `max_entries = 0` disables the bound.
+fn prune_reputation(map: &DashMap<IpAddr, WafReputation>, max_entries: usize, ttl_secs: u64) {
+    if max_entries == 0 || map.len() <= max_entries {
+        return;
+    }
+    let now = now_secs();
+    // 1. Age-prune: stale reputation is the first to go.
+    map.retain(|_, v| now.saturating_sub(v.ts_secs) <= ttl_secs);
+    // 2. Still over the cap → evict the oldest down to the low-water mark.
+    let low_water = max_entries - max_entries / 10;
+    let len = map.len();
+    if len > low_water {
+        let mut ages: Vec<(IpAddr, u64)> =
+            map.iter().map(|e| (*e.key(), e.value().ts_secs)).collect();
+        ages.sort_unstable_by_key(|&(_, ts)| ts); // oldest first
+        for (ip, _) in ages.into_iter().take(len - low_water) {
+            map.remove(&ip);
+        }
     }
 }
 
@@ -906,6 +952,71 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Reputation-table bounding (issue #287) ───────────────────────────
+    fn mk_rep(ts_secs: u64) -> WafReputation {
+        WafReputation {
+            score: 0.5,
+            ts_secs,
+            reason: 1,
+            source_node: [0u8; 32],
+        }
+    }
+    fn mk_ip(i: u32) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::new(
+            10,
+            (i >> 16) as u8,
+            (i >> 8) as u8,
+            i as u8,
+        ))
+    }
+
+    #[test]
+    fn prune_reputation_is_a_noop_under_the_cap() {
+        let map = DashMap::new();
+        let now = now_secs();
+        for i in 0..10 {
+            map.insert(mk_ip(i), mk_rep(now));
+        }
+        prune_reputation(&map, 100, 100);
+        assert_eq!(map.len(), 10, "under the cap → untouched");
+    }
+
+    #[test]
+    fn prune_reputation_ages_out_stale_entries_first() {
+        let map = DashMap::new();
+        let now = now_secs();
+        // 50 stale (older than the 100s TTL) + 50 fresh, over the cap of 60.
+        for i in 0..50 {
+            map.insert(mk_ip(i), mk_rep(now.saturating_sub(200)));
+        }
+        for i in 50..100 {
+            map.insert(mk_ip(i), mk_rep(now));
+        }
+        prune_reputation(&map, 60, 100);
+        assert!(map.len() <= 60);
+        // The stale half is gone by age; every survivor is fresh.
+        assert_eq!(map.len(), 50);
+        assert!(map
+            .iter()
+            .all(|e| now.saturating_sub(e.value().ts_secs) <= 100));
+    }
+
+    #[test]
+    fn prune_reputation_evicts_oldest_when_all_fresh() {
+        let map = DashMap::new();
+        let now = now_secs();
+        // All fresh; mk_ip(0) is newest (ts=now), mk_ip(99) oldest (ts=now-99).
+        for i in 0..100 {
+            map.insert(mk_ip(i), mk_rep(now.saturating_sub(i as u64)));
+        }
+        // Huge TTL ⇒ age-prune keeps all ⇒ cap-eviction to the low-water mark.
+        prune_reputation(&map, 50, 1_000_000);
+        // low_water = 50 - 5 = 45, so the newest 45 survive.
+        assert_eq!(map.len(), 45, "bounded to the low-water mark");
+        assert!(map.contains_key(&mk_ip(0)), "newest must survive");
+        assert!(!map.contains_key(&mk_ip(99)), "oldest must be evicted");
+    }
     use std::net::Ipv4Addr;
 
     #[test]
