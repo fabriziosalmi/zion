@@ -102,3 +102,33 @@ path.
 - `ml/` (pipeline), `ml/README.md`, `ml/MODEL_CARD.md`
 - ADR-0007 (MSRV — the pipeline adds no runtime dep; tract-onnx already ships
   under `ml-waf`)
+
+## Update — real tool-traffic escalation (2026-08-03)
+
+The synthetic model was tested cross-source against a real HTTP-DATASET-CSIC-2010
+fragment (the only real data reachable in-sandbox — the canonical host is down;
+mirrors are stubs/pre-featurized/oversized): it detected **0 of 9** real attacks
+(scored them 0.000, same as benign) — the artifact-overfitting predicted above,
+now measured.
+
+Following that, an in-sandbox **attack-traffic lab** (`ml/attack_lab/`) was built
+to train on *real* traffic instead of synthetic payloads: point real tools
+(sqlmap with WAF-evasion `--tamper`, dalfox for XSS, SecLists payload replay) at
+a local capture server and record the requests they emit; label a realistic
+benign generator's traffic 0. Result:
+
+- **Capturing real tool traffic works** — the retrained model reaches AUC ≈ 0.9999
+  in-distribution and, unlike the synthetic one, actually recognizes
+  payload-bearing attacks (SQLi/XSS/LFI/cmd). The synthetic→real transfer gap is
+  the point: real traffic is required.
+- **The ceiling moved off the data.** It is now (a) the **URI+header feature set**
+  (no POST body, no value-semantics), so subtle parameter-tampering — much of the
+  CSIC "anomalous" fragment, which is structurally identical to benign e-commerce
+  — is invisible by construction; and (b) the **lack of a full real eval corpus**
+  (9 attacks is too few — the fragment metric swings 0↔44% on noise, skewed to
+  exactly that blind spot).
+
+Confirmed follow-up levers (explicit-go): **body-aware features** and a **full,
+diverse real eval corpus**. More scanners are diminishing returns. Still nothing
+shipped; the lab's captured traffic and models are gitignored. See
+`ml/attack_lab/README.md`.
