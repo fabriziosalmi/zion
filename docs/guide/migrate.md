@@ -153,9 +153,10 @@ gets a bodiless **304 Not Modified** when the file is unchanged — the same
 browser-caching behavior nginx gives you out of the box, so a cut-over doesn't
 regress asset revalidation. Byte-range requests are honored too (`206` +
 `Accept-Ranges: bytes`, `416` when unsatisfiable), so media seeking and resumable
-downloads work — and a ranged read can pull a slice out of a file larger than the
-64 MiB whole-file cap. (Multi-range responses and streaming of very large single
-reads are tracked follow-ups.)
+downloads work. Large files (above 64 MiB) stream frame-by-frame with bounded
+memory rather than being buffered whole, so there is **no file-size limit** on a
+static route — a video or install image serves fine. (Multi-range responses are a
+tracked follow-up; single ranges and full downloads are complete.)
 
 ## Verify before you cut over
 
