@@ -13,9 +13,14 @@ ignore = [
     "RUSTSEC-2024-0436",  # `paste` unmaintained (proc-macro, no runtime surface) — review by 2026-09-01
     # ── Direct dep needing API migration ──
     "RUSTSEC-2025-0134",  # `rustls-pemfile` archived; migrate to rustls-pki-types::pem — review by 2026-08-01
+    # ── Soundness (unsound) in feature-gated transitive deps ──
+    # cargo-audit scans the FLAT lockfile and flags these under `--deny unsound`;
+    # cargo-deny's all-features GRAPH does not resolve them, so they are ignored
+    # here but NOT in deny.toml (listing a not-detected id there trips cargo-deny).
+    # -0217 (tract-nnef 0.21.14) WAS resolved by the tract 0.21.17 bump (v0.7.1).
+    "RUSTSEC-2026-0002",  # `lru` IterMut Stacked-Borrows unsound; via ratatui (tui feature, off by default) — review by 2026-10-01
+    "RUSTSEC-2026-0186",  # `memmap2 0.9.10` unchecked ptr offset (unsound); via tract-onnx (ml-waf, off by default), no fix yet — review by 2026-10-01
     # ── DoS in a feature-gated transitive dep (acme/init/ml-waf, not core) ──
-    # -0002 (lru/ratatui), -0186 (memmap2) and -0217 (tract-nnef 0.21.14) were
-    # resolved by the v0.7.1 bumps (tract 0.21.17 + rust-minor) and removed.
     "RUSTSEC-2026-0009",  # `time` 0.3.41 RFC2822-parse stack-exhaustion DoS; via rcgen/tract (feature-gated, not core), untrusted input never reaches it; fix (>=0.3.47) blocked by transitive `time <0.3.42` + 1.82 MSRV — review by 2026-10-01
     # ── Pulled in by aimp_node (--features sovereign-aimp, off by default) ──
     "RUSTSEC-2024-0437",  # `protobuf 2.x` recursion-DoS via prometheus 0.13.4 → aimp_node — review by 2026-09-01
