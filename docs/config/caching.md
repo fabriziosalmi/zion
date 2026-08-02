@@ -61,8 +61,28 @@ The freshness lifetime is **origin-driven, clamped to the profile**:
 
 Every hit carries an **`Age`** header (RFC 9111 §4.2.3) — seeded from the upstream
 `Age` at insert plus time lived in zion's cache — and a `Cache-Control: max-age`
-so downstream caches compute the same expiry. A stale entry is not served; it is
-re-fetched (origin-side revalidation with `If-None-Match` is a roadmap item).
+so downstream caches compute the same expiry.
+
+## Origin-side revalidation (RFC 9111 §4.3)
+
+A stale entry is **revalidated**, not blindly re-fetched. When a stored entry is
+past its freshness and carries a validator, zion sends a **conditional GET** to
+the origin (`If-None-Match` from the stored `ETag`, `If-Modified-Since` from
+`Last-Modified`):
+
+- **`304 Not Modified`** → the stored entry is still good: zion revives its
+  freshness in place and serves the **cached body**, marked
+  `X-Zion-Cache: REVALIDATED` — no re-download. `zion_cache_revalidations`
+  counts these.
+- **`200 OK`** → the content changed: the new response replaces the stale entry
+  and is served + cached as a normal fetch.
+- **Origin error** (unreachable / 5xx during revalidation) → **stale-if-error**
+  (§4.2.4): zion serves the stale body (`X-Zion-Cache: STALE`) rather than
+  failing, so a flapping origin doesn't take cached content down.
+
+A stale entry with **no validator** can't be revalidated, so it is re-fetched in
+full (a normal miss). The stale body is kept in cache until it is revalidated or
+evicted by capacity — it is never served without one of the checks above.
 
 ## Request `Cache-Control` (RFC 9111 §5.2.1)
 
@@ -118,7 +138,7 @@ $ curl -sX POST 'http://127.0.0.1/_zion/cache/purge?prefix=/static/app.js'
 | Origin-driven freshness (`max-age` / `s-maxage`) + `Age` | 9111 §4.2 | Yes |
 | Request `Cache-Control` (no-cache/no-store/max-age=0/only-if-cached) | 9111 §5.2.1 | Yes |
 | Client conditional → `304` (If-None-Match / If-Modified-Since) | 9110 §13 | Yes |
-| Origin-side revalidation (stale → conditional GET) | 9111 §4.3 | Roadmap |
+| Origin-side revalidation (stale → conditional GET → 304) | 9111 §4.3 | Yes (`REVALIDATED`; stale-if-error §4.2.4) |
 
 See also [Hot-reload](/deploy/hot-reload) (cache survives config reloads) and the
 [two-level-cache ADR](/adr/0003-two-level-cache-with-generation).

@@ -49,6 +49,31 @@ pub struct CacheHit {
     pub max_age_secs: u64,
 }
 
+/// Outcome of a cache lookup (RFC 9111 §4.3). `Stale` returns the stored entry
+/// **without evicting it**, so the caller can revalidate with the origin and, on
+/// a `304 Not Modified`, revive it via [`StaticCache::refresh`] instead of
+/// re-downloading the body.
+pub enum CacheLookup {
+    /// Within its freshness lifetime — serve directly.
+    Fresh(CacheHit),
+    /// Past its freshness lifetime but still stored — revalidate before serving.
+    Stale(CacheHit),
+    /// Not stored.
+    Miss,
+}
+
+impl CacheLookup {
+    /// The fresh hit, if this lookup was `Fresh`. Ergonomic accessor for the
+    /// common "serve-now-or-nothing" callers (and tests); `Stale`/`Miss` → `None`.
+    #[inline]
+    pub fn fresh(self) -> Option<CacheHit> {
+        match self {
+            CacheLookup::Fresh(hit) => Some(hit),
+            _ => None,
+        }
+    }
+}
+
 /// L1 entry — with TTL from L2 (prevents stale data after expiry).
 struct L1Entry {
     body: Bytes,
@@ -307,53 +332,45 @@ impl StaticCache {
     }
 
     #[inline]
-    pub fn get(&self, path: &str) -> Option<CacheHit> {
+    pub fn get(&self, path: &str) -> CacheLookup {
+        use std::sync::atomic::Ordering::Relaxed;
         let l1_max = self.l1_max_entries;
 
-        // If Single-Core fallback is active, bypass L1/L2 distinction.
-        // The L2 becomes thread-local Hashmap (L1 speed for all misses).
-        // `let-else` binds l2 for the concurrent path below and diverges
-        // (returns) on the single-core path — this replaces a later
-        // `unreachable!()` that was a latent process-abort under panic=abort.
+        // Single-core fallback: LOCAL_L2 only. A stored-but-expired entry is
+        // returned as `Stale` (kept in place) so the caller can revalidate —
+        // RFC 9111 §4.3 — instead of the old evict-and-refetch.
         let Some(l2_concurrent) = &self.l2 else {
-            let mut expired = false;
-            let hit = LOCAL_L2.with(|map| {
+            return LOCAL_L2.with(|map| {
                 let m = map.borrow();
-                if let Some(entry) = m.get(path) {
-                    if Instant::now() >= entry.expires_at {
-                        expired = true;
-                        None
-                    } else {
-                        Some(CacheHit {
+                match m.get(path) {
+                    Some(entry) => {
+                        let hit = CacheHit {
                             body: entry.body.clone(),
                             meta: entry.meta.clone(),
                             age_secs: entry.initial_age_secs
                                 + entry.inserted_at.elapsed().as_secs(),
                             max_age_secs: entry.freshness_secs,
-                        })
+                        };
+                        if Instant::now() >= entry.expires_at {
+                            CacheLookup::Stale(hit)
+                        } else {
+                            crate::metrics::METRICS.cache_hits.fetch_add(1, Relaxed);
+                            CacheLookup::Fresh(hit)
+                        }
                     }
-                } else {
-                    None
+                    None => {
+                        crate::metrics::METRICS.cache_misses.fetch_add(1, Relaxed);
+                        CacheLookup::Miss
+                    }
                 }
             });
-            if expired {
-                LOCAL_L2.with(|map| map.borrow_mut().remove(path));
-            }
-            if hit.is_some() {
-                crate::metrics::METRICS
-                    .cache_hits
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                crate::metrics::METRICS
-                    .cache_misses
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            return hit;
         };
 
         let current_gen = self.generation.load(std::sync::atomic::Ordering::Acquire);
 
-        // L1: thread-local, zero contention
+        // L1: thread-local, zero contention. `L1Cache::get` returns a fresh hit
+        // only (it evicts its own expired / stale-generation entries), so a miss
+        // here falls through to L2 — the source of truth for freshness.
         let l1_hit = L1.with(|l1| {
             let mut l1 = l1.borrow_mut();
             let l1 = l1.get_or_insert_with(|| L1Cache::new(l1_max));
@@ -361,37 +378,35 @@ impl StaticCache {
         });
 
         if let Some(hit) = l1_hit {
-            crate::metrics::METRICS
-                .cache_hits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Some(hit);
+            crate::metrics::METRICS.cache_hits.fetch_add(1, Relaxed);
+            return CacheLookup::Fresh(hit);
         }
 
-        // L2: shared DashMap. A true absence is a miss and must be counted —
-        // the bare `?` here previously returned None without recording it, so
-        // on multi-core builds cache_misses was undercounted and the reported
-        // hit-rate inflated.
+        // L2: shared DashMap. Absent = Miss (counted — a bare `?` here once
+        // undercounted misses and inflated the hit-rate). Expired = Stale, kept
+        // in place for origin revalidation (§4.3), NOT evicted. Fresh = promote
+        // to L1 and serve.
         let Some(entry) = l2_concurrent.get(path) else {
-            crate::metrics::METRICS
-                .cache_misses
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return None;
+            crate::metrics::METRICS.cache_misses.fetch_add(1, Relaxed);
+            return CacheLookup::Miss;
         };
-        if Instant::now() >= entry.expires_at {
-            drop(entry);
-            l2_concurrent.remove(path);
-            crate::metrics::METRICS
-                .cache_misses
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return None;
-        }
         let body = entry.body.clone();
         let meta = entry.meta.clone();
+        let age_secs = entry.initial_age_secs + entry.inserted_at.elapsed().as_secs();
+        let freshness_secs = entry.freshness_secs;
+        if Instant::now() >= entry.expires_at {
+            drop(entry); // release the DashMap read lock; leave the entry stored
+            return CacheLookup::Stale(CacheHit {
+                body,
+                meta,
+                age_secs,
+                max_age_secs: freshness_secs,
+            });
+        }
         let key: Arc<str> = entry.key().clone();
         let inserted_at = entry.inserted_at;
         let expires_at = entry.expires_at;
         let initial_age_secs = entry.initial_age_secs;
-        let freshness_secs = entry.freshness_secs;
         drop(entry); // release DashMap read lock
 
         // Promote to L1 preserving the original birth time, TTL and generation.
@@ -410,15 +425,38 @@ impl StaticCache {
             );
         });
 
-        crate::metrics::METRICS
-            .cache_hits
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(CacheHit {
+        crate::metrics::METRICS.cache_hits.fetch_add(1, Relaxed);
+        CacheLookup::Fresh(CacheHit {
             body,
             meta,
-            age_secs: initial_age_secs + inserted_at.elapsed().as_secs(),
+            age_secs,
             max_age_secs: freshness_secs,
         })
+    }
+
+    /// Revalidation refresh (RFC 9111 §4.3): after the origin answers a
+    /// conditional request with `304 Not Modified`, re-stamp the stored entry
+    /// with a fresh freshness lifetime, reusing the body the caller already
+    /// holds (from a [`CacheLookup::Stale`]). A 304 keeps the same body, so this
+    /// is an `insert` of the stored bytes with a new lifetime — reviving the
+    /// entry across all tiers (L2 write + generation bump ⇒ L1 re-promotes).
+    pub fn refresh(
+        &self,
+        path: &str,
+        body: Bytes,
+        meta: CachedMeta,
+        freshness_secs: u64,
+        initial_age_secs: u64,
+        max_entries: usize,
+    ) {
+        self.insert(
+            path,
+            body,
+            meta,
+            freshness_secs,
+            initial_age_secs,
+            max_entries,
+        );
     }
 
     /// Insert into L2 (source of truth). L1 populated lazily on next get.
@@ -627,7 +665,7 @@ mod tests {
             0,
             100,
         );
-        let hit = cache.get("/style.css").unwrap();
+        let hit = cache.get("/style.css").fresh().unwrap();
         assert_eq!(hit.body, Bytes::from("body{}"));
         assert_eq!(hit.meta.content_type.unwrap(), "text/css");
         assert_eq!(hit.meta.status, StatusCode::OK);
@@ -636,7 +674,7 @@ mod tests {
     #[test]
     fn get_miss_returns_none() {
         let cache = StaticCache::new();
-        assert!(cache.get("/nonexistent").is_none());
+        assert!(cache.get("/nonexistent").fresh().is_none());
     }
 
     #[test]
@@ -651,19 +689,68 @@ mod tests {
             last_modified: None,
         };
         cache.insert("/a.js", Bytes::from("v2"), meta2, 3600, 0, 100);
-        let hit = cache.get("/a.js").unwrap();
+        let hit = cache.get("/a.js").fresh().unwrap();
         assert_eq!(hit.body, Bytes::from("v2"));
         assert_eq!(hit.meta.content_type.unwrap(), "application/javascript");
         assert_eq!(cache.len(), 1);
     }
 
     #[test]
-    fn ttl_expiration() {
+    fn ttl_expiration_returns_stale_kept_in_place() {
         let cache = StaticCache::new();
         cache.insert("/expired.js", Bytes::from("old"), default_meta(), 0, 0, 100);
         std::thread::sleep(std::time::Duration::from_millis(10));
-        assert!(cache.get("/expired.js").is_none());
-        assert_eq!(cache.len(), 0);
+        // #266: an expired entry is not served fresh …
+        assert!(cache.get("/expired.js").fresh().is_none());
+        // … but it is kept for revalidation (Stale), not evicted.
+        assert!(matches!(
+            cache.get("/expired.js"),
+            CacheLookup::Stale(hit) if hit.body.as_ref() == b"old"
+        ));
+        assert_eq!(
+            cache.len(),
+            1,
+            "stale entries stay stored until refreshed/evicted"
+        );
+    }
+
+    #[test]
+    fn refresh_revives_a_stale_entry_to_fresh_reusing_the_body() {
+        let cache = StaticCache::new();
+        // freshness 0 ⇒ immediately stale.
+        cache.insert("/r.js", Bytes::from("v1"), default_meta(), 0, 0, 100);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let stale = match cache.get("/r.js") {
+            CacheLookup::Stale(hit) => hit,
+            other => panic!("expected Stale, got {}", disp(&other)),
+        };
+        // #266: a 304 revives it with a fresh lifetime, reusing the stored body.
+        cache.refresh(
+            "/r.js",
+            stale.body.clone(),
+            stale.meta.clone(),
+            3600,
+            0,
+            100,
+        );
+        let hit = cache
+            .get("/r.js")
+            .fresh()
+            .expect("entry must be fresh after refresh");
+        assert_eq!(
+            hit.body,
+            Bytes::from("v1"),
+            "refresh reuses the stored body"
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    fn disp(l: &CacheLookup) -> &'static str {
+        match l {
+            CacheLookup::Fresh(_) => "Fresh",
+            CacheLookup::Stale(_) => "Stale",
+            CacheLookup::Miss => "Miss",
+        }
     }
 
     #[test]
@@ -676,7 +763,7 @@ mod tests {
 
         cache.insert("/d", Bytes::from("d"), default_meta(), 3600, 0, 3);
         assert_eq!(cache.len(), 3);
-        assert!(cache.get("/d").is_some());
+        assert!(cache.get("/d").fresh().is_some());
     }
 
     #[test]
@@ -692,7 +779,7 @@ mod tests {
     fn empty_body_cacheable() {
         let cache = StaticCache::new();
         cache.insert("/empty", Bytes::new(), default_meta(), 3600, 0, 100);
-        assert!(cache.get("/empty").is_some());
+        assert!(cache.get("/empty").fresh().is_some());
     }
 
     #[test]
@@ -700,7 +787,7 @@ mod tests {
         let cache = StaticCache::new();
         let big = Bytes::from(vec![0xFFu8; 1024 * 1024]);
         cache.insert("/big.bin", big.clone(), default_meta(), 3600, 0, 100);
-        let hit = cache.get("/big.bin").unwrap();
+        let hit = cache.get("/big.bin").fresh().unwrap();
         assert_eq!(hit.body, big);
     }
 
@@ -710,11 +797,11 @@ mod tests {
         cache.insert("/hot.js", Bytes::from("hot"), default_meta(), 3600, 0, 100);
 
         // First get: L2 hit + L1 promote
-        assert!(cache.get("/hot.js").is_some());
+        assert!(cache.get("/hot.js").fresh().is_some());
 
         // Second get: should be L1 hit (no way to verify directly,
         // but we can verify correctness)
-        let hit = cache.get("/hot.js").unwrap();
+        let hit = cache.get("/hot.js").fresh().unwrap();
         assert_eq!(hit.body, Bytes::from("hot"));
     }
 
@@ -763,7 +850,7 @@ mod tests {
             last_modified: None,
         };
         cache.insert("/no-ct", Bytes::from("data"), meta, 3600, 0, 100);
-        let hit = cache.get("/no-ct").unwrap();
+        let hit = cache.get("/no-ct").fresh().unwrap();
         assert!(hit.meta.content_type.is_none());
     }
 
@@ -778,7 +865,7 @@ mod tests {
             last_modified: None,
         };
         cache.insert("/304", Bytes::new(), meta, 3600, 0, 100);
-        let hit = cache.get("/304").unwrap();
+        let hit = cache.get("/304").fresh().unwrap();
         assert_eq!(hit.meta.status, StatusCode::NOT_MODIFIED);
     }
 
@@ -786,7 +873,7 @@ mod tests {
     fn hit_reports_freshness_as_max_age() {
         let cache = StaticCache::new();
         cache.insert("/a.css", Bytes::from("x"), default_meta(), 600, 0, 100);
-        let hit = cache.get("/a.css").unwrap();
+        let hit = cache.get("/a.css").fresh().unwrap();
         assert_eq!(hit.max_age_secs, 600);
     }
 
@@ -794,7 +881,7 @@ mod tests {
     fn fresh_entry_has_zero_age() {
         let cache = StaticCache::new();
         cache.insert("/a.css", Bytes::from("x"), default_meta(), 600, 0, 100);
-        let hit = cache.get("/a.css").unwrap();
+        let hit = cache.get("/a.css").fresh().unwrap();
         // Just inserted with no upstream age — Age must be ~0, never the lifetime.
         assert_eq!(hit.age_secs, 0);
     }
@@ -804,7 +891,7 @@ mod tests {
         // Object arrived from the shield already 120s old (upstream Age: 120).
         let cache = StaticCache::new();
         cache.insert("/a.css", Bytes::from("x"), default_meta(), 600, 120, 100);
-        let hit = cache.get("/a.css").unwrap();
+        let hit = cache.get("/a.css").fresh().unwrap();
         assert!(
             hit.age_secs >= 120,
             "Age must include the upstream age, got {}",
@@ -817,13 +904,13 @@ mod tests {
         let cache = StaticCache::new();
         cache.insert("/a.css", Bytes::from("a"), default_meta(), 3600, 0, 100);
         cache.insert("/b.css", Bytes::from("b"), default_meta(), 3600, 0, 100);
-        assert!(cache.get("/a.css").is_some()); // promote into L1
+        assert!(cache.get("/a.css").fresh().is_some()); // promote into L1
         let n = cache.purge_all();
         assert_eq!(n, 2);
         assert_eq!(cache.len(), 0);
         // L1 entry must be treated as stale after the generation bump
-        assert!(cache.get("/a.css").is_none());
-        assert!(cache.get("/b.css").is_none());
+        assert!(cache.get("/a.css").fresh().is_none());
+        assert!(cache.get("/b.css").fresh().is_none());
     }
 
     #[test]
@@ -855,9 +942,9 @@ mod tests {
         );
         let n = cache.purge_prefix("/assets/");
         assert_eq!(n, 2);
-        assert!(cache.get("/assets/x.js").is_none());
+        assert!(cache.get("/assets/x.js").fresh().is_none());
         assert!(
-            cache.get("/index.html").is_some(),
+            cache.get("/index.html").fresh().is_some(),
             "non-matching key survives"
         );
     }
@@ -868,7 +955,7 @@ mod tests {
         let cache = StaticCache::new();
         cache.insert("/stale", Bytes::from("x"), default_meta(), 100, 100, 100);
         assert!(
-            cache.get("/stale").is_none(),
+            cache.get("/stale").fresh().is_none(),
             "an object that arrives already past its lifetime must not be served"
         );
     }
