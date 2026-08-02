@@ -1,0 +1,7 @@
+# ML-WAF training pipeline — pinned floors (verified against the in-sandbox set).
+# Pure-Python featurization + a tiny MLP; nothing here ships into the Zion binary
+# (tract-onnx does inference in production).
+numpy>=1.24
+torch>=2.0
+onnx>=1.15
+onnxruntime>=1.16

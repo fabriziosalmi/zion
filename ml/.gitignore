@@ -1,0 +1,11 @@
+# Review-gated + regenerable artifacts — NOT committed until the model is
+# explicitly approved for shipping (see the ADR). The pipeline reproduces them.
+*.onnx
+*.pt
+*.pth
+corpus/
+*.csv
+__pycache__/
+.venv/
+# Kept on purpose: features.py, generate_corpus.py, train.py, validate.py,
+# testdata/golden_features.json (the tiny cross-language parity fixture).

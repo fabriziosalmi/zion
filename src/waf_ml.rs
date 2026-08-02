@@ -445,4 +445,175 @@ mod tests {
             Ok(false) => panic!("enabled init must not silently report disabled"),
         }
     }
+
+    /// Golden-vector generator for the Python feature-extractor parity test
+    /// (`ml/features.py`). NOT a normal test — it is the source of truth that
+    /// pins the cross-language contract. Regenerate with:
+    ///
+    ///   cargo test --features ml-waf gen_golden_features -- --ignored --nocapture
+    ///
+    /// It writes `ml/testdata/golden_features.json`; `ml/test_parity.py` asserts
+    /// the Python port reproduces every vector. Keep the corpus diverse enough to
+    /// exercise each feature (methods, presence flags, special chars, encoding,
+    /// entropy, depth, digits, non-ASCII bytes).
+    #[test]
+    #[ignore = "generator, not a check — run explicitly to refresh the golden file"]
+    #[allow(clippy::type_complexity)] // an inline fixture list reads clearest as-is
+    fn gen_golden_features() {
+        // (method, uri, &[(header-name, header-value)])
+        let corpus: &[(&str, &str, &[(&str, &str)])] = &[
+            (
+                "GET",
+                "/api/v1/widgets/42",
+                &[
+                    ("user-agent", "Mozilla/5.0 (X11; Linux x86_64)"),
+                    ("content-type", "application/json"),
+                ],
+            ),
+            ("GET", "/", &[]),
+            (
+                "POST",
+                "/api/users",
+                &[
+                    ("user-agent", "curl/8.4.0"),
+                    ("content-type", "application/json"),
+                    ("authorization", "Bearer abc.def.ghi"),
+                    ("cookie", "sid=deadbeefcafe"),
+                ],
+            ),
+            ("GET", "/api/widgets?q=' OR '1'='1';--", &[]),
+            (
+                "GET",
+                "/search?q=<script>alert(1)</script>",
+                &[("referer", "https://evil.example/")],
+            ),
+            ("GET", "/../../../etc/passwd", &[]),
+            ("GET", "/%2e%2e%2f%2e%2e%2fetc%2fpasswd", &[]),
+            (
+                "PUT",
+                "/upload",
+                &[
+                    ("content-type", "multipart/form-data"),
+                    ("user-agent", "Mozilla/5.0"),
+                ],
+            ),
+            ("GET", "/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q", &[]),
+            (
+                "GET",
+                "/12345678901234567890",
+                &[("user-agent", "okhttp/4")],
+            ),
+            (
+                "GET",
+                "/caf\u{e9}/na\u{ef}ve",
+                &[("user-agent", "Mozilla/5.0")],
+            ),
+            (
+                "DELETE",
+                "/api/items/7",
+                &[
+                    ("authorization", "Bearer t"),
+                    ("x-custom", "aaaaaaaaaaaaaaaaaaaa"),
+                ],
+            ),
+        ];
+
+        let records: Vec<serde_json::Value> = corpus
+            .iter()
+            .map(|(method, uri, hdrs)| {
+                let mut hm = HeaderMap::new();
+                for (name, val) in *hdrs {
+                    let hn = hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap();
+                    hm.append(hn, hyper::header::HeaderValue::from_str(val).unwrap());
+                }
+                let f = extract_features(method, uri, &hm);
+                serde_json::json!({
+                    "method": method,
+                    "uri": uri,
+                    "headers": hdrs.iter().map(|(n, v)| serde_json::json!([n, v])).collect::<Vec<_>>(),
+                    "features": f.to_vec(),
+                })
+            })
+            .collect();
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("ml/testdata/golden_features.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&records).unwrap()).unwrap();
+        eprintln!(
+            "wrote {} golden records → {}",
+            records.len(),
+            path.display()
+        );
+    }
+
+    /// Load a trained ONNX scorer via **tract** (production's engine, not
+    /// onnxruntime) and measure end-to-end `score()` latency — feature
+    /// extraction + inference — against the `budget_us` (200µs p99) budget.
+    /// The single feasibility gate for the whole ML-WAF track.
+    ///
+    ///   ZION_ML_MODEL=ml/waf-scorer.onnx \
+    ///     cargo test --features ml-waf ml_scorer_latency -- --ignored --nocapture
+    #[test]
+    #[ignore = "latency bench — needs a trained model at $ZION_ML_MODEL"]
+    fn ml_scorer_latency() {
+        let path =
+            std::env::var("ZION_ML_MODEL").expect("set ZION_ML_MODEL to a trained .onnx path");
+        let cfg = MlConfig {
+            enabled: true,
+            model_path: PathBuf::from(&path),
+            ..Default::default()
+        };
+        assert!(
+            init(&cfg).expect("model must load in tract"),
+            "model not active"
+        );
+
+        let mut hm = HeaderMap::new();
+        hm.insert(
+            USER_AGENT,
+            "Mozilla/5.0 (X11; Linux x86_64)".parse().unwrap(),
+        );
+        let cases: &[(&str, &str)] = &[
+            ("GET", "/api/v1/users/42"),
+            ("GET", "/items?id=1' OR '1'='1';--"),
+            ("GET", "/search?q=<script>alert(1)</script>"),
+            ("GET", "/%2e%2e%2f%2e%2e%2fetc%2fpasswd"),
+            ("GET", "/${jndi:ldap://x/a}"),
+            ("POST", "/api/login?u=admin"),
+        ];
+
+        // Warm up (JIT/caches), then measure.
+        for i in 0..2000 {
+            let (m, u) = cases[i % cases.len()];
+            let _ = score(m, u, &hm);
+        }
+        let n = 50_000usize;
+        let mut lat_us: Vec<u64> = Vec::with_capacity(n);
+        let t0 = Instant::now();
+        for i in 0..n {
+            let (m, u) = cases[i % cases.len()];
+            if let Some((_, us)) = score(m, u, &hm) {
+                lat_us.push(us);
+            }
+        }
+        let avg_ns = t0.elapsed().as_nanos() as f64 / n as f64;
+        lat_us.sort_unstable();
+        let pct = |q: f64| lat_us[(((lat_us.len() as f64) * q) as usize).min(lat_us.len() - 1)];
+        eprintln!(
+            "tract ml score latency over {n} runs: avg={:.2}µs  p50={}µs p90={}µs p99={}µs max={}µs  (budget {}µs)",
+            avg_ns / 1000.0,
+            pct(0.50),
+            pct(0.90),
+            pct(0.99),
+            lat_us[lat_us.len() - 1],
+            cfg.budget_us,
+        );
+        assert!(
+            pct(0.99) < cfg.budget_us as u64,
+            "p99 {}µs exceeds the {}µs budget",
+            pct(0.99),
+            cfg.budget_us
+        );
+    }
 }
