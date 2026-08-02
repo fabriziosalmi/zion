@@ -151,8 +151,11 @@ Served files carry a weak `ETag` and a `Last-Modified` derived from the file's
 size and mtime, and a revalidating client (`If-None-Match` / `If-Modified-Since`)
 gets a bodiless **304 Not Modified** when the file is unchanged — the same
 browser-caching behavior nginx gives you out of the box, so a cut-over doesn't
-regress asset revalidation. (Range requests and streaming of very large files are
-tracked follow-ups; today a file is served whole, capped at 64 MiB.)
+regress asset revalidation. Byte-range requests are honored too (`206` +
+`Accept-Ranges: bytes`, `416` when unsatisfiable), so media seeking and resumable
+downloads work — and a ranged read can pull a slice out of a file larger than the
+64 MiB whole-file cap. (Multi-range responses and streaming of very large single
+reads are tracked follow-ups.)
 
 ## Verify before you cut over
 

@@ -12,14 +12,22 @@
 //! [`sanitize`] is pure (no I/O) and adversarially unit-tested; [`serve`] does
 //! the filesystem work on the tokio blocking pool via `tokio::fs`.
 
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::header::HeaderValue;
 use hyper::{HeaderMap, Method, Response, StatusCode};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::proxy::ZionBody;
+
+/// Whole-file / whole-slice in-memory read cap. Streaming is a deferred follow-up
+/// (ADR-0015); until then a response body — a full file OR a single range slice —
+/// is refused past this size rather than buffered whole, which under concurrency
+/// would be a memory-amplification DoS.
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Turn a request-path tail (already stripped of the route prefix) into a safe
 /// RELATIVE path under the serve root, or `None` if it must be refused. Pure —
@@ -163,32 +171,50 @@ async fn read_file(path: &Path, method: &Method, req_headers: &HeaderMap) -> Res
         Err(_) => return resp(StatusCode::NOT_FOUND),
     };
     let (etag, last_modified) = validators(&meta);
+    let mime = mime_for(path);
+    let total = meta.len();
 
-    // Conditional request: a fresh validator answers 304 (no body) for GET *and*
-    // HEAD (RFC 9110 §15.4.5). This is the whole point of the feature — a
+    // Conditional request first (RFC 9110 §13.2.1 evaluation order): a fresh
+    // validator answers 304 (no body) for GET *and* HEAD (RFC 9110 §15.4.5), so a
     // revalidating client gets bytes back only when the file actually changed.
     if crate::http_conditional::is_not_modified(req_headers, etag.as_ref(), last_modified.as_ref())
     {
         return not_modified(etag, last_modified);
     }
 
-    // HEAD needs only the length — never read the bytes into memory (a HEAD to a
-    // huge file would otherwise be a cheap memory-amplification DoS).
-    if method == Method::HEAD {
-        return file_response(
-            mime_for(path),
-            meta.len(),
-            etag,
-            last_modified,
-            Bytes::new(),
-        );
+    // Range request (RFC 9110 §14): honor it only when `If-Range` (if present)
+    // still matches this representation, then serve a 206 slice.
+    if if_range_allows(req_headers, last_modified.as_ref()) {
+        match parse_range(req_headers.get(hyper::header::RANGE), total) {
+            RangeOutcome::Unsatisfiable => {
+                return range_not_satisfiable(total, etag, last_modified);
+            }
+            RangeOutcome::Satisfiable(start, end) => {
+                // A HEAD reports the slice metadata without reading any bytes.
+                if method == Method::HEAD {
+                    return partial_response(
+                        mime,
+                        start,
+                        end,
+                        total,
+                        etag,
+                        last_modified,
+                        Bytes::new(),
+                    );
+                }
+                return read_range(path, mime, start, end, total, etag, last_modified).await;
+            }
+            RangeOutcome::Full => {} // no usable Range — fall through to the full 200.
+        }
     }
 
-    // Cap the whole-file in-memory read (streaming is a deferred follow-up,
-    // ADR-0015): refuse an oversized file rather than buffering it whole, which
-    // would be a memory-amplification DoS under concurrency.
-    const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-    if meta.len() > MAX_FILE_BYTES {
+    // Full representation. HEAD needs only the length — never read the bytes into
+    // memory (a HEAD to a huge file would otherwise be a cheap
+    // memory-amplification DoS).
+    if method == Method::HEAD {
+        return file_response(mime, total, etag, last_modified, Bytes::new());
+    }
+    if total > MAX_FILE_BYTES {
         return resp(StatusCode::PAYLOAD_TOO_LARGE);
     }
     let data = match tokio::fs::read(path).await {
@@ -196,16 +222,16 @@ async fn read_file(path: &Path, method: &Method, req_headers: &HeaderMap) -> Res
         Err(_) => return resp(StatusCode::NOT_FOUND),
     };
     let len = data.len() as u64;
-    file_response(mime_for(path), len, etag, last_modified, Bytes::from(data))
+    file_response(mime, len, etag, last_modified, Bytes::from(data))
 }
 
 /// Derive the `(ETag, Last-Modified)` validators from file metadata. The ETag is
 /// *weak* (`W/"len-secs.nanos"`): `len`+`mtime` is a cheap change fingerprint,
 /// not a byte-for-byte content hash, so it must never be used for a strong
-/// comparison (RFC 9110 §8.8.1) — which is exactly why `If-Range` byte-range
-/// reuse is deferred to the range follow-up. Either validator is `None` when the
-/// platform can't supply an mtime; the file still serves, just without
-/// revalidation.
+/// comparison (RFC 9110 §8.8.1) — which is why an `If-Range` carrying an
+/// entity-tag can never match it (see [`if_range_allows`]). Either validator is
+/// `None` when the platform can't supply an mtime; the file still serves, just
+/// without revalidation or ranged reads keyed on the tag.
 fn validators(meta: &std::fs::Metadata) -> (Option<HeaderValue>, Option<HeaderValue>) {
     let dur = meta
         .modified()
@@ -243,7 +269,8 @@ fn not_modified(
 }
 
 /// A `200 OK` file response (or its HEAD twin, with an empty `body`): content
-/// headers plus the revalidation validators the client echoes back next time.
+/// headers, the revalidation validators the client echoes back next time, and
+/// `Accept-Ranges: bytes` advertising that ranged requests are supported.
 fn file_response(
     mime: &'static str,
     content_length: u64,
@@ -254,7 +281,8 @@ fn file_response(
     let mut b = Response::builder()
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, mime)
-        .header(hyper::header::CONTENT_LENGTH, content_length);
+        .header(hyper::header::CONTENT_LENGTH, content_length)
+        .header(hyper::header::ACCEPT_RANGES, "bytes");
     if let Some(e) = etag {
         b = b.header(hyper::header::ETAG, e);
     }
@@ -262,6 +290,181 @@ fn file_response(
         b = b.header(hyper::header::LAST_MODIFIED, lm);
     }
     b.body(Full::new(body).map_err(|n| match n {}).boxed())
+        .unwrap()
+}
+
+/// The outcome of evaluating a `Range` header against a file of `total` bytes.
+enum RangeOutcome {
+    /// No range, an unrecognized unit, a multi-range set, or a malformed spec:
+    /// serve the full 200 (RFC 9110 §14.2 lets a server ignore a Range it cannot
+    /// or chooses not to satisfy).
+    Full,
+    /// A single satisfiable byte range, inclusive `[start, end]`.
+    Satisfiable(u64, u64),
+    /// A syntactically valid but unsatisfiable range → 416.
+    Unsatisfiable,
+}
+
+/// Parse a single-range `Range: bytes=…` against `total`. Only one range is
+/// supported (multipart/byteranges is a follow-up); a multi-range set is treated
+/// as [`RangeOutcome::Full`]. Suffix (`-N`) and open-ended (`N-`) forms handled.
+fn parse_range(header: Option<&HeaderValue>, total: u64) -> RangeOutcome {
+    let Some(spec) = header
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().strip_prefix("bytes="))
+    else {
+        return RangeOutcome::Full;
+    };
+    let spec = spec.trim();
+    if spec.is_empty() || spec.contains(',') {
+        return RangeOutcome::Full; // multi-range or empty → serve full
+    }
+    let Some((a, b)) = spec.split_once('-') else {
+        return RangeOutcome::Full;
+    };
+    let (a, b) = (a.trim(), b.trim());
+    if total == 0 {
+        return RangeOutcome::Unsatisfiable;
+    }
+    let (start, end) = if a.is_empty() {
+        // Suffix range: the last `n` bytes.
+        match b.parse::<u64>() {
+            Ok(0) => return RangeOutcome::Unsatisfiable, // "-0" = last zero bytes
+            Ok(n) => (total.saturating_sub(n), total - 1),
+            Err(_) => return RangeOutcome::Full,
+        }
+    } else {
+        let Ok(start) = a.parse::<u64>() else {
+            return RangeOutcome::Full;
+        };
+        let end = if b.is_empty() {
+            total - 1
+        } else {
+            match b.parse::<u64>() {
+                Ok(e) => e.min(total - 1), // clamp to the last byte
+                Err(_) => return RangeOutcome::Full,
+            }
+        };
+        (start, end)
+    };
+    if start > end || start >= total {
+        return RangeOutcome::Unsatisfiable;
+    }
+    RangeOutcome::Satisfiable(start, end)
+}
+
+/// Does `If-Range` (if present) still permit a ranged response? Our validator is
+/// a *weak* ETag, which can never satisfy `If-Range`'s strong entity-tag
+/// comparison (RFC 9110 §13.1.5) — so an `If-Range` carrying any entity-tag
+/// declines to a full 200. An `If-Range` carrying an HTTP-date honors the range
+/// only when it exactly matches our `Last-Modified`.
+fn if_range_allows(req_headers: &HeaderMap, last_modified: Option<&HeaderValue>) -> bool {
+    let Some(v) = req_headers
+        .get(hyper::header::IF_RANGE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return true; // no If-Range → range permitted
+    };
+    let v = v.trim();
+    // An entity-tag (weak or strong) requires strong comparison, which our weak
+    // tag fails by definition.
+    if v.starts_with("W/") || v.starts_with('"') {
+        return false;
+    }
+    // Otherwise it is an HTTP-date: honor the range only on an exact match.
+    match last_modified.and_then(|lm| lm.to_str().ok()) {
+        Some(lm) => v == lm.trim(),
+        None => false,
+    }
+}
+
+/// Read `[start, end]` from `path` and answer `206 Partial Content`. The slice is
+/// bounded by [`MAX_FILE_BYTES`] (the same memory guard as the full read) — a
+/// larger single range is refused with 413 until streaming lands.
+async fn read_range(
+    path: &Path,
+    mime: &'static str,
+    start: u64,
+    end: u64,
+    total: u64,
+    etag: Option<HeaderValue>,
+    last_modified: Option<HeaderValue>,
+) -> Response<ZionBody> {
+    let len = end - start + 1;
+    if len > MAX_FILE_BYTES {
+        return resp(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let mut f = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(_) => return resp(StatusCode::NOT_FOUND),
+    };
+    if f.seek(SeekFrom::Start(start)).await.is_err() {
+        return resp(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let mut buf = vec![0u8; len as usize];
+    if f.read_exact(&mut buf).await.is_err() {
+        // The file shrank between metadata and read (a race): the range that was
+        // satisfiable a moment ago no longer holds.
+        return range_not_satisfiable(total, etag, last_modified);
+    }
+    partial_response(
+        mime,
+        start,
+        end,
+        total,
+        etag,
+        last_modified,
+        Bytes::from(buf),
+    )
+}
+
+/// A `206 Partial Content` (or its HEAD twin, empty `body`) with `Content-Range`.
+#[allow(clippy::too_many_arguments)]
+fn partial_response(
+    mime: &'static str,
+    start: u64,
+    end: u64,
+    total: u64,
+    etag: Option<HeaderValue>,
+    last_modified: Option<HeaderValue>,
+    body: Bytes,
+) -> Response<ZionBody> {
+    let mut b = Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header(hyper::header::CONTENT_TYPE, mime)
+        .header(hyper::header::CONTENT_LENGTH, end - start + 1)
+        .header(hyper::header::ACCEPT_RANGES, "bytes")
+        .header(
+            hyper::header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{total}"),
+        );
+    if let Some(e) = etag {
+        b = b.header(hyper::header::ETAG, e);
+    }
+    if let Some(lm) = last_modified {
+        b = b.header(hyper::header::LAST_MODIFIED, lm);
+    }
+    b.body(Full::new(body).map_err(|n| match n {}).boxed())
+        .unwrap()
+}
+
+/// A `416 Range Not Satisfiable` carrying the authoritative total via
+/// `Content-Range: bytes */total` (RFC 9110 §14.4).
+fn range_not_satisfiable(
+    total: u64,
+    etag: Option<HeaderValue>,
+    last_modified: Option<HeaderValue>,
+) -> Response<ZionBody> {
+    let mut b = Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(hyper::header::CONTENT_RANGE, format!("bytes */{total}"));
+    if let Some(e) = etag {
+        b = b.header(hyper::header::ETAG, e);
+    }
+    if let Some(lm) = last_modified {
+        b = b.header(hyper::header::LAST_MODIFIED, lm);
+    }
+    b.body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
         .unwrap()
 }
 
@@ -370,6 +573,105 @@ mod tests {
             "text/javascript; charset=utf-8"
         );
         assert_eq!(mime_for(Path::new("x.unknown")), "application/octet-stream");
+    }
+
+    // ── Range parsing (pure) ──────────────────────────────────────────────────
+
+    fn hv(s: &str) -> HeaderValue {
+        HeaderValue::from_str(s).unwrap()
+    }
+
+    /// Assert `parse_range(bytes=spec, total)` yields a satisfiable `[a, b]`.
+    #[track_caller]
+    fn sat(spec: &str, total: u64, a: u64, b: u64) {
+        match parse_range(Some(&hv(spec)), total) {
+            RangeOutcome::Satisfiable(s, e) => assert_eq!((s, e), (a, b), "for {spec}"),
+            _ => panic!("{spec} on {total}: expected Satisfiable({a},{b})"),
+        }
+    }
+    #[track_caller]
+    fn unsat(spec: &str, total: u64) {
+        assert!(
+            matches!(
+                parse_range(Some(&hv(spec)), total),
+                RangeOutcome::Unsatisfiable
+            ),
+            "{spec} on {total}: expected Unsatisfiable"
+        );
+    }
+    #[track_caller]
+    fn full(spec: &str, total: u64) {
+        assert!(
+            matches!(parse_range(Some(&hv(spec)), total), RangeOutcome::Full),
+            "{spec} on {total}: expected Full"
+        );
+    }
+
+    #[test]
+    fn range_satisfiable_forms() {
+        sat("bytes=0-9", 100, 0, 9);
+        sat("bytes=10-", 100, 10, 99); // open-ended → to the last byte
+        sat("bytes=-20", 100, 80, 99); // suffix → last 20 bytes
+        sat("bytes=90-1000", 100, 90, 99); // end clamped to last byte
+        sat("bytes=0-0", 100, 0, 0); // first byte only
+        sat("bytes=99-99", 100, 99, 99); // last byte only
+        sat("bytes=-1000", 100, 0, 99); // suffix larger than file → whole file
+        sat("bytes= 0-9 ", 100, 0, 9); // tolerate surrounding whitespace
+    }
+
+    #[test]
+    fn range_unsatisfiable_forms() {
+        unsat("bytes=100-200", 100); // start at/after EOF
+        unsat("bytes=500-100", 100); // start > end (after clamp)
+        unsat("bytes=-0", 100); // suffix of zero bytes
+        unsat("bytes=0-0", 0); // any range on an empty file
+    }
+
+    #[test]
+    fn range_falls_through_to_full() {
+        assert!(matches!(parse_range(None, 100), RangeOutcome::Full)); // no header
+        full("bytes=0-9,20-29", 100); // multi-range not supported yet
+        full("items=0-9", 100); // unrecognized unit
+        full("bytes=", 100); // empty spec
+        full("bytes=abc", 100); // garbage (no dash)
+        full("bytes=-", 100); // no numbers
+        full("bytes=x-9", 100); // non-numeric start
+        full("bytes=0-y", 100); // non-numeric end
+    }
+
+    // ── If-Range gate (pure) ──────────────────────────────────────────────────
+
+    #[test]
+    fn if_range_gate() {
+        let lm = hv("Sun, 06 Nov 1994 08:49:37 GMT");
+        let none = HeaderMap::new();
+        assert!(if_range_allows(&none, Some(&lm)), "no If-Range → allowed");
+
+        let mut etag_ir = HeaderMap::new();
+        etag_ir.insert(hyper::header::IF_RANGE, hv("W/\"abc\""));
+        assert!(
+            !if_range_allows(&etag_ir, Some(&lm)),
+            "a weak entity-tag can never satisfy If-Range"
+        );
+        let mut strong_ir = HeaderMap::new();
+        strong_ir.insert(hyper::header::IF_RANGE, hv("\"abc\""));
+        assert!(
+            !if_range_allows(&strong_ir, Some(&lm)),
+            "our validator is weak, so even a strong If-Range tag declines"
+        );
+
+        let mut date_hit = HeaderMap::new();
+        date_hit.insert(hyper::header::IF_RANGE, hv("Sun, 06 Nov 1994 08:49:37 GMT"));
+        assert!(
+            if_range_allows(&date_hit, Some(&lm)),
+            "matching date → allowed"
+        );
+        let mut date_miss = HeaderMap::new();
+        date_miss.insert(hyper::header::IF_RANGE, hv("Mon, 07 Nov 1994 00:00:00 GMT"));
+        assert!(
+            !if_range_allows(&date_miss, Some(&lm)),
+            "stale date → declines"
+        );
     }
 }
 
@@ -590,5 +892,131 @@ mod serve_tests {
         h.insert(hyper::header::IF_NONE_MATCH, etag);
         let second = serve(&root.0, "css/main.css", false, &Method::HEAD, &h).await;
         assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    // ── Range requests (206 / 416 / Accept-Ranges) ────────────────────────────
+    // css/main.css is the 6-byte "body{}".
+
+    async fn body_bytes(r: Response<ZionBody>) -> Vec<u8> {
+        r.into_body().collect().await.unwrap().to_bytes().to_vec()
+    }
+
+    #[tokio::test]
+    async fn range_206_returns_the_slice() {
+        let root = root("range-mid");
+        let r = get_h(
+            &root.0,
+            "css/main.css",
+            one(hyper::header::RANGE, "bytes=0-2"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            r.headers().get(hyper::header::CONTENT_RANGE).unwrap(),
+            "bytes 0-2/6"
+        );
+        assert_eq!(r.headers().get(hyper::header::CONTENT_LENGTH).unwrap(), "3");
+        assert_eq!(
+            r.headers().get(hyper::header::ACCEPT_RANGES).unwrap(),
+            "bytes"
+        );
+        assert_eq!(&body_bytes(r).await, b"bod");
+    }
+
+    #[tokio::test]
+    async fn range_open_ended_and_suffix() {
+        let root = root("range-ends");
+        // open-ended: from byte 2 to the end
+        let r = get_h(
+            &root.0,
+            "css/main.css",
+            one(hyper::header::RANGE, "bytes=2-"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            r.headers().get(hyper::header::CONTENT_RANGE).unwrap(),
+            "bytes 2-5/6"
+        );
+        assert_eq!(&body_bytes(r).await, b"dy{}");
+        // suffix: the last 2 bytes
+        let r = get_h(
+            &root.0,
+            "css/main.css",
+            one(hyper::header::RANGE, "bytes=-2"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            r.headers().get(hyper::header::CONTENT_RANGE).unwrap(),
+            "bytes 4-5/6"
+        );
+        assert_eq!(&body_bytes(r).await, b"{}");
+    }
+
+    #[tokio::test]
+    async fn range_unsatisfiable_is_416_with_total() {
+        let root = root("range-416");
+        let r = get_h(
+            &root.0,
+            "css/main.css",
+            one(hyper::header::RANGE, "bytes=100-200"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            r.headers().get(hyper::header::CONTENT_RANGE).unwrap(),
+            "bytes */6"
+        );
+    }
+
+    #[tokio::test]
+    async fn head_with_range_is_206_headers_no_body() {
+        let root = root("range-head");
+        let r = serve(
+            &root.0,
+            "css/main.css",
+            false,
+            &Method::HEAD,
+            &one(hyper::header::RANGE, "bytes=1-3"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            r.headers().get(hyper::header::CONTENT_RANGE).unwrap(),
+            "bytes 1-3/6"
+        );
+        assert_eq!(r.headers().get(hyper::header::CONTENT_LENGTH).unwrap(), "3");
+        assert!(body_bytes(r).await.is_empty(), "HEAD must carry no body");
+    }
+
+    #[tokio::test]
+    async fn full_200_advertises_accept_ranges() {
+        let root = root("range-adv");
+        let r = get_h(&root.0, "css/main.css", HeaderMap::new()).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            r.headers().get(hyper::header::ACCEPT_RANGES).unwrap(),
+            "bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn if_range_with_weak_etag_declines_to_full_200() {
+        // A resumable client sends back the weak ETag in If-Range; because it is
+        // weak it can't satisfy If-Range, so we return the full 200, not a 206.
+        let root = root("range-ifrange");
+        let etag = get_h(&root.0, "css/main.css", HeaderMap::new())
+            .await
+            .headers()
+            .get(hyper::header::ETAG)
+            .unwrap()
+            .clone();
+        let mut h = HeaderMap::new();
+        h.insert(hyper::header::IF_RANGE, etag);
+        h.insert(hyper::header::RANGE, HeaderValue::from_static("bytes=0-2"));
+        let r = get_h(&root.0, "css/main.css", h).await;
+        assert_eq!(r.status(), StatusCode::OK, "weak If-Range → full 200");
+        assert_eq!(&body_bytes(r).await, b"body{}");
     }
 }
