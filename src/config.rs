@@ -534,6 +534,11 @@ pub struct RouteConfig {
     /// file (single-page-app fallback). Off by default.
     #[serde(default)]
     pub spa_fallback: bool,
+    /// For `mode = "static"`: when a `.br`/`.gz` sidecar sits next to a file and
+    /// the client's `Accept-Encoding` allows it, serve the precompressed variant
+    /// (like nginx `gzip_static` / Caddy `precompressed`). Off by default.
+    #[serde(default)]
+    pub precompressed: bool,
     #[serde(default)]
     pub internal_only: bool,
 
@@ -596,6 +601,8 @@ pub struct ResolvedRoute {
     pub serve_dir: Option<std::path::PathBuf>,
     /// SPA fallback (serve `index.html` on a miss) for `RouteMode::Static`.
     pub spa_fallback: bool,
+    /// Serve `.br`/`.gz` sidecars via `Accept-Encoding` for `RouteMode::Static`.
+    pub precompressed: bool,
     /// Literal path prefix stripped before the on-disk file lookup.
     pub static_prefix: String,
     pub waf: Option<WafProfile>,
@@ -1358,6 +1365,7 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
         mode: route.mode.clone(),
         serve_dir,
         spa_fallback: route.spa_fallback,
+        precompressed: route.precompressed,
         static_prefix,
         waf,
         waf_shadow: route.waf_shadow,
@@ -1524,6 +1532,7 @@ mod tests {
             mode: RouteMode::Standard,
             serve_dir: None,
             spa_fallback: false,
+            precompressed: false,
             internal_only: false,
             waf_profile: None,
             cache_profile: None,

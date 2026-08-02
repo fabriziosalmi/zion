@@ -155,8 +155,11 @@ regress asset revalidation. Byte-range requests are honored too (`206` +
 `Accept-Ranges: bytes`, `416` when unsatisfiable), so media seeking and resumable
 downloads work. Large files (above 64 MiB) stream frame-by-frame with bounded
 memory rather than being buffered whole, so there is **no file-size limit** on a
-static route — a video or install image serves fine. (Multi-range responses are a
-tracked follow-up; single ranges and full downloads are complete.)
+static route — a video or install image serves fine. With `precompressed = true`,
+a `.br`/`.gz` sidecar next to a file is served when the client's `Accept-Encoding`
+allows it (Brotli preferred), the same bandwidth win as nginx `gzip_static` /
+Caddy `precompressed`. (Multi-range responses are a tracked follow-up; single
+ranges and full downloads are complete.)
 
 ## Verify before you cut over
 

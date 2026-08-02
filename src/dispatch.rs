@@ -1210,6 +1210,7 @@ async fn process_request_inner(
                         dir,
                         tail,
                         rule.spa_fallback,
+                        rule.precompressed,
                         req.method(),
                         req.headers(),
                     )

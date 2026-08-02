@@ -32,6 +32,7 @@ defined in [0000-template.md](0000-template.md).
 | 0019  | [Static file conditional GET (ETag / Last-Modified → 304)](0019-static-conditional-get.md) | accepted |
 | 0020  | [Static file range requests (206 Partial Content)](0020-static-range-requests.md) | accepted |
 | 0021  | [Streaming large static files (lift the 64 MiB read cap)](0021-static-file-streaming.md) | accepted |
+| 0022  | [Precompressed static sidecars (`.br`/`.gz` via Accept-Encoding)](0022-static-precompressed-sidecars.md) | accepted |
 
 ## When to write a new ADR
 
