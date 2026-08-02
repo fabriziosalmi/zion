@@ -9,9 +9,10 @@
 //! - Cache (hit vs miss, Content-Type preservation)
 //! - SSE streaming
 //! - Large responses
-//! - Internal-only routes
 //! - Error code forwarding
-//! - Host header validation
+//! - Auth (JWT/HS256): missing/invalid → denied, valid → passes
+//! - CORS: preflight + allowed/disallowed origin handling
+//! - Rule composition: a route stacking WAF + auth + CORS enforces all three
 //!
 //! Prerequisites: running Zion on :4433 + test backend on :9090
 //! Setup: ZION_CONFIG=tests/zion-test.toml ./target/release/zion
@@ -485,4 +486,130 @@ integration_test!(t31_static_route_serves_files_not_503, {
     // the on-disk file server refuses traversal on the live server too.
     let (st, _, _) = get("/assets/..%2f..%2f..%2fetc/passwd");
     assert!(st == 403 || st == 404, "traversal must not leak (got {st})");
+});
+
+// ── Rule matrix: auth / CORS / and the two composed on one route ────────────
+// Proves the middlewares work AND compose. Auth is enforced only under the
+// `--features auth` build the integration workflow uses; host-based routing is
+// covered by the equivalence harness (tests/equivalence/multi-vhost).
+
+/// A JWT signed HS256 with the `[auth_profile.e2e].secret` in zion-test.toml,
+/// `exp` in the year 2100. Regenerate with the same secret if the profile
+/// changes: base64url(header).base64url(payload).HMAC-SHA256.
+const E2E_JWT: &str = "eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJzdWIiOiAiZTJlLXVzZXIiLCAiZW1haWwiOiAiZTJlQHppb24udGVzdCIsICJleHAiOiA0MTAyNDQ0ODAwfQ.i2pofCwQa8-IJSCFrmqGu2kcWwH-fdsSZ_ootnYQblc";
+
+/// GET with Host + arbitrary extra headers/flags.
+fn get_with(path: &str, extra: &[&str]) -> (u16, String, String) {
+    let url = format!("https://127.0.0.1:4433{path}");
+    let mut args: Vec<&str> = vec!["-H", "Host: bench.local"];
+    args.extend_from_slice(extra);
+    args.push(&url);
+    curl(&args)
+}
+
+integration_test!(t40_auth_missing_token_is_401, {
+    let (status, _, _) = get("/auth/x");
+    assert_eq!(status, 401, "an auth route with no token must be 401");
+});
+
+integration_test!(t41_auth_invalid_token_denied, {
+    let (status, _, _) = get_with("/auth/x", &["-H", "Authorization: Bearer not-a-jwt"]);
+    assert!(
+        status == 401 || status == 403,
+        "an invalid token must be denied (401/403), got {status}"
+    );
+});
+
+integration_test!(t42_auth_valid_jwt_reaches_backend, {
+    let auth = format!("Authorization: Bearer {E2E_JWT}");
+    let (status, _, _) = get_with("/auth/x", &["-H", &auth]);
+    assert_eq!(status, 200, "a valid JWT must reach the backend (200)");
+});
+
+integration_test!(t43_cors_preflight_returns_acao, {
+    let (status, _, headers) = get_with(
+        "/cors/x",
+        &[
+            "-X",
+            "OPTIONS",
+            "-H",
+            "Origin: https://trusted.example",
+            "-H",
+            "Access-Control-Request-Method: POST",
+        ],
+    );
+    assert!(
+        headers
+            .to_lowercase()
+            .contains("access-control-allow-origin"),
+        "preflight must return Access-Control-Allow-Origin; headers:\n{headers}"
+    );
+    assert!(status == 200 || status == 204, "preflight status {status}");
+});
+
+integration_test!(t44_cors_allowed_origin_reflected, {
+    let (_, _, headers) = get_with("/cors/x", &["-H", "Origin: https://trusted.example"]);
+    assert!(
+        headers
+            .to_lowercase()
+            .contains("access-control-allow-origin"),
+        "a request with an allowed Origin must get Access-Control-Allow-Origin"
+    );
+});
+
+integration_test!(t45_cors_disallowed_origin_not_reflected, {
+    let (_, _, headers) = get_with("/cors/x", &["-H", "Origin: https://evil.example"]);
+    let reflected = headers
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("access-control-allow-origin"))
+        .map(|l| l.contains("evil.example"))
+        .unwrap_or(false);
+    assert!(!reflected, "a disallowed origin must never be reflected");
+});
+
+integration_test!(t46_combo_unauthenticated_is_401, {
+    // Clean GET, no token — auth gates before the request reaches the backend.
+    let (status, _, _) = get("/combo/x");
+    assert_eq!(
+        status, 401,
+        "the combo route (waf+auth+cors) must require auth"
+    );
+});
+
+integration_test!(t47_combo_authed_clean_passes_with_cors, {
+    let auth = format!("Authorization: Bearer {E2E_JWT}");
+    let (status, _, headers) = get_with(
+        "/combo/x",
+        &["-H", &auth, "-H", "Origin: https://trusted.example"],
+    );
+    assert_eq!(status, 200, "authed + clean must pass the combo route");
+    assert!(
+        headers
+            .to_lowercase()
+            .contains("access-control-allow-origin"),
+        "CORS must still apply on the combo route"
+    );
+});
+
+integration_test!(t48_combo_authed_malformed_body_still_waf_blocked, {
+    // Authed, but a malformed JSON body: auth passes, WAF must still block —
+    // proving the middlewares stack rather than one bypassing the other.
+    let auth = format!("Authorization: Bearer {E2E_JWT}");
+    let (status, _, _) = curl(&[
+        "-X",
+        "POST",
+        "-H",
+        "Host: bench.local",
+        "-H",
+        &auth,
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        "{ this is not valid json",
+        "https://127.0.0.1:4433/combo/x",
+    ]);
+    assert!(
+        status == 400 || status == 403,
+        "WAF must block a malformed body even on an authed request, got {status}"
+    );
 });
