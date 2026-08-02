@@ -16,18 +16,27 @@ use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::header::HeaderValue;
 use hyper::{HeaderMap, Method, Response, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::proxy::ZionBody;
 
-/// Whole-file / whole-slice in-memory read cap. Streaming is a deferred follow-up
-/// (ADR-0015); until then a response body — a full file OR a single range slice —
-/// is refused past this size rather than buffered whole, which under concurrency
-/// would be a memory-amplification DoS.
+/// Buffer-whole-into-memory threshold. At or below this a body — a full file or a
+/// single range slice — is read into one `Bytes` and served as a `Full` body (the
+/// low-latency common case). Above it the body is streamed frame-by-frame instead
+/// (see [`stream_file`]), so an arbitrarily large file never sits in memory whole
+/// — the memory-amplification concern the ADR-0015 v1 guarded with a hard 413.
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Per-read chunk size for a streamed file body.
+const STREAM_CHUNK: usize = 64 * 1024;
+/// Frames buffered between the file reader and the socket. Bounds in-flight memory
+/// to about `STREAM_CHUNK × (STREAM_CHANNEL_CAP + 1)` while keeping the reader
+/// slightly ahead of the network.
+const STREAM_CHANNEL_CAP: usize = 8;
 
 /// Turn a request-path tail (already stripped of the route prefix) into a safe
 /// RELATIVE path under the serve root, or `None` if it must be refused. Pure —
@@ -104,8 +113,53 @@ fn hex(c: u8) -> Option<u8> {
 fn resp(status: StatusCode) -> Response<ZionBody> {
     Response::builder()
         .status(status)
-        .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+        .body(full_body(Bytes::new()))
         .unwrap()
+}
+
+/// Wrap already-materialized bytes as a one-shot [`ZionBody`].
+fn full_body(bytes: Bytes) -> ZionBody {
+    Full::new(bytes).map_err(|never| match never {}).boxed()
+}
+
+/// Stream `limit` bytes (or to EOF when `None`) from an already-positioned `file`
+/// as a framed [`ZionBody`], never holding more than [`STREAM_CHUNK`] × a small
+/// channel in memory. A read task feeds a bounded channel; the body drains it.
+///
+/// A mid-stream read error drops the sender, ending the body early — the same
+/// truncate-on-error behavior as the proxy path. The file was just `stat`ed and
+/// opened, so a fault here is a rare disk error, not a routine path, and the
+/// client sees a short read rather than a hang. The channel item type is
+/// `Result<_, hyper::Error>` to match [`ZionBody`]; only `Ok` frames are ever sent.
+fn stream_file(mut file: tokio::fs::File, limit: Option<u64>) -> ZionBody {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, hyper::Error>>(
+        STREAM_CHANNEL_CAP,
+    );
+    tokio::spawn(async move {
+        let mut remaining = limit;
+        let mut buf = vec![0u8; STREAM_CHUNK];
+        loop {
+            let want = match remaining {
+                Some(0) => break,                                 // served the whole slice
+                Some(n) => (n.min(STREAM_CHUNK as u64)) as usize, // don't overshoot the range
+                None => STREAM_CHUNK,
+            };
+            match file.read(&mut buf[..want]).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    let frame = hyper::body::Frame::data(Bytes::copy_from_slice(&buf[..n]));
+                    if tx.send(Ok(frame)).await.is_err() {
+                        break; // the client (receiver) went away
+                    }
+                    if let Some(r) = remaining.as_mut() {
+                        *r -= n as u64;
+                    }
+                }
+                Err(_) => break, // truncate on a read fault (see doc comment)
+            }
+        }
+    });
+    StreamBody::new(ReceiverStream::new(rx)).boxed()
 }
 
 /// Serve `tail` from `root`. `method` gates to GET/HEAD; `spa_fallback` serves
@@ -199,7 +253,7 @@ async fn read_file(path: &Path, method: &Method, req_headers: &HeaderMap) -> Res
                         total,
                         etag,
                         last_modified,
-                        Bytes::new(),
+                        full_body(Bytes::new()),
                     );
                 }
                 return read_range(path, mime, start, end, total, etag, last_modified).await;
@@ -212,17 +266,23 @@ async fn read_file(path: &Path, method: &Method, req_headers: &HeaderMap) -> Res
     // memory (a HEAD to a huge file would otherwise be a cheap
     // memory-amplification DoS).
     if method == Method::HEAD {
-        return file_response(mime, total, etag, last_modified, Bytes::new());
+        return file_response(mime, total, etag, last_modified, full_body(Bytes::new()));
     }
+    // A large file streams frame-by-frame instead of buffering whole; a small one
+    // takes the low-latency one-shot read.
     if total > MAX_FILE_BYTES {
-        return resp(StatusCode::PAYLOAD_TOO_LARGE);
+        let file = match tokio::fs::File::open(path).await {
+            Ok(f) => f,
+            Err(_) => return resp(StatusCode::NOT_FOUND),
+        };
+        return file_response(mime, total, etag, last_modified, stream_file(file, None));
     }
     let data = match tokio::fs::read(path).await {
         Ok(d) => d,
         Err(_) => return resp(StatusCode::NOT_FOUND),
     };
     let len = data.len() as u64;
-    file_response(mime, len, etag, last_modified, Bytes::from(data))
+    file_response(mime, len, etag, last_modified, full_body(Bytes::from(data)))
 }
 
 /// Derive the `(ETag, Last-Modified)` validators from file metadata. The ETag is
@@ -264,8 +324,7 @@ fn not_modified(
     if let Some(lm) = last_modified {
         b = b.header(hyper::header::LAST_MODIFIED, lm);
     }
-    b.body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
-        .unwrap()
+    b.body(full_body(Bytes::new())).unwrap()
 }
 
 /// A `200 OK` file response (or its HEAD twin, with an empty `body`): content
@@ -276,7 +335,7 @@ fn file_response(
     content_length: u64,
     etag: Option<HeaderValue>,
     last_modified: Option<HeaderValue>,
-    body: Bytes,
+    body: ZionBody,
 ) -> Response<ZionBody> {
     let mut b = Response::builder()
         .status(StatusCode::OK)
@@ -289,8 +348,7 @@ fn file_response(
     if let Some(lm) = last_modified {
         b = b.header(hyper::header::LAST_MODIFIED, lm);
     }
-    b.body(Full::new(body).map_err(|n| match n {}).boxed())
-        .unwrap()
+    b.body(body).unwrap()
 }
 
 /// The outcome of evaluating a `Range` header against a file of `total` bytes.
@@ -391,15 +449,24 @@ async fn read_range(
     last_modified: Option<HeaderValue>,
 ) -> Response<ZionBody> {
     let len = end - start + 1;
-    if len > MAX_FILE_BYTES {
-        return resp(StatusCode::PAYLOAD_TOO_LARGE);
-    }
     let mut f = match tokio::fs::File::open(path).await {
         Ok(f) => f,
         Err(_) => return resp(StatusCode::NOT_FOUND),
     };
     if f.seek(SeekFrom::Start(start)).await.is_err() {
         return resp(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    // A large slice streams from the seek position; a small one is read whole.
+    if len > MAX_FILE_BYTES {
+        return partial_response(
+            mime,
+            start,
+            end,
+            total,
+            etag,
+            last_modified,
+            stream_file(f, Some(len)),
+        );
     }
     let mut buf = vec![0u8; len as usize];
     if f.read_exact(&mut buf).await.is_err() {
@@ -414,7 +481,7 @@ async fn read_range(
         total,
         etag,
         last_modified,
-        Bytes::from(buf),
+        full_body(Bytes::from(buf)),
     )
 }
 
@@ -427,7 +494,7 @@ fn partial_response(
     total: u64,
     etag: Option<HeaderValue>,
     last_modified: Option<HeaderValue>,
-    body: Bytes,
+    body: ZionBody,
 ) -> Response<ZionBody> {
     let mut b = Response::builder()
         .status(StatusCode::PARTIAL_CONTENT)
@@ -444,8 +511,7 @@ fn partial_response(
     if let Some(lm) = last_modified {
         b = b.header(hyper::header::LAST_MODIFIED, lm);
     }
-    b.body(Full::new(body).map_err(|n| match n {}).boxed())
-        .unwrap()
+    b.body(body).unwrap()
 }
 
 /// A `416 Range Not Satisfiable` carrying the authoritative total via
@@ -464,8 +530,7 @@ fn range_not_satisfiable(
     if let Some(lm) = last_modified {
         b = b.header(hyper::header::LAST_MODIFIED, lm);
     }
-    b.body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
-        .unwrap()
+    b.body(full_body(Bytes::new())).unwrap()
 }
 
 /// MIME type by extension — a small, closed table (no `mime_guess` dependency).
@@ -1018,5 +1083,55 @@ mod serve_tests {
         let r = get_h(&root.0, "css/main.css", h).await;
         assert_eq!(r.status(), StatusCode::OK, "weak If-Range → full 200");
         assert_eq!(&body_bytes(r).await, b"body{}");
+    }
+
+    // ── Streaming bodies (stream_file) ────────────────────────────────────────
+    // The >MAX_FILE_BYTES serve path just opens the file and hands it to
+    // stream_file; these prove that machinery byte-for-byte without writing a
+    // 64 MiB fixture into the unit suite. The threshold path itself is exercised
+    // live (a >64 MiB file over a real socket).
+
+    async fn collect(body: ZionBody) -> Vec<u8> {
+        body.collect().await.unwrap().to_bytes().to_vec()
+    }
+
+    #[tokio::test]
+    async fn stream_file_whole_seek_and_limit() {
+        let root = root("stream-small"); // css/main.css = "body{}"
+        let path = root.0.join("css/main.css");
+
+        let whole = tokio::fs::File::open(&path).await.unwrap();
+        assert_eq!(&collect(stream_file(whole, None)).await, b"body{}");
+
+        let capped = tokio::fs::File::open(&path).await.unwrap();
+        assert_eq!(&collect(stream_file(capped, Some(3))).await, b"bod");
+
+        // A seek before streaming (how the range path drives it): last 4 bytes.
+        let mut seeked = tokio::fs::File::open(&path).await.unwrap();
+        seeked.seek(SeekFrom::Start(2)).await.unwrap();
+        assert_eq!(&collect(stream_file(seeked, Some(4))).await, b"dy{}");
+    }
+
+    #[tokio::test]
+    async fn stream_file_spans_multiple_chunks() {
+        // A file several STREAM_CHUNKs long exercises the read/send loop across
+        // many frames; the reassembled body must be byte-exact, and a non-chunk-
+        // aligned limit must stop on the exact byte.
+        let root = root("stream-big");
+        let n = STREAM_CHUNK * 3 + 12_345; // spans 4 frames, unaligned tail
+        let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let path = root.0.join("big.bin");
+        std::fs::write(&path, &data).unwrap();
+
+        let whole = tokio::fs::File::open(&path).await.unwrap();
+        let got = collect(stream_file(whole, None)).await;
+        assert_eq!(got.len(), n);
+        assert_eq!(got, data, "whole streamed body must be byte-exact");
+
+        let limit = STREAM_CHUNK + 7; // stop mid-second-chunk
+        let capped = tokio::fs::File::open(&path).await.unwrap();
+        let got = collect(stream_file(capped, Some(limit as u64))).await;
+        assert_eq!(got.len(), limit);
+        assert_eq!(got, data[..limit], "limited stream stops on the exact byte");
     }
 }
