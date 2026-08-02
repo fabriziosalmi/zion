@@ -399,6 +399,9 @@ pub struct Metrics {
     pub rate_limited: ShardedCounter,
     pub cache_hits: ShardedCounter,
     pub cache_misses: ShardedCounter,
+    /// Stale entries revalidated to a 304 (RFC 9111 §4.3) — served from cache
+    /// without re-downloading the body. A subset of "would-have-been misses".
+    pub cache_revalidations: ShardedCounter,
 
     // Global Counters (Cold Path or connection-level)
     pub websocket_upgrades: AtomicU64,
@@ -499,6 +502,7 @@ impl Metrics {
             rate_limited: ShardedCounter::new(),
             cache_hits: ShardedCounter::new(),
             cache_misses: ShardedCounter::new(),
+            cache_revalidations: ShardedCounter::new(),
             websocket_upgrades: AtomicU64::new(0),
             connections_total: AtomicU64::new(0),
             tls_handshake_errors: AtomicU64::new(0),
@@ -719,6 +723,18 @@ impl Metrics {
                                 zion_cache_misses ",
         );
         out.extend_from_slice(itoa_buf.format(self.cache_misses.load(Relaxed)).as_bytes());
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_cache_revalidations Stale entries revalidated to a 304 (served from cache, body not re-downloaded).\n\
+                                # TYPE zion_cache_revalidations counter\n\
+                                zion_cache_revalidations ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.cache_revalidations.load(Relaxed))
+                .as_bytes(),
+        );
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(

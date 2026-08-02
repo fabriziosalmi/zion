@@ -28,6 +28,7 @@ defined in [0000-template.md](0000-template.md).
 | 0015  | [`mode = "static"` — opt-in disk file serving](0015-route-mode-static.md) | accepted |
 | 0016  | [nginx `root`/`try_files`/`index` → `mode = "static"`](0016-importer-nginx-static-mapping.md) | accepted |
 | 0017  | [Audit-log rotation with per-segment chain re-anchoring](0017-audit-log-rotation.md) | accepted |
+| 0018  | [Cache origin-side revalidation (RFC 9111 §4.3)](0018-cache-origin-revalidation.md) | accepted |
 
 ## When to write a new ADR
 

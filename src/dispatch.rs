@@ -1498,11 +1498,15 @@ fn upstream_age(headers: &hyper::HeaderMap) -> u64 {
 /// Content-Encoding, a `Cache-Control` whose `max-age` matches the entry's
 /// freshness lifetime, and the `Age` header so downstream caches subtract
 /// elapsed time instead of resetting their freshness clock on every hit.
-fn cache_hit_response(hit: cache::CacheHit) -> Response<ZionBody> {
+/// Serve a stored body with the given `X-Zion-Cache` disposition. `HIT` = a
+/// fresh hit; `REVALIDATED` = a stale entry the origin confirmed with a 304
+/// (RFC 9111 §4.3), served without re-downloading; `STALE` = stale served on an
+/// origin error (§4.2.4 stale-if-error).
+fn cache_response(hit: cache::CacheHit, disposition: &'static str) -> Response<ZionBody> {
     let mut builder = Response::builder()
         .status(hit.meta.status)
         .header("Cache-Control", profile_cache_control(hit.max_age_secs))
-        .header("X-Zion-Cache", "HIT")
+        .header("X-Zion-Cache", disposition)
         .header(hyper::header::AGE, hit.age_secs);
     if let Some(ct) = &hit.meta.content_type {
         builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
@@ -1513,6 +1517,24 @@ fn cache_hit_response(hit: cache::CacheHit) -> Response<ZionBody> {
     builder
         .body(Full::new(hit.body).map_err(|never| match never {}).boxed())
         .unwrap()
+}
+
+#[inline]
+fn cache_hit_response(hit: cache::CacheHit) -> Response<ZionBody> {
+    cache_response(hit, "HIT")
+}
+
+/// Seed a conditional GET for origin revalidation (RFC 9111 §4.3.1) from a
+/// stale entry's stored validators. `insert` overwrites any client-supplied
+/// conditional header so we revalidate against *our* copy; the origin prefers
+/// `If-None-Match` when both are present (RFC 9110 §13.1.3).
+fn add_conditional_headers(headers: &mut hyper::HeaderMap, meta: &cache::CachedMeta) {
+    if let Some(etag) = &meta.etag {
+        headers.insert(hyper::header::IF_NONE_MATCH, etag.clone());
+    }
+    if let Some(lm) = &meta.last_modified {
+        headers.insert(hyper::header::IF_MODIFIED_SINCE, lm.clone());
+    }
 }
 
 /// Parse the REQUEST's `Cache-Control` for the directives a shared cache honors
@@ -1615,7 +1637,7 @@ fn not_modified_response(hit: &cache::CacheHit) -> Response<ZionBody> {
 }
 
 async fn handle_static_cache(
-    req: Request<ZionBody>,
+    mut req: Request<ZionBody>,
     state: Arc<AppState>,
     rule: &ResolvedRoute,
     remote_addr: SocketAddr,
@@ -1676,22 +1698,38 @@ async fn handle_static_cache(
     // only-if-cached (§5.2.1.7): serve from cache or 504 — never fetch.
     if rcc_only_if_cached {
         return Ok(match state.static_cache.get(&cache_key) {
-            Some(hit) => cache_hit_response(hit),
-            None => cache_only_if_cached_miss(),
+            // only-if-cached (§5.2.1.7) must not contact the origin, so a stale
+            // stored response can't be revalidated → 504, same as a miss.
+            cache::CacheLookup::Fresh(hit) => cache_hit_response(hit),
+            _ => cache_only_if_cached_miss(),
         });
     }
 
-    // RAM hit — zero-copy serve with preserved Content-Type and Content-Encoding,
-    // unless the client demanded a fresh response (`no-cache` / `no-store`).
+    // RAM lookup. `Fresh` → zero-copy serve. `Stale` → keep the body and
+    // revalidate with the origin below (RFC 9111 §4.3) instead of refetching.
+    // `Miss` → fall through to a full fetch. Skipped when the client demanded a
+    // fresh response (`no-cache` / `no-store`).
+    let mut revalidate: Option<cache::CacheHit> = None;
     if !rcc_no_cache && !rcc_no_store {
-        if let Some(hit) = state.static_cache.get(&cache_key) {
-            // Client conditional request (RFC 9110 §13): a matching
-            // If-None-Match / If-Modified-Since → 304 Not Modified, skipping the
-            // body entirely.
-            if client_conditional_hit(req.headers(), &hit.meta) {
-                return Ok(not_modified_response(&hit));
+        match state.static_cache.get(&cache_key) {
+            cache::CacheLookup::Fresh(hit) => {
+                // Client conditional request (RFC 9110 §13): a matching
+                // If-None-Match / If-Modified-Since → 304 Not Modified, skipping
+                // the body entirely.
+                if client_conditional_hit(req.headers(), &hit.meta) {
+                    return Ok(not_modified_response(&hit));
+                }
+                return Ok(cache_hit_response(hit));
             }
-            return Ok(cache_hit_response(hit));
+            cache::CacheLookup::Stale(hit) => {
+                // Only revalidate when we hold a validator; without one a
+                // conditional GET is pointless, so fall through to a full fetch.
+                if hit.meta.etag.is_some() || hit.meta.last_modified.is_some() {
+                    add_conditional_headers(req.headers_mut(), &hit.meta);
+                    revalidate = Some(hit);
+                }
+            }
+            cache::CacheLookup::Miss => {}
         }
     }
 
@@ -1714,11 +1752,13 @@ async fn handle_static_cache(
         // In both Ok and Err cases we re-check the cache; on miss we fall
         // through to fetch ourselves.
         let _ = rx.wait_for(|v| *v).await;
-        if let Some(hit) = state.static_cache.get(path_owned.as_ref()) {
+        if let Some(hit) = state.static_cache.get(path_owned.as_ref()).fresh() {
             // get() already counted this hit — don't double-count it here.
             return Ok(cache_hit_response(hit));
         }
-        // Cache miss even after wait — fall through to fetch from upstream
+        // Cache miss (or stale) even after wait — fall through to fetch from
+        // upstream, which re-populates (a stale re-check here is rare: the
+        // fetcher we waited on just stored a fresh entry).
     }
 
     // Register as the inflight fetcher for this key.
@@ -1745,10 +1785,45 @@ async fn handle_static_cache(
         Ok(r) => r,
         Err(e) => {
             state.inflight.remove(&path_owned);
+            // stale-if-error (RFC 9111 §4.2.4): if we were revalidating a stale
+            // entry and the origin is unreachable, serve the stale body rather
+            // than fail — a flapping origin doesn't take cached content down.
+            if let Some(hit) = revalidate {
+                return Ok(cache_response(hit, "STALE"));
+            }
             // tx drops at end of scope → channel closed → waiters get Err
             return Err(e);
         }
     };
+
+    // Revalidation outcome (RFC 9111 §4.3): a 304 confirms the stored entry is
+    // still good — revive its freshness and serve the stored body without the
+    // re-download. A 200 (or anything else) falls through to the normal
+    // store-and-serve path, replacing the stale entry with the new content.
+    if let Some(hit) = revalidate {
+        if resp.status() == StatusCode::NOT_MODIFIED {
+            let initial_age = upstream_age(resp.headers());
+            let effective_ttl = origin_freshness(resp.headers())
+                .map(|o| o.min(cache_ttl))
+                .unwrap_or(cache_ttl);
+            state.static_cache.refresh(
+                &path_owned,
+                hit.body.clone(),
+                hit.meta.clone(),
+                effective_ttl,
+                initial_age,
+                cache_max,
+            );
+            state.inflight.remove(&path_owned);
+            let _ = tx.send(true); // waiters observe the revived (fresh) entry
+            crate::metrics::METRICS
+                .cache_revalidations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(cache_response(hit, "REVALIDATED"));
+        }
+        // else: origin returned new content (200) or a non-304 status — drop the
+        // stale hit and let the normal path below store/serve the fresh response.
+    }
 
     // Only cache 200 OK responses
     if resp.status() == StatusCode::OK {
