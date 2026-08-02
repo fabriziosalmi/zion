@@ -253,18 +253,27 @@ async fn resolve_sidecar(canon_root: &Path, path: &Path, ext: &str) -> Option<Pa
     }
 }
 
-/// Is `coding` acceptable per an `Accept-Encoding` value? True when it (or `*`)
-/// appears with a non-zero q-value (RFC 9110 §12.5.3). A tiny parser — enough for
-/// static-asset negotiation, not a full q-value ranking.
+/// Is `coding` acceptable per an `Accept-Encoding` value (RFC 9110 §12.5.3)? An
+/// **explicit** entry for the coding governs and overrides the wildcard — so
+/// `br;q=0` refuses Brotli even alongside `*;q=1`. Only when the coding is not
+/// listed explicitly does a `*` entry's q-value decide. A tiny parser: enough for
+/// static-asset negotiation, not a full preference ranking.
 fn accepts(accept_encoding: &str, coding: &str) -> bool {
-    accept_encoding.split(',').any(|part| {
+    let mut wildcard: Option<f32> = None;
+    for part in accept_encoding.split(',') {
         let part = part.trim();
         let (name, q) = match part.split_once(';') {
             Some((n, params)) => (n.trim(), parse_q(params)),
             None => (part, 1.0),
         };
-        (name.eq_ignore_ascii_case(coding) || name == "*") && q > 0.0
-    })
+        if name.eq_ignore_ascii_case(coding) {
+            return q > 0.0; // explicit entry wins, wildcard notwithstanding
+        }
+        if name == "*" {
+            wildcard = Some(q);
+        }
+    }
+    wildcard.is_some_and(|q| q > 0.0)
 }
 
 /// Extract the `q=` weight from `Accept-Encoding` element params (default 1.0).
@@ -861,6 +870,13 @@ mod tests {
         assert!(!accepts("", "br")); // empty
         assert!(!accepts("br;q=0", "br")); // explicitly refused
         assert!(!accepts("gzip, *;q=0", "br")); // wildcard refused
+
+        // An explicit entry overrides the wildcard (RFC 9110 §12.5.3), in either
+        // order — a client can accept everything yet refuse Brotli.
+        assert!(!accepts("*;q=1, br;q=0", "br"));
+        assert!(!accepts("br;q=0, *;q=1", "br"));
+        assert!(accepts("*;q=0, br;q=1", "br")); // …or refuse all but Brotli
+        assert!(accepts("*;q=0, br", "br")); // explicit br (implicit q=1) wins
     }
 }
 
