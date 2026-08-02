@@ -1,18 +1,30 @@
-# Equivalence harness — `zion import nginx`
+# Equivalence harness — `zion import <nginx|caddy|traefik>`
 
 The migration pitch for [`zion import`](../../docs/adr/0011-zion-import-nginx.md)
 is only as good as its proof. This harness produces that proof with **real
-instances, no mocks**: it converts an nginx config, then shows that real Zion
-serving the converted config routes requests the same way the real nginx
-serving the original does — and that the handful of intentional differences
-are exactly the ones the import report already flagged.
+instances, no mocks**: it converts an incumbent proxy config, then shows that
+real Zion serving the converted config routes requests the same way the real
+proxy serving the original does — and that the handful of intentional
+differences are exactly the ones the import report already flagged.
+
+The **source is auto-detected** from the scenario directory:
+
+| file present | source | how the original runs |
+|---|---|---|
+| `nginx.conf` | nginx | real `nginx:alpine`, echo backends on `zeq-net` |
+| `Caddyfile` | caddy | real `caddy:alpine`, echo backends on `zeq-net` |
+| `docker-compose.yml` | traefik | real traefik via `docker compose up` (the compose file provides its own label-routed backends; needs `docker compose`) |
+
+Shipped scenarios: `multi-vhost` (nginx), `caddy-basic` (caddy), `traefik-compose`
+(traefik). Each column of the corpus is verified — Zion's live against the
+imported config, the incumbent's against the original.
 
 ## What it does
 
-For a scenario (a real `nginx.conf` plus a request corpus), `run.sh`:
+For a scenario, `run.sh`:
 
-1. starts **real nginx** (`nginx:alpine`) on the scenario's config,
-2. runs **`zion import nginx`** on that *same* config and prints the findings,
+1. starts the **real original proxy** on the scenario's config,
+2. runs **`zion import <src>`** on that *same* config and prints the findings,
 3. starts **real Zion** on the converted `zion.toml`,
 4. replays every `(Host, path)` request in the corpus against **both**,
 5. diffs the backend that answered — request by request.

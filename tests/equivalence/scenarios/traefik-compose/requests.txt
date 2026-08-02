@@ -1,0 +1,18 @@
+# Replay corpus: HOST PATH EXPECT_TRAEFIK EXPECT_ZION
+# Zion's column is verified live (zion serving the imported config); Traefik's
+# is what real traefik does with the same labels. `404` = no router matched.
+# Traefik has no default router, so an unmatched host or path is a 404 on both.
+alpha.example.com    /                      alpha    alpha
+alpha.example.com    /deep/path             alpha    alpha
+beta.example.com     /                      beta     beta
+api.example.com      /v1/users              users    users
+api.example.com      /v1/users/42           users    users
+api.example.com      /v1/orders             legacy   legacy
+api.example.com      /v1                    legacy   legacy
+api.example.com      /other                 404      404
+unknown.example.com  /                      404      404
+# Documented divergence (string prefix vs path segments): traefik's
+# PathPrefix(`/v1/users`) matches `/v1/users999` by string prefix -> users;
+# Zion imports it as `/v1/users/{*rest}` (segment-matched) so `/v1/users999`
+# falls to `/v1` -> legacy.
+api.example.com      /v1/users999           users    legacy

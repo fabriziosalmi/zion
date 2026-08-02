@@ -1,6 +1,7 @@
-# Equivalence harness: prove `zion import nginx` routes like the nginx it
-# converted, on real instances. Runs the branch binary (ZION_BIN mode), so a
-# mapper regression is caught before merge.
+# Equivalence harness: prove `zion import <nginx|caddy|traefik>` routes like the
+# proxy it converted, on real instances (real nginx / caddy / traefik vs real
+# zion serving the imported config). Runs the branch binary (ZION_BIN mode), so
+# a mapper regression in any of the three front-ends is caught before merge.
 name: equivalence
 
 on:
@@ -41,8 +42,20 @@ jobs:
           rustc --version && cargo --version
           cargo build --release --locked --bin zion
 
-      - name: Run the equivalence harness (branch binary vs real nginx)
+      - name: Equivalence — nginx (multi-vhost)
         env:
           ZION_BIN: target/release/zion
           NO_COLOR: "1"
         run: ./tests/equivalence/run.sh multi-vhost
+
+      - name: Equivalence — caddy (caddy-basic)
+        env:
+          ZION_BIN: target/release/zion
+          NO_COLOR: "1"
+        run: ./tests/equivalence/run.sh caddy-basic
+
+      - name: Equivalence — traefik (traefik-compose, real traefik via docker compose)
+        env:
+          ZION_BIN: target/release/zion
+          NO_COLOR: "1"
+        run: ./tests/equivalence/run.sh traefik-compose
