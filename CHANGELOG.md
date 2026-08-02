@@ -4,6 +4,42 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-08-03
+
+### Added
+- **`mode = "static"` runtime maturity — full nginx/Caddy asset parity.** The
+  disk file server (ADR-0015) gained the four HTTP behaviors real static hosting
+  needs, each proven live over a real socket:
+  - **Conditional GET** (ADR-0019, #340): a weak `ETag` (`W/"len-secs.nanos"`) +
+    `Last-Modified` derived from file metadata; `If-None-Match` /
+    `If-Modified-Since` are answered with a bodiless **304 Not Modified** (GET and
+    HEAD). The 304 decision is shared with the cache path via a new
+    `http_conditional` module; the required HTTP-date formatter is dependency-free
+    (no date crate in the core MSRV graph).
+  - **Range requests** (ADR-0020, #341): single-range `Range: bytes=…` →
+    **206 Partial Content** with `Content-Range` (served via seek), `416` when
+    unsatisfiable, `Accept-Ranges: bytes` advertised; `If-Range` honored.
+  - **Streaming** (ADR-0021, #342): files above 64 MiB now stream frame-by-frame
+    with bounded (~576 KiB) memory instead of returning `413` — **no file-size
+    limit** on a static route (video / install images serve fine). Applies to
+    ranged reads too.
+  - **Precompressed sidecars** (ADR-0022, #343): opt-in `precompressed = true`
+    serves a `.br`/`.gz` sidecar (Brotli preferred) when `Accept-Encoding` allows,
+    with the original `Content-Type` + `Content-Encoding` + `Vary: Accept-Encoding`
+    (like nginx `gzip_static`). Sidecars go through the same path-safety guard;
+    Zion never compresses on the fly.
+
+### Testing
+- **End-to-end rule-matrix** (#339): the integration suite gained live auth
+  (JWT/HS256), CORS, and **rule-composition** coverage — one route stacking
+  `waf + auth + cors` proves the middlewares compose (a valid token does not let a
+  malformed body bypass the WAF). The integration workflow now builds
+  `--features auth` so the gate is enforced.
+
+### Docs
+- Slowed the README "Migrating from nginx" terminal animation to a readable pace
+  (#344).
+
 ## [0.7.2] - 2026-07-31
 
 ### Added
