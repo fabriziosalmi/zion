@@ -1206,7 +1206,14 @@ async fn process_request_inner(
                         .strip_prefix(rule.static_prefix.as_str())
                         .unwrap_or(path)
                         .trim_start_matches('/');
-                    crate::static_files::serve(dir, tail, rule.spa_fallback, req.method()).await
+                    crate::static_files::serve(
+                        dir,
+                        tail,
+                        rule.spa_fallback,
+                        req.method(),
+                        req.headers(),
+                    )
+                    .await
                 }
                 // Unreachable (resolve_route requires serve_dir) — fail CLOSED
                 // rather than serve the process CWD if a future refactor slips.
@@ -1576,41 +1583,17 @@ fn cache_only_if_cached_miss() -> Response<ZionBody> {
         .unwrap()
 }
 
-/// Strip a weak-ETag `W/` prefix for the weak comparison `If-None-Match` uses
-/// (RFC 9110 §8.8.3.2).
-fn strip_weak(etag: &str) -> &str {
-    etag.strip_prefix("W/").unwrap_or(etag)
-}
-
 /// Does a client conditional request match this cached entry — i.e. can we
-/// answer 304 Not Modified? RFC 9110 §13.1: `If-None-Match` takes precedence
-/// (weak comparison; `*` matches any stored entry); otherwise `If-Modified-Since`
-/// is honored as an exact echo of the stored `Last-Modified` (the dominant
-/// browser revalidation pattern — full HTTP-date comparison is a follow-up).
+/// answer 304 Not Modified? Thin adapter over the shared
+/// [`crate::http_conditional::is_not_modified`] decision (RFC 9110 §13.1),
+/// sourcing the validators from the cached representation's metadata so the 304
+/// semantics stay identical to the static file server's.
 fn client_conditional_hit(req_headers: &hyper::HeaderMap, meta: &cache::CachedMeta) -> bool {
-    if let Some(inm) = req_headers
-        .get(hyper::header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-    {
-        let inm = inm.trim();
-        if inm == "*" {
-            return true;
-        }
-        let stored = match meta.etag.as_ref().and_then(|e| e.to_str().ok()) {
-            Some(e) => strip_weak(e.trim()),
-            None => return false,
-        };
-        return inm.split(',').any(|t| strip_weak(t.trim()) == stored);
-    }
-    if let (Some(ims), Some(lm)) = (
-        req_headers
-            .get(hyper::header::IF_MODIFIED_SINCE)
-            .and_then(|v| v.to_str().ok()),
-        meta.last_modified.as_ref().and_then(|v| v.to_str().ok()),
-    ) {
-        return ims.trim() == lm.trim();
-    }
-    false
+    crate::http_conditional::is_not_modified(
+        req_headers,
+        meta.etag.as_ref(),
+        meta.last_modified.as_ref(),
+    )
 }
 
 /// 304 Not Modified from a cache hit — preserved validators + freshness, no body
