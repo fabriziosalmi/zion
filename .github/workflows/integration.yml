@@ -51,8 +51,11 @@ jobs:
       - name: Generate self-signed cert
         run: bash benchmarks/certs/generate.sh
 
-      - name: Build zion (release)
-        run: cargo build --release --bin zion
+      - name: Build zion (release, --features auth)
+        # `auth` is enabled so the e2e rule-matrix (auth + kitchen-sink combo
+        # routes in zion-test.toml) is actually enforced, not warned-off. This
+        # job runs on stable Rust — unrelated to the 1.82 MSRV core job.
+        run: cargo build --release --features auth --bin zion
 
       - name: Build test backend (release)
         run: cargo build --release --manifest-path benchmarks/backend/Cargo.toml

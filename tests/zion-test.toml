@@ -71,6 +71,42 @@ path = "/"
 upstream = "backend"
 mode = "standard"
 
+# ── e2e rule-matrix (comprehensive coverage — auth/cors/combos) ──────────────
+# These prove features work end-to-end AND compose. Host-based routing is
+# covered separately by the equivalence harness (tests/equivalence/multi-vhost).
+
+# CORS per-route: zion injects Access-Control-* / answers the preflight; the
+# backend 200s any path.
+[[route]]
+path = "/cors/{*rest}"
+upstream = "backend"
+mode = "standard"
+cors = { allowed_origins = ["https://trusted.example"], allowed_headers = ["X-Custom"], max_age = 600 }
+
+# Auth (JWT HS256) — ENFORCED only when zion is built with `--features auth`
+# (the integration workflow builds with it). The lean default build parses this
+# but warns "auth feature off" and does NOT gate.
+[auth_profile.e2e]
+secret = "e2e-jwt-secret-at-least-32-bytes-long!"
+algorithm = "HS256"
+
+[[route]]
+path = "/auth/{*rest}"
+upstream = "backend"
+mode = "standard"
+auth_profile = "e2e"
+
+# Kitchen-sink combo: WAF + auth + CORS stacked on ONE route. Proves the
+# middlewares compose — auth gates an unauthenticated request; a valid token +
+# clean GET passes with the CORS header; a malformed JSON body is WAF-blocked.
+[[route]]
+path = "/combo/{*rest}"
+upstream = "backend"
+mode = "standard"
+waf = true
+auth_profile = "e2e"
+cors = { allowed_origins = ["https://trusted.example"] }
+
 # Catch-all (HTML/SSR)
 [[route]]
 path = "/{*rest}"

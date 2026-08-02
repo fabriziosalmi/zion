@@ -1,21 +1,37 @@
 # gitleaks configuration for Zion.
 #
-# Extends the upstream default ruleset and allowlists exactly one thing: the
-# benchmark self-signed TLS material. Those are throwaway `CN=bench.local` keys
-# generated on demand by `benchmarks/certs/generate.sh` (SAN bench.local /
-# localhost / 127.0.0.1) — never production secrets. One such key was committed
-# once (commit ad2c337, 2026-04-12) before `benchmarks/certs/*.key` was
-# gitignored; it is self-signed, superseded (a different key from the current
-# local one), and worthless to anyone, but it remains in git history, so we
-# allowlist the path to keep the full-history scan green rather than rewrite
-# history for a test key.
+# Extends the upstream default ruleset. Two allowlisted findings, both test
+# fixtures — never production secrets:
+#
+#  1. Benchmark self-signed TLS material — throwaway `CN=bench.local` keys
+#     generated on demand by `benchmarks/certs/generate.sh` (SAN bench.local /
+#     localhost / 127.0.0.1). One such key was committed once (commit ad2c337,
+#     2026-04-12) before `benchmarks/certs/*.key` was gitignored; it is
+#     self-signed, superseded (a different key from the current local one), and
+#     worthless to anyone, but it remains in git history, so we allowlist the
+#     path to keep the full-history scan green rather than rewrite history for a
+#     test key.
+#
+#  2. The e2e integration auth fixture — `E2E_JWT` in tests/integration.rs, a
+#     self-contained HS256 token whose signing secret is published in plain
+#     sight in tests/zion-test.toml (`e2e-jwt-secret-...`). It exists only to
+#     drive the auth gate in the #[ignore]d integration tests; its `exp` is year
+#     2100 so it never ages out, and it signs nothing real. Allowlisted by its
+#     exact value (not by path) so the scanner keeps watching the rest of that
+#     file for genuine leaks.
 title = "Zion"
 
 [extend]
 useDefault = true
 
-[allowlist]
+[[allowlists]]
 description = "Benchmark self-signed test certs (CN=bench.local) — not production secrets"
 paths = [
   '''benchmarks/certs/.*''',
+]
+
+[[allowlists]]
+description = "e2e integration auth fixture (HS256 test JWT; secret published in tests/zion-test.toml)"
+regexes = [
+  '''eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9\.eyJzdWIiOiAiZTJlLXVzZXIiLCAiZW1haWwiOiAiZTJlQHppb24udGVzdCIsICJleHAiOiA0MTAyNDQ0ODAwfQ\.i2pofCwQa8-IJSCFrmqGu2kcWwH-fdsSZ_ootnYQblc''',
 ]
