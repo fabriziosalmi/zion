@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::{Method, Response, StatusCode};
+use hyper::header::HeaderValue;
+use hyper::{HeaderMap, Method, Response, StatusCode};
 
 use crate::proxy::ZionBody;
 
@@ -106,6 +107,7 @@ pub async fn serve(
     tail: &str,
     spa_fallback: bool,
     method: &Method,
+    req_headers: &HeaderMap,
 ) -> Response<ZionBody> {
     if method != Method::GET && method != Method::HEAD {
         return resp(StatusCode::METHOD_NOT_ALLOWED);
@@ -120,11 +122,11 @@ pub async fn serve(
     };
 
     if let Some(path) = resolve_file(&canon_root, &rel).await {
-        return read_file(&path, method).await;
+        return read_file(&path, method, req_headers).await;
     }
     if spa_fallback {
         if let Some(index) = resolve_file(&canon_root, Path::new("index.html")).await {
-            return read_file(&index, method).await;
+            return read_file(&index, method, req_headers).await;
         }
     }
     resp(StatusCode::NOT_FOUND)
@@ -155,40 +157,111 @@ async fn resolve_file(canon_root: &Path, rel: &Path) -> Option<PathBuf> {
     }
 }
 
-async fn read_file(path: &Path, method: &Method) -> Response<ZionBody> {
+async fn read_file(path: &Path, method: &Method, req_headers: &HeaderMap) -> Response<ZionBody> {
+    let meta = match tokio::fs::metadata(path).await {
+        Ok(m) => m,
+        Err(_) => return resp(StatusCode::NOT_FOUND),
+    };
+    let (etag, last_modified) = validators(&meta);
+
+    // Conditional request: a fresh validator answers 304 (no body) for GET *and*
+    // HEAD (RFC 9110 §15.4.5). This is the whole point of the feature — a
+    // revalidating client gets bytes back only when the file actually changed.
+    if crate::http_conditional::is_not_modified(req_headers, etag.as_ref(), last_modified.as_ref())
+    {
+        return not_modified(etag, last_modified);
+    }
+
     // HEAD needs only the length — never read the bytes into memory (a HEAD to a
     // huge file would otherwise be a cheap memory-amplification DoS).
     if method == Method::HEAD {
-        let len = match tokio::fs::metadata(path).await {
-            Ok(m) => m.len(),
-            Err(_) => return resp(StatusCode::NOT_FOUND),
-        };
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, mime_for(path))
-            .header(hyper::header::CONTENT_LENGTH, len)
-            .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
-            .unwrap();
+        return file_response(
+            mime_for(path),
+            meta.len(),
+            etag,
+            last_modified,
+            Bytes::new(),
+        );
     }
+
     // Cap the whole-file in-memory read (streaming is a deferred follow-up,
     // ADR-0015): refuse an oversized file rather than buffering it whole, which
     // would be a memory-amplification DoS under concurrency.
     const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-    match tokio::fs::metadata(path).await {
-        Ok(m) if m.len() > MAX_FILE_BYTES => return resp(StatusCode::PAYLOAD_TOO_LARGE),
-        Ok(_) => {}
-        Err(_) => return resp(StatusCode::NOT_FOUND),
+    if meta.len() > MAX_FILE_BYTES {
+        return resp(StatusCode::PAYLOAD_TOO_LARGE);
     }
     let data = match tokio::fs::read(path).await {
         Ok(d) => d,
         Err(_) => return resp(StatusCode::NOT_FOUND),
     };
-    let len = data.len();
-    Response::builder()
+    let len = data.len() as u64;
+    file_response(mime_for(path), len, etag, last_modified, Bytes::from(data))
+}
+
+/// Derive the `(ETag, Last-Modified)` validators from file metadata. The ETag is
+/// *weak* (`W/"len-secs.nanos"`): `len`+`mtime` is a cheap change fingerprint,
+/// not a byte-for-byte content hash, so it must never be used for a strong
+/// comparison (RFC 9110 §8.8.1) — which is exactly why `If-Range` byte-range
+/// reuse is deferred to the range follow-up. Either validator is `None` when the
+/// platform can't supply an mtime; the file still serves, just without
+/// revalidation.
+fn validators(meta: &std::fs::Metadata) -> (Option<HeaderValue>, Option<HeaderValue>) {
+    let dur = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    let etag = dur.and_then(|d| {
+        HeaderValue::from_str(&format!(
+            "W/\"{:x}-{:x}.{:x}\"",
+            meta.len(),
+            d.as_secs(),
+            d.subsec_nanos()
+        ))
+        .ok()
+    });
+    let last_modified = dur.and_then(|d| {
+        HeaderValue::from_str(&crate::http_conditional::fmt_imf_fixdate(d.as_secs())).ok()
+    });
+    (etag, last_modified)
+}
+
+/// A `304 Not Modified` — validators preserved, no body (RFC 9110 §15.4.5).
+fn not_modified(
+    etag: Option<HeaderValue>,
+    last_modified: Option<HeaderValue>,
+) -> Response<ZionBody> {
+    let mut b = Response::builder().status(StatusCode::NOT_MODIFIED);
+    if let Some(e) = etag {
+        b = b.header(hyper::header::ETAG, e);
+    }
+    if let Some(lm) = last_modified {
+        b = b.header(hyper::header::LAST_MODIFIED, lm);
+    }
+    b.body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+        .unwrap()
+}
+
+/// A `200 OK` file response (or its HEAD twin, with an empty `body`): content
+/// headers plus the revalidation validators the client echoes back next time.
+fn file_response(
+    mime: &'static str,
+    content_length: u64,
+    etag: Option<HeaderValue>,
+    last_modified: Option<HeaderValue>,
+    body: Bytes,
+) -> Response<ZionBody> {
+    let mut b = Response::builder()
         .status(StatusCode::OK)
-        .header(hyper::header::CONTENT_TYPE, mime_for(path))
-        .header(hyper::header::CONTENT_LENGTH, len)
-        .body(Full::new(Bytes::from(data)).map_err(|n| match n {}).boxed())
+        .header(hyper::header::CONTENT_TYPE, mime)
+        .header(hyper::header::CONTENT_LENGTH, content_length);
+    if let Some(e) = etag {
+        b = b.header(hyper::header::ETAG, e);
+    }
+    if let Some(lm) = last_modified {
+        b = b.header(hyper::header::LAST_MODIFIED, lm);
+    }
+    b.body(Full::new(body).map_err(|n| match n {}).boxed())
         .unwrap()
 }
 
@@ -322,10 +395,22 @@ mod serve_tests {
     }
 
     async fn get(root: &Path, tail: &str, spa: bool) -> (StatusCode, String) {
-        let r = serve(root, tail, spa, &Method::GET).await;
+        let r = serve(root, tail, spa, &Method::GET, &HeaderMap::new()).await;
         let status = r.status();
         let body = r.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// GET with a set of request headers; returns the full response so tests can
+    /// inspect status + response headers (validators, 304, …).
+    async fn get_h(root: &Path, tail: &str, req: HeaderMap) -> Response<ZionBody> {
+        serve(root, tail, false, &Method::GET, &req).await
+    }
+
+    fn one(k: hyper::header::HeaderName, v: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(k, HeaderValue::from_str(v).unwrap());
+        h
     }
 
     #[tokio::test]
@@ -379,7 +464,14 @@ mod serve_tests {
     async fn head_returns_length_without_reading_the_body() {
         // F2: HEAD must report Content-Length without buffering the file.
         let root = root("head");
-        let r = serve(&root.0, "css/main.css", false, &Method::HEAD).await;
+        let r = serve(
+            &root.0,
+            "css/main.css",
+            false,
+            &Method::HEAD,
+            &HeaderMap::new(),
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::OK);
         assert_eq!(
             r.headers().get(hyper::header::CONTENT_LENGTH).unwrap(),
@@ -387,5 +479,116 @@ mod serve_tests {
         );
         let body = r.into_body().collect().await.unwrap().to_bytes();
         assert!(body.is_empty());
+    }
+
+    // ── Conditional GET (ETag / Last-Modified → 304) ──────────────────────────
+
+    #[tokio::test]
+    async fn a_200_carries_both_validators() {
+        let root = root("cond-200");
+        let r = get_h(&root.0, "css/main.css", HeaderMap::new()).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let et = r.headers().get(hyper::header::ETAG).expect("ETag present");
+        assert!(
+            et.to_str().unwrap().starts_with("W/\""),
+            "ETag should be weak, got {et:?}"
+        );
+        assert!(
+            r.headers().get(hyper::header::LAST_MODIFIED).is_some(),
+            "Last-Modified present"
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_if_none_match_is_304_with_no_body() {
+        let root = root("cond-inm");
+        // First fetch to learn the ETag the server minted for this file.
+        let first = get_h(&root.0, "css/main.css", HeaderMap::new()).await;
+        let etag = first
+            .headers()
+            .get(hyper::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        // Re-request with it: must be a bodiless 304 that still echoes the ETag.
+        let second = get_h(
+            &root.0,
+            "css/main.css",
+            one(hyper::header::IF_NONE_MATCH, &etag),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            second.headers().get(hyper::header::ETAG).unwrap(),
+            etag.as_str()
+        );
+        let body = second.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty(), "304 must carry no body");
+    }
+
+    #[tokio::test]
+    async fn matching_if_modified_since_is_304() {
+        let root = root("cond-ims");
+        let first = get_h(&root.0, "css/main.css", HeaderMap::new()).await;
+        let lm = first
+            .headers()
+            .get(hyper::header::LAST_MODIFIED)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let second = get_h(
+            &root.0,
+            "css/main.css",
+            one(hyper::header::IF_MODIFIED_SINCE, &lm),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn stale_if_none_match_still_serves_200() {
+        let root = root("cond-stale");
+        let r = get_h(
+            &root.0,
+            "css/main.css",
+            one(hyper::header::IF_NONE_MATCH, "W/\"deadbeef-0.0\""),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = r.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"body{}");
+    }
+
+    #[tokio::test]
+    async fn if_none_match_star_is_304() {
+        let root = root("cond-star");
+        let r = get_h(
+            &root.0,
+            "css/main.css",
+            one(hyper::header::IF_NONE_MATCH, "*"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn conditional_head_also_304s() {
+        // A HEAD that carries a matching validator must 304 too, not 200.
+        let root = root("cond-head");
+        let first = serve(
+            &root.0,
+            "css/main.css",
+            false,
+            &Method::HEAD,
+            &HeaderMap::new(),
+        )
+        .await;
+        let etag = first.headers().get(hyper::header::ETAG).unwrap().clone();
+        let mut h = HeaderMap::new();
+        h.insert(hyper::header::IF_NONE_MATCH, etag);
+        let second = serve(&root.0, "css/main.css", false, &Method::HEAD, &h).await;
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
     }
 }

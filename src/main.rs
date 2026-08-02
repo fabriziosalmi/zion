@@ -53,6 +53,7 @@ mod connlimit;
 mod doctor;
 mod error;
 mod health;
+mod http_conditional;
 mod import;
 mod init;
 mod listener;

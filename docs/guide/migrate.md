@@ -147,6 +147,13 @@ upstream = "backend"
 request URI while Zion strips the route prefix, so the two cancel out to the same
 on-disk path.
 
+Served files carry a weak `ETag` and a `Last-Modified` derived from the file's
+size and mtime, and a revalidating client (`If-None-Match` / `If-Modified-Since`)
+gets a bodiless **304 Not Modified** when the file is unchanged — the same
+browser-caching behavior nginx gives you out of the box, so a cut-over doesn't
+regress asset revalidation. (Range requests and streaming of very large files are
+tracked follow-ups; today a file is served whole, capped at 64 MiB.)
+
 ## Verify before you cut over
 
 Treat the import as a proposal, not a fait accompli:
