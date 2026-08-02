@@ -4,6 +4,39 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-07-31
+
+### Added
+- **Cache origin-side revalidation** (RFC 9111 §4.3, ADR-0018). A stale cache
+  entry is now revalidated with the origin via a conditional GET instead of
+  evicted and fully re-downloaded. On a `304 Not Modified` the stored body is
+  reused and served as `X-Zion-Cache: REVALIDATED` (counted by
+  `zion_cache_revalidations`); an origin error during revalidation serves the
+  stale body (`X-Zion-Cache: STALE`, stale-if-error §4.2.4). `StaticCache::get()`
+  now returns a three-valued `CacheLookup { Fresh | Stale | Miss }`.
+- **Audit-log rotation** (ADR-0017). The HMAC-chained audit log gained
+  size-based rotation with retention — `[audit].max_size_mb` (default 100) +
+  `max_files` (default 10) — so an enabled log is bounded on disk (~1.1 GB by
+  default). Each rotated segment re-anchors the chain at genesis with a
+  `chain_rotate` marker, so segments verify independently.
+- **ACME soak fault-injection legs.** `zion acme-soak` gained `key-rollover`
+  (discard the account, re-issue, assert a fresh account) and `ttl-edge` (assert
+  the renewal trigger fires at the `renew_before_days` edge) modes, run as a
+  matrix against Pebble in CI (issue #134). `nonce-collision` remains deferred
+  (needs per-request `badNonce` retry, not exposed by instant-acme 0.8.x).
+
+### Changed
+- **The AIMP mesh reputation table is now bounded** (issue #287): a 24-hour TTL
+  plus a 100k-entry cap with amortized eviction, so a long-lived mesh cannot grow
+  it without limit. Behind the `sovereign-aimp` feature (off by default).
+
+### Fixed
+- **`cargo-audit` CI (and master) went red** after v0.7.1 removed
+  `RUSTSEC-2026-0002`/`-0186` from the ignore lists on the strength of
+  cargo-deny's report — but cargo-audit scans the flat lockfile and still flags
+  them under `--deny unsound`. Re-ignored for cargo-audit only (not `deny.toml`,
+  where a not-detected id trips cargo-deny).
+
 ## [0.7.1] - 2026-07-31
 
 ### Changed
