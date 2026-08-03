@@ -12,9 +12,11 @@ our own `127.0.0.1` loopback, the goal is training a defensive WAF model.
 
 | file | role |
 |------|------|
-| `capture_server.py` | 127.0.0.1 HTTP server that logs every request (method/uri/headers) to JSONL and answers 200 |
-| `generate_traffic.py` | `--mode attack` replays SecLists payloads (LFI/cmdi/XSS) into varied shapes; `--mode benign` emits realistic traffic |
+| `capture_server.py` | 127.0.0.1 HTTP server that logs every request (method/uri/headers/**body**) to JSONL and answers 200 |
+| `generate_traffic.py` | `--mode attack` replays SecLists payloads (LFI/cmdi/XSS) into varied shapes (query/path/header/**POST body**); `--mode benign` emits realistic traffic (incl. matched POST bodies) |
 | `train_from_traffic.py` | featurizes the captured JSONL, trains the MLP, exports ONNX, and cross-source-evals on the CSIC sample |
+| `features_body.py` | body-aware extension: the 16 URI+header features **+ 6 structural body features** → a 22-dim vector |
+| `train_body.py` | A/B: trains 16-dim vs 22-dim on the same traffic, evals both on CSIC, + a **matched-cohort** isolation test (body is the only signal) |
 
 ## Reproduce
 
@@ -62,3 +64,32 @@ Two solid conclusions:
 Next real levers (each an explicit-go follow-up): **body-aware features**, and a
 **full, diverse real eval corpus**. More scanners alone are diminishing returns.
 Nothing here is shipped; see [ADR-0023](../../docs/adr/0023-ml-waf-training-pipeline.md).
+
+## Body-aware features (2026-08-03) — proven in isolation, blocked on data
+
+Follow-up lever #1, built and A/B-tested (`features_body.py` + `train_body.py`):
+6 structural body features (length, byte-entropy, special/`%`/digit/unprintable
+ratios) → a 22-dim extractor. Verdict:
+
+| test | 16 (URI+header) | 22 (+body) |
+|------|:---:|:---:|
+| in-distribution AUC | 0.992 | 0.999 |
+| CSIC anomalous detected | 0/9 | 0/9 |
+| **matched cohort** (body is the *only* signal) | **AUC 0.49** (chance) | **AUC 0.93** |
+
+The **matched cohort** is the decisive test: method+URI+headers held identical
+across classes, only the body varies. There the 22-dim model separates attack from
+benign (AUC 0.93) while the 16-dim model is at chance (0.49, body-blind by
+construction) — so **the body features carry real signal**. Yet they add nothing on
+captured/CSIC traffic, because those classes differ in a *non-body* dimension
+(endpoint, then `Authorization`-header presence) the model shortcuts on, never
+weighting the body. This is the **third instance** of the same root cause: the
+ceiling is **data realism**, not features. Body features only contribute when
+training data is structurally matched and differs in the payload — i.e. **real
+production traffic self-labeled by the deployed rule engine**. The 22-dim extractor
+is proven and ready to port to Rust *once such data exists*; the shipped scorer
+stays 16-dim (no model ships regardless).
+
+```bash
+python3 ml/attack_lab/train_body.py   # runs the A/B + the matched-cohort isolation
+```

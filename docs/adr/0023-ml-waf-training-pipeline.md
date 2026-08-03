@@ -132,3 +132,48 @@ Confirmed follow-up levers (explicit-go): **body-aware features** and a **full,
 diverse real eval corpus**. More scanners are diminishing returns. Still nothing
 shipped; the lab's captured traffic and models are gitignored. See
 `ml/attack_lab/README.md`.
+
+## Update — body-aware features: proven in isolation, blocked on data realism (2026-08-03)
+
+The first follow-up lever (body-aware features) was built and A/B-tested. Six
+**structural** body features (length, byte-entropy, special/`%`/digit ratios,
+unprintable ratio) were added → a **22-dim** extractor (`ml/attack_lab/features_body.py`),
+the capture server and traffic generator were extended to carry POST bodies, and
+16-dim vs 22-dim models were trained on the same captured traffic
+(`ml/attack_lab/train_body.py`). Two findings, one negative and one decisive:
+
+- **On captured traffic and CSIC, body features added no lift** — both models
+  detect 0/9 CSIC anomalous (only 3/9 have a body, and those are *value-semantic*
+  tampering — a syntactically clean value that is semantically wrong — which no
+  structural feature can catch). A controlled probe (same `POST /api/v1/users`,
+  benign vs attack body) *also* failed to separate: both models scored 1.000. The
+  cause is the **recurring lesson, third instance** — the captured benign/attack
+  classes differ in a *non-body* dimension (first endpoint, then the presence of an
+  `Authorization` header), so the model takes that shortcut and never weights the
+  body features.
+
+- **Decisive isolation proves the features carry real signal.** A **matched
+  cohort** (`matched_cohort()`) holds method + URI + *headers* identical across the
+  two classes and varies **only the body** (canonical benign values vs canonical
+  injection payloads). There, by construction, the 16-dim model is at chance and
+  the 22-dim model must rely on the body alone:
+
+  | model | held-out AUC | F1 |
+  |---|---|---|
+  | 16 (URI+header) | **0.494** (chance — body-blind) | 0.474 |
+  | 22 (+body) | **0.931** | 0.851 |
+
+  The body features **work**. When the body is the only signal, they lift AUC from
+  0.49 to 0.93.
+
+**Conclusion.** The bottleneck was never the features — it is **data realism**,
+proven now from three angles (synthetic signatures → tool traffic → body features):
+a model trained on data whose classes differ in *structural* dimensions (endpoint,
+header presence) learns those shortcuts and ignores the payload. Body features only
+contribute when training data is **structurally matched** and differs in the
+payload — i.e. **real production traffic self-labeled by the deployed rule engine**,
+not more synthetic or tool-generated data. The recommended path to a shippable
+model is therefore self-labeled production traffic; the 22-dim extractor is proven
+and ready to port to the Rust hot path *once such data exists*. The shipped Rust
+scorer stays 16-dim (no model ships regardless). Lab code lives on the review-gated
+branch; corpus and models remain gitignored.

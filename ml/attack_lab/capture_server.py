@@ -23,6 +23,7 @@ import threading
 OUT = os.environ.get("CAPTURE_OUT", "capture.jsonl")
 LABEL = os.environ.get("CAPTURE_LABEL", "attack")
 PORT = int(os.environ.get("CAPTURE_PORT", "9099"))
+BODY_CAP = int(os.environ.get("CAPTURE_BODY_CAP", "8192"))  # record up to N body bytes
 
 _lock = threading.Lock()
 _body = b"<html><body>OK</body></html>"
@@ -32,23 +33,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def _capture_and_reply(self, with_body: bool = True) -> None:
+        # Read (and record) up to BODY_CAP bytes of the request body — the
+        # payload a body-aware WAF would inspect. Drain the rest to keep the
+        # keep-alive stream in sync.
+        clen = int(self.headers.get("Content-Length", 0) or 0)
+        body = ""
+        if clen:
+            try:
+                raw = self.rfile.read(clen)
+                body = raw[:BODY_CAP].decode("latin-1", "replace")
+            except Exception:
+                pass
         rec = {
             "label": LABEL,
             "method": self.command,
             "uri": self.path,  # request-target: path + query, exactly as sent
             "headers": [[k, v] for k, v in self.headers.items()],
+            "body": body,
         }
         line = json.dumps(rec, ensure_ascii=False)
         with _lock:
             with open(OUT, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
-        # Drain any request body so keep-alive stays in sync.
-        clen = int(self.headers.get("Content-Length", 0) or 0)
-        if clen:
-            try:
-                self.rfile.read(clen)
-            except Exception:
-                pass
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.send_header("Content-Length", str(len(_body) if with_body else 0))

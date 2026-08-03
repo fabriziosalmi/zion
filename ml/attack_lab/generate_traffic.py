@@ -17,6 +17,7 @@ Strictly local: TARGET is our own 127.0.0.1 capture server.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 import urllib.parse
@@ -60,9 +61,9 @@ def load_payloads() -> list:
     return out
 
 
-def send(method: str, path: str, headers: dict) -> None:
+def send(method: str, path: str, headers: dict, data=None) -> None:
     try:
-        requests.request(method, TARGET + path, headers=headers, timeout=2)
+        requests.request(method, TARGET + path, headers=headers, data=data, timeout=2)
     except Exception:
         pass
 
@@ -77,7 +78,12 @@ def attack(rng: random.Random, n: int) -> None:
         pl, _cls = pool[i % len(pool)]
         enc = urllib.parse.quote(pl, safe="") if rng.random() < 0.5 else pl
         ua = rng.choice(UAS)
-        shape = rng.choices(["query", "path", "api", "header"], weights=[40, 20, 25, 15])[0]
+        # ~35% of attacks carry the payload in the POST BODY (form or JSON) — the
+        # blind spot the URI+header features miss and body features must catch.
+        shape = rng.choices(
+            ["query", "path", "api", "header", "body_form", "body_json"],
+            weights=[26, 12, 18, 9, 20, 15],
+        )[0]
         if shape == "query":
             send("GET", f"/{rng.choice(RESOURCES)}?q={enc}", {"User-Agent": ua})
         elif shape == "path":
@@ -85,8 +91,17 @@ def attack(rng: random.Random, n: int) -> None:
         elif shape == "api":
             param = rng.choice(["id", "file", "path", "cmd", "url", "name"])
             send("GET", f"/api/v1/{rng.choice(RESOURCES)}?{param}={enc}", {"User-Agent": ua})
-        else:
+        elif shape == "header":
             send("GET", "/", {"User-Agent": ua, "Referer": f"https://x/{enc}"})
+        elif shape == "body_form":
+            field = rng.choice(["username", "comment", "search", "id", "q", "data"])
+            body = f"{field}={urllib.parse.quote_plus(pl)}&submit=1"
+            send("POST", f"/{rng.choice(RESOURCES)}",
+                 {"User-Agent": ua, "Content-Type": "application/x-www-form-urlencoded"}, data=body)
+        else:  # body_json
+            body = json.dumps({rng.choice(["q", "name", "filter", "query"]): pl})
+            send("POST", f"/api/v1/{rng.choice(RESOURCES)}",
+                 {"User-Agent": ua, "Content-Type": "application/json"}, data=body)
 
 
 # Realistic product names WITH accents/spaces/punctuation — so benign carries
@@ -102,8 +117,20 @@ def benign(rng: random.Random, n: int) -> None:
     for _ in range(n):
         ua = rng.choice(UAS[:3] + ["Mozilla/5.0 (iPhone; CPU iPhone OS 17_1) Mobile/15E148"])
         h = {"User-Agent": ua, "Accept": "text/html,application/json"}
-        kind = rng.choices(["get", "list", "static", "page", "search", "write", "shop"],
-                           weights=[24, 15, 17, 12, 9, 9, 14])[0]
+        # Heavy on POST-with-body writes to the SAME endpoints attacks use, so
+        # the model can't shortcut on "POST here = attack" and must read the body.
+        kind = rng.choices(["get", "list", "static", "page", "search", "write", "shop", "post_form"],
+                           weights=[16, 10, 11, 8, 6, 22, 9, 18])[0]
+        if kind == "post_form":
+            field = rng.choice(["username", "comment", "search", "id", "q", "data"])
+            val = urllib.parse.quote_plus(rng.choice(
+                ["john.smith", "great product, thanks!", "office chair", "42",
+                 "wireless mouse", "please deliver monday"]))
+            body = f"{field}={val}&submit=1"
+            send("POST", f"/{rng.choice(RESOURCES)}",
+                 {"User-Agent": rng.choice(UAS[:3]), "Content-Type": "application/x-www-form-urlencoded"},
+                 data=body)
+            continue
         if kind == "shop":
             # e-commerce: numeric ids + encoded product names + prices (benign but
             # structurally rich: %XX, '+', commas, parens, accents).
@@ -125,7 +152,15 @@ def benign(rng: random.Random, n: int) -> None:
         else:
             hh = dict(h); hh["Content-Type"] = "application/json"
             hh["Authorization"] = "Bearer " + "".join(rng.choice("0123456789abcdef") for _ in range(24))
-            send(rng.choice(["POST", "PUT", "DELETE"]), f"/api/v1/{rng.choice(RESOURCES)}", hh)
+            # A realistic benign JSON body — so "has a POST body" is NOT an
+            # attack-only tell (the has_auth lesson, applied to the body).
+            body = json.dumps({
+                "name": rng.choice(PRODUCTS),
+                "quantity": rng.randint(1, 20),
+                "price": rng.randint(5, 900),
+                "note": rng.choice(["gift wrap please", "leave at door", "call on arrival", ""]),
+            })
+            send(rng.choice(["POST", "PUT", "PATCH"]), f"/api/v1/{rng.choice(RESOURCES)}", hh, data=body)
 
 
 def main() -> None:
