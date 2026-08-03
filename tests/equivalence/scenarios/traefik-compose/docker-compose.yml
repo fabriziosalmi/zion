@@ -1,0 +1,60 @@
+# Equivalence scenario: traefik-compose.
+# Traefik's native model is docker labels. This compose runs real traefik (the
+# docker provider) plus label-routed echo backends, and is ALSO exactly what
+# `zion import traefik` reads. Backends echo their own name, so "which backend
+# replied" IS the routing decision.
+#
+# All services join the harness-created external network `zeq-net`, so the
+# zion container (also on zeq-net) resolves the backend service names.
+#
+# Backends use hashicorp/http-echo (returns a fixed string). Traefik publishes
+# its `web` entrypoint on 127.0.0.1:${ZEQ_PROXY_PORT} (set by run.sh).
+
+networks:
+  default:
+    name: zeq-net
+    external: true
+
+services:
+  traefik:
+    image: traefik:v3.1
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+    ports:
+      - "127.0.0.1:${ZEQ_PROXY_PORT:-18080}:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  alpha:
+    image: hashicorp/http-echo
+    command: ["-text=alpha", "-listen=:5678"]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.alpha.rule=Host(`alpha.example.com`)
+      - traefik.http.services.alpha.loadbalancer.server.port=5678
+
+  beta:
+    image: hashicorp/http-echo
+    command: ["-text=beta", "-listen=:5678"]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.beta.rule=Host(`beta.example.com`)
+      - traefik.http.services.beta.loadbalancer.server.port=5678
+
+  users:
+    image: hashicorp/http-echo
+    command: ["-text=users", "-listen=:5678"]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.users.rule=Host(`api.example.com`) && PathPrefix(`/v1/users`)
+      - traefik.http.services.users.loadbalancer.server.port=5678
+
+  legacy:
+    image: hashicorp/http-echo
+    command: ["-text=legacy", "-listen=:5678"]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.legacy.rule=Host(`api.example.com`) && PathPrefix(`/v1`)
+      - traefik.http.services.legacy.loadbalancer.server.port=5678

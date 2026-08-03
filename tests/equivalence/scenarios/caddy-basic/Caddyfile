@@ -1,0 +1,37 @@
+# Equivalence scenario: caddy-basic.
+# Mirrors the nginx multi-vhost routing in Caddy's model — three host site
+# blocks + a multi-path API host + a hostless catch-all. Every backend answers
+# with its own name, so "which backend replied" IS the routing decision.
+# Backends resolve as zeq-be-<name>:5678 on the harness docker network.
+
+{
+	admin off
+	auto_https off
+}
+
+alpha.example.com:80 {
+	reverse_proxy zeq-be-alpha:5678
+}
+
+beta.example.com:80 {
+	reverse_proxy zeq-be-beta:5678
+}
+
+api.example.com:80 {
+	handle /status {
+		reverse_proxy zeq-be-health:5678
+	}
+	handle /v1/users* {
+		reverse_proxy zeq-be-users:5678
+	}
+	handle /v1/* {
+		reverse_proxy zeq-be-legacy:5678
+	}
+	handle {
+		reverse_proxy zeq-be-default:5678
+	}
+}
+
+:80 {
+	reverse_proxy zeq-be-default:5678
+}

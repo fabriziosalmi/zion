@@ -1,0 +1,21 @@
+# Replay corpus: HOST PATH EXPECT_CADDY EXPECT_ZION
+# Zion's column is verified live (zion serving the imported config); Caddy's is
+# what real Caddy does with the original Caddyfile — the harness proves they
+# agree (or diverge exactly as noted). `404` = no backend answered.
+alpha.example.com    /                      alpha    alpha
+alpha.example.com    /some/deep/path        alpha    alpha
+ALPHA.EXAMPLE.COM    /case-folding          alpha    alpha
+beta.example.com     /                      beta     beta
+unknown.example.com  /                      default  default
+api.example.com      /status                health   health
+api.example.com      /v1/users              users    users
+api.example.com      /v1/users/42/profile   users    users
+api.example.com      /v1/orders             legacy   legacy
+api.example.com      /other                 default  default
+# Documented divergence (string-prefix glob vs path segments): Caddy's
+# `handle /v1/users*` matches `/v1/users999` by string prefix -> users; Zion
+# imports it as `/v1/users/{*rest}` and matches on path segments, so
+# `/v1/users999` is a different segment and falls to `/v1/` -> legacy. NB: the
+# nginx importer flags this class as a partial finding; the caddy importer does
+# not yet — a follow-up (the harness surfaces it here regardless).
+api.example.com      /v1/users999           users    legacy
