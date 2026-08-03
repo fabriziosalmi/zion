@@ -87,7 +87,7 @@ webpki-roots = "1.0"
 hyper-rustls = { version = "0.27", features = ["http1", "http2", "webpki-roots", "ring"], default-features = false }
 
 # WAF: SIMD-accelerated JSON validation (10x faster than serde_json for validation)
-simd-json = "0.14"
+simd-json = "0.17"
 itoa = "1.0.18"
 ryu = "1.0.23"
 tokio-stream = "0.1.18"
