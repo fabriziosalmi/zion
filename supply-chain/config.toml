@@ -43,7 +43,7 @@ version = "0.8.12"
 criteria = "safe-to-deploy"
 
 [[exemptions.aho-corasick]]
-version = "1.1.4"
+version = "1.1.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.anstream]]
@@ -1031,7 +1031,7 @@ version = "1.1.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls]]
-version = "0.23.42"
+version = "0.23.43"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls-native-certs]]
@@ -1080,10 +1080,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.security-framework-sys]]
 version = "2.17.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.semver]]
-version = "1.0.28"
 criteria = "safe-to-deploy"
 
 [[exemptions.serde]]
@@ -1692,8 +1688,4 @@ criteria = "safe-to-deploy"
 
 [[exemptions.zerovec-derive]]
 version = "0.11.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.zmij]]
-version = "1.0.21"
 criteria = "safe-to-deploy"
