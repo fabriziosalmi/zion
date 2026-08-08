@@ -54,6 +54,22 @@ updates:
       # hold at 0.5.x rather than relitigate MSRV for a benchmark harness.
       - dependency-name: "criterion"
         versions: [">=0.6.0"]
+      # simd-json 0.15+ raised its MSRV to rustc 1.85 (via value-trait 0.12,
+      # edition2024) against the 1.82 anchor — the MSRV job fails at manifest
+      # parse, before any code compiles. Hold at 0.14.x. Same posture as above.
+      - dependency-name: "simd-json"
+        versions: [">=0.15.0"]
+      # toml 1.1+ raised its MSRV to rustc 1.85 (via serde_spanned 1.1,
+      # edition2024). Note the floor is 1.1.0, not 1.0.0: toml 1.0.x still
+      # declares rustc 1.76 and remains a legitimate upgrade from 0.8.x.
+      - dependency-name: "toml"
+        versions: [">=1.1.0"]
+      # tract-onnx 0.23+ requires rustc 1.91, past the FULL-feature 1.88
+      # anchor (rust-toolchain.toml) — a different wall from the ones above,
+      # since ml-waf is excluded from the no-default-features MSRV job. 0.22.x
+      # (rustc 1.85) stays proposable. Revisit when ml-waf leaves EXPERIMENTAL.
+      - dependency-name: "tract-onnx"
+        versions: [">=0.23.0"]
       # Pin major-version bumps for the cryptographic / network core — those
       # need a manual security review (release notes, advisory diff) before merge.
       - dependency-name: "rustls"
