@@ -105,7 +105,7 @@ time = { version = "0.3", optional = true, features = ["std"] }
 # v10 requires explicitly choosing a CryptoProvider; we pick aws_lc_rs to
 # stay aligned with rustls's backend (and the FIPS build path), avoiding a
 # dual-provider runtime panic that v10 enforces if neither is selected.
-jsonwebtoken = { version = "10", optional = true, default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11", optional = true, default-features = false, features = ["aws_lc_rs"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"], optional = true }
 
 # HTTP/3 QUIC (opt-in: cargo build --features http3)
