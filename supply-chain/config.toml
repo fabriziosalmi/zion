@@ -591,7 +591,7 @@ version = "0.4.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.jsonwebtoken]]
-version = "10.4.0"
+version = "11.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.kqueue]]
@@ -1080,10 +1080,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.security-framework-sys]]
 version = "2.17.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.semver]]
-version = "1.0.28"
 criteria = "safe-to-deploy"
 
 [[exemptions.serde]]
@@ -1692,8 +1688,4 @@ criteria = "safe-to-deploy"
 
 [[exemptions.zerovec-derive]]
 version = "0.11.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.zmij]]
-version = "1.0.21"
 criteria = "safe-to-deploy"
