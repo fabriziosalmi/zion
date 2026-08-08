@@ -95,7 +95,7 @@ core_affinity = "0.8"
 # ACME auto-renewal (opt-in: cargo build --features acme)
 instant-acme = { version = "0.8", features = ["hyper-rustls"], optional = true }
 rcgen = { version = "0.14", optional = true }
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 # Used by the init/acme cert generator to stamp a short-lived (1-day) bootstrap
 # cert so ACME issues a real cert on first boot. Already in the rcgen closure,
 # so it adds no net-new crate. Gated by acme/init only.
