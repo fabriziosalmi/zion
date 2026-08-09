@@ -59,11 +59,16 @@ updates:
       # parse, before any code compiles. Hold at 0.14.x. Same posture as above.
       - dependency-name: "simd-json"
         versions: [">=0.15.0"]
-      # toml 1.1+ raised its MSRV to rustc 1.85 (via serde_spanned 1.1,
-      # edition2024). Note the floor is 1.1.0, not 1.0.0: toml 1.0.x still
-      # declares rustc 1.76 and remains a legitimate upgrade from 0.8.x.
+      # toml 1.1+ raised its MSRV to rustc 1.85 (edition2024). The 1.0 line is
+      # blocked too, but transitively — which is why the floor is 1.0.0 and not
+      # 1.1.0 as first written: toml 1.0.7 declares rustc 1.76 itself, yet
+      # depends on `toml_parser ^1.0.10`, and that caret resolves to 1.1.x
+      # (rustc 1.85). #362 died parsing toml_parser-1.1.2's manifest under the
+      # 1.82 MSRV job, before any code compiled. Pinning the transitive down to
+      # 1.0.x is more upkeep than a build-time config parser earns, so hold the
+      # whole 1.x line at 0.8 until MSRV-core moves to 1.85.
       - dependency-name: "toml"
-        versions: [">=1.1.0"]
+        versions: [">=1.0.0"]
       # tract-onnx 0.23+ requires rustc 1.91, past the FULL-feature 1.88
       # anchor (rust-toolchain.toml) — a different wall from the ones above,
       # since ml-waf is excluded from the no-default-features MSRV job. 0.22.x
