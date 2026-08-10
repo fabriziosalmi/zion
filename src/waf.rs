@@ -1246,6 +1246,30 @@ pub fn validate_uri(uri: &str, mode: WafMode) -> WafVerdict {
 mod tests {
     use super::*;
 
+    /// Dump the WAF signature vocabulary for the ML-WAF corpus generator
+    /// (`ml/generate_corpus.py`), so synthetic attacks are seeded from exactly
+    /// what the deployed rule engine detects — and stay in sync when it evolves.
+    /// Not a check; run explicitly:
+    ///   `cargo test dump_waf_signatures -- --ignored --nocapture`
+    #[test]
+    #[ignore = "generator — refreshes ml/testdata/waf_signatures.json"]
+    fn dump_waf_signatures() {
+        let doc = serde_json::json!({
+            "balanced": BALANCED_PATTERNS,
+            "aggressive": AGGRESSIVE_EXTRA_PATTERNS,
+        });
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("ml/testdata/waf_signatures.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        eprintln!(
+            "wrote {} balanced + {} aggressive signatures → {}",
+            BALANCED_PATTERNS.len(),
+            AGGRESSIVE_EXTRA_PATTERNS.len(),
+            path.display()
+        );
+    }
+
     // ── Streaming scanner (Track D) ──
 
     #[test]
