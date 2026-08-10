@@ -593,11 +593,26 @@ mod tests {
         let t0 = Instant::now();
         for i in 0..n {
             let (m, u) = cases[i % cases.len()];
-            if let Some((_, us)) = score(m, u, &hm) {
-                lat_us.push(us);
-            }
+            // Fail loudly on the FIRST `None`. Skipping them silently would let
+            // the gate report a healthy p99 measured over a partial population
+            // — or, if every call returned `None`, index-panic below on an
+            // empty vec instead of naming the cause. A gate that can quietly
+            // measure the wrong thing is worse than no gate.
+            let (_, us) = score(m, u, &hm).unwrap_or_else(|| {
+                panic!("score() returned None at iteration {i}: model inactive or I/O interface mismatch")
+            });
+            lat_us.push(us);
         }
-        let avg_ns = t0.elapsed().as_nanos() as f64 / n as f64;
+        let elapsed = t0.elapsed();
+        assert_eq!(
+            lat_us.len(),
+            n,
+            "collected {} samples over {n} iterations",
+            lat_us.len()
+        );
+        // Divide by the sample count actually collected, which the assert above
+        // pins to `n` — not by `n` on faith.
+        let avg_ns = elapsed.as_nanos() as f64 / lat_us.len() as f64;
         lat_us.sort_unstable();
         let pct = |q: f64| lat_us[(((lat_us.len() as f64) * q) as usize).min(lat_us.len() - 1)];
         eprintln!(

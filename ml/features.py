@@ -57,10 +57,15 @@ def byte_entropy(data: bytes) -> float:
 
 
 def _has(headers: Headers, name: str) -> bool:
+    # HTTP header names are case-insensitive on BOTH sides: normalize the
+    # needle too, or a caller passing "User-Agent" silently never matches.
+    # Mirrors Rust `HeaderMap`, which is case-insensitive by construction.
+    name = name.lower()
     return any(k.lower() == name for k, _ in headers)
 
 
 def _get(headers: Headers, name: str) -> Optional[str]:
+    name = name.lower()
     for k, v in headers:
         if k.lower() == name:
             return v

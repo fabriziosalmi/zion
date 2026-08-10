@@ -34,13 +34,23 @@ def main() -> None:
     inp, out = sess.get_inputs()[0], sess.get_outputs()[0]
     print(f"  input  : {inp.name} {inp.shape} {inp.type}")
     print(f"  output : {out.name} {out.shape} {out.type}")
+    # Assert the FULL interface, not just the input half. A model with the
+    # right input but a wrong output rank/dtype passes an input-only check and
+    # then returns None from `waf_ml::score` at runtime — the failure this
+    # pre-flight exists to catch, surfacing in production instead of here.
     assert list(inp.shape) == [1, 16], f"input must be (1,16), got {inp.shape}"
+    assert inp.type == "tensor(float)", f"input must be f32, got {inp.type}"
+    assert list(out.shape) == [1, 1], f"output must be (1,1), got {out.shape}"
+    assert out.type == "tensor(float)", f"output must be f32, got {out.type}"
 
     def score(vec):
         x = np.asarray(vec, dtype=np.float32).reshape(1, 16)
         return float(sess.run(None, {inp.name: x})[0].ravel()[0])
 
-    data = np.load(args.corpus, allow_pickle=True)
+    # No allow_pickle: the corpus holds numeric arrays plus a unicode scalar,
+    # none of which need it, and enabling it turns `np.load` on an untrusted
+    # file into arbitrary code execution.
+    data = np.load(args.corpus)
     X, y = data["X"].astype(np.float32), data["y"]
     s = np.array([score(X[i]) for i in range(len(X))])
     # A float32 sigmoid can land a hair outside [0,1]; production waf_ml::score

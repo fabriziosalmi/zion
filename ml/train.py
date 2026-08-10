@@ -71,7 +71,10 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    data = np.load(args.corpus, allow_pickle=True)
+    # No allow_pickle: the corpus holds numeric arrays plus a unicode scalar,
+    # none of which need it, and enabling it turns `np.load` on an untrusted
+    # file into arbitrary code execution.
+    data = np.load(args.corpus)
     X, y = data["X"].astype(np.float32), data["y"].astype(np.float32)
 
     # Stratified-ish split 80/20 by a seeded permutation.
