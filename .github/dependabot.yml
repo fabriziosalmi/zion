@@ -59,16 +59,21 @@ updates:
       # parse, before any code compiles. Hold at 0.14.x. Same posture as above.
       - dependency-name: "simd-json"
         versions: [">=0.15.0"]
-      # toml 1.1+ raised its MSRV to rustc 1.85 (edition2024). The 1.0 line is
-      # blocked too, but transitively — which is why the floor is 1.0.0 and not
-      # 1.1.0 as first written: toml 1.0.7 declares rustc 1.76 itself, yet
-      # depends on `toml_parser ^1.0.10`, and that caret resolves to 1.1.x
-      # (rustc 1.85). #362 died parsing toml_parser-1.1.2's manifest under the
-      # 1.82 MSRV job, before any code compiled. Pinning the transitive down to
-      # 1.0.x is more upkeep than a build-time config parser earns, so hold the
-      # whole 1.x line at 0.8 until MSRV-core moves to 1.85.
+      # toml is blocked transitively, by `toml_parser` — not by its own MSRV.
+      # The wall starts at 0.9.0, not 1.0.0 as first written: 0.9.0 is where
+      # the parser was split out into `toml_parser ^1.0.0` (default `parse`
+      # feature), and that caret resolves to 1.1.x, which is edition2024 /
+      # rustc 1.85 — past the 1.82 anchor. The MSRV job then fails at manifest
+      # parse, before any code compiles: #362 (toml 1.0.7) and #367 (toml
+      # 0.9.12) both died on exactly that line, and 0.9.x slipped past the
+      # old >=1.0.0 floor. Note toml_parser 1.1.x is ALREADY in the lock via
+      # proc-macro-crate -> toml_edit 0.25, but that path sits outside the
+      # no-default-features graph, so cargo never opens its manifest; toml 0.9
+      # moves it onto the direct, non-optional config path where cargo must.
+      # Pinning the transitive down to 1.0.x is more upkeep than a build-time
+      # config parser earns, so hold at 0.8.x until MSRV-core moves to 1.85.
       - dependency-name: "toml"
-        versions: [">=1.0.0"]
+        versions: [">=0.9.0"]
       # tract-onnx 0.23+ requires rustc 1.91, past the FULL-feature 1.88
       # anchor (rust-toolchain.toml) — a different wall from the ones above,
       # since ml-waf is excluded from the no-default-features MSRV job. 0.22.x
