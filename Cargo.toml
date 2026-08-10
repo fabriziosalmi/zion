@@ -153,7 +153,7 @@ libc = "0.2"
 # build, deterministic across platforms. Loads quantized models on the
 # request hot path with a strict per-request budget (see waf_ml.rs).
 [dependencies.tract-onnx]
-version = "0.21"
+version = "0.22"
 optional = true
 default-features = false
 
