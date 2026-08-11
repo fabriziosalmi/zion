@@ -169,9 +169,19 @@ git = "https://github.com/fabriziosalmi/aimp"
 #   * 9408956…  `license = "MIT"` in aimp_node/Cargo.toml (cargo-deny).
 #   * 4631819…  `Identity::from_secret_bytes` + `secret_bytes` so
 #               zion can persist the Ed25519 seed across restarts.
-rev = "46318198785f8600c08af8c90533795316f4b1b3"
+#   * fbd0f9d…  aimp#14 — the node application (dashboard, CLI, metrics
+#               endpoint, file/env config loader) moved behind aimp's `cli`
+#               feature, which is why `default-features = false` below is
+#               load-bearing and not cosmetic.
+rev = "fbd0f9d797b0dde438a1a6fcec91b40d4da7c44b"
 package = "aimp_node"
 optional = true
+# We embed the protocol, not the node application: zion imports exactly
+# `crypto::{Identity, SecurityFirewall}` and `protocol::envelope::*`. Opting out
+# of aimp's default `cli` feature drops ratatui, crossterm, clap, axum and the
+# `config` loader — none of which zion can reach. aimp pins this surface in its
+# own `tests/embedder_surface.rs`, so a regression fails upstream, not here.
+default-features = false
 
 # rmp-serde — MessagePack codec used by AIMP envelopes. Pulled in
 # directly so zion can construct/parse `AimpEnvelope`s without going
