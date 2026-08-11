@@ -54,17 +54,23 @@ ignore = [
     #
     # ── Unmaintained transitive deps (no safe upgrade currently available) ──
     { id = "RUSTSEC-2024-0384", reason = "[review by 2026-09-01] `instant` is unmaintained but pulled in transitively only (no direct dep). Informational, no actual vulnerability. Re-evaluate after upstream deps migrate to `web-time`." },
-    { id = "RUSTSEC-2024-0436", reason = "[review by 2026-09-01] `paste` is unmaintained but pulled in transitively as a proc-macro (no runtime surface). No replacement consensus in the ecosystem yet. Track upstream replacement." },
     # ── Direct dep that needs migration to a new API ──
     { id = "RUSTSEC-2025-0134", reason = "[review by 2026-08-01] `rustls-pemfile` is archived; replacement is `rustls-pki-types::pem::PemObject`. Migration tracked as a follow-up task in src/tls.rs and src/acme.rs. Not a vulnerability." },
     # ── DoS in a feature-gated transitive dep (acme/init/ml-waf, not core) ──
     # NOTE: RUSTSEC-2026-0002 (`lru` via ratatui/TUI), -0186 (`memmap2` via
     # tract-onnx) and -0217 (`tract-nnef` 0.21.14) were RESOLVED by the v0.7.1
     # dependency bumps (tract 0.21.17 + the rust-minor group) and removed.
-    { id = "RUSTSEC-2026-0009", reason = "[review by 2026-10-01] `time` 0.3.41 stack-exhaustion DoS when parsing UNTRUSTED RFC 2822 input. Pulled in transitively by `rcgen` (acme/init) and `tract` (ml-waf) — all off the no-default-features core (`cargo tree --no-default-features -i time` matches nothing). Zion never feeds untrusted input to time's RFC 2822 parser (rcgen formats cert validity dates; tract loads models), so it is unreachable on the request path. The fix (`time >=0.3.47`) is currently blocked by a transitive `time <0.3.42` requirement and by the 1.82 core MSRV (0.3.47 needs edition2024/Rust 1.85, ADR-0007); track the upstream bump." },
+    # NOTE: RUSTSEC-2026-0009 (`time` 0.3.41 RFC 2822 stack-exhaustion DoS) was
+    # RESOLVED here: ratatui 0.30 lifted the transitive `time <0.3.42` bound that
+    # had been pinning us below the fix, so the lock now carries 0.3.55 — past
+    # `time >=0.3.47`. Leaving the id listed would trip cargo-deny, which errors
+    # on ignores that match no crate.
     # ── Pulled in by aimp_node (--features sovereign-aimp, off by default) ──
-    { id = "RUSTSEC-2024-0437", reason = "[review by 2026-09-01] `protobuf 2.28.0` recursion-DoS via `prometheus 0.13.4` → `aimp_node`. Only reachable when the experimental `sovereign-aimp` feature is enabled (off by default). Upstream `aimp_node` tracks the migration to `prometheus 0.14` which uses `protobuf 3.7.x`; accept the transitive risk on the experimental track until that lands." },
-    { id = "RUSTSEC-2024-0320", reason = "[review by 2026-09-01] `yaml-rust 0.4.5` unmaintained, pulled in via `config 0.13.4` → `aimp_node`. Same scope as RUSTSEC-2024-0437: only when `sovereign-aimp` is enabled. Replacement (`yaml-rust2`) is a drop-in but requires upstream `aimp_node` to bump `config`. Tracking upstream." },
+    { id = "RUSTSEC-2024-0437", reason = "[review by 2026-09-01] `protobuf 2.28.0` recursion-DoS via `prometheus 0.13.4` → `aimp_node`. Only reachable when the experimental `sovereign-aimp` feature is enabled (off by default). `prometheus` instruments aimp's library layer, so unlike `config`/`ratatui` it survives aimp's `cli` gate. Upstream `aimp_node` tracks the migration to `prometheus 0.14` which uses `protobuf 3.7.x`; accept the transitive risk on the experimental track until that lands." },
+    # NOTE: RUSTSEC-2024-0320 (`yaml-rust` via `config 0.13.4` → aimp_node) was
+    # RESOLVED by aimp#14: the config loader moved behind aimp's `cli` feature
+    # and zion now depends with `default-features = false`, so `config` — and
+    # with it `yaml-rust` — left the graph entirely.
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
