@@ -248,11 +248,17 @@ fn poll_loop(url: String, interval: Duration, tx: mpsc::Sender<FetchResult>) {
     }
 }
 
+// ratatui 0.30 turned `Backend::Error` into an associated type (it was a
+// hardcoded `io::Error`), so `draw()?` now boxes a generic error — which the
+// `Box<dyn Error>` return type can only accept if it outlives the call.
 fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     rx: &mpsc::Receiver<FetchResult>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    B::Error: 'static,
+{
     let mut last_draw = Instant::now() - FRAME_INTERVAL;
     loop {
         // Drain all pending poll results so we always render the freshest.
