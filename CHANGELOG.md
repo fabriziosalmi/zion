@@ -12,8 +12,8 @@ distinguishable from "someone forgot to write it down".
 
 ### Added
 - **ML-WAF training pipeline** (#345, ADR-0023) — a reproducible in-repo `ml/`
-  pipeline to train, validate and parity-check an ONNX scorer, plus an
-  `#[ignore]`d latency gate. **No model is committed** and `ml-waf` is neither
+  pipeline to train, validate and parity-check an ONNX scorer, plus a latency
+  gate marked `#[ignore]`. **No model is committed** and `ml-waf` is neither
   in `default` nor in `dist`, so the shipped binary is unchanged. The scorer
   remains inert until a model is reviewed and shipped deliberately; the blocker
   is data realism, not code.
@@ -21,8 +21,9 @@ distinguishable from "someone forgot to write it down".
 ### Changed
 - **`--features sovereign-aimp` costs 56 crates instead of 123** (#371). The
   upstream `aimp_node` moved its node application (dashboard, CLI, metrics
-  endpoint, config loader) behind its own `cli` feature, so Zion now depends
-  with `default-features = false`: it embeds the protocol, not the application.
+  endpoint, config loader) behind its own `cli` feature, so Zion now depends on
+  it with `default-features = false`: it embeds the protocol, not the
+  application.
   `Cargo.lock` lost 52 packages; `paste`, `yaml-rust`, `config`,
   `ratatui 0.26` and `crossterm 0.27` left the graph entirely.
 - **ratatui 0.29 → 0.30** for the `tui` feature (#371), pinned to the crossterm
