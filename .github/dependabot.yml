@@ -19,7 +19,13 @@ updates:
       interval: "daily"
       time: "06:00"
       timezone: "Europe/Rome"
-    open-pull-requests-limit: 10
+    # FROZEN for the v0.7.4 field-validation window. `0` disables version
+    # updates for this ecosystem while leaving every `ignore` rule below
+    # intact — those encode hard-won walls (toml_parser/edition2024 at
+    # 0.9.0, tract-onnx vs the 1.88 anchor, aws-lc-rs vs the unvalidated
+    # FIPS 4.x module) and must survive the freeze. Restore the previous
+    # limits, noted inline, when validation ends.
+    open-pull-requests-limit: 0  # was 10
     labels: ["dependencies", "rust"]
     commit-message:
       prefix: "deps"
@@ -117,7 +123,13 @@ updates:
     commit-message:
       prefix: "deps(bench)"
       include: "scope"
-    open-pull-requests-limit: 5
+    # FROZEN for the v0.7.4 field-validation window. `0` disables version
+    # updates for this ecosystem while leaving every `ignore` rule below
+    # intact — those encode hard-won walls (toml_parser/edition2024 at
+    # 0.9.0, tract-onnx vs the 1.88 anchor, aws-lc-rs vs the unvalidated
+    # FIPS 4.x module) and must survive the freeze. Restore the previous
+    # limits, noted inline, when validation ends.
+    open-pull-requests-limit: 0  # was 5
 
   # ── GitHub Actions ────────────────────────────────────────────────────────
   - package-ecosystem: "github-actions"
@@ -129,7 +141,13 @@ updates:
     commit-message:
       prefix: "ci"
       include: "scope"
-    open-pull-requests-limit: 5
+    # FROZEN for the v0.7.4 field-validation window. `0` disables version
+    # updates for this ecosystem while leaving every `ignore` rule below
+    # intact — those encode hard-won walls (toml_parser/edition2024 at
+    # 0.9.0, tract-onnx vs the 1.88 anchor, aws-lc-rs vs the unvalidated
+    # FIPS 4.x module) and must survive the freeze. Restore the previous
+    # limits, noted inline, when validation ends.
+    open-pull-requests-limit: 0  # was 5
     groups:
       actions:
         applies-to: "version-updates"
@@ -145,7 +163,13 @@ updates:
     commit-message:
       prefix: "docker"
       include: "scope"
-    open-pull-requests-limit: 5
+    # FROZEN for the v0.7.4 field-validation window. `0` disables version
+    # updates for this ecosystem while leaving every `ignore` rule below
+    # intact — those encode hard-won walls (toml_parser/edition2024 at
+    # 0.9.0, tract-onnx vs the 1.88 anchor, aws-lc-rs vs the unvalidated
+    # FIPS 4.x module) and must survive the freeze. Restore the previous
+    # limits, noted inline, when validation ends.
+    open-pull-requests-limit: 0  # was 5
 
   # ── VitePress docs site ───────────────────────────────────────────────────
   - package-ecosystem: "npm"
@@ -157,5 +181,11 @@ updates:
     commit-message:
       prefix: "docs"
       include: "scope"
-    open-pull-requests-limit: 3
+    # FROZEN for the v0.7.4 field-validation window. `0` disables version
+    # updates for this ecosystem while leaving every `ignore` rule below
+    # intact — those encode hard-won walls (toml_parser/edition2024 at
+    # 0.9.0, tract-onnx vs the 1.88 anchor, aws-lc-rs vs the unvalidated
+    # FIPS 4.x module) and must survive the freeze. Restore the previous
+    # limits, noted inline, when validation ends.
+    open-pull-requests-limit: 0  # was 3
     versioning-strategy: "increase-if-necessary"
