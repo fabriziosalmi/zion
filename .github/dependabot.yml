@@ -90,6 +90,22 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "aws-lc-rs"
         update-types: ["version-update:semver-major"]
+      # aws-lc-rs 1.18.0 switches `aws-lc-fips-sys` from the AWS-LC-FIPS 3.x
+      # branch to 4.x. 3.x is FIPS 140-3 VALIDATED (NIST certificates #5314
+      # static, #5298 dynamic); 4.x has completed lab testing and is submitted,
+      # but sits on the CMVP Modules In Process list — not yet certified.
+      #
+      # `--features fips` exists precisely to give operators a validated module,
+      # and README, docs/guide/architecture.md and docs/security/fips.md all say
+      # "validated" in so many words. Taking 1.18 would make those claims false
+      # while the PR title read like routine maintenance ("rust-minor group").
+      # Upstream's own guidance: pin to <1.18.0 to stay on the 3.x module.
+      #
+      # Note this is a SEPARATE condition from the semver-major pin above, which
+      # exists for a different reason (manual security review of crypto majors).
+      # When NIST certifies 4.0, delete this entry only — the other still stands.
+      - dependency-name: "aws-lc-rs"
+        versions: [">=1.18.0"]
 
   # Benchmarks workspace has its own Cargo.toml — keep it on the same cadence.
   - package-ecosystem: "cargo"
