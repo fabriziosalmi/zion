@@ -19,7 +19,7 @@ annotations:
   artifacthub.io/license: Apache-2.0
   artifacthub.io/changes: |
     - kind: changed
-      description: Bump appVersion to 0.1.11 (process hardening — version SSOT, draconian DCO, boot-panic refactor)
+      description: Bump appVersion to 0.7.4
     - kind: added
       description: ZION_AUDIT_HMAC_KEY wired from a Kubernetes Secret when [audit] is enabled
     - kind: added
