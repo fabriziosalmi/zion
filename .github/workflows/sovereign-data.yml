@@ -58,8 +58,9 @@ jobs:
           exit 1
         fi
 
-    # The PAT is passed to checkout so the credential git persists for `git push`
-    # is the PAT, not the read-only GITHUB_TOKEN.
+    # checkout stores whichever token it is given, and `git push` later reuses
+    # that stored credential. Passing the PAT here is therefore what makes the
+    # push work — the default GITHUB_TOKEN is read-only in this job.
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         token: ${{ secrets.SOVEREIGN_DATA_PAT }}
