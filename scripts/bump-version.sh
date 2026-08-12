@@ -72,6 +72,12 @@ sedi "/^\[package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*\"$OLD\"/version =
 # 2. Helm chart appVersion (chart `version:` is independent and not touched)
 if [[ -f deploy/helm/zion/Chart.yaml ]]; then
   sedi "s/^appVersion:[[:space:]]*\"$OLD\"/appVersion: \"$NEW\"/" deploy/helm/zion/Chart.yaml
+  # The Artifact Hub changelog annotation names the version too, and used to be
+  # left behind: it still read "Bump appVersion to 0.1.11" at 0.7.4, publishing
+  # wrong release notes to Artifact Hub for every release in between. Rewriting
+  # appVersion while leaving its own description stale is the drift this script
+  # exists to prevent.
+  sedi "s/(description: Bump appVersion to )$OLD.*/\1$NEW/" deploy/helm/zion/Chart.yaml
 fi
 
 # 3. README + docs — rewrite vX.Y.Z occurrences of the OLD version only.

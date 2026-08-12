@@ -2,13 +2,19 @@
 
 ## Supported Versions
 
-Security fixes ship in the latest minor release. Point releases inherit fixes
-from their containing minor — i.e. the latest `0.4.x` is always patched.
+Security fixes ship in the latest release only. There is no long-term support
+branch: older minors receive nothing, and the way to stay patched is to move to
+the current version.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.4.x (latest minor) | Yes |
-| < 0.7.3 | No |
+| < 0.7.4 | No |
+
+Everything at or above that line is the current release. Stated as a single
+threshold on purpose — the previous wording carried a second, hardcoded row
+(`0.4.x`) that `bump-version.sh` never rewrote, so it kept claiming support for
+0.4.x while the threshold marched on to 0.7.x. A policy that contradicts itself
+is worse than a terse one, and on a security policy it is worse still.
 
 ## Reporting a Vulnerability
 
