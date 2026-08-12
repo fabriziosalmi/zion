@@ -4,6 +4,65 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+Nothing here changes runtime behaviour for an operator: no new features, no bug
+fixes on the request path, no config surface. It is dependency hygiene, test
+infrastructure, and one experimental scaffold that ships inert. **This section
+is deliberately not a release** — recorded so that "nothing worth releasing" is
+distinguishable from "someone forgot to write it down".
+
+### Added
+- **ML-WAF training pipeline** (#345, ADR-0023) — a reproducible in-repo `ml/`
+  pipeline to train, validate and parity-check an ONNX scorer, plus a latency
+  gate marked `#[ignore]`. **No model is committed** and `ml-waf` is neither
+  in `default` nor in `dist`, so the shipped binary is unchanged. The scorer
+  remains inert until a model is reviewed and shipped deliberately; the blocker
+  is data realism, not code.
+
+### Changed
+- **`--features sovereign-aimp` costs 56 crates instead of 123** (#371). The
+  upstream `aimp_node` moved its node application (dashboard, CLI, metrics
+  endpoint, config loader) behind its own `cli` feature, so Zion now depends on
+  it with `default-features = false`: it embeds the protocol, not the
+  application.
+  `Cargo.lock` lost 52 packages; `paste`, `yaml-rust`, `config`,
+  `ratatui 0.26` and `crossterm 0.27` left the graph entirely.
+- **ratatui 0.29 → 0.30** for the `tui` feature (#371), pinned to the crossterm
+  backend only — the default feature set pulls every backend, which measures at
+  +52 crates. Net cost of the bump as actually compiled: +2.
+- **tract-onnx 0.21.17 → 0.22.3** (#363). Verified as not a latency regression
+  by measuring both versions on the same machine in the same session rather
+  than comparing against a previously published figure: p99 unchanged, means
+  within run-to-run noise of each other.
+- Routine dependency and toolchain bumps: `jsonwebtoken` 10.4 → 11.0,
+  `base64` 0.22 → 0.23.1, the Rust container base image, and grouped GitHub
+  Actions updates.
+
+### Fixed
+- **Three advisory ignores retired**, not silenced (#371) — each because the
+  advisory stopped applying, verified crate-by-crate:
+  `RUSTSEC-2024-0436` (`paste`, both sources gone), `RUSTSEC-2024-0320`
+  (`yaml-rust`, left the graph with aimp's `cli` gate), and `RUSTSEC-2026-0009`
+  (`time` 0.3.41 → 0.3.55, past the fix, after ratatui 0.30 lifted the
+  transitive `time <0.3.42` bound). `cargo-vet` exemptions: 422 → 395.
+  `RUSTSEC-2024-0437` stays and now records why it survives the same gate.
+- **Dependabot MSRV floors corrected to where the walls actually start**
+  (#359, #365, #368). The `toml` floor was tuned to the version that first
+  failed (1.0.0) rather than the version that introduces the break: the
+  `toml_parser`/edition2024 wall begins at **0.9.0**, so 0.9.x slipped through
+  and failed identically. Also holds `simd-json` and `tract-onnx` at their
+  respective walls.
+
+### Testing
+- **Equivalence harness generalized to Caddy and Traefik** (#347), previously
+  nginx-only.
+- **ML-WAF review findings fixed** — header lookups made case-insensitive on
+  both sides (the extractor's entire job is byte-exact parity with Rust
+  `HeaderMap`), `allow_pickle` dropped from corpus loading, `validate.py` now
+  asserts the full I/O contract instead of the input half it advertised, and
+  the latency gate fails loudly on a `None` result instead of dividing by an
+  assumed sample count. That last one also retroactively proved the tract
+  0.22.3 figures above were measured over a full population.
+
 ## [0.7.3] - 2026-08-03
 
 ### Added
