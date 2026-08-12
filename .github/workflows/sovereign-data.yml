@@ -21,8 +21,11 @@ jobs:
     name: refresh ${{ matrix.region }}
     runs-on: ubuntu-latest
     permissions:
-      contents: write       # push the auto-generated branch
-      pull-requests: write  # open the refresh PR
+      # Read-only on purpose. Both writes this job performs — pushing the branch
+      # and opening the PR — are carried by SOVEREIGN_DATA_PAT, so GITHUB_TOKEN
+      # needs nothing beyond read. Leaving `contents: write` here would grant a
+      # capability nothing uses, against this file's own stated posture.
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -34,7 +37,32 @@ jobs:
             output: src/sovereign/data_eu.rs
             adjective: EU-27
     steps:
+    # Fail with a sentence a human can act on. Without this, a missing secret
+    # surfaces 40 lines later as an opaque auth error on `git push`, which is
+    # how the previous three failures in this workflow stayed unread.
+    - name: Preflight — the refresh PAT must be present
+      env:
+        PAT: ${{ secrets.SOVEREIGN_DATA_PAT }}
+      run: |
+        if [ -z "$PAT" ]; then
+          echo "::error::secret SOVEREIGN_DATA_PAT is not set."
+          echo "This workflow opens its refresh PR with a dedicated fine-grained PAT"
+          echo "rather than GITHUB_TOKEN, because 'Allow GitHub Actions to create and"
+          echo "approve pull requests' is disabled repo-wide — deliberately, since"
+          echo "enabling it would grant that power to every workflow here."
+          echo ""
+          echo "Create a fine-grained PAT scoped to this repository only, with:"
+          echo "  Contents:      Read and write   (push the refresh branch)"
+          echo "  Pull requests: Read and write   (open the refresh PR)"
+          echo "Nothing else. Then add it as the SOVEREIGN_DATA_PAT repository secret."
+          exit 1
+        fi
+
+    # The PAT is passed to checkout so the credential git persists for `git push`
+    # is the PAT, not the read-only GITHUB_TOKEN.
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        token: ${{ secrets.SOVEREIGN_DATA_PAT }}
 
     - name: Download RIPE NCC delegated stats + IPtoASN
       run: |
@@ -109,4 +137,7 @@ jobs:
         The \`ranges_are_sorted\` and \`ranges_dont_overlap\` tests will run in CI." \
           --label "sovereign-data,automated"
       env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Dedicated PAT, not GITHUB_TOKEN: repo-wide policy blocks Actions from
+        # creating pull requests, and the narrow fix is a token scoped to this
+        # repo rather than lifting that policy for every workflow.
+        GH_TOKEN: ${{ secrets.SOVEREIGN_DATA_PAT }}
