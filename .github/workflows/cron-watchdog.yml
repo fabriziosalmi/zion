@@ -1,0 +1,91 @@
+name: cron-watchdog
+
+# Watches the watchers. Every other scheduled workflow in this repo reports into
+# the void: a failing cron blocks no merge, gates no PR, and notifies nobody.
+# sovereign-data failed six consecutive weekly runs (2026-07-06 .. 2026-08-12)
+# before anyone looked, and the datasets it maintains went stale the whole time.
+#
+# This job asserts that every cron workflow has SUCCEEDED on schedule recently,
+# and — the part that matters — makes a failure impossible to miss by opening
+# an issue. A watchdog that only turns its own run red would inherit exactly the
+# problem it exists to solve.
+
+on:
+  schedule:
+    # 09:00 UTC: after the 04:00 and 06:00 crons have had time to finish.
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read # list workflow runs
+  issues: write # raise the alarm where a human will see it
+
+concurrency:
+  group: cron-watchdog
+  cancel-in-progress: false
+
+jobs:
+  freshness:
+    name: Scheduled workflows are alive
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.0.1
+
+      - name: Check cron freshness
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          OUT=$(scripts/check-cron-freshness.sh 2>&1)
+          RC=$?
+          echo "$OUT"
+          {
+            echo 'report<<CRONEOF'
+            echo "$OUT"
+            echo 'CRONEOF'
+          } >> "$GITHUB_OUTPUT"
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Open or update the alarm issue
+        if: steps.check.outputs.rc != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT: ${{ steps.check.outputs.report }}
+        run: |
+          TITLE="Scheduled workflows are not running green"
+          BODY=$(printf '%s\n\n```\n%s\n```\n\n%s\n' \
+            "One or more scheduled workflows have not succeeded on schedule within their expected window." \
+            "$REPORT" \
+            "Two things trigger this, and the second is the quiet one: the workflow is failing, or GitHub disabled it (scheduled workflows are switched off after 60 days of repository inactivity — a disabled cron never fails, it just stops).
+
+          Raised by \`.github/workflows/cron-watchdog.yml\`. This issue is reused, not duplicated: it closes on its own once every cron is green again.")
+
+          EXISTING=$(gh issue list --state open --label cron-watchdog \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+            echo "updated issue #$EXISTING"
+          else
+            gh issue create --title "$TITLE" --body "$BODY" \
+              --label cron-watchdog --label automated
+          fi
+
+      - name: Close the alarm once everything is green
+        if: steps.check.outputs.rc == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EXISTING=$(gh issue list --state open --label cron-watchdog \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue close "$EXISTING" \
+              --comment "All scheduled workflows are succeeding on schedule again. Closed automatically."
+          fi
+
+      - name: Fail the run so the badge reflects reality
+        if: steps.check.outputs.rc != '0'
+        run: exit 1
