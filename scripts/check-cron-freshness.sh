@@ -40,6 +40,14 @@ for f in "$WF_DIR"/*.yml; do
   [[ -z "$cron_line" ]] && continue
 
   name="$(basename "$f")"
+
+  # Skip ourselves. This workflow carries a `schedule:` trigger too, so it lands
+  # in its own scan — and on the very first run it has no prior successful
+  # SCHEDULED run of itself, so it would flag itself STALE and open an alarm
+  # while every workflow it watches is healthy. A watchdog whose first act is a
+  # false positive teaches people to ignore it.
+  [[ "$name" == "cron-watchdog.yml" ]] && continue
+
   schedule="$(sed -E "s/cron: *['\"]//; s/['\"]$//" <<<"$cron_line")"
 
   # Day-of-week field pinned to a specific day => weekly, otherwise daily.
@@ -55,9 +63,16 @@ for f in "$WF_DIR"/*.yml; do
   # The most recent SUCCESSFUL scheduled run — not merely the most recent run.
   # Asking for the latest conclusion instead would go green again the moment a
   # manual dispatch succeeded, while the schedule stayed broken.
-  last_ok=$(gh run list --repo "$REPO" --workflow "$name" --limit 40 \
-    --json conclusion,createdAt,event \
-    --jq '[.[] | select(.event == "schedule" and .conclusion == "success")] | .[0].createdAt // empty' 2>/dev/null) || true
+  #
+  # Filtered server-side rather than by fetching N runs and filtering here.
+  # Several of these workflows (scorecard, supply-chain, codeql) also run on
+  # push and pull_request, so any fixed window can fill up with unrelated runs
+  # and push the last scheduled success out of view — reporting STALE for a
+  # perfectly healthy workflow. A watchdog that cries wolf gets muted, which
+  # returns us to exactly the problem it exists to solve.
+  last_ok=$(gh api \
+    "repos/$REPO/actions/workflows/$name/runs?event=schedule&status=success&per_page=1" \
+    --jq '.workflow_runs[0].created_at // empty' 2>/dev/null) || true
 
   checked=$((checked + 1))
 
