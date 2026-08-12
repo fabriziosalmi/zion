@@ -76,9 +76,22 @@ jobs:
       if: steps.diff.outputs.changed == 'true'
       run: |
         BRANCH="sovereign-data-${{ matrix.region }}-$(date +%Y%m%d)"
+
+        # The runner has no git identity, so `git commit` aborted with
+        #   fatal: empty ident name (for <runner@...>) not allowed
+        # every scheduled run since 2026-07-06 — the fetch worked, the commit
+        # never happened, and the datasets silently stopped being refreshed.
+        # `-s` below derives the Signed-off-by trailer from these values, so the
+        # identity and the DCO sign-off cannot drift apart.
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
         git checkout -b "$BRANCH"
         git add ${{ matrix.output }}
-        git commit -m "data(sovereign): weekly ${{ matrix.adjective }} CIDR refresh
+        # -s is required: dco.yml gates every pull_request to master on a
+        # Signed-off-by trailer, so an unsigned commit here would open a PR that
+        # can never merge.
+        git commit -s -m "data(sovereign): weekly ${{ matrix.adjective }} CIDR refresh
 
         Source: RIPE NCC delegated + IPtoASN ($(date +%Y-%m-%d))
         Changes: +${{ steps.diff.outputs.added }} -${{ steps.diff.outputs.removed }} lines"
