@@ -3,7 +3,7 @@ name: zion
 description: Zion Edge Gateway — high-performance Rust TLS reverse proxy with WAF
 type: application
 version: 0.2.2
-appVersion: "0.7.3"
+appVersion: "0.7.4"
 home: https://fabriziosalmi.github.io/zion
 sources:
   - https://github.com/fabriziosalmi/zion

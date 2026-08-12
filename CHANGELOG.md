@@ -4,11 +4,29 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
-Nothing here changes runtime behaviour for an operator: no new features, no bug
-fixes on the request path, no config surface. It is dependency hygiene, test
-infrastructure, and one experimental scaffold that ships inert. **This section
-is deliberately not a release** — recorded so that "nothing worth releasing" is
-distinguishable from "someone forgot to write it down".
+## [0.7.4] - 2026-08-13
+
+**A stability release, cut to be held still.** Nothing here changes runtime
+behaviour for an operator: no new features on the request path, no bug fixes
+there, no config surface. It is dependency hygiene, supply-chain corrections,
+CI that now checks what it claims to, and one experimental scaffold that ships
+inert.
+
+The reason to tag it anyway is that the next step is field validation against
+real sites — and that is only meaningful against a fixed point. Everything
+below is what the frozen baseline contains.
+
+### Data
+
+- **Sovereign ASN/CIDR datasets refreshed** (#375, #376) after the weekly job
+  had been silently failing for six weeks (see *Fixed*). EU-27 coverage is
+  essentially unchanged (+0.01%); the Italian set loses 0.86%, which was
+  verified against the sources rather than assumed: three Telecom Italia /15
+  blocks currently return `AS0 — Not routed` in IPtoASN, and one /24 has moved
+  to `AS32787` (Prolexic, US DDoS scrubbing). Excluding both is correct —
+  classifying unrouted space, or a US scrubbing centre, as Italian residential
+  would be wrong. Note this tracks BGP, so the classification will oscillate if
+  those prefixes are announced again.
 
 ### Added
 - **ML-WAF training pipeline** (#345, ADR-0023) — a reproducible in-repo `ml/`
@@ -38,6 +56,21 @@ distinguishable from "someone forgot to write it down".
   Actions updates.
 
 ### Fixed
+- **The weekly sovereign-data refresh runs again** (#374), after failing every
+  scheduled run from 2026-07-06 to 2026-08-12. Four layers, each hidden by the
+  one before it: the runner had no git identity, so `git commit` aborted; the
+  commit carried no `Signed-off-by`, so its PR could never have passed
+  `dco.yml`; the `sovereign-data` and `automated` labels did not exist, so
+  `gh pr create` died after pushing the branch; and repo policy forbids Actions
+  from opening pull requests, so it now uses a fine-grained PAT scoped to this
+  repository rather than lifting that policy for every workflow.
+- **`aws-lc-rs` held below 1.18.0** (#378). That release switches
+  `aws-lc-fips-sys` from the AWS-LC-FIPS **3.x** module — FIPS 140-3 validated,
+  NIST certificates #5314 and #5298 — to **4.x**, which has completed lab
+  testing but is still on the CMVP Modules In Process list. `--features fips`
+  exists to give operators a validated module, and the repo says "validated" in
+  five places; taking the bump would have made all five false behind a
+  `rust-minor` label. The existing pin only covered semver-major.
 - **Three advisory ignores retired**, not silenced (#371) — each because the
   advisory stopped applying, verified crate-by-crate:
   `RUSTSEC-2024-0436` (`paste`, both sources gone), `RUSTSEC-2024-0320`
@@ -53,6 +86,15 @@ distinguishable from "someone forgot to write it down".
   respective walls.
 
 ### Testing
+- **A watchdog over the scheduled workflows** (#372). Every cron in this repo
+  reported into the void — a failing one blocks no merge and notifies nobody,
+  which is how the sovereign-data breakage above survived six weeks. A daily job
+  now asserts that each scheduled workflow has had a *successful scheduled* run
+  inside its window, and opens an issue when one has not. It derives the
+  workflow list from the cron lines rather than hardcoding it, so a new
+  scheduled workflow is covered automatically; it also catches a cron that
+  stopped existing, since GitHub disables schedules after 60 days of repository
+  inactivity and a disabled cron never fails.
 - **Equivalence harness generalized to Caddy and Traefik** (#347), previously
   nginx-only.
 - **ML-WAF review findings fixed** — header lookups made case-insensitive on
