@@ -123,7 +123,10 @@ fn u16_list(bytes: &[u8]) -> Result<Vec<u16>, TlsFpError> {
         .collect())
 }
 
-/// Map a TLS version code point to its 2-char JA4 token.
+/// Map a TLS version code point to its 2-char JA4 token. TLS-over-TCP only:
+/// DTLS (`d1`/`d2`/`d3`) is out of scope for Phase 3a — the transport char is
+/// hardcoded `t` and this parser doesn't understand the DTLS ClientHello layout,
+/// so DTLS code points fall through to the `00` unknown token like anything else.
 fn version_token(v: u16) -> &'static str {
     match v {
         0x0304 => "13",
@@ -132,9 +135,6 @@ fn version_token(v: u16) -> &'static str {
         0x0301 => "10",
         0x0300 => "s3",
         0x0002 => "s2",
-        0xfeff => "d1",
-        0xfefd => "d2",
-        0xfefc => "d3",
         _ => "00",
     }
 }
@@ -168,9 +168,20 @@ fn sha256_12(input: &str) -> String {
     out
 }
 
-/// Zero-padded 4-char lowercase hex of a code point (for sorting + hashing).
-fn hex4(v: u16) -> String {
-    format!("{v:04x}")
+/// Comma-joined 4-char zero-padded lowercase hex of a code-point slice, in the
+/// slice's current order. Callers sort (ciphers, extension types) or preserve
+/// wire order (signature_algorithms) beforehand. Formats once — no per-element
+/// `String` allocation — and zero-padded 4-hex sorts identically to numeric u16
+/// order, so sorting the `u16`s is equivalent to sorting the hex strings.
+fn csv_hex(vals: &[u16]) -> String {
+    let mut out = String::with_capacity(vals.len() * 5);
+    for (i, v) in vals.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("{v:04x}"));
+    }
+    out
 }
 
 /// Fields extracted from a `ClientHello` that JA4 needs.
@@ -179,6 +190,10 @@ struct ClientHelloParts {
     ciphers: Vec<u16>,
     ext_types: Vec<u16>,
     sni_present: bool,
+    /// Whether the `supported_versions` (0x002b) extension was present — the JA4
+    /// version rule branches on presence, not on whether a non-GREASE value
+    /// survives.
+    sv_present: bool,
     supported_versions: Vec<u16>,
     sig_algs: Vec<u16>,
     first_alpn: Vec<u8>,
@@ -192,7 +207,16 @@ fn parse_client_hello(bytes: &[u8]) -> Result<ClientHelloParts, TlsFpError> {
     if r.u8()? != 0x01 {
         return Err(TlsFpError::NotClientHello);
     }
-    let _body_len = r.take(3)?; // 24-bit length — informational; we walk fields directly
+    // 24-bit handshake body length. Clamp the whole walk to it so a hostile
+    // length field can never make an extension read spill past the declared
+    // message into trailing bytes (a second record, or record framing, is the
+    // peek/hook commit's concern). The buffer must actually contain the message.
+    let blen = r.take(3)?;
+    let body_len = ((blen[0] as usize) << 16) | ((blen[1] as usize) << 8) | (blen[2] as usize);
+    let body_end = 4usize.checked_add(body_len).ok_or(TlsFpError::Malformed)?;
+    let body = bytes.get(4..body_end).ok_or(TlsFpError::Truncated)?;
+    let mut r = Reader::new(body);
+
     let legacy_version = r.u16()?;
     let _random = r.take(32)?;
     let sid_len = r.u8()? as usize;
@@ -209,6 +233,7 @@ fn parse_client_hello(bytes: &[u8]) -> Result<ClientHelloParts, TlsFpError> {
         ciphers,
         ext_types: Vec::new(),
         sni_present: false,
+        sv_present: false,
         supported_versions: Vec::new(),
         sig_algs: Vec::new(),
         first_alpn: Vec::new(),
@@ -230,11 +255,18 @@ fn parse_client_hello(bytes: &[u8]) -> Result<ClientHelloParts, TlsFpError> {
         match ext_type {
             0x0000 => parts.sni_present = true,
             0x0010 => {
-                // ALPN: [list_len u16][ {proto_len u8, proto bytes} … ]. Keep first.
+                // ALPN: [list_len u16][ {proto_len u8, proto bytes} … ]. Keep the
+                // first protocol. Best-effort: a well-formed but EMPTY list (body
+                // [0x00,0x00]) is valid and must yield the "00" token, not fail
+                // the whole fingerprint (which would drop a legitimate client).
                 let mut a = Reader::new(data);
-                let _list_len = a.u16()?;
-                let plen = a.u8()? as usize;
-                parts.first_alpn = a.take(plen)?.to_vec();
+                if a.u16().is_ok() {
+                    if let Ok(plen) = a.u8() {
+                        if let Ok(proto) = a.take(plen as usize) {
+                            parts.first_alpn = proto.to_vec();
+                        }
+                    }
+                }
             }
             0x000d => {
                 // signature_algorithms: [list_len u16][ u16 … ] — WIRE order.
@@ -244,6 +276,7 @@ fn parse_client_hello(bytes: &[u8]) -> Result<ClientHelloParts, TlsFpError> {
             }
             0x002b => {
                 // supported_versions: [list_len u8][ u16 … ].
+                parts.sv_present = true;
                 let mut s = Reader::new(data);
                 let list_len = s.u8()? as usize;
                 parts.supported_versions = u16_list(s.take(list_len)?)?;
@@ -263,70 +296,71 @@ fn parse_client_hello(bytes: &[u8]) -> Result<ClientHelloParts, TlsFpError> {
 pub fn ja4_from_client_hello(bytes: &[u8]) -> Result<Ja4, TlsFpError> {
     let p = parse_client_hello(bytes)?;
 
-    // ── JA4_a ─────────────────────────────────────────────────────────────
-    // Version: max of the GREASE-stripped supported_versions, else legacy.
-    let sv_max = p
-        .supported_versions
-        .iter()
-        .copied()
-        .filter(|v| !is_grease(*v))
-        .max();
-    let version = version_token(sv_max.unwrap_or(p.legacy_version));
-
-    let sni = if p.sni_present { 'd' } else { 'i' };
-
-    let cipher_ct = p.ciphers.iter().filter(|v| !is_grease(**v)).count().min(99);
-    let ext_ct = p
-        .ext_types
-        .iter()
-        .filter(|v| !is_grease(**v))
-        .count()
-        .min(99);
-
-    let (alpn0, alpn1) = alpn_token(&p.first_alpn);
-
-    let ja4_a = format!("t{version}{sni}{cipher_ct:02}{ext_ct:02}{alpn0}{alpn1}");
-
-    // ── JA4_b: sorted, GREASE-stripped ciphers, hashed ─────────────────────
-    let mut cipher_hex: Vec<String> = p
+    // GREASE-stripped working sets (used for both the counts and the hashes).
+    let ciphers: Vec<u16> = p
         .ciphers
         .iter()
         .copied()
         .filter(|v| !is_grease(*v))
-        .map(hex4)
         .collect();
-    cipher_hex.sort();
-    let ja4_b = if cipher_hex.is_empty() {
-        "000000000000".to_string()
-    } else {
-        sha256_12(&cipher_hex.join(","))
-    };
-
-    // ── JA4_c: sorted ext types (minus SNI+ALPN) + wire-order sig-algs ─────
-    let mut ext_hex: Vec<String> = p
+    let ext_types: Vec<u16> = p
         .ext_types
         .iter()
         .copied()
-        .filter(|v| !is_grease(*v) && *v != 0x0000 && *v != 0x0010)
-        .map(hex4)
+        .filter(|v| !is_grease(*v))
         .collect();
-    ext_hex.sort();
 
-    let ja4_c = if ext_hex.is_empty() {
+    // ── JA4_a ─────────────────────────────────────────────────────────────
+    // Version: the JA4 rule branches on whether supported_versions is PRESENT.
+    // If so, use the highest non-GREASE entry (or "00" when the list is empty /
+    // all-GREASE); otherwise use the legacy record version.
+    let version = if p.sv_present {
+        p.supported_versions
+            .iter()
+            .copied()
+            .filter(|v| !is_grease(*v))
+            .max()
+            .map_or("00", version_token)
+    } else {
+        version_token(p.legacy_version)
+    };
+
+    let sni = if p.sni_present { 'd' } else { 'i' };
+    // The extension count includes SNI + ALPN — they are only removed from JA4_c.
+    let cipher_ct = ciphers.len().min(99);
+    let ext_ct = ext_types.len().min(99);
+    let (alpn0, alpn1) = alpn_token(&p.first_alpn);
+    let ja4_a = format!("t{version}{sni}{cipher_ct:02}{ext_ct:02}{alpn0}{alpn1}");
+
+    // ── JA4_b: sorted ciphers, hashed ─────────────────────────────────────
+    let mut sorted_ciphers = ciphers;
+    sorted_ciphers.sort_unstable();
+    let ja4_b = if sorted_ciphers.is_empty() {
         "000000000000".to_string()
     } else {
-        let sig_hex: Vec<String> = p
+        sha256_12(&csv_hex(&sorted_ciphers))
+    };
+
+    // ── JA4_c: sorted ext types (minus SNI+ALPN) + wire-order sig-algs ─────
+    let mut sorted_exts: Vec<u16> = ext_types
+        .into_iter()
+        .filter(|v| *v != 0x0000 && *v != 0x0010)
+        .collect();
+    sorted_exts.sort_unstable();
+    let ja4_c = if sorted_exts.is_empty() {
+        "000000000000".to_string()
+    } else {
+        let sig_algs: Vec<u16> = p
             .sig_algs
             .iter()
             .copied()
             .filter(|v| !is_grease(*v))
-            .map(hex4)
             .collect();
         // No sig-algs → NO trailing underscore (a classic JA4 off-by-one).
-        let combined = if sig_hex.is_empty() {
-            ext_hex.join(",")
+        let combined = if sig_algs.is_empty() {
+            csv_hex(&sorted_exts)
         } else {
-            format!("{}_{}", ext_hex.join(","), sig_hex.join(","))
+            format!("{}_{}", csv_hex(&sorted_exts), csv_hex(&sig_algs))
         };
         sha256_12(&combined)
     };
@@ -509,6 +543,54 @@ mod tests {
         // ja4_c hashes only 0017 (SNI+ALPN removed).
         let c = ja4.as_str().split('_').nth(2).unwrap();
         assert_eq!(c, sha256_12("0017"));
+    }
+
+    #[test]
+    fn empty_alpn_list_yields_00_token_not_error() {
+        // A well-formed but EMPTY ALPN ProtocolNameList (body [0x00,0x00]) is
+        // valid and must fingerprint with ALPN token "00" — not error out, which
+        // would fail-open by dropping a legitimate client at the gate.
+        let ciphers: [u16; 1] = [0x1301];
+        let mut ext = Vec::new();
+        push_ext(&mut ext, 0x0000, &[0x00, 0x00]); // SNI
+        push_ext(&mut ext, 0x0010, &[0x00, 0x00]); // ALPN: empty ProtocolNameList
+        push_ext(&mut ext, 0x0017, &[]);
+        let hello = assemble_body(0x0303, &ciphers, &ext);
+        let ja4 = ja4_from_client_hello(&hello).expect("empty ALPN must not error");
+        let a = ja4.as_str().split('_').next().unwrap();
+        assert_eq!(a, "t12d010300"); // 1 cipher, 3 exts, SNI, ALPN token "00"
+    }
+
+    #[test]
+    fn all_grease_supported_versions_yields_00() {
+        // supported_versions PRESENT but only GREASE → version token "00", not a
+        // silent fall-back to the legacy record version.
+        let ciphers: [u16; 1] = [0x1301];
+        let mut ext = Vec::new();
+        push_ext(&mut ext, 0x002b, &[0x02, 0x0a, 0x0a]); // [len=2][GREASE 0x0a0a]
+        let hello = assemble_body(0x0303, &ciphers, &ext);
+        let ja4 = ja4_from_client_hello(&hello).unwrap();
+        assert_eq!(&ja4.as_str()[1..3], "00");
+    }
+
+    #[test]
+    fn body_len_larger_than_buffer_is_truncated() {
+        // The 24-bit handshake length claims more than the buffer holds → the
+        // clamp rejects it up front instead of walking a short buffer.
+        let mut hello = chrome_client_hello();
+        hello[1] = 0xff; // inflate the high byte of the 24-bit body length
+        assert_eq!(ja4_from_client_hello(&hello), Err(TlsFpError::Truncated));
+    }
+
+    #[test]
+    fn trailing_bytes_after_message_are_ignored() {
+        // Extra bytes beyond the declared handshake message (a second record, or
+        // peek slack) do not corrupt the fingerprint — the clamp keeps the walk
+        // inside body_len.
+        let mut hello = chrome_client_hello();
+        hello.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let ja4 = ja4_from_client_hello(&hello).unwrap();
+        assert_eq!(ja4.as_str(), "t13d1516h2_8daaf6152771_e5627efa2ab1");
     }
 
     #[test]
