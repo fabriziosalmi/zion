@@ -367,16 +367,28 @@ pub struct TlsConfig {
 #[derive(Deserialize, Clone, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct FingerprintConfig {
-    /// `off` (default) | `shadow` | `allowlist`. Commit 2 (#27) implements
-    /// off + shadow — compute JA4, count known/unknown, log, but NEVER block.
-    /// `allowlist` enforcement (socket close before the handshake) lands in
-    /// commit 3; until then it behaves like `shadow`.
+    /// `off` (default) | `shadow` | `allowlist`.
+    /// - `off`: no fingerprinting; zero overhead.
+    /// - `shadow`: compute JA4, count known/unknown, log — but never block.
+    /// - `allowlist`: additionally enforce — a fingerprint not in `allowed` is
+    ///   handled per `on_unknown`, an unfingerprintable ClientHello per
+    ///   `on_unfingerprintable` (a `drop` closes the socket before the handshake).
     #[serde(default)]
     pub mode: FingerprintMode,
     /// Known-good fingerprints. In `shadow` they label a connection known vs
-    /// unknown for the metrics; in `allowlist` (later) they are the allowlist.
+    /// unknown for the metrics; in `allowlist` they are the enforced allowlist.
     #[serde(default)]
     pub allowed: Vec<AllowedFingerprint>,
+    /// `allowlist` mode: what to do with a fingerprint not in `allowed`.
+    /// Default `log_only` — observe without blocking. `drop` closes the socket
+    /// before the TLS handshake.
+    #[serde(default)]
+    pub on_unknown: OnUnknown,
+    /// `allowlist` mode: what to do with a connection whose ClientHello can't be
+    /// fingerprinted (peek timed out, record larger than the buffer, not TLS).
+    /// Default `allow` — availability first; `drop` fails closed for the strict.
+    #[serde(default)]
+    pub on_unfingerprintable: OnUnfingerprintable,
 }
 
 #[derive(Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -386,6 +398,26 @@ pub enum FingerprintMode {
     Off,
     Shadow,
     Allowlist,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OnUnknown {
+    /// Log + count the unknown fingerprint; let the connection proceed.
+    #[default]
+    LogOnly,
+    /// Close the socket before the TLS handshake.
+    Drop,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OnUnfingerprintable {
+    /// Let the connection proceed into the handshake (availability first).
+    #[default]
+    Allow,
+    /// Close the socket before the TLS handshake.
+    Drop,
 }
 
 #[allow(dead_code)] // fields read only under `--features tls-fingerprint`
@@ -856,6 +888,37 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             "server.listen_https '{}' is not a valid address",
             config.server.listen_https
         ));
+    }
+
+    // [tls.fingerprint]: an allowlist that drops every unknown but lists no
+    // allowed entries would deny ALL traffic — refuse to boot into a total
+    // outage. Only enforced where it would actually bite (feature on); a
+    // feature-off build is handled by warn_feature_config_gaps instead.
+    #[cfg(feature = "tls-fingerprint")]
+    if let Some(fp) = &config.tls.fingerprint {
+        if fp.mode == FingerprintMode::Allowlist
+            && fp.on_unknown == OnUnknown::Drop
+            && fp.allowed.is_empty()
+        {
+            errors.push(
+                "[tls.fingerprint] mode = \"allowlist\" with on_unknown = \"drop\" and an \
+                 empty `allowed` list would drop EVERY connection. Add allowed entries, set \
+                 on_unknown = \"log_only\", or use mode = \"shadow\"."
+                    .to_string(),
+            );
+        }
+        // A malformed allowlist entry can never match a computed JA4, so under
+        // on_unknown = drop it is a silent deny-all the empty-list check above
+        // misses. Surface the typo at boot instead of as a production outage.
+        for a in &fp.allowed {
+            if !crate::tls_fp::looks_like_ja4(&a.ja4) {
+                errors.push(format!(
+                    "[tls.fingerprint] allowed entry '{}' has an invalid JA4 '{}' \
+                     (expected e.g. t13d1516h2_8daaf6152771_e5627efa2ab1)",
+                    a.name, a.ja4
+                ));
+            }
+        }
     }
 
     // SNI entries need a subject to match on (file existence is deploy-time)
@@ -1587,6 +1650,54 @@ mod tests {
             waf_shadow: false,
             cors: None,
         }
+    }
+
+    #[cfg(feature = "tls-fingerprint")]
+    #[test]
+    fn allowlist_drop_empty_list_refuses_boot() {
+        // mode=allowlist + on_unknown=drop + empty allowed = drop EVERYTHING.
+        let deny_all = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"drop\"\nallowed=[]\n\
+             [upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        // Semantic (filesystem-free) validation — the cert paths need not exist.
+        let cfg = parse_schema(deny_all, "test").expect("parse");
+        let err = validate_semantics(&cfg, "test").err().unwrap_or_default();
+        assert!(err.contains("drop EVERY connection"), "got: {err}");
+    }
+
+    #[cfg(feature = "tls-fingerprint")]
+    #[test]
+    fn allowlist_malformed_ja4_is_rejected() {
+        // A non-empty allowlist of unmatchable entries is an equivalent deny-all;
+        // surface the typo at boot, not as a silent production outage.
+        let bad = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"drop\"\n\
+             allowed=[{name=\"typo\",ja4=\"not-a-ja4\"}]\n\
+             [upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let cfg = parse_schema(bad, "test").expect("parse");
+        let err = validate_semantics(&cfg, "test").err().unwrap_or_default();
+        assert!(err.contains("invalid JA4"), "got: {err}");
+    }
+
+    #[cfg(feature = "tls-fingerprint")]
+    #[test]
+    fn allowlist_log_only_empty_list_boots() {
+        // log_only never drops, so an empty allowlist is harmless — must pass.
+        let ok = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"log_only\"\nallowed=[]\n\
+             [upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let cfg = parse_schema(ok, "test").expect("parse");
+        assert!(
+            validate_semantics(&cfg, "test").is_ok(),
+            "log_only empty allowlist must pass semantics, got: {:?}",
+            validate_semantics(&cfg, "test").err()
+        );
     }
 
     #[test]

@@ -860,6 +860,26 @@ fn warn_feature_config_gaps(config: &config::ZionConfig) {
             );
         }
     }
+    // Enforcement with an open side door: an allowlist that drops unknown
+    // fingerprints but lets un-fingerprintable ClientHellos through can be
+    // bypassed by a client that fragments/oversizes its hello. Warn so the
+    // operator opts into on_unfingerprintable = "drop" deliberately.
+    #[cfg(feature = "tls-fingerprint")]
+    if let Some(fp) = &config.tls.fingerprint {
+        if fp.mode == config::FingerprintMode::Allowlist
+            && fp.on_unknown == config::OnUnknown::Drop
+            && fp.on_unfingerprintable == config::OnUnfingerprintable::Allow
+        {
+            logging::warn(
+                "config",
+                "[tls.fingerprint] allowlist drops unknown fingerprints but \
+                 on_unfingerprintable = \"allow\" (default) — a client can BYPASS \
+                 the allowlist by fragmenting or oversizing its ClientHello so it \
+                 can't be fingerprinted. Set on_unfingerprintable = \"drop\" for \
+                 strict zero-trust.",
+            );
+        }
+    }
     // In a build where every referenced feature is present, all blocks above
     // compile out and `config` is otherwise unused here.
     let _ = config;
@@ -1817,12 +1837,17 @@ fn spawn_https_handler(
         let _conn_guard = metrics::ConnectionGuard::new();
         let _ = tcp_stream.set_nodelay(true);
         net::tune_accepted(&tcp_stream);
-        // Shadow-mode JA4 fingerprinting (#27): peek the ClientHello before the
-        // handshake and count it known/unknown. MSG_PEEK leaves the bytes in the
-        // kernel buffer for rustls to re-read. No peek — no syscall — when the
-        // feature is off or `[tls.fingerprint] mode = "off"` (resolved to `None`).
+        // JA4 fingerprint gate (#27): peek the ClientHello before the handshake,
+        // compute JA4, count known/unknown. MSG_PEEK leaves the bytes in the
+        // kernel buffer for rustls to re-read. In allowlist mode a rejected
+        // fingerprint closes the connection HERE, before any handshake. No peek —
+        // no syscall — when the feature is off or mode = off (runtime `None`).
         #[cfg(feature = "tls-fingerprint")]
-        tls_fp::shadow_observe(&tcp_stream, &state).await;
+        if tls_fp::fingerprint_gate(&tcp_stream, &state).await == tls_fp::GateDecision::Reject {
+            // Dropping tcp_stream closes the socket; the connection permit and
+            // per-IP slot release when their guards drop at end of scope.
+            return;
+        }
         metrics::METRICS
             .connections_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

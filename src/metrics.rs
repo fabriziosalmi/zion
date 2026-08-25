@@ -407,11 +407,15 @@ pub struct Metrics {
     pub websocket_upgrades: AtomicU64,
     pub connections_total: AtomicU64,
     pub tls_handshake_errors: AtomicU64,
-    /// JA4 client fingerprints observed in shadow mode (#27): matched an
-    /// allowlist entry (`known`) vs not (`unknown`). Advisory only — shadow
-    /// mode never gates a connection.
+    /// JA4 client fingerprints observed (#27, in `shadow` or `allowlist` mode):
+    /// matched an allowlist entry (`known`) vs not (`unknown`). In `allowlist`
+    /// mode an unknown may then be rejected — see `tls_fp_rejected`.
     pub tls_fp_known: AtomicU64,
     pub tls_fp_unknown: AtomicU64,
+    /// Connections closed before the TLS handshake by the JA4 allowlist gate
+    /// (#27): an unknown fingerprint under `on_unknown = drop`, or an
+    /// unfingerprintable ClientHello under `on_unfingerprintable = drop`.
+    pub tls_fp_rejected: AtomicU64,
     /// Connections closed at accept because the source IP was already at
     /// its `max_connections_per_ip` concurrent cap (anti-DDoS lever).
     pub connections_rejected_per_ip: AtomicU64,
@@ -513,6 +517,7 @@ impl Metrics {
             tls_handshake_errors: AtomicU64::new(0),
             tls_fp_known: AtomicU64::new(0),
             tls_fp_unknown: AtomicU64::new(0),
+            tls_fp_rejected: AtomicU64::new(0),
             connections_rejected_per_ip: AtomicU64::new(0),
             enforcement_denied_class: AtomicU64::new(0),
             enforcement_denied_mesh_score: AtomicU64::new(0),
@@ -769,7 +774,7 @@ impl Metrics {
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(
-            b"# HELP zion_tls_fp_known Shadow-mode JA4 fingerprints matching an allowlist entry.\n\
+            b"# HELP zion_tls_fp_known JA4 fingerprints matching an allowlist entry (shadow or allowlist mode).\n\
                                 # TYPE zion_tls_fp_known counter\n\
                                 zion_tls_fp_known ",
         );
@@ -777,13 +782,25 @@ impl Metrics {
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(
-            b"# HELP zion_tls_fp_unknown Shadow-mode JA4 fingerprints not on the allowlist.\n\
+            b"# HELP zion_tls_fp_unknown JA4 fingerprints not on the allowlist (shadow or allowlist mode).\n\
                                 # TYPE zion_tls_fp_unknown counter\n\
                                 zion_tls_fp_unknown ",
         );
         out.extend_from_slice(
             itoa_buf
                 .format(self.tls_fp_unknown.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_tls_fp_rejected Connections closed before the handshake by the JA4 allowlist gate.\n\
+                                # TYPE zion_tls_fp_rejected counter\n\
+                                zion_tls_fp_rejected ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.tls_fp_rejected.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");
