@@ -222,6 +222,11 @@ pub(crate) struct ResolvedAppConfig {
     /// `ZionConfig.access_log` with header names already lowercased
     /// at config-load time.
     pub(crate) access_log: config::AccessLogConfig,
+    /// Resolved JA4 fingerprinting runtime (#27). `None` when the feature is off
+    /// or `[tls.fingerprint] mode = "off"` — the accept path then does no
+    /// ClientHello peek (zero overhead).
+    #[cfg(feature = "tls-fingerprint")]
+    pub(crate) tls_fingerprint: Option<tls_fp::TlsFpRuntime>,
 }
 
 impl ResolvedAppConfig {
@@ -249,6 +254,8 @@ impl ResolvedAppConfig {
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             sovereign_log_classification: false,
             access_log: config::AccessLogConfig::default(),
+            #[cfg(feature = "tls-fingerprint")]
+            tls_fingerprint: None,
         }
     }
 
@@ -441,6 +448,12 @@ impl ResolvedAppConfig {
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             sovereign_log_classification,
             access_log: config.access_log.clone(),
+            #[cfg(feature = "tls-fingerprint")]
+            tls_fingerprint: config
+                .tls
+                .fingerprint
+                .as_ref()
+                .and_then(tls_fp::TlsFpRuntime::from_config),
         })
     }
 }
@@ -829,7 +842,24 @@ fn warn_feature_config_gaps(config: &config::ZionConfig) {
             );
         }
     }
-    // In a build where every referenced feature is present, both blocks above
+    #[cfg(not(feature = "tls-fingerprint"))]
+    {
+        let fp_active = config
+            .tls
+            .fingerprint
+            .as_ref()
+            .is_some_and(|fp| fp.mode != config::FingerprintMode::Off);
+        if fp_active {
+            logging::warn(
+                "config",
+                "[tls.fingerprint] is set to a non-off mode but this binary was \
+                 built WITHOUT `--features tls-fingerprint` — JA4 fingerprints \
+                 are NOT computed and no connection is observed or gated. \
+                 Rebuild with `--features tls-fingerprint`.",
+            );
+        }
+    }
+    // In a build where every referenced feature is present, all blocks above
     // compile out and `config` is otherwise unused here.
     let _ = config;
 }
@@ -1786,6 +1816,12 @@ fn spawn_https_handler(
         let _conn_guard = metrics::ConnectionGuard::new();
         let _ = tcp_stream.set_nodelay(true);
         net::tune_accepted(&tcp_stream);
+        // Shadow-mode JA4 fingerprinting (#27): peek the ClientHello before the
+        // handshake and count it known/unknown. MSG_PEEK leaves the bytes in the
+        // kernel buffer for rustls to re-read. Zero cost when the feature is off
+        // or `[tls.fingerprint] mode = "off"` (resolved to `None`).
+        #[cfg(feature = "tls-fingerprint")]
+        tls_fp::shadow_observe(&tcp_stream, &state).await;
         metrics::METRICS
             .connections_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

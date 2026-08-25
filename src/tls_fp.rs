@@ -368,6 +368,97 @@ pub fn ja4_from_client_hello(bytes: &[u8]) -> Result<Ja4, TlsFpError> {
     Ok(Ja4(format!("{ja4_a}_{ja4_b}_{ja4_c}")))
 }
 
+/// Compute JA4 from a raw TLS record buffer as `MSG_PEEK`'d off the socket — the
+/// buffer starts at the 5-byte TLS record header (`content_type`, legacy
+/// version, length). Strips the header and fingerprints the ClientHello in the
+/// first handshake record.
+///
+/// Only the first record is inspected. A ClientHello fragmented across multiple
+/// TLS records (rare, and something a peek may also simply not have buffered
+/// yet) yields `Truncated` — the shadow-mode caller treats that as "not
+/// fingerprinted this time" rather than an error to act on. Bytes beyond the
+/// first record (a coalesced second record) are ignored.
+pub fn ja4_from_tls_record(bytes: &[u8]) -> Result<Ja4, TlsFpError> {
+    let mut r = Reader::new(bytes);
+    // TLS record: content_type(1) = 22 handshake, legacy_version(2), length(2).
+    if r.u8()? != 0x16 {
+        return Err(TlsFpError::NotClientHello);
+    }
+    let _legacy_version = r.u16()?;
+    let rec_len = r.u16()? as usize;
+    // The handshake message (starting at the 0x01 ClientHello msg_type) is the
+    // record payload. ja4_from_client_hello clamps to the handshake's own 24-bit
+    // length, so a short/fragmented payload comes back as Truncated.
+    let payload = r.take(rec_len)?;
+    ja4_from_client_hello(payload)
+}
+
+/// Runtime-resolved fingerprint state, read on the accept path. Built once per
+/// config load from `[tls.fingerprint]`; the resolver returns `None` for
+/// `mode = off` so the hot path pays nothing when the feature is unused.
+#[derive(Clone, Debug)]
+pub struct TlsFpRuntime {
+    pub mode: crate::config::FingerprintMode,
+    /// JA4 string → allowlist entry name (for the known/unknown metric split).
+    allowed: std::collections::HashMap<String, String>,
+}
+
+impl TlsFpRuntime {
+    /// Resolve from config; `None` for `mode = off` (zero hot-path cost).
+    pub fn from_config(cfg: &crate::config::FingerprintConfig) -> Option<Self> {
+        if cfg.mode == crate::config::FingerprintMode::Off {
+            return None;
+        }
+        let allowed = cfg
+            .allowed
+            .iter()
+            .map(|a| (a.ja4.clone(), a.name.clone()))
+            .collect();
+        Some(TlsFpRuntime {
+            mode: cfg.mode.clone(),
+            allowed,
+        })
+    }
+
+    /// The allowlist entry name for a fingerprint, if it is known.
+    pub fn known_name(&self, ja4: &Ja4) -> Option<&str> {
+        self.allowed.get(ja4.as_str()).map(String::as_str)
+    }
+}
+
+/// Shadow-mode observation on the accept path: `MSG_PEEK` the ClientHello
+/// (leaving the bytes in the kernel buffer for rustls to re-read), compute JA4,
+/// and count it known vs unknown against the allowlist. It NEVER blocks — the
+/// allowlist gate (closing the socket before the handshake) is #27 commit 3.
+///
+/// A ClientHello that can't be peeked or parsed yet (fragmented, not buffered)
+/// is silently skipped: shadow mode observes, it never fails a connection.
+pub async fn shadow_observe(stream: &tokio::net::TcpStream, state: &crate::AppState) {
+    let cfg = state.config.load();
+    let Some(fp) = cfg.tls_fingerprint.as_ref() else {
+        return; // mode = off → nothing resolved → zero cost
+    };
+    let mut buf = [0u8; 1024];
+    let n = match stream.peek(&mut buf).await {
+        Ok(n) if n > 0 => n,
+        _ => return,
+    };
+    // A truncated / fragmented / not-a-ClientHello peek is skipped silently —
+    // shadow mode observes, it never fails a connection.
+    if let Ok(ja4) = ja4_from_tls_record(&buf[..n]) {
+        if fp.known_name(&ja4).is_some() {
+            crate::metrics::METRICS
+                .tls_fp_known
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            crate::metrics::METRICS
+                .tls_fp_unknown
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(ja4 = %ja4, "tls-fp: unknown ClientHello fingerprint (shadow mode)");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +563,60 @@ mod tests {
         assert_eq!(ja4.as_str(), "t13d1516h2_8daaf6152771_e5627efa2ab1");
     }
 
+    /// Wrap a handshake-message body in a TLS handshake record header
+    /// (`0x16`, legacy version 0x0301, length).
+    fn wrap_record(body: &[u8]) -> Vec<u8> {
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        rec.extend_from_slice(body);
+        rec
+    }
+
+    #[test]
+    fn tls_record_wrapper_matches_reference() {
+        // The record-framed ClientHello (as MSG_PEEK'd off the socket) yields the
+        // same fingerprint as the bare handshake body.
+        let rec = wrap_record(&chrome_client_hello());
+        let ja4 = ja4_from_tls_record(&rec).expect("record parse");
+        assert_eq!(ja4.as_str(), "t13d1516h2_8daaf6152771_e5627efa2ab1");
+    }
+
+    #[test]
+    fn tls_record_ignores_a_coalesced_second_record() {
+        // A peek that also grabbed the start of a second record must not corrupt
+        // the fingerprint — only the first record's payload is read.
+        let mut rec = wrap_record(&chrome_client_hello());
+        rec.extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x05, 1, 2, 3, 4, 5]); // app-data record
+        let ja4 = ja4_from_tls_record(&rec).unwrap();
+        assert_eq!(ja4.as_str(), "t13d1516h2_8daaf6152771_e5627efa2ab1");
+    }
+
+    #[test]
+    fn non_handshake_record_is_rejected() {
+        // 0x17 = application_data, not a handshake record.
+        let mut rec = vec![0x17, 0x03, 0x03];
+        rec.extend_from_slice(&4u16.to_be_bytes());
+        rec.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(ja4_from_tls_record(&rec), Err(TlsFpError::NotClientHello));
+    }
+
+    #[test]
+    fn fragmented_record_payload_is_truncated_not_a_panic() {
+        // A record whose declared length exceeds the buffer (peek caught only a
+        // fragment) → Truncated, never a panic.
+        let rec = wrap_record(&chrome_client_hello());
+        for n in 0..rec.len() {
+            let _ = ja4_from_tls_record(&rec[..n]); // must not panic
+        }
+        // A record header claiming more payload than present.
+        let hello = chrome_client_hello();
+        let mut rec = wrap_record(&hello);
+        let inflated = (hello.len() as u16 + 50).to_be_bytes();
+        rec[3] = inflated[0];
+        rec[4] = inflated[1];
+        assert_eq!(ja4_from_tls_record(&rec), Err(TlsFpError::Truncated));
+    }
+
     #[test]
     fn ja4_a_fields_decompose() {
         let ja4 = ja4_from_client_hello(&chrome_client_hello()).unwrap();
@@ -486,6 +631,31 @@ mod tests {
         // supported_versions; the reference JA4 only matches if all are stripped.
         let ja4 = ja4_from_client_hello(&chrome_client_hello()).unwrap();
         assert_eq!(ja4.as_str(), "t13d1516h2_8daaf6152771_e5627efa2ab1");
+    }
+
+    #[test]
+    fn runtime_resolves_off_to_none_and_classifies() {
+        use crate::config::{AllowedFingerprint, FingerprintConfig, FingerprintMode};
+        // mode = off → None, so the accept path pays nothing.
+        let off = FingerprintConfig {
+            mode: FingerprintMode::Off,
+            allowed: vec![],
+        };
+        assert!(TlsFpRuntime::from_config(&off).is_none());
+
+        // shadow with an allowlist → Some; known_name classifies known vs unknown.
+        let cfg = FingerprintConfig {
+            mode: FingerprintMode::Shadow,
+            allowed: vec![AllowedFingerprint {
+                name: "chrome".into(),
+                ja4: "t13d1516h2_8daaf6152771_e5627efa2ab1".into(),
+            }],
+        };
+        let rt = TlsFpRuntime::from_config(&cfg).expect("shadow resolves to Some");
+        let known = ja4_from_client_hello(&chrome_client_hello()).unwrap();
+        assert_eq!(rt.known_name(&known), Some("chrome"));
+        let unknown = Ja4("t00i0000_000000000000_000000000000".into());
+        assert_eq!(rt.known_name(&unknown), None);
     }
 
     #[test]
