@@ -47,6 +47,15 @@ jobs:
   audit:
     name: cargo-audit (advisories)
     runs-on: [self-hosted, Linux, X64]
+    # Give this job its OWN rustup toolchain store under runner.temp (wiped at
+    # the start of every job on self-hosted runners). The persistent Contabo
+    # runners otherwise share one mutable ~/.rustup across jobs, and a
+    # half-removed rust-std leaves a stale component manifest that makes
+    # dtolnay/rust-toolchain's reinstall abort ("failure removing component
+    # rust-std … .rmeta"). Only RUSTUP_HOME moves — CARGO_HOME is untouched, so
+    # the rustup/cargo binaries stay on PATH and crate caching is unaffected.
+    env:
+      RUSTUP_HOME: ${{ runner.temp }}/rustup
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -122,6 +131,9 @@ jobs:
     name: cargo-geiger (unsafe surface)
     runs-on: [self-hosted, Linux, X64]
     continue-on-error: true   # geiger is a *report*, not a gate
+    # Isolated rustup store — see the `audit` job for the rationale.
+    env:
+      RUSTUP_HOME: ${{ runner.temp }}/rustup
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -162,6 +174,9 @@ jobs:
     if: github.event_name != 'pull_request'
     permissions:
       contents: read
+    # Isolated rustup store — see the `audit` job for the rationale.
+    env:
+      RUSTUP_HOME: ${{ runner.temp }}/rustup
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
