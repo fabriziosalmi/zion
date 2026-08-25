@@ -393,6 +393,26 @@ pub fn ja4_from_tls_record(bytes: &[u8]) -> Result<Ja4, TlsFpError> {
     ja4_from_client_hello(payload)
 }
 
+/// Cheap shape check for a configured JA4 string: `<10-char a>_<12 hex b>_<12
+/// hex c>`. Catches a typo / wrong case / truncation at config load rather than
+/// as a silent never-matches outage (a malformed allowlist entry matches nothing,
+/// which under `on_unknown = drop` is a total outage the empty-list guard misses).
+/// Case is not enforced here — [`TlsFpRuntime::from_config`] lowercases entries.
+pub fn looks_like_ja4(s: &str) -> bool {
+    let mut parts = s.trim().split('_');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(a), Some(b), Some(c), None) => {
+            a.len() == 10
+                && a.bytes().all(|x| x.is_ascii_alphanumeric())
+                && b.len() == 12
+                && b.bytes().all(|x| x.is_ascii_hexdigit())
+                && c.len() == 12
+                && c.bytes().all(|x| x.is_ascii_hexdigit())
+        }
+        _ => false,
+    }
+}
+
 /// Runtime-resolved fingerprint state, read on the accept path. Built once per
 /// config load from `[tls.fingerprint]`; the resolver returns `None` for
 /// `mode = off` so the hot path pays nothing when the feature is unused.
@@ -411,10 +431,13 @@ impl TlsFpRuntime {
         if cfg.mode == crate::config::FingerprintMode::Off {
             return None;
         }
+        // Normalize entries (trim + lowercase) so a configured JA4 that differs
+        // only in case/whitespace from the computed (lowercase) fingerprint still
+        // matches instead of silently never matching.
         let allowed = cfg
             .allowed
             .iter()
-            .map(|a| (a.ja4.clone(), a.name.clone()))
+            .map(|a| (a.ja4.trim().to_ascii_lowercase(), a.name.clone()))
             .collect();
         Some(TlsFpRuntime {
             mode: cfg.mode.clone(),
@@ -795,6 +818,35 @@ mod tests {
             OnUnfingerprintable::Drop,
         );
         assert_eq!(strict.unfingerprintable_decision(), GateDecision::Reject);
+    }
+
+    #[test]
+    fn looks_like_ja4_accepts_valid_rejects_garbage() {
+        assert!(looks_like_ja4("t13d1516h2_8daaf6152771_e5627efa2ab1"));
+        // case + surrounding whitespace tolerated (from_config lowercases).
+        assert!(looks_like_ja4("  T13D1516H2_8DAAF6152771_E5627EFA2AB1  "));
+        assert!(!looks_like_ja4("t13d1516h2_8daaf6152771")); // 2 parts
+        assert!(!looks_like_ja4("t13d1516h2_8daaf6152771_e5627efa2ab1_x")); // 4 parts
+        assert!(!looks_like_ja4("short_8daaf6152771_e5627efa2ab1")); // a not 10 chars
+        assert!(!looks_like_ja4("t13d1516h2_zzzz6152771_e5627efa2ab1")); // b not hex
+        assert!(!looks_like_ja4("t13d1516h2_8daaf615277_e5627efa2ab1")); // b is 11 chars
+    }
+
+    #[test]
+    fn from_config_normalizes_case_so_uppercase_matches() {
+        use crate::config::{AllowedFingerprint, FingerprintConfig, FingerprintMode};
+        let cfg = FingerprintConfig {
+            mode: FingerprintMode::Allowlist,
+            allowed: vec![AllowedFingerprint {
+                name: "chrome".into(),
+                ja4: "  T13D1516H2_8DAAF6152771_E5627EFA2AB1  ".into(), // upper + spaces
+            }],
+            ..Default::default()
+        };
+        let rt = TlsFpRuntime::from_config(&cfg).unwrap();
+        // The computed JA4 is lowercase; the normalized entry must still match.
+        let computed = ja4_from_client_hello(&chrome_client_hello()).unwrap();
+        assert_eq!(rt.known_name(&computed), Some("chrome"));
     }
 
     #[test]

@@ -905,6 +905,18 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                     .to_string(),
             );
         }
+        // A malformed allowlist entry can never match a computed JA4, so under
+        // on_unknown = drop it is a silent deny-all the empty-list check above
+        // misses. Surface the typo at boot instead of as a production outage.
+        for a in &fp.allowed {
+            if !crate::tls_fp::looks_like_ja4(&a.ja4) {
+                errors.push(format!(
+                    "[tls.fingerprint] allowed entry '{}' has an invalid JA4 '{}' \
+                     (expected e.g. t13d1516h2_8daaf6152771_e5627efa2ab1)",
+                    a.name, a.ja4
+                ));
+            }
+        }
     }
 
     // SNI entries need a subject to match on (file existence is deploy-time)
@@ -1651,6 +1663,22 @@ mod tests {
         let cfg = parse_schema(deny_all, "test").expect("parse");
         let err = validate_semantics(&cfg, "test").err().unwrap_or_default();
         assert!(err.contains("drop EVERY connection"), "got: {err}");
+    }
+
+    #[cfg(feature = "tls-fingerprint")]
+    #[test]
+    fn allowlist_malformed_ja4_is_rejected() {
+        // A non-empty allowlist of unmatchable entries is an equivalent deny-all;
+        // surface the typo at boot, not as a silent production outage.
+        let bad = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"drop\"\n\
+             allowed=[{name=\"typo\",ja4=\"not-a-ja4\"}]\n\
+             [upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let cfg = parse_schema(bad, "test").expect("parse");
+        let err = validate_semantics(&cfg, "test").err().unwrap_or_default();
+        assert!(err.contains("invalid JA4"), "got: {err}");
     }
 
     #[cfg(feature = "tls-fingerprint")]

@@ -860,6 +860,26 @@ fn warn_feature_config_gaps(config: &config::ZionConfig) {
             );
         }
     }
+    // Enforcement with an open side door: an allowlist that drops unknown
+    // fingerprints but lets un-fingerprintable ClientHellos through can be
+    // bypassed by a client that fragments/oversizes its hello. Warn so the
+    // operator opts into on_unfingerprintable = "drop" deliberately.
+    #[cfg(feature = "tls-fingerprint")]
+    if let Some(fp) = &config.tls.fingerprint {
+        if fp.mode == config::FingerprintMode::Allowlist
+            && fp.on_unknown == config::OnUnknown::Drop
+            && fp.on_unfingerprintable == config::OnUnfingerprintable::Allow
+        {
+            logging::warn(
+                "config",
+                "[tls.fingerprint] allowlist drops unknown fingerprints but \
+                 on_unfingerprintable = \"allow\" (default) — a client can BYPASS \
+                 the allowlist by fragmenting or oversizing its ClientHello so it \
+                 can't be fingerprinted. Set on_unfingerprintable = \"drop\" for \
+                 strict zero-trust.",
+            );
+        }
+    }
     // In a build where every referenced feature is present, all blocks above
     // compile out and `config` is otherwise unused here.
     let _ = config;
