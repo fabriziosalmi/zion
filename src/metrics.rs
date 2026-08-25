@@ -412,6 +412,10 @@ pub struct Metrics {
     /// mode never gates a connection.
     pub tls_fp_known: AtomicU64,
     pub tls_fp_unknown: AtomicU64,
+    /// Connections closed before the TLS handshake by the JA4 allowlist gate
+    /// (#27): an unknown fingerprint under `on_unknown = drop`, or an
+    /// unfingerprintable ClientHello under `on_unfingerprintable = drop`.
+    pub tls_fp_rejected: AtomicU64,
     /// Connections closed at accept because the source IP was already at
     /// its `max_connections_per_ip` concurrent cap (anti-DDoS lever).
     pub connections_rejected_per_ip: AtomicU64,
@@ -513,6 +517,7 @@ impl Metrics {
             tls_handshake_errors: AtomicU64::new(0),
             tls_fp_known: AtomicU64::new(0),
             tls_fp_unknown: AtomicU64::new(0),
+            tls_fp_rejected: AtomicU64::new(0),
             connections_rejected_per_ip: AtomicU64::new(0),
             enforcement_denied_class: AtomicU64::new(0),
             enforcement_denied_mesh_score: AtomicU64::new(0),
@@ -784,6 +789,18 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.tls_fp_unknown.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_tls_fp_rejected Connections closed before the handshake by the JA4 allowlist gate.\n\
+                                # TYPE zion_tls_fp_rejected counter\n\
+                                zion_tls_fp_rejected ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.tls_fp_rejected.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");

@@ -399,6 +399,8 @@ pub fn ja4_from_tls_record(bytes: &[u8]) -> Result<Ja4, TlsFpError> {
 #[derive(Clone, Debug)]
 pub struct TlsFpRuntime {
     pub mode: crate::config::FingerprintMode,
+    on_unknown: crate::config::OnUnknown,
+    on_unfingerprintable: crate::config::OnUnfingerprintable,
     /// JA4 string → allowlist entry name (for the known/unknown metric split).
     allowed: std::collections::HashMap<String, String>,
 }
@@ -416,6 +418,8 @@ impl TlsFpRuntime {
             .collect();
         Some(TlsFpRuntime {
             mode: cfg.mode.clone(),
+            on_unknown: cfg.on_unknown,
+            on_unfingerprintable: cfg.on_unfingerprintable,
             allowed,
         })
     }
@@ -423,6 +427,39 @@ impl TlsFpRuntime {
     /// The allowlist entry name for a fingerprint, if it is known.
     pub fn known_name(&self, ja4: &Ja4) -> Option<&str> {
         self.allowed.get(ja4.as_str()).map(String::as_str)
+    }
+
+    /// Verdict for an unknown fingerprint. Rejects only in `allowlist` mode with
+    /// `on_unknown = drop`; `shadow` and `log_only` observe without blocking.
+    fn unknown_decision(&self, ja4: &Ja4) -> GateDecision {
+        use crate::config::{FingerprintMode, OnUnknown};
+        if self.mode == FingerprintMode::Allowlist && self.on_unknown == OnUnknown::Drop {
+            tracing::warn!(ja4 = %ja4, "tls-fp: rejecting connection — fingerprint not on allowlist");
+            crate::metrics::METRICS
+                .tls_fp_rejected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            GateDecision::Reject
+        } else {
+            tracing::info!(ja4 = %ja4, "tls-fp: unknown ClientHello fingerprint");
+            GateDecision::Proceed
+        }
+    }
+
+    /// Verdict for a connection whose ClientHello could not be fingerprinted.
+    /// Availability-first: proceed unless `allowlist` + `on_unfingerprintable =
+    /// drop`.
+    fn unfingerprintable_decision(&self) -> GateDecision {
+        use crate::config::{FingerprintMode, OnUnfingerprintable};
+        if self.mode == FingerprintMode::Allowlist
+            && self.on_unfingerprintable == OnUnfingerprintable::Drop
+        {
+            crate::metrics::METRICS
+                .tls_fp_rejected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            GateDecision::Reject
+        } else {
+            GateDecision::Proceed
+        }
     }
 }
 
@@ -479,40 +516,57 @@ async fn peek_client_hello(stream: &tokio::net::TcpStream, buf: &mut [u8]) -> Op
     }
 }
 
-/// Shadow-mode observation on the accept path: `MSG_PEEK` the ClientHello
-/// (leaving the bytes in the kernel buffer for rustls to re-read), compute JA4,
-/// and count it known vs unknown against the allowlist. It NEVER blocks — the
-/// allowlist gate (closing the socket before the handshake) is #27 commit 3.
+/// The accept-path gate's verdict: proceed into the TLS handshake, or reject
+/// (the caller closes the socket before the handshake starts).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GateDecision {
+    Proceed,
+    Reject,
+}
+
+/// The accept-path JA4 gate: `MSG_PEEK` the ClientHello (leaving the bytes in
+/// the kernel buffer for rustls to re-read), compute JA4, count it known vs
+/// unknown, and return whether the connection may proceed.
 ///
-/// A ClientHello that can't be peeked or parsed yet (fragmented, not buffered)
-/// is silently skipped: shadow mode observes, it never fails a connection.
-pub async fn shadow_observe(stream: &tokio::net::TcpStream, state: &crate::AppState) {
+/// - `mode = off` (runtime `None`) → `Proceed`, no peek, no syscall.
+/// - `mode = shadow` → always `Proceed`; only observes (counts + logs).
+/// - `mode = allowlist` → `Reject` an unknown fingerprint iff `on_unknown =
+///   drop`, and a ClientHello that couldn't be fingerprinted iff
+///   `on_unfingerprintable = drop`; otherwise `Proceed`.
+pub async fn fingerprint_gate(
+    stream: &tokio::net::TcpStream,
+    state: &crate::AppState,
+) -> GateDecision {
     // Clone the resolved runtime out (a cheap Arc clone) and DROP the arc-swap
     // Guard before awaiting — never hold a config Guard across an await point.
     let fp = {
         let cfg = state.config.load();
         match cfg.tls_fingerprint.as_ref() {
             Some(fp) => fp.clone(),
-            None => return, // mode = off → no peek, no syscall
+            None => return GateDecision::Proceed, // mode = off → no peek, no syscall
         }
     };
     let mut buf = [0u8; PEEK_CAP];
     let Some(n) = peek_client_hello(stream, &mut buf).await else {
-        return; // timeout / EOF / stalled client — never extend the pre-handshake lifetime
+        // Timeout / EOF / stalled client — could not fingerprint.
+        return fp.unfingerprintable_decision();
     };
-    // A truncated / not-a-ClientHello peek is skipped silently — shadow mode
-    // observes, it never fails a connection.
-    if let Ok(ja4) = ja4_from_tls_record(&buf[..n]) {
-        if fp.known_name(&ja4).is_some() {
-            crate::metrics::METRICS
-                .tls_fp_known
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            crate::metrics::METRICS
-                .tls_fp_unknown
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::info!(ja4 = %ja4, "tls-fp: unknown ClientHello fingerprint (shadow mode)");
+    match ja4_from_tls_record(&buf[..n]) {
+        Ok(ja4) => {
+            if fp.known_name(&ja4).is_some() {
+                crate::metrics::METRICS
+                    .tls_fp_known
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                GateDecision::Proceed
+            } else {
+                crate::metrics::METRICS
+                    .tls_fp_unknown
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                fp.unknown_decision(&ja4)
+            }
         }
+        // A not-a-ClientHello / truncated-beyond-budget peek: couldn't fingerprint.
+        Err(_) => fp.unfingerprintable_decision(),
     }
 }
 
@@ -701,12 +755,56 @@ mod tests {
     }
 
     #[test]
+    fn gate_decisions_by_mode_and_policy() {
+        use crate::config::{FingerprintMode, OnUnfingerprintable, OnUnknown};
+        let ja4 = Ja4("t13d1516h2_8daaf6152771_e5627efa2ab1".into());
+        let mk = |mode, on_unknown, on_unfingerprintable| TlsFpRuntime {
+            mode,
+            on_unknown,
+            on_unfingerprintable,
+            allowed: std::collections::HashMap::new(),
+        };
+        // shadow NEVER rejects, whatever the policy knobs say.
+        let sh = mk(
+            FingerprintMode::Shadow,
+            OnUnknown::Drop,
+            OnUnfingerprintable::Drop,
+        );
+        assert_eq!(sh.unknown_decision(&ja4), GateDecision::Proceed);
+        assert_eq!(sh.unfingerprintable_decision(), GateDecision::Proceed);
+        // allowlist + log_only: observe, don't block.
+        let al_log = mk(
+            FingerprintMode::Allowlist,
+            OnUnknown::LogOnly,
+            OnUnfingerprintable::Allow,
+        );
+        assert_eq!(al_log.unknown_decision(&ja4), GateDecision::Proceed);
+        // allowlist + drop: unknown is rejected; unfingerprintable stays fail-open
+        // by default (service first).
+        let al_drop = mk(
+            FingerprintMode::Allowlist,
+            OnUnknown::Drop,
+            OnUnfingerprintable::Allow,
+        );
+        assert_eq!(al_drop.unknown_decision(&ja4), GateDecision::Reject);
+        assert_eq!(al_drop.unfingerprintable_decision(), GateDecision::Proceed);
+        // opting into strict unfingerprintable handling rejects those too.
+        let strict = mk(
+            FingerprintMode::Allowlist,
+            OnUnknown::LogOnly,
+            OnUnfingerprintable::Drop,
+        );
+        assert_eq!(strict.unfingerprintable_decision(), GateDecision::Reject);
+    }
+
+    #[test]
     fn runtime_resolves_off_to_none_and_classifies() {
         use crate::config::{AllowedFingerprint, FingerprintConfig, FingerprintMode};
         // mode = off → None, so the accept path pays nothing.
         let off = FingerprintConfig {
             mode: FingerprintMode::Off,
             allowed: vec![],
+            ..Default::default()
         };
         assert!(TlsFpRuntime::from_config(&off).is_none());
 
@@ -717,6 +815,7 @@ mod tests {
                 name: "chrome".into(),
                 ja4: "t13d1516h2_8daaf6152771_e5627efa2ab1".into(),
             }],
+            ..Default::default()
         };
         let rt = TlsFpRuntime::from_config(&cfg).expect("shadow resolves to Some");
         let known = ja4_from_client_hello(&chrome_client_hello()).unwrap();
