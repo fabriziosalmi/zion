@@ -28,7 +28,7 @@ JSON=0
 # Slack over the nominal cadence: runners queue, GitHub spreads scheduled load,
 # and a single missed tick is noise rather than signal. Two ticks missed is not.
 DAILY_MAX_AGE_H=48
-WEEKLY_MAX_AGE_H=216 # 9 days
+WEEKLY_MAX_AGE_H=336 # 14 days — 2× the 168h weekly cadence, mirroring DAILY (2× its 24h). Tolerates one missed/late weekly tick instead of false-tripping at 1.28× (was 216).
 
 now_epoch=$(date -u +%s)
 stale=0
