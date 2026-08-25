@@ -518,6 +518,7 @@ pub async fn run_soak() -> i32 {
         acme: None,
         client_ca_path: None,
         client_auth: "none".into(),
+        fingerprint: None,
     };
 
     // HTTP-01 responder: Pebble (via challtestsrv DNS) resolves `domain`

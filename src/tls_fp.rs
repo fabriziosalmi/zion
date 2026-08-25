@@ -436,6 +436,49 @@ const PEEK_CAP: usize = 4096;
 /// sent after TCP connect, so this only bites a client that connects and stalls.
 const PEEK_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Does the buffer already hold a complete first TLS record (5-byte header +
+/// its declared payload)?
+fn first_record_complete(buf: &[u8]) -> bool {
+    buf.len() >= 5 && buf.len() >= 5 + (((buf[3] as usize) << 8) | buf[4] as usize)
+}
+
+/// `MSG_PEEK` the first TLS record (the ClientHello) without consuming it,
+/// waiting — up to `PEEK_BUDGET` — for the rest of a ClientHello that arrives
+/// split across TCP segments (a TLS 1.3 hybrid post-quantum ClientHello exceeds
+/// one MSS, so its first peek is otherwise a partial record and gets dropped).
+/// Returns the peeked length, or `None` on timeout / EOF / error. Every byte is
+/// left in the kernel buffer for rustls to re-read.
+///
+/// This runs BEFORE the 10s-bounded rustls accept, while already holding the
+/// connection permit + per-IP slot, so it MUST be bounded: an unbounded wait on
+/// a client that connects and sends nothing is a slow-loris amplification.
+async fn peek_client_hello(stream: &tokio::net::TcpStream, buf: &mut [u8]) -> Option<usize> {
+    let deadline = tokio::time::Instant::now() + PEEK_BUDGET;
+    loop {
+        let n = match tokio::time::timeout_at(deadline, stream.peek(buf)).await {
+            Ok(Ok(n)) if n > 0 => n,
+            _ => return None,
+        };
+        // Not a handshake record (don't wait on non-TLS/garbage), the whole
+        // first record is here, or the buffer is full → classify what we have.
+        if buf[0] != 0x16 || first_record_complete(&buf[..n]) || n == buf.len() {
+            return Some(n);
+        }
+        // Partial handshake record — briefly wait for the rest, bounded by the
+        // deadline. Sleeping (not spinning): the next TCP segment arrives within
+        // an RTT, and a stalled client is capped by PEEK_BUDGET.
+        if tokio::time::timeout_at(
+            deadline,
+            tokio::time::sleep(std::time::Duration::from_millis(2)),
+        )
+        .await
+        .is_err()
+        {
+            return Some(n); // deadline hit — classify what we have (likely Truncated → skip)
+        }
+    }
+}
+
 /// Shadow-mode observation on the accept path: `MSG_PEEK` the ClientHello
 /// (leaving the bytes in the kernel buffer for rustls to re-read), compute JA4,
 /// and count it known vs unknown against the allowlist. It NEVER blocks — the
@@ -453,19 +496,12 @@ pub async fn shadow_observe(stream: &tokio::net::TcpStream, state: &crate::AppSt
             None => return, // mode = off → no peek, no syscall
         }
     };
-    // Bound the peek. This runs BEFORE the rustls accept (which is 10s-bounded),
-    // while already holding the connection permit + per-IP slot, so an unbounded
-    // wait on a client that connects and sends nothing would be a slow-loris
-    // amplification. On timeout/short/EOF, skip fingerprinting and let the
-    // connection proceed into the bounded handshake — shadow mode must never
-    // extend a connection's pre-handshake lifetime.
     let mut buf = [0u8; PEEK_CAP];
-    let n = match tokio::time::timeout(PEEK_BUDGET, stream.peek(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => n,
-        _ => return,
+    let Some(n) = peek_client_hello(stream, &mut buf).await else {
+        return; // timeout / EOF / stalled client — never extend the pre-handshake lifetime
     };
-    // A truncated / fragmented / not-a-ClientHello peek is skipped silently —
-    // shadow mode observes, it never fails a connection.
+    // A truncated / not-a-ClientHello peek is skipped silently — shadow mode
+    // observes, it never fails a connection.
     if let Ok(ja4) = ja4_from_tls_record(&buf[..n]) {
         if fp.known_name(&ja4).is_some() {
             crate::metrics::METRICS
@@ -600,6 +636,16 @@ mod tests {
         let rec = wrap_record(&chrome_client_hello());
         let ja4 = ja4_from_tls_record(&rec).expect("record parse");
         assert_eq!(ja4.as_str(), "t13d1516h2_8daaf6152771_e5627efa2ab1");
+    }
+
+    #[test]
+    fn first_record_complete_boundary() {
+        // Drives the peek-completion loop: keep waiting until the whole first
+        // record is buffered (so a multi-segment PQ ClientHello isn't dropped).
+        let rec = wrap_record(&chrome_client_hello());
+        assert!(first_record_complete(&rec));
+        assert!(!first_record_complete(&rec[..rec.len() - 1])); // one byte short
+        assert!(!first_record_complete(&[0x16, 0x03, 0x01])); // header not even complete
     }
 
     #[test]
