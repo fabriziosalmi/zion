@@ -368,6 +368,154 @@ pub fn ja4_from_client_hello(bytes: &[u8]) -> Result<Ja4, TlsFpError> {
     Ok(Ja4(format!("{ja4_a}_{ja4_b}_{ja4_c}")))
 }
 
+/// Compute JA4 from a raw TLS record buffer as `MSG_PEEK`'d off the socket — the
+/// buffer starts at the 5-byte TLS record header (`content_type`, legacy
+/// version, length). Strips the header and fingerprints the ClientHello in the
+/// first handshake record.
+///
+/// Only the first record is inspected. A ClientHello fragmented across multiple
+/// TLS records (rare, and something a peek may also simply not have buffered
+/// yet) yields `Truncated` — the shadow-mode caller treats that as "not
+/// fingerprinted this time" rather than an error to act on. Bytes beyond the
+/// first record (a coalesced second record) are ignored.
+pub fn ja4_from_tls_record(bytes: &[u8]) -> Result<Ja4, TlsFpError> {
+    let mut r = Reader::new(bytes);
+    // TLS record: content_type(1) = 22 handshake, legacy_version(2), length(2).
+    if r.u8()? != 0x16 {
+        return Err(TlsFpError::NotClientHello);
+    }
+    let _legacy_version = r.u16()?;
+    let rec_len = r.u16()? as usize;
+    // The handshake message (starting at the 0x01 ClientHello msg_type) is the
+    // record payload. ja4_from_client_hello clamps to the handshake's own 24-bit
+    // length, so a short/fragmented payload comes back as Truncated.
+    let payload = r.take(rec_len)?;
+    ja4_from_client_hello(payload)
+}
+
+/// Runtime-resolved fingerprint state, read on the accept path. Built once per
+/// config load from `[tls.fingerprint]`; the resolver returns `None` for
+/// `mode = off` so the hot path pays nothing when the feature is unused.
+#[derive(Clone, Debug)]
+pub struct TlsFpRuntime {
+    pub mode: crate::config::FingerprintMode,
+    /// JA4 string → allowlist entry name (for the known/unknown metric split).
+    allowed: std::collections::HashMap<String, String>,
+}
+
+impl TlsFpRuntime {
+    /// Resolve from config; `None` for `mode = off` (zero hot-path cost).
+    pub fn from_config(cfg: &crate::config::FingerprintConfig) -> Option<Self> {
+        if cfg.mode == crate::config::FingerprintMode::Off {
+            return None;
+        }
+        let allowed = cfg
+            .allowed
+            .iter()
+            .map(|a| (a.ja4.clone(), a.name.clone()))
+            .collect();
+        Some(TlsFpRuntime {
+            mode: cfg.mode.clone(),
+            allowed,
+        })
+    }
+
+    /// The allowlist entry name for a fingerprint, if it is known.
+    pub fn known_name(&self, ja4: &Ja4) -> Option<&str> {
+        self.allowed.get(ja4.as_str()).map(String::as_str)
+    }
+}
+
+/// Bytes peeked to cover a full ClientHello — big enough for a TLS 1.3 hybrid
+/// post-quantum key share (X25519MLKEM768 pushes the record past ~1.5 KB); a
+/// 1 KB buffer would silently truncate exactly the modern browsers we most want
+/// to fingerprint.
+const PEEK_CAP: usize = 4096;
+
+/// Upper bound on the pre-handshake peek. A real ClientHello is the first thing
+/// sent after TCP connect, so this only bites a client that connects and stalls.
+const PEEK_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Does the buffer already hold a complete first TLS record (5-byte header +
+/// its declared payload)?
+fn first_record_complete(buf: &[u8]) -> bool {
+    buf.len() >= 5 && buf.len() >= 5 + (((buf[3] as usize) << 8) | buf[4] as usize)
+}
+
+/// `MSG_PEEK` the first TLS record (the ClientHello) without consuming it,
+/// waiting — up to `PEEK_BUDGET` — for the rest of a ClientHello that arrives
+/// split across TCP segments (a TLS 1.3 hybrid post-quantum ClientHello exceeds
+/// one MSS, so its first peek is otherwise a partial record and gets dropped).
+/// Returns the peeked length, or `None` on timeout / EOF / error. Every byte is
+/// left in the kernel buffer for rustls to re-read.
+///
+/// This runs BEFORE the 10s-bounded rustls accept, while already holding the
+/// connection permit + per-IP slot, so it MUST be bounded: an unbounded wait on
+/// a client that connects and sends nothing is a slow-loris amplification.
+async fn peek_client_hello(stream: &tokio::net::TcpStream, buf: &mut [u8]) -> Option<usize> {
+    let deadline = tokio::time::Instant::now() + PEEK_BUDGET;
+    loop {
+        let n = match tokio::time::timeout_at(deadline, stream.peek(buf)).await {
+            Ok(Ok(n)) if n > 0 => n,
+            _ => return None,
+        };
+        // Not a handshake record (don't wait on non-TLS/garbage), the whole
+        // first record is here, or the buffer is full → classify what we have.
+        if buf[0] != 0x16 || first_record_complete(&buf[..n]) || n == buf.len() {
+            return Some(n);
+        }
+        // Partial handshake record — briefly wait for the rest, bounded by the
+        // deadline. Sleeping (not spinning): the next TCP segment arrives within
+        // an RTT, and a stalled client is capped by PEEK_BUDGET.
+        if tokio::time::timeout_at(
+            deadline,
+            tokio::time::sleep(std::time::Duration::from_millis(2)),
+        )
+        .await
+        .is_err()
+        {
+            return Some(n); // deadline hit — classify what we have (likely Truncated → skip)
+        }
+    }
+}
+
+/// Shadow-mode observation on the accept path: `MSG_PEEK` the ClientHello
+/// (leaving the bytes in the kernel buffer for rustls to re-read), compute JA4,
+/// and count it known vs unknown against the allowlist. It NEVER blocks — the
+/// allowlist gate (closing the socket before the handshake) is #27 commit 3.
+///
+/// A ClientHello that can't be peeked or parsed yet (fragmented, not buffered)
+/// is silently skipped: shadow mode observes, it never fails a connection.
+pub async fn shadow_observe(stream: &tokio::net::TcpStream, state: &crate::AppState) {
+    // Clone the resolved runtime out (a cheap Arc clone) and DROP the arc-swap
+    // Guard before awaiting — never hold a config Guard across an await point.
+    let fp = {
+        let cfg = state.config.load();
+        match cfg.tls_fingerprint.as_ref() {
+            Some(fp) => fp.clone(),
+            None => return, // mode = off → no peek, no syscall
+        }
+    };
+    let mut buf = [0u8; PEEK_CAP];
+    let Some(n) = peek_client_hello(stream, &mut buf).await else {
+        return; // timeout / EOF / stalled client — never extend the pre-handshake lifetime
+    };
+    // A truncated / not-a-ClientHello peek is skipped silently — shadow mode
+    // observes, it never fails a connection.
+    if let Ok(ja4) = ja4_from_tls_record(&buf[..n]) {
+        if fp.known_name(&ja4).is_some() {
+            crate::metrics::METRICS
+                .tls_fp_known
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            crate::metrics::METRICS
+                .tls_fp_unknown
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(ja4 = %ja4, "tls-fp: unknown ClientHello fingerprint (shadow mode)");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +620,70 @@ mod tests {
         assert_eq!(ja4.as_str(), "t13d1516h2_8daaf6152771_e5627efa2ab1");
     }
 
+    /// Wrap a handshake-message body in a TLS handshake record header
+    /// (`0x16`, legacy version 0x0301, length).
+    fn wrap_record(body: &[u8]) -> Vec<u8> {
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        rec.extend_from_slice(body);
+        rec
+    }
+
+    #[test]
+    fn tls_record_wrapper_matches_reference() {
+        // The record-framed ClientHello (as MSG_PEEK'd off the socket) yields the
+        // same fingerprint as the bare handshake body.
+        let rec = wrap_record(&chrome_client_hello());
+        let ja4 = ja4_from_tls_record(&rec).expect("record parse");
+        assert_eq!(ja4.as_str(), "t13d1516h2_8daaf6152771_e5627efa2ab1");
+    }
+
+    #[test]
+    fn first_record_complete_boundary() {
+        // Drives the peek-completion loop: keep waiting until the whole first
+        // record is buffered (so a multi-segment PQ ClientHello isn't dropped).
+        let rec = wrap_record(&chrome_client_hello());
+        assert!(first_record_complete(&rec));
+        assert!(!first_record_complete(&rec[..rec.len() - 1])); // one byte short
+        assert!(!first_record_complete(&[0x16, 0x03, 0x01])); // header not even complete
+    }
+
+    #[test]
+    fn tls_record_ignores_a_coalesced_second_record() {
+        // A peek that also grabbed the start of a second record must not corrupt
+        // the fingerprint — only the first record's payload is read.
+        let mut rec = wrap_record(&chrome_client_hello());
+        rec.extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x05, 1, 2, 3, 4, 5]); // app-data record
+        let ja4 = ja4_from_tls_record(&rec).unwrap();
+        assert_eq!(ja4.as_str(), "t13d1516h2_8daaf6152771_e5627efa2ab1");
+    }
+
+    #[test]
+    fn non_handshake_record_is_rejected() {
+        // 0x17 = application_data, not a handshake record.
+        let mut rec = vec![0x17, 0x03, 0x03];
+        rec.extend_from_slice(&4u16.to_be_bytes());
+        rec.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(ja4_from_tls_record(&rec), Err(TlsFpError::NotClientHello));
+    }
+
+    #[test]
+    fn fragmented_record_payload_is_truncated_not_a_panic() {
+        // A record whose declared length exceeds the buffer (peek caught only a
+        // fragment) → Truncated, never a panic.
+        let rec = wrap_record(&chrome_client_hello());
+        for n in 0..rec.len() {
+            let _ = ja4_from_tls_record(&rec[..n]); // must not panic
+        }
+        // A record header claiming more payload than present.
+        let hello = chrome_client_hello();
+        let mut rec = wrap_record(&hello);
+        let inflated = (hello.len() as u16 + 50).to_be_bytes();
+        rec[3] = inflated[0];
+        rec[4] = inflated[1];
+        assert_eq!(ja4_from_tls_record(&rec), Err(TlsFpError::Truncated));
+    }
+
     #[test]
     fn ja4_a_fields_decompose() {
         let ja4 = ja4_from_client_hello(&chrome_client_hello()).unwrap();
@@ -486,6 +698,31 @@ mod tests {
         // supported_versions; the reference JA4 only matches if all are stripped.
         let ja4 = ja4_from_client_hello(&chrome_client_hello()).unwrap();
         assert_eq!(ja4.as_str(), "t13d1516h2_8daaf6152771_e5627efa2ab1");
+    }
+
+    #[test]
+    fn runtime_resolves_off_to_none_and_classifies() {
+        use crate::config::{AllowedFingerprint, FingerprintConfig, FingerprintMode};
+        // mode = off → None, so the accept path pays nothing.
+        let off = FingerprintConfig {
+            mode: FingerprintMode::Off,
+            allowed: vec![],
+        };
+        assert!(TlsFpRuntime::from_config(&off).is_none());
+
+        // shadow with an allowlist → Some; known_name classifies known vs unknown.
+        let cfg = FingerprintConfig {
+            mode: FingerprintMode::Shadow,
+            allowed: vec![AllowedFingerprint {
+                name: "chrome".into(),
+                ja4: "t13d1516h2_8daaf6152771_e5627efa2ab1".into(),
+            }],
+        };
+        let rt = TlsFpRuntime::from_config(&cfg).expect("shadow resolves to Some");
+        let known = ja4_from_client_hello(&chrome_client_hello()).unwrap();
+        assert_eq!(rt.known_name(&known), Some("chrome"));
+        let unknown = Ja4("t00i0000_000000000000_000000000000".into());
+        assert_eq!(rt.known_name(&unknown), None);
     }
 
     #[test]

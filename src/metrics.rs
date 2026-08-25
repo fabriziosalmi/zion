@@ -407,6 +407,11 @@ pub struct Metrics {
     pub websocket_upgrades: AtomicU64,
     pub connections_total: AtomicU64,
     pub tls_handshake_errors: AtomicU64,
+    /// JA4 client fingerprints observed in shadow mode (#27): matched an
+    /// allowlist entry (`known`) vs not (`unknown`). Advisory only — shadow
+    /// mode never gates a connection.
+    pub tls_fp_known: AtomicU64,
+    pub tls_fp_unknown: AtomicU64,
     /// Connections closed at accept because the source IP was already at
     /// its `max_connections_per_ip` concurrent cap (anti-DDoS lever).
     pub connections_rejected_per_ip: AtomicU64,
@@ -506,6 +511,8 @@ impl Metrics {
             websocket_upgrades: AtomicU64::new(0),
             connections_total: AtomicU64::new(0),
             tls_handshake_errors: AtomicU64::new(0),
+            tls_fp_known: AtomicU64::new(0),
+            tls_fp_unknown: AtomicU64::new(0),
             connections_rejected_per_ip: AtomicU64::new(0),
             enforcement_denied_class: AtomicU64::new(0),
             enforcement_denied_mesh_score: AtomicU64::new(0),
@@ -757,6 +764,26 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.connections_total.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_tls_fp_known Shadow-mode JA4 fingerprints matching an allowlist entry.\n\
+                                # TYPE zion_tls_fp_known counter\n\
+                                zion_tls_fp_known ",
+        );
+        out.extend_from_slice(itoa_buf.format(self.tls_fp_known.load(Relaxed)).as_bytes());
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_tls_fp_unknown Shadow-mode JA4 fingerprints not on the allowlist.\n\
+                                # TYPE zion_tls_fp_unknown counter\n\
+                                zion_tls_fp_unknown ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.tls_fp_unknown.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");

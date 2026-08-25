@@ -352,6 +352,50 @@ pub struct TlsConfig {
     /// Client auth mode: "none" (default), "optional", "required".
     #[serde(default = "default_client_auth")]
     pub client_auth: String,
+    /// JA4 TLS client fingerprinting (`--features tls-fingerprint`, issue #27).
+    /// Absent or `mode = "off"` → zero overhead, no ClientHello peek.
+    #[serde(default)]
+    pub fingerprint: Option<FingerprintConfig>,
+}
+
+/// JA4 TLS client-fingerprinting config (`[tls.fingerprint]`). Always parsed so
+/// a typo is a clear error on any build; only *acted upon* under the
+/// `tls-fingerprint` feature (a feature-off `mode != off` is warned — see
+/// `warn_feature_config_gaps`). `allowed` is only read under the feature, hence
+/// the targeted allow (mirrors `AcmeConfig`).
+#[allow(dead_code)]
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct FingerprintConfig {
+    /// `off` (default) | `shadow` | `allowlist`. Commit 2 (#27) implements
+    /// off + shadow — compute JA4, count known/unknown, log, but NEVER block.
+    /// `allowlist` enforcement (socket close before the handshake) lands in
+    /// commit 3; until then it behaves like `shadow`.
+    #[serde(default)]
+    pub mode: FingerprintMode,
+    /// Known-good fingerprints. In `shadow` they label a connection known vs
+    /// unknown for the metrics; in `allowlist` (later) they are the allowlist.
+    #[serde(default)]
+    pub allowed: Vec<AllowedFingerprint>,
+}
+
+#[derive(Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FingerprintMode {
+    #[default]
+    Off,
+    Shadow,
+    Allowlist,
+}
+
+#[allow(dead_code)] // fields read only under `--features tls-fingerprint`
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct AllowedFingerprint {
+    /// Human label for metrics/logs (e.g. `chrome-131`, `corp-agent`).
+    pub name: String,
+    /// The JA4 string, e.g. `t13d1516h2_8daaf6152771_e5627efa2ab1`.
+    pub ja4: String,
 }
 
 #[derive(Deserialize, Clone, Debug)]
