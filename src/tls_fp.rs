@@ -426,6 +426,16 @@ impl TlsFpRuntime {
     }
 }
 
+/// Bytes peeked to cover a full ClientHello — big enough for a TLS 1.3 hybrid
+/// post-quantum key share (X25519MLKEM768 pushes the record past ~1.5 KB); a
+/// 1 KB buffer would silently truncate exactly the modern browsers we most want
+/// to fingerprint.
+const PEEK_CAP: usize = 4096;
+
+/// Upper bound on the pre-handshake peek. A real ClientHello is the first thing
+/// sent after TCP connect, so this only bites a client that connects and stalls.
+const PEEK_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Shadow-mode observation on the accept path: `MSG_PEEK` the ClientHello
 /// (leaving the bytes in the kernel buffer for rustls to re-read), compute JA4,
 /// and count it known vs unknown against the allowlist. It NEVER blocks — the
@@ -434,13 +444,24 @@ impl TlsFpRuntime {
 /// A ClientHello that can't be peeked or parsed yet (fragmented, not buffered)
 /// is silently skipped: shadow mode observes, it never fails a connection.
 pub async fn shadow_observe(stream: &tokio::net::TcpStream, state: &crate::AppState) {
-    let cfg = state.config.load();
-    let Some(fp) = cfg.tls_fingerprint.as_ref() else {
-        return; // mode = off → nothing resolved → zero cost
+    // Clone the resolved runtime out (a cheap Arc clone) and DROP the arc-swap
+    // Guard before awaiting — never hold a config Guard across an await point.
+    let fp = {
+        let cfg = state.config.load();
+        match cfg.tls_fingerprint.as_ref() {
+            Some(fp) => fp.clone(),
+            None => return, // mode = off → no peek, no syscall
+        }
     };
-    let mut buf = [0u8; 1024];
-    let n = match stream.peek(&mut buf).await {
-        Ok(n) if n > 0 => n,
+    // Bound the peek. This runs BEFORE the rustls accept (which is 10s-bounded),
+    // while already holding the connection permit + per-IP slot, so an unbounded
+    // wait on a client that connects and sends nothing would be a slow-loris
+    // amplification. On timeout/short/EOF, skip fingerprinting and let the
+    // connection proceed into the bounded handshake — shadow mode must never
+    // extend a connection's pre-handshake lifetime.
+    let mut buf = [0u8; PEEK_CAP];
+    let n = match tokio::time::timeout(PEEK_BUDGET, stream.peek(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => n,
         _ => return,
     };
     // A truncated / fragmented / not-a-ClientHello peek is skipped silently —

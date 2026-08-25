@@ -226,7 +226,7 @@ pub(crate) struct ResolvedAppConfig {
     /// or `[tls.fingerprint] mode = "off"` — the accept path then does no
     /// ClientHello peek (zero overhead).
     #[cfg(feature = "tls-fingerprint")]
-    pub(crate) tls_fingerprint: Option<tls_fp::TlsFpRuntime>,
+    pub(crate) tls_fingerprint: Option<std::sync::Arc<tls_fp::TlsFpRuntime>>,
 }
 
 impl ResolvedAppConfig {
@@ -453,7 +453,8 @@ impl ResolvedAppConfig {
                 .tls
                 .fingerprint
                 .as_ref()
-                .and_then(tls_fp::TlsFpRuntime::from_config),
+                .and_then(tls_fp::TlsFpRuntime::from_config)
+                .map(std::sync::Arc::new),
         })
     }
 }
@@ -1818,8 +1819,8 @@ fn spawn_https_handler(
         net::tune_accepted(&tcp_stream);
         // Shadow-mode JA4 fingerprinting (#27): peek the ClientHello before the
         // handshake and count it known/unknown. MSG_PEEK leaves the bytes in the
-        // kernel buffer for rustls to re-read. Zero cost when the feature is off
-        // or `[tls.fingerprint] mode = "off"` (resolved to `None`).
+        // kernel buffer for rustls to re-read. No peek — no syscall — when the
+        // feature is off or `[tls.fingerprint] mode = "off"` (resolved to `None`).
         #[cfg(feature = "tls-fingerprint")]
         tls_fp::shadow_observe(&tcp_stream, &state).await;
         metrics::METRICS
