@@ -367,10 +367,12 @@ pub struct TlsConfig {
 #[derive(Deserialize, Clone, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct FingerprintConfig {
-    /// `off` (default) | `shadow` | `allowlist`. Commit 2 (#27) implements
-    /// off + shadow — compute JA4, count known/unknown, log, but NEVER block.
-    /// `allowlist` enforcement (socket close before the handshake) lands in
-    /// commit 3; until then it behaves like `shadow`.
+    /// `off` (default) | `shadow` | `allowlist`.
+    /// - `off`: no fingerprinting; zero overhead.
+    /// - `shadow`: compute JA4, count known/unknown, log — but never block.
+    /// - `allowlist`: additionally enforce — a fingerprint not in `allowed` is
+    ///   handled per `on_unknown`, an unfingerprintable ClientHello per
+    ///   `on_unfingerprintable` (a `drop` closes the socket before the handshake).
     #[serde(default)]
     pub mode: FingerprintMode,
     /// Known-good fingerprints. In `shadow` they label a connection known vs

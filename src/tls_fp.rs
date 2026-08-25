@@ -476,6 +476,10 @@ impl TlsFpRuntime {
         if self.mode == FingerprintMode::Allowlist
             && self.on_unfingerprintable == OnUnfingerprintable::Drop
         {
+            tracing::warn!(
+                "tls-fp: rejecting connection — ClientHello could not be fingerprinted \
+                 (on_unfingerprintable = drop)"
+            );
             crate::metrics::METRICS
                 .tls_fp_rejected
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

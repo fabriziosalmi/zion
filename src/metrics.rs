@@ -407,9 +407,9 @@ pub struct Metrics {
     pub websocket_upgrades: AtomicU64,
     pub connections_total: AtomicU64,
     pub tls_handshake_errors: AtomicU64,
-    /// JA4 client fingerprints observed in shadow mode (#27): matched an
-    /// allowlist entry (`known`) vs not (`unknown`). Advisory only — shadow
-    /// mode never gates a connection.
+    /// JA4 client fingerprints observed (#27, in `shadow` or `allowlist` mode):
+    /// matched an allowlist entry (`known`) vs not (`unknown`). In `allowlist`
+    /// mode an unknown may then be rejected — see `tls_fp_rejected`.
     pub tls_fp_known: AtomicU64,
     pub tls_fp_unknown: AtomicU64,
     /// Connections closed before the TLS handshake by the JA4 allowlist gate
@@ -774,7 +774,7 @@ impl Metrics {
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(
-            b"# HELP zion_tls_fp_known Shadow-mode JA4 fingerprints matching an allowlist entry.\n\
+            b"# HELP zion_tls_fp_known JA4 fingerprints matching an allowlist entry (shadow or allowlist mode).\n\
                                 # TYPE zion_tls_fp_known counter\n\
                                 zion_tls_fp_known ",
         );
@@ -782,7 +782,7 @@ impl Metrics {
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(
-            b"# HELP zion_tls_fp_unknown Shadow-mode JA4 fingerprints not on the allowlist.\n\
+            b"# HELP zion_tls_fp_unknown JA4 fingerprints not on the allowlist (shadow or allowlist mode).\n\
                                 # TYPE zion_tls_fp_unknown counter\n\
                                 zion_tls_fp_unknown ",
         );
