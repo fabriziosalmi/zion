@@ -66,7 +66,7 @@ ignore = [
     # `time >=0.3.47`. Leaving the id listed would trip cargo-deny, which errors
     # on ignores that match no crate.
     # ── Pulled in by aimp_node (--features sovereign-aimp, off by default) ──
-    { id = "RUSTSEC-2024-0437", reason = "[review by 2026-09-01] `protobuf 2.28.0` recursion-DoS via `prometheus 0.13.4` → `aimp_node`. Only reachable when the experimental `sovereign-aimp` feature is enabled (off by default). `prometheus` instruments aimp's library layer, so unlike `config`/`ratatui` it survives aimp's `cli` gate. Upstream `aimp_node` tracks the migration to `prometheus 0.14` which uses `protobuf 3.7.x`; accept the transitive risk on the experimental track until that lands." },
+    { id = "RUSTSEC-2024-0437", reason = "[review by 2026-09-01] `protobuf 2.28.0` recursion-DoS (Dependabot alias GHSA-2gh3-rmm4-6rq5 / CVE-2025-53605) via `prometheus 0.13.4` → `aimp_node`. Only reachable when the experimental `sovereign-aimp` feature is enabled (off by default). `prometheus` instruments aimp's library layer, so unlike `config`/`ratatui` it survives aimp's `cli` gate. Upstream `aimp_node` tracks the migration to `prometheus 0.14` which uses `protobuf 3.7.x`; accept the transitive risk on the experimental track until that lands." },
     # NOTE: RUSTSEC-2024-0320 (`yaml-rust` via `config 0.13.4` → aimp_node) was
     # RESOLVED by aimp#14: the config loader moved behind aimp's `cli` feature
     # and zion now depends with `default-features = false`, so `config` — and
