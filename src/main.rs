@@ -93,6 +93,10 @@ mod ktls;
 // and drop your own scorer.
 #[cfg(feature = "ml-waf")]
 mod waf_ml;
+// TLS client fingerprinting (JA4). Phase 3a (#27): a pure JA4 library over the
+// ClientHello; the allowlist gate, config, and peek hook land in later commits.
+#[cfg(feature = "tls-fingerprint")]
+mod tls_fp;
 // AIMP-as-control-plane: serverless gossip of WAF rules and IP reputation
 // via Merkle-CRDT. Top-level `aimp_cp` instead of nesting under `sovereign::`
 // so it does not pull in geo-* features by accident.

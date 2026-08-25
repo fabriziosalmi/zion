@@ -190,6 +190,16 @@ default-features = false
 version = "1"
 optional = true
 
+# Track D — TLS client fingerprinting (JA4, `--features tls-fingerprint`).
+# SHA-256 over the sorted, GREASE-stripped cipher/extension lists. `sha2 0.10`
+# is ALREADY in the tree (ring/aws-lc closure, 0.10.9), so this adds ZERO new
+# audited crates. Pinned to 0.10 on purpose: the crates.io `ja4` crate wants
+# sha2 ^0.11, which would fork a second major — we hand-roll the parser instead.
+[dependencies.sha2]
+version = "0.10"
+optional = true
+default-features = false
+
 [features]
 default = []
 io-uring-accept = ["io-uring"]
@@ -243,6 +253,11 @@ ml-waf = ["dep:tract-onnx"]
 # serverless gossip of WAF rules / IP reputation / threat intel via
 # Merkle-CRDT. Implies sovereign-signals (the existing Phase 3 hook).
 sovereign-aimp = ["sovereign-signals", "dep:aimp_node", "dep:rmp-serde"]
+# Track D — TLS client fingerprinting (JA4). Hand-rolled ClientHello parser +
+# JA4 hasher (FoxIO standard); the only dep is `sha2`, already resolved
+# transitively, so no new audited crates. MSRV-1.82-clean (no edition-2024
+# pull) — intentionally NOT in `dist`. See src/tls_fp.rs and issue #27.
+tls-fingerprint = ["dep:sha2"]
 
 # Track C — property-based testing (proptest) only used by `cargo test`.
 [dev-dependencies]

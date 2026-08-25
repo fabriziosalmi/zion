@@ -5195,6 +5195,7 @@ dependencies = [
  "ryu",
  "serde",
  "serde_json",
+ "sha2",
  "simd-json",
  "socket2",
  "time",
