@@ -435,33 +435,54 @@ impl FpRate {
         }
     }
 
-    /// Admit one connection at `now_secs` (unix seconds). `false` = over cap.
-    fn admit(&self, now_secs: u64) -> bool {
+    /// Admit one connection at `now_secs` (unix seconds).
+    ///
+    /// `FirstDenial` marks the ONE connection per window that crosses the cap
+    /// (the successful CAS from `count == cps` to `cps + 1` happens exactly
+    /// once) — the caller logs on that and stays silent on every later
+    /// `Denied`, so a flood against a rate-limited fingerprint produces at
+    /// most one log line per second instead of one per connection.
+    fn admit(&self, now_secs: u64) -> Admit {
         use std::sync::atomic::Ordering::Relaxed;
         let window = now_secs as u32;
         loop {
             let old = self.packed.load(Relaxed);
             let (old_window, old_count) = ((old >> 32) as u32, old as u32);
-            let (new, admitted) = if old_window == window {
+            let (new, verdict) = if old_window == window {
                 // Same window — increment; saturate so a flood can't wrap the
                 // counter back under the cap.
                 (
                     ((window as u64) << 32) | u64::from(old_count.saturating_add(1)),
-                    old_count < self.cps,
+                    match old_count.cmp(&self.cps) {
+                        std::cmp::Ordering::Less => Admit::Granted,
+                        std::cmp::Ordering::Equal => Admit::FirstDenial,
+                        std::cmp::Ordering::Greater => Admit::Denied,
+                    },
                 )
             } else {
                 // New window — this connection is its first.
-                (((window as u64) << 32) | 1, true)
+                (((window as u64) << 32) | 1, Admit::Granted)
             };
             if self
                 .packed
                 .compare_exchange_weak(old, new, Relaxed, Relaxed)
                 .is_ok()
             {
-                return admitted;
+                return verdict;
             }
         }
     }
+}
+
+/// Verdict of [`FpRate::admit`] for one connection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Admit {
+    /// Under the cap — proceed.
+    Granted,
+    /// The connection that crossed the cap: denied, and the one worth logging.
+    FirstDenial,
+    /// Over the cap, already reported this window: denied silently.
+    Denied,
 }
 
 /// One resolved allowlist entry: the human label plus the optional
@@ -529,31 +550,42 @@ impl TlsFpRuntime {
     /// Over-cap in `allowlist` mode drops the connection pre-handshake; in
     /// `shadow` it is counted (`zion_tls_fp_rate_limited`) but never blocks —
     /// shadow observes, whatever the knobs say.
+    ///
+    /// Only the window's FIRST denial is logged: a JA4 is replayable
+    /// client-controlled input, so a per-connection log line here would hand an
+    /// attacker unbounded log amplification (the same hazard the ban fast path
+    /// closes for unknown fingerprints). Every denial still counts in the
+    /// metrics.
     fn known_decision(&self, ja4: &Ja4, entry: &AllowedEntry, now_secs: u64) -> GateDecision {
         use crate::config::FingerprintMode;
         let Some(rate) = &entry.rate else {
             return GateDecision::Proceed;
         };
-        if rate.admit(now_secs) {
+        let verdict = rate.admit(now_secs);
+        if verdict == Admit::Granted {
             return GateDecision::Proceed;
         }
         crate::metrics::METRICS
             .tls_fp_rate_limited
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.mode == FingerprintMode::Allowlist {
-            tracing::warn!(
-                ja4 = %ja4, name = %entry.name, limit_cps = rate.cps,
-                "tls-fp: per-fingerprint connection rate exceeded — dropping pre-handshake"
-            );
+            if verdict == Admit::FirstDenial {
+                tracing::warn!(
+                    ja4 = %ja4, name = %entry.name, limit_cps = rate.cps,
+                    "tls-fp: per-fingerprint connection rate exceeded — dropping over-cap connections this second"
+                );
+            }
             crate::metrics::METRICS
                 .tls_fp_rejected
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             GateDecision::Reject
         } else {
-            tracing::info!(
-                ja4 = %ja4, name = %entry.name, limit_cps = rate.cps,
-                "tls-fp: per-fingerprint connection rate exceeded (shadow — connection proceeds)"
-            );
+            if verdict == Admit::FirstDenial {
+                tracing::info!(
+                    ja4 = %ja4, name = %entry.name, limit_cps = rate.cps,
+                    "tls-fp: per-fingerprint connection rate exceeded (shadow — connections proceed)"
+                );
+            }
             GateDecision::Proceed
         }
     }
@@ -603,44 +635,103 @@ impl TlsFpRuntime {
     }
 }
 
-/// Ban set for rejected unknown fingerprints (#27 commit 4): JA4 → banned
-/// until. Owned by `AppState` — like the per-IP `rate_map`, it tracks client
-/// behaviour, not config, so it survives hot-reloads (an operator tweaking an
-/// unrelated knob mid-attack must not amnesty every banned fingerprint).
-pub type BanMap = dashmap::DashMap<String, std::time::Instant>;
-
 /// Ceiling on tracked bans. An attacker rotating a UNIQUE JA4 per connection
 /// would otherwise grow the map without bound. At the cap, expired entries are
 /// swept; if the map is still full the insert is skipped — a ban is only the
 /// fast path, the slow path still rejects every unknown connection one by one.
 const MAX_BAN_ENTRIES: usize = 4096;
 
-/// Is `ja4` actively banned at `now`? An expired entry is removed on the way.
-fn ban_hit(bans: &BanMap, ja4: &str, now: std::time::Instant) -> bool {
-    // The read guard from `get` MUST be dropped before `remove` touches the
-    // same key — holding it across the removal deadlocks the DashMap shard.
-    {
-        let Some(until) = bans.get(ja4) else {
-            return false;
-        };
-        if *until > now {
-            return true;
-        }
-    }
-    drop(bans.remove(ja4));
-    false
+/// Minimum spacing between full-map sweeps of the ban set. A sweep is a
+/// `retain` that write-locks every DashMap shard and walks all entries; at
+/// capacity, doing that per connection would put O(MAX_BAN_ENTRIES) work on
+/// the accept path of the exact flood the cap defends against.
+const BAN_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Ban set for rejected unknown fingerprints (#27 commit 4): JA4 → banned
+/// until. Owned by `AppState` — like the per-IP `rate_map`, it tracks client
+/// behaviour, not config, so it survives hot-reloads (an operator tweaking an
+/// unrelated knob mid-attack must not amnesty every banned fingerprint).
+#[derive(Debug, Default)]
+pub struct BanSet {
+    map: dashmap::DashMap<String, std::time::Instant>,
+    /// Elapsed-milliseconds-since-first-use timestamp before which no full-map
+    /// sweep may run (amortizes the at-capacity `retain` to one per
+    /// `BAN_SWEEP_INTERVAL` process-wide; a CAS elects the single sweeper).
+    next_sweep_ms: std::sync::atomic::AtomicU64,
+    /// Fixed origin for `next_sweep_ms` (set on first use).
+    epoch: std::sync::OnceLock<std::time::Instant>,
 }
 
-/// Record a ban for `ja4` until `now + ttl`, sweeping expired entries (and
-/// giving up on the insert) when the map is at capacity.
-fn ban_insert(bans: &BanMap, ja4: &str, now: std::time::Instant, ttl: std::time::Duration) {
-    if bans.len() >= MAX_BAN_ENTRIES {
-        bans.retain(|_, until| *until > now);
-        if bans.len() >= MAX_BAN_ENTRIES {
-            return; // full of LIVE bans — skip; the slow path still rejects
+impl BanSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Milliseconds from the set's fixed epoch to `now`. Monotonic; saturates
+    /// at 0 for a `now` predating the epoch (only synthetic test clocks).
+    fn elapsed_ms(&self, now: std::time::Instant) -> u64 {
+        let epoch = *self.epoch.get_or_init(|| now);
+        now.saturating_duration_since(epoch).as_millis() as u64
+    }
+
+    /// Is `ja4` actively banned at `now`? An expired entry is removed on the way.
+    fn hit(&self, ja4: &str, now: std::time::Instant) -> bool {
+        // The read guard from `get` MUST be dropped before `remove` touches the
+        // same key — holding it across the removal deadlocks the DashMap shard.
+        {
+            let Some(until) = self.map.get(ja4) else {
+                return false;
+            };
+            if *until > now {
+                return true;
+            }
+        }
+        drop(self.map.remove(ja4));
+        false
+    }
+
+    /// Record a ban for `ja4` until `now + ttl`. At capacity, sweep expired
+    /// entries — but at most once per `BAN_SWEEP_INTERVAL` across the whole
+    /// process (CAS elects one sweeper; everyone else skips the insert) — and
+    /// give up on the insert if the map is still full of live bans.
+    fn insert(&self, ja4: &str, now: std::time::Instant, ttl: std::time::Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.map.len() >= MAX_BAN_ENTRIES {
+            let now_ms = self.elapsed_ms(now);
+            let next = self.next_sweep_ms.load(Relaxed);
+            if now_ms < next {
+                return; // a sweep just ran and the map is still full — skip
+            }
+            if self
+                .next_sweep_ms
+                .compare_exchange(
+                    next,
+                    now_ms + BAN_SWEEP_INTERVAL.as_millis() as u64,
+                    Relaxed,
+                    Relaxed,
+                )
+                .is_err()
+            {
+                return; // another connection won the sweep election — skip
+            }
+            self.map.retain(|_, until| *until > now);
+            if self.map.len() >= MAX_BAN_ENTRIES {
+                return; // full of LIVE bans — skip; the slow path still rejects
+            }
+        }
+        // Validation caps ban_ttl_secs at one year, so this add cannot
+        // overflow in practice — checked anyway: a skipped ban is safe, an
+        // abort (release panics abort) is not.
+        if let Some(until) = now.checked_add(ttl) {
+            self.map.insert(ja4.to_owned(), until);
         }
     }
-    bans.insert(ja4.to_owned(), now + ttl);
+
+    /// Number of tracked bans (tests / introspection).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 /// Bytes peeked to cover a full ClientHello — big enough for a TLS 1.3 hybrid
@@ -753,7 +844,7 @@ pub async fn fingerprint_gate(
                 // are dropped — everywhere else nothing is ever banned.
                 if fp.drops_unknown() && !fp.ban_ttl.is_zero() {
                     let now = std::time::Instant::now();
-                    if ban_hit(&state.tls_fp_bans, ja4.as_str(), now) {
+                    if state.tls_fp_bans.hit(ja4.as_str(), now) {
                         crate::metrics::METRICS
                             .tls_fp_banned_hits
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -765,7 +856,7 @@ pub async fn fingerprint_gate(
                         tracing::debug!(ja4 = %ja4, "tls-fp: rejecting banned fingerprint (fast path)");
                         return GateDecision::Reject;
                     }
-                    ban_insert(&state.tls_fp_bans, ja4.as_str(), now, fp.ban_ttl);
+                    state.tls_fp_bans.insert(ja4.as_str(), now, fp.ban_ttl);
                 }
                 fp.unknown_decision(&ja4)
             }
@@ -1210,21 +1301,24 @@ mod tests {
     fn fp_rate_admits_up_to_cps_within_one_second() {
         let rate = FpRate::new(3);
         let t = 1_000_000u64;
-        assert!(rate.admit(t));
-        assert!(rate.admit(t));
-        assert!(rate.admit(t));
-        assert!(!rate.admit(t)); // 4th connection in the same second → over cap
-        assert!(!rate.admit(t)); // stays over for the rest of the window
+        assert_eq!(rate.admit(t), Admit::Granted);
+        assert_eq!(rate.admit(t), Admit::Granted);
+        assert_eq!(rate.admit(t), Admit::Granted);
+        // 4th connection in the same second crosses the cap — the ONE worth
+        // logging; every later denial in the window is silent.
+        assert_eq!(rate.admit(t), Admit::FirstDenial);
+        assert_eq!(rate.admit(t), Admit::Denied);
+        assert_eq!(rate.admit(t), Admit::Denied);
     }
 
     #[test]
     fn fp_rate_resets_on_a_new_second() {
         let rate = FpRate::new(1);
         let t = 1_000_000u64;
-        assert!(rate.admit(t));
-        assert!(!rate.admit(t));
-        assert!(rate.admit(t + 1)); // next window starts fresh
-        assert!(!rate.admit(t + 1));
+        assert_eq!(rate.admit(t), Admit::Granted);
+        assert_eq!(rate.admit(t), Admit::FirstDenial);
+        assert_eq!(rate.admit(t + 1), Admit::Granted); // next window starts fresh
+        assert_eq!(rate.admit(t + 1), Admit::FirstDenial); // and logs once again
     }
 
     #[test]
@@ -1236,8 +1330,8 @@ mod tests {
             ((t as u32 as u64) << 32) | u64::from(u32::MAX),
             std::sync::atomic::Ordering::Relaxed,
         );
-        assert!(!rate.admit(t));
-        assert!(!rate.admit(t)); // saturated, still over
+        assert_eq!(rate.admit(t), Admit::Denied);
+        assert_eq!(rate.admit(t), Admit::Denied); // saturated, still over, still silent
     }
 
     #[test]
@@ -1281,41 +1375,78 @@ mod tests {
 
     #[test]
     fn ban_hit_respects_ttl_and_removes_expired() {
-        let bans = BanMap::new();
+        let bans = BanSet::new();
         let now = std::time::Instant::now();
         let ttl = std::time::Duration::from_secs(600);
-        ban_insert(&bans, "fp-a", now, ttl);
-        assert!(ban_hit(&bans, "fp-a", now)); // inside the TTL
-        assert!(!ban_hit(&bans, "fp-b", now)); // never banned
-                                               // Past the TTL the entry no longer bans — and is removed on the way.
-        assert!(!ban_hit(
-            &bans,
-            "fp-a",
-            now + ttl + std::time::Duration::from_secs(1)
-        ));
-        assert!(bans.get("fp-a").is_none());
+        bans.insert("fp-a", now, ttl);
+        assert!(bans.hit("fp-a", now)); // inside the TTL
+        assert!(!bans.hit("fp-b", now)); // never banned
+                                         // Past the TTL the entry no longer bans — and is removed on the way.
+        assert!(!bans.hit("fp-a", now + ttl + std::time::Duration::from_secs(1)));
+        assert!(bans.map.get("fp-a").is_none());
     }
 
     #[test]
     fn ban_insert_at_capacity_sweeps_expired_then_skips_when_full_of_live() {
-        let bans = BanMap::new();
+        let bans = BanSet::new();
         let now = std::time::Instant::now();
         let ttl = std::time::Duration::from_secs(600);
         // Fill to the cap with entries that are already expired at `later`.
         for i in 0..MAX_BAN_ENTRIES {
-            bans.insert(format!("old-{i}"), now); // banned_until = now → expired after now
+            bans.map.insert(format!("old-{i}"), now); // banned_until = now → expired after now
         }
-        let later = now + std::time::Duration::from_secs(1);
+        let later = now + std::time::Duration::from_secs(2);
         // The sweep clears the expired entries and the insert lands.
-        ban_insert(&bans, "fresh", later, ttl);
-        assert!(ban_hit(&bans, "fresh", later));
+        bans.insert("fresh", later, ttl);
+        assert!(bans.hit("fresh", later));
         assert!(bans.len() < MAX_BAN_ENTRIES);
-        // Now fill to the cap with LIVE bans: the next insert is skipped.
+        // Now fill to the cap with LIVE bans: the next insert is skipped
+        // (once the sweep interval has passed, so the sweep itself runs).
         for i in 0..MAX_BAN_ENTRIES {
-            bans.insert(format!("live-{i}"), later + ttl);
+            bans.map.insert(format!("live-{i}"), later + ttl);
         }
-        ban_insert(&bans, "overflow", later, ttl);
-        assert!(!ban_hit(&bans, "overflow", later));
+        let much_later = later + BAN_SWEEP_INTERVAL + std::time::Duration::from_millis(1);
+        bans.insert("overflow", much_later, ttl);
+        assert!(!bans.hit("overflow", much_later));
+    }
+
+    #[test]
+    fn ban_sweep_is_amortized_one_full_retain_per_interval() {
+        let bans = BanSet::new();
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_secs(600);
+        // Cap the map with entries that are EXPIRED at `later` — sweepable.
+        for i in 0..MAX_BAN_ENTRIES {
+            bans.map.insert(format!("old-{i}"), now);
+        }
+        let later = now + std::time::Duration::from_secs(2);
+        // First at-capacity insert runs the sweep and lands.
+        bans.insert("first", later, ttl);
+        assert!(bans.hit("first", later));
+        // Re-cap with expired entries again, WITHIN the sweep interval: the
+        // sweep must NOT run again — the insert is skipped even though every
+        // entry is sweepable. This is the amortization: O(n) retain at most
+        // once per BAN_SWEEP_INTERVAL, not per connection.
+        for i in 0..MAX_BAN_ENTRIES {
+            bans.map.insert(format!("re-{i}"), now);
+        }
+        let within = later + std::time::Duration::from_millis(10);
+        bans.insert("second", within, ttl);
+        assert!(!bans.hit("second", within));
+        // After the interval the sweep is allowed again and the insert lands.
+        let after = later + BAN_SWEEP_INTERVAL + std::time::Duration::from_millis(1);
+        bans.insert("third", after, ttl);
+        assert!(bans.hit("third", after));
+    }
+
+    #[test]
+    fn ban_insert_skips_on_instant_overflow_instead_of_panicking() {
+        // Validation caps ban_ttl_secs at one year, but the insert must stay
+        // panic-free regardless (release panics abort the proxy).
+        let bans = BanSet::new();
+        let now = std::time::Instant::now();
+        bans.insert("fp-x", now, std::time::Duration::from_secs(u64::MAX));
+        assert!(!bans.hit("fp-x", now)); // skipped, not aborted
     }
 
     #[test]

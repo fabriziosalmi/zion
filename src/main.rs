@@ -523,7 +523,7 @@ struct AppState {
     /// about the client's behaviour, not about the config — and is only ever
     /// consulted while the CURRENT config drops unknown fingerprints.
     #[cfg(feature = "tls-fingerprint")]
-    pub(crate) tls_fp_bans: tls_fp::BanMap,
+    pub(crate) tls_fp_bans: tls_fp::BanSet,
 }
 
 impl AppState {
@@ -1094,7 +1094,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         conn_per_ip: Arc::new(connlimit::PerIpConnLimiter::new()),
         inflight: numa::NumaAwareMap::new(),
         #[cfg(feature = "tls-fingerprint")]
-        tls_fp_bans: tls_fp::BanMap::new(),
+        tls_fp_bans: tls_fp::BanSet::new(),
         audit: audit_handle,
         redact: compiled_redact,
         http_builder: Arc::new({
