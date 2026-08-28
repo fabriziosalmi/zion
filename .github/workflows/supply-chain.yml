@@ -47,16 +47,27 @@ jobs:
   audit:
     name: cargo-audit (advisories)
     runs-on: [self-hosted, Linux, X64]
-    # Give this job its OWN rustup toolchain store under runner.temp (wiped at
-    # the start of every job on self-hosted runners). The persistent Contabo
-    # runners otherwise share one mutable ~/.rustup across jobs, and a
-    # half-removed rust-std leaves a stale component manifest that makes
-    # dtolnay/rust-toolchain's reinstall abort ("failure removing component
-    # rust-std … .rmeta"). Only RUSTUP_HOME moves — CARGO_HOME is untouched, so
-    # the rustup/cargo binaries stay on PATH and crate caching is unaffected.
-    env:
-      RUSTUP_HOME: ${{ runner.temp }}/rustup
+    # Give this job its OWN rustup toolchain store under runner.temp. The
+    # persistent Contabo runners otherwise share one mutable ~/.rustup across
+    # jobs, and a half-removed rust-std leaves a stale component manifest that
+    # makes dtolnay/rust-toolchain's reinstall abort ("failure removing
+    # component rust-std … .rmeta"). Only RUSTUP_HOME moves — CARGO_HOME is
+    # untouched, so the rustup/cargo binaries stay on PATH and crate caching
+    # is unaffected.
+    # The `rm -rf` is what actually makes it per-job: on these runners
+    # $RUNNER_TEMP is NOT wiped between jobs, so a job killed mid-install
+    # leaves a manifest-less toolchain there that rustup then reports as
+    # "unchanged" and never repairs ("error: Missing manifest in toolchain
+    # 'stable'"), poisoning every later job on that runner.
+    # NOTE: exported via GITHUB_ENV in the first step, NOT job-level `env:` —
+    # the `runner` context is not available there, and an expression that uses
+    # it makes GitHub reject the whole workflow file at run creation (zero
+    # jobs, required checks never report, every PR blocked).
     steps:
+      - name: Isolate rustup store (see comment above)
+        run: |
+          rm -rf "$RUNNER_TEMP/rustup"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       # Prebuilt binary, not `cargo install` from source: building the tool
@@ -131,10 +142,13 @@ jobs:
     name: cargo-geiger (unsafe surface)
     runs-on: [self-hosted, Linux, X64]
     continue-on-error: true   # geiger is a *report*, not a gate
-    # Isolated rustup store — see the `audit` job for the rationale.
-    env:
-      RUSTUP_HOME: ${{ runner.temp }}/rustup
+    # Isolated rustup store — see the `audit` job for the rationale (and for
+    # why it's a GITHUB_ENV step, not job-level `env:`).
     steps:
+      - name: Isolate rustup store
+        run: |
+          rm -rf "$RUNNER_TEMP/rustup"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -174,10 +188,13 @@ jobs:
     if: github.event_name != 'pull_request'
     permissions:
       contents: read
-    # Isolated rustup store — see the `audit` job for the rationale.
-    env:
-      RUSTUP_HOME: ${{ runner.temp }}/rustup
+    # Isolated rustup store — see the `audit` job for the rationale (and for
+    # why it's a GITHUB_ENV step, not job-level `env:`).
     steps:
+      - name: Isolate rustup store
+        run: |
+          rm -rf "$RUNNER_TEMP/rustup"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2

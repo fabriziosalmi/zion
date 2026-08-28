@@ -39,6 +39,8 @@ GEMINI_IMPRO.md
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
 benchmarks/backend/target/
 benchmarks/backend/Cargo.lock
 
