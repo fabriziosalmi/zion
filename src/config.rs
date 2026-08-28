@@ -364,7 +364,7 @@ pub struct TlsConfig {
 /// `warn_feature_config_gaps`). `allowed` is only read under the feature, hence
 /// the targeted allow (mirrors `AcmeConfig`).
 #[allow(dead_code)]
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct FingerprintConfig {
     /// `off` (default) | `shadow` | `allowlist`.
@@ -389,6 +389,35 @@ pub struct FingerprintConfig {
     /// Default `allow` — availability first; `drop` fails closed for the strict.
     #[serde(default)]
     pub on_unfingerprintable: OnUnfingerprintable,
+    /// `allowlist` + `on_unknown = "drop"`: once an unknown fingerprint is
+    /// rejected it goes on a ban set for this many seconds, and repeat
+    /// connections with the same JA4 are rejected on a fast path — one map
+    /// lookup, a debug-level log instead of a warn per connection, counted in
+    /// `zion_tls_fp_banned_hits`. Under a flood of one fingerprint this is
+    /// what keeps the log readable. `0` disables the ban set (every rejection
+    /// logs individually). Default 600 (10 minutes). Bans survive config
+    /// reloads but never outlive the process.
+    #[serde(default = "default_ban_ttl_secs")]
+    pub ban_ttl_secs: u64,
+}
+
+fn default_ban_ttl_secs() -> u64 {
+    600
+}
+
+// Manual impl (not derived) so `FingerprintConfig::default()` and a TOML block
+// that omits `ban_ttl_secs` agree on 600 — a derived Default would say 0
+// (bans disabled) while serde says 600.
+impl Default for FingerprintConfig {
+    fn default() -> Self {
+        Self {
+            mode: FingerprintMode::default(),
+            allowed: Vec::new(),
+            on_unknown: OnUnknown::default(),
+            on_unfingerprintable: OnUnfingerprintable::default(),
+            ban_ttl_secs: default_ban_ttl_secs(),
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -428,6 +457,14 @@ pub struct AllowedFingerprint {
     pub name: String,
     /// The JA4 string, e.g. `t13d1516h2_8daaf6152771_e5627efa2ab1`.
     pub ja4: String,
+    /// Cap on NEW TLS connections per second for this fingerprint —
+    /// connections, not HTTP requests: the gate runs before the handshake,
+    /// where requests don't exist yet. Over-cap connections are dropped
+    /// pre-handshake in `allowlist` mode and only counted
+    /// (`zion_tls_fp_rate_limited`) in `shadow`. `0` (default) = no limit,
+    /// consistent with `[server] rate_limit_rps`.
+    #[serde(default)]
+    pub rate_limit_cps: u32,
 }
 
 #[derive(Deserialize, Clone, Debug)]

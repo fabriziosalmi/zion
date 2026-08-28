@@ -413,16 +413,79 @@ pub fn looks_like_ja4(s: &str) -> bool {
     }
 }
 
+/// Per-fingerprint fixed-window (1 s) connection-rate state. Shared across
+/// connections through the `Arc<TlsFpRuntime>` — the window and count are
+/// packed into one `AtomicU64` and advanced by CAS, the same idiom as
+/// `security::RateEntry`, so the hot path takes no lock. Reset on config
+/// reload (the state spans one second; losing it at a reload is noise).
+#[derive(Debug)]
+struct FpRate {
+    /// Connections admitted per one-second window; always > 0 here (a
+    /// configured 0 resolves to "no limit" = no `FpRate` at all).
+    cps: u32,
+    /// `(unix_second as u32) << 32 | count` — window + count in one CAS.
+    packed: std::sync::atomic::AtomicU64,
+}
+
+impl FpRate {
+    fn new(cps: u32) -> Self {
+        FpRate {
+            cps,
+            packed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Admit one connection at `now_secs` (unix seconds). `false` = over cap.
+    fn admit(&self, now_secs: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let window = now_secs as u32;
+        loop {
+            let old = self.packed.load(Relaxed);
+            let (old_window, old_count) = ((old >> 32) as u32, old as u32);
+            let (new, admitted) = if old_window == window {
+                // Same window — increment; saturate so a flood can't wrap the
+                // counter back under the cap.
+                (
+                    ((window as u64) << 32) | u64::from(old_count.saturating_add(1)),
+                    old_count < self.cps,
+                )
+            } else {
+                // New window — this connection is its first.
+                (((window as u64) << 32) | 1, true)
+            };
+            if self
+                .packed
+                .compare_exchange_weak(old, new, Relaxed, Relaxed)
+                .is_ok()
+            {
+                return admitted;
+            }
+        }
+    }
+}
+
+/// One resolved allowlist entry: the human label plus the optional
+/// per-fingerprint connection-rate limit.
+#[derive(Debug)]
+struct AllowedEntry {
+    name: String,
+    rate: Option<FpRate>,
+}
+
 /// Runtime-resolved fingerprint state, read on the accept path. Built once per
 /// config load from `[tls.fingerprint]`; the resolver returns `None` for
 /// `mode = off` so the hot path pays nothing when the feature is unused.
-#[derive(Clone, Debug)]
+/// Shared as `Arc<TlsFpRuntime>` (not cloned per connection): the per-entry
+/// rate atomics must be one instance across all connections.
+#[derive(Debug)]
 pub struct TlsFpRuntime {
     pub mode: crate::config::FingerprintMode,
     on_unknown: crate::config::OnUnknown,
     on_unfingerprintable: crate::config::OnUnfingerprintable,
-    /// JA4 string → allowlist entry name (for the known/unknown metric split).
-    allowed: std::collections::HashMap<String, String>,
+    /// TTL of the unknown-fingerprint ban fast path; zero = bans disabled.
+    ban_ttl: std::time::Duration,
+    /// JA4 string → allowlist entry (name + optional rate limit).
+    allowed: std::collections::HashMap<String, AllowedEntry>,
 }
 
 impl TlsFpRuntime {
@@ -437,19 +500,69 @@ impl TlsFpRuntime {
         let allowed = cfg
             .allowed
             .iter()
-            .map(|a| (a.ja4.trim().to_ascii_lowercase(), a.name.clone()))
+            .map(|a| {
+                (
+                    a.ja4.trim().to_ascii_lowercase(),
+                    AllowedEntry {
+                        name: a.name.clone(),
+                        rate: (a.rate_limit_cps > 0).then(|| FpRate::new(a.rate_limit_cps)),
+                    },
+                )
+            })
             .collect();
         Some(TlsFpRuntime {
             mode: cfg.mode.clone(),
             on_unknown: cfg.on_unknown,
             on_unfingerprintable: cfg.on_unfingerprintable,
+            ban_ttl: std::time::Duration::from_secs(cfg.ban_ttl_secs),
             allowed,
         })
     }
 
     /// The allowlist entry name for a fingerprint, if it is known.
     pub fn known_name(&self, ja4: &Ja4) -> Option<&str> {
-        self.allowed.get(ja4.as_str()).map(String::as_str)
+        self.allowed.get(ja4.as_str()).map(|e| e.name.as_str())
+    }
+
+    /// Verdict for a KNOWN (allowlisted) fingerprint: admit unless its
+    /// per-fingerprint connection-rate limit says the current second is full.
+    /// Over-cap in `allowlist` mode drops the connection pre-handshake; in
+    /// `shadow` it is counted (`zion_tls_fp_rate_limited`) but never blocks —
+    /// shadow observes, whatever the knobs say.
+    fn known_decision(&self, ja4: &Ja4, entry: &AllowedEntry, now_secs: u64) -> GateDecision {
+        use crate::config::FingerprintMode;
+        let Some(rate) = &entry.rate else {
+            return GateDecision::Proceed;
+        };
+        if rate.admit(now_secs) {
+            return GateDecision::Proceed;
+        }
+        crate::metrics::METRICS
+            .tls_fp_rate_limited
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.mode == FingerprintMode::Allowlist {
+            tracing::warn!(
+                ja4 = %ja4, name = %entry.name, limit_cps = rate.cps,
+                "tls-fp: per-fingerprint connection rate exceeded — dropping pre-handshake"
+            );
+            crate::metrics::METRICS
+                .tls_fp_rejected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            GateDecision::Reject
+        } else {
+            tracing::info!(
+                ja4 = %ja4, name = %entry.name, limit_cps = rate.cps,
+                "tls-fp: per-fingerprint connection rate exceeded (shadow — connection proceeds)"
+            );
+            GateDecision::Proceed
+        }
+    }
+
+    /// Would this runtime drop an unknown fingerprint? (The only combination
+    /// that rejects — and therefore the only one where the ban set applies.)
+    fn drops_unknown(&self) -> bool {
+        self.mode == crate::config::FingerprintMode::Allowlist
+            && self.on_unknown == crate::config::OnUnknown::Drop
     }
 
     /// Verdict for an unknown fingerprint. Rejects only in `allowlist` mode with
@@ -488,6 +601,46 @@ impl TlsFpRuntime {
             GateDecision::Proceed
         }
     }
+}
+
+/// Ban set for rejected unknown fingerprints (#27 commit 4): JA4 → banned
+/// until. Owned by `AppState` — like the per-IP `rate_map`, it tracks client
+/// behaviour, not config, so it survives hot-reloads (an operator tweaking an
+/// unrelated knob mid-attack must not amnesty every banned fingerprint).
+pub type BanMap = dashmap::DashMap<String, std::time::Instant>;
+
+/// Ceiling on tracked bans. An attacker rotating a UNIQUE JA4 per connection
+/// would otherwise grow the map without bound. At the cap, expired entries are
+/// swept; if the map is still full the insert is skipped — a ban is only the
+/// fast path, the slow path still rejects every unknown connection one by one.
+const MAX_BAN_ENTRIES: usize = 4096;
+
+/// Is `ja4` actively banned at `now`? An expired entry is removed on the way.
+fn ban_hit(bans: &BanMap, ja4: &str, now: std::time::Instant) -> bool {
+    // The read guard from `get` MUST be dropped before `remove` touches the
+    // same key — holding it across the removal deadlocks the DashMap shard.
+    {
+        let Some(until) = bans.get(ja4) else {
+            return false;
+        };
+        if *until > now {
+            return true;
+        }
+    }
+    drop(bans.remove(ja4));
+    false
+}
+
+/// Record a ban for `ja4` until `now + ttl`, sweeping expired entries (and
+/// giving up on the insert) when the map is at capacity.
+fn ban_insert(bans: &BanMap, ja4: &str, now: std::time::Instant, ttl: std::time::Duration) {
+    if bans.len() >= MAX_BAN_ENTRIES {
+        bans.retain(|_, until| *until > now);
+        if bans.len() >= MAX_BAN_ENTRIES {
+            return; // full of LIVE bans — skip; the slow path still rejects
+        }
+    }
+    bans.insert(ja4.to_owned(), now + ttl);
 }
 
 /// Bytes peeked to cover a full ClientHello — big enough for a TLS 1.3 hybrid
@@ -580,15 +733,40 @@ pub async fn fingerprint_gate(
     };
     match ja4_from_tls_record(&buf[..n]) {
         Ok(ja4) => {
-            if fp.known_name(&ja4).is_some() {
+            // The allowlist is consulted BEFORE the ban set: an operator who
+            // hot-reloads a previously-unknown fingerprint onto the allowlist
+            // must win over a stale ban immediately.
+            if let Some(entry) = fp.allowed.get(ja4.as_str()) {
                 crate::metrics::METRICS
                     .tls_fp_known
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                GateDecision::Proceed
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                fp.known_decision(&ja4, entry, now_secs)
             } else {
                 crate::metrics::METRICS
                     .tls_fp_unknown
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Ban fast path (#27 commit 4): only meaningful when unknowns
+                // are dropped — everywhere else nothing is ever banned.
+                if fp.drops_unknown() && !fp.ban_ttl.is_zero() {
+                    let now = std::time::Instant::now();
+                    if ban_hit(&state.tls_fp_bans, ja4.as_str(), now) {
+                        crate::metrics::METRICS
+                            .tls_fp_banned_hits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::metrics::METRICS
+                            .tls_fp_rejected
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // debug, not warn: the first offense already warned when
+                        // the ban was recorded — this keeps a flood readable.
+                        tracing::debug!(ja4 = %ja4, "tls-fp: rejecting banned fingerprint (fast path)");
+                        return GateDecision::Reject;
+                    }
+                    ban_insert(&state.tls_fp_bans, ja4.as_str(), now, fp.ban_ttl);
+                }
                 fp.unknown_decision(&ja4)
             }
         }
@@ -789,6 +967,7 @@ mod tests {
             mode,
             on_unknown,
             on_unfingerprintable,
+            ban_ttl: std::time::Duration::from_secs(600),
             allowed: std::collections::HashMap::new(),
         };
         // shadow NEVER rejects, whatever the policy knobs say.
@@ -844,6 +1023,7 @@ mod tests {
             allowed: vec![AllowedFingerprint {
                 name: "chrome".into(),
                 ja4: "  T13D1516H2_8DAAF6152771_E5627EFA2AB1  ".into(), // upper + spaces
+                rate_limit_cps: 0,
             }],
             ..Default::default()
         };
@@ -870,6 +1050,7 @@ mod tests {
             allowed: vec![AllowedFingerprint {
                 name: "chrome".into(),
                 ja4: "t13d1516h2_8daaf6152771_e5627efa2ab1".into(),
+                rate_limit_cps: 0,
             }],
             ..Default::default()
         };
@@ -1021,5 +1202,163 @@ mod tests {
         let inner_len = (body.len() - 4) as u32;
         body[1..4].copy_from_slice(&inner_len.to_be_bytes()[1..]);
         assert_eq!(ja4_from_client_hello(&body), Err(TlsFpError::Malformed));
+    }
+
+    // ── #27 commit 4: per-fingerprint rate limit + ban fast path ──────────────
+
+    #[test]
+    fn fp_rate_admits_up_to_cps_within_one_second() {
+        let rate = FpRate::new(3);
+        let t = 1_000_000u64;
+        assert!(rate.admit(t));
+        assert!(rate.admit(t));
+        assert!(rate.admit(t));
+        assert!(!rate.admit(t)); // 4th connection in the same second → over cap
+        assert!(!rate.admit(t)); // stays over for the rest of the window
+    }
+
+    #[test]
+    fn fp_rate_resets_on_a_new_second() {
+        let rate = FpRate::new(1);
+        let t = 1_000_000u64;
+        assert!(rate.admit(t));
+        assert!(!rate.admit(t));
+        assert!(rate.admit(t + 1)); // next window starts fresh
+        assert!(!rate.admit(t + 1));
+    }
+
+    #[test]
+    fn fp_rate_count_saturates_instead_of_wrapping() {
+        // A u32::MAX-sized flood must not wrap the counter back under the cap.
+        let rate = FpRate::new(1);
+        let t = 42u64;
+        rate.packed.store(
+            ((t as u32 as u64) << 32) | u64::from(u32::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        assert!(!rate.admit(t));
+        assert!(!rate.admit(t)); // saturated, still over
+    }
+
+    #[test]
+    fn known_decision_drops_over_cap_in_allowlist_but_only_observes_in_shadow() {
+        use crate::config::{FingerprintMode, OnUnfingerprintable, OnUnknown};
+        let ja4 = Ja4("t13d1516h2_8daaf6152771_e5627efa2ab1".into());
+        let mk = |mode| TlsFpRuntime {
+            mode,
+            on_unknown: OnUnknown::Drop,
+            on_unfingerprintable: OnUnfingerprintable::Allow,
+            ban_ttl: std::time::Duration::from_secs(600),
+            allowed: std::collections::HashMap::new(),
+        };
+        let entry = AllowedEntry {
+            name: "chrome".into(),
+            rate: Some(FpRate::new(1)),
+        };
+        let t = 7_777u64;
+        // allowlist: first admitted, second dropped.
+        let al = mk(FingerprintMode::Allowlist);
+        assert_eq!(al.known_decision(&ja4, &entry, t), GateDecision::Proceed);
+        assert_eq!(al.known_decision(&ja4, &entry, t), GateDecision::Reject);
+        // shadow: over cap is observed, never blocked.
+        let entry_sh = AllowedEntry {
+            name: "chrome".into(),
+            rate: Some(FpRate::new(1)),
+        };
+        let sh = mk(FingerprintMode::Shadow);
+        assert_eq!(sh.known_decision(&ja4, &entry_sh, t), GateDecision::Proceed);
+        assert_eq!(sh.known_decision(&ja4, &entry_sh, t), GateDecision::Proceed);
+        // no rate configured: always Proceed.
+        let unlimited = AllowedEntry {
+            name: "curl".into(),
+            rate: None,
+        };
+        assert_eq!(
+            al.known_decision(&ja4, &unlimited, t),
+            GateDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn ban_hit_respects_ttl_and_removes_expired() {
+        let bans = BanMap::new();
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_secs(600);
+        ban_insert(&bans, "fp-a", now, ttl);
+        assert!(ban_hit(&bans, "fp-a", now)); // inside the TTL
+        assert!(!ban_hit(&bans, "fp-b", now)); // never banned
+                                               // Past the TTL the entry no longer bans — and is removed on the way.
+        assert!(!ban_hit(
+            &bans,
+            "fp-a",
+            now + ttl + std::time::Duration::from_secs(1)
+        ));
+        assert!(bans.get("fp-a").is_none());
+    }
+
+    #[test]
+    fn ban_insert_at_capacity_sweeps_expired_then_skips_when_full_of_live() {
+        let bans = BanMap::new();
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_secs(600);
+        // Fill to the cap with entries that are already expired at `later`.
+        for i in 0..MAX_BAN_ENTRIES {
+            bans.insert(format!("old-{i}"), now); // banned_until = now → expired after now
+        }
+        let later = now + std::time::Duration::from_secs(1);
+        // The sweep clears the expired entries and the insert lands.
+        ban_insert(&bans, "fresh", later, ttl);
+        assert!(ban_hit(&bans, "fresh", later));
+        assert!(bans.len() < MAX_BAN_ENTRIES);
+        // Now fill to the cap with LIVE bans: the next insert is skipped.
+        for i in 0..MAX_BAN_ENTRIES {
+            bans.insert(format!("live-{i}"), later + ttl);
+        }
+        ban_insert(&bans, "overflow", later, ttl);
+        assert!(!ban_hit(&bans, "overflow", later));
+    }
+
+    #[test]
+    fn from_config_resolves_rate_limit_only_when_positive() {
+        use crate::config::{AllowedFingerprint, FingerprintConfig, FingerprintMode};
+        let cfg = FingerprintConfig {
+            mode: FingerprintMode::Allowlist,
+            allowed: vec![
+                AllowedFingerprint {
+                    name: "limited".into(),
+                    ja4: "t13d1516h2_8daaf6152771_e5627efa2ab1".into(),
+                    rate_limit_cps: 50,
+                },
+                AllowedFingerprint {
+                    name: "unlimited".into(),
+                    ja4: "t13d1516h2_000000000000_000000000000".into(),
+                    rate_limit_cps: 0, // 0 = no limit, same as [server] rate_limit_rps
+                },
+            ],
+            ban_ttl_secs: 0,
+            ..Default::default()
+        };
+        let rt = TlsFpRuntime::from_config(&cfg).unwrap();
+        let limited = rt
+            .allowed
+            .get("t13d1516h2_8daaf6152771_e5627efa2ab1")
+            .unwrap();
+        assert_eq!(limited.rate.as_ref().map(|r| r.cps), Some(50));
+        let unlimited = rt
+            .allowed
+            .get("t13d1516h2_000000000000_000000000000")
+            .unwrap();
+        assert!(unlimited.rate.is_none());
+        assert!(rt.ban_ttl.is_zero()); // ban_ttl_secs = 0 disables the ban set
+    }
+
+    #[test]
+    fn fingerprint_config_default_and_serde_default_agree_on_ban_ttl() {
+        use crate::config::FingerprintConfig;
+        // The manual Default impl and a TOML block omitting ban_ttl_secs must
+        // both say 600 — a derived Default would silently disagree (0).
+        assert_eq!(FingerprintConfig::default().ban_ttl_secs, 600);
+        let parsed: FingerprintConfig = toml::from_str("mode = \"shadow\"").unwrap();
+        assert_eq!(parsed.ban_ttl_secs, 600);
     }
 }
