@@ -556,12 +556,19 @@ impl TlsFpRuntime {
     /// attacker unbounded log amplification (the same hazard the ban fast path
     /// closes for unknown fingerprints). Every denial still counts in the
     /// metrics.
-    fn known_decision(&self, ja4: &Ja4, entry: &AllowedEntry, now_secs: u64) -> GateDecision {
+    /// `now_secs` is a closure so the common unlimited entry pays no clock
+    /// read: it is only invoked once a rate limit actually exists.
+    fn known_decision(
+        &self,
+        ja4: &Ja4,
+        entry: &AllowedEntry,
+        now_secs: impl FnOnce() -> u64,
+    ) -> GateDecision {
         use crate::config::FingerprintMode;
         let Some(rate) = &entry.rate else {
             return GateDecision::Proceed;
         };
-        let verdict = rate.admit(now_secs);
+        let verdict = rate.admit(now_secs());
         if verdict == Admit::Granted {
             return GateDecision::Proceed;
         }
@@ -831,11 +838,12 @@ pub async fn fingerprint_gate(
                 crate::metrics::METRICS
                     .tls_fp_known
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let now_secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                fp.known_decision(&ja4, entry, now_secs)
+                fp.known_decision(&ja4, entry, || {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                })
             } else {
                 crate::metrics::METRICS
                     .tls_fp_unknown
@@ -1352,23 +1360,31 @@ mod tests {
         let t = 7_777u64;
         // allowlist: first admitted, second dropped.
         let al = mk(FingerprintMode::Allowlist);
-        assert_eq!(al.known_decision(&ja4, &entry, t), GateDecision::Proceed);
-        assert_eq!(al.known_decision(&ja4, &entry, t), GateDecision::Reject);
+        assert_eq!(al.known_decision(&ja4, &entry, || t), GateDecision::Proceed);
+        assert_eq!(al.known_decision(&ja4, &entry, || t), GateDecision::Reject);
         // shadow: over cap is observed, never blocked.
         let entry_sh = AllowedEntry {
             name: "chrome".into(),
             rate: Some(FpRate::new(1)),
         };
         let sh = mk(FingerprintMode::Shadow);
-        assert_eq!(sh.known_decision(&ja4, &entry_sh, t), GateDecision::Proceed);
-        assert_eq!(sh.known_decision(&ja4, &entry_sh, t), GateDecision::Proceed);
+        assert_eq!(
+            sh.known_decision(&ja4, &entry_sh, || t),
+            GateDecision::Proceed
+        );
+        assert_eq!(
+            sh.known_decision(&ja4, &entry_sh, || t),
+            GateDecision::Proceed
+        );
         // no rate configured: always Proceed.
         let unlimited = AllowedEntry {
             name: "curl".into(),
             rate: None,
         };
         assert_eq!(
-            al.known_decision(&ja4, &unlimited, t),
+            al.known_decision(&ja4, &unlimited, || unreachable!(
+                "no rate limit — the clock must not be read"
+            )),
             GateDecision::Proceed
         );
     }
