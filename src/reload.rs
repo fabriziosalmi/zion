@@ -165,6 +165,29 @@ pub(crate) fn reload_now(
         Err(_) => return Err("rebuild panicked (router construction failed)".to_string()),
     };
 
+    // A [tls.fingerprint] posture flip is a security change an operator wants
+    // positively confirmed. The posture is (mode, on_unknown,
+    // on_unfingerprintable) — not mode alone: within mode = allowlist,
+    // on_unknown log_only → drop is exactly the moment enforcement (and the
+    // ban machinery) begins, and the reverse is the moment it stops. Reloads
+    // of unrelated knobs stay silent (#27 commit 5).
+    #[cfg(feature = "tls-fingerprint")]
+    {
+        let posture_of = |c: &crate::ResolvedAppConfig| {
+            c.tls_fingerprint
+                .as_ref()
+                .map(|fp| fp.posture())
+                .unwrap_or_default()
+        };
+        let (old_p, new_p) = (posture_of(&previous), posture_of(&snapshot));
+        if old_p != new_p {
+            tracing::info!(
+                from = ?old_p, to = ?new_p,
+                "tls-fp: fingerprint enforcement posture changed on reload (mode, on_unknown, on_unfingerprintable)"
+            );
+        }
+    }
+
     // 3. Atomic swap + generation bump + best-effort notify.
     state_config.store(Arc::new(snapshot));
     let gen = CONFIG_GENERATION.fetch_add(1, Ordering::Release) + 1;

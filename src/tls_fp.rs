@@ -545,6 +545,24 @@ impl TlsFpRuntime {
         self.allowed.get(ja4.as_str()).map(|e| e.name.as_str())
     }
 
+    /// The enforcement posture as one comparable value: mode alone doesn't
+    /// tell the story — within `allowlist`, flipping `on_unknown` from
+    /// `log_only` to `drop` is exactly the moment enforcement (and the ban
+    /// machinery) begins. The reload announcer compares postures, not modes.
+    pub fn posture(
+        &self,
+    ) -> (
+        crate::config::FingerprintMode,
+        crate::config::OnUnknown,
+        crate::config::OnUnfingerprintable,
+    ) {
+        (
+            self.mode.clone(),
+            self.on_unknown,
+            self.on_unfingerprintable,
+        )
+    }
+
     /// Verdict for a KNOWN (allowlisted) fingerprint: admit unless its
     /// per-fingerprint connection-rate limit says the current second is full.
     /// Over-cap in `allowlist` mode drops the connection pre-handshake; in
@@ -802,34 +820,41 @@ pub enum GateDecision {
     Reject,
 }
 
-/// The accept-path JA4 gate: `MSG_PEEK` the ClientHello (leaving the bytes in
-/// the kernel buffer for rustls to re-read), compute JA4, count it known vs
-/// unknown, and return whether the connection may proceed.
-///
-/// - `mode = off` (runtime `None`) → `Proceed`, no peek, no syscall.
-/// - `mode = shadow` → always `Proceed`; only observes (counts + logs).
-/// - `mode = allowlist` → `Reject` an unknown fingerprint iff `on_unknown =
-///   drop`, and a ClientHello that couldn't be fingerprinted iff
-///   `on_unfingerprintable = drop`; otherwise `Proceed`.
-pub async fn fingerprint_gate(
-    stream: &tokio::net::TcpStream,
-    state: &crate::AppState,
-) -> GateDecision {
-    // Clone the resolved runtime out (a cheap Arc clone) and DROP the arc-swap
-    // Guard before awaiting — never hold a config Guard across an await point.
-    let fp = {
-        let cfg = state.config.load();
-        match cfg.tls_fingerprint.as_ref() {
-            Some(fp) => fp.clone(),
-            None => return GateDecision::Proceed, // mode = off → no peek, no syscall
+/// The fingerprint identity of one accepted connection (#27 commit 5):
+/// computed pre-handshake by the gate, stashed on the connection, and turned
+/// into the `X-Client-TLS-JA4` / `X-Client-TLS-Allowlisted` upstream headers
+/// by [`apply_headers`] — the same lifecycle as the mTLS
+/// `X-Client-Cert-Fingerprint`.
+#[derive(Clone, Debug)]
+pub struct TlsFpIdentity {
+    /// The computed JA4.
+    pub ja4: Ja4,
+    /// The matching allowlist entry's `name`, when the fingerprint is known.
+    pub allowed_name: Option<String>,
+}
+
+/// What the accept-path gate concluded about one connection.
+pub struct GateOutcome {
+    pub decision: GateDecision,
+    /// `Some` whenever a JA4 was actually computed — including for a shadow
+    /// or log-only connection that proceeds unknown. `None` when
+    /// fingerprinting is off or the ClientHello couldn't be fingerprinted.
+    pub identity: Option<TlsFpIdentity>,
+}
+
+impl GateOutcome {
+    fn proceed_anonymous() -> Self {
+        GateOutcome {
+            decision: GateDecision::Proceed,
+            identity: None,
         }
-    };
-    let mut buf = [0u8; PEEK_CAP];
-    let Some(n) = peek_client_hello(stream, &mut buf).await else {
-        // Timeout / EOF / stalled client — could not fingerprint.
-        return fp.unfingerprintable_decision();
-    };
-    match ja4_from_tls_record(&buf[..n]) {
+    }
+}
+
+/// The post-peek decision tree, factored out of the async gate so the whole
+/// mode × allowlist × ban × rate matrix is unit-testable without sockets.
+fn classify(fp: &TlsFpRuntime, bans: &BanSet, parsed: Result<Ja4, TlsFpError>) -> GateOutcome {
+    match parsed {
         Ok(ja4) => {
             // The allowlist is consulted BEFORE the ban set: an operator who
             // hot-reloads a previously-unknown fingerprint onto the allowlist
@@ -838,12 +863,19 @@ pub async fn fingerprint_gate(
                 crate::metrics::METRICS
                     .tls_fp_known
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                fp.known_decision(&ja4, entry, || {
+                let decision = fp.known_decision(&ja4, entry, || {
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs()
-                })
+                });
+                GateOutcome {
+                    decision,
+                    identity: Some(TlsFpIdentity {
+                        allowed_name: Some(entry.name.clone()),
+                        ja4,
+                    }),
+                }
             } else {
                 crate::metrics::METRICS
                     .tls_fp_unknown
@@ -852,7 +884,7 @@ pub async fn fingerprint_gate(
                 // are dropped — everywhere else nothing is ever banned.
                 if fp.drops_unknown() && !fp.ban_ttl.is_zero() {
                     let now = std::time::Instant::now();
-                    if state.tls_fp_bans.hit(ja4.as_str(), now) {
+                    if bans.hit(ja4.as_str(), now) {
                         crate::metrics::METRICS
                             .tls_fp_banned_hits
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -862,15 +894,100 @@ pub async fn fingerprint_gate(
                         // debug, not warn: the first offense already warned when
                         // the ban was recorded — this keeps a flood readable.
                         tracing::debug!(ja4 = %ja4, "tls-fp: rejecting banned fingerprint (fast path)");
-                        return GateDecision::Reject;
+                        return GateOutcome {
+                            decision: GateDecision::Reject,
+                            identity: Some(TlsFpIdentity {
+                                ja4,
+                                allowed_name: None,
+                            }),
+                        };
                     }
-                    state.tls_fp_bans.insert(ja4.as_str(), now, fp.ban_ttl);
+                    bans.insert(ja4.as_str(), now, fp.ban_ttl);
                 }
-                fp.unknown_decision(&ja4)
+                GateOutcome {
+                    decision: fp.unknown_decision(&ja4),
+                    identity: Some(TlsFpIdentity {
+                        ja4,
+                        allowed_name: None,
+                    }),
+                }
             }
         }
         // A not-a-ClientHello / truncated-beyond-budget peek: couldn't fingerprint.
-        Err(_) => fp.unfingerprintable_decision(),
+        Err(_) => GateOutcome {
+            decision: fp.unfingerprintable_decision(),
+            identity: None,
+        },
+    }
+}
+
+/// The accept-path JA4 gate: `MSG_PEEK` the ClientHello (leaving the bytes in
+/// the kernel buffer for rustls to re-read), compute JA4, count it known vs
+/// unknown, and return whether the connection may proceed — plus the computed
+/// identity for the upstream headers (see [`TlsFpIdentity`]).
+///
+/// - `mode = off` (runtime `None`) → `Proceed`, no peek, no syscall.
+/// - `mode = shadow` → always `Proceed`; only observes (counts + logs).
+/// - `mode = allowlist` → `Reject` an unknown fingerprint iff `on_unknown =
+///   drop`, and a ClientHello that couldn't be fingerprinted iff
+///   `on_unfingerprintable = drop`; otherwise `Proceed`.
+pub async fn fingerprint_gate(
+    stream: &tokio::net::TcpStream,
+    state: &crate::AppState,
+) -> GateOutcome {
+    // Clone the resolved runtime out (a cheap Arc clone) and DROP the arc-swap
+    // Guard before awaiting — never hold a config Guard across an await point.
+    let fp = {
+        let cfg = state.config.load();
+        match cfg.tls_fingerprint.as_ref() {
+            Some(fp) => fp.clone(),
+            None => return GateOutcome::proceed_anonymous(), // mode = off → no peek, no syscall
+        }
+    };
+    let mut buf = [0u8; PEEK_CAP];
+    let Some(n) = peek_client_hello(stream, &mut buf).await else {
+        // Timeout / EOF / stalled client — could not fingerprint.
+        return GateOutcome {
+            decision: fp.unfingerprintable_decision(),
+            identity: None,
+        };
+    };
+    classify(&fp, &state.tls_fp_bans, ja4_from_tls_record(&buf[..n]))
+}
+
+/// The upstream header carrying the connection's JA4. Zion's attestation — a
+/// client must never be able to set it (see [`apply_headers`]).
+pub const HDR_JA4: &str = "X-Client-TLS-JA4";
+/// The upstream header carrying the matching allowlist entry's name.
+pub const HDR_ALLOWLISTED: &str = "X-Client-TLS-Allowlisted";
+
+/// Strip any inbound `X-Client-TLS-JA4` / `X-Client-TLS-Allowlisted`
+/// unconditionally, THEN re-inject the verified values when the gate computed
+/// an identity — exactly the mTLS `X-Client-Cert-Fingerprint` discipline:
+/// without the strip-first, a forged header would survive to the upstream as a
+/// fake fingerprint identity.
+///
+/// Call sites, precisely: the :443 service closure is the ONLY caller —
+/// `Some` when the gate computed an identity, `None` when fingerprinting is
+/// off or the ClientHello couldn't be fingerprinted. The plaintext :80 path
+/// and feature-off builds do NOT call this — the module is compiled out
+/// without the feature — they strip by string literal in main.rs instead
+/// (`header_name_consts_match_the_feature_off_literals` pins the names).
+/// Deleting those literal strips in favour of "deduplicating" through this
+/// function would break exactly those two paths.
+pub fn apply_headers<B>(req: &mut hyper::Request<B>, identity: Option<&TlsFpIdentity>) {
+    req.headers_mut().remove(HDR_JA4);
+    req.headers_mut().remove(HDR_ALLOWLISTED);
+    let Some(id) = identity else { return };
+    // A computed JA4 is always header-safe (lowercase alnum + '_'); the entry
+    // name is operator-controlled, so from_str guards it.
+    if let Ok(v) = hyper::header::HeaderValue::from_str(id.ja4.as_str()) {
+        req.headers_mut().insert(HDR_JA4, v);
+    }
+    if let Some(name) = &id.allowed_name {
+        if let Ok(v) = hyper::header::HeaderValue::from_str(name) {
+            req.headers_mut().insert(HDR_ALLOWLISTED, v);
+        }
     }
 }
 
@@ -1463,6 +1580,165 @@ mod tests {
         let now = std::time::Instant::now();
         bans.insert("fp-x", now, std::time::Duration::from_secs(u64::MAX));
         assert!(!bans.hit("fp-x", now)); // skipped, not aborted
+    }
+
+    // ── #27 commit 5: identity stash + upstream headers ───────────────────────
+
+    /// Runtime with one allowlisted entry, for the classify/headers tests.
+    fn runtime_with_chrome(mode: crate::config::FingerprintMode) -> TlsFpRuntime {
+        use crate::config::{OnUnfingerprintable, OnUnknown};
+        let mut allowed = std::collections::HashMap::new();
+        allowed.insert(
+            "t13d1516h2_8daaf6152771_e5627efa2ab1".to_string(),
+            AllowedEntry {
+                name: "chrome".into(),
+                rate: None,
+            },
+        );
+        TlsFpRuntime {
+            mode,
+            on_unknown: OnUnknown::Drop,
+            on_unfingerprintable: OnUnfingerprintable::Allow,
+            ban_ttl: std::time::Duration::from_secs(600),
+            allowed,
+        }
+    }
+
+    #[test]
+    fn classify_carries_identity_for_known_and_unknown_but_not_unfingerprintable() {
+        use crate::config::FingerprintMode;
+        let fp = runtime_with_chrome(FingerprintMode::Shadow);
+        let bans = BanSet::new();
+        // Known: identity with the allowlist entry's name.
+        let out = classify(
+            &fp,
+            &bans,
+            Ok(Ja4("t13d1516h2_8daaf6152771_e5627efa2ab1".into())),
+        );
+        assert_eq!(out.decision, GateDecision::Proceed);
+        let id = out.identity.expect("known carries identity");
+        assert_eq!(id.allowed_name.as_deref(), Some("chrome"));
+        // Unknown in shadow: proceeds, identity present, no name.
+        let out = classify(
+            &fp,
+            &bans,
+            Ok(Ja4("t00i0000_000000000000_000000000000".into())),
+        );
+        assert_eq!(out.decision, GateDecision::Proceed);
+        let id = out.identity.expect("unknown still carries identity");
+        assert!(id.allowed_name.is_none());
+        // Unfingerprintable: no identity at all.
+        let out = classify(&fp, &bans, Err(TlsFpError::Truncated));
+        assert_eq!(out.decision, GateDecision::Proceed); // on_unfingerprintable = allow
+        assert!(out.identity.is_none());
+    }
+
+    #[test]
+    fn classify_allowlist_beats_a_stale_ban() {
+        use crate::config::FingerprintMode;
+        // The documented un-ban path: an operator hot-reloads a banned
+        // fingerprint onto the allowlist and it must be admitted IMMEDIATELY —
+        // the allowlist lookup runs before the ban set. A "check the cheap ban
+        // map first" refactor would break exactly this; this test is the pin.
+        let fp = runtime_with_chrome(FingerprintMode::Allowlist); // on_unknown = Drop
+        let bans = BanSet::new();
+        let chrome = "t13d1516h2_8daaf6152771_e5627efa2ab1";
+        bans.insert(
+            chrome,
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(600),
+        );
+        let out = classify(&fp, &bans, Ok(Ja4(chrome.into())));
+        assert_eq!(out.decision, GateDecision::Proceed);
+        assert_eq!(
+            out.identity.unwrap().allowed_name.as_deref(),
+            Some("chrome")
+        );
+    }
+
+    #[test]
+    fn posture_reflects_enforcement_knobs_not_just_mode() {
+        use crate::config::{FingerprintMode, OnUnknown};
+        let log_only = TlsFpRuntime {
+            on_unknown: OnUnknown::LogOnly,
+            ..runtime_with_chrome(FingerprintMode::Allowlist)
+        };
+        let drop = runtime_with_chrome(FingerprintMode::Allowlist); // on_unknown = Drop
+                                                                    // Same mode, different posture — the reload announcer must see it.
+        assert_ne!(log_only.posture(), drop.posture());
+    }
+
+    #[test]
+    fn classify_ban_fast_path_rejects_and_still_reports_identity() {
+        use crate::config::FingerprintMode;
+        let fp = runtime_with_chrome(FingerprintMode::Allowlist); // on_unknown = Drop
+        let bans = BanSet::new();
+        let unknown = || Ok(Ja4("t00i0000_000000000000_000000000000".into()));
+        // First offense: rejected via unknown_decision, ban recorded.
+        let out = classify(&fp, &bans, unknown());
+        assert_eq!(out.decision, GateDecision::Reject);
+        assert!(out.identity.is_some());
+        // Second offense: rejected via the ban fast path — identity still there.
+        let out = classify(&fp, &bans, unknown());
+        assert_eq!(out.decision, GateDecision::Reject);
+        let id = out.identity.expect("banned fast path keeps the identity");
+        assert!(id.allowed_name.is_none());
+    }
+
+    #[test]
+    fn apply_headers_strips_forgeries_and_injects_the_verified_identity() {
+        let mut req = hyper::Request::builder()
+            .header(HDR_JA4, "t13dforged_aaaaaaaaaaaa_bbbbbbbbbbbb")
+            .header(HDR_ALLOWLISTED, "forged-name")
+            .body(())
+            .unwrap();
+        let id = TlsFpIdentity {
+            ja4: Ja4("t13d1516h2_8daaf6152771_e5627efa2ab1".into()),
+            allowed_name: Some("chrome".into()),
+        };
+        apply_headers(&mut req, Some(&id));
+        assert_eq!(
+            req.headers().get(HDR_JA4).unwrap(),
+            "t13d1516h2_8daaf6152771_e5627efa2ab1"
+        );
+        assert_eq!(req.headers().get(HDR_ALLOWLISTED).unwrap(), "chrome");
+    }
+
+    #[test]
+    fn apply_headers_without_identity_strips_only() {
+        let mut req = hyper::Request::builder()
+            .header(HDR_JA4, "t13dforged_aaaaaaaaaaaa_bbbbbbbbbbbb")
+            .header(HDR_ALLOWLISTED, "forged-name")
+            .body(())
+            .unwrap();
+        apply_headers::<()>(&mut req, None);
+        assert!(req.headers().get(HDR_JA4).is_none());
+        assert!(req.headers().get(HDR_ALLOWLISTED).is_none());
+    }
+
+    #[test]
+    fn apply_headers_skips_an_unsafe_allowlist_name() {
+        // The entry name is operator-controlled; a value HeaderValue rejects
+        // must be skipped, not panic — and must not leave the forged one.
+        let mut req = hyper::Request::builder()
+            .header(HDR_ALLOWLISTED, "forged")
+            .body(())
+            .unwrap();
+        let id = TlsFpIdentity {
+            ja4: Ja4("t13d1516h2_8daaf6152771_e5627efa2ab1".into()),
+            allowed_name: Some("bad\nname".into()),
+        };
+        apply_headers(&mut req, Some(&id));
+        assert!(req.headers().get(HDR_JA4).is_some());
+        assert!(req.headers().get(HDR_ALLOWLISTED).is_none());
+    }
+
+    #[test]
+    fn header_name_consts_match_the_feature_off_literals() {
+        // main.rs strips these by string literal on builds where this module
+        // is compiled out — the consts and the literals must never drift.
+        assert_eq!(HDR_JA4, "X-Client-TLS-JA4");
+        assert_eq!(HDR_ALLOWLISTED, "X-Client-TLS-Allowlisted");
     }
 
     #[test]
