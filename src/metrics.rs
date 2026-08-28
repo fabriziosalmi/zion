@@ -416,6 +416,14 @@ pub struct Metrics {
     /// (#27): an unknown fingerprint under `on_unknown = drop`, or an
     /// unfingerprintable ClientHello under `on_unfingerprintable = drop`.
     pub tls_fp_rejected: AtomicU64,
+    /// Rejections served by the ban fast path (#27 commit 4): the fingerprint
+    /// was already on the ban set, so the connection was dropped with a single
+    /// map lookup and a debug-level log. Also counted in `tls_fp_rejected`.
+    pub tls_fp_banned_hits: AtomicU64,
+    /// Connections over an allowlist entry's `rate_limit_cps` (#27 commit 4).
+    /// Dropped pre-handshake in `allowlist` mode (also counted in
+    /// `tls_fp_rejected`); in `shadow` mode counted here but never blocked.
+    pub tls_fp_rate_limited: AtomicU64,
     /// Connections closed at accept because the source IP was already at
     /// its `max_connections_per_ip` concurrent cap (anti-DDoS lever).
     pub connections_rejected_per_ip: AtomicU64,
@@ -518,6 +526,8 @@ impl Metrics {
             tls_fp_known: AtomicU64::new(0),
             tls_fp_unknown: AtomicU64::new(0),
             tls_fp_rejected: AtomicU64::new(0),
+            tls_fp_banned_hits: AtomicU64::new(0),
+            tls_fp_rate_limited: AtomicU64::new(0),
             connections_rejected_per_ip: AtomicU64::new(0),
             enforcement_denied_class: AtomicU64::new(0),
             enforcement_denied_mesh_score: AtomicU64::new(0),
@@ -801,6 +811,30 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.tls_fp_rejected.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_tls_fp_banned_hits Rejections served by the JA4 ban fast path (already-banned fingerprint).\n\
+                                # TYPE zion_tls_fp_banned_hits counter\n\
+                                zion_tls_fp_banned_hits ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.tls_fp_banned_hits.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_tls_fp_rate_limited Connections over a per-fingerprint rate_limit_cps (dropped in allowlist mode, observed in shadow).\n\
+                                # TYPE zion_tls_fp_rate_limited counter\n\
+                                zion_tls_fp_rate_limited ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.tls_fp_rate_limited.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");

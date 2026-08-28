@@ -364,7 +364,7 @@ pub struct TlsConfig {
 /// `warn_feature_config_gaps`). `allowed` is only read under the feature, hence
 /// the targeted allow (mirrors `AcmeConfig`).
 #[allow(dead_code)]
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct FingerprintConfig {
     /// `off` (default) | `shadow` | `allowlist`.
@@ -389,6 +389,41 @@ pub struct FingerprintConfig {
     /// Default `allow` — availability first; `drop` fails closed for the strict.
     #[serde(default)]
     pub on_unfingerprintable: OnUnfingerprintable,
+    /// `allowlist` + `on_unknown = "drop"`: once an unknown fingerprint is
+    /// rejected it goes on a ban set for this many seconds, and repeat
+    /// connections with the same JA4 are rejected on a fast path — one map
+    /// lookup, a debug-level log instead of a warn per connection, counted in
+    /// `zion_tls_fp_banned_hits`. Under a flood of one fingerprint this is
+    /// what keeps the log readable. `0` disables the ban set (every rejection
+    /// logs individually). Default 600 (10 minutes). Bans survive config
+    /// reloads but never outlive the process.
+    #[serde(default = "default_ban_ttl_secs")]
+    pub ban_ttl_secs: u64,
+}
+
+fn default_ban_ttl_secs() -> u64 {
+    600
+}
+
+/// Upper bound accepted for `ban_ttl_secs` (1 year). Anything larger is an
+/// operator error (see the validator) — and, unvalidated, would overflow
+/// `Instant + Duration` on the first ban insert.
+#[allow(dead_code)] // read only by the `tls-fingerprint`-gated validator block
+pub const MAX_BAN_TTL_SECS: u64 = 31_536_000;
+
+// Manual impl (not derived) so `FingerprintConfig::default()` and a TOML block
+// that omits `ban_ttl_secs` agree on 600 — a derived Default would say 0
+// (bans disabled) while serde says 600.
+impl Default for FingerprintConfig {
+    fn default() -> Self {
+        Self {
+            mode: FingerprintMode::default(),
+            allowed: Vec::new(),
+            on_unknown: OnUnknown::default(),
+            on_unfingerprintable: OnUnfingerprintable::default(),
+            ban_ttl_secs: default_ban_ttl_secs(),
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -428,6 +463,14 @@ pub struct AllowedFingerprint {
     pub name: String,
     /// The JA4 string, e.g. `t13d1516h2_8daaf6152771_e5627efa2ab1`.
     pub ja4: String,
+    /// Cap on NEW TLS connections per second for this fingerprint —
+    /// connections, not HTTP requests: the gate runs before the handshake,
+    /// where requests don't exist yet. Over-cap connections are dropped
+    /// pre-handshake in `allowlist` mode and only counted
+    /// (`zion_tls_fp_rate_limited`) in `shadow`. `0` (default) = no limit,
+    /// consistent with `[server] rate_limit_rps`.
+    #[serde(default)]
+    pub rate_limit_cps: u32,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -918,6 +961,35 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                     a.name, a.ja4
                 ));
             }
+        }
+        // Duplicate JA4s would silently last-win in the runtime's HashMap —
+        // harmless when entries only carried a name, but now the surviving
+        // entry's rate_limit_cps (or lack of one) silently replaces the
+        // other's. Make the collision an operator error instead.
+        let mut seen = std::collections::HashMap::new();
+        for a in &fp.allowed {
+            let norm = a.ja4.trim().to_ascii_lowercase();
+            if let Some(first) = seen.insert(norm, &a.name) {
+                errors.push(format!(
+                    "[tls.fingerprint] entries '{}' and '{}' list the same JA4 '{}' — \
+                     merge them (only one would take effect, chosen arbitrarily)",
+                    first,
+                    a.name,
+                    a.ja4.trim()
+                ));
+            }
+        }
+        // An absurd ban TTL would overflow `Instant + Duration` on the first
+        // ban insert — a panic, and with the release profile's panic=abort a
+        // dead proxy. Bans are process-local; "permanent" is not a thing here.
+        if fp.ban_ttl_secs > MAX_BAN_TTL_SECS {
+            errors.push(format!(
+                "[tls.fingerprint] ban_ttl_secs = {} exceeds the maximum {} (1 year). \
+                 The ban set is process-local and never outlives a restart — for a \
+                 permanent block, remove the fingerprint from `allowed` and keep \
+                 on_unknown = \"drop\".",
+                fp.ban_ttl_secs, MAX_BAN_TTL_SECS
+            ));
         }
     }
 
@@ -1681,6 +1753,41 @@ mod tests {
         let cfg = parse_schema(bad, "test").expect("parse");
         let err = validate_semantics(&cfg, "test").err().unwrap_or_default();
         assert!(err.contains("invalid JA4"), "got: {err}");
+    }
+
+    #[cfg(feature = "tls-fingerprint")]
+    #[test]
+    fn allowlist_duplicate_ja4_is_rejected() {
+        // Two entries with the same (normalized) JA4 would silently last-win in
+        // the runtime map — and one of them may carry a rate_limit_cps the
+        // other silently disables. Refuse at boot.
+        let dup = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"drop\"\n\
+             allowed=[{name=\"a\",ja4=\"t13d1516h2_8daaf6152771_e5627efa2ab1\",rate_limit_cps=10},\
+                      {name=\"b\",ja4=\"T13D1516H2_8DAAF6152771_E5627EFA2AB1\"}]\n\
+             [upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let cfg = parse_schema(dup, "test").expect("parse");
+        let err = validate_semantics(&cfg, "test").err().unwrap_or_default();
+        assert!(err.contains("same JA4"), "got: {err}");
+    }
+
+    #[cfg(feature = "tls-fingerprint")]
+    #[test]
+    fn ban_ttl_over_a_year_is_rejected() {
+        // An absurd TTL is an operator error (and, far enough out, would
+        // overflow Instant + Duration on the first ban insert — TOML itself
+        // already rejects anything above i64::MAX). Two years must refuse.
+        let huge = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"drop\"\nban_ttl_secs=63072000\n\
+             allowed=[{name=\"a\",ja4=\"t13d1516h2_8daaf6152771_e5627efa2ab1\"}]\n\
+             [upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let cfg = parse_schema(huge, "test").expect("parse");
+        let err = validate_semantics(&cfg, "test").err().unwrap_or_default();
+        assert!(err.contains("ban_ttl_secs"), "got: {err}");
     }
 
     #[cfg(feature = "tls-fingerprint")]
