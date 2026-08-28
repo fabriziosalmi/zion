@@ -545,6 +545,24 @@ impl TlsFpRuntime {
         self.allowed.get(ja4.as_str()).map(|e| e.name.as_str())
     }
 
+    /// The enforcement posture as one comparable value: mode alone doesn't
+    /// tell the story — within `allowlist`, flipping `on_unknown` from
+    /// `log_only` to `drop` is exactly the moment enforcement (and the ban
+    /// machinery) begins. The reload announcer compares postures, not modes.
+    pub fn posture(
+        &self,
+    ) -> (
+        crate::config::FingerprintMode,
+        crate::config::OnUnknown,
+        crate::config::OnUnfingerprintable,
+    ) {
+        (
+            self.mode.clone(),
+            self.on_unknown,
+            self.on_unfingerprintable,
+        )
+    }
+
     /// Verdict for a KNOWN (allowlisted) fingerprint: admit unless its
     /// per-fingerprint connection-rate limit says the current second is full.
     /// Over-cap in `allowlist` mode drops the connection pre-handshake; in
@@ -947,8 +965,16 @@ pub const HDR_ALLOWLISTED: &str = "X-Client-TLS-Allowlisted";
 /// unconditionally, THEN re-inject the verified values when the gate computed
 /// an identity — exactly the mTLS `X-Client-Cert-Fingerprint` discipline:
 /// without the strip-first, a forged header would survive to the upstream as a
-/// fake fingerprint identity. Called with `None` (strip only) on the plaintext
-/// :80 path and on feature-off builds.
+/// fake fingerprint identity.
+///
+/// Call sites, precisely: the :443 service closure is the ONLY caller —
+/// `Some` when the gate computed an identity, `None` when fingerprinting is
+/// off or the ClientHello couldn't be fingerprinted. The plaintext :80 path
+/// and feature-off builds do NOT call this — the module is compiled out
+/// without the feature — they strip by string literal in main.rs instead
+/// (`header_name_consts_match_the_feature_off_literals` pins the names).
+/// Deleting those literal strips in favour of "deduplicating" through this
+/// function would break exactly those two paths.
 pub fn apply_headers<B>(req: &mut hyper::Request<B>, identity: Option<&TlsFpIdentity>) {
     req.headers_mut().remove(HDR_JA4);
     req.headers_mut().remove(HDR_ALLOWLISTED);
@@ -1605,6 +1631,41 @@ mod tests {
         let out = classify(&fp, &bans, Err(TlsFpError::Truncated));
         assert_eq!(out.decision, GateDecision::Proceed); // on_unfingerprintable = allow
         assert!(out.identity.is_none());
+    }
+
+    #[test]
+    fn classify_allowlist_beats_a_stale_ban() {
+        use crate::config::FingerprintMode;
+        // The documented un-ban path: an operator hot-reloads a banned
+        // fingerprint onto the allowlist and it must be admitted IMMEDIATELY —
+        // the allowlist lookup runs before the ban set. A "check the cheap ban
+        // map first" refactor would break exactly this; this test is the pin.
+        let fp = runtime_with_chrome(FingerprintMode::Allowlist); // on_unknown = Drop
+        let bans = BanSet::new();
+        let chrome = "t13d1516h2_8daaf6152771_e5627efa2ab1";
+        bans.insert(
+            chrome,
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(600),
+        );
+        let out = classify(&fp, &bans, Ok(Ja4(chrome.into())));
+        assert_eq!(out.decision, GateDecision::Proceed);
+        assert_eq!(
+            out.identity.unwrap().allowed_name.as_deref(),
+            Some("chrome")
+        );
+    }
+
+    #[test]
+    fn posture_reflects_enforcement_knobs_not_just_mode() {
+        use crate::config::{FingerprintMode, OnUnknown};
+        let log_only = TlsFpRuntime {
+            on_unknown: OnUnknown::LogOnly,
+            ..runtime_with_chrome(FingerprintMode::Allowlist)
+        };
+        let drop = runtime_with_chrome(FingerprintMode::Allowlist); // on_unknown = Drop
+                                                                    // Same mode, different posture — the reload announcer must see it.
+        assert_ne!(log_only.posture(), drop.posture());
     }
 
     #[test]

@@ -962,6 +962,21 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                 ));
             }
         }
+        // The entry name becomes the X-Client-TLS-Allowlisted header value
+        // (#27 commit 5). HeaderValue::from_str is NOT a sufficient guard —
+        // it accepts the empty string and bytes >= 0x80 — so a sloppy name
+        // would silently degrade the attestation (header absent or mangled)
+        // with zero diagnostics. Refuse anything but non-empty visible ASCII.
+        for a in &fp.allowed {
+            if a.name.trim().is_empty() || !a.name.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+                errors.push(format!(
+                    "[tls.fingerprint] allowed entry with ja4 '{}' has an invalid name {:?} — \
+                     the name is forwarded as the X-Client-TLS-Allowlisted header and must be \
+                     non-empty printable ASCII",
+                    a.ja4, a.name
+                ));
+            }
+        }
         // Duplicate JA4s would silently last-win in the runtime's HashMap —
         // harmless when entries only carried a name, but now the surviving
         // entry's rate_limit_cps (or lack of one) silently replaces the
@@ -1771,6 +1786,29 @@ mod tests {
         let cfg = parse_schema(dup, "test").expect("parse");
         let err = validate_semantics(&cfg, "test").err().unwrap_or_default();
         assert!(err.contains("same JA4"), "got: {err}");
+    }
+
+    #[cfg(feature = "tls-fingerprint")]
+    #[test]
+    fn allowlist_name_must_be_printable_ascii() {
+        // The name becomes the X-Client-TLS-Allowlisted header value;
+        // HeaderValue::from_str alone would accept "" and bytes >= 0x80 and
+        // silently degrade the attestation. The validator refuses at boot.
+        // TOML-escaped literals (Rust's Debug escapes are not valid TOML):
+        // empty, blank, non-ASCII, control character.
+        for bad_name_toml in ["\"\"", "\"   \"", "\"café-agent\"", "\"bell\\u0007\""] {
+            let toml = format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+                 [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+                 [tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"drop\"\n\
+                 allowed=[{{name={bad_name_toml},ja4=\"t13d1516h2_8daaf6152771_e5627efa2ab1\"}}]\n\
+                 [upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+                 [[route]]\npath=\"/{{*rest}}\"\nupstream=\"be\"\n"
+            );
+            let cfg = parse_schema(&toml, "test").expect("parse");
+            let err = validate_semantics(&cfg, "test").err().unwrap_or_default();
+            assert!(err.contains("invalid name"), "{bad_name_toml} got: {err}");
+        }
     }
 
     #[cfg(feature = "tls-fingerprint")]

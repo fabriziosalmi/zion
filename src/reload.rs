@@ -165,23 +165,25 @@ pub(crate) fn reload_now(
         Err(_) => return Err("rebuild panicked (router construction failed)".to_string()),
     };
 
-    // A [tls.fingerprint] mode flip is a security-posture change an operator
-    // wants positively confirmed (shadow → allowlist is the moment enforcement
-    // begins; the reverse is the moment it stops). Announce it — reloads of
-    // unrelated knobs stay silent (#27 commit 5).
+    // A [tls.fingerprint] posture flip is a security change an operator wants
+    // positively confirmed. The posture is (mode, on_unknown,
+    // on_unfingerprintable) — not mode alone: within mode = allowlist,
+    // on_unknown log_only → drop is exactly the moment enforcement (and the
+    // ban machinery) begins, and the reverse is the moment it stops. Reloads
+    // of unrelated knobs stay silent (#27 commit 5).
     #[cfg(feature = "tls-fingerprint")]
     {
-        let mode_of = |c: &crate::ResolvedAppConfig| {
+        let posture_of = |c: &crate::ResolvedAppConfig| {
             c.tls_fingerprint
                 .as_ref()
-                .map(|fp| fp.mode.clone())
-                .unwrap_or(crate::config::FingerprintMode::Off)
+                .map(|fp| fp.posture())
+                .unwrap_or_default()
         };
-        let (old_mode, new_mode) = (mode_of(&previous), mode_of(&snapshot));
-        if old_mode != new_mode {
+        let (old_p, new_p) = (posture_of(&previous), posture_of(&snapshot));
+        if old_p != new_p {
             tracing::info!(
-                from = ?old_mode, to = ?new_mode,
-                "tls-fp: fingerprint mode changed on reload"
+                from = ?old_p, to = ?new_p,
+                "tls-fp: fingerprint enforcement posture changed on reload (mode, on_unknown, on_unfingerprintable)"
             );
         }
     }
