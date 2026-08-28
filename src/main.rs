@@ -1851,11 +1851,19 @@ fn spawn_https_handler(
         // fingerprint closes the connection HERE, before any handshake. No peek —
         // no syscall — when the feature is off or mode = off (runtime `None`).
         #[cfg(feature = "tls-fingerprint")]
-        if tls_fp::fingerprint_gate(&tcp_stream, &state).await == tls_fp::GateDecision::Reject {
-            // Dropping tcp_stream closes the socket; the connection permit and
-            // per-IP slot release when their guards drop at end of scope.
-            return;
-        }
+        let tls_fp_identity: Option<std::sync::Arc<tls_fp::TlsFpIdentity>> = {
+            let outcome = tls_fp::fingerprint_gate(&tcp_stream, &state).await;
+            if outcome.decision == tls_fp::GateDecision::Reject {
+                // Dropping tcp_stream closes the socket; the connection permit
+                // and per-IP slot release when their guards drop at end of scope.
+                return;
+            }
+            // Stash the computed identity (#27 commit 5): the JA4 exists only
+            // pre-handshake, so it must ride the connection to become the
+            // X-Client-TLS-JA4 / -Allowlisted upstream headers per request —
+            // the same lifecycle as the mTLS client_cert_fingerprint below.
+            outcome.identity.map(std::sync::Arc::new)
+        };
         metrics::METRICS
             .connections_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1961,6 +1969,8 @@ fn spawn_https_handler(
                     let state = state.clone();
                     let early_flag = early_flag.clone();
                     let client_fp = client_fp.clone();
+                    #[cfg(feature = "tls-fingerprint")]
+                    let tls_fp_identity = tls_fp_identity.clone();
                     async move {
                         // Fast-path: health probes bypass the full pipeline (~1us vs ~5us).
                         let path = req.uri().path();
@@ -1987,6 +1997,19 @@ fn spawn_https_handler(
                             if let Ok(val) = hyper::header::HeaderValue::from_str(fp) {
                                 req.headers_mut().insert("X-Client-Cert-Fingerprint", val);
                             }
+                        }
+                        // Same discipline for the JA4 identity headers (#27
+                        // commit 5): strip any inbound forgery, re-inject the
+                        // gate-computed values. Feature-off builds never
+                        // compute an identity, so they strip only.
+                        #[cfg(feature = "tls-fingerprint")]
+                        tls_fp::apply_headers(&mut req, tls_fp_identity.as_deref());
+                        #[cfg(not(feature = "tls-fingerprint"))]
+                        {
+                            // Module compiled out with the feature — strip the
+                            // literals (names asserted equal by a gated test).
+                            req.headers_mut().remove("X-Client-TLS-JA4");
+                            req.headers_mut().remove("X-Client-TLS-Allowlisted");
                         }
                         use http_body_util::BodyExt;
                         let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
@@ -2044,6 +2067,11 @@ async fn handle_http(
     // is logged or proxied, so a client cannot smuggle a fake mTLS identity.
     req.headers_mut().remove("X-Client-Cert-Fingerprint");
     req.headers_mut().remove("X-Client-Cert-DN");
+    // Likewise for the JA4 identity headers — no TLS on :80, so any inbound
+    // copy is forged. Literal names: the tls_fp module (and its consts) is
+    // compiled out without the feature, and the strip must happen regardless.
+    req.headers_mut().remove("X-Client-TLS-JA4");
+    req.headers_mut().remove("X-Client-TLS-Allowlisted");
 
     // Rate limit HTTP/80 to prevent DoS via redirect/ACME flood
     if !check_rate_limit(&state, remote_addr.ip()) {

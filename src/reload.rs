@@ -165,6 +165,27 @@ pub(crate) fn reload_now(
         Err(_) => return Err("rebuild panicked (router construction failed)".to_string()),
     };
 
+    // A [tls.fingerprint] mode flip is a security-posture change an operator
+    // wants positively confirmed (shadow → allowlist is the moment enforcement
+    // begins; the reverse is the moment it stops). Announce it — reloads of
+    // unrelated knobs stay silent (#27 commit 5).
+    #[cfg(feature = "tls-fingerprint")]
+    {
+        let mode_of = |c: &crate::ResolvedAppConfig| {
+            c.tls_fingerprint
+                .as_ref()
+                .map(|fp| fp.mode.clone())
+                .unwrap_or(crate::config::FingerprintMode::Off)
+        };
+        let (old_mode, new_mode) = (mode_of(&previous), mode_of(&snapshot));
+        if old_mode != new_mode {
+            tracing::info!(
+                from = ?old_mode, to = ?new_mode,
+                "tls-fp: fingerprint mode changed on reload"
+            );
+        }
+    }
+
     // 3. Atomic swap + generation bump + best-effort notify.
     state_config.store(Arc::new(snapshot));
     let gen = CONFIG_GENERATION.fetch_add(1, Ordering::Release) + 1;
