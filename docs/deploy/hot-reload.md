@@ -1,6 +1,6 @@
 # Hot-reload
 
-Zion watches its config file (the path in `ZION_CONFIG`, default `zion.toml`) and the certificate files referenced by `[tls]`. When either changes, the running process applies the change without a restart and without dropping in-flight connections. There is no admin endpoint, no SIGHUP, no orchestrator dance — edit the file, save, the change is live.
+Zion watches its config file (the path in `ZION_CONFIG`, default `zion.toml`) and the directories holding the certificates referenced by `[tls]` (see [What reloads (certificate files)](#what-reloads-certificate-files) for exactly what is subscribed). When either changes, the running process applies the change without a restart and without dropping in-flight connections. There is no admin endpoint, no SIGHUP, no orchestrator dance — edit the file, save, the change is live.
 
 This page is the contract: what reloads, what doesn't, what survives, and how to verify it landed.
 
@@ -31,10 +31,15 @@ Everything below is re-applied at the next request after the swap. In-flight req
 
 ## What reloads (certificate files)
 
-Independent of `zion.toml`, the TLS watcher fires on changes to:
-
-- `tls.cert_path` / `tls.key_path`
-- Each `tls.sni[*].cert_path` / `key_path`
+Independent of `zion.toml`, the TLS watcher fires on filesystem events in the
+**parent directories of `tls.cert_path` and each `tls.sni[*].cert_path`** —
+that is what it actually subscribes to. A key file saved next to its cert (the
+usual layout, and what every ACME client and `certbot` deployment does) is
+picked up by the same directory watch. The caveat: a `key_path` that lives in
+a **different directory** from its cert is *not* watched — touching only that
+key file will not trigger the reload until the cert (or anything in the cert's
+directory) changes too. Keep each cert/key pair in one directory, or touch the
+cert after rotating a remotely-located key.
 
 The `ServerConfig` is rebuilt from disk on the blocking thread pool (so file I/O does not stall the runtime), then atomic-swapped. ALPN, session tickets, 0-RTT settings, and mTLS verifier are reconstituted from the same `[tls]` section that is currently loaded.
 

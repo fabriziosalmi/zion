@@ -4,10 +4,15 @@
 //! Sits between the TLS listener and the upstream/cache. For each
 //! accepted request it walks the pipeline:
 //!
-//!   1. inline fast-path (`/healthz`, `/readyz`, `/metrics`,
+//!   1. security gates (URI length, method whitelist, rate limiter,
+//!      CORS pre-flight) — the rate limiter deliberately runs BEFORE the
+//!      built-in endpoints below, so a request that reaches THIS
+//!      pipeline cannot use `/healthz` to dodge it. (The :443 h1/h2
+//!      listener separately answers health probes on its own fast path
+//!      in main.rs, before this pipeline — unrated by design: liveness
+//!      checks must answer even when the box is saturated.)
+//!   2. built-in endpoints (`/healthz`, `/readyz`, `/metrics`,
 //!      `/_zion/snapshot.json`)
-//!   2. security gates (URI length, method whitelist, rate limiter,
-//!      CORS pre-flight)
 //!   3. radix routing → `Arc<ResolvedRoute>`
 //!   4. WAF pipeline (content-type, size, structural validation,
 //!      entropy, Aho-Corasick scan)
