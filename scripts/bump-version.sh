@@ -115,7 +115,9 @@ cat <<EOF
 bumped: $OLD → $NEW
 next steps:
   1. add a CHANGELOG.md entry for $NEW
-  2. git add -A && git commit -m "chore(release): v$NEW"
-  3. git tag -s v$NEW -m "v$NEW"   (or unsigned: git tag v$NEW)
-  4. git push && git push --tags
+  2. bash scripts/update-readme-boot-shot.sh   (refresh the README hero
+     screenshot from the real binary — it shows the version)
+  3. git add -A && git commit -m "chore(release): v$NEW"
+  4. git tag -s v$NEW -m "v$NEW"   (or unsigned: git tag v$NEW)
+  5. git push && git push --tags
 EOF
