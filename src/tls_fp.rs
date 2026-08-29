@@ -491,6 +491,10 @@ enum Admit {
 struct AllowedEntry {
     name: String,
     rate: Option<FpRate>,
+    /// Compiled `allowed_routes` matcher (#27 follow-up); `None` = no
+    /// restriction. Same pattern semantics as the request router — built by
+    /// `config::compile_path_set`.
+    routes: Option<matchit::Router<()>>,
 }
 
 /// Runtime-resolved fingerprint state, read on the accept path. Built once per
@@ -527,6 +531,25 @@ impl TlsFpRuntime {
                     AllowedEntry {
                         name: a.name.clone(),
                         rate: (a.rate_limit_cps > 0).then(|| FpRate::new(a.rate_limit_cps)),
+                        routes: if a.allowed_routes.is_empty() {
+                            None
+                        } else {
+                            match crate::config::compile_path_set(&a.allowed_routes) {
+                                Ok(r) => Some(r),
+                                // Validation refuses bad patterns at load, so
+                                // this arm is unreachable in practice — but if
+                                // it ever fires, fail OPEN (unrestricted) and
+                                // say so loudly: a silent total deny for an
+                                // allowlisted client is the worse failure.
+                                Err(e) => {
+                                    tracing::error!(
+                                        name = %a.name, error = %e,
+                                        "tls-fp: allowed_routes failed to compile past validation — entry left UNRESTRICTED"
+                                    );
+                                    None
+                                }
+                            }
+                        },
                     },
                 )
             })
@@ -538,6 +561,64 @@ impl TlsFpRuntime {
             ban_ttl: std::time::Duration::from_secs(cfg.ban_ttl_secs),
             allowed,
         })
+    }
+
+    /// The complete per-request route gate (#27 follow-up): restriction
+    /// lookup, mode policy, metric, and (debug) logging in one place, so the
+    /// dispatch wiring stays a dumb two-liner and the mode branch is
+    /// unit-testable here. `Reject` ONLY in `allowlist` mode for a restricted
+    /// fingerprint outside its list; `shadow` observes (counts
+    /// `zion_tls_fp_route_denied`, never blocks). Deny logging is debug-level on purpose: a JA4 is replayable
+    /// client-controlled input, and the metric is the operator signal — the
+    /// access log never sees early-gate denials (same as the sovereign gate).
+    pub fn route_gate(&self, ja4: &str, path: &str) -> GateDecision {
+        use crate::config::FingerprintMode;
+        // Health probes are NEVER policy-gated — a restriction list that
+        // 403s the load balancer's health check is an outage lever. On :443
+        // HTTP/1.1-2 these are answered on the listener fast path and never
+        // reach dispatch, but HTTP/3 bridges straight into process_request
+        // (see quic.rs handle_h3_request), so the exemption must live HERE
+        // to be a structural property rather than a per-protocol accident.
+        if path == "/healthz" || path == "/readyz" {
+            return GateDecision::Proceed;
+        }
+        let Some(name) = self.route_denied(ja4, path) else {
+            return GateDecision::Proceed;
+        };
+        crate::metrics::METRICS
+            .tls_fp_route_denied
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.mode == FingerprintMode::Allowlist {
+            tracing::debug!(
+                ja4,
+                name,
+                path,
+                "tls-fp: route not in allowed_routes for this fingerprint — 403"
+            );
+            GateDecision::Reject
+        } else {
+            tracing::debug!(
+                ja4,
+                name,
+                path,
+                "tls-fp: route not in allowed_routes (shadow — proceeding)"
+            );
+            GateDecision::Proceed
+        }
+    }
+
+    /// Per-fingerprint route restriction (#27 follow-up): `Some(entry name)`
+    /// when `ja4` is allowlisted with an `allowed_routes` list that does NOT
+    /// cover `path`. `None` = unrestricted entry, path covered, or `ja4` not
+    /// on the allowlist at all (unknowns are the gate's business, not this).
+    pub fn route_denied(&self, ja4: &str, path: &str) -> Option<&str> {
+        let entry = self.allowed.get(ja4)?;
+        let routes = entry.routes.as_ref()?;
+        if routes.at(path).is_ok() {
+            None
+        } else {
+            Some(entry.name.as_str())
+        }
     }
 
     /// The allowlist entry name for a fingerprint, if it is known.
@@ -1240,6 +1321,7 @@ mod tests {
                 name: "chrome".into(),
                 ja4: "  T13D1516H2_8DAAF6152771_E5627EFA2AB1  ".into(), // upper + spaces
                 rate_limit_cps: 0,
+                allowed_routes: vec![],
             }],
             ..Default::default()
         };
@@ -1267,6 +1349,7 @@ mod tests {
                 name: "chrome".into(),
                 ja4: "t13d1516h2_8daaf6152771_e5627efa2ab1".into(),
                 rate_limit_cps: 0,
+                allowed_routes: vec![],
             }],
             ..Default::default()
         };
@@ -1473,6 +1556,7 @@ mod tests {
         let entry = AllowedEntry {
             name: "chrome".into(),
             rate: Some(FpRate::new(1)),
+            routes: None,
         };
         let t = 7_777u64;
         // allowlist: first admitted, second dropped.
@@ -1483,6 +1567,7 @@ mod tests {
         let entry_sh = AllowedEntry {
             name: "chrome".into(),
             rate: Some(FpRate::new(1)),
+            routes: None,
         };
         let sh = mk(FingerprintMode::Shadow);
         assert_eq!(
@@ -1497,6 +1582,7 @@ mod tests {
         let unlimited = AllowedEntry {
             name: "curl".into(),
             rate: None,
+            routes: None,
         };
         assert_eq!(
             al.known_decision(&ja4, &unlimited, || unreachable!(
@@ -1593,6 +1679,7 @@ mod tests {
             AllowedEntry {
                 name: "chrome".into(),
                 rate: None,
+                routes: None,
             },
         );
         TlsFpRuntime {
@@ -1742,6 +1829,113 @@ mod tests {
     }
 
     #[test]
+    fn route_denied_matrix_with_router_alias_semantics() {
+        use crate::config::{AllowedFingerprint, FingerprintConfig, FingerprintMode};
+        let chrome = "t13d1516h2_8daaf6152771_e5627efa2ab1";
+        let curl = "t13d1516h2_000000000000_000000000000";
+        let cfg = FingerprintConfig {
+            mode: FingerprintMode::Allowlist,
+            allowed: vec![
+                AllowedFingerprint {
+                    name: "api-agent".into(),
+                    ja4: chrome.into(),
+                    rate_limit_cps: 0,
+                    allowed_routes: vec!["/api/{*rest}".into(), "/healthz".into()],
+                },
+                AllowedFingerprint {
+                    name: "unrestricted".into(),
+                    ja4: curl.into(),
+                    rate_limit_cps: 0,
+                    allowed_routes: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        let rt = TlsFpRuntime::from_config(&cfg).unwrap();
+        // Covered paths — including the catch-all's BARE prefix (router alias
+        // semantics: /api/{*rest} also serves /api) and the trailing-slash
+        // variant of an explicit path.
+        assert_eq!(rt.route_denied(chrome, "/api/v1/users"), None);
+        assert_eq!(rt.route_denied(chrome, "/api"), None);
+        assert_eq!(rt.route_denied(chrome, "/healthz"), None);
+        assert_eq!(rt.route_denied(chrome, "/healthz/"), None);
+        // Outside the list → denied, reporting the entry name.
+        assert_eq!(rt.route_denied(chrome, "/admin"), Some("api-agent"));
+        assert_eq!(rt.route_denied(chrome, "/"), Some("api-agent"));
+        // No restriction list → never denied.
+        assert_eq!(rt.route_denied(curl, "/anything"), None);
+        // Not on the allowlist at all → not this check's business.
+        assert_eq!(
+            rt.route_denied("t00i0000_000000000000_000000000000", "/admin"),
+            None
+        );
+    }
+
+    #[test]
+    fn route_gate_mode_matrix_allowlist_rejects_shadow_observes() {
+        use crate::config::{AllowedFingerprint, FingerprintConfig, FingerprintMode};
+        let chrome = "t13d1516h2_8daaf6152771_e5627efa2ab1";
+        let mk = |mode| {
+            let cfg = FingerprintConfig {
+                mode,
+                allowed: vec![AllowedFingerprint {
+                    name: "api-agent".into(),
+                    ja4: chrome.into(),
+                    rate_limit_cps: 0,
+                    allowed_routes: vec!["/api/{*rest}".into()],
+                }],
+                ..Default::default()
+            };
+            TlsFpRuntime::from_config(&cfg).unwrap()
+        };
+        // allowlist: outside the list → Reject (the dispatch 403); inside → Proceed.
+        let al = mk(FingerprintMode::Allowlist);
+        assert_eq!(al.route_gate(chrome, "/admin"), GateDecision::Reject);
+        assert_eq!(al.route_gate(chrome, "/api/v1"), GateDecision::Proceed);
+        // shadow: NEVER rejects, even outside the list (observe-only rollout).
+        let sh = mk(FingerprintMode::Shadow);
+        assert_eq!(sh.route_gate(chrome, "/admin"), GateDecision::Proceed);
+        // unknown ja4 / unrestricted: not this gate's business.
+        assert_eq!(
+            al.route_gate("t00i0000_000000000000_000000000000", "/admin"),
+            GateDecision::Proceed
+        );
+        // health probes: exempt BY DESIGN even for a restricted fingerprint —
+        // over HTTP/3 they reach dispatch, and a 403 on the LB's health check
+        // would be an outage lever.
+        assert_eq!(al.route_gate(chrome, "/healthz"), GateDecision::Proceed);
+        assert_eq!(al.route_gate(chrome, "/readyz"), GateDecision::Proceed);
+    }
+
+    #[test]
+    fn route_gate_counts_denials_in_both_modes() {
+        use crate::config::{AllowedFingerprint, FingerprintConfig, FingerprintMode};
+        let chrome = "t13d1516h2_8daaf6152771_e5627efa2ab1";
+        let cfg = FingerprintConfig {
+            mode: FingerprintMode::Shadow,
+            allowed: vec![AllowedFingerprint {
+                name: "api-agent".into(),
+                ja4: chrome.into(),
+                rate_limit_cps: 0,
+                allowed_routes: vec!["/api/{*rest}".into()],
+            }],
+            ..Default::default()
+        };
+        let rt = TlsFpRuntime::from_config(&cfg).unwrap();
+        let before = crate::metrics::METRICS
+            .tls_fp_route_denied
+            .load(std::sync::atomic::Ordering::Relaxed);
+        rt.route_gate(chrome, "/admin"); // shadow denial: counted, not blocked
+        rt.route_gate(chrome, "/api/ok"); // allowed: NOT counted
+        let after = crate::metrics::METRICS
+            .tls_fp_route_denied
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // >= 1 rather than == 1: the metric is a global atomic shared with
+        // parallel tests — only the delta from THIS test's denial is asserted.
+        assert!(after > before, "denial must increment the metric");
+    }
+
+    #[test]
     fn from_config_resolves_rate_limit_only_when_positive() {
         use crate::config::{AllowedFingerprint, FingerprintConfig, FingerprintMode};
         let cfg = FingerprintConfig {
@@ -1751,11 +1945,13 @@ mod tests {
                     name: "limited".into(),
                     ja4: "t13d1516h2_8daaf6152771_e5627efa2ab1".into(),
                     rate_limit_cps: 50,
+                    allowed_routes: vec![],
                 },
                 AllowedFingerprint {
                     name: "unlimited".into(),
                     ja4: "t13d1516h2_000000000000_000000000000".into(),
                     rate_limit_cps: 0, // 0 = no limit, same as [server] rate_limit_rps
+                    allowed_routes: vec![],
                 },
             ],
             ban_ttl_secs: 0,

@@ -336,6 +336,35 @@ async fn process_request_inner(
         }
     }
 
+    // ── JA4 per-fingerprint route restriction (#27 follow-up) ──
+    //
+    // Request-level policy, so the deny is HTTP-level: the handshake already
+    // happened, and on HTTP/2 dropping the connection would kill unrelated
+    // in-flight requests — 403, like the sovereign enforcement gate above.
+    // The `X-Client-TLS-JA4` header is Zion's OWN attestation (any inbound
+    // copy is stripped and the verified value re-injected at the listener —
+    // see `tls_fp::apply_headers`), so trusting it here is sound. Like every
+    // pre-routing gate, this early return never reaches the access log; the
+    // `zion_tls_fp_route_denied` metric is the operator signal. Policy, mode
+    // handling, metric, and (debug) logging all live in `route_gate` — and
+    // note the gate covers the WHOLE request surface reaching dispatch
+    // (built-in /metrics included). /healthz and /readyz are exempt INSIDE
+    // route_gate: HTTP/3 bridges into dispatch directly (quic.rs), so the
+    // health exemption must be the gate's own property, not an accident of
+    // the :443 listener fast path.
+    #[cfg(feature = "tls-fingerprint")]
+    if let Some(fp) = cfg.tls_fingerprint.as_ref() {
+        if let Some(ja4) = req
+            .headers()
+            .get(crate::tls_fp::HDR_JA4)
+            .and_then(|v| v.to_str().ok())
+        {
+            if fp.route_gate(ja4, req.uri().path()) == crate::tls_fp::GateDecision::Reject {
+                return Ok(empty_response(StatusCode::FORBIDDEN));
+            }
+        }
+    }
+
     // ── AIMP mesh score lookup (signal, not gate) ──
     //
     // If the AIMP control plane is up and has a reputation entry for
