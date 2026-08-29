@@ -4,6 +4,78 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-08-29
+
+**The JA4 release.** The zero-trust TLS fingerprint gate (#27) ships complete,
+end to end: a hand-rolled ClientHello parser, a pre-handshake enforcement gate,
+per-fingerprint policy, and the fingerprint identity forwarded to upstreams.
+Everything sits behind `--features tls-fingerprint` and costs nothing when off.
+The release also repairs a CI supply-chain gate that had been silently dead for
+three days — the kind of failure that looks green from every angle that
+matters, which is exactly why it is documented loudly below.
+
+### Added
+
+- **JA4 client-fingerprint library** (#388): `src/tls_fp.rs` computes the
+  canonical FoxIO JA4 from raw `ClientHello` bytes. The parser is hand-rolled
+  and every read is bounds-checked — adversarial input yields a typed error,
+  never a panic. Only new dependency surface: `sha2`, already in-tree.
+- **Shadow mode** (#390): `[tls.fingerprint] mode = "shadow"` peeks the
+  ClientHello pre-handshake (`MSG_PEEK`, multi-segment post-quantum hellos
+  handled, 3 s budget), counts known vs unknown against the allowlist
+  (`zion_tls_fp_known` / `zion_tls_fp_unknown`) and never blocks.
+- **Allowlist enforcement** (#391): `mode = "allowlist"` with `on_unknown`
+  (`log_only` default | `drop`) and `on_unfingerprintable` (`allow` default |
+  `drop`); a deny-all misconfiguration refuses to boot. `zion_tls_fp_rejected`.
+- **Ban fast path + per-fingerprint connection rate limit** (#396): a rejected
+  unknown fingerprint goes on a process-local ban set (`ban_ttl_secs`, default
+  600) so repeats are dropped with one map lookup and a debug-level log — a
+  single-fingerprint flood no longer floods the log. Allowlist entries accept
+  `rate_limit_cps`, a cap on new TLS connections per second, enforced
+  pre-handshake with exactly one log line per second when crossed. Metrics:
+  `zion_tls_fp_banned_hits`, `zion_tls_fp_rate_limited`.
+- **Fingerprint identity to upstreams** (#397): the computed JA4 (and the
+  matching allowlist entry name) is stashed on the connection and forwarded as
+  `X-Client-TLS-JA4` / `X-Client-TLS-Allowlisted` — with the mTLS discipline:
+  inbound copies are stripped unconditionally before the verified values are
+  injected, on every path including plaintext :80 and feature-off builds.
+  Hot-reloads now announce enforcement-posture changes (mode, `on_unknown`,
+  `on_unfingerprintable`) so "the moment enforcement begins" is a log line.
+- **Per-fingerprint route restriction** (#398): `allowed_routes` on an
+  allowlist entry — same pattern syntax and alias semantics as `[[route]]
+  path` — returns **403** for requests outside the list in `allowlist` mode
+  and observes (`zion_tls_fp_route_denied`) in `shadow`. The deny is
+  HTTP-level by design: at request time the handshake already happened, and on
+  HTTP/2 a connection drop would kill unrelated in-flight requests.
+  `/healthz` and `/readyz` are exempt structurally — a restriction list must
+  never be able to 403 the load balancer's health check.
+
+### Fixed
+
+- **The supply-chain workflow was silently dead 2026-08-25 → 08-28** and is
+  repaired in two acts. #394: a `runner` context expression in job-level
+  `env:` made GitHub reject the whole workflow file at run creation — every
+  run "failed" with zero jobs, so the six REQUIRED status checks never
+  reported and every PR sat blocked while `gh pr checks` looked all green.
+  #395: the per-job rustup isolation assumed `$RUNNER_TEMP` is wiped between
+  jobs on the self-hosted runners — it is not; a job killed mid-install left a
+  manifest-less toolchain that poisoned every later job on that runner. The
+  store is now wiped (amortized) in the isolate step. Process rule that came
+  out of it: `actionlint` gates every workflow edit.
+- **h2 advisory posture** (#387): h2 0.4.16 (RUSTSEC-2026-0258), cargo-vet
+  exemption refreshed, weekly advisory-freshness window widened to 2× cadence,
+  protobuf advisory aliases mapped in deny.toml.
+
+### Data
+
+- Weekly sovereign CIDR refreshes 2026-08-24: EU-27 (#385) and Italy (#386).
+
+### CI / Chore
+
+- GitHub Actions group bump (#389); `.pytest_cache/` and `.ruff_cache/`
+  ignored (#393); the dependabot freeze for the v0.7.4 validation window
+  (#381) stays in place.
+
 ## [0.7.4] - 2026-08-13
 
 **A stability release, cut to be held still.** Nothing here changes runtime
