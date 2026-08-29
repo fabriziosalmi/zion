@@ -471,6 +471,17 @@ pub struct AllowedFingerprint {
     /// consistent with `[server] rate_limit_rps`.
     #[serde(default)]
     pub rate_limit_cps: u32,
+    /// Routes this fingerprint may request — same pattern syntax and matching
+    /// semantics as `[[route]] path` (matchit; a catch-all also covers its
+    /// bare prefix, `/x` and `/x/` are the same). Empty (default) = no
+    /// restriction. A request outside the list gets **403** in `allowlist`
+    /// mode — request-level policy is HTTP-level: the handshake already
+    /// happened, and on HTTP/2 dropping the connection would kill unrelated
+    /// in-flight requests — and is only counted
+    /// (`zion_tls_fp_route_denied`) in `shadow`. Patterns are validated at
+    /// boot; an invalid one refuses the config.
+    #[serde(default)]
+    pub allowed_routes: Vec<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -960,6 +971,20 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                      (expected e.g. t13d1516h2_8daaf6152771_e5627efa2ab1)",
                     a.name, a.ja4
                 ));
+            }
+        }
+        // allowed_routes patterns must compile (#27 follow-up): a typo'd
+        // pattern would otherwise be discovered as a runtime surprise — either
+        // a silent no-restriction or a silent deny — instead of a boot error.
+        for a in &fp.allowed {
+            if !a.allowed_routes.is_empty() {
+                if let Err(e) = compile_path_set(&a.allowed_routes) {
+                    errors.push(format!(
+                        "[tls.fingerprint] allowed entry '{}': {e} (allowed_routes uses \
+                         the same pattern syntax as [[route]] path)",
+                        a.name
+                    ));
+                }
             }
         }
         // The entry name becomes the X-Client-TLS-Allowlisted header value
@@ -1606,6 +1631,36 @@ fn trailing_slash_variant(path: &str) -> Option<String> {
     }
 }
 
+/// Compile a set of route-path patterns into a bare matcher with the SAME
+/// alias semantics as the request router (bare prefix for catch-alls,
+/// trailing-slash variant otherwise — see `RouterBuilder::insert`). Used by
+/// `[tls.fingerprint]` `allowed_routes` (#27 follow-up) so a restriction list
+/// matches paths exactly the way `[[route]] path` does — two pattern dialects
+/// in one config would be a trap. Alias inserts are best-effort, mirroring
+/// `RouterBuilder::finish`.
+#[allow(dead_code)] // read only under `--features tls-fingerprint`
+pub(crate) fn compile_path_set(patterns: &[String]) -> Result<matchit::Router<()>, String> {
+    let mut router = matchit::Router::new();
+    let mut aliases: Vec<String> = Vec::new();
+    for p in patterns {
+        router
+            .insert(p.clone(), ())
+            .map_err(|e| format!("bad route pattern '{p}': {e}"))?;
+        match catchall_bare_prefix(p) {
+            Some(bare) => aliases.push(bare),
+            None => {
+                if let Some(v) = trailing_slash_variant(p) {
+                    aliases.push(v);
+                }
+            }
+        }
+    }
+    for a in aliases {
+        let _ = router.insert(a, ());
+    }
+    Ok(router)
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // ROUTES MINI-TABLE (boot-time visualization)
 // ═══════════════════════════════════════════════════════════════════
@@ -1786,6 +1841,29 @@ mod tests {
         let cfg = parse_schema(dup, "test").expect("parse");
         let err = validate_semantics(&cfg, "test").err().unwrap_or_default();
         assert!(err.contains("same JA4"), "got: {err}");
+    }
+
+    #[cfg(feature = "tls-fingerprint")]
+    #[test]
+    fn allowed_routes_bad_pattern_is_rejected() {
+        // A typo'd pattern must be a boot error, not a runtime surprise.
+        let bad = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"drop\"\n\
+             allowed=[{name=\"a\",ja4=\"t13d1516h2_8daaf6152771_e5627efa2ab1\",allowed_routes=[\"/api/{unclosed\"]}]\n\
+             [upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let cfg = parse_schema(bad, "test").expect("parse");
+        let err = validate_semantics(&cfg, "test").err().unwrap_or_default();
+        assert!(err.contains("allowed_routes"), "got: {err}");
+        // And a valid list passes.
+        let ok = bad.replace("[\"/api/{unclosed\"]", "[\"/api/{*rest}\", \"/healthz\"]");
+        let cfg = parse_schema(&ok, "test").expect("parse");
+        assert!(
+            validate_semantics(&cfg, "test").is_ok(),
+            "valid allowed_routes must pass: {:?}",
+            validate_semantics(&cfg, "test").err()
+        );
     }
 
     #[cfg(feature = "tls-fingerprint")]

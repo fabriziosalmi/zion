@@ -336,6 +336,47 @@ async fn process_request_inner(
         }
     }
 
+    // ── JA4 per-fingerprint route restriction (#27 follow-up) ──
+    //
+    // Request-level policy, so the deny is HTTP-level: the handshake already
+    // happened, and on HTTP/2 dropping the connection would kill unrelated
+    // in-flight requests — 403, like the sovereign enforcement gate above.
+    // The `X-Client-TLS-JA4` header is Zion's OWN attestation (any inbound
+    // copy is stripped and the verified value re-injected at the listener —
+    // see `tls_fp::apply_headers`), so trusting it here is sound. Deny
+    // logging is debug-level on purpose: a JA4 is replayable
+    // client-controlled input, and the metric plus the 403 in the access log
+    // already carry the signal (see the commit-4 log-amplification findings).
+    #[cfg(feature = "tls-fingerprint")]
+    if let Some(fp) = cfg.tls_fingerprint.as_ref() {
+        if let Some(ja4) = req
+            .headers()
+            .get(crate::tls_fp::HDR_JA4)
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some(name) = fp.route_denied(ja4, req.uri().path()) {
+                metrics::METRICS
+                    .tls_fp_route_denied
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if fp.mode == crate::config::FingerprintMode::Allowlist {
+                    tracing::debug!(
+                        ja4,
+                        name,
+                        path = req.uri().path(),
+                        "tls-fp: route not in allowed_routes for this fingerprint — 403"
+                    );
+                    return Ok(empty_response(StatusCode::FORBIDDEN));
+                }
+                tracing::debug!(
+                    ja4,
+                    name,
+                    path = req.uri().path(),
+                    "tls-fp: route not in allowed_routes (shadow — proceeding)"
+                );
+            }
+        }
+    }
+
     // ── AIMP mesh score lookup (signal, not gate) ──
     //
     // If the AIMP control plane is up and has a reputation entry for

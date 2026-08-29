@@ -424,6 +424,9 @@ pub struct Metrics {
     /// Dropped pre-handshake in `allowlist` mode (also counted in
     /// `tls_fp_rejected`); in `shadow` mode counted here but never blocked.
     pub tls_fp_rate_limited: AtomicU64,
+    /// Requests outside an allowlisted fingerprint's `allowed_routes` (#27
+    /// follow-up): 403 in `allowlist` mode, counted-only in `shadow`.
+    pub tls_fp_route_denied: AtomicU64,
     /// Connections closed at accept because the source IP was already at
     /// its `max_connections_per_ip` concurrent cap (anti-DDoS lever).
     pub connections_rejected_per_ip: AtomicU64,
@@ -528,6 +531,7 @@ impl Metrics {
             tls_fp_rejected: AtomicU64::new(0),
             tls_fp_banned_hits: AtomicU64::new(0),
             tls_fp_rate_limited: AtomicU64::new(0),
+            tls_fp_route_denied: AtomicU64::new(0),
             connections_rejected_per_ip: AtomicU64::new(0),
             enforcement_denied_class: AtomicU64::new(0),
             enforcement_denied_mesh_score: AtomicU64::new(0),
@@ -835,6 +839,18 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.tls_fp_rate_limited.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_tls_fp_route_denied Requests outside an allowlisted fingerprint's allowed_routes (403 in allowlist mode, observed in shadow).\n\
+                                # TYPE zion_tls_fp_route_denied counter\n\
+                                zion_tls_fp_route_denied ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.tls_fp_route_denied.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");
