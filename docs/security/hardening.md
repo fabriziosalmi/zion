@@ -139,7 +139,7 @@ When the TLS listener is configured with client-certificate verification (`clien
 X-Client-Cert-Fingerprint: sha256:<64 hex chars>
 ```
 
-The value is the SHA-256 of the leaf DER, hex-encoded with a `sha256:` prefix — the same convention used by openssl and nginx (`$ssl_client_fingerprint`). It is collision-resistant and stable across re-issuance only when the cert bytes themselves are stable; rotating a cert produces a new fingerprint.
+The value is the SHA-256 of the leaf DER, hex-encoded with a `sha256:` prefix — Zion's pinned wire format for this header (the prefix names the algorithm so it can never be ambiguous). (nginx's `$ssl_client_fingerprint` is a similar idea but a **SHA-1** digest — do not compare the two values directly.) It is collision-resistant and stable across re-issuance only when the cert bytes themselves are stable; rotating a cert produces a new fingerprint.
 
 Earlier Zion versions emitted `X-Client-Cert-DN`, computed as a 64-bit XOR-fold of the first 64 DER bytes. That value was advertised as a "DN" but was neither a Distinguished Name nor collision-resistant; it has been removed. If your upstream still expects the old header, map it at the upstream side from `X-Client-Cert-Fingerprint` (note: the new value is a fingerprint, not a DN, and downstream identity mapping must be done via your roster).
 
