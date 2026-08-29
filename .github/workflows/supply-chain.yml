@@ -30,50 +30,23 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # The repo's `rust-toolchain.toml` pins `channel = "1.88.0"` with
-  # `profile = "minimal"`. Some self-hosted runners have that 1.88.0
-  # toolchain installed *without* the `cargo` component, so the in-repo
-  # override makes `cargo install`/`cargo vet` fail with "the 'cargo'
-  # binary … is not applicable to the '1.88.0' toolchain". These audit
-  # tools don't need the pinned compiler — they analyse Cargo.lock and the
-  # vet baseline — so we force `stable` (installed by dtolnay/rust-toolchain
-  # below) and bypass the override. RUSTUP_TOOLCHAIN has the highest
-  # precedence, above rust-toolchain.toml. GitHub-hosted CI is unaffected
-  # because a fresh runner auto-syncs a complete 1.88.0.
+  # The audit tools don't need the repo's pinned 1.88 compiler — they
+  # analyse Cargo.lock and the vet baseline — so force `stable` (installed
+  # by dtolnay/rust-toolchain below) and bypass the rust-toolchain.toml
+  # override. RUSTUP_TOOLCHAIN has the highest precedence.
   RUSTUP_TOOLCHAIN: stable
 
 jobs:
   # ── 1. RustSec advisories — scheduled + on-PR. ────────────────────────────
   audit:
     name: cargo-audit (advisories)
-    runs-on: [self-hosted, Linux, X64]
-    # Give this job its OWN rustup toolchain store under runner.temp. The
-    # persistent Contabo runners otherwise share one mutable ~/.rustup across
-    # jobs, and a half-removed rust-std leaves a stale component manifest that
-    # makes dtolnay/rust-toolchain's reinstall abort ("failure removing
-    # component rust-std … .rmeta"). Only RUSTUP_HOME moves — CARGO_HOME is
-    # untouched, so the rustup/cargo binaries stay on PATH and crate caching
-    # is unaffected.
-    # The `rm -rf` is what actually makes it per-job: on these runners
-    # $RUNNER_TEMP is NOT wiped between jobs, so a job killed mid-install
-    # leaves a manifest-less toolchain there that rustup then reports as
-    # "unchanged" and never repairs ("error: Missing manifest in toolchain
-    # 'stable'"), poisoning every later job on that runner.
-    # NOTE: exported via GITHUB_ENV in the first step, NOT job-level `env:` —
-    # the `runner` context is not available there, and an expression that uses
-    # it makes GitHub reject the whole workflow file at run creation (zero
-    # jobs, required checks never report, every PR blocked).
+    runs-on: ubuntu-latest
     steps:
-      - name: Isolate rustup store (see comment above)
-        run: |
-          rm -rf "$RUNNER_TEMP/rustup"
-          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      # Prebuilt binary, not `cargo install` from source: building the tool
-      # on the self-hosted runners is the flaky step ("could not parse/
-      # generate dep info … .d: No such file" — a /tmp race during the
-      # install build). A downloaded binary sidesteps it and is faster.
+      # Prebuilt binary, not `cargo install` from source: faster, and it
+      # sidesteps the /tmp-race class of install-build failures that bit the
+      # old self-hosted runners.
       - name: Install cargo-audit
         uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
         with:
@@ -85,7 +58,7 @@ jobs:
   # ── 2. cargo-deny: advisories+licenses+bans+sources, all in one. ──────────
   deny:
     name: cargo-deny (${{ matrix.checks }})
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -113,10 +86,6 @@ jobs:
   # cargo-vet baseline" for the standing operator workflow.
   vet:
     name: cargo-vet
-    # GitHub-hosted: the self-hosted runner's network corrupts the cargo-vet
-    # tarball in transit (sha256 mismatch on a download that verifies clean
-    # elsewhere; cargo-audit/cargo-deny use different URLs and are unaffected).
-    # Pure-CI audit — no self-hosted HW needed — so use a reliable network.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -140,15 +109,9 @@ jobs:
   # ── 4. cargo-geiger — quantify unsafe surface (informational signal). ────
   geiger:
     name: cargo-geiger (unsafe surface)
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     continue-on-error: true   # geiger is a *report*, not a gate
-    # Isolated rustup store — see the `audit` job for the rationale (and for
-    # why it's a GITHUB_ENV step, not job-level `env:`).
     steps:
-      - name: Isolate rustup store
-        run: |
-          rm -rf "$RUNNER_TEMP/rustup"
-          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -156,18 +119,15 @@ jobs:
           shared-key: geiger
       - name: Install build deps
         run: |
-          # Self-hosted runners typically have these pre-installed and may
-          # lack passwordless sudo, so only reach for apt when something is
-          # actually missing — and don't hard-fail the step if sudo is
-          # unavailable (the later cargo step surfaces any real gap).
+          # ubuntu-latest ships these preinstalled; the guard keeps the
+          # step a no-op there and harmless anywhere else.
           if ! command -v cmake >/dev/null || ! command -v pkg-config >/dev/null; then
             sudo apt-get update && \
             sudo apt-get install -y cmake pkg-config build-essential libssl-dev || \
             echo "::warning::could not apt-get build deps; relying on pre-installed toolchain"
           fi
-      # Prebuilt binary, not `cargo install` from source: building the tool on
-      # the self-hosted runners is the flaky step (intermittent "No such file or
-      # directory (os error 2)" mid-compile). Mirrors the cargo-audit/cargo-vet jobs.
+      # Prebuilt binary, not `cargo install` from source — faster; mirrors
+      # the cargo-audit job.
       - name: Install cargo-geiger
         uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
         with:
@@ -184,17 +144,11 @@ jobs:
   # ── 5. CycloneDX SBOM — on master + release tags. Attached to releases. ──
   sbom:
     name: SBOM (CycloneDX)
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
     permissions:
       contents: read
-    # Isolated rustup store — see the `audit` job for the rationale (and for
-    # why it's a GITHUB_ENV step, not job-level `env:`).
     steps:
-      - name: Isolate rustup store
-        run: |
-          rm -rf "$RUNNER_TEMP/rustup"
-          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -202,10 +156,8 @@ jobs:
           shared-key: sbom
       - name: Install build deps
         run: |
-          # Self-hosted runners typically have these pre-installed and may
-          # lack passwordless sudo, so only reach for apt when something is
-          # actually missing — and don't hard-fail the step if sudo is
-          # unavailable (the later cargo step surfaces any real gap).
+          # ubuntu-latest ships these preinstalled; the guard keeps the
+          # step a no-op there and harmless anywhere else.
           if ! command -v cmake >/dev/null || ! command -v pkg-config >/dev/null; then
             sudo apt-get update && \
             sudo apt-get install -y cmake pkg-config build-essential libssl-dev || \
