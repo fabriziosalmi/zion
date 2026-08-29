@@ -10,7 +10,12 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-command -v vhs >/dev/null || { echo "FATAL: vhs not installed (brew install vhs)" >&2; exit 1; }
+for tool in vhs openssl; do
+  command -v "$tool" >/dev/null || {
+    echo "FATAL: $tool not installed — see https://github.com/charmbracelet/vhs#installation for vhs" >&2
+    exit 1
+  }
+done
 
 echo "building release binary..."
 cargo build --release --quiet
