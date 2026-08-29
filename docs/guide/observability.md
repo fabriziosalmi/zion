@@ -147,7 +147,7 @@ event under the `access` target with these fields:
 | `latency_us` | u64    | Total request duration (client → response sent), in µs.      |
 | `method`     | str    | HTTP method.                                                 |
 | `path`       | str    | URI path with query-string redacted via `[redact.query_params]`. |
-| `remote_ip`  | str    | Client IP after XFF resolution.                              |
+| `remote_ip`  | str    | The TCP peer address (raw socket peer). Behind a trusted proxy, the XFF-resolved client IP drives rate limiting and the security gates but is **not** what this field logs — read the forwarded chain from your upstream's own logs. |
 | `headers`    | json   | Configured headers, redacted per `[redact.headers]`. Empty when `[access_log] include_headers` is empty (default). |
 | `mtls_fp`    | str    | `X-Client-Cert-Fingerprint` value (SHA-256 hex), when present and `[access_log] mtls_fingerprint = true`. Never redacted — the value is already a hash. |
 
