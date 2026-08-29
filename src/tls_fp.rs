@@ -563,6 +563,41 @@ impl TlsFpRuntime {
         })
     }
 
+    /// The complete per-request route gate (#27 follow-up): restriction
+    /// lookup, mode policy, metric, and (debug) logging in one place, so the
+    /// dispatch wiring stays a dumb two-liner and the mode branch is
+    /// unit-testable here. `Reject` ONLY in `allowlist` mode for a restricted
+    /// fingerprint outside its list; `shadow` observes (counts
+    /// `zion_tls_fp_route_denied`, never blocks). Deny logging is debug-level on purpose: a JA4 is replayable
+    /// client-controlled input, and the metric is the operator signal — the
+    /// access log never sees early-gate denials (same as the sovereign gate).
+    pub fn route_gate(&self, ja4: &str, path: &str) -> GateDecision {
+        use crate::config::FingerprintMode;
+        let Some(name) = self.route_denied(ja4, path) else {
+            return GateDecision::Proceed;
+        };
+        crate::metrics::METRICS
+            .tls_fp_route_denied
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.mode == FingerprintMode::Allowlist {
+            tracing::debug!(
+                ja4,
+                name,
+                path,
+                "tls-fp: route not in allowed_routes for this fingerprint — 403"
+            );
+            GateDecision::Reject
+        } else {
+            tracing::debug!(
+                ja4,
+                name,
+                path,
+                "tls-fp: route not in allowed_routes (shadow — proceeding)"
+            );
+            GateDecision::Proceed
+        }
+    }
+
     /// Per-fingerprint route restriction (#27 follow-up): `Some(entry name)`
     /// when `ja4` is allowlisted with an `allowed_routes` list that does NOT
     /// cover `path`. `None` = unrestricted entry, path covered, or `ja4` not
@@ -1825,6 +1860,65 @@ mod tests {
             rt.route_denied("t00i0000_000000000000_000000000000", "/admin"),
             None
         );
+    }
+
+    #[test]
+    fn route_gate_mode_matrix_allowlist_rejects_shadow_observes() {
+        use crate::config::{AllowedFingerprint, FingerprintConfig, FingerprintMode};
+        let chrome = "t13d1516h2_8daaf6152771_e5627efa2ab1";
+        let mk = |mode| {
+            let cfg = FingerprintConfig {
+                mode,
+                allowed: vec![AllowedFingerprint {
+                    name: "api-agent".into(),
+                    ja4: chrome.into(),
+                    rate_limit_cps: 0,
+                    allowed_routes: vec!["/api/{*rest}".into()],
+                }],
+                ..Default::default()
+            };
+            TlsFpRuntime::from_config(&cfg).unwrap()
+        };
+        // allowlist: outside the list → Reject (the dispatch 403); inside → Proceed.
+        let al = mk(FingerprintMode::Allowlist);
+        assert_eq!(al.route_gate(chrome, "/admin"), GateDecision::Reject);
+        assert_eq!(al.route_gate(chrome, "/api/v1"), GateDecision::Proceed);
+        // shadow: NEVER rejects, even outside the list (observe-only rollout).
+        let sh = mk(FingerprintMode::Shadow);
+        assert_eq!(sh.route_gate(chrome, "/admin"), GateDecision::Proceed);
+        // unknown ja4 / unrestricted: not this gate's business.
+        assert_eq!(
+            al.route_gate("t00i0000_000000000000_000000000000", "/admin"),
+            GateDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn route_gate_counts_denials_in_both_modes() {
+        use crate::config::{AllowedFingerprint, FingerprintConfig, FingerprintMode};
+        let chrome = "t13d1516h2_8daaf6152771_e5627efa2ab1";
+        let cfg = FingerprintConfig {
+            mode: FingerprintMode::Shadow,
+            allowed: vec![AllowedFingerprint {
+                name: "api-agent".into(),
+                ja4: chrome.into(),
+                rate_limit_cps: 0,
+                allowed_routes: vec!["/api/{*rest}".into()],
+            }],
+            ..Default::default()
+        };
+        let rt = TlsFpRuntime::from_config(&cfg).unwrap();
+        let before = crate::metrics::METRICS
+            .tls_fp_route_denied
+            .load(std::sync::atomic::Ordering::Relaxed);
+        rt.route_gate(chrome, "/admin"); // shadow denial: counted, not blocked
+        rt.route_gate(chrome, "/api/ok"); // allowed: NOT counted
+        let after = crate::metrics::METRICS
+            .tls_fp_route_denied
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // >= 1 rather than == 1: the metric is a global atomic shared with
+        // parallel tests — only the delta from THIS test's denial is asserted.
+        assert!(after > before, "denial must increment the metric");
     }
 
     #[test]

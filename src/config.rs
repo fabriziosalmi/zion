@@ -480,6 +480,12 @@ pub struct AllowedFingerprint {
     /// in-flight requests — and is only counted
     /// (`zion_tls_fp_route_denied`) in `shadow`. Patterns are validated at
     /// boot; an invalid one refuses the config.
+    ///
+    /// Scope: the list is a positive grant over the WHOLE request surface,
+    /// built-in endpoints included — a restricted scraper needs `/metrics`
+    /// on its list (the endpoint's own internal-IP gate still applies).
+    /// Exceptions: `/healthz` and `/readyz` are answered on the listener
+    /// fast path, before this gate exists, and are never restricted.
     #[serde(default)]
     pub allowed_routes: Vec<String>,
 }
