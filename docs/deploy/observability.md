@@ -17,9 +17,13 @@ Zion exposes built-in endpoints that bypass routing and upstream forwarding:
 | `GET /_zion/snapshot.json` | JSON (metrics + quantiles + platform) | **internal IPs only** | `zion top` / dashboards |
 | `POST /_zion/cache/purge` | `{"purged":N,"scope":...}` | **internal IPs only**, POST-only (`405` on GET) | Flush the RAM cache on deploy; `?prefix=/path` for scoped purge |
 
-`/healthz` and `/readyz` are handled before rate limiting and routing, so they
-always respond even under load. `/metrics`, `/_zion/snapshot.json`, and
-`/_zion/cache/purge` are restricted to internal source IPs (external clients get
+On the HTTPS listener (HTTP/1.1 and /2), `/healthz` and `/readyz` are answered
+on a listener fast path before the request pipeline, so they respond even under
+load. Requests that do reach the pipeline (HTTP/3 is bridged into it directly)
+hit the per-IP rate limiter **before** the health endpoints — a deliberate
+choice, so `/healthz` cannot be used to bypass rate limiting in a flood.
+`/metrics`, `/_zion/snapshot.json`, and `/_zion/cache/purge` always go through
+the pipeline and are restricted to internal source IPs (external clients get
 `403`).
 
 ## Prometheus metrics

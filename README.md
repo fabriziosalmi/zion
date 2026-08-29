@@ -125,7 +125,7 @@ cargo build --release --features http3           # + HTTP/3 QUIC listener
 cargo build --release --features otel            # + OpenTelemetry tracing + OTLP export
 cargo build --release --features fips            # + FIPS 140-3 build (aws-lc-rs validated backend)
 cargo build --release --features geo-ita         # + Italian / EU sovereign edge classification
-cargo build --release --features io-uring-accept # Linux 5.19+: single-shot accept
+cargo build --release --features io-uring-accept # Linux: single-shot io_uring accept (validated on 5.19+ kernels)
 cargo build --release --features numa-aware      # + per-NUMA-node DashMap sharding (Linux multi-socket)
 
 # "max" build
