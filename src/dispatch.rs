@@ -6,9 +6,11 @@
 //!
 //!   1. security gates (URI length, method whitelist, rate limiter,
 //!      CORS pre-flight) — the rate limiter deliberately runs BEFORE the
-//!      built-in endpoints below, so `/healthz` cannot bypass it in a
-//!      flood (the :443 h1/h2 listener answers health probes on its own
-//!      fast path in main.rs, before this pipeline)
+//!      built-in endpoints below, so a request that reaches THIS
+//!      pipeline cannot use `/healthz` to dodge it. (The :443 h1/h2
+//!      listener separately answers health probes on its own fast path
+//!      in main.rs, before this pipeline — unrated by design: liveness
+//!      checks must answer even when the box is saturated.)
 //!   2. built-in endpoints (`/healthz`, `/readyz`, `/metrics`,
 //!      `/_zion/snapshot.json`)
 //!   3. radix routing → `Arc<ResolvedRoute>`
