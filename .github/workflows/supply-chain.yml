@@ -163,8 +163,15 @@ jobs:
             sudo apt-get install -y cmake pkg-config build-essential libssl-dev || \
             echo "::warning::could not apt-get build deps; relying on pre-installed toolchain"
           fi
+      # Prebuilt binary, not `cargo install` from source: building the tool
+      # on the self-hosted runners is the flaky step ("could not parse/
+      # generate dep info … .d: No such file" — a /tmp race during the
+      # install build; it took out the 2026-08-29 scheduled run). Same cure
+      # already applied to cargo-audit and cargo-geiger above.
       - name: Install cargo-cyclonedx
-        run: cargo install --locked cargo-cyclonedx
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
+        with:
+          tool: cargo-cyclonedx
       - name: Generate SBOM (JSON, all features)
         # `cargo-cyclonedx --override-filename FOO --format json` writes
         # `FOO.json` in the manifest dir (no `.cdx.` infix). Rename to the
