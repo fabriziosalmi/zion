@@ -484,8 +484,10 @@ pub struct AllowedFingerprint {
     /// Scope: the list is a positive grant over the WHOLE request surface,
     /// built-in endpoints included — a restricted scraper needs `/metrics`
     /// on its list (the endpoint's own internal-IP gate still applies).
-    /// Exceptions: `/healthz` and `/readyz` are answered on the listener
-    /// fast path, before this gate exists, and are never restricted.
+    /// Exceptions: `/healthz` and `/readyz` are exempt BY DESIGN — the gate
+    /// itself allows them (`route_gate`), so the property holds on every
+    /// protocol: on :443 HTTP/1.1-2 they are answered on the listener fast
+    /// path before dispatch, while HTTP/3 bridges into dispatch directly.
     #[serde(default)]
     pub allowed_routes: Vec<String>,
 }

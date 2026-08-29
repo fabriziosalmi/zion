@@ -573,6 +573,15 @@ impl TlsFpRuntime {
     /// access log never sees early-gate denials (same as the sovereign gate).
     pub fn route_gate(&self, ja4: &str, path: &str) -> GateDecision {
         use crate::config::FingerprintMode;
+        // Health probes are NEVER policy-gated — a restriction list that
+        // 403s the load balancer's health check is an outage lever. On :443
+        // HTTP/1.1-2 these are answered on the listener fast path and never
+        // reach dispatch, but HTTP/3 bridges straight into process_request
+        // (see quic.rs handle_h3_request), so the exemption must live HERE
+        // to be a structural property rather than a per-protocol accident.
+        if path == "/healthz" || path == "/readyz" {
+            return GateDecision::Proceed;
+        }
         let Some(name) = self.route_denied(ja4, path) else {
             return GateDecision::Proceed;
         };
@@ -1891,6 +1900,11 @@ mod tests {
             al.route_gate("t00i0000_000000000000_000000000000", "/admin"),
             GateDecision::Proceed
         );
+        // health probes: exempt BY DESIGN even for a restricted fingerprint —
+        // over HTTP/3 they reach dispatch, and a 403 on the LB's health check
+        // would be an outage lever.
+        assert_eq!(al.route_gate(chrome, "/healthz"), GateDecision::Proceed);
+        assert_eq!(al.route_gate(chrome, "/readyz"), GateDecision::Proceed);
     }
 
     #[test]

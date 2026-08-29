@@ -348,8 +348,10 @@ async fn process_request_inner(
     // `zion_tls_fp_route_denied` metric is the operator signal. Policy, mode
     // handling, metric, and (debug) logging all live in `route_gate` — and
     // note the gate covers the WHOLE request surface reaching dispatch
-    // (built-in /metrics included; /healthz and /readyz are answered on the
-    // listener fast path and never get here).
+    // (built-in /metrics included). /healthz and /readyz are exempt INSIDE
+    // route_gate: HTTP/3 bridges into dispatch directly (quic.rs), so the
+    // health exemption must be the gate's own property, not an accident of
+    // the :443 listener fast path.
     #[cfg(feature = "tls-fingerprint")]
     if let Some(fp) = cfg.tls_fingerprint.as_ref() {
         if let Some(ja4) = req
