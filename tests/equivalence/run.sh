@@ -35,7 +35,7 @@
 set -euo pipefail
 
 SCENARIO="${1:-multi-vhost}"
-ZION_IMAGE="${ZION_IMAGE:-ghcr.io/fabriziosalmi/zion:0.7.3}"
+ZION_IMAGE="${ZION_IMAGE:-ghcr.io/fabriziosalmi/zion:0.7.5}"
 ZION_RUNTIME_IMAGE="${ZION_RUNTIME_IMAGE:-ubuntu:24.04}"
 NGINX_IMAGE="nginx:1.27-alpine"
 CADDY_IMAGE="caddy:2-alpine"
