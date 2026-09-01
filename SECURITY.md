@@ -8,7 +8,7 @@ the current version.
 
 | Version | Supported |
 | ------- | --------- |
-| < 0.7.5 | No |
+| < 0.7.6 | No |
 
 Everything at or above that line is the current release. Stated as a single
 threshold on purpose — the previous wording carried a second, hardcoded row

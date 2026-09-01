@@ -21,7 +21,7 @@ A clear and concise description of what you expected to happen.
 **Environment (please complete the following information):**
  - OS: [e.g. Linux, macOS]
  - Architecture: [e.g. arm64, amd64]
- - Zion Version: [e.g. 0.7.5]
+ - Zion Version: [e.g. 0.7.6]
 
 **Additional context**
 Add any other context about the problem here (e.g. logs with `RUST_LOG=trace`, upstream backend type like Go/Node).
