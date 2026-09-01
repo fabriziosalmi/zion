@@ -4,6 +4,29 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-09-01
+
+**Sovereign correctness.** The `geo-ita` / `geo-eu` origin classifier baked its
+CIDR→role tables from a curated ASN list, but the pipeline chased the ASN
+*number*, not the holder — and RIPE reassigns ASNs. A curated ASN that moved to
+a different (even foreign) holder had its new ranges silently re-labelled with
+the old Italian/EU role. This patch closes that hole; the data plane is untouched.
+
+### Fixed
+
+- **ASN holder validation, fail-closed** (#408): the data generator now carries
+  each ASN's expected holder as data and verifies it against the live RIPEstat
+  holder before emitting — an accent- and case-insensitive match that requires
+  every significant expected token, so a reassignment cannot validate on a
+  coincidental shared token. On any drift it refuses to generate, and the weekly
+  refresh job blocks its PR instead of opening it silently. Curated sets were
+  corrected against the live holders: ASNs reassigned out of national/EU
+  sovereignty were removed (e.g. AS21479 → Rostelecom/RU, AS5535 → FAO),
+  legitimate Italian reassignments renamed. The live check runs only in the
+  scheduled job — the Rust test matrix reads the baked data. Adds a pinned
+  golden classification test, offline matcher fixtures (run in CI), and
+  `docs/config/sovereign.md`.
+
 ## [0.7.5] - 2026-08-29
 
 **The JA4 release.** The zero-trust TLS fingerprint gate (#27) ships complete,
