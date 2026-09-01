@@ -162,11 +162,15 @@ ROLE_PRIORITY = 1
 RIPESTAT_URL = "https://stat.ripe.net/data/as-overview/data.json?resource=AS{}"
 
 # Legal forms / generic words that carry no identity — dropped before matching.
-# "italia"/"italy" MUST be here: many distinct Italian holders share it, so a
-# match on it alone would pair unrelated orgs (Vodafone Italia vs Fastweb Italia).
+# NOTE: geographic words like "italia"/"italy" are deliberately NOT noise. With
+# the require-ALL-tokens match below, keeping them makes matching STRONGER, not
+# weaker: "Telecom Italia" reduces to {telecom, italia}, so a reassignment to a
+# different "Telecom X" (e.g. Telecom Argentina) is correctly rejected — it lacks
+# "italia". Under the old any-overlap match they had to be dropped (two IT holders
+# share "italia"); require-all handles that case via the distinctive token instead.
 _NOISE = {
     "asn", "as", "srl", "spa", "sa", "s", "p", "a", "network", "networks",
-    "italia", "italy", "gmbh", "sas", "llc", "group", "consortium", "pjsc",
+    "gmbh", "sas", "llc", "group", "consortium", "pjsc",
     "plc", "oao", "ooo", "inc", "ltd", "ltda", "bv", "ag", "se", "nv", "the",
 }
 
@@ -190,8 +194,14 @@ def _tokens(name: str) -> set[str]:
 
 
 def holder_matches(expected: str, actual: str) -> bool:
-    """True if expected and live holder share ≥1 significant token."""
-    return bool(_tokens(expected) & _tokens(actual))
+    """True if EVERY significant token of the expected holder appears in the live
+    holder. Stricter than a single-token overlap: a reassignment that merely
+    shares one generic token (e.g. `telecom`, `orange`) no longer validates
+    unless the live holder actually carries the full expected name. An expected
+    name that reduces to no significant tokens (all noise) never matches — that
+    is a curation error to fix, not a silent pass."""
+    exp = _tokens(expected)
+    return bool(exp) and exp <= _tokens(actual)
 
 
 def fetch_holder(asn: int, timeout: int = 15) -> str:

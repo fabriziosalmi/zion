@@ -53,10 +53,24 @@ def test_drifted_holders_do_not_match():
     assert not gsd.holder_matches("PosteMobile", LIVE[41336])
 
 
-def test_italia_is_noise_not_a_match():
-    # Two different Italian holders that share only "Italia" must NOT match —
-    # otherwise every IT holder would validate against every other.
+def test_require_all_rejects_partial_overlap():
+    # The match requires EVERY significant expected token. Two holders that share
+    # only one token do NOT match — this is what stops a reassignment from
+    # validating on a coincidental overlap.
+    # Different IT holders sharing only "italia":
     assert not gsd.holder_matches("Vodafone Italia", "Fastweb Italia S.p.A.")
+    # A generic distinctive token is not enough on its own: a curated
+    # "Telecom Italia" must not validate against an unrelated "Telecom X".
+    assert not gsd.holder_matches("Telecom Italia", "Telecom Argentina S.A.")
+    # The full expected name in the live holder does match.
+    assert gsd.holder_matches("Telecom Italia", "ASN-IBSNAZ Telecom Italia S.p.A.")
+    assert gsd.holder_matches("A1 Telekom Austria", "A1TELEKOM-AT A1 Telekom Austria AG")
+
+
+def test_empty_expected_never_matches():
+    # An expected name that reduces to no significant tokens (all noise) is a
+    # curation error — it must fail closed, never trivially pass.
+    assert not gsd.holder_matches("S.p.A.", "Anything Holder Ltd")
 
 
 def test_accent_and_legal_form_are_normalized():

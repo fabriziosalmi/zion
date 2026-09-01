@@ -79,6 +79,12 @@ jobs:
           -o .sovereign-data/ip2asn-v6.tsv.gz
         gunzip -f .sovereign-data/ip2asn-v6.tsv.gz
 
+    - name: Offline matcher tests (no network)
+      # Guard the holder-drift matcher itself: token normalization, accent
+      # folding, and the require-all-tokens rule are pinned against recorded
+      # fixtures so a regression here can't quietly weaken drift detection.
+      run: python3 scripts/test_generate_sovereign_data.py
+
     - name: Validate curated ASN holders + generate ${{ matrix.output }}
       run: |
         # The generator now validates every curated ASN against its LIVE
