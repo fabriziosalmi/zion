@@ -79,14 +79,26 @@ jobs:
           -o .sovereign-data/ip2asn-v6.tsv.gz
         gunzip -f .sovereign-data/ip2asn-v6.tsv.gz
 
-    - name: Generate ${{ matrix.output }}
+    - name: Validate curated ASN holders + generate ${{ matrix.output }}
       run: |
-        python3 scripts/generate_sovereign_data.py \
-          --region ${{ matrix.region }} \
-          --ripe .sovereign-data/delegated-ripencc-latest \
-          --iptoasn .sovereign-data/ip2asn-v4.tsv \
-          --iptoasn6 .sovereign-data/ip2asn-v6.tsv \
-          --output ${{ matrix.output }}
+        # The generator now validates every curated ASN against its LIVE
+        # RIPEstat holder and FAILS CLOSED on drift — an ASN that RIPE has
+        # reassigned to a different (even foreign) holder. That is the whole
+        # point of this step: the old pipeline chased the ASN number, so a
+        # reassigned ASN's new ranges were silently re-labelled with the old
+        # Italian/EU role. A failure here is INTENTIONAL and blocks the refresh
+        # PR; the drift report printed above names the ASNs a human must fix
+        # (update the expected holder, or remove the ASN) in
+        # scripts/generate_sovereign_data.py.
+        if ! python3 scripts/generate_sovereign_data.py \
+              --region ${{ matrix.region }} \
+              --ripe .sovereign-data/delegated-ripencc-latest \
+              --iptoasn .sovereign-data/ip2asn-v4.tsv \
+              --iptoasn6 .sovereign-data/ip2asn-v6.tsv \
+              --output ${{ matrix.output }}; then
+          echo "::error title=Sovereign holder drift::A curated ${{ matrix.region }} ASN no longer matches its live RIPEstat holder (see the drift report in the log). The dataset will NOT refresh until scripts/generate_sovereign_data.py is corrected by hand. This is fail-closed on purpose — a reassigned ASN must never be re-labelled with a sovereign role automatically."
+          exit 1
+        fi
 
     - name: Check for changes
       id: diff
@@ -134,8 +146,12 @@ jobs:
         - RIPE NCC delegated stats: \`ftp.ripe.net/pub/stats/ripencc/delegated-ripencc-latest\`
         - IPtoASN (Team Cymru): \`iptoasn.com/data/ip2asn-v4.tsv.gz\`
 
-        **Verification:** Review the diff to ensure no unexpected ranges were added/removed.
-        The \`ranges_are_sorted\` and \`ranges_dont_overlap\` tests will run in CI." \
+        **Holder validation PASSED** — this PR only opens when every curated ASN
+        still matches its live RIPEstat holder (the job fails closed otherwise, so
+        a reassigned ASN can no longer be silently re-labelled with a sovereign
+        role). The generated header carries the snapshot date. CI additionally runs
+        \`ranges_are_sorted\`, \`ranges_dont_overlap\`, and the pinned golden
+        classification test." \
           --label "sovereign-data,automated"
       env:
         # Dedicated PAT, not GITHUB_TOKEN: repo-wide policy blocks Actions from

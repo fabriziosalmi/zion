@@ -4,6 +4,7 @@
 //! DO NOT EDIT MANUALLY — changes will be overwritten by CI.
 //!
 //! Sources: RIPE NCC delegated stats + IPtoASN (Team Cymru), v4 + v6.
+//! Snapshot date: 2026-09-01 (curated-ASN holders validated against RIPEstat as-overview on this date — see the generator).
 
 use super::{CidrEntry, CidrEntry6, IpClass};
 
@@ -26,7 +27,8 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x023AAC00, 0x023AACFF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
     cr(0x02700000, 0x0277FFFF, IpClass::ResidentialIta),
-    cr(0x029C0000, 0x029FFFFF, IpClass::ResidentialIta),
+    cr(0x029C0000, 0x029DBFFF, IpClass::ResidentialIta),
+    cr(0x029E0000, 0x029FFFFF, IpClass::ResidentialIta),
     cr(0x02C00000, 0x02C7FFFF, IpClass::ResidentialIta),
     cr(0x02E00000, 0x02EFFFFF, IpClass::ResidentialIta),
     cr(0x05012C00, 0x05012CFF, IpClass::ResidentialIta),
@@ -147,7 +149,7 @@ pub static RANGES: &[CidrEntry] = &[
     // ── DATACENTER / HOSTING ──
     cr(0x259CF400, 0x259CF4FF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
-    cr(0x259F0000, 0x25A3FFFF, IpClass::ResidentialIta),
+    cr(0x259F0000, 0x259FFFFF, IpClass::ResidentialIta),
     cr(0x25B00000, 0x25B7FFFF, IpClass::ResidentialIta),
     cr(0x25BAC000, 0x25BAFFFF, IpClass::ResidentialIta),
     // ── DATACENTER / HOSTING ──
@@ -166,9 +168,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x28A0FC00, 0x28A0FCFF, IpClass::DatacenterIta),
     cr(0x28A0FE00, 0x28A0FEFF, IpClass::DatacenterIta),
     cr(0x2BE20000, 0x2BE201FF, IpClass::DatacenterIta),
-    // ── GOVERNMENT / INSTITUTIONAL ──
-    cr(0x2D091F00, 0x2D091FFF, IpClass::GovIta),
-    // ── DATACENTER / HOSTING ──
     cr(0x2D0B7400, 0x2D0B77FF, IpClass::DatacenterIta),
     cr(0x2D0D5800, 0x2D0D5BFF, IpClass::DatacenterIta),
     cr(0x2D0D7800, 0x2D0D7BFF, IpClass::DatacenterIta),
@@ -236,7 +235,6 @@ pub static RANGES: &[CidrEntry] = &[
     // ── RESIDENTIAL ISPs ──
     cr(0x31EC0000, 0x31EC3FFF, IpClass::ResidentialIta),
     // ── DATACENTER / HOSTING ──
-    cr(0x32032600, 0x320326FF, IpClass::DatacenterIta),
     cr(0x32725B00, 0x32725BFF, IpClass::DatacenterIta),
     cr(0x33260000, 0x3326FFFF, IpClass::DatacenterIta),
     cr(0x33440000, 0x3344FFFF, IpClass::DatacenterIta),
@@ -331,21 +329,14 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x4E8A2000, 0x4E8A23FF, IpClass::DatacenterIta),
     cr(0x4E8A3E00, 0x4E8A3EFF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
-    cr(0x4ED00000, 0x4ED7FFFF, IpClass::ResidentialIta),
     cr(0x4F000000, 0x4F3FFFFF, IpClass::ResidentialIta),
     // ── DATACENTER / HOSTING ──
-    cr(0x4F639200, 0x4F6392FF, IpClass::DatacenterIta),
     cr(0x4F6E3D00, 0x4F6E3DFF, IpClass::DatacenterIta),
     cr(0x4F890000, 0x4F897FFF, IpClass::DatacenterIta),
-    cr(0x4F898B00, 0x4F898BFF, IpClass::DatacenterIta),
-    cr(0x4F89A400, 0x4F89A4FF, IpClass::DatacenterIta),
-    cr(0x4F89B400, 0x4F89B4FF, IpClass::DatacenterIta),
-    cr(0x4F89B700, 0x4F89B7FF, IpClass::DatacenterIta),
     cr(0x4FACD800, 0x4FACD8FF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
     cr(0x50100000, 0x5017FFFF, IpClass::ResidentialIta),
     cr(0x50434200, 0x504342FF, IpClass::ResidentialIta),
-    cr(0x50440000, 0x50440DFF, IpClass::ResidentialIta),
     // ── DATACENTER / HOSTING ──
     cr(0x50467400, 0x504677FF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
@@ -363,13 +354,9 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x50D30000, 0x50D3BFFF, IpClass::DatacenterIta),
     cr(0x50D3E000, 0x50D3EFFF, IpClass::DatacenterIta),
     cr(0x50F05E00, 0x50F05EFF, IpClass::DatacenterIta),
-    // ── RESIDENTIAL ISPs ──
-    cr(0x50FE6000, 0x50FE7FFF, IpClass::ResidentialIta),
-    // ── DATACENTER / HOSTING ──
     cr(0x511B4A00, 0x511B4AFF, IpClass::DatacenterIta),
     cr(0x511DB000, 0x511DB3FF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
-    cr(0x51380000, 0x5139FFFF, IpClass::ResidentialIta),
     cr(0x51480000, 0x514AEDFF, IpClass::ResidentialIta),
     cr(0x514AF000, 0x514AFBFF, IpClass::ResidentialIta),
     cr(0x514AFD00, 0x514BFFFF, IpClass::ResidentialIta),
@@ -484,13 +471,9 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x53886A00, 0x53886BFF, IpClass::DatacenterIta),
     cr(0x5388D600, 0x5388D7FF, IpClass::DatacenterIta),
     cr(0x538F1000, 0x538F17FF, IpClass::DatacenterIta),
-    // ── RESIDENTIAL ISPs ──
-    cr(0x539E0000, 0x539EFFFF, IpClass::ResidentialIta),
-    // ── DATACENTER / HOSTING ──
     cr(0x53AFA700, 0x53AFA7FF, IpClass::DatacenterIta),
     cr(0x53AFAD00, 0x53AFADFF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
-    cr(0x53DDC000, 0x53DDDFFF, IpClass::ResidentialIta),
     cr(0x53E04000, 0x53E04FFF, IpClass::ResidentialIta),
     cr(0x53E08000, 0x53E1FFFF, IpClass::ResidentialIta),
     // ── DATACENTER / HOSTING ──
@@ -528,30 +511,19 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x5576A400, 0x5576A4FF, IpClass::DatacenterIta),
     cr(0x559F7300, 0x559F73FF, IpClass::DatacenterIta),
     cr(0x55D04C00, 0x55D04FFF, IpClass::DatacenterIta),
-    // ── RESIDENTIAL ISPs ──
-    cr(0x55D10C00, 0x55D10DFF, IpClass::ResidentialIta),
-    cr(0x55D10F00, 0x55D10FFF, IpClass::ResidentialIta),
-    // ── DATACENTER / HOSTING ──
     cr(0x55D99000, 0x55D991FF, IpClass::DatacenterIta),
     cr(0x55EB8000, 0x55EB9DFF, IpClass::DatacenterIta),
     cr(0x56361A00, 0x56361AFF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
-    cr(0x566D8000, 0x566D9FFF, IpClass::ResidentialIta),
     cr(0x57000000, 0x571FFFFF, IpClass::ResidentialIta),
     // ── DATACENTER / HOSTING ──
     cr(0x574C8900, 0x574C89FF, IpClass::DatacenterIta),
     cr(0x574C8C00, 0x574C8CFF, IpClass::DatacenterIta),
-    cr(0x574CAA00, 0x574CAAFF, IpClass::DatacenterIta),
     cr(0x5756B500, 0x5756B5FF, IpClass::DatacenterIta),
     cr(0x5756FC00, 0x5756FCFF, IpClass::DatacenterIta),
     cr(0x57628000, 0x5762FFFF, IpClass::DatacenterIta),
-    // ── RESIDENTIAL ISPs ──
-    cr(0x57750000, 0x57751FFF, IpClass::ResidentialIta),
-    cr(0x57752400, 0x57752FFF, IpClass::ResidentialIta),
-    // ── DATACENTER / HOSTING ──
     cr(0x57E52800, 0x57E528FF, IpClass::DatacenterIta),
     cr(0x57E53300, 0x57E533FF, IpClass::DatacenterIta),
-    cr(0x57F08000, 0x57F0BFFF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
     cr(0x58200000, 0x58211AFF, IpClass::ResidentialIta),
     cr(0x58211C00, 0x582C3BFF, IpClass::ResidentialIta),
@@ -590,8 +562,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x59BD2000, 0x59BD2FFF, IpClass::DatacenterIta),
     cr(0x59BD3800, 0x59BD3FFF, IpClass::DatacenterIta),
     cr(0x59D54300, 0x59D543FF, IpClass::DatacenterIta),
-    // ── RESIDENTIAL ISPs ──
-    cr(0x59F96000, 0x59F96FFF, IpClass::ResidentialIta),
     // ── GOVERNMENT / INSTITUTIONAL ──
     cr(0x5A930000, 0x5A93FFFF, IpClass::GovIta),
     // ── RESIDENTIAL ISPs ──
@@ -599,15 +569,11 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x5B502E00, 0x5B502EFF, IpClass::ResidentialIta),
     cr(0x5B503000, 0x5B51FFFF, IpClass::ResidentialIta),
     // ── DATACENTER / HOSTING ──
-    cr(0x5B5A5800, 0x5B5A5EFF, IpClass::DatacenterIta),
     cr(0x5B620000, 0x5B63FFFF, IpClass::DatacenterIta),
     cr(0x5B6B8000, 0x5B6BFFFF, IpClass::DatacenterIta),
     cr(0x5B790000, 0x5B79FFFF, IpClass::DatacenterIta),
     cr(0x5B860000, 0x5B86FFFF, IpClass::DatacenterIta),
     cr(0x5BBEF000, 0x5BBEF7FF, IpClass::DatacenterIta),
-    // ── GOVERNMENT / INSTITUTIONAL ──
-    cr(0x5BC1E400, 0x5BC1E7FF, IpClass::GovIta),
-    // ── DATACENTER / HOSTING ──
     cr(0x5BC61300, 0x5BC613FF, IpClass::DatacenterIta),
     cr(0x5BC72000, 0x5BC720FF, IpClass::DatacenterIta),
     cr(0x5BC75300, 0x5BC753FF, IpClass::DatacenterIta),
@@ -616,12 +582,8 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x5BE07500, 0x5BE075FF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
     cr(0x5BE1F400, 0x5BE1F7FF, IpClass::ResidentialIta),
-    // ── GOVERNMENT / INSTITUTIONAL ──
-    cr(0x5BE54A00, 0x5BE54BFF, IpClass::GovIta),
-    // ── RESIDENTIAL ISPs ──
     cr(0x5BE6D900, 0x5BE6D9FF, IpClass::ResidentialIta),
     // ── DATACENTER / HOSTING ──
-    cr(0x5BE78400, 0x5BE784FF, IpClass::DatacenterIta),
     cr(0x5BEE5300, 0x5BEE54FF, IpClass::DatacenterIta),
     cr(0x5BEE7000, 0x5BEE70FF, IpClass::DatacenterIta),
     cr(0x5BF62600, 0x5BF626FF, IpClass::DatacenterIta),
@@ -650,12 +612,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x5D900000, 0x5D97FFFF, IpClass::ResidentialIta),
     // ── DATACENTER / HOSTING ──
     cr(0x5DAE6F00, 0x5DAE6FFF, IpClass::DatacenterIta),
-    // ── RESIDENTIAL ISPs ──
-    cr(0x5DB26000, 0x5DB263FF, IpClass::ResidentialIta),
-    cr(0x5DB26800, 0x5DB26BFF, IpClass::ResidentialIta),
-    cr(0x5DB27E00, 0x5DB27FFF, IpClass::ResidentialIta),
-    // ── DATACENTER / HOSTING ──
-    cr(0x5DBAE000, 0x5DBAFFFF, IpClass::DatacenterIta),
+    cr(0x5DBAF000, 0x5DBAFFFF, IpClass::DatacenterIta),
     cr(0x5E170000, 0x5E17AD5C, IpClass::DatacenterIta),
     cr(0x5E17AD5E, 0x5E17FFFF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
@@ -686,9 +643,7 @@ pub static RANGES: &[CidrEntry] = &[
     // ── DATACENTER / HOSTING ──
     cr(0x5F87A600, 0x5F87A7FF, IpClass::DatacenterIta),
     cr(0x5F8D2000, 0x5F8D2FFF, IpClass::DatacenterIta),
-    cr(0x5F8EC000, 0x5F8EC8FF, IpClass::DatacenterIta),
     cr(0x5FA95400, 0x5FA957FF, IpClass::DatacenterIta),
-    cr(0x5FD50000, 0x5FD57FFF, IpClass::DatacenterIta),
     cr(0x5FD80000, 0x5FD9FFFF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
     cr(0x5FE00000, 0x5FFFFFFF, IpClass::ResidentialIta),
@@ -735,9 +690,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x6D7A0F00, 0x6D7A0FFF, IpClass::DatacenterIta),
     cr(0x6D7A1400, 0x6D7A14FF, IpClass::DatacenterIta),
     cr(0x6D7A3A00, 0x6D7A3AFF, IpClass::DatacenterIta),
-    // ── RESIDENTIAL ISPs ──
-    cr(0x6DAC4000, 0x6DAC42FF, IpClass::ResidentialIta),
-    // ── DATACENTER / HOSTING ──
     cr(0x6DB02800, 0x6DB037FF, IpClass::DatacenterIta),
     cr(0x6DB09900, 0x6DB099FF, IpClass::DatacenterIta),
     cr(0x6DE85900, 0x6DE859FF, IpClass::DatacenterIta),
@@ -751,14 +703,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x80748000, 0x8074FFFF, IpClass::ResidentialIta),
     // ── DATACENTER / HOSTING ──
     cr(0x808C0000, 0x808C7FFF, IpClass::DatacenterIta),
-    // ── GOVERNMENT / INSTITUTIONAL ──
-    cr(0x81E90000, 0x81E97FFF, IpClass::GovIta),
-    cr(0x81E9A300, 0x81E9A3FF, IpClass::GovIta),
-    cr(0x81E9C500, 0x81E9C7FF, IpClass::GovIta),
-    cr(0x81E9CB00, 0x81E9CFFF, IpClass::GovIta),
-    cr(0x81E9D600, 0x81E9D7FF, IpClass::GovIta),
-    cr(0x81E9DA00, 0x81E9DFFF, IpClass::GovIta),
-    cr(0x81E9F000, 0x81E9FFFF, IpClass::GovIta),
     // ── RESIDENTIAL ISPs ──
     cr(0x82008000, 0x8200BFFF, IpClass::ResidentialIta),
     cr(0x82190000, 0x8219FFFF, IpClass::ResidentialIta),
@@ -799,7 +743,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x89533200, 0x895332FF, IpClass::DatacenterIta),
     // ── GOVERNMENT / INSTITUTIONAL ──
     cr(0x89CC0000, 0x89CCFFFF, IpClass::GovIta),
-    cr(0x89FB0000, 0x89FBFFFF, IpClass::GovIta),
     cr(0x8A290000, 0x8A29FFFF, IpClass::GovIta),
     // ── DATACENTER / HOSTING ──
     cr(0x8AC78000, 0x8AC7FFFF, IpClass::DatacenterIta),
@@ -958,22 +901,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x97F80E00, 0x97F80FFF, IpClass::DatacenterIta),
     cr(0x98E48000, 0x98E4FFFF, IpClass::DatacenterIta),
     cr(0x99347400, 0x993474FF, IpClass::DatacenterIta),
-    // ── GOVERNMENT / INSTITUTIONAL ──
-    cr(0x99600000, 0x99600AFF, IpClass::GovIta),
-    cr(0x99600C00, 0x99600FFF, IpClass::GovIta),
-    cr(0x99601200, 0x996013FF, IpClass::GovIta),
-    cr(0x99601800, 0x996018FF, IpClass::GovIta),
-    cr(0x99603600, 0x996037FF, IpClass::GovIta),
-    cr(0x99607000, 0x996071FF, IpClass::GovIta),
-    cr(0x99607E00, 0x99607FFF, IpClass::GovIta),
-    cr(0x99609000, 0x996091FF, IpClass::GovIta),
-    cr(0x9960DC00, 0x9960DFFF, IpClass::GovIta),
-    cr(0x9960F800, 0x9960FAFF, IpClass::GovIta),
-    cr(0x9960FD00, 0x9960FEFF, IpClass::GovIta),
-    cr(0x99610000, 0x996107FF, IpClass::GovIta),
-    cr(0x99610B00, 0x99610BFF, IpClass::GovIta),
-    cr(0x99611A00, 0x99611AFF, IpClass::GovIta),
-    // ── DATACENTER / HOSTING ──
     cr(0x9B02D500, 0x9B02D5FF, IpClass::DatacenterIta),
     cr(0x9B750500, 0x9B7506FF, IpClass::DatacenterIta),
     cr(0x9B750B00, 0x9B750BFF, IpClass::DatacenterIta),
@@ -1023,8 +950,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x9F450000, 0x9F45FFFF, IpClass::DatacenterIta),
     // ── GOVERNMENT / INSTITUTIONAL ──
     cr(0x9F950000, 0x9F95FFFF, IpClass::GovIta),
-    // ── RESIDENTIAL ISPs ──
-    cr(0x9FD50000, 0x9FD5FFFF, IpClass::ResidentialIta),
     // ── DATACENTER / HOSTING ──
     cr(0x9FFF9C00, 0x9FFF9FFF, IpClass::DatacenterIta),
     cr(0xA0149E00, 0xA0149FFF, IpClass::DatacenterIta),
@@ -1058,9 +983,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xA7EB0000, 0xA7EBFFFF, IpClass::DatacenterIta),
     cr(0xA7FD3E00, 0xA7FD3EFF, IpClass::DatacenterIta),
     cr(0xA8770000, 0xA877FFFF, IpClass::DatacenterIta),
-    // ── GOVERNMENT / INSTITUTIONAL ──
-    cr(0xA8CA0000, 0xA8CAFFFF, IpClass::GovIta),
-    // ── DATACENTER / HOSTING ──
     cr(0xA8DE2B00, 0xA8DE2BFF, IpClass::DatacenterIta),
     cr(0xA8DE3100, 0xA8DE31FF, IpClass::DatacenterIta),
     cr(0xA8DEB700, 0xA8DEB7FF, IpClass::DatacenterIta),
@@ -1118,7 +1040,6 @@ pub static RANGES: &[CidrEntry] = &[
     // ── DATACENTER / HOSTING ──
     cr(0xB90C2000, 0xB90C21FF, IpClass::DatacenterIta),
     cr(0xB90C4100, 0xB90C41FF, IpClass::DatacenterIta),
-    cr(0xB90F4400, 0xB90F47FF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
     cr(0xB9165400, 0xB91655FF, IpClass::ResidentialIta),
     // ── DATACENTER / HOSTING ──
@@ -1130,8 +1051,6 @@ pub static RANGES: &[CidrEntry] = &[
     // ── DATACENTER / HOSTING ──
     cr(0xB91DF800, 0xB91DFBFF, IpClass::DatacenterIta),
     cr(0xB91ED400, 0xB91ED5FF, IpClass::DatacenterIta),
-    cr(0xB920F800, 0xB920F8FF, IpClass::DatacenterIta),
-    cr(0xB920FA00, 0xB920FAFF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
     cr(0xB9244800, 0xB9244BFF, IpClass::ResidentialIta),
     cr(0xB92B1300, 0xB92B13FF, IpClass::ResidentialIta),
@@ -1143,7 +1062,6 @@ pub static RANGES: &[CidrEntry] = &[
     // ── RESIDENTIAL ISPs ──
     cr(0xB9362000, 0xB93623FF, IpClass::ResidentialIta),
     // ── DATACENTER / HOSTING ──
-    cr(0xB9365000, 0xB93653FF, IpClass::DatacenterIta),
     cr(0xB936D400, 0xB936D7FF, IpClass::DatacenterIta),
     cr(0xB9380800, 0xB9380BFF, IpClass::DatacenterIta),
     cr(0xB93A7400, 0xB93A77FF, IpClass::DatacenterIta),
@@ -1181,7 +1099,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xB97F1C00, 0xB97F1CFF, IpClass::DatacenterIta),
     cr(0xB981DC00, 0xB981DCFF, IpClass::DatacenterIta),
     cr(0xB981DE00, 0xB981DEFF, IpClass::DatacenterIta),
-    cr(0xB9834400, 0xB98345FF, IpClass::DatacenterIta),
     cr(0xB9854A00, 0xB9854AFF, IpClass::DatacenterIta),
     cr(0xB987BC00, 0xB987BCFF, IpClass::DatacenterIta),
     cr(0xB989B500, 0xB989B5FF, IpClass::DatacenterIta),
@@ -1287,12 +1204,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC01E7C00, 0xC01E7CFF, IpClass::DatacenterIta),
     // ── GOVERNMENT / INSTITUTIONAL ──
     cr(0xC029DA00, 0xC029DAFF, IpClass::GovIta),
-    cr(0xC02A3F00, 0xC02A40FF, IpClass::GovIta),
-    cr(0xC02C0000, 0xC02C03FF, IpClass::GovIta),
-    cr(0xC02C0A00, 0xC02C0AFF, IpClass::GovIta),
-    cr(0xC02C0D00, 0xC02C0DFF, IpClass::GovIta),
-    cr(0xC02C1100, 0xC02C11FF, IpClass::GovIta),
-    cr(0xC02C1800, 0xC02C18FF, IpClass::GovIta),
     cr(0xC0376500, 0xC03765FF, IpClass::GovIta),
     // ── DATACENTER / HOSTING ──
     cr(0xC0411400, 0xC04117FF, IpClass::DatacenterIta),
@@ -1308,8 +1219,6 @@ pub static RANGES: &[CidrEntry] = &[
     // ── DATACENTER / HOSTING ──
     cr(0xC05F0000, 0xC05F3FFF, IpClass::DatacenterIta),
     cr(0xC0630000, 0xC063FFFF, IpClass::DatacenterIta),
-    // ── GOVERNMENT / INSTITUTIONAL ──
-    cr(0xC066AB00, 0xC066ABFF, IpClass::GovIta),
     // ── RESIDENTIAL ISPs ──
     cr(0xC0681700, 0xC06817FF, IpClass::ResidentialIta),
     cr(0xC06A0000, 0xC06ABFFF, IpClass::ResidentialIta),
@@ -1349,8 +1258,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC1134C00, 0xC1134DFF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
     cr(0xC11B1C00, 0xC11B1FFF, IpClass::ResidentialIta),
-    // ── GOVERNMENT / INSTITUTIONAL ──
-    cr(0xC11CB100, 0xC11CB1FF, IpClass::GovIta),
     // ── DATACENTER / HOSTING ──
     cr(0xC121B000, 0xC121B1FF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
@@ -1368,7 +1275,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC12B1000, 0xC12B11FF, IpClass::ResidentialIta),
     // ── GOVERNMENT / INSTITUTIONAL ──
     cr(0xC12B1200, 0xC12B13FF, IpClass::GovIta),
-    cr(0xC12B2400, 0xC12B24FF, IpClass::GovIta),
     // ── RESIDENTIAL ISPs ──
     cr(0xC12B2C00, 0xC12B2FFF, IpClass::ResidentialIta),
     // ── GOVERNMENT / INSTITUTIONAL ──
@@ -1465,7 +1371,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC2F30000, 0xC2F3FFFF, IpClass::ResidentialIta),
     // ── DATACENTER / HOSTING ──
     cr(0xC3149200, 0xC31492FF, IpClass::DatacenterIta),
-    cr(0xC3153800, 0xC3153FFF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
     cr(0xC31F0000, 0xC31FFFFF, IpClass::ResidentialIta),
     cr(0xC3204400, 0xC32044FF, IpClass::ResidentialIta),
@@ -1519,14 +1424,12 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC6F48000, 0xC6F4FFFF, IpClass::DatacenterIta),
     cr(0xC6F53000, 0xC6F53FFF, IpClass::DatacenterIta),
     cr(0xC7078D00, 0xC7078DFF, IpClass::DatacenterIta),
-    // ── GOVERNMENT / INSTITUTIONAL ──
-    cr(0xC72E1400, 0xC72E15FF, IpClass::GovIta),
-    // ── DATACENTER / HOSTING ──
     cr(0xC730B200, 0xC730B2FF, IpClass::DatacenterIta),
     cr(0xC7A8C000, 0xC7A8C3FF, IpClass::DatacenterIta),
     cr(0xC7C18A00, 0xC7C18AFF, IpClass::DatacenterIta),
     cr(0xC7C38C00, 0xC7C38DFF, IpClass::DatacenterIta),
     cr(0xC7CC1800, 0xC7CC18FF, IpClass::DatacenterIta),
+    cr(0xC9044300, 0xC90443FF, IpClass::DatacenterIta),
     cr(0xC9830300, 0xC98303FF, IpClass::DatacenterIta),
     cr(0xCA023C00, 0xCA023FFF, IpClass::DatacenterIta),
     cr(0xCA5CD600, 0xCA5CD7FF, IpClass::DatacenterIta),
@@ -1646,7 +1549,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xD93D1800, 0xD93D3FFF, IpClass::DatacenterIta),
     cr(0xD93D7800, 0xD93D7FFF, IpClass::DatacenterIta),
     cr(0xD9414900, 0xD94149FF, IpClass::DatacenterIta),
-    cr(0xD9458400, 0xD94584FF, IpClass::DatacenterIta),
     cr(0xD9482000, 0xD94827FF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
     cr(0xD949D000, 0xD949D7FF, IpClass::ResidentialIta),
@@ -1691,8 +1593,6 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A006D40000000000000000000000000, 0x2A006D42FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
     cr6(0x2A006D44000000000000000000000000, 0x2A006D44FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
     cr6(0x2A0082E0000000000000000000000000, 0x2A0082E000FFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
-    cr6(0x2A00BDC0000000000000000000000000, 0x2A00BDC0DFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
-    cr6(0x2A00BDC1000000000000000000000000, 0x2A00BDC7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
     cr6(0x2A0104F8000000000000000000000000, 0x2A0104F9FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
     cr6(0x2A0104FFFF0100000000000000000000, 0x2A0104FFFF01FFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
@@ -1700,8 +1600,6 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A010820000000000000000000000000, 0x2A010820FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::ResidentialIta),
     cr6(0x2A010827000000000000000000000000, 0x2A010827FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::ResidentialIta),
     cr6(0x2A0108D0000000000000000000000000, 0x2A0108D0FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::ResidentialIta),
-    cr6(0x2A010E09000000000000000000000000, 0x2A010E09FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::ResidentialIta),
-    cr6(0x2A010E10000000000000000000000000, 0x2A010E13FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::ResidentialIta),
     cr6(0x2A012000000000000000000000000000, 0x2A012FFFFFFFFFFFFFFFFFFFFFFFFFFF, IpClass::ResidentialIta),
     // ── DATACENTER / HOSTING ──
     cr6(0x2A017540000000000000000000000000, 0x2A017540FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
@@ -1709,26 +1607,11 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A022420000000000000000000000000, 0x2A022420FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
     cr6(0x2A0229E0000100000000000000000000, 0x2A0229E00002FFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
     cr6(0x2A0229E2000000000000000000000000, 0x2A0229E2FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
-    cr6(0x2A024460000000000000000000000000, 0x2A024460FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
     cr6(0x2A024720000000000000000000000000, 0x2A024727FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
     cr6(0x2A024D80000000000000000000000000, 0x2A024D80FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
     // ── RESIDENTIAL ISPs ──
     cr6(0x2A02B000000000000000000000000000, 0x2A02B1FFFFFFFFFFFFFFFFFFFFFFFFFF, IpClass::ResidentialIta),
     cr6(0x2A038980000000000000000000000000, 0x2A038980FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::ResidentialIta),
-    // ── GOVERNMENT / INSTITUTIONAL ──
-    cr6(0x2A03DB801C1400000000000000000000, 0x2A03DB801C14FFFFFFFFFFFFFFFFFFFF, IpClass::GovIta),
-    cr6(0x2A03DB80440400000000000000000000, 0x2A03DB804404FFFFFFFFFFFFFFFFFFFF, IpClass::GovIta),
-    cr6(0x2A03DB80441000000000000000000000, 0x2A03DB804410FFFFFFFFFFFFFFFFFFFF, IpClass::GovIta),
-    cr6(0x2A03DB80441400000000000000000000, 0x2A03DB804414FFFFFFFFFFFFFFFFFFFF, IpClass::GovIta),
-    cr6(0x2A03DB80441600000000000000000000, 0x2A03DB804416FFFFFFFFFFFFFFFFFFFF, IpClass::GovIta),
-    cr6(0x2A03DB80442000000000000000000000, 0x2A03DB804420FFFFFFFFFFFFFFFFFFFF, IpClass::GovIta),
-    cr6(0x2A03DB80442400000000000000000000, 0x2A03DB804424FFFFFFFFFFFFFFFFFFFF, IpClass::GovIta),
-    cr6(0x2A03DB80443400000000000000000000, 0x2A03DB804434FFFFFFFFFFFFFFFFFFFF, IpClass::GovIta),
-    cr6(0x2A03DB80446000000000000000000000, 0x2A03DB804460FFFFFFFFFFFFFFFFFFFF, IpClass::GovIta),
-    cr6(0x2A03DB80447000000000000000000000, 0x2A03DB804470FFFFFFFFFFFFFFFFFFFF, IpClass::GovIta),
-    cr6(0x2A03DB80448000000000000000000000, 0x2A03DB804480FFFFFFFFFFFFFFFFFFFF, IpClass::GovIta),
-    cr6(0x2A03DB80448400000000000000000000, 0x2A03DB804484FFFFFFFFFFFFFFFFFFFF, IpClass::GovIta),
-    cr6(0x2A03DB80449400000000000000000000, 0x2A03DB804494FFFFFFFFFFFFFFFFFFFF, IpClass::GovIta),
     // ── DATACENTER / HOSTING ──
     cr6(0x2A03FF80000000000000000000000000, 0x2A03FF87FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
     cr6(0x2A042080000000000000000000000000, 0x2A042087FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
@@ -1749,8 +1632,6 @@ pub static RANGES6: &[CidrEntry6] = &[
     // ── DATACENTER / HOSTING ──
     cr6(0x2A11E980000000000000000000000000, 0x2A11E987FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
     cr6(0x2A122240000000000000000000000000, 0x2A122247FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
-    cr6(0x2A1425C5000000000000000000000000, 0x2A1425C5FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
-    cr6(0x2A1425C7000000000000000000000000, 0x2A1425C7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterIta),
 ];
 
 /// Const constructor — raw inclusive host-order u32 bounds.
