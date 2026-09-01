@@ -111,6 +111,7 @@ export default defineConfig({
           { text: 'CORS', link: '/config/cors' },
           { text: 'Authentication', link: '/config/auth' },
           { text: 'HTTP/3 (QUIC)', link: '/config/http3' },
+          { text: 'Sovereign Edge', link: '/config/sovereign' },
         ]
       },
       {

@@ -4,6 +4,7 @@
 //! DO NOT EDIT MANUALLY — changes will be overwritten by CI.
 //!
 //! Sources: RIPE NCC delegated stats + IPtoASN (Team Cymru), v4 + v6.
+//! Snapshot date: 2026-09-01 (curated-ASN holders validated against RIPEstat as-overview on this date — see the generator).
 
 use super::{CidrEntry, CidrEntry6, IpClass};
 
@@ -132,13 +133,14 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU RESIDENTIAL ISPs ──
     cr(0x02880000, 0x028FFFFF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
-    cr(0x02980600, 0x029807FF, IpClass::Eu),
-    cr(0x02981000, 0x029820FF, IpClass::Eu),
-    cr(0x02982200, 0x029827FF, IpClass::Eu),
-    cr(0x02982A00, 0x0298D7FF, IpClass::Eu),
+    cr(0x02981000, 0x02981FFF, IpClass::Eu),
+    cr(0x02982200, 0x029823FF, IpClass::Eu),
+    cr(0x02982A00, 0x029839FF, IpClass::Eu),
+    cr(0x02984000, 0x029848FF, IpClass::Eu),
+    cr(0x02984A00, 0x0298D7FF, IpClass::Eu),
     cr(0x0298E000, 0x0298F5FF, IpClass::Eu),
     cr(0x0298F700, 0x0298F7FF, IpClass::Eu),
-    cr(0x0298FA00, 0x0298FFFF, IpClass::Eu),
+    cr(0x0298FA00, 0x0298FAFF, IpClass::Eu),
     cr(0x029A0000, 0x029FFFFF, IpClass::Eu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0x02A00000, 0x02AFFFFF, IpClass::ResidentialEu),
@@ -877,20 +879,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x1F4D7800, 0x1F4D78FF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0x1F580000, 0x1F59FFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0x1F5F0000, 0x1F5F07FF, IpClass::GovEu),
-    cr(0x1F5F0E00, 0x1F5F1FFF, IpClass::GovEu),
-    cr(0x1F5F3000, 0x1F5F38FF, IpClass::GovEu),
-    cr(0x1F5F4000, 0x1F5F47FF, IpClass::GovEu),
-    cr(0x1F5F6000, 0x1F5F7FFF, IpClass::GovEu),
-    cr(0x1F5FA000, 0x1F5FAFFF, IpClass::GovEu),
-    cr(0x1F5FB800, 0x1F5FBFFF, IpClass::GovEu),
-    cr(0x1F5FD000, 0x1F5FD7FF, IpClass::GovEu),
-    cr(0x1F5FDA00, 0x1F5FDFFF, IpClass::GovEu),
-    cr(0x1F5FF000, 0x1F5FF3FF, IpClass::GovEu),
-    cr(0x1F5FF600, 0x1F5FFBFF, IpClass::GovEu),
-    cr(0x1F5FFE00, 0x1F5FFFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0x1F610000, 0x1F61FFFF, IpClass::Eu),
     cr(0x1F63C000, 0x1F63CCFF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
@@ -2263,9 +2251,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x2D8B2000, 0x2D8B27FF, IpClass::Eu),
     cr(0x2D8B2C00, 0x2D8B33FF, IpClass::Eu),
     cr(0x2D8B3800, 0x2D8B4BFF, IpClass::Eu),
-    // ── EU DATACENTER / CLOUD ──
-    cr(0x2D8B5400, 0x2D8B57FF, IpClass::DatacenterEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0x2D8B5800, 0x2D8B67FF, IpClass::Eu),
     cr(0x2D8B6900, 0x2D8B6BFF, IpClass::Eu),
     cr(0x2D8B7000, 0x2D8B79FF, IpClass::Eu),
@@ -2565,7 +2550,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x2D98AC00, 0x2D98AFFF, IpClass::Eu),
     cr(0x2D98B400, 0x2D98C3FF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
-    cr(0x2D98C700, 0x2D98C8FF, IpClass::DatacenterEu),
+    cr(0x2D98C700, 0x2D98C7FF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0x2D98CC00, 0x2D98CFFF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
@@ -2577,7 +2562,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x2D991000, 0x2D9913FF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
     cr(0x2D991500, 0x2D9915FF, IpClass::DatacenterEu),
-    cr(0x2D991700, 0x2D9917FF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0x2D991800, 0x2D991BFF, IpClass::Eu),
     cr(0x2D992000, 0x2D9923FF, IpClass::Eu),
@@ -3172,11 +3156,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x2EF76000, 0x2EF767FF, IpClass::Eu),
     cr(0x2EF76C00, 0x2EF76DFF, IpClass::Eu),
     cr(0x2EF78000, 0x2EF78DFF, IpClass::Eu),
-    cr(0x2EF79000, 0x2EF807FF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0x2EF80800, 0x2EF80BFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
-    cr(0x2EF80C00, 0x2EF81FFF, IpClass::Eu),
+    cr(0x2EF79000, 0x2EF81FFF, IpClass::Eu),
     cr(0x2EF84000, 0x2EF85FFF, IpClass::Eu),
     cr(0x2EF8A000, 0x2EF8BFFF, IpClass::Eu),
     cr(0x2EF92000, 0x2EF95FFF, IpClass::Eu),
@@ -3236,7 +3216,6 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU-27 BASELINE (country-level) ──
     cr(0x31EC0000, 0x31EC3FFF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
-    cr(0x32032600, 0x320326FF, IpClass::DatacenterEu),
     cr(0x3215B000, 0x3215BFFF, IpClass::DatacenterEu),
     cr(0x32725B00, 0x32725BFF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
@@ -3361,8 +3340,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x3E044000, 0x3E047FFF, IpClass::Eu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0x3E048000, 0x3E04FFFF, IpClass::ResidentialEu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0x3E050000, 0x3E057FFF, IpClass::GovEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0x3E080000, 0x3E083FFF, IpClass::Eu),
     cr(0x3E088000, 0x3E09FFFF, IpClass::Eu),
@@ -3479,9 +3456,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x3E645B00, 0x3E649FFF, IpClass::Eu),
     cr(0x3E64C000, 0x3E64CBFF, IpClass::Eu),
     cr(0x3E64D000, 0x3E657FFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0x3E660000, 0x3E667FFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0x3E669000, 0x3E669FFF, IpClass::Eu),
     cr(0x3E66C000, 0x3E67FFFF, IpClass::Eu),
     cr(0x3E6A0000, 0x3E6A3FFF, IpClass::Eu),
@@ -3553,9 +3527,6 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU-27 BASELINE (country-level) ──
     cr(0x3E858000, 0x3E859FFF, IpClass::Eu),
     cr(0x3E85C000, 0x3E85FFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0x3E860000, 0x3E86FFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0x3E878000, 0x3E87FFFF, IpClass::Eu),
     cr(0x3E8A0000, 0x3E8AFFFF, IpClass::Eu),
     cr(0x3E8C2000, 0x3E8C3FFF, IpClass::Eu),
@@ -3618,21 +3589,12 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x3EAB8000, 0x3EABBFFF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0x3EABE400, 0x3EABE7FF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0x3EAC0000, 0x3EAC07FF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0x3EAD0000, 0x3EAD1FFF, IpClass::Eu),
     cr(0x3EADA000, 0x3EADBFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0x3EADC000, 0x3EADFFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0x3EAE0000, 0x3EAFFFFF, IpClass::Eu),
     cr(0x3EB02000, 0x3EB0BFFF, IpClass::Eu),
     cr(0x3EB0E000, 0x3EB11FFF, IpClass::Eu),
     cr(0x3EB14000, 0x3EB3FFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0x3EB40000, 0x3EB4FFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0x3EB50000, 0x3EB51FFF, IpClass::Eu),
     cr(0x3EB54000, 0x3EB607FF, IpClass::Eu),
     cr(0x3EB62400, 0x3EB62FFF, IpClass::Eu),
@@ -4380,7 +4342,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x4E8F4000, 0x4E8FBFFF, IpClass::Eu),
     cr(0x4E980000, 0x4E989FFF, IpClass::Eu),
     cr(0x4E98C000, 0x4E98FFFF, IpClass::Eu),
-    cr(0x4E992000, 0x4E997FFF, IpClass::Eu),
+    cr(0x4E992000, 0x4E995FFF, IpClass::Eu),
     cr(0x4E99A000, 0x4E9A1FFF, IpClass::Eu),
     cr(0x4E9A4000, 0x4E9A5FFF, IpClass::Eu),
     cr(0x4E9A8000, 0x4E9A9FFF, IpClass::Eu),
@@ -4428,9 +4390,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x4F635000, 0x4F6357FF, IpClass::Eu),
     cr(0x4F636000, 0x4F6367FF, IpClass::Eu),
     cr(0x4F637000, 0x4F638FFF, IpClass::Eu),
-    // ── EU DATACENTER / CLOUD ──
-    cr(0x4F639200, 0x4F6392FF, IpClass::DatacenterEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0x4F639800, 0x4F63AFFF, IpClass::Eu),
     cr(0x4F63B800, 0x4F63BFFF, IpClass::Eu),
     cr(0x4F63C800, 0x4F63D7FF, IpClass::Eu),
@@ -4648,6 +4607,11 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x50240000, 0x5025FFFF, IpClass::Eu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0x50260000, 0x5027FFFF, IpClass::ResidentialEu),
+    // ── EU-27 BASELINE (country-level) ──
+    cr(0x502E8000, 0x502E9FFF, IpClass::Eu),
+    cr(0x502EE000, 0x502F1FFF, IpClass::Eu),
+    cr(0x502FC000, 0x502FCFFF, IpClass::Eu),
+    // ── EU RESIDENTIAL ISPs ──
     cr(0x50300000, 0x50334BFF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0x50334C00, 0x50334CFF, IpClass::Eu),
@@ -4931,7 +4895,8 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x509E7000, 0x509FDFFF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0x509FE000, 0x50A7FFFF, IpClass::Eu),
-    cr(0x50AA0000, 0x50AD8FFF, IpClass::Eu),
+    cr(0x50AA0000, 0x50AD75FF, IpClass::Eu),
+    cr(0x50AD7800, 0x50AD8FFF, IpClass::Eu),
     cr(0x50AD9800, 0x50AD9FFF, IpClass::Eu),
     cr(0x50ADAC00, 0x50ADAEFF, IpClass::Eu),
     cr(0x50ADB000, 0x50ADBFFF, IpClass::Eu),
@@ -4970,7 +4935,8 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x50D26000, 0x50D27FFF, IpClass::Eu),
     cr(0x50D30000, 0x50D3FFFF, IpClass::Eu),
     cr(0x50D60000, 0x50D9FFFF, IpClass::Eu),
-    cr(0x50DC0000, 0x50E0FDFF, IpClass::Eu),
+    cr(0x50DC0000, 0x50E0EDFF, IpClass::Eu),
+    cr(0x50E0EF00, 0x50E0FDFF, IpClass::Eu),
     cr(0x50E0FF00, 0x50E1FFFF, IpClass::Eu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0x50E20000, 0x50E2FFFF, IpClass::ResidentialEu),
@@ -5068,9 +5034,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x50FE8000, 0x50FE8FFF, IpClass::Eu),
     cr(0x50FEC000, 0x50FF0FFF, IpClass::Eu),
     cr(0x50FF7000, 0x50FF7FFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0x50FFA000, 0x50FFAFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
+    cr(0x50FFA000, 0x50FFAFFF, IpClass::Eu),
     cr(0x50FFE000, 0x51007FFF, IpClass::Eu),
     cr(0x5100C000, 0x5100D9FF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
@@ -5728,10 +5692,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x5288C000, 0x5288FFFF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0x52890000, 0x52897FFF, IpClass::Eu),
-    cr(0x528A8000, 0x528A9FFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0x528AA000, 0x528ABFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
+    cr(0x528A8000, 0x528ABFFF, IpClass::Eu),
     cr(0x528B0000, 0x528C3FFF, IpClass::Eu),
     cr(0x528C8000, 0x528CBFFF, IpClass::Eu),
     cr(0x528D0000, 0x528DFFFF, IpClass::Eu),
@@ -5753,9 +5714,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x52950000, 0x52957FFF, IpClass::Eu),
     cr(0x5295A000, 0x5295BFFF, IpClass::Eu),
     cr(0x5295E000, 0x5295FFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0x52960000, 0x52961FFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0x52962000, 0x52963FFF, IpClass::Eu),
     cr(0x52968000, 0x529697FF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
@@ -5967,6 +5925,14 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x538FF500, 0x5390BFFF, IpClass::Eu),
     cr(0x53910000, 0x5391FFFF, IpClass::Eu),
     cr(0x53928000, 0x53947FFF, IpClass::Eu),
+    // ── EU RESIDENTIAL ISPs ──
+    cr(0x53949000, 0x539493FF, IpClass::ResidentialEu),
+    cr(0x5394A200, 0x5394A2FF, IpClass::ResidentialEu),
+    cr(0x5394A500, 0x5394A7FF, IpClass::ResidentialEu),
+    cr(0x5394AE00, 0x5394AFFF, IpClass::ResidentialEu),
+    cr(0x5394B100, 0x5394B3FF, IpClass::ResidentialEu),
+    cr(0x5394BC00, 0x5394BCFF, IpClass::ResidentialEu),
+    // ── EU-27 BASELINE (country-level) ──
     cr(0x5394C000, 0x5394FFFF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
     cr(0x53954000, 0x53957FFF, IpClass::DatacenterEu),
@@ -6305,6 +6271,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x5508E400, 0x5508E4FF, IpClass::Eu),
     cr(0x5508E900, 0x5508E9FF, IpClass::Eu),
     cr(0x5508ED00, 0x5508EFFF, IpClass::Eu),
+    cr(0x5508F700, 0x5508F7FF, IpClass::Eu),
     cr(0x55090000, 0x55093FFF, IpClass::Eu),
     cr(0x5509C000, 0x5509E0FF, IpClass::Eu),
     cr(0x5509F000, 0x5509F7FF, IpClass::Eu),
@@ -6487,6 +6454,9 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x55BA0000, 0x55BB7FFF, IpClass::Eu),
     cr(0x55BBA000, 0x55BBD4FF, IpClass::Eu),
     cr(0x55BBD800, 0x55BCBFFF, IpClass::Eu),
+    // ── EU RESIDENTIAL ISPs ──
+    cr(0x55BDC100, 0x55BDC2FF, IpClass::ResidentialEu),
+    // ── EU-27 BASELINE (country-level) ──
     cr(0x55BE0000, 0x55BEEFFF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
     cr(0x55BEF000, 0x55BEF3FF, IpClass::DatacenterEu),
@@ -6879,7 +6849,6 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU DATACENTER / CLOUD ──
     cr(0x574C8900, 0x574C89FF, IpClass::DatacenterEu),
     cr(0x574C8C00, 0x574C8CFF, IpClass::DatacenterEu),
-    cr(0x574CAA00, 0x574CAAFF, IpClass::DatacenterEu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0x574CAC00, 0x574CACFF, IpClass::ResidentialEu),
     cr(0x574CAE00, 0x574CAFFF, IpClass::ResidentialEu),
@@ -7643,7 +7612,7 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU DATACENTER / CLOUD ──
     cr(0x597EE900, 0x597EE9FF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
-    cr(0x597EEA00, 0x597EF7FF, IpClass::Eu),
+    cr(0x597EEA00, 0x597EEFFF, IpClass::Eu),
     cr(0x597F0000, 0x597F7FFF, IpClass::Eu),
     cr(0x597FC000, 0x597FDFFF, IpClass::Eu),
     cr(0x597FEC00, 0x597FEFFF, IpClass::Eu),
@@ -7921,11 +7890,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x5B5A0000, 0x5B5A07FF, IpClass::Eu),
     cr(0x5B5A1800, 0x5B5A1FFF, IpClass::Eu),
     cr(0x5B5A3000, 0x5B5A3FFF, IpClass::Eu),
-    cr(0x5B5A4800, 0x5B5A57FF, IpClass::Eu),
-    // ── EU DATACENTER / CLOUD ──
-    cr(0x5B5A5800, 0x5B5A5EFF, IpClass::DatacenterEu),
-    // ── EU-27 BASELINE (country-level) ──
-    cr(0x5B5A5F00, 0x5B5A67FF, IpClass::Eu),
+    cr(0x5B5A4800, 0x5B5A67FF, IpClass::Eu),
     cr(0x5B5A7000, 0x5B5A7FFF, IpClass::Eu),
     cr(0x5B5A9000, 0x5B5AA1FF, IpClass::Eu),
     cr(0x5B5AA400, 0x5B5AA5FF, IpClass::Eu),
@@ -9146,9 +9111,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x5BDBB800, 0x5BDBBBFF, IpClass::Eu),
     cr(0x5BDBD000, 0x5BDBDBFF, IpClass::Eu),
     cr(0x5BDBEC00, 0x5BDBF7FF, IpClass::Eu),
-    // ── EU RESIDENTIAL ISPs ──
-    cr(0x5BDC0200, 0x5BDC02FF, IpClass::ResidentialEu),
-    // ── EU-27 BASELINE (country-level) ──
+    cr(0x5BDC0200, 0x5BDC02FF, IpClass::Eu),
     cr(0x5BDC0400, 0x5BDC04FF, IpClass::Eu),
     cr(0x5BDC0600, 0x5BDC0AFF, IpClass::Eu),
     cr(0x5BDC0D00, 0x5BDC15FF, IpClass::Eu),
@@ -9527,7 +9490,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x5BE64200, 0x5BE643FF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0x5BE64400, 0x5BE647FF, IpClass::Eu),
-    cr(0x5BE64A00, 0x5BE64EFF, IpClass::Eu),
+    cr(0x5BE64B00, 0x5BE64EFF, IpClass::Eu),
     cr(0x5BE65200, 0x5BE653FF, IpClass::Eu),
     cr(0x5BE65600, 0x5BE65AFF, IpClass::Eu),
     cr(0x5BE66000, 0x5BE660FF, IpClass::Eu),
@@ -11426,7 +11389,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x676F7000, 0x676F73FF, IpClass::Eu),
     cr(0x67703C00, 0x67703CFF, IpClass::Eu),
     cr(0x6770AA00, 0x6770ABFF, IpClass::Eu),
-    cr(0x67711D00, 0x67711DFF, IpClass::Eu),
     cr(0x6773B600, 0x6773B7FF, IpClass::Eu),
     cr(0x67757C00, 0x67757FFF, IpClass::Eu),
     cr(0x67793000, 0x677931FF, IpClass::Eu),
@@ -12330,8 +12292,6 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU-27 BASELINE (country-level) ──
     cr(0x84F3C600, 0x84F3FFFF, IpClass::Eu),
     // ── EU GOVERNMENT / RESEARCH ──
-    cr(0x84F44000, 0x84F44EFF, IpClass::GovEu),
-    cr(0x84F4F000, 0x84F4F0FF, IpClass::GovEu),
     cr(0x84FC0000, 0x84FCFFFF, IpClass::GovEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0x86000000, 0x86000FFF, IpClass::Eu),
@@ -12510,7 +12470,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x88ADD300, 0x88ADD4FF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0x88ADD500, 0x88ADFFFF, IpClass::Eu),
-    cr(0x88B0A000, 0x88B0DFFF, IpClass::Eu),
+    cr(0x88B0A000, 0x88B0FFFF, IpClass::Eu),
     cr(0x88C70000, 0x88C7FFFF, IpClass::Eu),
     cr(0x88C90000, 0x88C9FFFF, IpClass::Eu),
     cr(0x88CE0000, 0x88CEFFFF, IpClass::Eu),
@@ -12519,9 +12479,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x88E70000, 0x88E7FFFF, IpClass::GovEu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0x88EE1000, 0x88EE10FF, IpClass::ResidentialEu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0x88EE5400, 0x88EE55FF, IpClass::GovEu),
-    cr(0x88EEE000, 0x88EEE0FF, IpClass::GovEu),
     // ── EU DATACENTER / CLOUD ──
     cr(0x88F30000, 0x88F3B093, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
@@ -12706,7 +12663,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x8B630000, 0x8B63FFFF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0x8B640200, 0x8B640FFF, IpClass::Eu),
-    cr(0x8B641200, 0x8B641FFF, IpClass::Eu),
+    cr(0x8B641400, 0x8B641FFF, IpClass::Eu),
     cr(0x8B646200, 0x8B6462FF, IpClass::Eu),
     cr(0x8B64B000, 0x8B64BFFF, IpClass::Eu),
     cr(0x8B7A0000, 0x8B7CFFFF, IpClass::Eu),
@@ -13125,11 +13082,11 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x8F320000, 0x8F33FFFF, IpClass::Eu),
     cr(0x8F3A4000, 0x8F3A7FFF, IpClass::Eu),
     cr(0x8F5D0000, 0x8F5DFFFF, IpClass::Eu),
-    cr(0x8F630000, 0x8F63D4FF, IpClass::Eu),
+    cr(0x8F630000, 0x8F63D3FF, IpClass::Eu),
     // ── EU RESIDENTIAL ISPs ──
-    cr(0x8F63D500, 0x8F63D5FF, IpClass::ResidentialEu),
+    cr(0x8F63D400, 0x8F63D6FF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
-    cr(0x8F63D600, 0x8F63FFFF, IpClass::Eu),
+    cr(0x8F63D700, 0x8F63FFFF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
     cr(0x8F6D3600, 0x8F6D36FF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
@@ -13158,6 +13115,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x8FEF0000, 0x8FEFFFFF, IpClass::Eu),
     cr(0x8FF50000, 0x8FF5FFFF, IpClass::Eu),
     cr(0x8FF6A000, 0x8FF6A7FF, IpClass::Eu),
+    cr(0x8FF6F000, 0x8FF6F7FF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
     cr(0x90022000, 0x90023FFF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
@@ -13340,9 +13298,9 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU GOVERNMENT / RESEARCH ──
     cr(0x91640000, 0x916475FF, IpClass::GovEu),
     // ── EU-27 BASELINE (country-level) ──
-    cr(0x91647600, 0x916476FF, IpClass::Eu),
+    cr(0x91647600, 0x916477FF, IpClass::Eu),
     // ── EU GOVERNMENT / RESEARCH ──
-    cr(0x91647700, 0x9165FFFF, IpClass::GovEu),
+    cr(0x91647800, 0x9165FFFF, IpClass::GovEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0x91660000, 0x916601FF, IpClass::Eu),
     // ── EU GOVERNMENT / RESEARCH ──
@@ -13808,6 +13766,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x959C0000, 0x959DFFFF, IpClass::Eu),
     cr(0x95AA3A00, 0x95AA3BFF, IpClass::Eu),
     cr(0x95AA9000, 0x95AA91FF, IpClass::Eu),
+    cr(0x95AAE400, 0x95AAE4FF, IpClass::Eu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0x95AC0000, 0x95ACFFFF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
@@ -13900,7 +13859,8 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0x96F40000, 0x96F4FFFF, IpClass::GovEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0x96FB0000, 0x96FB0FFF, IpClass::Eu),
-    cr(0x96FB2000, 0x96FB37FF, IpClass::Eu),
+    cr(0x96FB2000, 0x96FB2DFF, IpClass::Eu),
+    cr(0x96FB3000, 0x96FB37FF, IpClass::Eu),
     cr(0x96FB3A00, 0x96FB47FF, IpClass::Eu),
     cr(0x96FB4C00, 0x96FB6FFF, IpClass::Eu),
     cr(0x96FB7C00, 0x96FB94FF, IpClass::Eu),
@@ -14691,6 +14651,7 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU-27 BASELINE (country-level) ──
     cr(0xA1740000, 0xA174FFFF, IpClass::Eu),
     cr(0xA1860000, 0xA186FFFF, IpClass::Eu),
+    cr(0xA191A800, 0xA191AFFF, IpClass::Eu),
     cr(0xA1930000, 0xA193FFFF, IpClass::Eu),
     cr(0xA19E0000, 0xA19EFFFF, IpClass::Eu),
     // ── EU RESIDENTIAL ISPs ──
@@ -14898,8 +14859,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xA6015A00, 0xA6015AFF, IpClass::DatacenterEu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0xA601F000, 0xA601F0FF, IpClass::ResidentialEu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xA6318000, 0xA631FFFF, IpClass::GovEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0xA66C8000, 0xA66CBFFF, IpClass::Eu),
     cr(0xA7115000, 0xA71157FF, IpClass::Eu),
@@ -15207,9 +15166,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xB0602000, 0xB0603FFF, IpClass::Eu),
     cr(0xB0605800, 0xB0607FFF, IpClass::Eu),
     cr(0xB0608800, 0xB0608BFF, IpClass::Eu),
-    // ── EU DATACENTER / CLOUD ──
-    cr(0xB0608C00, 0xB0608FFF, IpClass::DatacenterEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xB0609000, 0xB060B7FF, IpClass::Eu),
     cr(0xB060C000, 0xB060FFFF, IpClass::Eu),
     cr(0xB0610800, 0xB0611FFF, IpClass::Eu),
@@ -16063,9 +16019,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xB908EC00, 0xB908F7FF, IpClass::Eu),
     cr(0xB908FC00, 0xB90917FF, IpClass::Eu),
     cr(0xB9091C00, 0xB9091FFF, IpClass::Eu),
-    // ── EU DATACENTER / CLOUD ──
-    cr(0xB9093400, 0xB90934FF, IpClass::DatacenterEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xB9093500, 0xB90943FF, IpClass::Eu),
     cr(0xB9096000, 0xB90977FF, IpClass::Eu),
     cr(0xB9097C00, 0xB90987FF, IpClass::Eu),
@@ -16193,10 +16146,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xB90EFC00, 0xB90F03FF, IpClass::Eu),
     cr(0xB90F0800, 0xB90F23FF, IpClass::Eu),
     cr(0xB90F2C00, 0xB90F37FF, IpClass::Eu),
-    // ── EU DATACENTER / CLOUD ──
-    cr(0xB90F4400, 0xB90F47FF, IpClass::DatacenterEu),
-    // ── EU-27 BASELINE (country-level) ──
-    cr(0xB90F4800, 0xB90F53FF, IpClass::Eu),
+    cr(0xB90F4400, 0xB90F53FF, IpClass::Eu),
     cr(0xB90F5C00, 0xB90F5FFF, IpClass::Eu),
     cr(0xB90F6400, 0xB90F67FF, IpClass::Eu),
     cr(0xB90F6C00, 0xB90F6FFF, IpClass::Eu),
@@ -17489,7 +17439,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xB954B000, 0xB954B3FF, IpClass::Eu),
     cr(0xB954C400, 0xB954CFFF, IpClass::Eu),
     cr(0xB954D400, 0xB954DBFF, IpClass::Eu),
-    cr(0xB954E000, 0xB954E1FF, IpClass::Eu),
+    cr(0xB954E000, 0xB954E0FF, IpClass::Eu),
     cr(0xB954E300, 0xB954EBFF, IpClass::Eu),
     cr(0xB954F000, 0xB954F3FF, IpClass::Eu),
     cr(0xB954F800, 0xB95507FF, IpClass::Eu),
@@ -17641,9 +17591,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xB95DD400, 0xB95DD7FF, IpClass::Eu),
     cr(0xB95DE000, 0xB95DE3FF, IpClass::Eu),
     cr(0xB95DE800, 0xB95DF3FF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xB95E0000, 0xB95E03FF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xB95E0400, 0xB95E07FF, IpClass::Eu),
     cr(0xB95E0C00, 0xB95E0FFF, IpClass::Eu),
     cr(0xB95E1400, 0xB95E17FF, IpClass::Eu),
@@ -18447,6 +18394,9 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xB987BC00, 0xB987BCFF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0xB987BE00, 0xB987C5FF, IpClass::Eu),
+    // ── EU DATACENTER / CLOUD ──
+    cr(0xB987CA00, 0xB987CAFF, IpClass::DatacenterEu),
+    // ── EU-27 BASELINE (country-level) ──
     cr(0xB987CC00, 0xB987CFFF, IpClass::Eu),
     cr(0xB987D800, 0xB987DBFF, IpClass::Eu),
     cr(0xB987E000, 0xB987E3FF, IpClass::Eu),
@@ -20868,11 +20818,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xB9F8BC00, 0xB9F8BFFF, IpClass::Eu),
     cr(0xB9F8C400, 0xB9F8DBFF, IpClass::Eu),
     cr(0xB9F8E300, 0xB9F8F7FF, IpClass::Eu),
-    cr(0xB9F90000, 0xB9F903FF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xB9F90400, 0xB9F904FF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
-    cr(0xB9F90500, 0xB9F907FF, IpClass::Eu),
+    cr(0xB9F90000, 0xB9F907FF, IpClass::Eu),
     cr(0xB9F90C00, 0xB9F923FF, IpClass::Eu),
     cr(0xB9F92800, 0xB9F937FF, IpClass::Eu),
     cr(0xB9F93C00, 0xB9F943FF, IpClass::Eu),
@@ -20889,7 +20835,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xB9F9C400, 0xB9F9C7FF, IpClass::Eu),
     cr(0xB9F9CC00, 0xB9F9D3FF, IpClass::Eu),
     cr(0xB9F9D800, 0xB9F9DCFF, IpClass::Eu),
-    cr(0xB9F9DE00, 0xB9F9E0FF, IpClass::Eu),
+    cr(0xB9F9E000, 0xB9F9E0FF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
     cr(0xB9F9E100, 0xB9F9E1FF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
@@ -21546,7 +21492,6 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU DATACENTER / CLOUD ──
     cr(0xC01E7C00, 0xC01E7CFF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
-    cr(0xC01F0E00, 0xC01F0EFF, IpClass::Eu),
     cr(0xC01F1700, 0xC01F17FF, IpClass::Eu),
     cr(0xC01F1B00, 0xC01F1BFF, IpClass::Eu),
     cr(0xC01F2800, 0xC01F28FF, IpClass::Eu),
@@ -22178,11 +22123,7 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU GOVERNMENT / RESEARCH ──
     cr(0xC06D3000, 0xC06D30FF, IpClass::GovEu),
     // ── EU-27 BASELINE (country-level) ──
-    cr(0xC06D3100, 0xC06D33FF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xC06D3400, 0xC06D34FF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
-    cr(0xC06D3500, 0xC06D35FF, IpClass::Eu),
+    cr(0xC06D3100, 0xC06D35FF, IpClass::Eu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0xC06D3600, 0xC06D36FF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
@@ -22654,8 +22595,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC0A6FC00, 0xC0A6FFFF, IpClass::Eu),
     // ── EU GOVERNMENT / RESEARCH ──
     cr(0xC0A70000, 0xC0A7FFFF, IpClass::GovEu),
-    // ── EU RESIDENTIAL ISPs ──
-    cr(0xC0AA0100, 0xC0AA01FF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0xC0AB0100, 0xC0AB05FF, IpClass::Eu),
     cr(0xC0ACE800, 0xC0ACE8FF, IpClass::Eu),
@@ -23074,7 +23013,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC1185000, 0xC11857FF, IpClass::GovEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0xC1185800, 0xC11860FF, IpClass::Eu),
-    cr(0xC1186200, 0xC11862FF, IpClass::Eu),
     cr(0xC1186400, 0xC11864FF, IpClass::Eu),
     cr(0xC1186800, 0xC11868FF, IpClass::Eu),
     cr(0xC1186A00, 0xC1186CFF, IpClass::Eu),
@@ -24013,11 +23951,7 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU RESIDENTIAL ISPs ──
     cr(0xC161B000, 0xC161BAFF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
-    cr(0xC161BB00, 0xC161EDFF, IpClass::Eu),
-    // ── EU RESIDENTIAL ISPs ──
-    cr(0xC161EE00, 0xC161EEFF, IpClass::ResidentialEu),
-    // ── EU-27 BASELINE (country-level) ──
-    cr(0xC161EF00, 0xC162B4FF, IpClass::Eu),
+    cr(0xC161BB00, 0xC162B4FF, IpClass::Eu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0xC162B500, 0xC162B5FF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
@@ -24936,10 +24870,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC1B0EE00, 0xC1B0EEFF, IpClass::Eu),
     cr(0xC1B0F400, 0xC1B0F7FF, IpClass::Eu),
     cr(0xC1B0FC00, 0xC1B17FFF, IpClass::Eu),
-    // ── EU RESIDENTIAL ISPs ──
-    cr(0xC1B18C00, 0xC1B193FF, IpClass::ResidentialEu),
-    // ── EU-27 BASELINE (country-level) ──
-    cr(0xC1B19400, 0xC1B1AFFF, IpClass::Eu),
+    cr(0xC1B18C00, 0xC1B1AFFF, IpClass::Eu),
     // ── EU GOVERNMENT / RESEARCH ──
     cr(0xC1B1B000, 0xC1B1B3FF, IpClass::GovEu),
     // ── EU-27 BASELINE (country-level) ──
@@ -26027,8 +25958,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC2213200, 0xC22132FF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0xC2213300, 0xC22133FF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xC2213500, 0xC22137FF, IpClass::GovEu),
     // ── EU DATACENTER / CLOUD ──
     cr(0xC2213E00, 0xC2213EFF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
@@ -26087,7 +26016,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC223B800, 0xC223B9FF, IpClass::Eu),
     cr(0xC223BB00, 0xC223BDFF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
-    cr(0xC223E000, 0xC223E2FF, IpClass::DatacenterEu),
+    cr(0xC223E000, 0xC223E1FF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0xC223EC00, 0xC223EFFF, IpClass::Eu),
     cr(0xC223F200, 0xC223F3FF, IpClass::Eu),
@@ -26339,7 +26268,8 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC230D800, 0xC230D9FF, IpClass::Eu),
     cr(0xC230DB00, 0xC230E7FF, IpClass::Eu),
     cr(0xC230EC00, 0xC230F3FF, IpClass::Eu),
-    cr(0xC230F800, 0xC23103FF, IpClass::Eu),
+    cr(0xC230F800, 0xC230FEFF, IpClass::Eu),
+    cr(0xC2310000, 0xC23103FF, IpClass::Eu),
     cr(0xC2310600, 0xC2310BFF, IpClass::Eu),
     cr(0xC2311200, 0xC2312FFF, IpClass::Eu),
     // ── EU RESIDENTIAL ISPs ──
@@ -26394,10 +26324,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC2328400, 0xC2328AFF, IpClass::Eu),
     cr(0xC2328C00, 0xC2328CFF, IpClass::Eu),
     cr(0xC2329700, 0xC23297FF, IpClass::Eu),
-    cr(0xC2329B00, 0xC2329FFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xC232A000, 0xC232A0FF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
+    cr(0xC2329B00, 0xC232A0FF, IpClass::Eu),
     cr(0xC232A200, 0xC232A4FF, IpClass::Eu),
     cr(0xC232A600, 0xC232A6FF, IpClass::Eu),
     cr(0xC232A800, 0xC232A8FF, IpClass::Eu),
@@ -26678,9 +26605,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC245E200, 0xC245FCFF, IpClass::Eu),
     cr(0xC245FE00, 0xC245FFFF, IpClass::Eu),
     cr(0xC2470000, 0xC247FFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xC24A5000, 0xC24A57FF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xC24C0200, 0xC24C0EFF, IpClass::Eu),
     cr(0xC24C1300, 0xC24C19FF, IpClass::Eu),
     cr(0xC24C1D00, 0xC24C1DFF, IpClass::Eu),
@@ -26691,11 +26615,7 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU DATACENTER / CLOUD ──
     cr(0xC24C2400, 0xC24C25FF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
-    cr(0xC24C2600, 0xC24C27FF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xC24C2800, 0xC24C28FF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
-    cr(0xC24C2900, 0xC24C2AFF, IpClass::Eu),
+    cr(0xC24C2600, 0xC24C2AFF, IpClass::Eu),
     // ── EU GOVERNMENT / RESEARCH ──
     cr(0xC24C2B00, 0xC24C2BFF, IpClass::GovEu),
     // ── EU-27 BASELINE (country-level) ──
@@ -26735,7 +26655,7 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU RESIDENTIAL ISPs ──
     cr(0xC24CD100, 0xC24CD1FF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
-    cr(0xC24CD200, 0xC24CD3FF, IpClass::Eu),
+    cr(0xC24CD200, 0xC24CD2FF, IpClass::Eu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0xC24CD400, 0xC24CD7FF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
@@ -26902,10 +26822,7 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU RESIDENTIAL ISPs ──
     cr(0xC26B5400, 0xC26B5BFF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
-    cr(0xC26B5D00, 0xC26B71FF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xC26B7200, 0xC26B72FF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
+    cr(0xC26B5D00, 0xC26B72FF, IpClass::Eu),
     cr(0xC26B7700, 0xC26B7BFF, IpClass::Eu),
     cr(0xC26B7E00, 0xC26B97FF, IpClass::Eu),
     // ── EU RESIDENTIAL ISPs ──
@@ -27488,7 +27405,8 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC2998300, 0xC29986FF, IpClass::Eu),
     cr(0xC2999100, 0xC29993FF, IpClass::Eu),
     cr(0xC2999600, 0xC299987F, IpClass::Eu),
-    cr(0xC2999B00, 0xC2999D7F, IpClass::Eu),
+    cr(0xC2999B00, 0xC2999BFF, IpClass::Eu),
+    cr(0xC2999C40, 0xC2999D7F, IpClass::Eu),
     cr(0xC2999DC0, 0xC2999E7F, IpClass::Eu),
     cr(0xC2999F00, 0xC2999F7F, IpClass::Eu),
     cr(0xC2999FC0, 0xC299A7FF, IpClass::Eu),
@@ -27837,9 +27755,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC2D51800, 0xC2D518FF, IpClass::Eu),
     cr(0xC2D51A00, 0xC2D51BFF, IpClass::Eu),
     cr(0xC2D51D00, 0xC2D53FFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xC2D54000, 0xC2D55FFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xC2D56200, 0xC2D565FF, IpClass::Eu),
     cr(0xC2D56D00, 0xC2D56DFF, IpClass::Eu),
     cr(0xC2D57000, 0xC2D573FF, IpClass::Eu),
@@ -28200,11 +28115,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC3237200, 0xC32373FF, IpClass::Eu),
     cr(0xC3237600, 0xC32377FF, IpClass::Eu),
     cr(0xC3237A00, 0xC3237AFF, IpClass::Eu),
-    cr(0xC3237E00, 0xC32451FF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xC3245200, 0xC32452FF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
-    cr(0xC3245300, 0xC32459FF, IpClass::Eu),
+    cr(0xC3237E00, 0xC32459FF, IpClass::Eu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0xC3245A00, 0xC3245BFF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
@@ -28423,10 +28334,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC33C5F00, 0xC33C5F7F, IpClass::Eu),
     cr(0xC33C6000, 0xC33CA3FF, IpClass::Eu),
     cr(0xC33CAA00, 0xC33CAAFF, IpClass::Eu),
-    cr(0xC33CB000, 0xC33CB5FF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xC33CB600, 0xC33CB7FF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
+    cr(0xC33CB000, 0xC33CB7FF, IpClass::Eu),
     cr(0xC33CBA00, 0xC33CBFFF, IpClass::Eu),
     cr(0xC33CCC00, 0xC33CCFFF, IpClass::Eu),
     cr(0xC33CD400, 0xC33CDBFF, IpClass::Eu),
@@ -28477,10 +28385,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC3421E00, 0xC3421FFF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0xC3422000, 0xC34240FF, IpClass::Eu),
-    cr(0xC3424400, 0xC34245FF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xC3424600, 0xC34246FF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
+    cr(0xC3424400, 0xC34246FF, IpClass::Eu),
     cr(0xC3424900, 0xC3424CFF, IpClass::Eu),
     cr(0xC3425000, 0xC34250FF, IpClass::Eu),
     cr(0xC3425200, 0xC34252FF, IpClass::Eu),
@@ -28740,9 +28645,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC358F600, 0xC358F7FF, IpClass::Eu),
     cr(0xC358FA00, 0xC358FBFF, IpClass::Eu),
     cr(0xC35A0000, 0xC35A1FFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xC35A4000, 0xC35A5FFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xC35A6200, 0xC35A6BFF, IpClass::Eu),
     cr(0xC35A6E00, 0xC35A6FFF, IpClass::Eu),
     cr(0xC35A7200, 0xC35A77FF, IpClass::Eu),
@@ -28800,7 +28702,8 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC35FE000, 0xC35FE7FF, IpClass::Eu),
     cr(0xC35FEA00, 0xC35FEBFF, IpClass::Eu),
     cr(0xC35FED00, 0xC35FF8FF, IpClass::Eu),
-    cr(0xC35FFE00, 0xC3603FFF, IpClass::Eu),
+    cr(0xC35FFE00, 0xC36027FF, IpClass::Eu),
+    cr(0xC3603000, 0xC3603FFF, IpClass::Eu),
     cr(0xC3606000, 0xC3607FFF, IpClass::Eu),
     cr(0xC3608100, 0xC36081FF, IpClass::Eu),
     cr(0xC3608400, 0xC36085FF, IpClass::Eu),
@@ -28822,8 +28725,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC362E700, 0xC362E8FF, IpClass::Eu),
     // ── EU GOVERNMENT / RESEARCH ──
     cr(0xC362E900, 0xC362FFFF, IpClass::GovEu),
-    cr(0xC3634000, 0xC3634FFF, IpClass::GovEu),
-    cr(0xC3640000, 0xC364FFFF, IpClass::GovEu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0xC3650000, 0xC3653FFF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
@@ -28941,6 +28842,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC389C600, 0xC389C7FF, IpClass::Eu),
     cr(0xC389CC00, 0xC389CDFF, IpClass::Eu),
     cr(0xC389D000, 0xC389D5FF, IpClass::Eu),
+    cr(0xC389D700, 0xC389D7FF, IpClass::Eu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0xC389D800, 0xC389D9FF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
@@ -28968,7 +28870,8 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC38C0000, 0xC38C8FFF, IpClass::Eu),
     cr(0xC38C9400, 0xC38C9FFF, IpClass::Eu),
     cr(0xC38CAC00, 0xC38CAFFF, IpClass::Eu),
-    cr(0xC38CB800, 0xC38CC3FF, IpClass::Eu),
+    cr(0xC38CB800, 0xC38CBDFF, IpClass::Eu),
+    cr(0xC38CBF00, 0xC38CC3FF, IpClass::Eu),
     cr(0xC38CC800, 0xC38CCBFF, IpClass::Eu),
     cr(0xC38CD000, 0xC38CD3FF, IpClass::Eu),
     cr(0xC38CDC00, 0xC38CDFFF, IpClass::Eu),
@@ -29082,9 +28985,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC3A25400, 0xC3A257FF, IpClass::Eu),
     cr(0xC3A25C00, 0xC3A25FFF, IpClass::Eu),
     cr(0xC3A2C000, 0xC3A2DFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xC3A30000, 0xC3A3FFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xC3A40000, 0xC3A5FFFF, IpClass::Eu),
     cr(0xC3A70000, 0xC3A77FFF, IpClass::Eu),
     cr(0xC3A79000, 0xC3A79FFF, IpClass::Eu),
@@ -29106,8 +29006,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC3AAB100, 0xC3AAB2FF, IpClass::Eu),
     cr(0xC3AAB500, 0xC3AAB9FF, IpClass::Eu),
     cr(0xC3AABB00, 0xC3AABFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xC3AB2400, 0xC3AB27FF, IpClass::GovEu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0xC3AC0000, 0xC3AC5FFF, IpClass::ResidentialEu),
     cr(0xC3ACE000, 0xC3ACFFFF, IpClass::ResidentialEu),
@@ -29160,9 +29058,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC3B63A00, 0xC3B63AFF, IpClass::Eu),
     cr(0xC3B63C00, 0xC3B63DFF, IpClass::Eu),
     cr(0xC3B64000, 0xC3B65FFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xC3B66000, 0xC3B67FFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xC3B6C400, 0xC3B6C9FF, IpClass::Eu),
     cr(0xC3B6CC00, 0xC3B6D3FF, IpClass::Eu),
     cr(0xC3B6D800, 0xC3B6DDFF, IpClass::Eu),
@@ -29721,9 +29616,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC685CE00, 0xC685CEFF, IpClass::Eu),
     cr(0xC687DC00, 0xC687DCFF, IpClass::Eu),
     cr(0xC6A09800, 0xC6A098FF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xC6B2EC00, 0xC6B2ECFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xC6B49600, 0xC6B499FF, IpClass::Eu),
     cr(0xC6CA1D00, 0xC6CA1DFF, IpClass::Eu),
     cr(0xC6CBC600, 0xC6CBC7FF, IpClass::Eu),
@@ -29740,6 +29632,7 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU DATACENTER / CLOUD ──
     cr(0xC7078D00, 0xC7078DFF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
+    cr(0xC7134C00, 0xC7134DFF, IpClass::Eu),
     cr(0xC7224200, 0xC72242FF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
     cr(0xC72FF100, 0xC72FF2FF, IpClass::DatacenterEu),
@@ -29784,7 +29677,11 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xC8EAE000, 0xC8EAEFFF, IpClass::Eu),
     cr(0xC9037000, 0xC9037FFF, IpClass::Eu),
     cr(0xC903E000, 0xC903EFFF, IpClass::Eu),
-    cr(0xC9044000, 0xC9044FFF, IpClass::Eu),
+    cr(0xC9044000, 0xC90442FF, IpClass::Eu),
+    // ── EU DATACENTER / CLOUD ──
+    cr(0xC9044300, 0xC90443FF, IpClass::DatacenterEu),
+    // ── EU-27 BASELINE (country-level) ──
+    cr(0xC9044400, 0xC9044FFF, IpClass::Eu),
     cr(0xC9071000, 0xC9071FFF, IpClass::Eu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0xC90EE000, 0xC90EE0FF, IpClass::ResidentialEu),
@@ -29865,6 +29762,7 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xCB1C0800, 0xCB1C09FF, IpClass::Eu),
     cr(0xCB1C0F00, 0xCB1C0FFF, IpClass::Eu),
     cr(0xCB1D3500, 0xCB1D35FF, IpClass::Eu),
+    cr(0xCB1E2100, 0xCB1E21FF, IpClass::Eu),
     cr(0xCB1F2800, 0xCB1F28FF, IpClass::Eu),
     cr(0xCB1F6700, 0xCB1F67FF, IpClass::Eu),
     cr(0xCB1FD900, 0xCB1FD9FF, IpClass::Eu),
@@ -29880,12 +29778,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xCB4EA600, 0xCB4EA7FF, IpClass::Eu),
     cr(0xCB586000, 0xCB5863FF, IpClass::Eu),
     cr(0xCB624300, 0xCB6243FF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xCB9E4400, 0xCB9E45FF, IpClass::GovEu),
-    cr(0xCB9E4800, 0xCB9E49FF, IpClass::GovEu),
-    cr(0xCB9E4C00, 0xCB9E4DFF, IpClass::GovEu),
-    cr(0xCB9E5800, 0xCB9E59FF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xCB9F5000, 0xCB9F5FFF, IpClass::Eu),
     cr(0xCBAB4000, 0xCBAB5FFF, IpClass::Eu),
     cr(0xCBBCA000, 0xCBBCBFFF, IpClass::Eu),
@@ -29897,8 +29789,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xCC1D9200, 0xCC1D92FF, IpClass::DatacenterEu),
     // ── EU RESIDENTIAL ISPs ──
     cr(0xCC347000, 0xCC347FFF, IpClass::ResidentialEu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xCC34BC00, 0xCC34BCFF, IpClass::GovEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0xCC39DC00, 0xCC39DCFF, IpClass::Eu),
     cr(0xCC4BE500, 0xCC4BE5FF, IpClass::Eu),
@@ -29928,9 +29818,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xCDEAB000, 0xCDEAB0FF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0xCDED6800, 0xCDED6FFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xCE490000, 0xCE49FFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xCE7C6800, 0xCE7C6FFF, IpClass::Eu),
     cr(0xCEA84800, 0xCEA84FFF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
@@ -30083,9 +29970,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xD4080700, 0xD4081FFF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0xD4084000, 0xD4089FFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xD408A000, 0xD408BFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xD408C000, 0xD408DFFF, IpClass::Eu),
     cr(0xD408F000, 0xD408F0FF, IpClass::Eu),
     cr(0xD408F200, 0xD408F6FF, IpClass::Eu),
@@ -30140,9 +30024,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xD414A000, 0xD414BFFF, IpClass::Eu),
     cr(0xD4154000, 0xD4155FFF, IpClass::Eu),
     cr(0xD4158000, 0xD415BFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xD415C000, 0xD415DFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xD415E000, 0xD415FFFF, IpClass::Eu),
     cr(0xD4162000, 0xD4163FFF, IpClass::Eu),
     cr(0xD4166000, 0xD4169FFF, IpClass::Eu),
@@ -30176,9 +30057,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xD41E4000, 0xD41E7FFF, IpClass::Eu),
     cr(0xD41F2000, 0xD41F7FFF, IpClass::Eu),
     cr(0xD41FA000, 0xD41FBFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xD41FC000, 0xD41FDFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xD4200000, 0xD42017FF, IpClass::Eu),
     cr(0xD4202D00, 0xD4202DFF, IpClass::Eu),
     cr(0xD4203000, 0xD42033FF, IpClass::Eu),
@@ -30203,9 +30081,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xD4284000, 0xD4287FFF, IpClass::Eu),
     cr(0xD428A000, 0xD428BFFF, IpClass::Eu),
     cr(0xD428E000, 0xD428FFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xD4298000, 0xD4299FFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xD429E000, 0xD429FFFF, IpClass::Eu),
     cr(0xD42AE000, 0xD42AFFFF, IpClass::Eu),
     cr(0xD42B2000, 0xD42B7FFF, IpClass::Eu),
@@ -30427,9 +30302,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xD46B1000, 0xD46B13FF, IpClass::Eu),
     cr(0xD46B2000, 0xD46B5FFF, IpClass::Eu),
     cr(0xD46B8000, 0xD46BBFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xD46C0000, 0xD46C1FFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xD46C2000, 0xD46C3FFF, IpClass::Eu),
     cr(0xD46C5200, 0xD46C53FF, IpClass::Eu),
     cr(0xD46C6000, 0xD46C60FF, IpClass::Eu),
@@ -30492,9 +30364,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xD47D6000, 0xD47D8FFF, IpClass::Eu),
     cr(0xD47E0000, 0xD47E5FFF, IpClass::Eu),
     cr(0xD47EC000, 0xD47EDFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xD47F0000, 0xD47F1FFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xD47F2000, 0xD47F5FFF, IpClass::Eu),
     cr(0xD47F8000, 0xD47FFFFF, IpClass::Eu),
     // ── EU GOVERNMENT / RESEARCH ──
@@ -30546,9 +30415,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xD4A28C00, 0xD4A28FFF, IpClass::Eu),
     cr(0xD4A29800, 0xD4A29BFF, IpClass::Eu),
     cr(0xD4A2A000, 0xD4A2BFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xD4A2C000, 0xD4A2FFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xD4A30000, 0xD4A3FFFF, IpClass::Eu),
     cr(0xD4A52000, 0xD4A6FFFF, IpClass::Eu),
     cr(0xD4A98000, 0xD4A9FFFF, IpClass::Eu),
@@ -30745,9 +30611,6 @@ pub static RANGES: &[CidrEntry] = &[
     // ── EU-27 BASELINE (country-level) ──
     cr(0xD50B0000, 0xD50BFFFF, IpClass::Eu),
     cr(0xD50D0000, 0xD50DFFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xD50F0000, 0xD50FFFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xD5102000, 0xD5113FFF, IpClass::Eu),
     cr(0xD5118000, 0xD511FFFF, IpClass::Eu),
     cr(0xD5130000, 0xD5137FFF, IpClass::Eu),
@@ -30944,9 +30807,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xD5899D00, 0xD5899DFF, IpClass::ResidentialEu),
     // ── EU-27 BASELINE (country-level) ──
     cr(0xD5899E00, 0xD5899FFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xD589A000, 0xD589BFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xD589C000, 0xD589DFFF, IpClass::Eu),
     cr(0xD58A0000, 0xD58A3FFF, IpClass::Eu),
     cr(0xD58A8000, 0xD58A9FFF, IpClass::Eu),
@@ -31149,9 +31009,6 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xD5C1C300, 0xD5C1EAFF, IpClass::Eu),
     cr(0xD5C1EC00, 0xD5C1EDFF, IpClass::Eu),
     cr(0xD5C1F000, 0xD5C1F9FF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xD5C20000, 0xD5C23FFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xD5C28000, 0xD5C2FFFF, IpClass::Eu),
     cr(0xD5C31800, 0xD5C31FFF, IpClass::Eu),
     cr(0xD5C34000, 0xD5C43FFF, IpClass::Eu),
@@ -31259,14 +31116,12 @@ pub static RANGES: &[CidrEntry] = &[
     cr(0xD5EB4000, 0xD5EC04FF, IpClass::Eu),
     cr(0xD5EC0700, 0xD5EC07FF, IpClass::Eu),
     cr(0xD5EC1000, 0xD5EC1FFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr(0xD5EC4000, 0xD5EC7FFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr(0xD5ED0000, 0xD5EDBFFF, IpClass::Eu),
     cr(0xD5EE2000, 0xD5EE7FFF, IpClass::Eu),
     cr(0xD5EEC000, 0xD5EF3FFF, IpClass::Eu),
     cr(0xD5EF8000, 0xD5EF88FF, IpClass::Eu),
-    cr(0xD5EF8A00, 0xD5EF9AFF, IpClass::Eu),
+    cr(0xD5EF8A00, 0xD5EF8FFF, IpClass::Eu),
+    cr(0xD5EF9800, 0xD5EF9AFF, IpClass::Eu),
     cr(0xD5EF9C00, 0xD5EFBFFF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
     cr(0xD5EFC000, 0xD5EFD8DD, IpClass::DatacenterEu),
@@ -32007,7 +31862,6 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x20010678021000000000000000000000, 0x200106780210FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x20010678021400000000000000000000, 0x200106780214FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x20010678021C00000000000000000000, 0x20010678021CFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
-    cr6(0x20010678022400000000000000000000, 0x200106780224FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x20010678022800000000000000000000, 0x200106780228FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x20010678022C00000000000000000000, 0x20010678022CFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x20010678023000000000000000000000, 0x200106780230FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -32561,6 +32415,7 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x200106780F6400000000000000000000, 0x200106780F64FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x200106780F7000000000000000000000, 0x200106780F70FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x200106780F7400000000000000000000, 0x200106780F74FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
+    cr6(0x200106780F7800000000000000000000, 0x200106780F78FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x200106780F8000000000000000000000, 0x200106780F80FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x200106780F8400000000000000000000, 0x200106780F84FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x200106780F8800000000000000000000, 0x200106780F88FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -32609,6 +32464,7 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x20010678104800000000000000000000, 0x200106781048FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x20010678104C00000000000000000000, 0x20010678104CFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x20010678105000000000000000000000, 0x200106781050FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
+    cr6(0x20010678105C00000000000000000000, 0x20010678105CFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x20010678106400000000000000000000, 0x200106781064FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x20010678107000000000000000000000, 0x200106781070FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x20010678107400000000000000000000, 0x200106781074FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -32719,6 +32575,9 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2001067812EC00000000000000000000, 0x2001067812ECFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067812F000000000000000000000, 0x2001067812F0FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067812F800000000000000000000, 0x2001067812F8FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
+    cr6(0x20010678130400000000000000000000, 0x200106781304FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
+    cr6(0x20010678130800000000000000000000, 0x200106781308FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
+    cr6(0x20010678130C00000000000000000000, 0x20010678130CFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C000000000000000000000000, 0x2001067C0000FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C000400000000000000000000, 0x2001067C0004FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C000C00000000000000000000, 0x2001067C000CFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -33414,6 +33273,7 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2001067C0FBC00000000000000000000, 0x2001067C0FBCFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C0FC400000000000000000000, 0x2001067C0FC4FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C0FC800000000000000000000, 0x2001067C0FC8FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
+    cr6(0x2001067C0FDC00000000000000000000, 0x2001067C0FDCFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C0FEC00000000000000000000, 0x2001067C0FECFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C0FF400000000000000000000, 0x2001067C0FF4FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C0FF800000000000000000000, 0x2001067C0FF8FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -33719,6 +33579,7 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2001067C185800000000000000000000, 0x2001067C1858FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C186400000000000000000000, 0x2001067C1864FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C186C00000000000000000000, 0x2001067C186CFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
+    cr6(0x2001067C187000000000000000000000, 0x2001067C1870FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C187400000000000000000000, 0x2001067C1874FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C187800000000000000000000, 0x2001067C1878FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C187C00000000000000000000, 0x2001067C187CFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -34137,6 +33998,7 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2001067C26DC00000000000000000000, 0x2001067C26DCFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C26E000000000000000000000, 0x2001067C26E0FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C26E400000000000000000000, 0x2001067C26E4FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
+    cr6(0x2001067C26E800000000000000000000, 0x2001067C26E8FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C26F000000000000000000000, 0x2001067C26F0FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C26F400000000000000000000, 0x2001067C26F4FFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2001067C26FC00000000000000000000, 0x2001067C26FCFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -34564,9 +34426,6 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x20010720000000000000000000000000, 0x20010727FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::GovEu),
     // ── EU-27 BASELINE (country-level) ──
     cr6(0x20010730000000000000000000000000, 0x20010738FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr6(0x20010740000000000000000000000000, 0x20010740FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr6(0x20010748000000000000000000000000, 0x20010748FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x20010750000000000000000000000000, 0x20010758FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     // ── EU GOVERNMENT / RESEARCH ──
@@ -34958,21 +34817,11 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x20030000000000000000000000000000, 0x20031FFFFFFFFFFFFFFFFFFFFFFFFFFF, IpClass::ResidentialEu),
     // ── EU DATACENTER / CLOUD ──
     cr6(0x24021F00000000000000000000000000, 0x24021F00FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr6(0x2402FB00800000000000000000000000, 0x2402FB0081FFFFFFFFFFFFFFFFFFFFFF, IpClass::GovEu),
-    cr6(0x2402FB00840000000000000000000000, 0x2402FB0085FFFFFFFFFFFFFFFFFFFFFF, IpClass::GovEu),
-    cr6(0x2402FB00880000000000000000000000, 0x2402FB0088FFFFFFFFFFFFFFFFFFFFFF, IpClass::GovEu),
-    cr6(0x2402FB00C00000000000000000000000, 0x2402FB00C3FFFFFFFFFFFFFFFFFFFFFF, IpClass::GovEu),
     // ── EU RESIDENTIAL ISPs ──
     cr6(0x26020810208200000000000000000000, 0x260208102082FFFFFFFFFFFFFFFFFFFF, IpClass::ResidentialEu),
     cr6(0x2602FD920C6000000000000000000000, 0x2602FD920C6FFFFFFFFFFFFFFFFFFFFF, IpClass::ResidentialEu),
     // ── EU DATACENTER / CLOUD ──
     cr6(0x26042DC0000000000000000000000000, 0x26042DC0FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr6(0x2606F100D00000000000000000000000, 0x2606F100D1FFFFFFFFFFFFFFFFFFFFFF, IpClass::GovEu),
-    cr6(0x2606F100D40000000000000000000000, 0x2606F100DFFFFFFFFFFFFFFFFFFFFFFF, IpClass::GovEu),
-    cr6(0x2606F100E40000000000000000000000, 0x2606F100E5FFFFFFFFFFFFFFFFFFFFFF, IpClass::GovEu),
-    // ── EU DATACENTER / CLOUD ──
     cr6(0x26075300000000000000000000000000, 0x26075300FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
     cr6(0x2607B500000100000000000000000000, 0x2607B5000001FFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
     cr6(0x2607B500040000000000000000000000, 0x2607B50005FFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
@@ -35276,9 +35125,6 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A001FE8000000000000000000000000, 0x2A001FE8FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A001FF0000000000000000000000000, 0x2A001FF0FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A001FF8000000000000000000000000, 0x2A001FF8FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr6(0x2A002000000000000000000000000000, 0x2A00237FFFFFFFFFFFFFFFFFFFFFFFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
     cr6(0x2A004020000000000000000000000000, 0x2A004020FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A004040000000000000000000000000, 0x2A004040FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A004060000000000000000000000000, 0x2A004067FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -38138,7 +37984,6 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A035980000000000000000000000000, 0x2A035980FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0359C0000000000000000000000000, 0x2A0359C0FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A035A40000000000000000000000000, 0x2A035A40FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
-    cr6(0x2A035AE0000000000000000000000000, 0x2A035AE0FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A035B60000000000000000000000000, 0x2A035B60FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A035BA0000000000000000000000000, 0x2A035BA0FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A035C00000000000000000000000000, 0x2A035C00FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -39462,10 +39307,9 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A053500000000000000000000000000, 0x2A053507FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     // ── EU DATACENTER / CLOUD ──
     cr6(0x2A0535C0000000000000000000000000, 0x2A0535C00005FFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
-    cr6(0x2A0535C0000700000000000000000000, 0x2A0535C00010FFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
-    cr6(0x2A0535C0001200000000000000000000, 0x2A0535C1F43CFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
-    cr6(0x2A0535C1F43E00000000000000000000, 0x2A0535C2BF0AFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
-    cr6(0x2A0535C2BF0C00000000000000000000, 0x2A0535C7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
+    cr6(0x2A0535C0000700000000000000000000, 0x2A0535C0000FFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
+    cr6(0x2A0535C0001200000000000000000000, 0x2A0535C0FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
+    cr6(0x2A0535C2000000000000000000000000, 0x2A0535C7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
     cr6(0x2A053600000000000000000000000000, 0x2A053607FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A053640000000000000000000000000, 0x2A053647FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -40338,7 +40182,6 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A06C240000000000000000000000000, 0x2A06C247FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A06C280000000000000000000000000, 0x2A06C287FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A06C2C0000000000000000000000000, 0x2A06C2C7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
-    cr6(0x2A06C300000000000000000000000000, 0x2A06C307FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A06C340000000000000000000000000, 0x2A06C347FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A06C440000000000000000000000000, 0x2A06C447FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A06C480000000000000000000000000, 0x2A06C487FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -41588,7 +41431,6 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A09EE40000000000000000000000000, 0x2A09EE47FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A09EE80000000000000000000000000, 0x2A09EE87FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A09EEC0000000000000000000000000, 0x2A09EEC7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
-    cr6(0x2A09F040000000000000000000000000, 0x2A09F047FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A09F080000000000000000000000000, 0x2A09F087FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A09F0C0000000000000000000000000, 0x2A09F0C7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A09F180000000000000000000000000, 0x2A09F187FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -42137,7 +41979,6 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A0ADE40000000000000000000000000, 0x2A0ADE40FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0ADE80000000000000000000000000, 0x2A0ADE80FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0ADEC0000000000000000000000000, 0x2A0ADEC7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
-    cr6(0x2A0ADF00000000000000000000000000, 0x2A0ADF07FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0ADF40000000000000000000000000, 0x2A0ADF47FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0AE040000000000000000000000000, 0x2A0AE047FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0AE100000000000000000000000000, 0x2A0AE107FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -42321,7 +42162,6 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A0B2F00000000000000000000000000, 0x2A0B2F07FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0B2F40000000000000000000000000, 0x2A0B2F40FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0B2F80000000000000000000000000, 0x2A0B2F87FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
-    cr6(0x2A0B2FC0000000000000000000000000, 0x2A0B2FC7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0B3040000000000000000000000000, 0x2A0B3040FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0B3080000000000000000000000000, 0x2A0B3080FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0B30C0000000000000000000000000, 0x2A0B30C7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -43082,9 +42922,7 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A0C7A80000000000000000000000000, 0x2A0C7A87FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0C7AC0000000000000000000000000, 0x2A0C7AC7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0C7B40000000000000000000000000, 0x2A0C7B47FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr6(0x2A0C7C80000000000000000000000000, 0x2A0C7C87FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
+    cr6(0x2A0C7C80000000000000000000000000, 0x2A0C7C87FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0C7CC0000000000000000000000000, 0x2A0C7CC7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0C7D40000000000000000000000000, 0x2A0C7D40FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0C7E00000000000000000000000000, 0x2A0C7E07FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -43104,9 +42942,7 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A0C83C0000000000000000000000000, 0x2A0C83C7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0C8400000000000000000000000000, 0x2A0C8407FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0C8440000000000000000000000000, 0x2A0C8447FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
-    // ── EU GOVERNMENT / RESEARCH ──
-    cr6(0x2A0C8480000000000000000000000000, 0x2A0C8483FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::GovEu),
-    // ── EU-27 BASELINE (country-level) ──
+    cr6(0x2A0C8480000000000000000000000000, 0x2A0C8483FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0C84C0000000000000000000000000, 0x2A0C84C7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0C8500000000000000000000000000, 0x2A0C8507FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0C85C0000000000000000000000000, 0x2A0C85C7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -43437,7 +43273,6 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A0D0A00000000000000000000000000, 0x2A0D0A07FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0D0B00000000000000000000000000, 0x2A0D0B07FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0D0B80000000000000000000000000, 0x2A0D0B80FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
-    cr6(0x2A0D0C00000000000000000000000000, 0x2A0D0C07FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0D0C40000000000000000000000000, 0x2A0D0C47FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0D0C80000000000000000000000000, 0x2A0D0C87FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0D0CC0000000000000000000000000, 0x2A0D0CC7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -43704,6 +43539,7 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A0D8540000000000000000000000000, 0x2A0D8547FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0D8600000000000000000000000000, 0x2A0D8607FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0D8640000000000000000000000000, 0x2A0D8647FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
+    cr6(0x2A0D8680000000000000000000000000, 0x2A0D8687FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0D86C0000000000000000000000000, 0x2A0D86C7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0D8700000000000000000000000000, 0x2A0D8707FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0D8780000000000000000000000000, 0x2A0D8787FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -43766,6 +43602,7 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A0DA5C0000000000000000000000000, 0x2A0DA5C7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0DA600000000000000000000000000, 0x2A0DA603FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0DA680000000000000000000000000, 0x2A0DA680FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
+    cr6(0x2A0DA740000000000000000000000000, 0x2A0DA747FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0DA780000000000000000000000000, 0x2A0DA787FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0DA7C0000000000000000000000000, 0x2A0DA7C7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0DA800000000000000000000000000, 0x2A0DA807FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -43855,6 +43692,9 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A0DD640000000000000000000000000, 0x2A0DD647FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0DD780000000000000000000000000, 0x2A0DD787FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0DD7C0000000000000000000000000, 0x2A0DD7C7FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
+    // ── EU DATACENTER / CLOUD ──
+    cr6(0x2A0DD907000000000000000000000000, 0x2A0DD907FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
+    // ── EU-27 BASELINE (country-level) ──
     cr6(0x2A0DDA80000000000000000000000000, 0x2A0DDA80FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0DDB00000000000000000000000000, 0x2A0DDB07FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0DDB40000000000000000000000000, 0x2A0DDB47FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
@@ -43995,7 +43835,6 @@ pub static RANGES6: &[CidrEntry6] = &[
     cr6(0x2A0E1A80003300000000000000000000, 0x2A0E1A800033FFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
     cr6(0x2A0E1A83003300000000000000000000, 0x2A0E1A830033FFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
     cr6(0x2A0E1A83004400000000000000000000, 0x2A0E1A830044FFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
-    cr6(0x2A0E1A83006600000000000000000000, 0x2A0E1A830066FFFFFFFFFFFFFFFFFFFF, IpClass::DatacenterEu),
     // ── EU-27 BASELINE (country-level) ──
     cr6(0x2A0E1B00000000000000000000000000, 0x2A0E1B07FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),
     cr6(0x2A0E1B40000000000000000000000000, 0x2A0E1B47FFFFFFFFFFFFFFFFFFFFFFFF, IpClass::Eu),

@@ -643,6 +643,50 @@ mod tests {
         );
     }
 
+    // ── Golden classification (regression net) ───────────────────────
+    // A small, stable set with its role PINNED. Unlike the loose EU test
+    // above, these fail if a role changes at all — so even with correct
+    // upstream data, a curated ASN silently dropping out or a lookup
+    // regression is caught. Regenerated alongside the CIDR tables; if a
+    // legitimate RIPE reassignment moves one of these, update it deliberately.
+    #[cfg(feature = "geo-ita")]
+    #[test]
+    fn golden_classify_italian_roles() {
+        // 193.206.0.1 — GARR (AS137), the Italian academic/research network.
+        assert_eq!(classify("193.206.0.1".parse().unwrap()), IpClass::GovIta);
+        // 2.16.17.0 — a curated Italian residential-ISP range.
+        assert_eq!(
+            classify("2.16.17.0".parse().unwrap()),
+            IpClass::ResidentialIta
+        );
+        // 2.26.132.0 — a curated Italian datacenter/hosting range.
+        assert_eq!(
+            classify("2.26.132.0".parse().unwrap()),
+            IpClass::DatacenterIta
+        );
+        // A non-sovereign IP stays Unknown.
+        assert_eq!(classify("8.8.8.8".parse().unwrap()), IpClass::Unknown);
+    }
+
+    #[cfg(feature = "geo-eu")]
+    #[test]
+    fn golden_classify_eu_roles() {
+        // 193.0.0.1 — RIPE NCC (NL): an EU-27 allocation with no curated role.
+        assert_eq!(classify("193.0.0.1".parse().unwrap()), IpClass::Eu);
+        // 217.0.0.1 — Deutsche Telekom (AS3320, DE): curated residential override.
+        assert_eq!(
+            classify("217.0.0.1".parse().unwrap()),
+            IpClass::ResidentialEu
+        );
+        // 45.12.192.0 — a curated EU government/research range.
+        assert_eq!(classify("45.12.192.0".parse().unwrap()), IpClass::GovEu);
+        // 62.171.128.1 — Contabo (AS51167, DE): a curated EU datacenter.
+        assert_eq!(
+            classify("62.171.128.1".parse().unwrap()),
+            IpClass::DatacenterEu
+        );
+    }
+
     #[cfg(feature = "geo-eu")]
     #[test]
     fn ipclass_display_eu() {
