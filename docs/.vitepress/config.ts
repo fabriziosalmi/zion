@@ -11,6 +11,9 @@ export default defineConfig({
   title: 'Zion Edge Gateway',
   description: 'High-performance TLS reverse proxy with built-in WAF, written in Rust',
   base: '/zion/',
+  // The hostname must carry the base path: VitePress joins it with each page's
+  // route, so without /zion/ every URL in the sitemap points at a 404.
+  sitemap: { hostname: 'https://fabriziosalmi.github.io/zion/' },
   head: [
     // Everything this site loads is first-party. 'unsafe-inline' is required
     // because VitePress emits an inline appearance script and inline styles.
