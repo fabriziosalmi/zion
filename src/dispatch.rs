@@ -216,6 +216,21 @@ fn route_cache_key(host: Option<&str>, path: &str) -> u64 {
     h.finish()
 }
 
+/// Zion-owned identity headers upstreams trust as *verified*. Any inbound copy
+/// is a spoof attempt and is dropped at the trust boundary; the auth gate later
+/// re-injects the authenticated values. Kept as a named list so the reserved
+/// set lives in exactly one place.
+const RESERVED_IDENTITY_HEADERS: [&str; 2] = ["x-auth-subject", "x-auth-email"];
+
+/// Strip every reserved identity header off an inbound request. Idempotent, and
+/// clears repeated copies (hyper lower-cases header names, so one `remove` per
+/// name suffices).
+fn scrub_reserved_identity_headers(headers: &mut hyper::HeaderMap) {
+    for name in RESERVED_IDENTITY_HEADERS {
+        headers.remove(name);
+    }
+}
+
 async fn process_request_inner(
     mut req: Request<ZionBody>,
     state: Arc<AppState>,
@@ -232,6 +247,19 @@ async fn process_request_inner(
     let cfg = state.cfg();
 
     // ── Pre-routing security gates (zero-cost, before any processing) ──
+
+    // Scrub reserved identity headers off every inbound request. Zion owns
+    // `X-Auth-Subject` / `X-Auth-Email`: upstreams trust them as *verified*
+    // claims, so any copy a client sent must die at the trust boundary here,
+    // BEFORE the auth gate re-injects the authenticated values. Stripping is
+    // unconditional (not `#[cfg(feature = "auth")]`): a build without the auth
+    // gate, or a route with no auth profile, still forwards to an upstream and
+    // must never carry a client-spoofed identity. The auth gate's later
+    // `insert` replaces, but only on the paths where a claim is present — an
+    // absent `sub`, `forward_claims = false`, or no profile at all would
+    // otherwise let the spoofed header ride through. Reserved header names are
+    // ASCII-lowercased by hyper, so one `remove` per name clears every copy.
+    scrub_reserved_identity_headers(req.headers_mut());
 
     // Gate: URI length (reject oversized URIs before routing).
     // Check full path+query, not just path — an attacker could send a short
@@ -2598,6 +2626,35 @@ mod tests {
         let r = deny_or_tarpit(&shed, StatusCode::FORBIDDEN).await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
         assert_eq!(m.tarpit_shed_total.load(Relaxed), s1 + 1);
+    }
+
+    #[test]
+    fn scrubs_client_spoofed_identity_headers() {
+        // A client sends the reserved identity headers Zion owns — in mixed
+        // case and duplicated. All copies must be gone after the scrub, so a
+        // route with no auth profile (or a build without the auth gate) can
+        // never forward a spoofed identity upstream.
+        let mut h = hyper::HeaderMap::new();
+        h.append("X-Auth-Subject", "attacker".parse().unwrap());
+        h.append("x-auth-subject", "attacker2".parse().unwrap());
+        h.insert("X-AUTH-EMAIL", "evil@example.com".parse().unwrap());
+        h.insert("X-Forwarded-For", "203.0.113.1".parse().unwrap());
+
+        scrub_reserved_identity_headers(&mut h);
+
+        assert!(h.get("x-auth-subject").is_none(), "subject not stripped");
+        assert!(h.get("x-auth-email").is_none(), "email not stripped");
+        assert_eq!(
+            h.get_all("x-auth-subject").iter().count(),
+            0,
+            "duplicate copies must all be removed"
+        );
+        // Unrelated headers are untouched.
+        assert_eq!(
+            h.get("x-forwarded-for").unwrap(),
+            "203.0.113.1",
+            "scrub must not touch other headers"
+        );
     }
 
     // ── Singleflight primitive (race fix) ──
