@@ -975,6 +975,27 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                     .to_string(),
             );
         }
+        // An ENFORCING allowlist (unknowns dropped) that still lets an
+        // UN-fingerprintable ClientHello through fails open: an attacker sends
+        // a deliberately malformed hello the parser can't fingerprint and
+        // sidesteps the allowlist entirely, defeating the very drop it just
+        // configured for unknowns. The `on_unfingerprintable = allow` default
+        // is availability-first and inconsistent with `on_unknown = drop`.
+        // Refuse to boot into that silent bypass; an observe posture
+        // (on_unknown = log_only, or mode = shadow) is unaffected.
+        if fp.mode == FingerprintMode::Allowlist
+            && fp.on_unknown == OnUnknown::Drop
+            && fp.on_unfingerprintable == OnUnfingerprintable::Allow
+        {
+            errors.push(
+                "[tls.fingerprint] mode = \"allowlist\" with on_unknown = \"drop\" but \
+                 on_unfingerprintable = \"allow\" fails OPEN — a ClientHello the parser cannot \
+                 fingerprint bypasses the allowlist while unknowns are dropped. Set \
+                 on_unfingerprintable = \"drop\" to fail closed consistently, or use \
+                 on_unknown = \"log_only\" / mode = \"shadow\" to observe without enforcing."
+                    .to_string(),
+            );
+        }
         // A malformed allowlist entry can never match a computed JA4, so under
         // on_unknown = drop it is a silent deny-all the empty-list check above
         // misses. Surface the typo at boot instead of as a production outage.
@@ -1892,7 +1913,7 @@ mod tests {
         // A typo'd pattern must be a boot error, not a runtime surprise.
         let bad = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
              [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
-             [tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"drop\"\n\
+             [tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"drop\"\non_unfingerprintable=\"drop\"\n\
              allowed=[{name=\"a\",ja4=\"t13d1516h2_8daaf6152771_e5627efa2ab1\",allowed_routes=[\"/api/{unclosed\"]}]\n\
              [upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
              [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
@@ -1962,6 +1983,36 @@ mod tests {
         assert!(
             validate_semantics(&cfg, "test").is_ok(),
             "log_only empty allowlist must pass semantics, got: {:?}",
+            validate_semantics(&cfg, "test").err()
+        );
+    }
+
+    #[cfg(feature = "tls-fingerprint")]
+    #[test]
+    fn enforcing_allowlist_rejects_fail_open_unfingerprintable() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let allowed = "allowed=[{name=\"a\",ja4=\"t13d1516h2_8daaf6152771_e5627efa2ab1\"}]\n";
+
+        // Enforcing (on_unknown=drop) + default on_unfingerprintable (allow) is
+        // a fail-open bypass → must be rejected.
+        let open =
+            format!("{base}[tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"drop\"\n{allowed}");
+        let err = validate_str(&open, "test").err().unwrap_or_default();
+        assert!(
+            err.contains("on_unfingerprintable"),
+            "enforcing allowlist with allow-unfingerprintable must be rejected, got: {err}"
+        );
+
+        // Explicit fail-closed passes.
+        let closed = format!(
+            "{base}[tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"drop\"\non_unfingerprintable=\"drop\"\n{allowed}"
+        );
+        let cfg = parse_schema(&closed, "test").expect("parse");
+        assert!(
+            validate_semantics(&cfg, "test").is_ok(),
+            "fail-closed allowlist must pass: {:?}",
             validate_semantics(&cfg, "test").err()
         );
     }
