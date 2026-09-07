@@ -11,7 +11,7 @@
 //! of the connection pool happens at boot in `build_http_client`.
 
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Full, Limited};
 use hyper::header::HeaderValue;
 use hyper::{Request, Response, StatusCode, Version};
 use hyper_util::client::legacy::Client;
@@ -110,6 +110,18 @@ pub fn gateway_timeout() -> Response<ZionBody> {
         .status(StatusCode::GATEWAY_TIMEOUT)
         .body(
             Full::new(Bytes::from("504 Gateway Timeout"))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
+#[inline]
+fn simple_status(status: StatusCode, msg: &'static str) -> Response<ZionBody> {
+    Response::builder()
+        .status(status)
+        .body(
+            Full::new(Bytes::from_static(msg.as_bytes()))
                 .map_err(|never| match never {})
                 .boxed(),
         )
@@ -336,11 +348,37 @@ pub async fn proxy_pass_ha(
         .await;
     }
 
-    // Buffer the body once so each attempt can replay it.
+    // Buffer the body once so each attempt can replay it. This buffer is held
+    // entirely in memory, so it MUST be bounded: a bare `collect()` here lets a
+    // client stream an unbounded (or slow-drip) body into an HA route and
+    // exhaust RAM — one full copy per concurrent request — regardless of
+    // whether the route has a WAF profile. Cap the size (413 on overflow) and
+    // the read time (408 on a slowloris drip that never reaches the cap). Both
+    // bounds apply before failover, so a rejected body never becomes N upstream
+    // attempts either.
     let (parts, body) = req.into_parts();
-    let body_bytes = match body.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => return Ok(bad_gateway()),
+    let limited = Limited::new(body, MAX_HA_REPLAY_BODY);
+    let body_bytes = match tokio::time::timeout(HA_BODY_COLLECT_TIMEOUT, limited.collect()).await {
+        Ok(Ok(c)) => c.to_bytes(),
+        // `Limited` surfaces overflow as a boxed `LengthLimitError`; any other
+        // collect error is a broken client stream → 400. Distinguish so an
+        // operator sees "too large" separately from "client hung up".
+        Ok(Err(e))
+            if e.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some() =>
+        {
+            return Ok(simple_status(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "413 Payload Too Large",
+            ));
+        }
+        Ok(Err(_)) => return Ok(simple_status(StatusCode::BAD_REQUEST, "400 Bad Request")),
+        Err(_elapsed) => {
+            return Ok(simple_status(
+                StatusCode::REQUEST_TIMEOUT,
+                "408 Request Timeout",
+            ));
+        }
     };
     let method = parts.method.clone();
     let uri = parts.uri.clone();
@@ -501,6 +539,18 @@ pub async fn proxy_pass_stream(
 /// phase and is not yet wired to the shared pooled client; this overall bound
 /// is what closes the hang.
 const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hard ceiling on a request body buffered for HA replay. Failover has to hold
+/// the whole body in memory to resend it, so this bounds per-request RAM on
+/// Standard (multi-upstream) routes independently of any WAF `max_body_mb`.
+/// 16 MiB comfortably covers ordinary API/form payloads; genuinely large
+/// uploads belong on a single-upstream (streaming) route, not an HA-replay one.
+const MAX_HA_REPLAY_BODY: usize = 16 * 1024 * 1024;
+
+/// Wall-clock cap on reading the replay body. Stops a slowloris drip from
+/// pinning a worker (and its per-IP conn slot) indefinitely while never
+/// reaching `MAX_HA_REPLAY_BODY`.
+const HA_BODY_COLLECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Internal: send a prepared request through the shared client.
 #[inline]
@@ -959,6 +1009,51 @@ mod tests {
     #[test]
     fn bad_gateway_returns_502() {
         assert_eq!(bad_gateway().status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn ha_replay_rejects_oversized_body_before_dialing() {
+        // A body past MAX_HA_REPLAY_BODY must be refused with 413 at the buffer
+        // step — before any upstream is selected or dialed, so an oversized
+        // payload never becomes N connection attempts and never sits unbounded
+        // in RAM. An empty health map guarantees that if we *did* reach the
+        // failover loop, select_best_upstream would return None and we'd see a
+        // 502 instead — so a 413 here proves the bound fired first.
+        // The HTTPS client build needs a process-level rustls provider; the
+        // daemon installs this at boot (main.rs). Idempotent, so safe here.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let oversized = vec![0u8; MAX_HA_REPLAY_BODY + 1];
+        let body: ZionBody = Full::new(Bytes::from(oversized))
+            .map_err(|never| match never {})
+            .boxed();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .body(body)
+            .unwrap();
+
+        let pool = vec![
+            "http://127.0.0.1:9/a".to_string(),
+            "http://127.0.0.1:9/b".to_string(),
+        ];
+        let health_map: crate::health::HealthMap = std::sync::Arc::new(Default::default());
+
+        let resp = proxy_pass_ha(
+            &build_http_client(),
+            req,
+            &pool,
+            &scheme(),
+            &authority(),
+            &health_map,
+            None,
+            "https",
+            XffMode::Append,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     // ── XffMode policy tests ──
