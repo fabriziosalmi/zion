@@ -1678,7 +1678,12 @@ async fn handle_http_connection(
     // drop (including early return / panic).
     let _permit = match state.conn_limit.clone().try_acquire_owned() {
         Ok(p) => p,
-        Err(_) => return,
+        Err(_) => {
+            metrics::METRICS
+                .connections_rejected_global
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
     };
     let _ip_slot = match state
         .conn_per_ip
@@ -1830,6 +1835,9 @@ fn spawn_https_handler(
     let permit = match state.conn_limit.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
+            metrics::METRICS
+                .connections_rejected_global
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             drop(tcp_stream);
             return;
         }
