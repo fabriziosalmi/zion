@@ -153,3 +153,53 @@ With `hot_reload = true` (default), certificate renewal requires no restart:
 2. Write new files to the watched directory
 3. Zion detects the change, debounces 2 seconds, reloads
 4. New connections use new certs; in-flight connections are unaffected
+
+## Scaling & limits
+
+**Per-node connection ceiling.** The global concurrent-connection limit is
+derived from RAM (25% of RAM ÷ 256 KB per connection) but **hard-capped at
+100,000** per node. This is a deliberate design limit, not just a RAM guard: on
+a large box the formula would allow far more, but the admission semaphore caps
+at 100k and the 100,001st concurrent connection is shed. Raise it only by
+changing the clamp in `compute_conn_limit` and rebuilding.
+
+**Per-replica enforcement (multi-replica).** Rate limiting
+(`rate_limit_rps`), the per-IP connection cap (`max_connections_per_ip`), and
+JA4 fingerprint bans are **process-local, in-memory** state. They are enforced
+**per replica**, not fleet-wide. Behind an L4 load balancer with N replicas, a
+single client's effective allowance is the configured value **× N**: e.g.
+`max_connections_per_ip = 100` across 10 replicas lets one source IP hold ~1,000
+concurrent connections, and a JA4 fingerprint banned on one replica is not
+banned on the others until it independently crosses the threshold there. Despite
+the "global" wording in some config docs, these limits are per-process. To size
+them:
+
+- divide the intended fleet-wide limit by the replica count, **or**
+- front the fleet with source-IP-hash affinity so a client is pinned to one
+  replica, **or**
+- accept per-replica semantics for a defence-in-depth (not exact) bound.
+
+The shipped Helm chart defaults to 2 replicas and autoscales to 10 — plan the
+limit values accordingly.
+
+## Rollback
+
+Zion's config parser is fail-closed (`deny_unknown_fields`): an older binary
+rejects a `zion.toml` that contains a key added by a **newer** release and exits
+`2` (config category). So the **binary and its config are one unit** — roll them
+back together.
+
+- **Kubernetes / Helm:** `helm rollback <release> <revision>` reverts the chart
+  (image tag **and** the ConfigMap) atomically. Do not pin only `image.tag`
+  back while keeping a newer `values.yaml`.
+- **Bare metal / systemd:** keep the previous `(binary, /etc/zion/zion.toml)`
+  pair together. To roll back, restore both, then `systemctl restart zion`.
+  Reverting only the binary onto a config that gained a new key will fail to
+  boot with a `config validation failed` message naming the unknown key.
+
+**Compatibility contract:** within a release the config schema is exact (no
+unknown keys). Across releases, a config authored for version *N* may not load
+on version *N−1* if it uses keys introduced in *N*. There is no schema-version
+handshake yet, so treat a downgrade as "restore the matching config too", and
+read the CHANGELOG for any config or forwarded-header contract changes before
+upgrading or rolling back.

@@ -189,7 +189,7 @@ survives. See [zion.example.toml](zion.example.toml) for the full reference and
 Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) -> Proxy/Cache -> Upstream
                          |                                |
                     URI limit                  Aho-Corasick (~100 balanced / ~240 aggressive)
-                    Method whitelist           Entropy analysis (JSON-string-only)
+                    Method whitelist           Entropy analysis (bodies ≥256 B)
                     Rate limiter               simd-json validation
                     CORS pre-flight            Depth/size limits
 ```
@@ -210,7 +210,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 
 **Cache** — two-level RAM cache: L1 thread-local (O(1) intrusive-LRU) + L2 sharded DashMap, generation-based coherence (no stale data after update), request coalescing (singleflight: N concurrent misses → 1 upstream fetch). Honors the origin's `Cache-Control`, emits `Age` and an `X-Zion-Cache: HIT|MISS|BYPASS` decision header, and exposes a `POST /_zion/cache/purge` flush for deploys.
 
-**WAF (zero-regex, O(N) single-pass)** — Aho-Corasick scanner, two pattern sets (`balanced` ~100 high-precision / `aggressive` ~240 broad-recall), Shannon-entropy analysis (JSON-string-only), simd-json structural limits, Content-Type enforcement, iterative normalization (URL-decode / SQL-comment / unicode), mTLS `X-Client-Cert-Fingerprint` forwarding, and a shadow mode (log + count, never block).
+**WAF (zero-regex, O(N) single-pass)** — Aho-Corasick scanner, two pattern sets (`balanced` ~100 high-precision / `aggressive` ~240 broad-recall), Shannon-entropy analysis (bodies ≥256 B; restricted to JSON string values only for `application/json`, whole-body otherwise), simd-json structural limits, Content-Type enforcement, iterative normalization (URL-decode / SQL-comment / unicode), mTLS `X-Client-Cert-Fingerprint` forwarding, and a shadow mode (log + count, never block).
 
 **Security** — HSTS preload, nosniff, frame-deny, Referrer-Policy, Permissions-Policy, per-route CSP; `Server`/hop-by-hop stripping (RFC 7230); URI-length cap + 7-method whitelist; per-IP rate limit **and** per-IP concurrent-connection cap (enforced at accept); CORS (FNV O(1)); header-bomb limits (64 headers / 16 KB).
 
