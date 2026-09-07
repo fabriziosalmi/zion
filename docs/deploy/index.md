@@ -96,7 +96,7 @@ docker run -d \
 
 ## Config validation
 
-Zion validates the entire configuration at startup and exits with code 1 on any error. Checked items:
+Zion validates the entire configuration at startup. Checked items:
 
 - Server addresses are valid socket addresses
 - TLS cert and key files exist on disk
@@ -106,10 +106,33 @@ Zion validates the entire configuration at startup and exits with code 1 on any 
 - Every `waf_profile` and `cache_profile` reference exists
 - All upstream URLs are valid URIs
 
-Run a dry validation by starting Zion and checking exit code:
+## Exit codes
+
+The daemon's exit code encodes the **failure category**, so a supervisor
+(systemd `Restart=`, Kubernetes `restartPolicy`) can branch — a config error
+should not drive a restart loop, a transient bind failure can. The contract is
+covered by `tests/exit_codes.rs`:
+
+| Code | Category | Meaning |
+|------|----------|---------|
+| `0`  | success  | Clean shutdown (e.g. after `SIGTERM`) |
+| `2`  | config   | Config unreadable, unparseable, or failed validation (bad address, dangling upstream, unknown profile reference, …) |
+| `3`  | tls      | TLS material bad — cert/key missing, malformed, or mismatched |
+| `4`  | listener | Binding a listen socket failed (port in use, permission denied) |
+| `5`  | runtime  | A runtime subsystem failed to start — ACME, auth, or audit |
+| `1`  | other    | Any other fatal error |
+
+There is no dedicated `--check` mode: starting the daemon **is** the validation.
+On a bad config it exits fast with the matching category code above (before
+binding any port); on a good config it keeps running and serving. So a quick
+pre-flight is "did it fail fast?", not `&& echo OK` (which would only fire once
+the server later shuts down):
 
 ```bash
-ZION_CONFIG=./zion.toml ./zion && echo "Config OK"
+# Exits 0 only if the config loaded AND TLS came up within the window; a
+# non-zero code is the failure category from the table above.
+ZION_CONFIG=./zion.toml timeout 2s ./zion; code=$?
+[ "$code" = 124 ] && echo "config + TLS OK (still serving)" || echo "failed: exit $code"
 ```
 
 ## Graceful shutdown
