@@ -1201,6 +1201,20 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
         }
     }
 
+    // An upstream name defined in BOTH the structured `[upstream.<name>]` map
+    // and the legacy flat `[upstreams]` map is ambiguous: resolve_upstream
+    // silently prefers the structured one and drops the legacy URL, so two
+    // divergent definitions can coexist with zero diagnostics. Reject the
+    // collision so the operator picks one home for the name.
+    for name in config.upstream.keys() {
+        if config.upstreams.contains_key(name) {
+            errors.push(format!(
+                "upstream '{name}' is defined in both [upstream.{name}] and [upstreams]; \
+                 remove one — the legacy [upstreams] entry would be silently ignored"
+            ));
+        }
+    }
+
     errors
 }
 
@@ -2502,6 +2516,35 @@ enabledd = true
         assert!(
             err.contains("client_ca_path"),
             "auth=mtls without client_ca_path must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn upstream_defined_in_both_maps_is_rejected() {
+        // Same name in [upstream.api] and [upstreams] → ambiguous, must fail.
+        let both = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [upstream.api]\nurl=\"http://127.0.0.1:8000\"\n\
+             [upstreams]\napi=\"http://127.0.0.1:9000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"api\"\n";
+        let err = validate_str(both, "test").err().unwrap_or_default();
+        assert!(
+            err.contains("defined in both"),
+            "colliding upstream name must be rejected, got: {err}"
+        );
+
+        // Distinct names in the two maps are fine.
+        let ok = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [upstream.api]\nurl=\"http://127.0.0.1:8000\"\n\
+             [upstreams]\nlegacy=\"http://127.0.0.1:9000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"api\"\n";
+        let cfg: ZionConfig = toml::from_str(ok).unwrap();
+        assert!(
+            !semantic_errors(&cfg)
+                .iter()
+                .any(|e| e.contains("defined in both")),
+            "distinct upstream names must not collide"
         );
     }
 
