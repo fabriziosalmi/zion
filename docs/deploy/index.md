@@ -145,6 +145,15 @@ Zion handles `SIGINT` (Ctrl+C) and `SIGTERM`:
 
 This works by acquiring all semaphore permits (connection limit). When all active connections release their permits, the drain is complete.
 
+**Panics bypass the drain.** Release builds compile with `panic = "abort"`, so a
+reachable panic anywhere (request/WAF/proxy/reload path, or unsafe FFI)
+`SIGABRT`s the whole process immediately — the 30 s drain does **not** run and
+every in-flight connection is severed. This is a deliberate trade-off (the code
+holds a no-reachable-panic doctrine, so a panic signals a bug, not expected
+load): keep Zion under a supervisor that restarts on non-zero/abnormal exit
+(systemd `Restart=on-failure`, Kubernetes `restartPolicy`), and rely on multiple
+replicas + a load balancer to absorb the loss of one instance.
+
 ## Certificate renewal
 
 With `hot_reload = true` (default), certificate renewal requires no restart:

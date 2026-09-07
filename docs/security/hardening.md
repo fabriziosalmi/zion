@@ -141,7 +141,23 @@ X-Client-Cert-Fingerprint: sha256:<64 hex chars>
 
 The value is the SHA-256 of the leaf DER, hex-encoded with a `sha256:` prefix — Zion's pinned wire format for this header (the prefix names the algorithm so it can never be ambiguous). (nginx's `$ssl_client_fingerprint` is a similar idea but a **SHA-1** digest — do not compare the two values directly.) It is collision-resistant and stable across re-issuance only when the cert bytes themselves are stable; rotating a cert produces a new fingerprint.
 
-Earlier Zion versions emitted `X-Client-Cert-DN`, computed as a 64-bit XOR-fold of the first 64 DER bytes. That value was advertised as a "DN" but was neither a Distinguished Name nor collision-resistant; it has been removed. If your upstream still expects the old header, map it at the upstream side from `X-Client-Cert-Fingerprint` (note: the new value is a fingerprint, not a DN, and downstream identity mapping must be done via your roster).
+Earlier Zion versions emitted `X-Client-Cert-DN`, computed as a 64-bit XOR-fold of the first 64 DER bytes. That value was advertised as a "DN" but was neither a Distinguished Name nor collision-resistant; it was **removed in v0.1.7** and replaced by `X-Client-Cert-Fingerprint` with no coexistence window. If your upstream still expects the old header, map it at the upstream side from `X-Client-Cert-Fingerprint` (note: the new value is a fingerprint, not a DN, and downstream identity mapping must be done via your roster).
+
+### Injected request-header contract
+
+Zion's contract for the headers it sets or strips on the way to the upstream. Anything an upstream trusts for identity is Zion-owned: any inbound copy from the client is stripped before Zion re-injects the verified value, so these cannot be forged by a client.
+
+| Header | Direction | Meaning | Since |
+|--------|-----------|---------|-------|
+| `X-Forwarded-For` | set per `xff_mode` | client IP chain (see table above) | 0.1 |
+| `X-Real-IP` | set (inbound never trusted) | resolved client IP | 0.1 |
+| `X-Forwarded-Proto` / `X-Forwarded-Host` | set | original scheme / Host | 0.1 |
+| `X-Request-ID` | set if absent, else echoed | request correlation id | 0.1 |
+| `X-Client-Cert-Fingerprint` | set on mTLS routes (inbound stripped) | `sha256:<hex>` of the leaf DER | **0.1.7** (replaced `X-Client-Cert-DN`) |
+| `X-Client-TLS-JA4` / `X-Client-TLS-*` | set on TLS-fingerprint routes (inbound stripped) | verified JA4 identity | 0.7.5 |
+| `X-Auth-Subject` / `X-Auth-Email` | set from validated claims (inbound **always** stripped) | authenticated `sub` / `email` | requires `--features auth` |
+
+Breaking changes to this contract are called out in the [CHANGELOG](https://github.com/fabriziosalmi/zion/blob/master/CHANGELOG.md); pin the header names you consume and re-check them on a major upgrade.
 
 ## Hot-reload
 

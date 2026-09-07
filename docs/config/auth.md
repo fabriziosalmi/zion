@@ -14,12 +14,21 @@ For internal microservices using shared secrets:
 
 ```toml
 [auth_profile.internal]
-secret = "your-hmac-secret-key"
+# Prefer secret_env over a literal `secret` — it keeps the signing key out of
+# zion.toml (and out of version control). It names an environment variable:
+secret_env = "ZION_AUTH_INTERNAL_SECRET"
 algorithm = "HS256"
 issuer = "auth.internal"
 audience = "api.internal"
 forward_claims = true
 ```
+
+::: warning Keep the HMAC secret out of the config file
+A literal `secret` puts a live signing key in `zion.toml` — anyone who can read
+the file can forge valid tokens. Use `secret_env` (the name of an env var
+holding the secret); it wins over `secret` when both are set, and a
+named-but-missing/empty env var fails startup rather than silently continuing.
+:::
 
 ### OIDC (asymmetric)
 
@@ -48,7 +57,8 @@ waf = true
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `secret` | string | — | HMAC shared secret (for HS256/HS384/HS512) |
+| `secret` | string | — | HMAC shared secret literal (HS256/HS384/HS512). **Prefer `secret_env`.** |
+| `secret_env` | string | — | Name of an env var holding the HMAC secret. Preferred over `secret`; wins when both are set. |
 | `jwks_url` | string | — | JWKS endpoint URL (for RS256/ES256, auto-refreshed hourly) |
 | `algorithm` | string | `HS256` | JWT algorithm. Auto-selects RS256 when `jwks_url` is set without `secret` |
 | `issuer` | string | — | Expected `iss` claim (optional) |
@@ -78,6 +88,30 @@ When `forward_claims = true`, decoded claims are injected as headers:
 |--------|-------|-------------|
 | `X-Auth-Subject` | `sub` | User ID / subject |
 | `X-Auth-Email` | `email` | User email (if present in token) |
+
+These headers are **reserved**: Zion strips any inbound `X-Auth-Subject` /
+`X-Auth-Email` from the client on every request (regardless of the auth
+feature or whether a route has an auth profile) before the gate re-injects the
+verified values, so an upstream can trust them as authenticated. A client
+cannot forge them.
+
+## Token lifetime and revocation
+
+Zion validates a token's **signature, expiry (`exp`), and not-before (`nbf`)**
+on every request, but it has **no revocation or replay defense**: there is no
+denylist, no OIDC introspection, and no `jti`/nonce replay check. A valid token
+is accepted until it expires, and can be replayed any number of times within
+its lifetime.
+
+Consequences for operators:
+
+- **Issue short-lived tokens.** The token lifetime is your effective revocation
+  window — a leaked token cannot be invalidated before `exp`. Minutes, not days.
+- A logout / key-compromise event cannot be enforced at the edge mid-lifetime;
+  rotate the signing key (or JWKS) to invalidate outstanding tokens en masse.
+- If per-token revocation matters for your deployment, terminate auth at a
+  service that maintains a denylist / introspection endpoint, and use Zion's
+  gate as defense in depth.
 
 ### JWKS refresh
 
