@@ -16,9 +16,14 @@
 # ============================================================================
 
 # ── Stage 1: Build ──
-# Pinned to match rust-toolchain.toml. MSRV (Cargo.toml rust-version=1.82)
-# only applies to the no-default-features build; this image bakes a full
-# default-features binary so we need the same compiler we ship with.
+# The base image tag (rust:1.97) provides rustup + cargo, but the ACTUAL build
+# compiler is 1.88.0: `rust-toolchain.toml` is COPYed into the build context
+# below (see the COPY of rust-toolchain.toml), and rustup honours it, so cargo
+# compiles with the same 1.88.0 we pin for dev/CI regardless of the base tag.
+# The base tag therefore need not equal the pin — bump it for a newer rustup
+# without changing the compiler. MSRV (Cargo.toml rust-version=1.82) only
+# applies to the no-default-features build; this image bakes a full
+# default-features binary, which needs the 1.88 pin (acme/auth/etc.).
 #
 # `--platform=$TARGETPLATFORM` (NOT $BUILDPLATFORM): the builder runs on the
 # *target* architecture, so `cargo build` below produces a binary for that
