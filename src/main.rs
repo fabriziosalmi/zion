@@ -43,6 +43,7 @@
 
 mod acme;
 mod admin;
+mod atomic_file;
 mod audit;
 mod auth;
 mod bootstrap;

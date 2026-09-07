@@ -113,6 +113,12 @@ fn main() {
 #[path = "_shared/aimp_metrics_stub.rs"]
 mod metrics;
 
+// aimp_cp writes its identity seed through the shared atomic-write helper
+// (`crate::atomic_file`), so the example crate must vendor that module too.
+#[cfg(feature = "sovereign-aimp")]
+#[path = "../src/atomic_file.rs"]
+mod atomic_file;
+
 #[cfg(feature = "sovereign-aimp")]
 #[path = "../src/aimp_cp.rs"]
 mod aimp_cp;

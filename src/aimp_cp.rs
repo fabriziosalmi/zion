@@ -870,8 +870,6 @@ async fn run_anti_entropy(
 /// non-root user that doesn't own that directory — there the operator
 /// is expected to point `identity_path` at a path the service can write.
 fn load_or_generate_identity(path: &std::path::Path) -> Result<Identity, String> {
-    use std::io::Write;
-
     // Try to load an existing seed.
     if path.exists() {
         match std::fs::read(path) {
@@ -900,43 +898,15 @@ fn load_or_generate_identity(path: &std::path::Path) -> Result<Identity, String>
     let identity = Identity::new();
     let secret = identity.secret_bytes();
 
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    // Atomic write: tmp file + rename, so a partial write never
-    // produces a half-baked seed file. chmod 0600 BEFORE the rename
-    // so the file is never readable by other users in transit.
-    let tmp_path = path.with_extension("bin.tmp");
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp_path)
-    {
-        Ok(mut f) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
-            }
-            if let Err(e) = f.write_all(&secret) {
-                eprintln!(
-                    "aimp_cp: warn: identity_path {} write failed: {e}",
-                    path.display()
-                );
-            } else if let Err(e) = std::fs::rename(&tmp_path, path) {
-                eprintln!(
-                    "aimp_cp: warn: identity_path {} rename failed: {e}",
-                    path.display()
-                );
-            }
-        }
-        Err(e) => {
-            eprintln!(
-                "aimp_cp: warn: identity_path {} cannot create tmp file: {e} — running with ephemeral identity",
-                path.display()
-            );
-        }
+    // Atomic write, created 0600 up front with the error PROPAGATED (not the old
+    // create-then-chmod-then-swallow, which could rename a world-readable seed if
+    // the chmod failed). On failure we run with an ephemeral identity rather than
+    // persist a seed whose permissions we could not guarantee.
+    if let Err(e) = crate::atomic_file::write_atomic_0600(path, secret.as_ref()) {
+        eprintln!(
+            "aimp_cp: warn: identity_path {} not persisted ({e}) — running with ephemeral identity",
+            path.display()
+        );
     }
 
     Ok(identity)

@@ -285,7 +285,10 @@ async fn do_renewal_native(
         // Persist credentials for future runs
         let creds_json = serde_json::to_string_pretty(&credentials)
             .map_err(|e| format!("cannot serialize credentials: {e}"))?;
-        std::fs::write(&creds_path, creds_json)
+        // Atomic + 0600: the ACME account key authorizes issuing/revoking certs
+        // for the domain, so it must never be world-readable at rest, and a torn
+        // write must not persist a truncated account.json.
+        crate::atomic_file::write_atomic_0600(creds_path.as_ref(), creds_json.as_bytes())
             .map_err(|e| format!("cannot write account.json: {e}"))?;
 
         crate::logging::info("acme", "ACME account created and persisted");
@@ -377,11 +380,23 @@ async fn do_renewal_native(
         .await
         .map_err(|e| format!("poll_certificate failed: {e}"))?;
 
-    // --- Step 6: Write to disk ---
-    std::fs::write(&tls_config.cert_path, cert_chain_pem.as_bytes())
-        .map_err(|e| format!("cannot write cert to '{}': {}", tls_config.cert_path, e))?;
-    std::fs::write(&tls_config.key_path, private_key_pem.as_bytes())
-        .map_err(|e| format!("cannot write key to '{}': {}", tls_config.key_path, e))?;
+    // --- Step 6: Write to disk (atomic pair, key before cert, 0600) ---
+    // Cert and key are one logical unit: two separate truncate-in-place writes
+    // could be interrupted, leaving a new cert beside the old key (or a truncated
+    // PEM) that loads but fails every TLS handshake. Stage both, fsync, then
+    // rename key-first so a partial state never shows a cert without its key.
+    crate::atomic_file::write_cert_key_atomic(
+        std::path::Path::new(&tls_config.key_path),
+        private_key_pem.as_bytes(),
+        std::path::Path::new(&tls_config.cert_path),
+        cert_chain_pem.as_bytes(),
+    )
+    .map_err(|e| {
+        format!(
+            "cannot write cert/key pair to '{}' + '{}': {e}",
+            tls_config.cert_path, tls_config.key_path
+        )
+    })?;
 
     crate::logging::info(
         "acme",

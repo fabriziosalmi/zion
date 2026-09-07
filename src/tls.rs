@@ -158,7 +158,18 @@ fn load_certified_key(cert_path: &str, key_path: &str) -> Result<Arc<CertifiedKe
     let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
         .map_err(|e| format!("Failed to create signing key from PEM: {e}"))?;
 
-    Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
+    let ck = CertifiedKey::new(certs, signing_key);
+    // Reject a mismatched cert/key pair up front instead of loading it and
+    // failing every TLS handshake. This is the load-side guard that backs the
+    // atomic renewal write (atomic_file::write_cert_key_atomic): even if a crash
+    // caught the renewal in the sub-microsecond window between renaming the key
+    // and the cert, the resulting mismatched pair is refused here, so a hot
+    // reload keeps the last-good acceptor and boot fails loudly rather than
+    // serving a cert whose key it does not hold.
+    ck.keys_match()
+        .map_err(|e| format!("TLS cert '{cert_path}' does not match key '{key_path}': {e}"))?;
+
+    Ok(Arc::new(ck))
 }
 
 /// Build a TLS acceptor for the admin listener's `auth = "mtls"` mode (#26): the
