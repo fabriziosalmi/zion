@@ -176,6 +176,15 @@ pub(crate) async fn process_request(
 ) -> Result<Response<ZionBody>, hyper::Error> {
     let client_request_id = req.headers().get("X-Request-ID").cloned();
     let mut resp = process_request_inner(req, state, remote_addr, is_early_data).await?;
+    // Record status ONCE per request, for every outcome. This is the single
+    // choke point every response flows through, so counting here — instead of
+    // at each `return` inside the pipeline — means the pre-routing security
+    // rejects (414/405/425/429/403 and the auth 401/403) are counted too.
+    // Previously those returned before the inner recording site, so an attack
+    // that tripped a gate was invisible in `/metrics` and undercounted
+    // `requests_total`. `record_status` must fire exactly once per request, so
+    // the inner call sites are removed in favour of this one.
+    metrics::METRICS.record_status(resp.status().as_u16());
     inject_security_headers(&mut resp);
     if !resp.headers().contains_key("X-Request-ID") {
         if let Some(id) = client_request_id {
@@ -662,7 +671,6 @@ async fn process_request_inner(
             Some(url) => url,
             None if rule.mode == config::RouteMode::Static => &EMPTY_UPSTREAM,
             None => {
-                metrics::METRICS.record_status(503);
                 return Ok(text_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "upstream unavailable",
@@ -774,7 +782,6 @@ async fn process_request_inner(
                 metrics::METRICS
                     .waf_denied
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                metrics::METRICS.record_status(400);
                 logging::info("waf", &format!("URI denied: {reason} ({uri_str})"));
                 emit_waf_block(&state, &remote_addr, method, uri_str, "uri", &reason);
                 return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
@@ -813,7 +820,6 @@ async fn process_request_inner(
                     metrics::METRICS
                         .waf_denied
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    metrics::METRICS.record_status(400);
                     logging::info(
                         "waf_ml",
                         &format!(
@@ -917,7 +923,6 @@ async fn process_request_inner(
                         metrics::METRICS
                             .waf_denied
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        metrics::METRICS.record_status(400);
                         emit_waf_block(
                             &state,
                             &remote_addr,
@@ -976,7 +981,6 @@ async fn process_request_inner(
                     metrics::METRICS
                         .waf_denied
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    metrics::METRICS.record_status(400);
                     emit_waf_block(
                         &state,
                         &remote_addr,
@@ -1022,7 +1026,6 @@ async fn process_request_inner(
                     metrics::METRICS
                         .waf_denied
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    metrics::METRICS.record_status(400);
                     emit_waf_block(
                         &state,
                         &remote_addr,
@@ -1295,8 +1298,9 @@ async fn process_request_inner(
             .insert(hyper::header::CONTENT_SECURITY_POLICY, csp_val.clone());
     }
 
-    // Record metrics (atomic increment, ~2ns)
-    metrics::METRICS.record_status(resp.status().as_u16());
+    // Status is recorded once, centrally, in `process_request` (the wrapper),
+    // so every outcome — this completion path and every early security reject —
+    // is counted exactly once.
 
     let request_elapsed = request_start.elapsed();
 
