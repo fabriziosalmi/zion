@@ -225,6 +225,17 @@ fn route_cache_key(host: Option<&str>, path: &str) -> u64 {
     h.finish()
 }
 
+/// Render a 16-byte W3C trace id as 32 lowercase hex chars — the join key that
+/// links an access-log line and a signed audit record to the distributed trace.
+fn trace_id_to_hex(bytes: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(32);
+    for &b in bytes {
+        s.push(crate::HEX_DIGITS[(b >> 4) as usize] as char);
+        s.push(crate::HEX_DIGITS[(b & 0xF) as usize] as char);
+    }
+    s
+}
+
 /// Zion-owned identity headers upstreams trust as *verified*. Any inbound copy
 /// is a spoof attempt and is dropped at the trust boundary; the auth gate later
 /// re-injects the authenticated values. Kept as a named list so the reserved
@@ -1143,6 +1154,13 @@ async fn process_request_inner(
     }
     observability::TRACES_EMITTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+    // Stringify the trace ID once (32 lowercase hex) so BOTH the access-log
+    // line and the audit record can carry it. Without this an operator can see
+    // a request in the logs, or a signed audit event, but has no key to join
+    // it to the distributed trace in Tempo/Jaeger — the histogram exemplar was
+    // the only place the id surfaced.
+    let trace_hex: String = trace_id_to_hex(&trace_id_bytes);
+
     // Pre-extract X-Request-ID for response echo (before req is consumed)
     let request_id_val = req.headers().get("X-Request-ID").cloned();
 
@@ -1340,6 +1358,9 @@ async fn process_request_inner(
             method = %log_method,
             path = %path_safe,
             remote_ip = %remote_addr.ip(),
+            // 32-hex W3C trace id — the join key from this log line to the
+            // distributed trace (and to the matching audit record).
+            trace_id = %trace_hex,
             // Issue #60: configured request headers, redacted via the
             // [redact.headers] policy, packed into one JSON object so
             // dynamic field names don't fight the tracing macro.
@@ -1375,7 +1396,7 @@ async fn process_request_inner(
                 seq: 0,
                 ts: String::new(),
                 kind: audit::kind::REQUEST_COMPLETED,
-                trace_id: None,
+                trace_id: Some(trace_hex.clone()),
                 remote_ip: Some(remote_addr.ip().to_string()),
                 method: Some(log_method.to_string()),
                 path: Some(path_safe.to_string()),
@@ -2634,6 +2655,23 @@ mod tests {
         let r = deny_or_tarpit(&shed, StatusCode::FORBIDDEN).await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
         assert_eq!(m.tarpit_shed_total.load(Relaxed), s1 + 1);
+    }
+
+    #[test]
+    fn trace_id_hex_is_32_lowercase_hex() {
+        // All-zero and a known pattern → exact 32-hex, lowercase, matching the
+        // W3C traceparent trace-id rendering used in the header.
+        assert_eq!(trace_id_to_hex(&[0u8; 16]), "0".repeat(32));
+        let bytes: [u8; 16] = [
+            0x0a, 0xf7, 0x65, 0x19, 0x16, 0xcd, 0x43, 0xdd, 0x84, 0x48, 0xeb, 0x21, 0x1c, 0x80,
+            0x31, 0x9c,
+        ];
+        let hex = trace_id_to_hex(&bytes);
+        assert_eq!(hex, "0af7651916cd43dd8448eb211c80319c");
+        assert_eq!(hex.len(), 32);
+        assert!(hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
     }
 
     #[test]
