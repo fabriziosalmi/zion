@@ -1816,7 +1816,14 @@ mod tests {
             allowed_name: Some("bad\nname".into()),
         };
         apply_headers(&mut req, Some(&id));
-        assert!(req.headers().get(HDR_JA4).is_some());
+        // Assert the exact verified JA4 is injected (not merely present): a
+        // regression that wrote a wrong/attacker-influenced value on this path
+        // while still dropping the unsafe allowlist name would slip past a bare
+        // is_some() check.
+        assert_eq!(
+            req.headers().get(HDR_JA4).and_then(|v| v.to_str().ok()),
+            Some("t13d1516h2_8daaf6152771_e5627efa2ab1")
+        );
         assert!(req.headers().get(HDR_ALLOWLISTED).is_none());
     }
 
