@@ -172,11 +172,17 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn two_listeners_share_a_port_via_reuseport() {
         // SO_REUSEPORT lets a second listener bind the SAME concrete port.
         // Without it (SO_REUSEADDR alone) the second bind would EADDRINUSE.
+        // Runtime-skip (not #[cfg]) on non-Linux so the test still compiles and
+        // is *counted* everywhere — keeping the README test-count SSOT platform-
+        // independent — while only asserting where set_reuseport actually runs.
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: SO_REUSEPORT same-port bind is Linux-only");
+            return;
+        }
         let first = bind_with_reuseport("127.0.0.1:0".parse().unwrap()).expect("first bind");
         let port = first.local_addr().unwrap().port();
         let same: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
