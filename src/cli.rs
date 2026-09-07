@@ -86,7 +86,7 @@ pub struct SuggestOpts {
 /// Options for `zion import <source> <input>` (ADR-0011).
 #[derive(Debug, Clone, Default)]
 pub struct ImportOpts {
-    /// Source format: `nginx` or `traefik`; empty = usage error.
+    /// Source format: `nginx`, `traefik`, or `caddy`; empty = usage error.
     pub source: String,
     /// Input config path, or `-` for stdin.
     pub input: Option<String>,

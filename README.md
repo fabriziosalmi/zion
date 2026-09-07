@@ -11,6 +11,8 @@
 [![FIPS-ready](https://img.shields.io/badge/FIPS_140--3-ready_(--features_fips)-success.svg)](docs/security/fips.md)
 [![ASVS L2](https://img.shields.io/badge/OWASP_ASVS-L2_mapped-blue.svg)](docs/security/asvs.md)
 
+<sub>The SLSA / cosign provenance above covers the **default** release binaries. A `--features fips` build is a manual, currently unattested build — see [fips.md](docs/security/fips.md#compliance-posture-summary).</sub>
+
 <!-- Project metadata -->
 [![Version](https://img.shields.io/github/v/release/fabriziosalmi/zion?include_prereleases&color=blue&label=release)](https://github.com/fabriziosalmi/zion/releases)
 [![MSRV](https://img.shields.io/badge/MSRV-1.82%20core%20%2F%201.88%20full-blue.svg)](Cargo.toml)

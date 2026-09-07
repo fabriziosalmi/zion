@@ -21,6 +21,12 @@
 //!
 //! Hot path: zero allocation in the common case. Everything that turns
 //! a `Request` into a `Response` lives here or is called from here.
+//!
+//! Feature gating: the sovereign classification + enforcement path
+//! (`deny_or_tarpit`, the enforce gate) is compiled in only under
+//! `feature = "geo-ita"` or `feature = "geo-eu"`. A default-feature binary
+//! does NOT run it — keep that in mind before chasing an enforcement bug in a
+//! build that never included the code.
 
 use crate::audit;
 use crate::audit::AuditEvent;
