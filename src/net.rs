@@ -145,3 +145,58 @@ pub fn tune_accepted(stream: &tokio::net::TcpStream) {
 
 #[cfg(not(target_os = "linux"))]
 pub fn tune_accepted(_stream: &tokio::net::TcpStream) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn binds_ipv4_ephemeral_port() {
+        let l = bind_with_reuseport("127.0.0.1:0".parse().unwrap()).expect("bind v4");
+        let addr = l.local_addr().unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_ne!(addr.port(), 0, "kernel must assign a real port");
+    }
+
+    #[tokio::test]
+    async fn binds_ipv6_ephemeral_port() {
+        // The domain-selection branch: an IPv6 addr must bind on an IPv6 socket.
+        // Skip gracefully where the host has no IPv6 loopback configured.
+        match bind_with_reuseport("[::1]:0".parse().unwrap()) {
+            Ok(l) => {
+                let addr = l.local_addr().unwrap();
+                assert!(addr.is_ipv6());
+                assert_ne!(addr.port(), 0);
+            }
+            Err(e) => eprintln!("skipping IPv6 bind test (no ::1?): {e}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn two_listeners_share_a_port_via_reuseport() {
+        // SO_REUSEPORT lets a second listener bind the SAME concrete port.
+        // Without it (SO_REUSEADDR alone) the second bind would EADDRINUSE.
+        let first = bind_with_reuseport("127.0.0.1:0".parse().unwrap()).expect("first bind");
+        let port = first.local_addr().unwrap().port();
+        let same: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let second = bind_with_reuseport(same);
+        assert!(
+            second.is_ok(),
+            "SO_REUSEPORT must allow a second bind on the same port: {:?}",
+            second.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn tune_accepted_is_safe_on_a_live_stream() {
+        // Exercises the accept-side tuning FFI on a real connected socket.
+        let listener = bind_with_reuseport("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (server, _) = listener.accept().await.expect("accept");
+        // Must not panic on either end.
+        tune_accepted(&server);
+        tune_accepted(&client);
+    }
+}
