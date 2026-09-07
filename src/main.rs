@@ -1028,9 +1028,22 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
             } else {
                 std::env::var("ZION_AIMP_LISTEN").unwrap_or_else(|_| "0.0.0.0:9443".to_string())
             };
-            let listen: std::net::SocketAddr = listen_raw
-                .parse()
-                .unwrap_or_else(|_| "0.0.0.0:9443".parse().unwrap());
+            // Fail closed: a malformed listen address must NOT silently fall back
+            // to `0.0.0.0:9443` — that would bind the gossip control plane to
+            // every interface. The TOML path is already rejected at config
+            // validation; this also covers the `ZION_AIMP_LISTEN` env override,
+            // which bypasses that check. On a bad value, skip mesh bootstrap
+            // (aimp_cp = None) — bootstrap failure is non-fatal by design.
+            let listen: Option<std::net::SocketAddr> = match listen_raw.parse() {
+                Ok(addr) => Some(addr),
+                Err(e) => {
+                    eprintln!(
+                        "  AIMP control plane disabled: listen '{listen_raw}' is not a valid \
+                         socket address: {e}"
+                    );
+                    None
+                }
+            };
             let peers: Vec<std::net::SocketAddr> = if !toml_cfg.peers.is_empty() {
                 toml_cfg
                     .peers
@@ -1052,31 +1065,36 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/zion/aimp-identity.bin"))
             };
-            let cfg = aimp_cp::AimpControlPlaneConfig {
-                enabled: true,
-                listen,
-                peers,
-                identity_path,
-                anti_entropy_secs: toml_cfg.anti_entropy_secs,
-                inbound_claims_per_sec: toml_cfg.inbound_claims_per_sec,
-                inbound_claim_burst: toml_cfg.inbound_claim_burst,
-            };
-            match aimp_cp::bootstrap(cfg).await {
-                Ok(cp) => {
-                    eprintln!(
-                        "  AIMP control plane up: node_id[0..4]={:02x?} listen={} peers={}",
-                        &cp.node_id()[..4],
+            match listen {
+                None => None, // invalid listen already reported above; fail closed
+                Some(listen) => {
+                    let cfg = aimp_cp::AimpControlPlaneConfig {
+                        enabled: true,
                         listen,
-                        cp.reputation().is_empty() as u8 // touch the handle
-                    );
-                    Some(cp)
-                }
-                Err(e) => {
-                    crate::logging::warn(
-                        "aimp_cp",
-                        &format!("bootstrap failed: {e} — continuing without AIMP"),
-                    );
-                    None
+                        peers,
+                        identity_path,
+                        anti_entropy_secs: toml_cfg.anti_entropy_secs,
+                        inbound_claims_per_sec: toml_cfg.inbound_claims_per_sec,
+                        inbound_claim_burst: toml_cfg.inbound_claim_burst,
+                    };
+                    match aimp_cp::bootstrap(cfg).await {
+                        Ok(cp) => {
+                            eprintln!(
+                                "  AIMP control plane up: node_id[0..4]={:02x?} listen={} peers={}",
+                                &cp.node_id()[..4],
+                                listen,
+                                cp.reputation().is_empty() as u8 // touch the handle
+                            );
+                            Some(cp)
+                        }
+                        Err(e) => {
+                            crate::logging::warn(
+                                "aimp_cp",
+                                &format!("bootstrap failed: {e} — continuing without AIMP"),
+                            );
+                            None
+                        }
+                    }
                 }
             }
         } else {

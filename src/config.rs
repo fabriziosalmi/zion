@@ -1186,6 +1186,21 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
         }
     }
 
+    // [sovereign_aimp] — when the mesh is enabled and a listen address is set
+    // in TOML, it MUST parse. Previously a malformed value silently fell back
+    // to `0.0.0.0:9443` at boot, binding the gossip control plane to every
+    // interface — a fat-fingered address would quietly expose it to the
+    // internet. Fail validation instead of guessing a (world-open) default.
+    #[cfg(feature = "sovereign-aimp")]
+    if config.sovereign_aimp.enabled && !config.sovereign_aimp.listen.is_empty() {
+        if let Err(e) = config.sovereign_aimp.listen.parse::<std::net::SocketAddr>() {
+            errors.push(format!(
+                "sovereign_aimp.listen '{}' is not a valid socket address (e.g. 127.0.0.1:9443): {e}",
+                config.sovereign_aimp.listen
+            ));
+        }
+    }
+
     errors
 }
 
@@ -2487,6 +2502,43 @@ enabledd = true
         assert!(
             err.contains("client_ca_path"),
             "auth=mtls without client_ca_path must be rejected, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "sovereign-aimp")]
+    #[test]
+    fn sovereign_aimp_listen_must_parse_when_enabled() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+
+        // Malformed listen (missing port) must fail validation — NOT silently
+        // fall back to a world-open 0.0.0.0 bind.
+        let bad = format!("{base}[sovereign_aimp]\nenabled=true\nlisten=\"127.0.0.1\"\n");
+        let err = validate_str(&bad, "test").err().unwrap_or_default();
+        assert!(
+            err.contains("sovereign_aimp.listen"),
+            "malformed aimp listen must be rejected, got: {err}"
+        );
+
+        // A valid listen passes (semantic layer; cert files are a deploy check).
+        let good = format!("{base}[sovereign_aimp]\nenabled=true\nlisten=\"127.0.0.1:9443\"\n");
+        let cfg: ZionConfig = toml::from_str(&good).unwrap();
+        assert!(
+            !semantic_errors(&cfg)
+                .iter()
+                .any(|e| e.contains("sovereign_aimp.listen")),
+            "valid aimp listen must not be flagged"
+        );
+
+        // Disabled mesh: listen is not validated even if malformed (never bound).
+        let disabled = format!("{base}[sovereign_aimp]\nenabled=false\nlisten=\"nonsense\"\n");
+        let cfg: ZionConfig = toml::from_str(&disabled).unwrap();
+        assert!(
+            !semantic_errors(&cfg)
+                .iter()
+                .any(|e| e.contains("sovereign_aimp.listen")),
+            "disabled mesh must not validate its listen"
         );
     }
 
