@@ -1103,6 +1103,16 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                     route.path
                 ));
             }
+            // A static route serves from disk and needs no upstream;
+            // resolve_route silently discards any `upstream` here. Reject a
+            // non-empty one so the mismatch is a boot error, not a surprise.
+            if !route.upstream.is_empty() {
+                errors.push(format!(
+                    "route '{}' is mode=static but sets upstream = '{}' — a static route \
+                     serves from serve_dir and ignores upstream; remove it",
+                    route.path, route.upstream
+                ));
+            }
         } else {
             let has_upstream = config.upstream.contains_key(&route.upstream)
                 || config.upstreams.contains_key(&route.upstream);
@@ -1110,6 +1120,28 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                 errors.push(format!(
                     "route '{}' references unknown upstream '{}'",
                     route.path, route.upstream
+                ));
+            }
+            // serve_dir / spa_fallback / precompressed are honoured ONLY under
+            // mode=static; on any other mode they are silently ignored, so an
+            // operator expecting disk serving gets proxy behaviour instead.
+            // Reject the combination rather than dropping it quietly.
+            let mut static_only = Vec::new();
+            if route.serve_dir.as_deref().is_some_and(|s| !s.is_empty()) {
+                static_only.push("serve_dir");
+            }
+            if route.spa_fallback {
+                static_only.push("spa_fallback");
+            }
+            if route.precompressed {
+                static_only.push("precompressed");
+            }
+            if !static_only.is_empty() {
+                errors.push(format!(
+                    "route '{}' is mode={:?} but sets static-only field(s) {:?}; these apply \
+                     only to mode=static and would be silently ignored — set mode = \"static\" \
+                     or remove them",
+                    route.path, route.mode, static_only
                 ));
             }
         }
@@ -2016,6 +2048,37 @@ mod tests {
             validate_semantics(&cfg, "test").is_ok(),
             "fail-closed allowlist must pass: {:?}",
             validate_semantics(&cfg, "test").err()
+        );
+    }
+
+    #[test]
+    fn illegal_route_mode_field_combinations_are_rejected() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n";
+
+        // A static route that also names an upstream: upstream is silently
+        // dropped by resolve_route → reject.
+        let static_with_upstream = format!(
+            "{base}[[route]]\npath=\"/{{*rest}}\"\nmode=\"static\"\nserve_dir=\"/srv\"\nupstream=\"be\"\n"
+        );
+        let err = validate_str(&static_with_upstream, "test")
+            .err()
+            .unwrap_or_default();
+        assert!(
+            err.contains("mode=static but sets upstream"),
+            "static + upstream must be rejected, got: {err}"
+        );
+
+        // A standard (proxy) route that sets serve_dir: honoured only under
+        // mode=static → reject.
+        let standard_with_serve_dir =
+            format!("{base}[[route]]\npath=\"/{{*rest}}\"\nupstream=\"be\"\nserve_dir=\"/srv\"\n");
+        let err = validate_str(&standard_with_serve_dir, "test")
+            .err()
+            .unwrap_or_default();
+        assert!(
+            err.contains("static-only field"),
+            "non-static + serve_dir must be rejected, got: {err}"
         );
     }
 
