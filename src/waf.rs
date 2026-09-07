@@ -1013,6 +1013,35 @@ pub fn validate_request(
     body: &[u8],
     profile: &WafProfile,
 ) -> WafVerdict {
+    validate_request_impl(method, content_type, body, profile, false)
+}
+
+/// Same pipeline as [`validate_request`], but for a body the streaming WAF
+/// already scanned incrementally: the raw Aho-Corasick pass (Gate 3, first
+/// scan) is skipped because the `StreamingScanner` ran the SAME pattern set
+/// over the SAME bytes (with chunk-boundary overlap) as the frames arrived.
+/// The normalized/encoded scan, entropy, and JSON-structural gates still run —
+/// the streamer does not cover those. This avoids a second O(N) raw scan of the
+/// whole reassembled body on exactly the large-body requests streaming exists
+/// to serve.
+#[inline]
+pub fn validate_request_prescanned(
+    method: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+    profile: &WafProfile,
+) -> WafVerdict {
+    validate_request_impl(method, content_type, body, profile, true)
+}
+
+#[inline]
+fn validate_request_impl(
+    method: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+    profile: &WafProfile,
+    raw_prescanned: bool,
+) -> WafVerdict {
     // ── Gate 1: Body size (O(1)) ──
     let max_body_bytes = profile.max_body_mb * 1_048_576;
     if body.len() as u64 > max_body_bytes {
@@ -1070,7 +1099,10 @@ pub fn validate_request(
     let scanner = scanner_for(profile.mode);
 
     // Scan raw body first (fast path — no alloc if no encoding present).
-    if scanner.is_match(body) {
+    // Skipped when the streaming WAF already ran this exact raw pass over the
+    // same bytes incrementally (see `validate_request_prescanned`); the encoded
+    // pass and JSON gates below always run regardless.
+    if !raw_prescanned && scanner.is_match(body) {
         return WafVerdict::Deny("injection pattern detected");
     }
 
@@ -1414,6 +1446,39 @@ mod tests {
         assert_eq!(
             validate_request("POST", Some("application/json"), body, &strict_profile()),
             WafVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn prescanned_skips_raw_scan_but_keeps_encoded_pass() {
+        let profile = aggressive_profile();
+        // A plain (un-encoded) injection pattern: caught by the normal raw scan,
+        // but the prescanned variant assumes the streamer already ran that pass
+        // and therefore skips it — so it does NOT re-deny here.
+        let raw = b"id=1 union select password from admin";
+        assert!(matches!(
+            validate_request("POST", Some("multipart/form-data"), raw, &profile),
+            WafVerdict::Deny(_)
+        ));
+        assert_eq!(
+            validate_request_prescanned("POST", Some("multipart/form-data"), raw, &profile),
+            WafVerdict::Allow,
+            "prescanned must skip the raw scan (the streamer already did it)"
+        );
+
+        // An ENCODED injection is caught by the normalized pass, which the
+        // prescanned variant still runs — both must deny.
+        let encoded = b"a=%27%20union%20select%20password%20from%20admin%20--";
+        assert!(matches!(
+            validate_request("POST", Some("multipart/form-data"), encoded, &profile),
+            WafVerdict::Deny(_)
+        ));
+        assert!(
+            matches!(
+                validate_request_prescanned("POST", Some("multipart/form-data"), encoded, &profile),
+                WafVerdict::Deny(_)
+            ),
+            "prescanned must still run the encoded/normalized pass"
         );
     }
 

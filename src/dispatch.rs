@@ -978,7 +978,14 @@ async fn process_request_inner(
                 }
             };
 
-            let verdict = waf::validate_request(method, ct, &body_bytes, waf_profile);
+            // On the streaming path the raw Aho-Corasick pass already ran
+            // incrementally over these bytes, so skip the redundant buffered
+            // raw scan; the encoded/entropy/JSON gates still run.
+            let verdict = if waf_profile.streaming {
+                waf::validate_request_prescanned(method, ct, &body_bytes, waf_profile)
+            } else {
+                waf::validate_request(method, ct, &body_bytes, waf_profile)
+            };
             if let waf::WafVerdict::Deny(reason) = verdict {
                 if rule.waf_shadow {
                     metrics::METRICS
