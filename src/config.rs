@@ -108,9 +108,11 @@ fn default_admin_rate_limit() -> u32 {
 
 /// `[sovereign_aimp]` block — gossip control plane.
 ///
-/// Env vars `ZION_AIMP_*` still work and override the TOML values when set,
-/// so existing deployments keep working. Operators are encouraged to migrate
-/// to TOML for review/diffability.
+/// TOML takes precedence: a `ZION_AIMP_*` env var only fills a field that is
+/// UNSET (empty) in this block — it does NOT override a value present in the
+/// TOML (see the wiring in `main.rs`). Env vars are the legacy path and keep
+/// existing deployments working; operators are encouraged to migrate to TOML
+/// for review/diffability. (If you need an env var to win, clear the TOML key.)
 #[cfg(feature = "sovereign-aimp")]
 #[derive(Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]

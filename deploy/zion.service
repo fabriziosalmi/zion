@@ -19,6 +19,14 @@ ProtectHome=true
 ReadOnlyPaths=/etc/zion
 PrivateTmp=true
 
+# Writable runtime state. ProtectSystem=strict mounts the FS read-only, so
+# without this the ACME subsystem (account key + renewed cert/key under
+# /var/lib/zion) and the panic last-gasp file cannot be written and automatic
+# HTTPS issuance/renewal fails. StateDirectory creates /var/lib/zion owned by
+# the service user and grants write access under the strict sandbox.
+StateDirectory=zion
+Environment=ZION_LAST_GASP_PATH=/var/lib/zion/last_panic.jsonl
+
 # Allow binding to privileged ports (80, 443)
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
