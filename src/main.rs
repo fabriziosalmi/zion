@@ -387,23 +387,19 @@ impl ResolvedAppConfig {
                         "[sovereign.enforce.tarpit] enabled with max_concurrent = 0 — every flagged request is shed to an immediate 403 (tarpit is a no-op)",
                     );
                 }
-                // #151 self-DoS guard: a held tarpit connection keeps its
-                // global connection-pool permit and per-IP slot for the whole
-                // hold, so the ceiling must stay a small fraction of the pool —
-                // otherwise a flood of flagged sources pins admission. Clamp to
-                // 1/4 of the global connection ceiling and say so.
+                // #151 self-DoS guard: the ceiling must stay a small fraction of
+                // the connection pool (a held tarpit connection pins a permit +
+                // per-IP slot for its whole hold). The invariant lives in the
+                // policy itself; the root just wires it and logs the outcome.
+                if let Some((old, cap)) = policy.clamp_tarpit_concurrency(conn_limit_max) {
+                    logging::warn(
+                        "sovereign",
+                        &format!(
+                            "[sovereign.enforce.tarpit] max_concurrent {old} exceeds 1/4 of the global connection ceiling ({conn_limit_max}) — clamping to {cap} so held connections can't pin the admission pool",
+                        ),
+                    );
+                }
                 if tp.enabled && policy.tarpit_max_concurrent > 0 {
-                    let safety_cap = ((conn_limit_max / 4) as u32).max(1);
-                    if policy.tarpit_max_concurrent > safety_cap {
-                        logging::warn(
-                            "sovereign",
-                            &format!(
-                                "[sovereign.enforce.tarpit] max_concurrent {} exceeds 1/4 of the global connection ceiling ({}) — clamping to {} so held connections can't pin the admission pool",
-                                policy.tarpit_max_concurrent, conn_limit_max, safety_cap,
-                            ),
-                        );
-                        policy.tarpit_max_concurrent = safety_cap;
-                    }
                     // A few seconds already imposes the cost; very long holds
                     // tie up connections (capped by the connection idle timeout)
                     // and slow the shutdown drain.
