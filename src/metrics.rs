@@ -668,6 +668,19 @@ impl Metrics {
         let mut out = bytes::BytesMut::with_capacity(4096);
         let mut itoa_buf = itoa::Buffer::new();
 
+        // Build-info gauge (constant 1) carrying the version as a label — the
+        // standard Prometheus `*_build_info` convention. Lets a scraper join
+        // any zion series to its version and alert on version skew; the crate's
+        // own e2e harness queries this series. `CARGO_PKG_VERSION` is a
+        // compile-time literal with no label-unsafe characters.
+        out.extend_from_slice(
+            b"# HELP zion_build_info Build metadata (constant 1; see the version label).\n\
+                                # TYPE zion_build_info gauge\n\
+                                zion_build_info{version=\"",
+        );
+        out.extend_from_slice(env!("CARGO_PKG_VERSION").as_bytes());
+        out.extend_from_slice(b"\"} 1\n");
+
         out.extend_from_slice(
             b"# HELP zion_requests_total Total HTTP requests processed.\n\
                                 # TYPE zion_requests_total counter\n\
@@ -1492,6 +1505,11 @@ mod tests {
         assert!(out.contains("zion_request_duration_seconds_bucket"));
         assert!(out.contains("zion_upstream_duration_seconds_bucket"));
         assert!(out.contains("zion_tls_handshake_duration_seconds_bucket"));
+        // build-info gauge with the compiled version label.
+        assert!(out.contains(&format!(
+            "zion_build_info{{version=\"{}\"}} 1",
+            env!("CARGO_PKG_VERSION")
+        )));
     }
 
     #[test]
