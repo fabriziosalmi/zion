@@ -56,12 +56,24 @@ securityContext:
   capabilities:
     drop:
       - ALL
-    # Uncomment ONE of these only if you actually bind 80/443 (< 1024)
-    # without an upstream LB doing it for you. Most production setups
-    # terminate the privileged port at the LB and target an unprivileged
-    # containerPort here, so this stays empty.
+    # Left empty on purpose. The container binds the UNPRIVILEGED ports in
+    # `containerPorts` below (>= 1024), so a non-root pod with ALL caps
+    # dropped needs no NET_BIND_SERVICE. Only if you override containerPorts
+    # back to 80/443 must you add the capability here — and keep it in sync
+    # with those ports (that mismatch is exactly what this default avoids).
     # add:
     #   - NET_BIND_SERVICE
+
+# Ports the Zion process binds INSIDE the container. Unprivileged by default
+# so the pod runs non-root with every Linux capability dropped and never needs
+# NET_BIND_SERVICE. The Service still presents 80/443 to the world (see
+# `service` below) and targets these by NAME, so external clients are
+# unaffected. The daemon's own listen addresses are derived from these values
+# in the ConfigMap, so the three can't drift out of sync. If you must bind
+# 80/443 in-container, set these to 80/443 AND add NET_BIND_SERVICE above.
+containerPorts:
+  http: 8080
+  https: 8443
 
 podAnnotations: {}
 podLabels: {}
@@ -168,16 +180,40 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
-# Volumes. /var/lib/zion is created as an emptyDir so the ACME renewal
-# subsystem (which writes account.json + cert.pem) works under
-# readOnlyRootFilesystem: true. Size is small — ACME state is bytes.
+# /var/lib/zion holds ACME state — the account key and the renewed
+# certificate/key pair — plus the panic last-gasp file.
+#
+# By default it is an emptyDir: fine when TLS is terminated at the LB and Zion
+# does NOT run ACME in-pod, but EPHEMERAL — wiped whenever the pod is
+# rescheduled (node drain, eviction, rolling update onto a new node). If Zion
+# renews certificates itself, an emptyDir means the ACME account key and certs
+# are lost on every reschedule, forcing re-registration and re-issuance that
+# quickly trips the CA's rate limits (Let's Encrypt: a handful of duplicate
+# certs per week). Enable persistence to keep that state across restarts.
+#
+# NOTE: a PVC is ReadWriteOnce, so a single volume cannot back more than one
+# replica. For in-pod ACME with persistence, run replicaCount: 1 (or switch to
+# a StatefulSet / an external cert-manager Secret). Multi-replica deployments
+# should terminate TLS at the LB or source certs from a shared Secret and leave
+# persistence disabled.
+persistence:
+  enabled: false
+  # Reuse an existing PVC instead of letting the chart create one.
+  existingClaim: ""
+  accessMode: ReadWriteOnce
+  size: 64Mi
+  # storageClassName: ""   # "" = cluster default; "-" = disable dynamic provisioning
+  annotations: {}
+
+# Size cap for the emptyDir used when persistence.enabled = false.
 varlib:
   sizeLimit: 16Mi
 
 # Zion configuration — projected as a ConfigMap and mounted at /etc/zion.
+# The listen addresses are NOT set here: they are derived from `containerPorts`
+# in the ConfigMap so the bound ports, the declared containerPorts, and the
+# Service targetPorts stay consistent by construction.
 config:
-  listen_http: "0.0.0.0:80"
-  listen_https: "0.0.0.0:443"
   # You can mount a Secret and define certificates paths here
   # cert_path: "/etc/ssl/zion/tls.crt"
   # key_path: "/etc/ssl/zion/tls.key"

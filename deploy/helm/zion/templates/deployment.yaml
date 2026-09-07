@@ -66,13 +66,13 @@ spec:
               value: /var/lib/zion/last_panic.jsonl
           ports:
             - name: http
-              containerPort: 80
+              containerPort: {{ .Values.containerPorts.http }}
               protocol: TCP
             - name: https
-              containerPort: 443
+              containerPort: {{ .Values.containerPorts.https }}
               protocol: TCP
             - name: quic
-              containerPort: 443
+              containerPort: {{ .Values.containerPorts.https }}
               protocol: UDP
           {{- if .Values.probes.startup.enabled }}
           startupProbe:
@@ -100,9 +100,16 @@ spec:
         - name: config-volume
           configMap:
             name: {{ include "zion.fullname" . }}
+        # ACME state (account key + renewed certs). Persistent when enabled so
+        # it survives a reschedule; otherwise an ephemeral emptyDir.
         - name: zion-state
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default (include "zion.fullname" .) }}
+          {{- else }}
           emptyDir:
             sizeLimit: {{ .Values.varlib.sizeLimit }}
+          {{- end }}
         - name: tmp
           emptyDir:
             sizeLimit: 16Mi
