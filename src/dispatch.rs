@@ -1783,35 +1783,39 @@ async fn handle_static_cache(
     let path_owned: Arc<str> = Arc::from(cache_key);
 
     // Singleflight: coalesce concurrent cache misses for the same key.
-    // If another request is already fetching, subscribe to its watch channel
-    // and wait for completion. We use watch (not Notify) because
-    // `Receiver::wait_for` inspects the current value at first poll: if the
-    // fetcher already sent `true` between our get() and our .await, we still
-    // observe it and return immediately instead of hanging.
-    let waiter = state
-        .inflight
-        .get(&path_owned)
-        .map(|entry| entry.value().subscribe());
-
-    if let Some(mut rx) = waiter {
-        // Err = sender dropped without sending true (fetch aborted/errored).
-        // In both Ok and Err cases we re-check the cache; on miss we fall
-        // through to fetch ourselves.
+    //
+    // "Become the fetcher, or find the one already running" must be a single
+    // atomic step — a separate `get()` then `insert()` lets two concurrent
+    // misses both see "absent" and both register, the second clobbering the
+    // first's sender (orphaning its waiters and double-fetching upstream). So
+    // we use `get_or_insert_with`, which returns `inserted = true` to exactly
+    // one caller. We use watch (not Notify) because `Receiver::wait_for`
+    // inspects the current value at first poll: if the fetcher published `true`
+    // between our registration and our `.await`, we still observe it and return
+    // immediately instead of hanging.
+    //
+    // A waiter whose fetcher aborted (sender dropped without `true`) wakes,
+    // re-checks the cache, and on a miss loops to try to become the fetcher
+    // itself (or wait on whichever fetcher took over). Progress is guaranteed
+    // as long as fetches terminate.
+    let tx = loop {
+        let (tx, inserted) = state
+            .inflight
+            .get_or_insert_with(path_owned.clone(), || tokio::sync::watch::channel(false).0);
+        if inserted {
+            // We own the fetch for this key.
+            break tx;
+        }
+        // Someone else is fetching — wait for them.
+        let mut rx = tx.subscribe();
         let _ = rx.wait_for(|v| *v).await;
         if let Some(hit) = state.static_cache.get(path_owned.as_ref()).fresh() {
             // get() already counted this hit — don't double-count it here.
             return Ok(cache_hit_response(hit));
         }
-        // Cache miss (or stale) even after wait — fall through to fetch from
-        // upstream, which re-populates (a stale re-check here is rare: the
-        // fetcher we waited on just stored a fresh entry).
-    }
-
-    // Register as the inflight fetcher for this key.
-    // Initial value `false` = "fetch in progress"; we publish `true` once the
-    // cache is populated. Drop without sending `true` signals abort to waiters.
-    let (tx, _) = tokio::sync::watch::channel(false);
-    state.inflight.insert(path_owned.clone(), tx.clone());
+        // Cache miss/stale after wait (fetcher aborted, or stored a
+        // non-cacheable response): loop to fetch ourselves.
+    };
 
     // RAM miss — fetch from upstream.
     // On error, drop the inflight sender. Waiters' wait_for() returns Err
