@@ -213,7 +213,17 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthPr
         // Uses exponential backoff on failure (5s → 10s → ... → 3600s).
         tokio::spawn(async move {
             let client = loop {
-                match reqwest::Client::builder().build() {
+                // Bound both the connect and the overall request: reqwest has
+                // NO default timeout, so a JWKS endpoint that accepts the
+                // connection but never responds would park `send().await`
+                // forever, wedging the refresh loop and freezing key rotation.
+                // With a deadline the hung fetch fails and trips the backoff
+                // path below instead.
+                match reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(5))
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()
+                {
                     Ok(c) => break c,
                     Err(e) => {
                         crate::logging::error(
