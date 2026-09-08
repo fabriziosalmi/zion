@@ -1,0 +1,40 @@
+# Zion Edge Gateway
+
+> A single auditable Rust binary at the edge of your network: TLS 1.3 termination, a zero-regex WAF (Aho-Corasick), a two-level RAM cache, and an upstream proxy — replacing nginx + a WAF module + a cache + a geo-tagger with one static executable. No sidecars, no control plane, no runtime dependencies. Licensed Apache-2.0.
+
+Zion is configured with explicit TOML knobs (not a black box), ships signed multi-arch containers (cosign + SLSA provenance + CycloneDX SBOM), and hot-reloads config via an atomic pointer swap. Optional feature flags add ACME auto-renewal, JWT/OIDC auth, HTTP/3 (QUIC), JA4 TLS fingerprinting, and an AIMP gossip mesh.
+
+## Documentation
+
+- [What is Zion?](https://fabriziosalmi.github.io/zion/guide/): overview, design goals, and when to reach for it
+- [Quick start](https://fabriziosalmi.github.io/zion/guide/quickstart): from zero to a running TLS proxy in ~30 seconds
+- [Migrating to Zion](https://fabriziosalmi.github.io/zion/guide/migrate): `zion import` from nginx, Traefik, and Caddy configs
+- [CLI reference](https://fabriziosalmi.github.io/zion/guide/cli): every subcommand and flag
+- [Architecture](https://fabriziosalmi.github.io/zion/guide/architecture): request lifecycle, module map, and concurrency model
+
+## Configuration
+
+- [Configuration reference](https://fabriziosalmi.github.io/zion/config/): the full TOML schema
+- [TLS & SNI](https://fabriziosalmi.github.io/zion/config/tls): certificates, SNI resolution, mTLS, session tickets
+- [ACME auto-renewal](https://fabriziosalmi.github.io/zion/config/acme): HTTP-01 issuance via Let's Encrypt
+- [Routing](https://fabriziosalmi.github.io/zion/config/routing): radix-tree host/path routing and route modes
+- [Caching](https://fabriziosalmi.github.io/zion/config/caching): the two-level (thread-local L1 + shared L2) cache
+- [WAF](https://fabriziosalmi.github.io/zion/config/waf): the five-gate, zero-regex WAF pipeline
+- [Authentication](https://fabriziosalmi.github.io/zion/config/auth): per-route JWT/OIDC validation
+
+## Security
+
+- [WAF pipeline](https://fabriziosalmi.github.io/zion/security/): how requests are inspected
+- [Hardening](https://fabriziosalmi.github.io/zion/security/hardening): production deployment hardening
+- [Threat model (STRIDE)](https://fabriziosalmi.github.io/zion/security/threat-model): assets, threats, mitigations
+- [Supply chain](https://fabriziosalmi.github.io/zion/security/supply-chain): signing, provenance, and SBOM verification
+
+## Performance
+
+- [Benchmarks](https://fabriziosalmi.github.io/zion/benchmarks/): methodology and headline throughput numbers
+- [Optimization log](https://fabriziosalmi.github.io/zion/benchmarks/optimization): the measured tuning history
+
+## Source
+
+- [GitHub repository](https://github.com/fabriziosalmi/zion): source, issues, and releases
+- [Changelog](https://github.com/fabriziosalmi/zion/blob/master/CHANGELOG.md): release notes
