@@ -4,6 +4,34 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-08
+
+**Audit quick-wins.** Low-risk residual findings from the re-audit (which scored
+75.8/100, 0 critical/high); the larger items are tracked as issues (#417–#424).
+No breaking changes.
+
+### Fixed
+
+- **docs**: the inline systemd unit in the deployment guide now includes
+  `StateDirectory=zion` (it had drifted from the shipped `deploy/zion.service`,
+  reintroducing the read-only `/var/lib/zion` write-path trap for anyone
+  transcribing it); the ACME `state_dir` doc comment now says
+  `/var/lib/zion/acme` (was `/etc/zion/acme`, contradicting the code default);
+  the Docker recipe is flagged as illustrative/root vs the shipped distroless
+  non-root image; the AIMP mesh is marked experimental in the guide.
+- **observability**: a local WAF-block that can't be gossiped (publish queue
+  full / control plane not bootstrapped) now increments a new
+  `zion_mesh_claims_dropped_publish_total` counter instead of dropping silently;
+  the `publish_block` docstring corrected to match.
+
+### Changed
+
+- **perf**: CORS requests validate the `Origin` once (reuse the pre-computed
+  allow-origin) instead of calling `check_origin` — and re-lowercasing the
+  origin — a second time per request.
+- **build**: the container image carries an `org.opencontainers.image.revision`
+  (commit sha) label.
+
 ## [0.8.1] - 2026-09-08
 
 **Container-build hotfix.** v0.8.0 published all binary artifacts, SBOM and
