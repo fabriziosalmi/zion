@@ -459,6 +459,11 @@ pub struct Metrics {
     // regardless of which build their distro produced).
     /// Successful local emits — bumped in `aimp_cp::publish_block`.
     pub mesh_claims_emitted: AtomicU64,
+    /// LOCAL blocks that could NOT be gossiped because the publish queue was
+    /// full or the control plane was not bootstrapped (back-pressure drop).
+    /// Send-side counterpart to the receive-side `mesh_claims_dropped_*`; the
+    /// local block still took effect, only its fleet-wide propagation was lost.
+    pub mesh_claims_dropped_publish: AtomicU64,
     /// Inbound envelopes that *passed* the merge policy gates.
     pub mesh_claims_received: AtomicU64,
     /// Inbound envelopes rejected on signature verification.
@@ -547,6 +552,7 @@ impl Metrics {
             tarpit_held_ms_total: AtomicU64::new(0),
             mesh_claims_emitted: AtomicU64::new(0),
             mesh_claims_received: AtomicU64::new(0),
+            mesh_claims_dropped_publish: AtomicU64::new(0),
             mesh_claims_dropped_signature: AtomicU64::new(0),
             mesh_claims_dropped_replay: AtomicU64::new(0),
             mesh_claims_dropped_other: AtomicU64::new(0),
@@ -1027,6 +1033,18 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.mesh_claims_emitted.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_mesh_claims_dropped_publish_total Local blocks not gossiped (publish queue full / control plane down).\n\
+                                # TYPE zion_mesh_claims_dropped_publish_total counter\n\
+                                zion_mesh_claims_dropped_publish_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.mesh_claims_dropped_publish.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");

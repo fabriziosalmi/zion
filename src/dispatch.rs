@@ -633,38 +633,47 @@ async fn process_request_inner(
         .and_then(|o| rule.cors.as_ref().and_then(|c| c.check_origin(o)));
 
     if let Some(ref cors) = rule.cors {
-        if let Some(ref origin_val) = req_origin {
-            let origin_str = origin_val.to_str().unwrap_or("");
-            if let Some(allow_origin) = cors.check_origin(origin_str) {
-                // Pre-flight OPTIONS — respond immediately without proxying
-                if *req.method() == hyper::Method::OPTIONS {
-                    let mut resp = empty_response(StatusCode::NO_CONTENT);
-                    let h = resp.headers_mut();
-                    h.insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, allow_origin);
-                    h.insert(
-                        hyper::header::ACCESS_CONTROL_ALLOW_METHODS,
-                        cors.allow_methods.clone(),
-                    );
-                    h.insert(
-                        hyper::header::ACCESS_CONTROL_ALLOW_HEADERS,
-                        cors.allow_headers.clone(),
-                    );
-                    h.insert(hyper::header::ACCESS_CONTROL_MAX_AGE, cors.max_age.clone());
-                    inject_security_headers(&mut resp);
-                    return Ok(resp);
+        // An origin is present: reuse the `cors_allow_origin` computed above
+        // instead of calling `check_origin` (and re-lowercasing the origin) a
+        // second time per request.
+        if req_origin.is_some() {
+            match cors_allow_origin.as_ref() {
+                Some(allow_origin) => {
+                    // Pre-flight OPTIONS — respond immediately without proxying.
+                    if *req.method() == hyper::Method::OPTIONS {
+                        let mut resp = empty_response(StatusCode::NO_CONTENT);
+                        let h = resp.headers_mut();
+                        h.insert(
+                            hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                            allow_origin.clone(),
+                        );
+                        h.insert(
+                            hyper::header::ACCESS_CONTROL_ALLOW_METHODS,
+                            cors.allow_methods.clone(),
+                        );
+                        h.insert(
+                            hyper::header::ACCESS_CONTROL_ALLOW_HEADERS,
+                            cors.allow_headers.clone(),
+                        );
+                        h.insert(hyper::header::ACCESS_CONTROL_MAX_AGE, cors.max_age.clone());
+                        inject_security_headers(&mut resp);
+                        return Ok(resp);
+                    }
                 }
-            } else {
-                // Origin not in allowed list — block state-changing methods AND preflight.
-                if *req.method() == hyper::Method::OPTIONS
-                    || matches!(
-                        *req.method(),
-                        hyper::Method::POST
-                            | hyper::Method::PUT
-                            | hyper::Method::PATCH
-                            | hyper::Method::DELETE
-                    )
-                {
-                    return Ok(empty_response(StatusCode::FORBIDDEN));
+                None => {
+                    // Origin present but not allowed — block state-changing
+                    // methods AND preflight.
+                    if *req.method() == hyper::Method::OPTIONS
+                        || matches!(
+                            *req.method(),
+                            hyper::Method::POST
+                                | hyper::Method::PUT
+                                | hyper::Method::PATCH
+                                | hyper::Method::DELETE
+                        )
+                    {
+                        return Ok(empty_response(StatusCode::FORBIDDEN));
+                    }
                 }
             }
         }

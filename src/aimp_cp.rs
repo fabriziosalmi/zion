@@ -200,8 +200,9 @@ impl AimpControlPlane {
 
     /// Publish a local block to the gossip mesh. Returns immediately —
     /// the actual UDP send happens in the publish task. If the channel
-    /// is full (catastrophic back-pressure), the delta is silently
-    /// dropped and a counter is bumped.
+    /// is full (catastrophic back-pressure), the delta is dropped, the
+    /// `mesh_claims_dropped_publish` counter is bumped, and `Err` is returned
+    /// (the local block itself already took effect; only gossip is lost).
     pub fn publish_block(&self, ip: IpAddr, score: f32, reason: u8) -> Result<(), &'static str> {
         let ip_v6 = match ip {
             IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
@@ -213,9 +214,15 @@ impl AimpControlPlane {
             ts_secs: now_secs(),
             reason,
         };
-        self.publish_tx
-            .try_send(delta)
-            .map_err(|_| "aimp-cp: publish queue full or closed")?;
+        if self.publish_tx.try_send(delta).is_err() {
+            // Back-pressure drop: the local block already took effect, only its
+            // gossip propagation is lost. Count it (send-side counterpart to the
+            // receive-side mesh_claims_dropped_* buckets) so it isn't silent.
+            crate::metrics::METRICS
+                .mesh_claims_dropped_publish
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err("aimp-cp: publish queue full or closed");
+        }
         // Successful local emit (the publisher task drains and signs +
         // sends). Increment AFTER a successful enqueue so a
         // back-pressure drop doesn't get counted as an emit.
