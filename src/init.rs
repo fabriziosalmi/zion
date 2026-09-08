@@ -215,9 +215,14 @@ pub fn run_auto(opts: AutoOpts) -> Result<PathBuf, String> {
         sans.push("localhost".to_string());
     }
     let cert = generate_simple_self_signed(sans).map_err(|e| format!("rcgen: {e}"))?;
-    std::fs::write(&cert_path, cert.cert.pem()).map_err(|e| format!("write {cert_path:?}: {e}"))?;
-    std::fs::write(&key_path, cert.signing_key.serialize_pem())
-        .map_err(|e| format!("write {key_path:?}: {e}"))?;
+    // Owner-only (0o600) atomic write — even a throwaway dev key must not be
+    // world-readable on a shared machine's $TMPDIR.
+    crate::atomic_file::write_cert_key_atomic(
+        &key_path,
+        cert.signing_key.serialize_pem().as_bytes(),
+        &cert_path,
+        cert.cert.pem().as_bytes(),
+    )?;
 
     let toml = format!(
         "# zion auto-mode — generated for one-shot dev / demo use.\n\
@@ -706,11 +711,17 @@ fn generate_tls_cert(r: &ResolvedInit) -> CertOutcome {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    if let Err(e) = std::fs::write(&r.cert_path, &cert_pem) {
-        return CertOutcome::Failed(format!("write {}: {}", r.cert_path, e));
-    }
-    if let Err(e) = std::fs::write(&r.key_path, &key_pem) {
-        return CertOutcome::Failed(format!("write {}: {}", r.key_path, e));
+    // Owner-only (0o600) atomic write of the pair — the serving private key
+    // must never be world-readable, not even for the instant between create
+    // and a later chmod. Same hardened path used for the ACME/mesh keys,
+    // rather than a bare `std::fs::write` (default umask, typically 0644).
+    if let Err(e) = crate::atomic_file::write_cert_key_atomic(
+        Path::new(&r.key_path),
+        key_pem.as_bytes(),
+        Path::new(&r.cert_path),
+        cert_pem.as_bytes(),
+    ) {
+        return CertOutcome::Failed(e);
     }
 
     CertOutcome::Generated
@@ -945,6 +956,28 @@ mod tests {
                 .collect(),
             ..InitOpts::default()
         }
+    }
+
+    #[cfg(all(unix, feature = "init"))]
+    #[test]
+    fn generated_tls_key_is_owner_only() {
+        // The serving private key must be created 0o600, never world-readable
+        // (the bare std::fs::write default was 0o644). Drives the self-signed
+        // branch of generate_tls_cert and checks the on-disk key mode.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("zion-init-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r =
+            build_non_interactive(opts_with_upstreams(&[("backend", "127.0.0.1:8000")]), &[])
+                .unwrap();
+        r.gen_tls = true;
+        r.acme = false; // self-signed path → the long-lived cert is the serving cert
+        r.cert_path = dir.join("server.crt").to_string_lossy().into_owned();
+        r.key_path = dir.join("server.key").to_string_lossy().into_owned();
+        assert!(matches!(generate_tls_cert(&r), CertOutcome::Generated));
+        let mode = std::fs::metadata(&r.key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "serving private key must be owner-only");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

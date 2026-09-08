@@ -52,6 +52,23 @@ pub fn spawn_renewal_task(
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
         loop {
+            // Liveness heartbeat: advance on every wake-up, *before* the
+            // work, so a dead loop is distinguishable from the normal
+            // months-long idle steady state (a stopped loop freezes both
+            // signals). The renewal counters below only move on an actual
+            // attempt, which is silent when the cert is simply still fresh.
+            use std::sync::atomic::Ordering::Relaxed;
+            crate::metrics::METRICS
+                .acme_loop_checks_total
+                .fetch_add(1, Relaxed);
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            crate::metrics::METRICS
+                .acme_loop_last_check_timestamp_seconds
+                .store(now_secs, Relaxed);
+
             // Check if renewal is needed (uses blocking fs)
             let cert_path = tls_config.cert_path.clone();
             let renew_days = acme_config.renew_before_days;

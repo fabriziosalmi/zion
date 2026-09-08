@@ -490,6 +490,19 @@ pub struct Metrics {
     /// ACME renewal attempts that failed (any stage: account, order,
     /// challenge, finalize, write).
     pub acme_renewal_failures_total: AtomicU64,
+    /// Total iterations of the ACME renewal background loop (monotonic
+    /// counter). Advances on every 12h wake-up, *including* the common
+    /// no-op case where the cert is still fresh — unlike the renewal
+    /// counters, which only move on an actual attempt. `rate() == 0`
+    /// over more than one interval means the loop is dead.
+    pub acme_loop_checks_total: AtomicU64,
+    /// Unix timestamp (seconds) of the last ACME loop wake-up (gauge, a
+    /// liveness heartbeat). A stopped loop leaves this frozen, so
+    /// `time() - zion_acme_loop_last_check_timestamp_seconds` exceeding
+    /// the ~12h check interval distinguishes a dead loop from the normal
+    /// months-long idle steady state (the cert-silently-expires gap). 0
+    /// until the first wake-up.
+    pub acme_loop_last_check_timestamp_seconds: AtomicU64,
 
     // Gauges
     pub active_connections: AtomicI64,
@@ -562,6 +575,8 @@ impl Metrics {
             mesh_gossip_bytes_out: AtomicU64::new(0),
             acme_renewals_total: AtomicU64::new(0),
             acme_renewal_failures_total: AtomicU64::new(0),
+            acme_loop_checks_total: AtomicU64::new(0),
+            acme_loop_last_check_timestamp_seconds: AtomicU64::new(0),
             active_connections: AtomicI64::new(0),
             process_resident_memory_bytes: AtomicU64::new(0),
             process_open_fds: AtomicU64::new(0),
@@ -1146,6 +1161,26 @@ impl Metrics {
                 .format(self.acme_renewal_failures_total.load(Relaxed))
                 .as_bytes(),
         );
+        out.extend_from_slice(
+            b"\n# HELP zion_acme_loop_checks_total ACME renewal loop iterations (advances every ~12h wake-up, including no-op checks; rate()==0 means the loop is dead).\n\
+                                # TYPE zion_acme_loop_checks_total counter\n\
+                                zion_acme_loop_checks_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.acme_loop_checks_total.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(
+            b"\n# HELP zion_acme_loop_last_check_timestamp_seconds Unix time of the last ACME loop wake-up (liveness heartbeat; 0 until first check). Alert when time()-this exceeds the check interval.\n\
+                                # TYPE zion_acme_loop_last_check_timestamp_seconds gauge\n\
+                                zion_acme_loop_last_check_timestamp_seconds ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.acme_loop_last_check_timestamp_seconds.load(Relaxed))
+                .as_bytes(),
+        );
         out.extend_from_slice(b"\n");
 
         self.request_duration.render(
@@ -1573,6 +1608,31 @@ mod tests {
         assert!(out.contains("zion_process_resident_memory_bytes "));
         assert!(out.contains("# TYPE zion_process_open_fds gauge"));
         assert!(out.contains("zion_process_open_fds "));
+    }
+
+    #[test]
+    fn acme_loop_liveness_heartbeat_rendered() {
+        // The heartbeat that distinguishes a dead ACME renewal loop from the
+        // normal months-long idle steady state: a monotonic iteration counter
+        // and a last-check timestamp gauge, both always emitted so a dashboard
+        // can alert on staleness. (`render` caches per wall-clock second, so a
+        // fresh Metrics is used for each assertion to force a cache-miss.)
+        let fresh = Metrics::new();
+        let out0 = String::from_utf8(fresh.render(false).to_vec()).unwrap();
+        assert!(out0.contains("# TYPE zion_acme_loop_checks_total counter"));
+        assert!(out0.contains("\nzion_acme_loop_checks_total 0\n"));
+        assert!(out0.contains("# TYPE zion_acme_loop_last_check_timestamp_seconds gauge"));
+        assert!(out0.contains("\nzion_acme_loop_last_check_timestamp_seconds 0\n"));
+
+        // A wake-up advances both signals; a frozen loop leaves them put.
+        let bumped = Metrics::new();
+        bumped.acme_loop_checks_total.fetch_add(1, Relaxed);
+        bumped
+            .acme_loop_last_check_timestamp_seconds
+            .store(1_700_000_000, Relaxed);
+        let out1 = String::from_utf8(bumped.render(false).to_vec()).unwrap();
+        assert!(out1.contains("\nzion_acme_loop_checks_total 1\n"));
+        assert!(out1.contains("\nzion_acme_loop_last_check_timestamp_seconds 1700000000\n"));
     }
 
     #[test]
