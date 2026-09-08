@@ -24,12 +24,20 @@ on:
     branches: [master]
     paths:
       - "src/waf.rs"
+      # WAF effectiveness depends on the request/body pipeline that FEEDS the
+      # scanner, not just waf.rs: dispatch.rs runs the URI/body gates and the
+      # streaming scan, proxy.rs handles body collection. A recall regression
+      # can originate there, so the corpus gate must trigger on them too.
+      - "src/dispatch.rs"
+      - "src/proxy.rs"
       - "benchmarks/waf-corpus/**"
       - ".github/workflows/waf-corpus.yml"
   push:
     branches: [master]
     paths:
       - "src/waf.rs"
+      - "src/dispatch.rs"
+      - "src/proxy.rs"
       - "benchmarks/waf-corpus/**"
 
 permissions:

@@ -19,9 +19,25 @@ use std::sync::Arc;
 // TOP-LEVEL CONFIG
 // ============================================================================
 
+/// The config-schema version THIS binary understands. Bump it (and document
+/// the migration) whenever a breaking config change lands. A config may declare
+/// `schema_version` to opt into the version handshake below.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ZionConfig {
+    /// Optional schema version the file targets. When present and NEWER than
+    /// this binary's `CURRENT_SCHEMA_VERSION`, the loader emits targeted upgrade
+    /// guidance (see `check_schema_version`) instead of a bare unknown-field
+    /// rejection. Absent = "no version declared", treated as compatible.
+    ///
+    /// `#[allow(dead_code)]`: the value is consumed by the lenient pre-parse
+    /// probe in `check_schema_version`, not read off this struct — but the field
+    /// must exist so the strict `deny_unknown_fields` parse ACCEPTS the key.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub schema_version: Option<u32>,
     pub server: ServerConfig,
     pub tls: TlsConfig,
     #[serde(default)]
@@ -769,8 +785,38 @@ pub struct ResolvedRoute {
 // LOADING & BUILDING
 // ============================================================================
 
+/// Read the file's declared `schema_version` FIRST, before the strict typed
+/// parse — a lenient probe that ignores every other key. If the file targets a
+/// NEWER schema than this binary understands, return targeted upgrade guidance
+/// rather than letting the strict parse fail on an unknown key it can't explain.
+/// A missing, older, or equal version is accepted (the strict parse then runs).
+pub fn check_schema_version(raw: &str, label: &str) -> Result<(), String> {
+    // No deny_unknown_fields: this probe deliberately tolerates every other key.
+    #[derive(Deserialize)]
+    struct SchemaProbe {
+        #[serde(default)]
+        schema_version: Option<u32>,
+    }
+    // A malformed TOML is reported by the real parse with a better message; the
+    // probe stays silent on parse errors so we don't double-report.
+    if let Ok(probe) = toml::from_str::<SchemaProbe>(raw) {
+        if let Some(v) = probe.schema_version {
+            if v > CURRENT_SCHEMA_VERSION {
+                return Err(format!(
+                    "{label}: config declares schema_version = {v}, but this zion supports up to \
+                     {CURRENT_SCHEMA_VERSION}. Upgrade zion to a build that understands schema \
+                     {v}, or target the older schema (see the CHANGELOG for the config changes \
+                     between schema versions)."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn load_config(path: &str) -> Result<ZionConfig, String> {
     let raw = fs::read_to_string(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
+    check_schema_version(&raw, path)?;
     let config: ZionConfig =
         toml::from_str(&raw).map_err(|e| format!("Invalid TOML in {path}: {e}"))?;
     validate_config(&config, path)?;
@@ -785,6 +831,7 @@ pub fn load_config(path: &str) -> Result<ZionConfig, String> {
 /// suggested config carries placeholder cert paths the operator fills in, so
 /// file existence isn't a schema concern.
 pub fn parse_schema(raw: &str, label: &str) -> Result<ZionConfig, String> {
+    check_schema_version(raw, label)?;
     toml::from_str(raw).map_err(|e| format!("Invalid TOML in {label}: {e}"))
 }
 
@@ -794,6 +841,7 @@ pub fn parse_schema(raw: &str, label: &str) -> Result<ZionConfig, String> {
 /// the pushed body must be fully deployable (real cert paths and all), unlike
 /// `zion suggest` which only needs the schema-level [`parse_schema`].
 pub fn validate_str(raw: &str, label: &str) -> Result<ZionConfig, String> {
+    check_schema_version(raw, label)?;
     let config: ZionConfig =
         toml::from_str(raw).map_err(|e| format!("Invalid TOML in {label}: {e}"))?;
     validate_config(&config, label)?;
@@ -2638,6 +2686,33 @@ enabledd = true
         assert!(
             err.contains("client_ca_path"),
             "auth=mtls without client_ca_path must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn schema_version_handshake() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+
+        // No schema_version → accepted (backward compatible).
+        assert!(check_schema_version(base, "t").is_ok());
+        assert!(parse_schema(base, "t").is_ok());
+
+        // Equal / older → accepted.
+        let cur = format!("schema_version = {CURRENT_SCHEMA_VERSION}\n{base}");
+        assert!(parse_schema(&cur, "t").is_ok());
+
+        // Newer than this binary → targeted guidance, even before the strict
+        // parse would choke on hypothetical new keys.
+        let newer = format!(
+            "schema_version = {}\nfuture_key = \"x\"\n{base}",
+            CURRENT_SCHEMA_VERSION + 1
+        );
+        let err = check_schema_version(&newer, "t").unwrap_err();
+        assert!(
+            err.contains("schema_version") && err.contains("Upgrade zion"),
+            "too-new schema must give upgrade guidance, got: {err}"
         );
     }
 

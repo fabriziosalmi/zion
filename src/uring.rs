@@ -101,6 +101,41 @@ mod inner {
         Ok(())
     }
 
+    /// Bail after this many consecutive non-transient accept errors — a
+    /// persistently-bad listener fd (the ENOTSOCK race that motivated the
+    /// single-shot rewrite) would otherwise spin the loop forever.
+    const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 50;
+
+    /// What to do with a single accept CQE `result()`. Extracted from the loop
+    /// so the transient/error/accepted decision — including the ENOTSOCK
+    /// re-submit path and the error-cap bail — is unit-testable without an
+    /// io_uring instance or a real socket.
+    #[derive(Debug, PartialEq, Eq)]
+    enum AcceptOutcome {
+        /// EAGAIN / EINTR: skip this CQE, do not count it as an error.
+        Transient,
+        /// A real accept error. `consecutive` is the running count *after* this
+        /// one; `stop` is true once the bail threshold is reached.
+        Error { consecutive: u32, stop: bool },
+        /// A valid accepted fd.
+        Accepted(RawFd),
+    }
+
+    fn classify_accept_result(res: i32, consecutive_errors: u32) -> AcceptOutcome {
+        if res >= 0 {
+            return AcceptOutcome::Accepted(res as RawFd);
+        }
+        let errno = -res;
+        if errno == libc::EAGAIN || errno == libc::EINTR {
+            return AcceptOutcome::Transient;
+        }
+        let consecutive = consecutive_errors.saturating_add(1);
+        AcceptOutcome::Error {
+            consecutive,
+            stop: consecutive >= MAX_CONSECUTIVE_ACCEPT_ERRORS,
+        }
+    }
+
     fn uring_accept_loop(listener_fd: RawFd, tx: mpsc::Sender<AcceptedConn>) {
         // Ring with 256 entries — enough for burst accept without overflowing
         let mut ring = IoUring::new(256).expect("io_uring init failed");
@@ -145,22 +180,25 @@ mod inner {
                     return;
                 }
 
-                if fd < 0 {
-                    let errno = -fd;
-                    if errno == libc::EAGAIN || errno == libc::EINTR {
+                match classify_accept_result(fd, consecutive_errors) {
+                    AcceptOutcome::Transient => continue,
+                    AcceptOutcome::Error { consecutive, stop } => {
+                        consecutive_errors = consecutive;
+                        let errno = -fd;
+                        if consecutive_errors <= 3 || consecutive_errors % 1000 == 0 {
+                            eprintln!(
+                                "  io_uring accept error: errno {errno} (#{consecutive_errors})"
+                            );
+                        }
+                        if stop {
+                            eprintln!(
+                                "  io_uring accept: {consecutive_errors} consecutive errors (errno {errno}); listener fd unusable — stopping accept loop"
+                            );
+                            return;
+                        }
                         continue;
                     }
-                    consecutive_errors += 1;
-                    if consecutive_errors <= 3 || consecutive_errors % 1000 == 0 {
-                        eprintln!("  io_uring accept error: errno {errno} (#{consecutive_errors})");
-                    }
-                    if consecutive_errors >= 50 {
-                        eprintln!(
-                            "  io_uring accept: {consecutive_errors} consecutive errors (errno {errno}); listener fd unusable — stopping accept loop"
-                        );
-                        return;
-                    }
-                    continue;
+                    AcceptOutcome::Accepted(_) => {}
                 }
                 consecutive_errors = 0;
 
@@ -226,6 +264,52 @@ mod inner {
                 Some(SocketAddr::from((ip, u16::from_be(addr.sin6_port))))
             }
             _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn accepted_fd_is_classified() {
+            assert_eq!(classify_accept_result(7, 0), AcceptOutcome::Accepted(7));
+            // A prior error streak does not affect a successful accept.
+            assert_eq!(classify_accept_result(7, 40), AcceptOutcome::Accepted(7));
+        }
+
+        #[test]
+        fn eagain_and_eintr_are_transient() {
+            assert_eq!(
+                classify_accept_result(-libc::EAGAIN, 5),
+                AcceptOutcome::Transient
+            );
+            assert_eq!(
+                classify_accept_result(-libc::EINTR, 5),
+                AcceptOutcome::Transient
+            );
+        }
+
+        #[test]
+        fn enotsock_counts_as_error_and_caps() {
+            // The ENOTSOCK race (errno 88) that motivated single-shot accept:
+            // counted, and once the streak hits the cap the loop is told to stop.
+            let first = classify_accept_result(-libc::ENOTSOCK, 0);
+            assert_eq!(
+                first,
+                AcceptOutcome::Error {
+                    consecutive: 1,
+                    stop: false
+                }
+            );
+            let at_cap = classify_accept_result(-libc::ENOTSOCK, MAX_CONSECUTIVE_ACCEPT_ERRORS - 1);
+            assert_eq!(
+                at_cap,
+                AcceptOutcome::Error {
+                    consecutive: MAX_CONSECUTIVE_ACCEPT_ERRORS,
+                    stop: true
+                }
+            );
         }
     }
 }

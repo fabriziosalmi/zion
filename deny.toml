@@ -53,9 +53,9 @@ ignore = [
     # reason serves as the manual review checkpoint.
     #
     # ── Unmaintained transitive deps (no safe upgrade currently available) ──
-    { id = "RUSTSEC-2024-0384", reason = "[review by 2026-09-01] `instant` is unmaintained but pulled in transitively only (no direct dep). Informational, no actual vulnerability. Re-evaluate after upstream deps migrate to `web-time`." },
+    { id = "RUSTSEC-2024-0384", reason = "[review by 2026-12-01; re-assessed 2026-09-08] `instant` is unmaintained but pulled in transitively only (no direct dep). Informational, no actual vulnerability. Re-evaluate after upstream deps migrate to `web-time`." },
     # ── Direct dep that needs migration to a new API ──
-    { id = "RUSTSEC-2025-0134", reason = "[review by 2026-08-01] `rustls-pemfile` is archived; replacement is `rustls-pki-types::pem::PemObject`. Migration tracked as a follow-up task in src/tls.rs and src/acme.rs. Not a vulnerability." },
+    { id = "RUSTSEC-2025-0134", reason = "[review by 2026-12-01; re-assessed 2026-09-08: rustls-pemfile 2.x still stable + in wide use, no known vulnerability — it's an unmaintained/archived advisory only] `rustls-pemfile` is archived; replacement is `rustls-pki-types::pem::PemObject`. Migration across the cert-loading sites (src/tls.rs, src/acme.rs, src/quic.rs) is tracked as a follow-up — deferred over blindly touching the TLS-critical path. Not a vulnerability." },
     # ── DoS in a feature-gated transitive dep (acme/init/ml-waf, not core) ──
     # NOTE: RUSTSEC-2026-0002 (`lru` via ratatui/TUI) and -0217 (`tract-nnef`
     # 0.21.14) were RESOLVED by the v0.7.1 dependency bumps (tract 0.21.17 + the

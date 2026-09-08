@@ -189,3 +189,22 @@ updates:
     # limits, noted inline, when validation ends.
     open-pull-requests-limit: 0  # was 3
     versioning-strategy: "increase-if-necessary"
+
+  # ── Python ML training pipeline (ml/requirements.txt) ─────────────────────
+  # Nothing here ships into the Zion binary (tract-onnx does inference in
+  # production), but the pipeline pulls torch/onnx/numpy/requests, which have
+  # their own advisory stream. Declared so version + security updates are
+  # proposed once the freeze below lifts; active advisory detection runs in the
+  # `pip-audit` CI job regardless of this limit.
+  - package-ecosystem: "pip"
+    directory: "/ml"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels: ["dependencies", "python"]
+    commit-message:
+      prefix: "ml"
+      include: "scope"
+    # FROZEN for the v0.7.4 field-validation window, consistent with the other
+    # ecosystems above. Restore to 5 when validation ends.
+    open-pull-requests-limit: 0  # was 5

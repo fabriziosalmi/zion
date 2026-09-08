@@ -55,6 +55,24 @@ jobs:
         # Fail on any unfixed advisory + any yanked crate.
         run: cargo audit --deny warnings --deny unmaintained --deny unsound --deny yanked
 
+  # ── 1b. Python advisories for the ML training pipeline. ───────────────────
+  # ml/ is dev-only (nothing ships into the Zion binary — tract-onnx does
+  # inference in production), but torch/onnx/numpy/requests have their own
+  # advisory stream that was previously covered by nothing. Uses the runner's
+  # preinstalled Python (no new pinned action). `--no-deps` audits the declared
+  # direct dependencies; full transitive + hashed coverage arrives with the ml
+  # lockfile (ZION-DEP-02, tracked separately — torch's cross-platform wheels
+  # make a hashed lock non-trivial).
+  pip-audit:
+    name: pip-audit (python advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pip-audit
+        run: python3 -m pip install --user pip-audit
+      - name: Run pip-audit
+        run: python3 -m pip_audit -r ml/requirements.txt --no-deps
+
   # ── 2. cargo-deny: advisories+licenses+bans+sources, all in one. ──────────
   deny:
     name: cargo-deny (${{ matrix.checks }})
