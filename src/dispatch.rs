@@ -695,22 +695,37 @@ async fn process_request_inner(
             }
         };
 
-    // SAFETY (inner unwrap): "/" is a compile-time-constant single-char URI
-    // that always parses successfully. Used as a defensive fallback when the
-    // configured upstream URL fails to parse — a config-validation error
-    // that should have been caught at boot, but keeping this as a runtime
-    // soft fallback prevents a panic if a hot-reload sneaks in a bad URL.
-    let target_uri: hyper::Uri = target_upstream_url
-        .parse()
-        .unwrap_or_else(|_| "/".parse().unwrap());
-    let dyn_scheme = target_uri
-        .scheme()
-        .cloned()
-        .unwrap_or_else(|| rule.upstream_scheme.clone());
-    let dyn_authority = target_uri
-        .authority()
-        .cloned()
-        .unwrap_or_else(|| rule.upstream_authority.clone());
+    // Resolve scheme + authority for the selected upstream. Fast path: a
+    // single-upstream (or static, empty) route always resolves to
+    // `upstream_url[0]`, whose scheme+authority were parsed ONCE at
+    // config-build time into `rule.upstream_scheme` / `rule.upstream_authority`
+    // — so skip the per-request `hyper::Uri` parse entirely (the common case).
+    // Only a multi-upstream HA/latency pool, where the selected member varies
+    // per request, needs to parse the chosen URL.
+    //
+    // SAFETY (inner unwrap on the slow path): "/" is a compile-time-constant
+    // single-char URI that always parses. Used as a defensive fallback if a
+    // hot-reload sneaks in a bad URL (config validation should have caught it).
+    let (dyn_scheme, dyn_authority) = if rule.upstream_url.len() <= 1 {
+        (
+            rule.upstream_scheme.clone(),
+            rule.upstream_authority.clone(),
+        )
+    } else {
+        let target_uri: hyper::Uri = target_upstream_url
+            .parse()
+            .unwrap_or_else(|_| "/".parse().unwrap());
+        (
+            target_uri
+                .scheme()
+                .cloned()
+                .unwrap_or_else(|| rule.upstream_scheme.clone()),
+            target_uri
+                .authority()
+                .cloned()
+                .unwrap_or_else(|| rule.upstream_authority.clone()),
+        )
+    };
 
     // --- Gate: Auth (JWT/OIDC) ---
     #[cfg(feature = "auth")]
