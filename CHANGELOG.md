@@ -4,6 +4,89 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-08
+
+**Security & robustness hardening.** A full code-metrics audit of v0.7.6 scored
+39/100 ("Poor"), capped by a CRITICAL non-atomic ACME key/cert write and a weak
+state-integrity posture. This release remediates the CRITICAL, every
+high-severity finding, and ~all medium/low ones (0 critical / 0 high remain);
+the re-audit of this commit scores **75.8/100 ("Strong")**. Most changes are
+internal hardening, but several tighten config validation to **fail closed** —
+configs that were silently accepted before may now be rejected at boot. Read the
+Breaking section before upgrading.
+
+### ⚠️ Breaking (config validation — fail closed)
+
+- **JA4 enforcing allowlist**: `[tls.fingerprint] mode = "allowlist"` with
+  `on_unknown = "drop"` now **refuses to boot** unless `on_unfingerprintable`
+  is also `"drop"` — the old default (`"allow"`) let a client bypass the
+  allowlist with an unfingerprintable ClientHello. Set `on_unfingerprintable =
+  "drop"`, or use `on_unknown = "log_only"` / `mode = "shadow"` to observe.
+- **`sovereign_aimp.listen`**: a malformed value is now a validation error
+  instead of silently binding the gossip control plane to `0.0.0.0:9443`.
+- **Route/upstream integrity**: a name defined in both `[upstream.X]` and
+  `[upstreams]`, a `mode = "static"` route with an `upstream`, or a non-static
+  route with `serve_dir`/`spa_fallback`/`precompressed` are now rejected rather
+  than silently ignored.
+- **Helm**: the container now binds unprivileged `8080/8443` by default (the
+  Service still presents `80/443`); override `containerPorts` + add
+  `NET_BIND_SERVICE` if you need privileged in-container ports.
+- **Release toolchain** pinned to Rust 1.88.0 (was "latest stable").
+
+### Security
+
+- **Atomic, owner-only secret/state writes** (`src/atomic_file.rs`): the ACME
+  account key, the renewed cert/key pair, and the mesh identity seed are written
+  to a `0o600` temp sibling, fsync'd, then atomically renamed — no torn write,
+  no world-readable window. The TLS loader now verifies cert/key correspondence
+  (`keys_match`) and keeps the last-good pair on mismatch.
+- **Reserved identity headers stripped inbound**: `X-Auth-Subject` /
+  `X-Auth-Email` are removed from every request at the trust boundary before the
+  auth gate re-injects the verified values, so an upstream can trust them.
+- **Bounded HA-replay body**: the failover path caps the buffered request body
+  (16 MiB → 413, 30s → 408) instead of an unbounded `collect()`.
+- **WAF JSON depth guard runs before the parser**: the zero-alloc depth/length
+  scan now precedes `simd_json`, so a deeply-nested body can't exhaust the
+  recursive parser.
+- **JWT HMAC secret via `secret_env`** (keep the key out of `zion.toml`); the
+  JWKS refresh client now has a connect + request timeout; a startup warning
+  fires when a JWT profile omits issuer/audience scoping.
+- Race-free request-coalescing singleflight (atomic `get_or_insert_with`).
+
+### Added
+
+- **`schema_version`** config handshake: a file targeting a newer schema gets
+  targeted upgrade guidance instead of a bare unknown-field rejection.
+- **Build provenance**: `zion --version` and the `zion_build_info` metric now
+  carry the git commit + date (via `build.rs`).
+- Metrics: `zion_connections_rejected_global` (global-ceiling shedding);
+  `zion_build_info`.
+- CI: a `pip-audit` job + a Dependabot `pip` ecosystem for the Python ML
+  pipeline.
+
+### Fixed / Changed
+
+- **Observability**: every response status is now counted once, centrally — the
+  pre-routing security rejects (414/405/425/429/403/401) were previously
+  invisible in `/metrics` and undercounted `requests_total`; the W3C trace id is
+  threaded into the access log and the signed audit record.
+- **Audit log**: pre-rotation flush errors are surfaced; a broken rotation now
+  sheds (drop + count) instead of growing the segment unbounded; the durability
+  guarantee is documented accurately (process-crash, not power-loss).
+- **Reliability**: the rate-map scavenge loop exits cleanly on shutdown; the
+  per-upstream `connect_timeout_ms` is documented as advisory-only.
+- **Ops**: systemd unit gets `StateDirectory=zion` (ACME writes work under
+  `ProtectSystem=strict`); Helm gains an optional PVC for ACME state; rollback
+  runbook, exit-code table, and per-replica scaling docs added.
+- **Perf**: single-upstream routes skip the per-request upstream-URI parse; the
+  streaming-WAF path no longer double-scans the body.
+- **Docs**: corrected the daemon exit-code contract (config error is `2`, not
+  `1`), the WAF entropy scope, the FIPS provenance scope, the ADR sidebar
+  (0012–0023), and the `caddy` import reference; documented token lifetime /
+  revocation, `secret_env`, and the forwarded-header contract.
+- Reject a fail-open enforcing JA4 allowlist; new unit tests for `net.rs` bind
+  logic, the io_uring accept classifier, and the WAF depth guard.
+
 ## [0.7.6] - 2026-09-01
 
 **Sovereign correctness.** The `geo-ita` / `geo-eu` origin classifier baked its
