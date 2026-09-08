@@ -35,14 +35,83 @@ export default defineConfig({
         ]
       : []),
     ['link', { rel: 'icon', type: 'image/svg+xml', href: '/zion/logo.svg' }],
+    // Apple / PWA touch icon (raster; SVG is not honoured here).
+    ['link', { rel: 'apple-touch-icon', href: '/zion/apple-touch-icon.png' }],
     ['meta', { name: 'theme-color', content: '#0b0b0d' }],
+    // Let Google Discover use large image previews.
+    ['meta', { name: 'robots', content: 'index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1' }],
     ['meta', { property: 'og:title', content: 'Zion Edge Gateway' }],
     ['meta', { property: 'og:description', content: 'One auditable Rust binary at the edge — TLS 1.3, a zero-regex WAF, and a two-level RAM cache. No sidecars, no control plane.' }],
     ['meta', { property: 'og:type', content: 'website' }],
+    ['meta', { property: 'og:site_name', content: 'Zion Edge Gateway' }],
+    // Absolute URL, 1200×630, served from this site (docs/public/og.png).
+    ['meta', { property: 'og:image', content: 'https://fabriziosalmi.github.io/zion/og.png' }],
+    ['meta', { property: 'og:image:width', content: '1200' }],
+    ['meta', { property: 'og:image:height', content: '630' }],
+    ['meta', { property: 'og:image:alt', content: 'Zion Edge Gateway — TLS 1.3, a zero-regex WAF, and a two-level RAM cache' }],
+    ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
+    ['meta', { name: 'twitter:title', content: 'Zion Edge Gateway' }],
+    ['meta', { name: 'twitter:description', content: 'One auditable Rust binary at the edge — TLS 1.3, a zero-regex WAF, and a two-level RAM cache. No sidecars, no control plane.' }],
+    ['meta', { name: 'twitter:image', content: 'https://fabriziosalmi.github.io/zion/og.png' }],
+    // Structured data for search + AI crawlers (Schema.org). WebSite +
+    // SoftwareApplication describe the project as a free, cross-platform
+    // developer tool; emitted site-wide so any entry page carries it.
+    [
+      'script',
+      { type: 'application/ld+json' },
+      JSON.stringify({
+        '@context': 'https://schema.org',
+        '@graph': [
+          {
+            '@type': 'WebSite',
+            name: 'Zion Edge Gateway',
+            url: 'https://fabriziosalmi.github.io/zion/',
+            description:
+              'High-performance TLS reverse proxy with built-in WAF, written in Rust.',
+          },
+          {
+            '@type': 'SoftwareApplication',
+            name: 'Zion Edge Gateway',
+            description:
+              'High-performance TLS reverse proxy with built-in WAF, written in Rust.',
+            url: 'https://fabriziosalmi.github.io/zion/',
+            applicationCategory: 'DeveloperApplication',
+            operatingSystem: 'Linux, macOS, Windows',
+            programmingLanguage: 'Rust',
+            license: 'https://www.apache.org/licenses/LICENSE-2.0',
+            codeRepository: 'https://github.com/fabriziosalmi/zion',
+            downloadUrl: 'https://github.com/fabriziosalmi/zion/releases',
+            author: {
+              '@type': 'Person',
+              name: 'Fabrizio Salmi',
+              url: 'https://github.com/fabriziosalmi',
+            },
+            offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+          },
+        ],
+      }),
+    ],
   ],
 
   lastUpdated: true,
   cleanUrls: true,
+
+  // Per-page absolute canonical + og:url. VitePress emits neither by default,
+  // so build the URL from the page's own path against the canonical origin.
+  // cleanUrls is on, so `foo/bar.md` → `foo/bar` and any `index.md` → the
+  // directory with a trailing slash — matching the generated sitemap exactly.
+  transformPageData(pageData) {
+    const origin = 'https://fabriziosalmi.github.io/zion/'
+    const slug = pageData.relativePath
+      .replace(/(^|\/)index\.md$/, '$1')
+      .replace(/\.md$/, '')
+    const url = origin + slug
+    pageData.frontmatter.head ??= []
+    pageData.frontmatter.head.push(
+      ['link', { rel: 'canonical', href: url }],
+      ['meta', { property: 'og:url', content: url }],
+    )
+  },
 
   // Internal working notes (homelab topology, bench-rig hosts) are gitignored
   // and must never render on the public site even if present in a local tree.
@@ -68,7 +137,9 @@ export default defineConfig({
   ],
 
   themeConfig: {
-    logo: '/logo.svg',
+    // Object form (not a bare string) so VitePress renders a non-empty `alt`
+    // on the nav logo instead of `alt=""` — the site's only <img>.
+    logo: { src: '/logo.svg', alt: 'Zion Edge Gateway logo' },
     siteTitle: 'Zion',
 
     nav: [

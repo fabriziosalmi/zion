@@ -1,0 +1,9 @@
+# Zion Edge Gateway — vulnerability disclosure (RFC 9116)
+# Note: for a *.github.io project page this file is served at
+# /zion/.well-known/security.txt; the domain-root copy is owned by the
+# fabriziosalmi.github.io apex repository.
+Contact: https://github.com/fabriziosalmi/zion/security/advisories/new
+Policy: https://fabriziosalmi.github.io/zion/security/
+Preferred-Languages: en, it
+Expires: 2027-09-08T00:00:00.000Z
+Canonical: https://fabriziosalmi.github.io/zion/.well-known/security.txt

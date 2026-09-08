@@ -1,0 +1,8 @@
+# Served at /zion/robots.txt. Standards-compliant crawlers read robots.txt
+# only from the domain root (fabriziosalmi.github.io/robots.txt), which is
+# owned by the apex fabriziosalmi.github.io repository — the Sitemap line
+# below must also be added there to be honoured by search engines.
+User-agent: *
+Allow: /
+
+Sitemap: https://fabriziosalmi.github.io/zion/sitemap.xml
