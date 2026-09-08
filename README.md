@@ -221,7 +221,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 **Opt-in tracks (feature-gated, default-off)**
 - **kTLS offload** (`--features ktls`, Linux 5.10+) — *experimental*: flips the socket into in-kernel TLS after handshake toward `sendfile`-class zero-copy. The offload is wired but not yet exercised end-to-end in CI (issue #52).
 - **ML-augmented WAF** (`--features ml-waf`) — *experimental*: 16-dim tract-onnx scorer on the WAF hot path (200 µs p99 budget), advisory metric/header — never a hard gate. Ships no bundled model.
-- **AIMP serverless mesh** (`--features sovereign-aimp`) — Ed25519-signed UDP gossip of WAF deltas + IP reputation across a fleet, no central control plane.
+- **AIMP serverless mesh** (`--features sovereign-aimp`, **experimental** — off by default, wire protocol not yet stable) — Ed25519-signed UDP gossip of WAF deltas + IP reputation across a fleet, no central control plane.
 
 ## Sovereign edge & DDoS resistance
 

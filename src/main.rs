@@ -1038,14 +1038,20 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
             let listen_raw = if !toml_cfg.listen.is_empty() {
                 toml_cfg.listen.clone()
             } else {
-                std::env::var("ZION_AIMP_LISTEN").unwrap_or_else(|_| "0.0.0.0:9443".to_string())
+                // Fail closed on an ENABLED-but-unconfigured listen: default to
+                // LOOPBACK, never `0.0.0.0` — an operator who enabled the mesh
+                // without naming an interface must not get the gossip control
+                // plane bound to every interface by accident (the world-open
+                // default was the ZION-CONF gap). Set `sovereign_aimp.listen`
+                // (or ZION_AIMP_LISTEN) explicitly to expose it on a real NIC.
+                std::env::var("ZION_AIMP_LISTEN").unwrap_or_else(|_| "127.0.0.1:9443".to_string())
             };
             // Fail closed: a malformed listen address must NOT silently fall back
-            // to `0.0.0.0:9443` — that would bind the gossip control plane to
-            // every interface. The TOML path is already rejected at config
-            // validation; this also covers the `ZION_AIMP_LISTEN` env override,
-            // which bypasses that check. On a bad value, skip mesh bootstrap
-            // (aimp_cp = None) — bootstrap failure is non-fatal by design.
+            // to a default — that could bind the gossip control plane somewhere
+            // unintended. The TOML path is already rejected at config validation;
+            // this also covers the `ZION_AIMP_LISTEN` env override, which bypasses
+            // that check. On a bad value, skip mesh bootstrap (aimp_cp = None) —
+            // bootstrap failure is non-fatal by design.
             let listen: Option<std::net::SocketAddr> = match listen_raw.parse() {
                 Ok(addr) => Some(addr),
                 Err(e) => {
