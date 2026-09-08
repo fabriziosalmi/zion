@@ -108,8 +108,12 @@ RUN mkdir -p /out/var/lib/zion && \
 # by the CI release workflow when building from the precompiled musl artifact.
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:bd2899c12b335c827750ccf2359879eab09c09b206023dcebea408947d54127c AS runtime
 
-# Re-declare so labels can interpolate it.
+# Re-declare so labels can interpolate them.
 ARG SOURCE_DATE_EPOCH=0
+# The commit the image was built from — the same value stamped into the binary
+# (build.rs). Makes the image self-describing via `org.opencontainers.image.revision`
+# without unpacking the binary or reading the SLSA attestation.
+ARG ZION_GIT_SHA=""
 
 # OCI labels — surfaced by GHCR/Quay UIs and by image scanners.
 LABEL org.opencontainers.image.title="Zion Edge Gateway" \
@@ -119,6 +123,7 @@ LABEL org.opencontainers.image.title="Zion Edge Gateway" \
       org.opencontainers.image.url="https://github.com/fabriziosalmi/zion" \
       org.opencontainers.image.documentation="https://fabriziosalmi.github.io/zion" \
       org.opencontainers.image.vendor="Fabrizio Salmi" \
+      org.opencontainers.image.revision="$ZION_GIT_SHA" \
       org.opencontainers.image.created="$SOURCE_DATE_EPOCH"
 
 COPY --from=builder /build/target/release/zion /usr/local/bin/zion

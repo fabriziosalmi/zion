@@ -50,6 +50,13 @@ ProtectHome=true
 ReadOnlyPaths=/etc/zion
 PrivateTmp=true
 
+# Writable runtime state. ProtectSystem=strict makes the FS read-only, so
+# without this the ACME subsystem (account key + renewed cert/key under
+# /var/lib/zion) and the panic last-gasp file cannot be written. StateDirectory
+# creates /var/lib/zion owned by the service user and grants write access.
+StateDirectory=zion
+Environment=ZION_LAST_GASP_PATH=/var/lib/zion/last_panic.jsonl
+
 # Allow binding to privileged ports (80, 443)
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
@@ -69,6 +76,16 @@ sudo systemctl enable --now zion
 ```
 
 ## Docker
+
+::: tip Use the official image for production
+This is a **minimal illustrative** Dockerfile — it runs as **root** on a
+`debian-slim` base and is not the hardened image. For production pull the
+official image, which is **distroless, non-root (UID 65532)**, multi-arch, and
+cosign-signed with SLSA provenance:
+`docker pull ghcr.io/fabriziosalmi/zion:latest`. Build it from the repo
+[`Dockerfile`](https://github.com/fabriziosalmi/zion/blob/master/Dockerfile) if
+you need to build locally.
+:::
 
 ```dockerfile
 FROM rust:1.82-bookworm AS builder

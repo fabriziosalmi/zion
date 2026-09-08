@@ -535,7 +535,9 @@ pub struct AcmeConfig {
     /// Days before expiry to trigger renewal. Default: 30.
     #[serde(default = "default_acme_renew_days")]
     pub renew_before_days: u64,
-    /// Where to store ACME account key + certs. Default: /etc/zion/acme/
+    /// Where to store ACME account key + certs. Default: `/var/lib/zion/acme`
+    /// (a runtime-writable state dir — NOT `/etc`, which is read-only under the
+    /// hardened systemd unit and the distroless container).
     #[serde(default = "default_acme_state_dir")]
     pub state_dir: String,
 }

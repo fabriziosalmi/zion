@@ -23,6 +23,7 @@ use std::sync::atomic::AtomicU64;
 
 pub struct Metrics {
     pub mesh_claims_emitted: AtomicU64,
+    pub mesh_claims_dropped_publish: AtomicU64,
     pub mesh_claims_received: AtomicU64,
     pub mesh_claims_dropped_signature: AtomicU64,
     pub mesh_claims_dropped_replay: AtomicU64,
@@ -37,6 +38,7 @@ impl Metrics {
     const fn new() -> Self {
         Self {
             mesh_claims_emitted: AtomicU64::new(0),
+            mesh_claims_dropped_publish: AtomicU64::new(0),
             mesh_claims_received: AtomicU64::new(0),
             mesh_claims_dropped_signature: AtomicU64::new(0),
             mesh_claims_dropped_replay: AtomicU64::new(0),
