@@ -686,11 +686,17 @@ impl Metrics {
         );
         out.extend_from_slice(env!("CARGO_PKG_VERSION").as_bytes());
         // git sha + commit date stamped by build.rs; label values are safe
-        // (hex sha / ISO date / the literal "unknown").
+        // (hex sha / ISO date / the literal "unknown"). `option_env!` (not
+        // `env!`) so the binary compiles even when build.rs did not run (e.g. a
+        // Docker context without build.rs) — it degrades to "unknown".
         out.extend_from_slice(b"\",commit=\"");
-        out.extend_from_slice(env!("ZION_GIT_SHA").as_bytes());
+        out.extend_from_slice(option_env!("ZION_GIT_SHA").unwrap_or("unknown").as_bytes());
         out.extend_from_slice(b"\",commit_date=\"");
-        out.extend_from_slice(env!("ZION_COMMIT_DATE").as_bytes());
+        out.extend_from_slice(
+            option_env!("ZION_COMMIT_DATE")
+                .unwrap_or("unknown")
+                .as_bytes(),
+        );
         out.extend_from_slice(b"\"} 1\n");
 
         out.extend_from_slice(
@@ -1533,8 +1539,8 @@ mod tests {
         assert!(out.contains(&format!(
             "zion_build_info{{version=\"{}\",commit=\"{}\",commit_date=\"{}\"}} 1",
             env!("CARGO_PKG_VERSION"),
-            env!("ZION_GIT_SHA"),
-            env!("ZION_COMMIT_DATE"),
+            option_env!("ZION_GIT_SHA").unwrap_or("unknown"),
+            option_env!("ZION_COMMIT_DATE").unwrap_or("unknown"),
         )));
         assert!(out.contains("zion_connections_rejected_global 0"));
     }

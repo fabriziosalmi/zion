@@ -57,7 +57,7 @@ RUN apt-get update && \
 # Pre-warm the dependency closure with a stub `main`. The Cargo cache for
 # /usr/local/cargo/registry survives the next COPY thanks to BuildKit's
 # layer cache, so application changes don't rebuild every dep.
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
 RUN mkdir -p src benches && \
     echo 'fn main() {}' > src/main.rs && \
     # The manifest declares `[[bench]]` targets (Criterion, harness=false);
@@ -78,6 +78,15 @@ RUN mkdir -p src benches && \
 COPY src/ src/
 COPY benches/ benches/
 COPY .cargo/ .cargo/
+# Git provenance for the in-binary stamp (build.rs → --version / zion_build_info).
+# The build context has no .git, so release.yml passes these as build-args; they
+# sit AFTER the dep pre-warm so a new commit's sha never busts the cached
+# dependency layer. Absent (a plain `docker build`) → build.rs falls back to
+# "unknown", which is fine.
+ARG ZION_GIT_SHA=""
+ARG ZION_COMMIT_DATE=""
+ENV ZION_GIT_SHA=${ZION_GIT_SHA}
+ENV ZION_COMMIT_DATE=${ZION_COMMIT_DATE}
 # --features dist: the redistributable bundle (acme + init) so the official
 # image ships automatic HTTPS and the init wizard out of the box.
 RUN cargo build --release --locked --features dist && \

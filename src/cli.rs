@@ -428,13 +428,16 @@ fn parse_top_opts(args: &[String]) -> TopOpts {
 }
 
 pub fn print_version() {
-    // git sha + commit date are stamped by build.rs (both "unknown" when built
-    // without a .git tree), so a loose binary ties back to its exact commit.
+    // git sha + commit date are stamped by build.rs. `option_env!` (not `env!`)
+    // so the binary still COMPILES when build.rs did not run — e.g. a Docker
+    // build whose context omits build.rs — degrading to "unknown" rather than a
+    // hard compile error. build.rs is present in the normal build and in the
+    // release/container builds (which also pass the sha via a build-arg).
     println!(
         "zion {} ({} {})",
         env!("CARGO_PKG_VERSION"),
-        env!("ZION_GIT_SHA"),
-        env!("ZION_COMMIT_DATE"),
+        option_env!("ZION_GIT_SHA").unwrap_or("unknown"),
+        option_env!("ZION_COMMIT_DATE").unwrap_or("unknown"),
     );
 }
 
