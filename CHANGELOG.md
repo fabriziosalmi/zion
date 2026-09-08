@@ -4,6 +4,30 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-09-08
+
+**Fail-closed security fixes.** A deeper re-audit of v0.8.2 surfaced two HIGH
+fail-opens (one a residual gap in the v0.8.0 AIMP-listen fix); this closes both.
+No behaviour change for a correct config.
+
+### Fixed
+
+- **AIMP mesh empty listen no longer binds `0.0.0.0`** (closes the v0.8.0
+  `sovereign_aimp.listen` gap): an enabled mesh with no `listen` (and no
+  `ZION_AIMP_LISTEN`) fell back to `0.0.0.0:9443` — the gossip control plane on
+  every interface. v0.8.0 rejected only a *malformed* listen, not an empty one.
+  The unconfigured case now defaults to **loopback** (`127.0.0.1:9443`); set
+  `listen`/`ZION_AIMP_LISTEN` explicitly to expose it on a real interface.
+- **mTLS `client_auth` without a CA is rejected at boot**: `client_auth =
+  "required" | "optional"` with no `tls.client_ca_path` silently built the
+  listener with **no client auth** — the enforcement the operator asked for was
+  off with no signal. Config validation now rejects it (mirrors the existing
+  `admin.auth = "mtls"` check), and also rejects an unknown `client_auth` value
+  (a typo previously coerced to `"none"`).
+- **docs**: correct the connection-limit formula in the architecture guide
+  (`/50` → `/256`, ~256 KB/conn) and tag the AIMP mesh **experimental** in the
+  README (it already was in the guide).
+
 ## [0.8.2] - 2026-09-08
 
 **Audit quick-wins.** Low-risk residual findings from the re-audit (which scored

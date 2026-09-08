@@ -149,7 +149,7 @@ Client
 | `Arc<AutoBuilder>` for HTTP builder | Per-connection clone is ref-count bump, not deep copy |
 | io_uring single-shot accept (Linux) | Dedicated accept thread; one SQE re-submitted per connection |
 | `SO_BUSY_POLL` (Linux) | Spin-poll NIC queue 50us for lower p99 latency |
-| Semaphore for connection limit | Bound from detected RAM: `(RAM_MB / 4) * 1024 / 50`, clamped 1k-100k |
+| Semaphore for connection limit | Bound from detected RAM: `(RAM_MB / 4) * 1024 / 256` (~256 KB/conn), clamped 1k-100k |
 
 ## Concurrency model
 

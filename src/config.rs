@@ -1297,6 +1297,31 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
         }
     }
 
+    // `client_auth` is a closed set; a typo would silently coerce to "none"
+    // (no client auth) — reject an unknown value so it fails closed at boot.
+    if !matches!(
+        config.tls.client_auth.as_str(),
+        "none" | "required" | "optional"
+    ) {
+        errors.push(format!(
+            "tls.client_auth '{}' must be \"none\", \"required\", or \"optional\"",
+            config.tls.client_auth
+        ));
+    }
+    // Data-plane mTLS: `client_auth = required|optional` needs a CA to verify
+    // presented client certs against. Without `tls.client_ca_path` the listener
+    // silently builds with NO client auth (fail-open) — the enforcement the
+    // operator asked for would be off with no signal. Reject it at boot.
+    if matches!(config.tls.client_auth.as_str(), "required" | "optional")
+        && config.tls.client_ca_path.is_none()
+    {
+        errors.push(format!(
+            "tls.client_auth = \"{}\" requires tls.client_ca_path (the CA that verifies \
+             presented client certificates); without it client-cert enforcement is silently off",
+            config.tls.client_auth
+        ));
+    }
+
     // [sovereign_aimp] — when the mesh is enabled and a listen address is set
     // in TOML, it MUST parse. Previously a malformed value silently fell back
     // to `0.0.0.0:9443` at boot, binding the gossip control plane to every
@@ -2716,6 +2741,49 @@ enabledd = true
             err.contains("schema_version") && err.contains("Upgrade zion"),
             "too-new schema must give upgrade guidance, got: {err}"
         );
+    }
+
+    #[test]
+    fn client_auth_requires_ca_and_valid_value() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [upstreams]\nbe=\"http://127.0.0.1:8000\"\n[[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+
+        // required without a CA → fail-open, must be rejected.
+        let no_ca =
+            format!("{base}[tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\nclient_auth=\"required\"\n");
+        let err = validate_str(&no_ca, "test").err().unwrap_or_default();
+        assert!(
+            err.contains("client_auth") && err.contains("client_ca_path"),
+            "required client_auth without a CA must be rejected, got: {err}"
+        );
+
+        // A typo'd value must be rejected (would silently coerce to none).
+        let typo =
+            format!("{base}[tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\nclient_auth=\"requird\"\n");
+        let err = validate_str(&typo, "test").err().unwrap_or_default();
+        assert!(
+            err.contains("client_auth") && err.contains("must be"),
+            "unknown client_auth must be rejected, got: {err}"
+        );
+
+        // required WITH a CA passes semantics (cert files are a deploy check).
+        let ok = format!(
+            "{base}[tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\nclient_auth=\"required\"\nclient_ca_path=\"/ca\"\n"
+        );
+        let cfg = parse_schema(&ok, "test").expect("parse");
+        assert!(
+            !semantic_errors(&cfg)
+                .iter()
+                .any(|e| e.contains("client_auth")),
+            "required client_auth WITH a CA must pass semantics"
+        );
+
+        // Default (none) needs no CA.
+        let none = format!("{base}[tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n");
+        let cfg = parse_schema(&none, "test").expect("parse");
+        assert!(!semantic_errors(&cfg)
+            .iter()
+            .any(|e| e.contains("client_auth")));
     }
 
     #[test]

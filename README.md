@@ -195,7 +195,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 ```
 
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-50 modules, ~46,300 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+50 modules, ~46,400 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Features
 
@@ -221,7 +221,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 **Opt-in tracks (feature-gated, default-off)**
 - **kTLS offload** (`--features ktls`, Linux 5.10+) — *experimental*: flips the socket into in-kernel TLS after handshake toward `sendfile`-class zero-copy. The offload is wired but not yet exercised end-to-end in CI (issue #52).
 - **ML-augmented WAF** (`--features ml-waf`) — *experimental*: 16-dim tract-onnx scorer on the WAF hot path (200 µs p99 budget), advisory metric/header — never a hard gate. Ships no bundled model.
-- **AIMP serverless mesh** (`--features sovereign-aimp`) — Ed25519-signed UDP gossip of WAF deltas + IP reputation across a fleet, no central control plane.
+- **AIMP serverless mesh** (`--features sovereign-aimp`, **experimental** — off by default, wire protocol not yet stable) — Ed25519-signed UDP gossip of WAF deltas + IP reputation across a fleet, no central control plane.
 
 ## Sovereign edge & DDoS resistance
 
@@ -288,7 +288,7 @@ MODE=full bash benchmarks/baseline/run-baseline.sh   # → benchmarks/baseline/z
 ## Testing
 
 <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
-**911 unit tests** run on every change; **23 integration tests** need a running Zion + a backend.
+**912 unit tests** run on every change; **23 integration tests** need a running Zion + a backend.
 
 ```bash
 cargo test                          # unit tests
@@ -317,12 +317,12 @@ Every release is signed and carries SLSA v1.0 build provenance — see
 
 ```bash
 # Binary release (Sigstore-backed provenance via gh CLI)
-gh release download v0.8.2 -R fabriziosalmi/zion -p '*x86_64-unknown-linux-musl*' -p 'SHA256SUMS'
+gh release download v0.8.3 -R fabriziosalmi/zion -p '*x86_64-unknown-linux-musl*' -p 'SHA256SUMS'
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify zion-v0.8.2-x86_64-unknown-linux-musl.tar.gz --owner fabriziosalmi
+gh attestation verify zion-v0.8.3-x86_64-unknown-linux-musl.tar.gz --owner fabriziosalmi
 
 # Container image (cosign keyless)
-cosign verify ghcr.io/fabriziosalmi/zion:v0.8.2 \
+cosign verify ghcr.io/fabriziosalmi/zion:v0.8.3 \
     --certificate-identity-regexp "^https://github.com/fabriziosalmi/zion/\\.github/workflows/release\\.yml@refs/tags/v" \
     --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 ```
