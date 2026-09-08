@@ -150,18 +150,21 @@ jobs:
           echo "SOURCE_DATE_EPOCH=${ts}" >> "$GITHUB_ENV"
           echo "epoch=${ts}" >> "$GITHUB_OUTPUT"
 
-      # rust-toolchain.toml in the repo root pins the dev compiler to 1.88.
-      # On a release tag we want the toolchain dtolnay/rust-toolchain installs
-      # (latest stable) instead, AND we need it to install the matrix target.
-      # When rust-toolchain.toml is present, dtolnay's `targets:` is ignored
-      # by `rustup`, so we drop the file for this job and add the target
-      # explicitly. The dev override resumes for non-release builds.
+      # Release builds are PINNED to the same toolchain as dev/CI
+      # (rust-toolchain.toml, currently 1.88.0) so the shipped binary is
+      # REPRODUCIBLE — "latest stable" would silently change the release
+      # compiler between tags and defeat the SLSA/attestation guarantee. We
+      # still drop rust-toolchain.toml for this job because, when present, it
+      # makes `rustup` ignore the target we add below; the explicit `toolchain:`
+      # input pins the exact version instead. To move the release compiler,
+      # bump BOTH this pin and rust-toolchain.toml together.
       - name: Drop dev toolchain pin for release builds
         shell: bash
         run: rm -f rust-toolchain.toml
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
         with:
+          toolchain: 1.88.0
           # `llvm-tools` ships rustc's *own* `llvm-profdata`, whose raw
           # profile format always matches the compiler that wrote the
           # `.profraw` files. A system llvm-profdata can be older (profraw
@@ -403,7 +406,11 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      # Pinned to match rust-toolchain.toml (1.88.0) — this job resolves crate
+      # metadata for the SBOM, so keep it on the same toolchain as the build.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: 1.88.0
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
