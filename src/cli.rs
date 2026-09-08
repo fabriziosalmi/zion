@@ -428,7 +428,14 @@ fn parse_top_opts(args: &[String]) -> TopOpts {
 }
 
 pub fn print_version() {
-    println!("zion {}", env!("CARGO_PKG_VERSION"));
+    // git sha + commit date are stamped by build.rs (both "unknown" when built
+    // without a .git tree), so a loose binary ties back to its exact commit.
+    println!(
+        "zion {} ({} {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("ZION_GIT_SHA"),
+        env!("ZION_COMMIT_DATE"),
+    );
 }
 
 pub fn print_help() {

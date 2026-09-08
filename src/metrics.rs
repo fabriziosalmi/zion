@@ -680,11 +680,17 @@ impl Metrics {
         // own e2e harness queries this series. `CARGO_PKG_VERSION` is a
         // compile-time literal with no label-unsafe characters.
         out.extend_from_slice(
-            b"# HELP zion_build_info Build metadata (constant 1; see the version label).\n\
+            b"# HELP zion_build_info Build metadata (constant 1; see the labels).\n\
                                 # TYPE zion_build_info gauge\n\
                                 zion_build_info{version=\"",
         );
         out.extend_from_slice(env!("CARGO_PKG_VERSION").as_bytes());
+        // git sha + commit date stamped by build.rs; label values are safe
+        // (hex sha / ISO date / the literal "unknown").
+        out.extend_from_slice(b"\",commit=\"");
+        out.extend_from_slice(env!("ZION_GIT_SHA").as_bytes());
+        out.extend_from_slice(b"\",commit_date=\"");
+        out.extend_from_slice(env!("ZION_COMMIT_DATE").as_bytes());
         out.extend_from_slice(b"\"} 1\n");
 
         out.extend_from_slice(
@@ -1525,8 +1531,10 @@ mod tests {
         assert!(out.contains("zion_tls_handshake_duration_seconds_bucket"));
         // build-info gauge with the compiled version label.
         assert!(out.contains(&format!(
-            "zion_build_info{{version=\"{}\"}} 1",
-            env!("CARGO_PKG_VERSION")
+            "zion_build_info{{version=\"{}\",commit=\"{}\",commit_date=\"{}\"}} 1",
+            env!("CARGO_PKG_VERSION"),
+            env!("ZION_GIT_SHA"),
+            env!("ZION_COMMIT_DATE"),
         )));
         assert!(out.contains("zion_connections_rejected_global 0"));
     }
