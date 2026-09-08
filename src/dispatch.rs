@@ -104,7 +104,7 @@ fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
     security::check_rate_limit(
         cfg.rate_limit_rps,
         cfg.rate_limit_window,
-        &state.rate_map,
+        &state.limiters.rate_map,
         ip,
     )
 }

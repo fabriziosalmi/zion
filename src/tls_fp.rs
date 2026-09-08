@@ -1033,7 +1033,11 @@ pub async fn fingerprint_gate(
             identity: None,
         };
     };
-    classify(&fp, &state.tls_fp_bans, ja4_from_tls_record(&buf[..n]))
+    classify(
+        &fp,
+        &state.limiters.tls_fp_bans,
+        ja4_from_tls_record(&buf[..n]),
+    )
 }
 
 /// The upstream header carrying the connection's JA4. Zion's attestation — a

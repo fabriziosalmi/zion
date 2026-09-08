@@ -456,6 +456,32 @@ impl ResolvedAppConfig {
     }
 }
 
+/// Behaviour-persistent per-source limiters, grouped so churn in one of them
+/// stays local to this struct instead of rippling through the whole `AppState`
+/// and all of its consumers (ZION-ARCH-02). Unlike the config-derived state
+/// (isolated in `ResolvedAppConfig`), these track live client behaviour and
+/// therefore persist across config reloads — a rate/conn/ban count is about the
+/// client, not the config.
+struct Limiters {
+    /// Per-IP rate limiter map.
+    ///
+    /// NUMA wrapper (issue #50): on a single-socket box / non-Linux /
+    /// `--no-default-features` build this is a transparent newtype
+    /// around `DashMap`. With `--features numa-aware` on a multi-socket
+    /// Linux host, `NumaAwareMap` shards by NUMA node and routes by the
+    /// calling thread's current node — same-socket workers stay
+    /// cache-local, cross-socket fallback scans on get-miss.
+    rate_map: Arc<numa::NumaAwareMap<std::net::IpAddr, RateEntry>>,
+    /// Per-IP concurrent-connection limiter. The cap is read from the config
+    /// snapshot at accept time; the global ceiling stays the `conn_limit`
+    /// semaphore on `AppState`.
+    conn_per_ip: Arc<connlimit::PerIpConnLimiter>,
+    /// Rejected-unknown JA4 ban set (#27 commit 4): fingerprint → banned until.
+    /// Only ever consulted while the CURRENT config drops unknown fingerprints.
+    #[cfg(feature = "tls-fingerprint")]
+    tls_fp_bans: tls_fp::BanSet,
+}
+
 /// Global shared state — lock-free reads via Arc + ArcSwap.
 struct AppState {
     /// Config-derived snapshot, atomically swappable. The hot path reads
@@ -477,21 +503,9 @@ struct AppState {
     http_builder: Arc<AutoBuilder<TokioExecutor>>,
     /// ACME HTTP-01 challenge tokens (empty when no challenge active).
     acme_challenges: acme::ChallengeStore,
-    /// Per-IP rate limiter map. Persists across config reloads — the IP
-    /// counters are about the IP's behaviour, not about the config.
-    ///
-    /// NUMA wrapper (issue #50): on a single-socket box / non-Linux /
-    /// `--no-default-features` build this is a transparent newtype
-    /// around `DashMap`. With `--features numa-aware` on a multi-socket
-    /// Linux host, `NumaAwareMap` shards by NUMA node and routes by the
-    /// calling thread's current node — same-socket workers stay
-    /// cache-local, cross-socket fallback scans on get-miss.
-    rate_map: Arc<numa::NumaAwareMap<std::net::IpAddr, RateEntry>>,
-    /// Per-IP concurrent-connection limiter. Like `rate_map`, persists
-    /// across config reloads (it tracks live sockets, not config); the cap
-    /// is read from the config snapshot at accept time. The global ceiling
-    /// stays the `conn_limit` semaphore above.
-    conn_per_ip: Arc<connlimit::PerIpConnLimiter>,
+    /// Behaviour-persistent per-source limiters (rate map, per-IP conn cap,
+    /// JA4 ban set) — grouped so subsystem churn stays local. See [`Limiters`].
+    limiters: Limiters,
     /// Singleflight: coalesce concurrent cache misses for the same key.
     /// First request fetches from upstream and inserts a `watch::Sender<bool>`;
     /// subsequent requests subscribe and await `true`. Watch (vs Notify) is
@@ -515,12 +529,6 @@ struct AppState {
     /// local block to the mesh). Cloning is cheap — internal `Arc`s.
     #[cfg(feature = "sovereign-aimp")]
     pub(crate) aimp_cp: Option<aimp_cp::AimpControlPlane>,
-    /// Rejected-unknown JA4 ban set (#27 commit 4): fingerprint → banned
-    /// until. Like `rate_map`, it persists across config reloads — a ban is
-    /// about the client's behaviour, not about the config — and is only ever
-    /// consulted while the CURRENT config drops unknown fingerprints.
-    #[cfg(feature = "tls-fingerprint")]
-    pub(crate) tls_fp_bans: tls_fp::BanSet,
 }
 
 impl AppState {
@@ -1113,11 +1121,13 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         static_cache: cache::StaticCache::new(),
         conn_limit: Arc::new(Semaphore::new(platform.conn_limit)),
         acme_challenges: acme::new_challenge_store(),
-        rate_map: Arc::new(numa::NumaAwareMap::new()),
-        conn_per_ip: Arc::new(connlimit::PerIpConnLimiter::new()),
+        limiters: Limiters {
+            rate_map: Arc::new(numa::NumaAwareMap::new()),
+            conn_per_ip: Arc::new(connlimit::PerIpConnLimiter::new()),
+            #[cfg(feature = "tls-fingerprint")]
+            tls_fp_bans: tls_fp::BanSet::new(),
+        },
         inflight: numa::NumaAwareMap::new(),
-        #[cfg(feature = "tls-fingerprint")]
-        tls_fp_bans: tls_fp::BanSet::new(),
         audit: audit_handle,
         redact: compiled_redact,
         http_builder: Arc::new({
@@ -1291,15 +1301,17 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                         // `.max(1)` guards scavenge_rate_map's `now / window`
                         // against a 0 window ever reaching the snapshot.
                         let window = state_for_scavenge.cfg().rate_limit_window.max(1);
-                        let removed =
-                            security::scavenge_rate_map(&state_for_scavenge.rate_map, window);
+                        let removed = security::scavenge_rate_map(
+                            &state_for_scavenge.limiters.rate_map,
+                            window,
+                        );
                         if removed > 0 {
                             logging::info(
                                 "rate_limit",
                                 &format!(
                                     "scavenged {} stale IPs ({} tracked)",
                                     removed,
-                                    state_for_scavenge.rate_map.len()
+                                    state_for_scavenge.limiters.rate_map.len()
                                 ),
                             );
                         }
@@ -1710,6 +1722,7 @@ async fn handle_http_connection(
         }
     };
     let _ip_slot = match state
+        .limiters
         .conn_per_ip
         .try_acquire(addr.ip(), state.config.load().max_connections_per_ip)
     {
@@ -1872,6 +1885,7 @@ fn spawn_https_handler(
     // `cap == 0` short-circuits inside `try_acquire` (zero overhead). A
     // rejected source is closed immediately, before the TLS handshake.
     let ip_slot = match state
+        .limiters
         .conn_per_ip
         .try_acquire(remote_addr.ip(), state.config.load().max_connections_per_ip)
     {
@@ -2255,7 +2269,7 @@ fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
     security::check_rate_limit(
         cfg.rate_limit_rps,
         cfg.rate_limit_window,
-        &state.rate_map,
+        &state.limiters.rate_map,
         ip,
     )
 }
