@@ -1268,22 +1268,42 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     // stays ~empty and the 60 s scavenge is a cheap no-op.
     {
         let state_for_scavenge = state.clone();
+        // Subscribe to the process shutdown signal so this loop exits cleanly
+        // on SIGINT/SIGTERM instead of being force-aborted mid-iteration when
+        // the runtime is dropped (#151 follow-up / ZION-CONC-03). The work here
+        // is idempotent stale-entry cleanup, so a lost iteration is harmless —
+        // but a deterministic exit keeps shutdown ordering predictable and
+        // matches the accept loops' shutdown idiom. The sibling maintenance
+        // loops (health checker, ACME renewal, AIMP mesh) similarly tolerate an
+        // abort: health probing is idempotent, ACME cert writes are atomic
+        // (see src/atomic_file.rs), and the audit writer flushes per event.
+        let mut scavenge_shutdown = super_shutdown_tx.subscribe();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                // `.max(1)` guards scavenge_rate_map's `now / window` against a
-                // 0 window ever reaching the snapshot.
-                let window = state_for_scavenge.cfg().rate_limit_window.max(1);
-                let removed = security::scavenge_rate_map(&state_for_scavenge.rate_map, window);
-                if removed > 0 {
-                    logging::info(
-                        "rate_limit",
-                        &format!(
-                            "scavenged {} stale IPs ({} tracked)",
-                            removed,
-                            state_for_scavenge.rate_map.len()
-                        ),
-                    );
+                tokio::select! {
+                    biased;
+                    res = scavenge_shutdown.changed() => {
+                        if res.is_err() || *scavenge_shutdown.borrow() {
+                            break; // shutting down (or sender dropped) — stop cleanly
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                        // `.max(1)` guards scavenge_rate_map's `now / window`
+                        // against a 0 window ever reaching the snapshot.
+                        let window = state_for_scavenge.cfg().rate_limit_window.max(1);
+                        let removed =
+                            security::scavenge_rate_map(&state_for_scavenge.rate_map, window);
+                        if removed > 0 {
+                            logging::info(
+                                "rate_limit",
+                                &format!(
+                                    "scavenged {} stale IPs ({} tracked)",
+                                    removed,
+                                    state_for_scavenge.rate_map.len()
+                                ),
+                            );
+                        }
+                    }
                 }
             }
         });
