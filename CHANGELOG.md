@@ -4,7 +4,29 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
-## [0.8.3] - 2026-09-08
+## [0.8.4] - 2026-09-08
+
+**ACME renewal-loop liveness + owner-only cert-key writes.** A confirming
+re-audit of v0.8.3 (raw quality "Strong", all prior fail-opens verified fixed)
+flagged one HIGH — a silent-failure observability gap — and one at-rest MEDIUM.
+Both are closed here. No behaviour change for a correct config.
+
+### Fixed
+
+- **ACME renewal loop now exposes a liveness heartbeat**: the renewal counters
+  (`zion_acme_renewals_total` / `_failures_total`) only advance on an actual
+  attempt, so a *dead* renewal loop was indistinguishable from the normal
+  months-long idle steady state — the certificate could silently expire with no
+  signal. The loop now advances `zion_acme_loop_checks_total` (a monotonic
+  iteration counter) and sets `zion_acme_loop_last_check_timestamp_seconds` (a
+  heartbeat gauge) on **every** ~12h wake-up, including the no-op case. Alert on
+  `time() - zion_acme_loop_last_check_timestamp_seconds` exceeding the check
+  interval, or on `rate(zion_acme_loop_checks_total[1d]) == 0`.
+- **`zion init` / `zion auto` write the serving TLS private key owner-only**:
+  the generated key was written via a bare `std::fs::write` (default umask,
+  typically world-readable `0644`), unlike the hardened `0600` atomic path
+  already used for the ACME account and mesh identity keys. Both now use
+  `write_cert_key_atomic` (created `0600`, never wider even in transit).
 
 **Fail-closed security fixes.** A deeper re-audit of v0.8.2 surfaced two HIGH
 fail-opens (one a residual gap in the v0.8.0 AIMP-listen fix); this closes both.
