@@ -4,6 +4,21 @@ Zion is configured via a single TOML file. Default path: `./zion.toml`. Override
 
 All configuration is validated at startup. Invalid config produces actionable error messages and exits immediately.
 
+## Schema version
+
+An optional top-level `schema_version` (integer) declares which config schema the
+file targets:
+
+```toml
+schema_version = 1
+```
+
+It is read **before** the strict parse. If the file targets a schema **newer**
+than the running binary understands, Zion exits with targeted upgrade guidance
+instead of a generic "unknown field" error. Omit it (the default) and the config
+is treated as compatible; the current schema version is `1`. Bump it only when a
+breaking config change lands (documented in the CHANGELOG).
+
 ## `[server]`
 
 | Key | Type | Default | Description |
