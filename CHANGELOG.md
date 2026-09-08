@@ -4,6 +4,25 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-08
+
+**Container-build hotfix.** v0.8.0 published all binary artifacts, SBOM and
+checksums, but both container-image builds failed — so the multi-arch manifest
+and cosign signing were skipped and no signed `ghcr.io/fabriziosalmi/zion:0.8.0`
+was published. The v0.8.0 binaries are unaffected; this release re-runs the full
+pipeline and ships the signed container. No code changes beyond the build fix.
+
+### Fixed
+
+- **Container build compiles again** (regression from the 0.8.0 `build.rs` git
+  stamp): the stamp used the compile-time `env!("ZION_GIT_SHA")`, but the
+  Dockerfile's selective `COPY` never included `build.rs`, so inside the
+  container there was no build script and the macro failed with "environment
+  variable not defined at compile time". Now `option_env!` (compiles to
+  `"unknown"` if the script did not run), `build.rs` is copied into the image,
+  and `release.yml` passes the commit sha/date as build-args so the container
+  keeps real `--version` / `zion_build_info` provenance.
+
 ## [0.8.0] - 2026-09-08
 
 **Security & robustness hardening.** A full code-metrics audit of v0.7.6 scored

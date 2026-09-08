@@ -499,8 +499,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Reproducible-build epoch
-        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+      - name: Reproducible-build epoch + git stamp
+        run: |
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+          # Passed as Docker build-args so build.rs stamps the real commit into
+          # the container binary (the build context has no .git). Same short-12
+          # sha + commit-date format build.rs computes locally.
+          echo "ZION_GIT_SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+          echo "ZION_COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y-%m-%d HEAD)" >> "$GITHUB_ENV"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -542,6 +548,8 @@ jobs:
           cache-to: type=gha,mode=max,scope=container-${{ matrix.arch }}
           build-args: |
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+            ZION_GIT_SHA=${{ env.ZION_GIT_SHA }}
+            ZION_COMMIT_DATE=${{ env.ZION_COMMIT_DATE }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
 
       # Guard against the "arm64 manifest carries an amd64 binary" class of bug.

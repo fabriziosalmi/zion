@@ -24,25 +24,41 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    // Re-run when HEAD moves or the index changes, so the stamp stays current.
+    // Re-run when HEAD moves or the index changes, so the stamp stays current;
+    // and when the injected vars change (the container build-arg path below).
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
+    println!("cargo:rerun-if-env-changed=ZION_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=ZION_COMMIT_DATE");
 
-    let mut sha = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    // Mark a build made from a dirty working tree — it does not correspond to
-    // any published commit.
-    if git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty()) {
-        sha.push_str("-dirty");
-    }
-    let date = git(&[
-        "show",
-        "-s",
-        "--format=%cd",
-        "--date=format:%Y-%m-%d",
-        "HEAD",
-    ])
-    .unwrap_or_else(|| "unknown".into());
+    // Prefer values injected via the environment — the container build has no
+    // `.git`, so `release.yml` passes the sha/date as a Docker build-arg → ENV.
+    // Fall back to querying git (the normal + binary-artifact builds), then to
+    // "unknown" (a source tarball with neither).
+    let sha = env_nonempty("ZION_GIT_SHA").unwrap_or_else(|| {
+        let mut s = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
+        // Mark a build made from a dirty working tree — it corresponds to no
+        // published commit.
+        if git(&["status", "--porcelain"]).is_some_and(|st| !st.is_empty()) {
+            s.push_str("-dirty");
+        }
+        s
+    });
+    let date = env_nonempty("ZION_COMMIT_DATE").unwrap_or_else(|| {
+        git(&[
+            "show",
+            "-s",
+            "--format=%cd",
+            "--date=format:%Y-%m-%d",
+            "HEAD",
+        ])
+        .unwrap_or_else(|| "unknown".into())
+    });
 
     println!("cargo:rustc-env=ZION_GIT_SHA={sha}");
     println!("cargo:rustc-env=ZION_COMMIT_DATE={date}");
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
 }
