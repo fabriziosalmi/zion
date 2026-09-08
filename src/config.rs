@@ -108,9 +108,11 @@ fn default_admin_rate_limit() -> u32 {
 
 /// `[sovereign_aimp]` block — gossip control plane.
 ///
-/// Env vars `ZION_AIMP_*` still work and override the TOML values when set,
-/// so existing deployments keep working. Operators are encouraged to migrate
-/// to TOML for review/diffability.
+/// TOML takes precedence: a `ZION_AIMP_*` env var only fills a field that is
+/// UNSET (empty) in this block — it does NOT override a value present in the
+/// TOML (see the wiring in `main.rs`). Env vars are the legacy path and keep
+/// existing deployments working; operators are encouraged to migrate to TOML
+/// for review/diffability. (If you need an env var to win, clear the TOML key.)
 #[cfg(feature = "sovereign-aimp")]
 #[derive(Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
@@ -556,6 +558,12 @@ pub struct UpstreamConfig {
     pub url: Option<String>,
     #[serde(default)]
     pub urls: Vec<String>,
+    /// Advisory only, for now. The shared pooled HTTP client is built once for
+    /// all upstreams, so this per-upstream connect deadline is NOT yet applied
+    /// to its connector — the connect phase is bounded by the overall
+    /// `UPSTREAM_REQUEST_TIMEOUT` (30s) instead. Set it for intent/forward
+    /// compatibility, but don't rely on a sub-second value speeding failover
+    /// against a black-holed upstream until it is wired to the connector.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_ms: u64,
     #[serde(default = "default_keepalive")]
@@ -969,6 +977,27 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                     .to_string(),
             );
         }
+        // An ENFORCING allowlist (unknowns dropped) that still lets an
+        // UN-fingerprintable ClientHello through fails open: an attacker sends
+        // a deliberately malformed hello the parser can't fingerprint and
+        // sidesteps the allowlist entirely, defeating the very drop it just
+        // configured for unknowns. The `on_unfingerprintable = allow` default
+        // is availability-first and inconsistent with `on_unknown = drop`.
+        // Refuse to boot into that silent bypass; an observe posture
+        // (on_unknown = log_only, or mode = shadow) is unaffected.
+        if fp.mode == FingerprintMode::Allowlist
+            && fp.on_unknown == OnUnknown::Drop
+            && fp.on_unfingerprintable == OnUnfingerprintable::Allow
+        {
+            errors.push(
+                "[tls.fingerprint] mode = \"allowlist\" with on_unknown = \"drop\" but \
+                 on_unfingerprintable = \"allow\" fails OPEN — a ClientHello the parser cannot \
+                 fingerprint bypasses the allowlist while unknowns are dropped. Set \
+                 on_unfingerprintable = \"drop\" to fail closed consistently, or use \
+                 on_unknown = \"log_only\" / mode = \"shadow\" to observe without enforcing."
+                    .to_string(),
+            );
+        }
         // A malformed allowlist entry can never match a computed JA4, so under
         // on_unknown = drop it is a silent deny-all the empty-list check above
         // misses. Surface the typo at boot instead of as a production outage.
@@ -1074,6 +1103,16 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                     route.path
                 ));
             }
+            // A static route serves from disk and needs no upstream;
+            // resolve_route silently discards any `upstream` here. Reject a
+            // non-empty one so the mismatch is a boot error, not a surprise.
+            if !route.upstream.is_empty() {
+                errors.push(format!(
+                    "route '{}' is mode=static but sets upstream = '{}' — a static route \
+                     serves from serve_dir and ignores upstream; remove it",
+                    route.path, route.upstream
+                ));
+            }
         } else {
             let has_upstream = config.upstream.contains_key(&route.upstream)
                 || config.upstreams.contains_key(&route.upstream);
@@ -1081,6 +1120,28 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                 errors.push(format!(
                     "route '{}' references unknown upstream '{}'",
                     route.path, route.upstream
+                ));
+            }
+            // serve_dir / spa_fallback / precompressed are honoured ONLY under
+            // mode=static; on any other mode they are silently ignored, so an
+            // operator expecting disk serving gets proxy behaviour instead.
+            // Reject the combination rather than dropping it quietly.
+            let mut static_only = Vec::new();
+            if route.serve_dir.as_deref().is_some_and(|s| !s.is_empty()) {
+                static_only.push("serve_dir");
+            }
+            if route.spa_fallback {
+                static_only.push("spa_fallback");
+            }
+            if route.precompressed {
+                static_only.push("precompressed");
+            }
+            if !static_only.is_empty() {
+                errors.push(format!(
+                    "route '{}' is mode={:?} but sets static-only field(s) {:?}; these apply \
+                     only to mode=static and would be silently ignored — set mode = \"static\" \
+                     or remove them",
+                    route.path, route.mode, static_only
                 ));
             }
         }
@@ -1183,6 +1244,35 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                 "admin.auth = \"mtls\" requires tls.client_ca_path (the CA that signs admin client certs)"
                     .to_string(),
             );
+        }
+    }
+
+    // [sovereign_aimp] — when the mesh is enabled and a listen address is set
+    // in TOML, it MUST parse. Previously a malformed value silently fell back
+    // to `0.0.0.0:9443` at boot, binding the gossip control plane to every
+    // interface — a fat-fingered address would quietly expose it to the
+    // internet. Fail validation instead of guessing a (world-open) default.
+    #[cfg(feature = "sovereign-aimp")]
+    if config.sovereign_aimp.enabled && !config.sovereign_aimp.listen.is_empty() {
+        if let Err(e) = config.sovereign_aimp.listen.parse::<std::net::SocketAddr>() {
+            errors.push(format!(
+                "sovereign_aimp.listen '{}' is not a valid socket address (e.g. 127.0.0.1:9443): {e}",
+                config.sovereign_aimp.listen
+            ));
+        }
+    }
+
+    // An upstream name defined in BOTH the structured `[upstream.<name>]` map
+    // and the legacy flat `[upstreams]` map is ambiguous: resolve_upstream
+    // silently prefers the structured one and drops the legacy URL, so two
+    // divergent definitions can coexist with zero diagnostics. Reject the
+    // collision so the operator picks one home for the name.
+    for name in config.upstream.keys() {
+        if config.upstreams.contains_key(name) {
+            errors.push(format!(
+                "upstream '{name}' is defined in both [upstream.{name}] and [upstreams]; \
+                 remove one — the legacy [upstreams] entry would be silently ignored"
+            ));
         }
     }
 
@@ -1857,7 +1947,7 @@ mod tests {
         // A typo'd pattern must be a boot error, not a runtime surprise.
         let bad = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
              [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
-             [tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"drop\"\n\
+             [tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"drop\"\non_unfingerprintable=\"drop\"\n\
              allowed=[{name=\"a\",ja4=\"t13d1516h2_8daaf6152771_e5627efa2ab1\",allowed_routes=[\"/api/{unclosed\"]}]\n\
              [upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
              [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
@@ -1928,6 +2018,67 @@ mod tests {
             validate_semantics(&cfg, "test").is_ok(),
             "log_only empty allowlist must pass semantics, got: {:?}",
             validate_semantics(&cfg, "test").err()
+        );
+    }
+
+    #[cfg(feature = "tls-fingerprint")]
+    #[test]
+    fn enforcing_allowlist_rejects_fail_open_unfingerprintable() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let allowed = "allowed=[{name=\"a\",ja4=\"t13d1516h2_8daaf6152771_e5627efa2ab1\"}]\n";
+
+        // Enforcing (on_unknown=drop) + default on_unfingerprintable (allow) is
+        // a fail-open bypass → must be rejected.
+        let open =
+            format!("{base}[tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"drop\"\n{allowed}");
+        let err = validate_str(&open, "test").err().unwrap_or_default();
+        assert!(
+            err.contains("on_unfingerprintable"),
+            "enforcing allowlist with allow-unfingerprintable must be rejected, got: {err}"
+        );
+
+        // Explicit fail-closed passes.
+        let closed = format!(
+            "{base}[tls.fingerprint]\nmode=\"allowlist\"\non_unknown=\"drop\"\non_unfingerprintable=\"drop\"\n{allowed}"
+        );
+        let cfg = parse_schema(&closed, "test").expect("parse");
+        assert!(
+            validate_semantics(&cfg, "test").is_ok(),
+            "fail-closed allowlist must pass: {:?}",
+            validate_semantics(&cfg, "test").err()
+        );
+    }
+
+    #[test]
+    fn illegal_route_mode_field_combinations_are_rejected() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n";
+
+        // A static route that also names an upstream: upstream is silently
+        // dropped by resolve_route → reject.
+        let static_with_upstream = format!(
+            "{base}[[route]]\npath=\"/{{*rest}}\"\nmode=\"static\"\nserve_dir=\"/srv\"\nupstream=\"be\"\n"
+        );
+        let err = validate_str(&static_with_upstream, "test")
+            .err()
+            .unwrap_or_default();
+        assert!(
+            err.contains("mode=static but sets upstream"),
+            "static + upstream must be rejected, got: {err}"
+        );
+
+        // A standard (proxy) route that sets serve_dir: honoured only under
+        // mode=static → reject.
+        let standard_with_serve_dir =
+            format!("{base}[[route]]\npath=\"/{{*rest}}\"\nupstream=\"be\"\nserve_dir=\"/srv\"\n");
+        let err = validate_str(&standard_with_serve_dir, "test")
+            .err()
+            .unwrap_or_default();
+        assert!(
+            err.contains("static-only field"),
+            "non-static + serve_dir must be rejected, got: {err}"
         );
     }
 
@@ -2487,6 +2638,72 @@ enabledd = true
         assert!(
             err.contains("client_ca_path"),
             "auth=mtls without client_ca_path must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn upstream_defined_in_both_maps_is_rejected() {
+        // Same name in [upstream.api] and [upstreams] → ambiguous, must fail.
+        let both = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [upstream.api]\nurl=\"http://127.0.0.1:8000\"\n\
+             [upstreams]\napi=\"http://127.0.0.1:9000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"api\"\n";
+        let err = validate_str(both, "test").err().unwrap_or_default();
+        assert!(
+            err.contains("defined in both"),
+            "colliding upstream name must be rejected, got: {err}"
+        );
+
+        // Distinct names in the two maps are fine.
+        let ok = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [upstream.api]\nurl=\"http://127.0.0.1:8000\"\n\
+             [upstreams]\nlegacy=\"http://127.0.0.1:9000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"api\"\n";
+        let cfg: ZionConfig = toml::from_str(ok).unwrap();
+        assert!(
+            !semantic_errors(&cfg)
+                .iter()
+                .any(|e| e.contains("defined in both")),
+            "distinct upstream names must not collide"
+        );
+    }
+
+    #[cfg(feature = "sovereign-aimp")]
+    #[test]
+    fn sovereign_aimp_listen_must_parse_when_enabled() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+
+        // Malformed listen (missing port) must fail validation — NOT silently
+        // fall back to a world-open 0.0.0.0 bind.
+        let bad = format!("{base}[sovereign_aimp]\nenabled=true\nlisten=\"127.0.0.1\"\n");
+        let err = validate_str(&bad, "test").err().unwrap_or_default();
+        assert!(
+            err.contains("sovereign_aimp.listen"),
+            "malformed aimp listen must be rejected, got: {err}"
+        );
+
+        // A valid listen passes (semantic layer; cert files are a deploy check).
+        let good = format!("{base}[sovereign_aimp]\nenabled=true\nlisten=\"127.0.0.1:9443\"\n");
+        let cfg: ZionConfig = toml::from_str(&good).unwrap();
+        assert!(
+            !semantic_errors(&cfg)
+                .iter()
+                .any(|e| e.contains("sovereign_aimp.listen")),
+            "valid aimp listen must not be flagged"
+        );
+
+        // Disabled mesh: listen is not validated even if malformed (never bound).
+        let disabled = format!("{base}[sovereign_aimp]\nenabled=false\nlisten=\"nonsense\"\n");
+        let cfg: ZionConfig = toml::from_str(&disabled).unwrap();
+        assert!(
+            !semantic_errors(&cfg)
+                .iter()
+                .any(|e| e.contains("sovereign_aimp.listen")),
+            "disabled mesh must not validate its listen"
         );
     }
 

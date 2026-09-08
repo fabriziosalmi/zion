@@ -57,9 +57,16 @@ ignore = [
     # ── Direct dep that needs migration to a new API ──
     { id = "RUSTSEC-2025-0134", reason = "[review by 2026-08-01] `rustls-pemfile` is archived; replacement is `rustls-pki-types::pem::PemObject`. Migration tracked as a follow-up task in src/tls.rs and src/acme.rs. Not a vulnerability." },
     # ── DoS in a feature-gated transitive dep (acme/init/ml-waf, not core) ──
-    # NOTE: RUSTSEC-2026-0002 (`lru` via ratatui/TUI), -0186 (`memmap2` via
-    # tract-onnx) and -0217 (`tract-nnef` 0.21.14) were RESOLVED by the v0.7.1
-    # dependency bumps (tract 0.21.17 + the rust-minor group) and removed.
+    # NOTE: RUSTSEC-2026-0002 (`lru` via ratatui/TUI) and -0217 (`tract-nnef`
+    # 0.21.14) were RESOLVED by the v0.7.1 dependency bumps (tract 0.21.17 + the
+    # rust-minor group) and their crates left the tree.
+    # RUSTSEC-2026-0186 (`memmap2` via tract-onnx): `memmap2` is STILL in the
+    # lock at 0.9.10 (tract-onnx pulls it; ml-waf is off by default), but the
+    # advisory no longer matches that version in the RustSec DB — both
+    # `cargo audit` and `cargo deny check advisories` pass clean against it, so
+    # no ignore entry is listed (an ignore that matches no advisory is itself a
+    # cargo-deny error). Re-add a dated ignore here only if a future DB revision
+    # starts flagging 0.9.10 before tract bumps past it.
     # NOTE: RUSTSEC-2026-0009 (`time` 0.3.41 RFC 2822 stack-exhaustion DoS) was
     # RESOLVED here: ratatui 0.30 lifted the transitive `time <0.3.42` bound that
     # had been pinning us below the fix, so the lock now carries 0.3.55 — past

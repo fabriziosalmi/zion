@@ -456,11 +456,40 @@ async fn writer_loop(
     // transition once instead of per-event.
     let mut flush_degraded = false;
     // Once rotation becomes impossible (rename keeps failing), stop attempting
-    // it so the writer degrades to unbounded-with-a-warning instead of spinning
-    // (re-anchor → still over cap → rename fails → repeat).
+    // it so the writer degrades instead of spinning (re-anchor → still over cap
+    // → rename fails → repeat).
     let mut rotation_disabled = max_size_bytes.is_none();
+    // Distinct from `rotation_disabled`: true only when rotation was CONFIGURED
+    // but FAILED at runtime. In that state we cap the segment by shedding
+    // (drop + count) events that would push it past `max_size_bytes`, rather
+    // than growing the file without bound — a rotation the operator asked for
+    // silently becoming an unbounded disk-fill is worse than a counted drop.
+    // (When rotation is off by config, `max_size_bytes` is None and this stays
+    // false, so an opt-out deployment keeps its intended unbounded behaviour.)
+    let mut rotation_broken = false;
+    let mut shed_logged = false;
 
     while let Some(mut event) = rx.recv().await {
+        // Shed when a configured rotation has broken and the segment is already
+        // at/over its cap: drop the event (counted) instead of appending and
+        // growing the file without bound. Self-heals only on restart — the
+        // failure is logged prominently below.
+        if rotation_broken {
+            if let Some(max) = max_size_bytes {
+                if bytes_written >= max {
+                    observability::AUDIT_EVENTS_DROPPED_TOTAL
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !shed_logged {
+                        crate::logging::error(
+                            "audit",
+                            "audit log rotation is broken and the segment is at its size cap — shedding (dropping + counting) further events to avoid an unbounded disk-fill; fix the directory permissions/disk and restart",
+                        );
+                        shed_logged = true;
+                    }
+                    continue;
+                }
+            }
+        }
         event.seq = seq;
         if event.ts.is_empty() {
             event.ts = now_iso8601();
@@ -481,11 +510,17 @@ async fn writer_loop(
                     prev_hash = new_prev;
                     seq += 1;
                     bytes_written += line.len() as u64;
-                    // Flush each event — durability over throughput. A flush
-                    // failure (transient ENOSPC, slow network FS) does NOT kill
-                    // the writer: the record stays buffered and a later flush
-                    // retries it, so audit self-heals once the disk recovers.
-                    // Log the degraded↔healthy transition once, not per event.
+                    // Flush each event — durability over throughput, but note
+                    // the scope: `BufWriter::flush` pushes bytes to the OS page
+                    // cache, not to stable storage. This survives a process
+                    // kill -9 (the kernel keeps the bytes) but NOT a power loss
+                    // or kernel crash, which can drop not-yet-synced records.
+                    // That is a deliberate throughput trade-off; add an
+                    // `sync_data` here (or open O_SYNC) if media durability is
+                    // required. A flush failure (transient ENOSPC, slow network
+                    // FS) does NOT kill the writer: the record stays buffered
+                    // and a later flush retries it, so audit self-heals once the
+                    // disk recovers. Log the degraded↔healthy transition once.
                     match file.flush().await {
                         Ok(()) => {
                             if flush_degraded {
@@ -521,8 +556,18 @@ async fn writer_loop(
         if !rotation_disabled {
             if let Some(max) = max_size_bytes {
                 if bytes_written >= max {
-                    let _ = file.flush().await;
-                    let _ = file.shutdown().await;
+                    // Flush the outgoing segment before sealing it. Unlike the
+                    // steady-state flush (which keeps records buffered and
+                    // retries), we are about to rename this file away, so a
+                    // failed flush here means buffered records are lost with the
+                    // old segment — surface it instead of discarding the error.
+                    if let Err(e) = file.flush().await {
+                        crate::logging::warn(
+                            "audit",
+                            &format!("audit log flush before rotation failed ({e}) — buffered records in the outgoing segment may be lost"),
+                        );
+                    }
+                    let _ = file.shutdown().await; // best-effort close of the outgoing fd
                     match rotate_paths(&path, max_files).await {
                         Ok(rotated_to) => match open_and_anchor(
                             &path,
@@ -574,6 +619,7 @@ async fn writer_loop(
                                 None => return,
                             }
                             rotation_disabled = true;
+                            rotation_broken = true;
                         }
                     }
                 }

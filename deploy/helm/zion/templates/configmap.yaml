@@ -7,8 +7,10 @@ metadata:
 data:
   zion.toml: |
     [server]
-    listen_http = {{ .Values.config.listen_http | quote }}
-    listen_https = {{ .Values.config.listen_https | quote }}
+    # Derived from .Values.containerPorts so the bound ports, the declared
+    # containerPorts, and the Service targetPorts cannot drift apart.
+    listen_http = {{ printf "0.0.0.0:%v" .Values.containerPorts.http | quote }}
+    listen_https = {{ printf "0.0.0.0:%v" .Values.containerPorts.https | quote }}
 
     [upstreams]
     {{- range $k, $v := .Values.config.upstreams }}

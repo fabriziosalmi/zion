@@ -173,6 +173,46 @@ where
         self.shards[local].insert(k, v)
     }
 
+    /// Atomically get the value for `k`, or insert one produced by `make` if
+    /// absent. Returns `(value, inserted)` where `inserted` is `true` only for
+    /// the single caller that created the entry. This is the race-free
+    /// primitive singleflight needs: a separate `get()` then `insert()` lets
+    /// two concurrent callers both observe "absent" and both insert, so the
+    /// second clobbers the first (orphaning its waiters and doubling the work).
+    ///
+    /// The vacant→insert transition is atomic on the local shard via DashMap's
+    /// `Entry` API, so concurrent callers on the same node always agree on one
+    /// winner. The cross-shard adopt below (a key placed by a thread that has
+    /// since migrated to another node) is best-effort, exactly as `get`/`insert`
+    /// already are for that rare case — never worse than the previous code.
+    pub fn get_or_insert_with<F>(&self, k: K, make: F) -> (V, bool)
+    where
+        V: Clone,
+        F: FnOnce() -> V,
+    {
+        use dashmap::mapref::entry::Entry;
+        let local = self.local_idx();
+        // Adopt an entry that already lives on a remote shard (post-migration).
+        if self.shards.len() > 1 {
+            for (i, shard) in self.shards.iter().enumerate() {
+                if i == local {
+                    continue;
+                }
+                if let Some(r) = shard.get(&k) {
+                    return (r.value().clone(), false);
+                }
+            }
+        }
+        match self.shards[local].entry(k) {
+            Entry::Occupied(e) => (e.get().clone(), false),
+            Entry::Vacant(e) => {
+                let v = make();
+                e.insert(v.clone());
+                (v, true)
+            }
+        }
+    }
+
     /// Remove `k` if present. Like `get`, tries the local shard first
     /// then scans the rest.
     pub fn remove(&self, k: &K) -> Option<(K, V)> {
@@ -495,6 +535,44 @@ mod tests {
         m.remove(&1);
         m.remove(&2);
         assert!(m.is_empty());
+    }
+
+    #[test]
+    fn get_or_insert_with_elects_single_winner() {
+        let m: NumaAwareMap<u32, u32> = NumaAwareMap::with_shards(1);
+        // First caller inserts and is told so; the closure ran.
+        let mut ran = 0;
+        let (v, inserted) = m.get_or_insert_with(7, || {
+            ran += 1;
+            100
+        });
+        assert_eq!((v, inserted), (100, true));
+        assert_eq!(ran, 1);
+        // Second caller for the same key adopts the existing value; its closure
+        // MUST NOT run (that is the whole point — no duplicate fetch).
+        let (v, inserted) = m.get_or_insert_with(7, || {
+            ran += 1;
+            999
+        });
+        assert_eq!((v, inserted), (100, false));
+        assert_eq!(ran, 1, "loser's closure must not run");
+        // A different key is a fresh election.
+        let (v, inserted) = m.get_or_insert_with(8, || 200);
+        assert_eq!((v, inserted), (200, true));
+    }
+
+    #[test]
+    fn get_or_insert_with_finds_key_on_remote_shard() {
+        // A key placed on a remote shard must be adopted (inserted == false),
+        // not duplicated into the local shard.
+        let m: NumaAwareMap<u32, u32> = NumaAwareMap::with_shards(4);
+        // Force the key onto specific shards regardless of node placement.
+        m.shards[2].insert(42, 500);
+        let (v, inserted) = m.get_or_insert_with(42, || 0);
+        assert_eq!((v, inserted), (500, false));
+        // Still exactly one copy across the map.
+        let copies: usize = m.shards.iter().filter(|s| s.contains_key(&42)).count();
+        assert_eq!(copies, 1, "adopt must not duplicate the key");
     }
 
     #[cfg(all(target_os = "linux", feature = "numa-aware"))]

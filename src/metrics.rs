@@ -430,6 +430,11 @@ pub struct Metrics {
     /// Connections closed at accept because the source IP was already at
     /// its `max_connections_per_ip` concurrent cap (anti-DDoS lever).
     pub connections_rejected_per_ip: AtomicU64,
+    /// Connections shed at accept because the GLOBAL connection semaphore
+    /// (the per-node ceiling, see `compute_conn_limit`) was exhausted. Lets an
+    /// operator alert on node-saturation shedding directly instead of inferring
+    /// it from `active_connections` approaching the limit.
+    pub connections_rejected_global: AtomicU64,
     /// Requests denied (403) by tag-driven enforcement because the origin
     /// class is on the `[sovereign.enforce] deny` list (#150).
     pub enforcement_denied_class: AtomicU64,
@@ -533,6 +538,7 @@ impl Metrics {
             tls_fp_rate_limited: AtomicU64::new(0),
             tls_fp_route_denied: AtomicU64::new(0),
             connections_rejected_per_ip: AtomicU64::new(0),
+            connections_rejected_global: AtomicU64::new(0),
             enforcement_denied_class: AtomicU64::new(0),
             enforcement_denied_mesh_score: AtomicU64::new(0),
             tarpit_active: AtomicU64::new(0),
@@ -667,6 +673,19 @@ impl Metrics {
         // Preallocate estimated capacity to avoid reallocations
         let mut out = bytes::BytesMut::with_capacity(4096);
         let mut itoa_buf = itoa::Buffer::new();
+
+        // Build-info gauge (constant 1) carrying the version as a label — the
+        // standard Prometheus `*_build_info` convention. Lets a scraper join
+        // any zion series to its version and alert on version skew; the crate's
+        // own e2e harness queries this series. `CARGO_PKG_VERSION` is a
+        // compile-time literal with no label-unsafe characters.
+        out.extend_from_slice(
+            b"# HELP zion_build_info Build metadata (constant 1; see the version label).\n\
+                                # TYPE zion_build_info gauge\n\
+                                zion_build_info{version=\"",
+        );
+        out.extend_from_slice(env!("CARGO_PKG_VERSION").as_bytes());
+        out.extend_from_slice(b"\"} 1\n");
 
         out.extend_from_slice(
             b"# HELP zion_requests_total Total HTTP requests processed.\n\
@@ -875,6 +894,18 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.connections_rejected_per_ip.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_connections_rejected_global Connections shed at accept because the global connection ceiling was exhausted.\n\
+                                # TYPE zion_connections_rejected_global counter\n\
+                                zion_connections_rejected_global ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.connections_rejected_global.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");
@@ -1492,6 +1523,12 @@ mod tests {
         assert!(out.contains("zion_request_duration_seconds_bucket"));
         assert!(out.contains("zion_upstream_duration_seconds_bucket"));
         assert!(out.contains("zion_tls_handshake_duration_seconds_bucket"));
+        // build-info gauge with the compiled version label.
+        assert!(out.contains(&format!(
+            "zion_build_info{{version=\"{}\"}} 1",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(out.contains("zion_connections_rejected_global 0"));
     }
 
     #[test]

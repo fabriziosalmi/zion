@@ -54,8 +54,8 @@ Legacy format `[upstreams]` (flat key-value map of name to URL) is also supporte
 | `max_string_len` | usize | `1048576` | Maximum JSON string length (bytes) |
 | `deny_unknown_content_types` | bool | `true` | Reject content types not in allowed list |
 | `allowed_content_types` | string[] | `["application/json", "multipart/form-data"]` | Permitted content types |
-| `entropy_check` | bool | `true` | Enable the Shannon-entropy gate on JSON string values |
-| `entropy_threshold` | f64 | `6.5` | Bits/byte above which a JSON string value is flagged |
+| `entropy_check` | bool | `true` | Enable the Shannon-entropy gate on request bodies ≥256 bytes (restricted to JSON string values for `application/json`; whole-body for other content types) |
+| `entropy_threshold` | f64 | `6.5` | Bits/byte above which a body's entropy is flagged |
 | `streaming` | bool | `false` | Scan request bodies chunk-by-chunk as they stream (fail-fast on first hit) |
 
 ## `[cache_profile.<name>]`

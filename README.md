@@ -11,6 +11,8 @@
 [![FIPS-ready](https://img.shields.io/badge/FIPS_140--3-ready_(--features_fips)-success.svg)](docs/security/fips.md)
 [![ASVS L2](https://img.shields.io/badge/OWASP_ASVS-L2_mapped-blue.svg)](docs/security/asvs.md)
 
+<sub>The SLSA / cosign provenance above covers the **default** release binaries. A `--features fips` build is a manual, currently unattested build — see [fips.md](docs/security/fips.md#compliance-posture-summary).</sub>
+
 <!-- Project metadata -->
 [![Version](https://img.shields.io/github/v/release/fabriziosalmi/zion?include_prereleases&color=blue&label=release)](https://github.com/fabriziosalmi/zion/releases)
 [![MSRV](https://img.shields.io/badge/MSRV-1.82%20core%20%2F%201.88%20full-blue.svg)](Cargo.toml)
@@ -187,13 +189,13 @@ survives. See [zion.example.toml](zion.example.toml) for the full reference and
 Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) -> Proxy/Cache -> Upstream
                          |                                |
                     URI limit                  Aho-Corasick (~100 balanced / ~240 aggressive)
-                    Method whitelist           Entropy analysis (JSON-string-only)
+                    Method whitelist           Entropy analysis (bodies ≥256 B)
                     Rate limiter               simd-json validation
                     CORS pre-flight            Depth/size limits
 ```
 
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-49 modules, ~44,900 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+50 modules, ~46,000 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Features
 
@@ -208,7 +210,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 
 **Cache** — two-level RAM cache: L1 thread-local (O(1) intrusive-LRU) + L2 sharded DashMap, generation-based coherence (no stale data after update), request coalescing (singleflight: N concurrent misses → 1 upstream fetch). Honors the origin's `Cache-Control`, emits `Age` and an `X-Zion-Cache: HIT|MISS|BYPASS` decision header, and exposes a `POST /_zion/cache/purge` flush for deploys.
 
-**WAF (zero-regex, O(N) single-pass)** — Aho-Corasick scanner, two pattern sets (`balanced` ~100 high-precision / `aggressive` ~240 broad-recall), Shannon-entropy analysis (JSON-string-only), simd-json structural limits, Content-Type enforcement, iterative normalization (URL-decode / SQL-comment / unicode), mTLS `X-Client-Cert-Fingerprint` forwarding, and a shadow mode (log + count, never block).
+**WAF (zero-regex, O(N) single-pass)** — Aho-Corasick scanner, two pattern sets (`balanced` ~100 high-precision / `aggressive` ~240 broad-recall), Shannon-entropy analysis (bodies ≥256 B; restricted to JSON string values only for `application/json`, whole-body otherwise), simd-json structural limits, Content-Type enforcement, iterative normalization (URL-decode / SQL-comment / unicode), mTLS `X-Client-Cert-Fingerprint` forwarding, and a shadow mode (log + count, never block).
 
 **Security** — HSTS preload, nosniff, frame-deny, Referrer-Policy, Permissions-Policy, per-route CSP; `Server`/hop-by-hop stripping (RFC 7230); URI-length cap + 7-method whitelist; per-IP rate limit **and** per-IP concurrent-connection cap (enforced at accept); CORS (FNV O(1)); header-bomb limits (64 headers / 16 KB).
 
@@ -286,7 +288,7 @@ MODE=full bash benchmarks/baseline/run-baseline.sh   # → benchmarks/baseline/z
 ## Testing
 
 <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
-**889 unit tests** run on every change; **23 integration tests** need a running Zion + a backend.
+**910 unit tests** run on every change; **23 integration tests** need a running Zion + a backend.
 
 ```bash
 cargo test                          # unit tests

@@ -44,5 +44,5 @@ sudo systemctl start zion
 
 1. **Bare Metal**: Linux `io_uring` and `SO_REUSEPORT` bindings in `src/net.rs` can be utilized.
 2. **Kubernetes**: Ensure you mount TLS certificates via Kubernetes `Secret` to `/etc/zion/certs/`, and point your `zion.toml` `cert_path` to that mount.
-3. **Capabilities**: The Helm chart drops all Linux capabilities (`drop: - ALL`) and runs as `uid 1000`.
+3. **Capabilities**: The Helm chart drops all Linux capabilities (`drop: - ALL`) and runs as `uid 65532` (the distroless nonroot user — matches the Dockerfile `USER` and `values.yaml` `runAsUser`).
 4. **QUIC (HTTP/3)**: To support QUIC, configure the Load Balancer to pass UDP traffic on port 443. The Service YAML sets `protocol: UDP` for the `quic` port.

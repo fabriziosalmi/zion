@@ -55,8 +55,17 @@ pub struct AuthProfileConfig {
     #[serde(default)]
     pub audience: Option<String>,
     /// HMAC secret for symmetric validation (base64 or raw string).
+    ///
+    /// Prefer `secret_env` over this: a literal here puts a live signing key in
+    /// zion.toml, which tends to land in version control / config management in
+    /// plaintext, and anyone who reads the file can forge valid tokens.
     #[serde(default)]
     pub secret: Option<String>,
+    /// Name of an environment variable holding the HMAC secret. Preferred over
+    /// the literal `secret` — it keeps the signing key out of the config file,
+    /// mirroring `[audit] key_env`. When both are set, `secret_env` wins.
+    #[serde(default)]
+    pub secret_env: Option<String>,
     /// JWKS URL for asymmetric validation (fetched at startup).
     #[serde(default)]
     pub jwks_url: Option<String>,
@@ -183,8 +192,27 @@ pub fn validate_token(token: &str, profile: &ResolvedAuthProfile) -> Result<Clai
 /// the route/profile name in its own error format.
 #[cfg(feature = "auth")]
 pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthProfile, String> {
+    // Resolve the effective HMAC secret: `secret_env` (preferred, keeps the key
+    // out of the config file) wins over a literal `secret`. A named-but-missing
+    // or empty env var is a hard error — failing closed beats silently falling
+    // back to no symmetric key (which would then error as "neither configured"
+    // and mask the operator's real mistake).
+    let effective_secret: Option<String> = if let Some(ref env_name) = config.secret_env {
+        match std::env::var(env_name) {
+            Ok(v) if !v.is_empty() => Some(v),
+            Ok(_) => return Err(format!("auth secret_env '{env_name}' is set but empty")),
+            Err(_) => {
+                return Err(format!(
+                    "auth secret_env '{env_name}' is not set in the environment"
+                ))
+            }
+        }
+    } else {
+        config.secret.clone()
+    };
+
     let mut alg_str = config.algorithm.clone();
-    if alg_str == "HS256" && config.jwks_url.is_some() && config.secret.is_none() {
+    if alg_str == "HS256" && config.jwks_url.is_some() && effective_secret.is_none() {
         alg_str = "RS256".to_string(); // Default to RS256 for asymmetric OIDC profiles
     }
 
@@ -203,7 +231,7 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthPr
     let mut decoding_key = None;
     let jwk_set_arc = Arc::new(arc_swap::ArcSwapOption::empty());
 
-    if let Some(ref secret) = config.secret {
+    if let Some(ref secret) = effective_secret {
         decoding_key = Some(Arc::new(DecodingKey::from_secret(secret.as_bytes())));
     } else if let Some(ref jwks_url) = config.jwks_url {
         let url = jwks_url.clone();
@@ -213,7 +241,17 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthPr
         // Uses exponential backoff on failure (5s → 10s → ... → 3600s).
         tokio::spawn(async move {
             let client = loop {
-                match reqwest::Client::builder().build() {
+                // Bound both the connect and the overall request: reqwest has
+                // NO default timeout, so a JWKS endpoint that accepts the
+                // connection but never responds would park `send().await`
+                // forever, wedging the refresh loop and freezing key rotation.
+                // With a deadline the hung fetch fails and trips the backoff
+                // path below instead.
+                match reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(5))
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()
+                {
                     Ok(c) => break c,
                     Err(e) => {
                         crate::logging::error(
@@ -349,6 +387,7 @@ mod tests {
             issuer: Some("zion-test".to_string()),
             audience: Some("api.zion.dev".to_string()),
             secret: Some(secret.to_string()),
+            secret_env: None,
             jwks_url: None,
             algorithm: "HS256".to_string(),
             forward_claims: true,
@@ -387,6 +426,7 @@ mod tests {
             issuer: None,
             audience: None,
             secret: Some("secret-b".to_string()), // wrong secret
+            secret_env: None,
             jwks_url: None,
             algorithm: "HS256".to_string(),
             forward_claims: true,
@@ -422,6 +462,7 @@ mod tests {
             issuer: None,
             audience: None,
             secret: Some("secret".to_string()),
+            secret_env: None,
             jwks_url: None,
             algorithm: "HS256".to_string(),
             forward_claims: true,
@@ -430,5 +471,62 @@ mod tests {
         let profile = resolve_auth_profile(&config).expect("valid test profile");
         let result = validate_token(&token, &profile);
         assert!(matches!(result, Err(AuthError::Expired)));
+    }
+
+    #[cfg(feature = "auth")]
+    #[test]
+    fn secret_env_is_read_and_preferred_over_literal() {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+
+        // Unique var name so parallel tests don't collide.
+        let var = format!("ZION_TEST_AUTH_SECRET_{}", std::process::id());
+        std::env::set_var(&var, "env-secret");
+
+        let claims = Claims {
+            sub: Some("u".to_string()),
+            email: None,
+            iss: None,
+            aud: None,
+            exp: Some(u64::MAX),
+            nbf: Some(0),
+        };
+        // Token signed with the ENV secret; a decoy literal that must be ignored.
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"env-secret"),
+        )
+        .unwrap();
+
+        let config = AuthProfileConfig {
+            issuer: None,
+            audience: None,
+            secret: Some("decoy-literal-that-must-be-ignored".to_string()),
+            secret_env: Some(var.clone()),
+            jwks_url: None,
+            algorithm: "HS256".to_string(),
+            forward_claims: true,
+        };
+        let profile = resolve_auth_profile(&config).expect("secret_env resolves");
+        assert!(
+            validate_token(&token, &profile).is_ok(),
+            "env secret must win"
+        );
+
+        // A named-but-missing env var is a hard error, not a silent fallback.
+        std::env::remove_var(&var);
+        let missing = AuthProfileConfig {
+            issuer: None,
+            audience: None,
+            secret: None,
+            secret_env: Some(var),
+            jwks_url: None,
+            algorithm: "HS256".to_string(),
+            forward_claims: true,
+        };
+        assert!(
+            resolve_auth_profile(&missing).is_err(),
+            "missing secret_env must fail closed"
+        );
     }
 }

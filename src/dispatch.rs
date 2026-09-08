@@ -21,6 +21,12 @@
 //!
 //! Hot path: zero allocation in the common case. Everything that turns
 //! a `Request` into a `Response` lives here or is called from here.
+//!
+//! Feature gating: the sovereign classification + enforcement path
+//! (`deny_or_tarpit`, the enforce gate) is compiled in only under
+//! `feature = "geo-ita"` or `feature = "geo-eu"`. A default-feature binary
+//! does NOT run it — keep that in mind before chasing an enforcement bug in a
+//! build that never included the code.
 
 use crate::audit;
 use crate::audit::AuditEvent;
@@ -176,6 +182,15 @@ pub(crate) async fn process_request(
 ) -> Result<Response<ZionBody>, hyper::Error> {
     let client_request_id = req.headers().get("X-Request-ID").cloned();
     let mut resp = process_request_inner(req, state, remote_addr, is_early_data).await?;
+    // Record status ONCE per request, for every outcome. This is the single
+    // choke point every response flows through, so counting here — instead of
+    // at each `return` inside the pipeline — means the pre-routing security
+    // rejects (414/405/425/429/403 and the auth 401/403) are counted too.
+    // Previously those returned before the inner recording site, so an attack
+    // that tripped a gate was invisible in `/metrics` and undercounted
+    // `requests_total`. `record_status` must fire exactly once per request, so
+    // the inner call sites are removed in favour of this one.
+    metrics::METRICS.record_status(resp.status().as_u16());
     inject_security_headers(&mut resp);
     if !resp.headers().contains_key("X-Request-ID") {
         if let Some(id) = client_request_id {
@@ -216,6 +231,32 @@ fn route_cache_key(host: Option<&str>, path: &str) -> u64 {
     h.finish()
 }
 
+/// Render a 16-byte W3C trace id as 32 lowercase hex chars — the join key that
+/// links an access-log line and a signed audit record to the distributed trace.
+fn trace_id_to_hex(bytes: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(32);
+    for &b in bytes {
+        s.push(crate::HEX_DIGITS[(b >> 4) as usize] as char);
+        s.push(crate::HEX_DIGITS[(b & 0xF) as usize] as char);
+    }
+    s
+}
+
+/// Zion-owned identity headers upstreams trust as *verified*. Any inbound copy
+/// is a spoof attempt and is dropped at the trust boundary; the auth gate later
+/// re-injects the authenticated values. Kept as a named list so the reserved
+/// set lives in exactly one place.
+const RESERVED_IDENTITY_HEADERS: [&str; 2] = ["x-auth-subject", "x-auth-email"];
+
+/// Strip every reserved identity header off an inbound request. Idempotent, and
+/// clears repeated copies (hyper lower-cases header names, so one `remove` per
+/// name suffices).
+fn scrub_reserved_identity_headers(headers: &mut hyper::HeaderMap) {
+    for name in RESERVED_IDENTITY_HEADERS {
+        headers.remove(name);
+    }
+}
+
 async fn process_request_inner(
     mut req: Request<ZionBody>,
     state: Arc<AppState>,
@@ -232,6 +273,19 @@ async fn process_request_inner(
     let cfg = state.cfg();
 
     // ── Pre-routing security gates (zero-cost, before any processing) ──
+
+    // Scrub reserved identity headers off every inbound request. Zion owns
+    // `X-Auth-Subject` / `X-Auth-Email`: upstreams trust them as *verified*
+    // claims, so any copy a client sent must die at the trust boundary here,
+    // BEFORE the auth gate re-injects the authenticated values. Stripping is
+    // unconditional (not `#[cfg(feature = "auth")]`): a build without the auth
+    // gate, or a route with no auth profile, still forwards to an upstream and
+    // must never carry a client-spoofed identity. The auth gate's later
+    // `insert` replaces, but only on the paths where a claim is present — an
+    // absent `sub`, `forward_claims = false`, or no profile at all would
+    // otherwise let the spoofed header ride through. Reserved header names are
+    // ASCII-lowercased by hyper, so one `remove` per name clears every copy.
+    scrub_reserved_identity_headers(req.headers_mut());
 
     // Gate: URI length (reject oversized URIs before routing).
     // Check full path+query, not just path — an attacker could send a short
@@ -634,7 +688,6 @@ async fn process_request_inner(
             Some(url) => url,
             None if rule.mode == config::RouteMode::Static => &EMPTY_UPSTREAM,
             None => {
-                metrics::METRICS.record_status(503);
                 return Ok(text_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "upstream unavailable",
@@ -746,7 +799,6 @@ async fn process_request_inner(
                 metrics::METRICS
                     .waf_denied
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                metrics::METRICS.record_status(400);
                 logging::info("waf", &format!("URI denied: {reason} ({uri_str})"));
                 emit_waf_block(&state, &remote_addr, method, uri_str, "uri", &reason);
                 return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
@@ -785,7 +837,6 @@ async fn process_request_inner(
                     metrics::METRICS
                         .waf_denied
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    metrics::METRICS.record_status(400);
                     logging::info(
                         "waf_ml",
                         &format!(
@@ -889,7 +940,6 @@ async fn process_request_inner(
                         metrics::METRICS
                             .waf_denied
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        metrics::METRICS.record_status(400);
                         emit_waf_block(
                             &state,
                             &remote_addr,
@@ -928,7 +978,14 @@ async fn process_request_inner(
                 }
             };
 
-            let verdict = waf::validate_request(method, ct, &body_bytes, waf_profile);
+            // On the streaming path the raw Aho-Corasick pass already ran
+            // incrementally over these bytes, so skip the redundant buffered
+            // raw scan; the encoded/entropy/JSON gates still run.
+            let verdict = if waf_profile.streaming {
+                waf::validate_request_prescanned(method, ct, &body_bytes, waf_profile)
+            } else {
+                waf::validate_request(method, ct, &body_bytes, waf_profile)
+            };
             if let waf::WafVerdict::Deny(reason) = verdict {
                 if rule.waf_shadow {
                     metrics::METRICS
@@ -948,7 +1005,6 @@ async fn process_request_inner(
                     metrics::METRICS
                         .waf_denied
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    metrics::METRICS.record_status(400);
                     emit_waf_block(
                         &state,
                         &remote_addr,
@@ -994,7 +1050,6 @@ async fn process_request_inner(
                     metrics::METRICS
                         .waf_denied
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    metrics::METRICS.record_status(400);
                     emit_waf_block(
                         &state,
                         &remote_addr,
@@ -1111,6 +1166,13 @@ async fn process_request_inner(
         }
     }
     observability::TRACES_EMITTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Stringify the trace ID once (32 lowercase hex) so BOTH the access-log
+    // line and the audit record can carry it. Without this an operator can see
+    // a request in the logs, or a signed audit event, but has no key to join
+    // it to the distributed trace in Tempo/Jaeger — the histogram exemplar was
+    // the only place the id surfaced.
+    let trace_hex: String = trace_id_to_hex(&trace_id_bytes);
 
     // Pre-extract X-Request-ID for response echo (before req is consumed)
     let request_id_val = req.headers().get("X-Request-ID").cloned();
@@ -1267,8 +1329,9 @@ async fn process_request_inner(
             .insert(hyper::header::CONTENT_SECURITY_POLICY, csp_val.clone());
     }
 
-    // Record metrics (atomic increment, ~2ns)
-    metrics::METRICS.record_status(resp.status().as_u16());
+    // Status is recorded once, centrally, in `process_request` (the wrapper),
+    // so every outcome — this completion path and every early security reject —
+    // is counted exactly once.
 
     let request_elapsed = request_start.elapsed();
 
@@ -1308,6 +1371,9 @@ async fn process_request_inner(
             method = %log_method,
             path = %path_safe,
             remote_ip = %remote_addr.ip(),
+            // 32-hex W3C trace id — the join key from this log line to the
+            // distributed trace (and to the matching audit record).
+            trace_id = %trace_hex,
             // Issue #60: configured request headers, redacted via the
             // [redact.headers] policy, packed into one JSON object so
             // dynamic field names don't fight the tracing macro.
@@ -1343,7 +1409,7 @@ async fn process_request_inner(
                 seq: 0,
                 ts: String::new(),
                 kind: audit::kind::REQUEST_COMPLETED,
-                trace_id: None,
+                trace_id: Some(trace_hex.clone()),
                 remote_ip: Some(remote_addr.ip().to_string()),
                 method: Some(log_method.to_string()),
                 path: Some(path_safe.to_string()),
@@ -1755,35 +1821,39 @@ async fn handle_static_cache(
     let path_owned: Arc<str> = Arc::from(cache_key);
 
     // Singleflight: coalesce concurrent cache misses for the same key.
-    // If another request is already fetching, subscribe to its watch channel
-    // and wait for completion. We use watch (not Notify) because
-    // `Receiver::wait_for` inspects the current value at first poll: if the
-    // fetcher already sent `true` between our get() and our .await, we still
-    // observe it and return immediately instead of hanging.
-    let waiter = state
-        .inflight
-        .get(&path_owned)
-        .map(|entry| entry.value().subscribe());
-
-    if let Some(mut rx) = waiter {
-        // Err = sender dropped without sending true (fetch aborted/errored).
-        // In both Ok and Err cases we re-check the cache; on miss we fall
-        // through to fetch ourselves.
+    //
+    // "Become the fetcher, or find the one already running" must be a single
+    // atomic step — a separate `get()` then `insert()` lets two concurrent
+    // misses both see "absent" and both register, the second clobbering the
+    // first's sender (orphaning its waiters and double-fetching upstream). So
+    // we use `get_or_insert_with`, which returns `inserted = true` to exactly
+    // one caller. We use watch (not Notify) because `Receiver::wait_for`
+    // inspects the current value at first poll: if the fetcher published `true`
+    // between our registration and our `.await`, we still observe it and return
+    // immediately instead of hanging.
+    //
+    // A waiter whose fetcher aborted (sender dropped without `true`) wakes,
+    // re-checks the cache, and on a miss loops to try to become the fetcher
+    // itself (or wait on whichever fetcher took over). Progress is guaranteed
+    // as long as fetches terminate.
+    let tx = loop {
+        let (tx, inserted) = state
+            .inflight
+            .get_or_insert_with(path_owned.clone(), || tokio::sync::watch::channel(false).0);
+        if inserted {
+            // We own the fetch for this key.
+            break tx;
+        }
+        // Someone else is fetching — wait for them.
+        let mut rx = tx.subscribe();
         let _ = rx.wait_for(|v| *v).await;
         if let Some(hit) = state.static_cache.get(path_owned.as_ref()).fresh() {
             // get() already counted this hit — don't double-count it here.
             return Ok(cache_hit_response(hit));
         }
-        // Cache miss (or stale) even after wait — fall through to fetch from
-        // upstream, which re-populates (a stale re-check here is rare: the
-        // fetcher we waited on just stored a fresh entry).
-    }
-
-    // Register as the inflight fetcher for this key.
-    // Initial value `false` = "fetch in progress"; we publish `true` once the
-    // cache is populated. Drop without sending `true` signals abort to waiters.
-    let (tx, _) = tokio::sync::watch::channel(false);
-    state.inflight.insert(path_owned.clone(), tx.clone());
+        // Cache miss/stale after wait (fetcher aborted, or stored a
+        // non-cacheable response): loop to fetch ourselves.
+    };
 
     // RAM miss — fetch from upstream.
     // On error, drop the inflight sender. Waiters' wait_for() returns Err
@@ -2598,6 +2668,52 @@ mod tests {
         let r = deny_or_tarpit(&shed, StatusCode::FORBIDDEN).await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
         assert_eq!(m.tarpit_shed_total.load(Relaxed), s1 + 1);
+    }
+
+    #[test]
+    fn trace_id_hex_is_32_lowercase_hex() {
+        // All-zero and a known pattern → exact 32-hex, lowercase, matching the
+        // W3C traceparent trace-id rendering used in the header.
+        assert_eq!(trace_id_to_hex(&[0u8; 16]), "0".repeat(32));
+        let bytes: [u8; 16] = [
+            0x0a, 0xf7, 0x65, 0x19, 0x16, 0xcd, 0x43, 0xdd, 0x84, 0x48, 0xeb, 0x21, 0x1c, 0x80,
+            0x31, 0x9c,
+        ];
+        let hex = trace_id_to_hex(&bytes);
+        assert_eq!(hex, "0af7651916cd43dd8448eb211c80319c");
+        assert_eq!(hex.len(), 32);
+        assert!(hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn scrubs_client_spoofed_identity_headers() {
+        // A client sends the reserved identity headers Zion owns — in mixed
+        // case and duplicated. All copies must be gone after the scrub, so a
+        // route with no auth profile (or a build without the auth gate) can
+        // never forward a spoofed identity upstream.
+        let mut h = hyper::HeaderMap::new();
+        h.append("X-Auth-Subject", "attacker".parse().unwrap());
+        h.append("x-auth-subject", "attacker2".parse().unwrap());
+        h.insert("X-AUTH-EMAIL", "evil@example.com".parse().unwrap());
+        h.insert("X-Forwarded-For", "203.0.113.1".parse().unwrap());
+
+        scrub_reserved_identity_headers(&mut h);
+
+        assert!(h.get("x-auth-subject").is_none(), "subject not stripped");
+        assert!(h.get("x-auth-email").is_none(), "email not stripped");
+        assert_eq!(
+            h.get_all("x-auth-subject").iter().count(),
+            0,
+            "duplicate copies must all be removed"
+        );
+        // Unrelated headers are untouched.
+        assert_eq!(
+            h.get("x-forwarded-for").unwrap(),
+            "203.0.113.1",
+            "scrub must not touch other headers"
+        );
     }
 
     // ── Singleflight primitive (race fix) ──

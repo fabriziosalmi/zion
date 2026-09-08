@@ -1,0 +1,25 @@
+{{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) -}}
+# Persistent volume for /var/lib/zion (ACME account key + renewed certs), so
+# that state survives a pod reschedule instead of being lost with an emptyDir.
+# ReadWriteOnce: a single volume backs a single writer — see the persistence
+# notes in values.yaml before scaling past one replica with in-pod ACME.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "zion.fullname" . }}
+  labels:
+    {{- include "zion.labels" . | nindent 4 }}
+  {{- with .Values.persistence.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    - {{ .Values.persistence.accessMode | quote }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size | quote }}
+  {{- if .Values.persistence.storageClassName }}
+  storageClassName: {{ .Values.persistence.storageClassName | quote }}
+  {{- end }}
+{{- end }}

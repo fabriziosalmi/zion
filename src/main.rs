@@ -43,6 +43,7 @@
 
 mod acme;
 mod admin;
+mod atomic_file;
 mod audit;
 mod auth;
 mod bootstrap;
@@ -386,23 +387,19 @@ impl ResolvedAppConfig {
                         "[sovereign.enforce.tarpit] enabled with max_concurrent = 0 — every flagged request is shed to an immediate 403 (tarpit is a no-op)",
                     );
                 }
-                // #151 self-DoS guard: a held tarpit connection keeps its
-                // global connection-pool permit and per-IP slot for the whole
-                // hold, so the ceiling must stay a small fraction of the pool —
-                // otherwise a flood of flagged sources pins admission. Clamp to
-                // 1/4 of the global connection ceiling and say so.
+                // #151 self-DoS guard: the ceiling must stay a small fraction of
+                // the connection pool (a held tarpit connection pins a permit +
+                // per-IP slot for its whole hold). The invariant lives in the
+                // policy itself; the root just wires it and logs the outcome.
+                if let Some((old, cap)) = policy.clamp_tarpit_concurrency(conn_limit_max) {
+                    logging::warn(
+                        "sovereign",
+                        &format!(
+                            "[sovereign.enforce.tarpit] max_concurrent {old} exceeds 1/4 of the global connection ceiling ({conn_limit_max}) — clamping to {cap} so held connections can't pin the admission pool",
+                        ),
+                    );
+                }
                 if tp.enabled && policy.tarpit_max_concurrent > 0 {
-                    let safety_cap = ((conn_limit_max / 4) as u32).max(1);
-                    if policy.tarpit_max_concurrent > safety_cap {
-                        logging::warn(
-                            "sovereign",
-                            &format!(
-                                "[sovereign.enforce.tarpit] max_concurrent {} exceeds 1/4 of the global connection ceiling ({}) — clamping to {} so held connections can't pin the admission pool",
-                                policy.tarpit_max_concurrent, conn_limit_max, safety_cap,
-                            ),
-                        );
-                        policy.tarpit_max_concurrent = safety_cap;
-                    }
                     // A few seconds already imposes the cost; very long holds
                     // tie up connections (capped by the connection idle timeout)
                     // and slow the shutdown drain.
@@ -866,23 +863,31 @@ fn warn_feature_config_gaps(config: &config::ZionConfig) {
             );
         }
     }
-    // Enforcement with an open side door: an allowlist that drops unknown
-    // fingerprints but lets un-fingerprintable ClientHellos through can be
-    // bypassed by a client that fragments/oversizes its hello. Warn so the
-    // operator opts into on_unfingerprintable = "drop" deliberately.
-    #[cfg(feature = "tls-fingerprint")]
-    if let Some(fp) = &config.tls.fingerprint {
-        if fp.mode == config::FingerprintMode::Allowlist
-            && fp.on_unknown == config::OnUnknown::Drop
-            && fp.on_unfingerprintable == config::OnUnfingerprintable::Allow
-        {
+    // NOTE: the allowlist "open side door" (on_unknown = drop + on_unfingerprintable
+    // = allow) is now a HARD config-validation error (see config::semantic_errors),
+    // so it can never reach this post-load warning — the earlier warn here was
+    // promoted to a fail-closed boot error and removed.
+
+    // Auth profile with no audience/issuer scoping: signature+exp are still
+    // checked, but ANY token signed by the same key/issuer is accepted — a
+    // confused-deputy risk in a fleet that shares an HMAC secret or OIDC issuer.
+    // Warn (not fatal — some single-tenant setups legitimately omit them).
+    #[cfg(feature = "auth")]
+    for (name, p) in &config.auth_profile {
+        if p.audience.is_none() || p.issuer.is_none() {
             logging::warn(
                 "config",
-                "[tls.fingerprint] allowlist drops unknown fingerprints but \
-                 on_unfingerprintable = \"allow\" (default) — a client can BYPASS \
-                 the allowlist by fragmenting or oversizing its ClientHello so it \
-                 can't be fingerprinted. Set on_unfingerprintable = \"drop\" for \
-                 strict zero-trust.",
+                &format!(
+                    "auth_profile '{name}' has no {} — signature and expiry are still \
+                     validated, but a token minted for a DIFFERENT audience/issuer sharing \
+                     the same key would be accepted (confused-deputy). Set issuer and \
+                     audience to scope acceptance.",
+                    match (p.issuer.is_none(), p.audience.is_none()) {
+                        (true, true) => "issuer or audience",
+                        (true, false) => "issuer",
+                        _ => "audience",
+                    }
+                ),
             );
         }
     }
@@ -1027,9 +1032,22 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
             } else {
                 std::env::var("ZION_AIMP_LISTEN").unwrap_or_else(|_| "0.0.0.0:9443".to_string())
             };
-            let listen: std::net::SocketAddr = listen_raw
-                .parse()
-                .unwrap_or_else(|_| "0.0.0.0:9443".parse().unwrap());
+            // Fail closed: a malformed listen address must NOT silently fall back
+            // to `0.0.0.0:9443` — that would bind the gossip control plane to
+            // every interface. The TOML path is already rejected at config
+            // validation; this also covers the `ZION_AIMP_LISTEN` env override,
+            // which bypasses that check. On a bad value, skip mesh bootstrap
+            // (aimp_cp = None) — bootstrap failure is non-fatal by design.
+            let listen: Option<std::net::SocketAddr> = match listen_raw.parse() {
+                Ok(addr) => Some(addr),
+                Err(e) => {
+                    eprintln!(
+                        "  AIMP control plane disabled: listen '{listen_raw}' is not a valid \
+                         socket address: {e}"
+                    );
+                    None
+                }
+            };
             let peers: Vec<std::net::SocketAddr> = if !toml_cfg.peers.is_empty() {
                 toml_cfg
                     .peers
@@ -1051,31 +1069,36 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/zion/aimp-identity.bin"))
             };
-            let cfg = aimp_cp::AimpControlPlaneConfig {
-                enabled: true,
-                listen,
-                peers,
-                identity_path,
-                anti_entropy_secs: toml_cfg.anti_entropy_secs,
-                inbound_claims_per_sec: toml_cfg.inbound_claims_per_sec,
-                inbound_claim_burst: toml_cfg.inbound_claim_burst,
-            };
-            match aimp_cp::bootstrap(cfg).await {
-                Ok(cp) => {
-                    eprintln!(
-                        "  AIMP control plane up: node_id[0..4]={:02x?} listen={} peers={}",
-                        &cp.node_id()[..4],
+            match listen {
+                None => None, // invalid listen already reported above; fail closed
+                Some(listen) => {
+                    let cfg = aimp_cp::AimpControlPlaneConfig {
+                        enabled: true,
                         listen,
-                        cp.reputation().is_empty() as u8 // touch the handle
-                    );
-                    Some(cp)
-                }
-                Err(e) => {
-                    crate::logging::warn(
-                        "aimp_cp",
-                        &format!("bootstrap failed: {e} — continuing without AIMP"),
-                    );
-                    None
+                        peers,
+                        identity_path,
+                        anti_entropy_secs: toml_cfg.anti_entropy_secs,
+                        inbound_claims_per_sec: toml_cfg.inbound_claims_per_sec,
+                        inbound_claim_burst: toml_cfg.inbound_claim_burst,
+                    };
+                    match aimp_cp::bootstrap(cfg).await {
+                        Ok(cp) => {
+                            eprintln!(
+                                "  AIMP control plane up: node_id[0..4]={:02x?} listen={} peers={}",
+                                &cp.node_id()[..4],
+                                listen,
+                                cp.reputation().is_empty() as u8 // touch the handle
+                            );
+                            Some(cp)
+                        }
+                        Err(e) => {
+                            crate::logging::warn(
+                                "aimp_cp",
+                                &format!("bootstrap failed: {e} — continuing without AIMP"),
+                            );
+                            None
+                        }
+                    }
                 }
             }
         } else {
@@ -1659,7 +1682,12 @@ async fn handle_http_connection(
     // drop (including early return / panic).
     let _permit = match state.conn_limit.clone().try_acquire_owned() {
         Ok(p) => p,
-        Err(_) => return,
+        Err(_) => {
+            metrics::METRICS
+                .connections_rejected_global
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
     };
     let _ip_slot = match state
         .conn_per_ip
@@ -1811,6 +1839,9 @@ fn spawn_https_handler(
     let permit = match state.conn_limit.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
+            metrics::METRICS
+                .connections_rejected_global
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             drop(tcp_stream);
             return;
         }

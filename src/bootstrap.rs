@@ -1204,6 +1204,11 @@ fn compute_workers(cores: usize) -> usize {
 fn compute_conn_limit(ram_mb: u64) -> usize {
     let available_mb = ram_mb / 4; // use max 25% of RAM for connections
     let max_conns = (available_mb * 1024 / 256) as usize; // 256 KB per conn
+                                                          // 100,000 is a deliberate PER-NODE ceiling, not just a RAM guard: on a
+                                                          // large box the RAM formula would allow far more, but the upper clamp caps
+                                                          // the admission semaphore here (the 100,001st concurrent connection is
+                                                          // shed). Documented as a design limit in the operations guide; raise the
+                                                          // upper bound here if a high-memory deployment genuinely needs more.
     max_conns.clamp(1_000, 100_000)
 }
 

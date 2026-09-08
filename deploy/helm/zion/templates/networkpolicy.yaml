@@ -36,13 +36,17 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- end }}
+      # These match the destination port ON THE POD (the containerPort after
+      # the Service DNATs 80/443), so they track .Values.containerPorts — not
+      # the external Service ports. Keeping them numeric (not named) avoids
+      # relying on named-port support, which some CNIs handle inconsistently.
       ports:
         - protocol: TCP
-          port: 80
+          port: {{ .Values.containerPorts.http }}
         - protocol: TCP
-          port: 443
+          port: {{ .Values.containerPorts.https }}
         - protocol: UDP
-          port: 443
+          port: {{ .Values.containerPorts.https }}
   egress:
     # DNS — required for upstream hostname resolution.
     - to:

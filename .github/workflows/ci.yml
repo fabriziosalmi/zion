@@ -155,9 +155,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@f2dd9f8ae5c180b960971aa7ebe1779681fbbda4 # 1.82.0
       - name: Override rust-toolchain.toml for this job
-        # rust-toolchain.toml pins the *dev* compiler to 1.85; the dtolnay
+        # rust-toolchain.toml pins the *dev* compiler to 1.88; the dtolnay
         # action only sets a default toolchain, so we drop the file for this
-        # one job to keep cargo from re-installing 1.85 on us.
+        # one job to keep cargo from re-installing 1.88 on us.
         run: rm -f rust-toolchain.toml
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:

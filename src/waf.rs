@@ -915,6 +915,18 @@ thread_local! {
 }
 
 fn validate_json_structure(body: &[u8], max_depth: usize, max_string_len: usize) -> WafVerdict {
+    // Order matters: the cheap, zero-alloc byte scan runs FIRST so it can reject
+    // a hostile body BEFORE the recursive `simd_json` parser ever touches it.
+    // `to_owned_value` builds an owned value tree by recursion — a deeply nested
+    // payload (`[[[[…]]]]` thousands deep) can exhaust the stack or balloon memory
+    // inside the parser, so checking depth only afterwards is too late. The scan
+    // bounds both nesting depth and string length up front; only a body that
+    // already fits those limits reaches the parser, where the parse now serves
+    // solely to reject malformed-but-shallow JSON.
+    if !check_depth_and_strings_raw(body, max_depth, max_string_len) {
+        return WafVerdict::Deny("JSON exceeds depth or string length limits");
+    }
+
     // Use thread-local buffer pool to avoid per-request allocation.
     // simd-json needs a mutable buffer — we copy body into the pooled buffer.
     let valid = JSON_BUF.with(|buf| {
@@ -927,11 +939,6 @@ fn validate_json_structure(body: &[u8], max_depth: usize, max_string_len: usize)
     });
     if !valid {
         return WafVerdict::Deny("malformed JSON");
-    }
-
-    // Depth + string length check via manual byte scan (zero-alloc)
-    if !check_depth_and_strings_raw(body, max_depth, max_string_len) {
-        return WafVerdict::Deny("JSON exceeds depth or string length limits");
     }
 
     WafVerdict::Allow
@@ -1006,6 +1013,35 @@ pub fn validate_request(
     body: &[u8],
     profile: &WafProfile,
 ) -> WafVerdict {
+    validate_request_impl(method, content_type, body, profile, false)
+}
+
+/// Same pipeline as [`validate_request`], but for a body the streaming WAF
+/// already scanned incrementally: the raw Aho-Corasick pass (Gate 3, first
+/// scan) is skipped because the `StreamingScanner` ran the SAME pattern set
+/// over the SAME bytes (with chunk-boundary overlap) as the frames arrived.
+/// The normalized/encoded scan, entropy, and JSON-structural gates still run —
+/// the streamer does not cover those. This avoids a second O(N) raw scan of the
+/// whole reassembled body on exactly the large-body requests streaming exists
+/// to serve.
+#[inline]
+pub fn validate_request_prescanned(
+    method: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+    profile: &WafProfile,
+) -> WafVerdict {
+    validate_request_impl(method, content_type, body, profile, true)
+}
+
+#[inline]
+fn validate_request_impl(
+    method: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+    profile: &WafProfile,
+    raw_prescanned: bool,
+) -> WafVerdict {
     // ── Gate 1: Body size (O(1)) ──
     let max_body_bytes = profile.max_body_mb * 1_048_576;
     if body.len() as u64 > max_body_bytes {
@@ -1063,7 +1099,10 @@ pub fn validate_request(
     let scanner = scanner_for(profile.mode);
 
     // Scan raw body first (fast path — no alloc if no encoding present).
-    if scanner.is_match(body) {
+    // Skipped when the streaming WAF already ran this exact raw pass over the
+    // same bytes incrementally (see `validate_request_prescanned`); the encoded
+    // pass and JSON gates below always run regardless.
+    if !raw_prescanned && scanner.is_match(body) {
         return WafVerdict::Deny("injection pattern detected");
     }
 
@@ -1407,6 +1446,39 @@ mod tests {
         assert_eq!(
             validate_request("POST", Some("application/json"), body, &strict_profile()),
             WafVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn prescanned_skips_raw_scan_but_keeps_encoded_pass() {
+        let profile = aggressive_profile();
+        // A plain (un-encoded) injection pattern: caught by the normal raw scan,
+        // but the prescanned variant assumes the streamer already ran that pass
+        // and therefore skips it — so it does NOT re-deny here.
+        let raw = b"id=1 union select password from admin";
+        assert!(matches!(
+            validate_request("POST", Some("multipart/form-data"), raw, &profile),
+            WafVerdict::Deny(_)
+        ));
+        assert_eq!(
+            validate_request_prescanned("POST", Some("multipart/form-data"), raw, &profile),
+            WafVerdict::Allow,
+            "prescanned must skip the raw scan (the streamer already did it)"
+        );
+
+        // An ENCODED injection is caught by the normalized pass, which the
+        // prescanned variant still runs — both must deny.
+        let encoded = b"a=%27%20union%20select%20password%20from%20admin%20--";
+        assert!(matches!(
+            validate_request("POST", Some("multipart/form-data"), encoded, &profile),
+            WafVerdict::Deny(_)
+        ));
+        assert!(
+            matches!(
+                validate_request_prescanned("POST", Some("multipart/form-data"), encoded, &profile),
+                WafVerdict::Deny(_)
+            ),
+            "prescanned must still run the encoded/normalized pass"
         );
     }
 
@@ -1921,6 +1993,24 @@ mod tests {
         assert_eq!(
             validate_request("POST", Some("application/json"), body, &strict_profile()),
             WafVerdict::Deny("JSON exceeds depth or string length limits")
+        );
+    }
+
+    #[test]
+    fn pathological_nesting_rejected_by_depth_guard_before_parse() {
+        // Thousands of levels deep: if the recursive simd_json parser ran first
+        // this could exhaust the stack. The zero-alloc depth scan must reject it
+        // up front — well before any level of nesting reaches the parser.
+        let deep = "[".repeat(50_000);
+        assert_eq!(
+            validate_request(
+                "POST",
+                Some("application/json"),
+                deep.as_bytes(),
+                &strict_profile()
+            ),
+            WafVerdict::Deny("JSON exceeds depth or string length limits"),
+            "deep nesting must be denied by the guard, not the parser"
         );
     }
 

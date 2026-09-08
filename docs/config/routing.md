@@ -171,4 +171,5 @@ Zion validates all routes at boot:
 - Path patterns must be valid radix tree patterns
 - Every `hosts` entry must be a canonical bare hostname or a `*.<domain>` wildcard
 
-If validation fails, Zion prints all errors and exits with code 1.
+If validation fails, Zion prints all errors and exits with code `2` (the
+config-error category — see [Exit codes](/deploy/#exit-codes)).

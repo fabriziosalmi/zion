@@ -466,6 +466,28 @@ impl EnforcePolicy {
         }
     }
 
+    /// Clamp the tarpit concurrency ceiling to a safe fraction (1/4) of the
+    /// global connection pool and report what changed (#151). A held tarpit
+    /// connection keeps its global connection-pool permit and per-IP slot for
+    /// the whole hold, so an unbounded ceiling lets a flood of flagged sources
+    /// pin admission — this invariant belongs to the enforcement policy, not
+    /// the composition root. No-op unless the tarpit is enabled with a positive
+    /// ceiling. Returns `Some((old, cap))` when it clamped, so the caller can
+    /// warn; `None` when nothing changed.
+    pub fn clamp_tarpit_concurrency(&mut self, conn_limit_max: usize) -> Option<(u32, u32)> {
+        if !self.tarpit_enabled || self.tarpit_max_concurrent == 0 {
+            return None;
+        }
+        let safety_cap = ((conn_limit_max / 4) as u32).max(1);
+        if self.tarpit_max_concurrent > safety_cap {
+            let old = self.tarpit_max_concurrent;
+            self.tarpit_max_concurrent = safety_cap;
+            Some((old, safety_cap))
+        } else {
+            None
+        }
+    }
+
     /// True if a request from `class_label` should be denied (`403`).
     #[inline]
     pub fn denies_class(&self, class_label: &str) -> bool {
@@ -790,6 +812,38 @@ mod tests {
 
         // Default config → tarpit off.
         assert!(!EnforcePolicy::from_config(&EnforceConfig::default()).tarpit_enabled);
+    }
+
+    #[test]
+    fn clamp_tarpit_concurrency_caps_at_quarter_of_pool() {
+        let mut p = EnforcePolicy::from_config(&EnforceConfig {
+            enabled: true,
+            deny: vec!["unknown".into()],
+            tarpit: TarpitConfig {
+                enabled: true,
+                hold_secs: 5,
+                max_concurrent: 10_000,
+            },
+            ..Default::default()
+        });
+        // 10_000 > 40_000/4 = 10_000? No — must exceed. Pool 20_000 → cap 5_000.
+        assert_eq!(p.clamp_tarpit_concurrency(20_000), Some((10_000, 5_000)));
+        assert_eq!(p.tarpit_max_concurrent, 5_000);
+        // Already within 1/4 → no clamp, no change.
+        assert_eq!(p.clamp_tarpit_concurrency(20_000), None);
+        assert_eq!(p.tarpit_max_concurrent, 5_000);
+
+        // Tarpit disabled → never clamps.
+        let mut off = EnforcePolicy::from_config(&EnforceConfig {
+            enabled: true,
+            tarpit: TarpitConfig {
+                enabled: false,
+                hold_secs: 5,
+                max_concurrent: 10_000,
+            },
+            ..Default::default()
+        });
+        assert_eq!(off.clamp_tarpit_concurrency(4), None);
     }
 
     #[cfg(feature = "geo-eu")]
