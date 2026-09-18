@@ -79,15 +79,15 @@ version = "0.1.89"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-lc-fips-sys]]
-version = "0.13.16"
+version = "0.14.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-lc-rs]]
-version = "1.17.3"
+version = "1.18.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.aws-lc-sys]]
-version = "0.43.0"
+version = "0.45.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.base64]]
@@ -979,7 +979,7 @@ version = "1.1.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls]]
-version = "0.23.43"
+version = "0.23.45"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls-native-certs]]
@@ -1003,7 +1003,7 @@ version = "0.1.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls-webpki]]
-version = "0.103.13"
+version = "0.103.15"
 criteria = "safe-to-deploy"
 
 [[exemptions.ryu]]
