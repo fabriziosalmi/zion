@@ -105,11 +105,24 @@ build pulls in `aws-lc-fips-sys`, which:
 
 | Aspect | Posture |
 |---|---|
-| Cryptographic module | AWS-LC FIPS 140-3 (Cert. #4759, in-process verification at link time) |
+| Cryptographic module | AWS-LC FIPS module as built by `aws-lc-fips-sys` 0.14.2 (AWS-LC 4.2.0), in-process verification at link time. **CMVP certificate mapping not re-verified**, see the note below |
 | Validated algorithms | TLS 1.3 AEAD suite, HMAC-SHA-256 (audit), AES-256-GCM (ticketer) |
 | Approved curves enforced | P-256, P-384, P-521 (X25519 disabled by upstream provider) |
 | Self-tests | Power-on, run by AWS-LC at process start |
 | Key generation | CTR-DRBG seeded from `getrandom(2)` |
+
+> **Module version changed on 2026-09-18.** Closing RUSTSEC-2026-0285
+> required `rustls` 0.23.45, which requires `aws-lc-rs` ^1.18, which in turn
+> moves `aws-lc-fips-sys` from 0.13.16 (AWS-LC 3.4.0) to 0.14.2 (AWS-LC
+> 4.2.0). There is no way to take the `rustls` fix while keeping the older
+> module: cargo rejects `aws-lc-rs` 1.17 alongside `rustls` 0.23.45.
+>
+> This page previously cited CMVP **Cert. #4759** for the earlier module.
+> Whether that certificate, a different one, or none yet covers the module
+> now in `Cargo.lock` has **not** been re-verified. Check the
+> [CMVP listing](https://csrc.nist.gov/projects/cryptographic-module-validation-program)
+> for AWS-LC 4.2.0 before relying on the `fips` build for a compliance claim.
+> The default (non-`fips`) build is unaffected.
 | Build attestation | **None for FIPS builds today** — manual build, no CI/release wiring; SLSA provenance covers the default binaries only |
 | Out of scope | Key storage, log retention, physical security |
 
