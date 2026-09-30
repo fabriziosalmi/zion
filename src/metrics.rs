@@ -397,6 +397,8 @@ pub struct Metrics {
     /// without blocking real traffic. Increments alongside a `logging::warn`.
     pub waf_shadow_would_block: ShardedCounter,
     pub rate_limited: ShardedCounter,
+    /// Requests refused with 508 because their `Via` already named this process.
+    pub loops_detected: ShardedCounter,
     pub cache_hits: ShardedCounter,
     pub cache_misses: ShardedCounter,
     /// Stale entries revalidated to a 304 (RFC 9111 §4.3) — served from cache
@@ -565,6 +567,7 @@ impl Metrics {
             waf_denied: ShardedCounter::new(),
             waf_shadow_would_block: ShardedCounter::new(),
             rate_limited: ShardedCounter::new(),
+            loops_detected: ShardedCounter::new(),
             cache_hits: ShardedCounter::new(),
             cache_misses: ShardedCounter::new(),
             cache_revalidations: ShardedCounter::new(),
@@ -872,6 +875,13 @@ impl Metrics {
         );
         out.extend_from_slice(b"\n");
 
+        out.extend_from_slice(
+            format!(
+                "# HELP zion_loops_detected Requests refused with 508 because their Via already named this process.\n# TYPE zion_loops_detected counter\nzion_loops_detected {}\n",
+                self.loops_detected.load(Relaxed)
+            )
+            .as_bytes(),
+        );
         out.extend_from_slice(
             b"# HELP zion_rate_limited Requests denied by rate limiter.\n\
                                 # TYPE zion_rate_limited counter\n\

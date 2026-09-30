@@ -190,6 +190,111 @@ async fn rate_limiter_answers_before_the_built_in_endpoints() {
     assert_eq!(get(&st, "198.51.100.7:1", "/healthz").await, 200);
 }
 
+// ── loop detection (Via) ────────────────────────────────────────────────────
+
+fn own_via() -> String {
+    format!("1.1 {}", crate::via::pseudonym())
+}
+
+#[tokio::test]
+async fn a_request_that_already_passed_through_this_proxy_is_a_loop() {
+    let st = state(0);
+    let me = own_via();
+    assert_eq!(
+        status(
+            &st,
+            EXTERNAL,
+            req(Method::GET, "/open/x", &[("via", &me)]),
+            false
+        )
+        .await,
+        508
+    );
+    // our name anywhere in the chain counts
+    let chain = format!("1.0 edge, {me}, 1.1 other");
+    assert_eq!(
+        status(
+            &st,
+            EXTERNAL,
+            req(Method::GET, "/open/x", &[("via", &chain)]),
+            false
+        )
+        .await,
+        508
+    );
+    // other proxies in the chain are not a loop, and an absent Via is not one either
+    assert_ne!(
+        status(
+            &st,
+            EXTERNAL,
+            req(Method::GET, "/open/x", &[("via", "1.1 some-other-proxy")]),
+            false
+        )
+        .await,
+        508
+    );
+    assert_ne!(
+        status(&st, EXTERNAL, req(Method::GET, "/open/x", &[]), false).await,
+        508
+    );
+    // even the built-in endpoints refuse a looping request: the gate is ahead of them
+    assert_eq!(
+        status(
+            &st,
+            EXTERNAL,
+            req(Method::GET, "/healthz", &[("via", &me)]),
+            false
+        )
+        .await,
+        508
+    );
+}
+
+#[tokio::test]
+async fn loop_detection_sits_after_method_and_early_data_and_before_the_rate_limiter() {
+    let me = own_via();
+    let st = state(1);
+    // TRACE with a looping Via: the method whitelist answers first
+    assert_eq!(
+        status(
+            &st,
+            EXTERNAL,
+            req(Method::TRACE, "/open/x", &[("via", &me)]),
+            false
+        )
+        .await,
+        405
+    );
+    // a POST in early data: 425 first
+    assert_eq!(
+        status(
+            &st,
+            EXTERNAL,
+            req(Method::POST, "/open/x", &[("via", &me)]),
+            true
+        )
+        .await,
+        425
+    );
+    // a client that has spent its rate budget still learns it is looping (508, not 429)
+    let _ = get(&st, EXTERNAL, "/healthz").await;
+    assert_eq!(
+        get(&st, EXTERNAL, "/healthz").await,
+        429,
+        "control: the budget is spent"
+    );
+    assert_eq!(
+        status(
+            &st,
+            EXTERNAL,
+            req(Method::GET, "/open/x", &[("via", &me)]),
+            false
+        )
+        .await,
+        508
+    );
+}
+
 // ── built-ins before routing ────────────────────────────────────────────────
 
 #[tokio::test]
