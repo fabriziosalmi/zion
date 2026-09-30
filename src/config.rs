@@ -750,6 +750,16 @@ pub struct CacheProfile {
     pub max_entries: usize,
     #[serde(default = "default_ttl")]
     pub ttl_seconds: u64,
+    /// Largest response body, in MiB, this profile will store. A bigger one is streamed
+    /// to the client and never cached, so one large object cannot push thousands of
+    /// small ones out. Default 50; must be at least 1. A declared `Content-Length`
+    /// over the limit skips buffering altogether.
+    #[serde(default = "default_max_object_mb")]
+    pub max_object_mb: u64,
+}
+
+pub(crate) fn default_max_object_mb() -> u64 {
+    50
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -1286,6 +1296,14 @@ fn deploy_errors(config: &ZionConfig) -> Vec<String> {
 fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     let mut errors: Vec<String> = Vec::new();
 
+    for (name, cp) in &config.cache_profile {
+        if cp.max_object_mb == 0 {
+            errors.push(format!(
+                "cache_profile.{name}.max_object_mb must be >= 1 (0 would cache nothing; \
+                 use `mode = \"none\"` for that)"
+            ));
+        }
+    }
     if config.server.rate_limit_max_tracked_ips == 0 {
         errors.push(
             "server.rate_limit_max_tracked_ips must be >= 1 (a cap of 0 would deny every new client)"
@@ -1728,6 +1746,26 @@ pub(crate) fn compile_path_set(patterns: &[String]) -> Result<matchit::Router<()
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn max_object_mb_defaults_to_50_and_zero_is_refused() {
+        let cfg = |extra: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+                 [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+                 [cache_profile.c]\nttl_seconds=60\n{extra}\n\
+                 [[route]]\npath=\"/{{*rest}}\"\nupstream=\"be\"\nmode=\"static_cache\"\ncache_profile=\"c\"\n"
+            )
+        };
+        let parsed: ZionConfig = toml::from_str(&cfg("")).unwrap();
+        assert_eq!(parsed.cache_profile["c"].max_object_mb, 50);
+        let parsed: ZionConfig = toml::from_str(&cfg("max_object_mb = 10")).unwrap();
+        assert_eq!(parsed.cache_profile["c"].max_object_mb, 10);
+        let e = validate_str(&cfg("max_object_mb = 0"), "t")
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("max_object_mb must be >= 1"), "{e}");
+    }
+
     #[test]
     fn tcp_keepalive_secs_defaults_to_60_and_can_be_changed_or_turned_off() {
         let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n";

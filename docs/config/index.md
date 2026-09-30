@@ -99,6 +99,7 @@ Legacy format `[upstreams]` (flat key-value map of name to URL) is also supporte
 | `mode` | string | `"memory"` | Cache mode (`"memory"` or `"none"`) |
 | `max_entries` | usize | `10000` | Maximum cached entries; the LRU evicts at this cap. `0` caches nothing (every insert evicts first) — it is not "unlimited". |
 | `ttl_seconds` | u64 | `3600` | Time-to-live in seconds (default: 1 hour — a header-less origin response must not be frozen for a year; RFC 9111 §4.2.2 heuristic freshness). |
+| `max_object_mb` | u64 | `50` | Largest response body (MiB) the profile will store; must be >= 1. A bigger one is streamed to the client whole and never cached, so one large object cannot push thousands of small ones out. A declared `Content-Length` over the limit skips buffering altogether. `zion_cache_too_large` counts the refusals |
 
 ## `[[route]]`
 

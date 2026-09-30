@@ -394,6 +394,7 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
             mode: CacheMode::Memory,
             max_entries: default_max_entries(),
             ttl_seconds: default_ttl(),
+            max_object_mb: crate::config::default_max_object_mb(),
         })
     } else {
         None

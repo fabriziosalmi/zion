@@ -83,7 +83,9 @@ async fn deny_or_tarpit(
 }
 
 const MAX_URI_LEN: usize = 8192;
-const MAX_CACHEABLE_BODY: usize = 50 * 1024 * 1024;
+/// Largest cacheable body for a route with no cache profile of its own; profiles set
+/// theirs with `max_object_mb`.
+const DEFAULT_MAX_OBJECT_BYTES: usize = 50 * 1024 * 1024;
 
 /// Per-frame idle timeout while reading a request body on the streaming WAF
 /// path: if no body frame arrives within this window the client is trickling
@@ -1200,6 +1202,7 @@ struct SwrRefresh {
     xff_mode: proxy::XffMode,
     cache_ttl: u64,
     cache_max: usize,
+    max_object: usize,
 }
 
 /// The request a background refresh sends: the same target and content
@@ -1341,7 +1344,7 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
     if !same_shape {
         return false;
     }
-    let Ok(collected) = http_body_util::Limited::new(body, MAX_CACHEABLE_BODY)
+    let Ok(collected) = http_body_util::Limited::new(body, job.max_object)
         .collect()
         .await
     else {
@@ -1800,11 +1803,15 @@ async fn handle_static_cache(
 
     // Cache TTL / capacity from the profile (mode=StaticCache without an
     // explicit profile uses the conservative 1h default; see config::default_ttl).
-    let (cache_ttl, cache_max) = match &rule.cache {
-        Some(cp) => (cp.ttl_seconds, cp.max_entries),
+    let (cache_ttl, cache_max, max_object) = match &rule.cache {
+        Some(cp) => (
+            cp.ttl_seconds,
+            cp.max_entries,
+            usize::try_from(cp.max_object_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX),
+        ),
         // Conservative fallback (1h) for a static_cache route with no resolved
         // profile — never the old 1-year freeze. See config::default_ttl.
-        None => (3600, 10_000),
+        None => (3600, 10_000, DEFAULT_MAX_OBJECT_BYTES),
     };
 
     // RFC 9111 §3.5: capture whether the request is authenticated BEFORE `req`
@@ -1905,6 +1912,7 @@ async fn handle_static_cache(
                         xff_mode,
                         cache_ttl,
                         cache_max,
+                        max_object,
                     };
                     spawn_swr_refresh(refresh);
                     crate::metrics::METRICS
@@ -2068,7 +2076,20 @@ async fn handle_static_cache(
         // authenticated-request / freshness §4.2). A request `Cache-Control:
         // no-store` (§5.2.1.5) also forbids storing the response. On a bypass,
         // stream the body straight through without populating the shared cache.
+        // A declared length over the profile's limit: do not even start buffering it.
+        let too_big = parts
+            .headers
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .is_some_and(|n| n > max_object);
+        if too_big {
+            metrics::METRICS
+                .cache_too_large
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let cacheable = !rcc_no_store
+            && !too_big
             && is_shared_cacheable(
                 req_authenticated,
                 &parts.headers,
@@ -2169,8 +2190,11 @@ async fn handle_static_cache(
                             Ok(data) => {
                                 if !cache_aborted {
                                     total_bytes += data.len();
-                                    if total_bytes > MAX_CACHEABLE_BODY {
+                                    if total_bytes > max_object {
                                         cache_aborted = true; // Stop buffering, but continue streaming!
+                                        metrics::METRICS
+                                            .cache_too_large
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     } else {
                                         cache_buffer.extend_from_slice(&data);
                                     }
@@ -2216,7 +2240,7 @@ async fn handle_static_cache(
                 // last-observed state when the sender drops.
                 let _ = tx_clone.send(true);
             }
-            // (else cache_aborted — body exceeded MAX_CACHEABLE_BODY: don't
+            // (else cache_aborted — body exceeded max_object: don't
             //  signal completion; waiters re-fetch through normal miss path.)
             state_clone.inflight.remove(&path_clone);
         });

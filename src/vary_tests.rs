@@ -34,6 +34,9 @@ struct Origin {
     set_cookie: Mutex<Option<String>>,
     /// Every `Via` value of the last request the origin saw, joined with ", ".
     last_via: Mutex<Option<String>>,
+    /// When set, the body is this many `x` bytes; the bool = send it chunked (no
+    /// Content-Length) instead of with a declared length.
+    big: Mutex<Option<(usize, bool)>>,
     /// The status the origin answers with (200 unless a test says otherwise).
     status: std::sync::atomic::AtomicU16,
     /// An extra response header (name, value), e.g. `Content-Location`.
@@ -96,9 +99,24 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                         if !vary.is_empty() {
                             b = b.header("vary", vary);
                         }
-                        Ok::<_, std::convert::Infallible>(
-                            b.body(Full::new(Bytes::from(body))).unwrap(),
-                        )
+                        let body: http_body_util::combinators::BoxBody<
+                            Bytes,
+                            std::convert::Infallible,
+                        > = match *o.big.lock().unwrap() {
+                            Some((n, true)) => {
+                                // chunked: 64 KiB frames, no declared length
+                                let frames = (0..n.div_ceil(65536)).map(move |i| {
+                                    let len = 65536.min(n - i * 65536);
+                                    Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(
+                                        Bytes::from(vec![b'x'; len]),
+                                    ))
+                                });
+                                http_body_util::StreamBody::new(tokio_stream::iter(frames)).boxed()
+                            }
+                            Some((n, false)) => Full::new(Bytes::from(vec![b'x'; n])).boxed(),
+                            None => Full::new(Bytes::from(body)).boxed(),
+                        };
+                        Ok::<_, std::convert::Infallible>(b.body(body).unwrap())
                     }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
@@ -111,6 +129,11 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
 }
 
 fn state_for(port: u16) -> Arc<AppState> {
+    state_for_with(port, "")
+}
+
+/// `profile_extra` is appended to `[cache_profile.c]`.
+fn state_for_with(port: u16, profile_extra: &str) -> Arc<AppState> {
     let toml = format!(
         r#"
 [server]
@@ -127,6 +150,7 @@ o = "http://127.0.0.1:{port}"
 [cache_profile.c]
 ttl_seconds = 3600
 max_entries = 100
+{profile_extra}
 
 [[route]]
 path = "/{{*rest}}"
@@ -142,7 +166,21 @@ async fn rig(vary: &str) -> (Arc<Origin>, Arc<AppState>) {
     rig_cc(vary, "public, max-age=60").await
 }
 
+/// An origin plus a state whose cache profile has `max_object_mb = limit_mb`.
+async fn rig_limit(limit_mb: u64) -> (Arc<Origin>, Arc<AppState>) {
+    rig_with(
+        "",
+        "public, max-age=60",
+        &format!("max_object_mb = {limit_mb}"),
+    )
+    .await
+}
+
 async fn rig_cc(vary: &str, cc: &str) -> (Arc<Origin>, Arc<AppState>) {
+    rig_with(vary, cc, "").await
+}
+
+async fn rig_with(vary: &str, cc: &str, profile_extra: &str) -> (Arc<Origin>, Arc<AppState>) {
     let o = Arc::new(Origin {
         vary: Mutex::new(vary.into()),
         hits: AtomicUsize::new(0),
@@ -150,11 +188,12 @@ async fn rig_cc(vary: &str, cc: &str) -> (Arc<Origin>, Arc<AppState>) {
         last_lang: Mutex::new(None),
         set_cookie: Mutex::new(None),
         last_via: Mutex::new(None),
+        big: Mutex::new(None),
         status: std::sync::atomic::AtomicU16::new(200),
         extra: Mutex::new(None),
     });
     let port = start_origin(o.clone()).await;
-    (o, state_for(port))
+    (o, state_for_with(port, profile_extra))
 }
 
 fn get(uri: &str, headers: &[(&str, &str)]) -> Request<ZionBody> {
@@ -727,5 +766,122 @@ async fn an_upstream_that_points_back_at_the_proxy_is_cut_after_one_bounce() {
         passes.load(Ordering::Relaxed),
         1,
         "it went to the upstream once, not forever"
+    );
+}
+
+// ── per-profile limit on the size of a cached object ────────────────────────
+
+const MIB: usize = 1024 * 1024;
+
+/// Bytes the client received and whether the response was served from/put in the cache.
+async fn fetch_len(st: &Arc<AppState>, uri: &str) -> (String, usize) {
+    let resp = process_request(
+        get(uri, &[]),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    let cache = resp
+        .headers()
+        .get("x-zion-cache")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let n = resp.into_body().collect().await.unwrap().to_bytes().len();
+    (cache, n)
+}
+
+#[tokio::test]
+async fn an_object_over_the_limit_is_streamed_whole_and_never_stored() {
+    for (n, chunked) in [false, true].into_iter().enumerate() {
+        let (o, st) = rig_limit(1).await;
+        *o.big.lock().unwrap() = Some((2 * MIB + 5, chunked));
+        let uri = format!("/big{n}");
+        for _ in 0..2 {
+            let (_, got) = fetch_len(&st, &uri).await;
+            assert_eq!(
+                got,
+                2 * MIB + 5,
+                "chunked={chunked}: the client must still receive every byte"
+            );
+            settle().await;
+        }
+        assert_eq!(
+            hits(&o),
+            2,
+            "chunked={chunked}: nothing was stored, so both requests reached the origin"
+        );
+        assert!(st
+            .static_cache
+            .get(&format!("{uri}\u{1f}"))
+            .fresh()
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn an_object_under_the_limit_is_cached() {
+    for (n, chunked) in [false, true].into_iter().enumerate() {
+        let (o, st) = rig_limit(1).await;
+        *o.big.lock().unwrap() = Some((MIB / 2, chunked));
+        let uri = format!("/small{n}");
+        let (_, got) = fetch_len(&st, &uri).await;
+        assert_eq!(got, MIB / 2);
+        settle().await;
+        let (c, got) = fetch_len(&st, &uri).await;
+        assert_eq!((c.as_str(), got), ("HIT", MIB / 2), "chunked={chunked}");
+        assert_eq!(hits(&o), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_declared_length_over_the_limit_bypasses_before_buffering() {
+    let (o, st) = rig_limit(1).await;
+    *o.big.lock().unwrap() = Some((2 * MIB, false)); // Content-Length: 2 MiB
+    let (c, got) = fetch_len(&st, "/declared").await;
+    assert_eq!(got, 2 * MIB);
+    assert_eq!(
+        c, "BYPASS",
+        "a declared oversized length is refused up front, not buffered then dropped"
+    );
+    assert_eq!(hits(&o), 1);
+}
+
+#[tokio::test]
+async fn a_background_refresh_over_the_limit_leaves_the_old_entry_alone() {
+    let (o, st) = rig_with(
+        "",
+        "public, max-age=1, stale-while-revalidate=30",
+        "max_object_mb = 1",
+    )
+    .await;
+    let (_, first) = fetch(&st, "/swr-big", &[]).await;
+    settle().await;
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    *o.big.lock().unwrap() = Some((2 * MIB, true)); // the refresh would be oversize
+    let (c, body) = fetch(&st, "/swr-big", &[]).await;
+    assert_eq!(
+        (c.as_str(), body.as_str()),
+        ("STALE-WHILE-REVALIDATE", first.as_str())
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while hits(&o) < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "refresh never reached the origin"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    settle().await;
+    let kept = match st.static_cache.get("/swr-big\u{1f}") {
+        crate::cache::CacheLookup::Fresh(h) | crate::cache::CacheLookup::Stale(h) => h.body.len(),
+        crate::cache::CacheLookup::Miss => 0,
+    };
+    assert_eq!(
+        kept,
+        first.len(),
+        "the oversize refresh must not replace the stored body"
     );
 }
