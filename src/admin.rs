@@ -25,7 +25,7 @@
 
 use crate::audit::{self, AuditEvent};
 use crate::reload::{reload_now, ConfigSource};
-use crate::AppState;
+use crate::state::AppState;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::service::service_fn;

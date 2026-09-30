@@ -24,7 +24,8 @@
 //!   * QUIC / HTTP/3 listener — its UDP socket is independent and not
 //!     re-bound here.
 
-use crate::{net, run_http_accept_loop, AppState, ResolvedAppConfig};
+use crate::state::{AppState, ResolvedAppConfig};
+use crate::{net, run_http_accept_loop};
 // `run_https_accept_loop` is only spawned by the supervisor in the
 // non-io_uring build flavour; on `--features io-uring-accept` the
 // accept loop is owned by the uring thread spawned in `async_main`
@@ -254,7 +255,7 @@ impl ListenerSupervisor {
                     crate::logging::warn(
                         "listener",
                         &format!(
-                            "HTTPS rebind to {want} skipped: --features io-uring-accept is incompatible with rebind in Phase 1.5; restart required"
+                            "HTTPS rebind to {want} skipped: --features io-uring-accept cannot rebind (a reload that moves listen_https is rejected before it gets here); restart required"
                         ),
                     );
                     return;

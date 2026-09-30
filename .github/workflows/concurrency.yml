@@ -1,0 +1,116 @@
+# Concurrency checks: Miri and ThreadSanitizer over the code that shares state
+# between threads (per-IP limiters, the health/backoff state machine, the sharded
+# NUMA map, the L1/L2 cache, the audit writer, hot reload, the metrics counters).
+#
+# Why a separate workflow: both tools need a nightly toolchain and are slow, so they
+# would only add noise and flakiness to the per-PR gate in ci.yml. This runs weekly,
+# on demand, and on PRs that touch the modules below.
+#
+# What each tool covers:
+#   * Miri  — pure data-structure/atomics tests, interpreted; catches undefined
+#             behaviour and data races in the memory model. It cannot run tokio's IO
+#             driver, so the async audit-writer tests are covered by TSAN instead.
+#   * TSAN  — the real threaded tests, instrumented (std rebuilt with it via
+#             -Zbuild-std), including the audit writer and the chaos suite.
+#
+# Both build with the SYSTEM allocator: neither tool understands mimalloc (Miri cannot
+# call it; TSAN does not intercept it, so memory freed by one thread and reused by
+# another is reported as a race). `--cfg zion_tsan` / `cfg(miri)` switch it off in
+# src/main.rs. Do not add a suppression file without a reproducer: with the system
+# allocator every test set below runs clean, so anything TSAN reports is real.
+
+name: concurrency
+
+on:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  workflow_dispatch:
+  pull_request:
+    branches: [master]
+    paths:
+      - "src/connlimit.rs"
+      - "src/health.rs"
+      - "src/numa.rs"
+      - "src/security.rs"
+      - "src/cache.rs"
+      - "src/audit.rs"
+      - "src/reload.rs"
+      - "src/metrics.rs"
+      - "src/observability.rs"
+      - "src/tarpit.rs"
+      - "tests/chaos.rs"
+      - ".github/workflows/concurrency.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: concurrency-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # rust-toolchain.toml pins the repo to 1.88.0 and beats the action's default
+  # toolchain; both tools need nightly (miri component, -Z flags), so say so here.
+  RUSTUP_TOOLCHAIN: nightly
+
+jobs:
+  miri:
+    name: miri
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: nightly
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Prepare the Miri sysroot
+        run: cargo miri setup
+      # -Zmiri-disable-isolation: these tests read the wall clock. The proptest
+      # suites are skipped (they persist regressions to disk).
+      - name: Miri — binary crate modules
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: >-
+          cargo miri test --locked --bin zion --
+          connlimit:: health:: tarpit:: security:: metrics::
+          --skip proptests
+      - name: Miri — library modules
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: >-
+          cargo miri test --locked --lib -- numa::
+
+  tsan:
+    name: thread sanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: -Zsanitizer=thread --cfg zion_tsan
+      RUSTDOCFLAGS: -Zsanitizer=thread
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: nightly
+          components: rust-src
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # TSAN aborts at startup when the kernel randomizes mmap with more entropy than
+      # its shadow memory layout expects (a known issue on recent runner images).
+      - name: Lower mmap entropy for TSAN
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: TSAN — library (audit writer, NUMA map, observability)
+        run: >-
+          cargo test --locked -Zbuild-std --target x86_64-unknown-linux-gnu --lib --
+          audit:: numa:: observability:: --skip proptests
+      - name: TSAN — binary crate (cache, limiters, health, reload, metrics)
+        run: >-
+          cargo test --locked -Zbuild-std --target x86_64-unknown-linux-gnu --bin zion --
+          cache:: connlimit:: health:: security:: reload:: metrics:: tarpit::
+          --skip proptests
+      - name: TSAN — chaos suite
+        run: >-
+          cargo test --locked -Zbuild-std --target x86_64-unknown-linux-gnu --test chaos

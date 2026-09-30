@@ -33,6 +33,12 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # Resource limits
 LimitNOFILE=65535
+# No core dumps: the process holds key material (TLS keys, JWT/audit HMAC secrets,
+# the mesh identity seed), and a core file would write it to disk and to whatever
+# collects dumps. Key buffers Zion controls are wiped on drop, but a dump also
+# captures memory it cannot. Remove this line temporarily if you need a crash
+# core to debug a `panic = "abort"` (the release profile aborts on panic).
+LimitCORE=0
 
 [Install]
 WantedBy=multi-user.target

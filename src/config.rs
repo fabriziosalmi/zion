@@ -9,11 +9,9 @@
 //! `build_router` is the single fallible entry point; everything that
 //! turns static TOML into runtime state flows through it.
 
-use matchit::Router;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::sync::Arc;
 
 // ============================================================================
 // TOP-LEVEL CONFIG
@@ -24,20 +22,26 @@ use std::sync::Arc;
 /// `schema_version` to opt into the version handshake below.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
+/// The version a file with NO `schema_version` is taken to be. Pinned to `1` — the
+/// schema every config written before the handshake existed used — and never
+/// "whatever is current": when schema 2 lands, an unversioned file must still be
+/// read as schema 1 (and migrated), not silently reinterpreted as 2.
+pub const LEGACY_SCHEMA_VERSION: u32 = 1;
+
+fn legacy_schema_version() -> u32 {
+    LEGACY_SCHEMA_VERSION
+}
+
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ZionConfig {
-    /// Optional schema version the file targets. When present and NEWER than
-    /// this binary's `CURRENT_SCHEMA_VERSION`, the loader emits targeted upgrade
-    /// guidance (see `check_schema_version`) instead of a bare unknown-field
-    /// rejection. Absent = "no version declared", treated as compatible.
-    ///
-    /// `#[allow(dead_code)]`: the value is consumed by the lenient pre-parse
-    /// probe in `check_schema_version`, not read off this struct — but the field
-    /// must exist so the strict `deny_unknown_fields` parse ACCEPTS the key.
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub schema_version: Option<u32>,
+    /// Schema version the file targets. **Absent means [`LEGACY_SCHEMA_VERSION`]
+    /// (1)**, not "compatible with anything": the file is read with the schema-1
+    /// reader and brought up to the current shape by `upgrade_schema`. A value
+    /// NEWER than this binary's `CURRENT_SCHEMA_VERSION` gets targeted upgrade
+    /// guidance (see `check_schema_version`); `0` is rejected.
+    #[serde(default = "legacy_schema_version")]
+    pub schema_version: u32,
     pub server: ServerConfig,
     pub tls: TlsConfig,
     #[serde(default)]
@@ -225,6 +229,16 @@ pub struct ServerConfig {
     /// Example: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// Peers allowed to use the internal-only endpoints (`/metrics`,
+    /// `/_zion/snapshot.json`, `/_zion/cache/purge`) and routes marked
+    /// `internal_only`, as CIDRs (bare IPs allowed). Empty (default) keeps the
+    /// built-in rule: any loopback / private-range / link-local / ULA peer. That
+    /// rule is a network-position test, so behind a private-range load balancer,
+    /// Kubernetes SNAT or a Docker bridge every client looks internal; set this (and
+    /// `trusted_proxies`) to name exactly which hosts are. Example: `["127.0.0.1/32",
+    /// "10.20.0.0/24"]`.
+    #[serde(default)]
+    pub internal_networks: Vec<String>,
     /// X-Forwarded-For policy applied to outbound requests to upstreams.
     ///
     /// * `"append"` (default): preserve any inbound XFF chain and append
@@ -569,19 +583,42 @@ fn default_alpn() -> Vec<String> {
 // UPSTREAM (abstracted: url, timeouts, keepalive, TLS to backend)
 // ============================================================================
 
+/// The `[upstream.<name>]` table exactly as written: a single `url`, a `urls`
+/// list, or (accepted for compatibility) both. Only ever an input to
+/// [`UpstreamConfig`], which normalizes it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUpstream {
+    url: Option<String>,
+    #[serde(default)]
+    urls: Vec<String>,
+    #[serde(default = "default_connect_timeout")]
+    connect_timeout_ms: u64,
+    #[serde(default = "default_keepalive")]
+    keepalive: usize,
+    #[serde(default)]
+    tls: bool,
+    #[serde(default)]
+    client_cert_path: Option<String>,
+    #[serde(default)]
+    client_key_path: Option<String>,
+}
+
 #[derive(Deserialize, Clone, Debug)]
 #[allow(dead_code)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawUpstream")]
 pub struct UpstreamConfig {
-    pub url: Option<String>,
-    #[serde(default)]
-    pub urls: Vec<String>,
-    /// Advisory only, for now. The shared pooled HTTP client is built once for
-    /// all upstreams, so this per-upstream connect deadline is NOT yet applied
-    /// to its connector — the connect phase is bounded by the overall
-    /// `UPSTREAM_REQUEST_TIMEOUT` (30s) instead. Set it for intent/forward
-    /// compatibility, but don't rely on a sub-second value speeding failover
-    /// against a black-holed upstream until it is wired to the connector.
+    /// Endpoints in failover order, **never empty**. `url` and `urls` are two
+    /// spellings of the same thing and are merged once, here: `urls` first, then
+    /// `url` if both were written. An upstream with neither is refused at parse
+    /// time, so no code past the loader can see an empty list.
+    urls: Vec<String>,
+    /// TCP connect deadline for this upstream, in milliseconds (default 3000, `0`
+    /// = none). It is applied to the connector of the HTTP client used for routes
+    /// that point here, so a black-holed member (packets dropped, no RST) is
+    /// abandoned after this long and the next HA member is tried, instead of
+    /// costing the full 30s request timeout per attempt. It covers the TCP connect
+    /// only; the TLS handshake and the response are bounded by that 30s timeout.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_ms: u64,
     #[serde(default = "default_keepalive")]
@@ -596,17 +633,45 @@ pub struct UpstreamConfig {
     pub client_key_path: Option<String>,
 }
 
-impl UpstreamConfig {
-    pub fn get_urls(&self) -> Vec<String> {
-        let mut all = self.urls.clone();
-        if let Some(u) = &self.url {
-            all.push(u.clone());
+impl TryFrom<RawUpstream> for UpstreamConfig {
+    type Error = String;
+
+    fn try_from(raw: RawUpstream) -> Result<Self, String> {
+        let mut urls = raw.urls;
+        if let Some(u) = raw.url {
+            urls.push(u);
         }
-        all
+        if urls.is_empty() {
+            return Err(
+                "an upstream needs at least one endpoint: set `url = \"http://host:port\"` \
+                 or `urls = [\"http://a:1\", \"http://b:2\"]`"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            urls,
+            connect_timeout_ms: raw.connect_timeout_ms,
+            keepalive: raw.keepalive,
+            tls: raw.tls,
+            client_cert_path: raw.client_cert_path,
+            client_key_path: raw.client_key_path,
+        })
     }
 }
 
-fn default_connect_timeout() -> u64 {
+impl UpstreamConfig {
+    /// The endpoints, in failover order. Never empty.
+    #[allow(dead_code)]
+    pub fn urls(&self) -> &[String] {
+        &self.urls
+    }
+
+    pub fn get_urls(&self) -> Vec<String> {
+        self.urls.clone()
+    }
+}
+
+pub(crate) fn default_connect_timeout() -> u64 {
     3000
 }
 fn default_keepalive() -> usize {
@@ -656,10 +721,10 @@ pub enum CacheMode {
 fn default_cache_mode() -> CacheMode {
     CacheMode::Memory
 }
-fn default_max_entries() -> usize {
+pub(crate) fn default_max_entries() -> usize {
     10_000
 }
-fn default_ttl() -> u64 {
+pub(crate) fn default_ttl() -> u64 {
     // Conservative heuristic-freshness default (RFC 9111 §4.2.2) for a
     // static_cache route that names no explicit lifetime: cache for 1 hour, not
     // a year. A header-less origin response must not be frozen (the audiolibri
@@ -671,8 +736,103 @@ fn default_ttl() -> u64 {
 // ROUTE CONFIG
 // ============================================================================
 
-#[derive(Deserialize, Clone, Debug)]
+/// A `[[route]]` table exactly as written: every field is a flat sibling, so
+/// contradictory combinations (a static route with no `serve_dir`, `waf = true`
+/// next to a `waf_profile`, …) are *representable* here. It is only ever an input
+/// to [`RouteConfig`], whose `TryFrom` refuses those combinations, so no value of
+/// the real type can hold one.
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawRoute {
+    path: String,
+    #[serde(default)]
+    hosts: Option<Vec<String>>,
+    #[serde(default)]
+    upstream: String,
+    #[serde(default)]
+    mode: RouteMode,
+    serve_dir: Option<String>,
+    #[serde(default)]
+    spa_fallback: bool,
+    #[serde(default)]
+    precompressed: bool,
+    #[serde(default)]
+    internal_only: bool,
+    waf_profile: Option<String>,
+    cache_profile: Option<String>,
+    csp: Option<String>,
+    auth_profile: Option<String>,
+    #[serde(default)]
+    waf: bool,
+    max_body_mb: Option<u64>,
+    #[serde(default)]
+    waf_shadow: bool,
+    cors: Option<CorsConfig>,
+}
+
+/// What a route serves. The two arms carry disjoint data, so a static route cannot
+/// have an upstream and a proxy route cannot have a `serve_dir`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RouteTarget {
+    /// Proxy to the named `[upstream.*]` / `[upstreams]` entry. The name is
+    /// resolved against the rest of the config in `validate_config`.
+    Upstream { name: String, mode: UpstreamMode },
+    /// Serve files from a local directory (ADR-0015); no upstream.
+    Static {
+        /// Never empty.
+        serve_dir: String,
+        /// Serve `index.html` for any path that maps to no file (SPA fallback).
+        spa_fallback: bool,
+        /// Serve a `.br`/`.gz` sidecar when the client's `Accept-Encoding` allows.
+        precompressed: bool,
+    },
+}
+
+/// The proxying flavours of a route (everything in [`RouteMode`] except `static`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpstreamMode {
+    Standard,
+    SseStream,
+    StaticCache,
+    Websocket,
+}
+
+impl From<UpstreamMode> for RouteMode {
+    fn from(m: UpstreamMode) -> Self {
+        match m {
+            UpstreamMode::Standard => RouteMode::Standard,
+            UpstreamMode::SseStream => RouteMode::SseStream,
+            UpstreamMode::StaticCache => RouteMode::StaticCache,
+            UpstreamMode::Websocket => RouteMode::Websocket,
+        }
+    }
+}
+
+/// The route's WAF setting. `waf`, `waf_profile` and `max_body_mb` are one policy
+/// decision in the TOML, three sibling keys; here it is one value.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WafPolicy {
+    /// No WAF on this route. `ignored_max_body_mb` keeps a `max_body_mb` that was
+    /// written anyway, only so the boot warning ("not enforced") can name it.
+    Off { ignored_max_body_mb: Option<u64> },
+    /// Legacy `waf = true`: an inline default profile with an optional body cap
+    /// (default 10 MiB).
+    Inline { max_body_mb: Option<u64> },
+    /// `waf_profile = "name"`: a named `[waf_profile.*]`, which carries its own
+    /// body cap.
+    Profile(String),
+}
+
+impl WafPolicy {
+    /// Is any WAF attached to this route?
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, WafPolicy::Off { .. })
+    }
+}
+
+/// One `[[route]]`, validated at parse time (see [`RawRoute`]).
+#[derive(Deserialize, Clone, Debug)]
+#[serde(try_from = "RawRoute")]
 pub struct RouteConfig {
     pub path: String,
 
@@ -682,32 +842,23 @@ pub struct RouteConfig {
     /// hostnames — validated as fixed points of
     /// [`crate::security::normalize_host`] (lowercase modulo case-folding, no
     /// scheme/path/port/trailing dot) so a config key and a normalized request
-    /// authority compare in the same form. Parsed and validated here; wired
-    /// into the router in a follow-up.
-    #[serde(default)]
+    /// authority compare in the same form.
     pub hosts: Option<Vec<String>>,
 
-    #[serde(default)]
-    pub upstream: String,
-    #[serde(default)]
-    pub mode: RouteMode,
-    /// For `mode = "static"`: the directory served from disk. Files under it are
-    /// served safely (no `..` traversal, no dotfiles); anything outside 404s.
-    pub serve_dir: Option<String>,
-    /// For `mode = "static"`: serve `index.html` for any path that maps to no
-    /// file (single-page-app fallback). Off by default.
-    #[serde(default)]
-    pub spa_fallback: bool,
-    /// For `mode = "static"`: when a `.br`/`.gz` sidecar sits next to a file and
-    /// the client's `Accept-Encoding` allows it, serve the precompressed variant
-    /// (like nginx `gzip_static` / Caddy `precompressed`). Off by default.
-    #[serde(default)]
-    pub precompressed: bool,
-    #[serde(default)]
+    /// Where the route sends (or serves) requests.
+    pub target: RouteTarget,
     pub internal_only: bool,
 
-    // New: named profile references (None = disabled)
-    pub waf_profile: Option<String>,
+    /// The WAF policy (`waf`, `waf_profile`, `max_body_mb`).
+    pub waf: WafPolicy,
+    /// Shadow mode: run WAF checks but do NOT block on violation.
+    /// Each would-be denial is logged (`logging::warn`) with the matched
+    /// reason and counted in the `waf_shadow_would_block` metric. Lets
+    /// operators migrating from nginx/ModSecurity test their WAF profile
+    /// against real traffic for hours/days before flipping to enforce.
+    /// Has no effect when no WAF is attached to the route.
+    pub waf_shadow: bool,
+
     pub cache_profile: Option<String>,
 
     /// Per-route Content-Security-Policy header. If set, injected into responses.
@@ -718,22 +869,126 @@ pub struct RouteConfig {
     /// If set, requests must carry a valid Bearer token.
     pub auth_profile: Option<String>,
 
-    // Legacy compat: bool waf flag + inline max_body_mb
-    #[serde(default)]
-    pub waf: bool,
-    pub max_body_mb: Option<u64>,
-
-    /// Shadow mode: run WAF checks but do NOT block on violation.
-    /// Each would-be denial is logged (`logging::warn`) with the matched
-    /// reason and counted in the `waf_shadow_would_block` metric. Lets
-    /// operators migrating from nginx/ModSecurity test their WAF profile
-    /// against real traffic for hours/days before flipping to enforce.
-    /// Has no effect when no WAF profile is attached to the route.
-    #[serde(default)]
-    pub waf_shadow: bool,
-
     /// Per-route CORS configuration. If unset, no CORS headers are injected.
     pub cors: Option<CorsConfig>,
+}
+
+impl RouteConfig {
+    /// The `mode` this route was written with, derived from its target.
+    pub fn mode(&self) -> RouteMode {
+        match &self.target {
+            RouteTarget::Static { .. } => RouteMode::Static,
+            RouteTarget::Upstream { mode, .. } => (*mode).into(),
+        }
+    }
+
+    /// The upstream this route proxies to; `None` for a static route.
+    pub fn upstream_name(&self) -> Option<&str> {
+        match &self.target {
+            RouteTarget::Upstream { name, .. } => Some(name),
+            RouteTarget::Static { .. } => None,
+        }
+    }
+}
+
+impl TryFrom<RawRoute> for RouteConfig {
+    type Error = String;
+
+    fn try_from(r: RawRoute) -> Result<Self, String> {
+        let path = r.path;
+
+        // ---- target: an upstream, or a directory — never a mixture ----
+        let target = if r.mode == RouteMode::Static {
+            let serve_dir = r
+                .serve_dir
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("route '{path}' is mode=static but has no serve_dir"))?;
+            // A static route serves from disk and needs no upstream; refuse a
+            // non-empty one so the mismatch is a boot error, not a surprise.
+            if !r.upstream.is_empty() {
+                return Err(format!(
+                    "route '{path}' is mode=static but sets upstream = '{}' — a static route \
+                     serves from serve_dir and ignores upstream; remove it",
+                    r.upstream
+                ));
+            }
+            RouteTarget::Static {
+                serve_dir,
+                spa_fallback: r.spa_fallback,
+                precompressed: r.precompressed,
+            }
+        } else {
+            // serve_dir / spa_fallback / precompressed are honoured ONLY under
+            // mode=static; anywhere else they would be silently ignored and the
+            // operator expecting disk serving would get proxy behaviour.
+            let mut static_only = Vec::new();
+            if r.serve_dir.as_deref().is_some_and(|s| !s.is_empty()) {
+                static_only.push("serve_dir");
+            }
+            if r.spa_fallback {
+                static_only.push("spa_fallback");
+            }
+            if r.precompressed {
+                static_only.push("precompressed");
+            }
+            if !static_only.is_empty() {
+                return Err(format!(
+                    "route '{path}' is mode={:?} but sets static-only field(s) {static_only:?}; \
+                     these apply only to mode=static and would be silently ignored — set \
+                     mode = \"static\" or remove them",
+                    r.mode
+                ));
+            }
+            let mode = match r.mode {
+                RouteMode::Standard => UpstreamMode::Standard,
+                RouteMode::SseStream => UpstreamMode::SseStream,
+                RouteMode::StaticCache => UpstreamMode::StaticCache,
+                RouteMode::Websocket => UpstreamMode::Websocket,
+                RouteMode::Static => unreachable!("handled by the branch above"),
+            };
+            RouteTarget::Upstream {
+                name: r.upstream,
+                mode,
+            }
+        };
+
+        // ---- WAF: one policy, not three keys ----
+        let waf = match (r.waf_profile, r.waf) {
+            (Some(_), true) => {
+                return Err(format!(
+                    "route '{path}' sets both `waf = true` and `waf_profile` — the profile wins \
+                     and `waf = true` (with its inline max_body_mb) has no effect; remove `waf = true`"
+                ));
+            }
+            (Some(_), false) if r.max_body_mb.is_some() => {
+                return Err(format!(
+                    "route '{path}' sets `max_body_mb` together with `waf_profile` — the profile \
+                     carries its own body cap and the route-level value has no effect; set \
+                     `max_body_mb` inside the [waf_profile] instead"
+                ));
+            }
+            (Some(name), false) => WafPolicy::Profile(name),
+            (None, true) => WafPolicy::Inline {
+                max_body_mb: r.max_body_mb,
+            },
+            (None, false) => WafPolicy::Off {
+                ignored_max_body_mb: r.max_body_mb,
+            },
+        };
+
+        Ok(Self {
+            path,
+            hosts: r.hosts,
+            target,
+            internal_only: r.internal_only,
+            waf,
+            waf_shadow: r.waf_shadow,
+            cache_profile: r.cache_profile,
+            csp: r.csp,
+            auth_profile: r.auth_profile,
+            cors: r.cors,
+        })
+    }
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
@@ -746,41 +1001,6 @@ pub enum RouteMode {
     Websocket,
     /// Serve files from a local directory (`serve_dir`); no upstream. ADR-0015.
     Static,
-}
-
-// ============================================================================
-// RESOLVED ROUTE (fully resolved at startup, zero lookups at runtime)
-// ============================================================================
-
-#[derive(Clone, Debug)]
-pub struct ResolvedRoute {
-    #[allow(dead_code)]
-    pub upstream_url: Vec<String>,
-    /// Pre-parsed URI parts — avoids full URI parse on every request.
-    pub upstream_scheme: hyper::http::uri::Scheme,
-    pub upstream_authority: hyper::http::uri::Authority,
-    pub mode: RouteMode,
-    /// For `RouteMode::Static`: the serve directory (not canonicalized here —
-    /// existence is a per-request check so an imported config validates offline).
-    pub serve_dir: Option<std::path::PathBuf>,
-    /// SPA fallback (serve `index.html` on a miss) for `RouteMode::Static`.
-    pub spa_fallback: bool,
-    /// Serve `.br`/`.gz` sidecars via `Accept-Encoding` for `RouteMode::Static`.
-    pub precompressed: bool,
-    /// Literal path prefix stripped before the on-disk file lookup.
-    pub static_prefix: String,
-    pub waf: Option<WafProfile>,
-    /// True iff the route is in WAF shadow mode (log + count, no block).
-    pub waf_shadow: bool,
-    pub cache: Option<CacheProfile>,
-    pub internal_only: bool,
-    /// Per-route CSP header value (pre-parsed at startup, zero cost at runtime).
-    pub csp: Option<hyper::header::HeaderValue>,
-    /// Resolved auth profile (pre-built at startup).
-    #[cfg(feature = "auth")]
-    pub auth: Option<crate::auth::ResolvedAuthProfile>,
-    /// Pre-compiled CORS headers for lightning-fast matching per-route.
-    pub cors: Option<std::sync::Arc<crate::security::CorsHeaders>>,
 }
 
 // ============================================================================
@@ -803,6 +1023,12 @@ pub fn check_schema_version(raw: &str, label: &str) -> Result<(), String> {
     // probe stays silent on parse errors so we don't double-report.
     if let Ok(probe) = toml::from_str::<SchemaProbe>(raw) {
         if let Some(v) = probe.schema_version {
+            if v == 0 {
+                return Err(format!(
+                    "{label}: schema_version = 0 is not a valid schema (versions start at \
+                     {LEGACY_SCHEMA_VERSION}); omit the key for an unversioned file"
+                ));
+            }
             if v > CURRENT_SCHEMA_VERSION {
                 return Err(format!(
                     "{label}: config declares schema_version = {v}, but this zion supports up to \
@@ -816,11 +1042,33 @@ pub fn check_schema_version(raw: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse one config document: version handshake, the strict typed parse, then the
+/// per-version reader. Every loader goes through here so no path can skip the
+/// migration step.
+fn parse_document(raw: &str, label: &str) -> Result<ZionConfig, String> {
+    check_schema_version(raw, label)?;
+    let config: ZionConfig =
+        toml::from_str(raw).map_err(|e| format!("Invalid TOML in {label}: {e}"))?;
+    upgrade_schema(config).map_err(|e| format!("{label}: {e}"))
+}
+
+/// Bring a config that was written for schema `config.schema_version` up to the
+/// current shape. There is one arm per supported version, so bumping
+/// `CURRENT_SCHEMA_VERSION` without adding its reader here fails the
+/// `every_supported_schema_version_has_a_reader` test instead of silently
+/// misreading old files. Only schema 1 exists today, so this is the identity.
+fn upgrade_schema(config: ZionConfig) -> Result<ZionConfig, String> {
+    match config.schema_version {
+        1 => Ok(config),
+        v => Err(format!(
+            "no reader for schema_version {v} (this build supports 1..={CURRENT_SCHEMA_VERSION})"
+        )),
+    }
+}
+
 pub fn load_config(path: &str) -> Result<ZionConfig, String> {
     let raw = fs::read_to_string(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
-    check_schema_version(&raw, path)?;
-    let config: ZionConfig =
-        toml::from_str(&raw).map_err(|e| format!("Invalid TOML in {path}: {e}"))?;
+    let config = parse_document(&raw, path)?;
     validate_config(&config, path)?;
     Ok(config)
 }
@@ -833,8 +1081,7 @@ pub fn load_config(path: &str) -> Result<ZionConfig, String> {
 /// suggested config carries placeholder cert paths the operator fills in, so
 /// file existence isn't a schema concern.
 pub fn parse_schema(raw: &str, label: &str) -> Result<ZionConfig, String> {
-    check_schema_version(raw, label)?;
-    toml::from_str(raw).map_err(|e| format!("Invalid TOML in {label}: {e}"))
+    parse_document(raw, label)
 }
 
 /// Full validation of a config from an in-memory string — the same schema AND
@@ -843,9 +1090,7 @@ pub fn parse_schema(raw: &str, label: &str) -> Result<ZionConfig, String> {
 /// the pushed body must be fully deployable (real cert paths and all), unlike
 /// `zion suggest` which only needs the schema-level [`parse_schema`].
 pub fn validate_str(raw: &str, label: &str) -> Result<ZionConfig, String> {
-    check_schema_version(raw, label)?;
-    let config: ZionConfig =
-        toml::from_str(raw).map_err(|e| format!("Invalid TOML in {label}: {e}"))?;
+    let config = parse_document(raw, label)?;
     validate_config(&config, label)?;
     Ok(config)
 }
@@ -1143,61 +1388,24 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
         errors.push("no [[route]] defined — at least one route is required".to_string());
     }
 
-    // Each route must reference a valid upstream — except a static route, which
-    // serves from disk and instead needs a serve_dir (ADR-0015).
+    // Route shape (a static route has a serve_dir and no upstream, a proxy route
+    // has no static-only fields, `waf` vs `waf_profile`) is enforced at parse time
+    // by `RouteConfig`'s TryFrom. What is left here are references that need the
+    // rest of the config to resolve.
     for route in &config.route {
-        if route.mode == RouteMode::Static {
-            if route.serve_dir.as_deref().unwrap_or("").is_empty() {
-                errors.push(format!(
-                    "route '{}' is mode=static but has no serve_dir",
-                    route.path
-                ));
-            }
-            // A static route serves from disk and needs no upstream;
-            // resolve_route silently discards any `upstream` here. Reject a
-            // non-empty one so the mismatch is a boot error, not a surprise.
-            if !route.upstream.is_empty() {
-                errors.push(format!(
-                    "route '{}' is mode=static but sets upstream = '{}' — a static route \
-                     serves from serve_dir and ignores upstream; remove it",
-                    route.path, route.upstream
-                ));
-            }
-        } else {
-            let has_upstream = config.upstream.contains_key(&route.upstream)
-                || config.upstreams.contains_key(&route.upstream);
+        if let Some(name) = route.upstream_name() {
+            let has_upstream =
+                config.upstream.contains_key(name) || config.upstreams.contains_key(name);
             if !has_upstream {
                 errors.push(format!(
                     "route '{}' references unknown upstream '{}'",
-                    route.path, route.upstream
-                ));
-            }
-            // serve_dir / spa_fallback / precompressed are honoured ONLY under
-            // mode=static; on any other mode they are silently ignored, so an
-            // operator expecting disk serving gets proxy behaviour instead.
-            // Reject the combination rather than dropping it quietly.
-            let mut static_only = Vec::new();
-            if route.serve_dir.as_deref().is_some_and(|s| !s.is_empty()) {
-                static_only.push("serve_dir");
-            }
-            if route.spa_fallback {
-                static_only.push("spa_fallback");
-            }
-            if route.precompressed {
-                static_only.push("precompressed");
-            }
-            if !static_only.is_empty() {
-                errors.push(format!(
-                    "route '{}' is mode={:?} but sets static-only field(s) {:?}; these apply \
-                     only to mode=static and would be silently ignored — set mode = \"static\" \
-                     or remove them",
-                    route.path, route.mode, static_only
+                    route.path, name
                 ));
             }
         }
 
         // WAF profile reference must exist
-        if let Some(ref profile) = route.waf_profile {
+        if let WafPolicy::Profile(profile) = &route.waf {
             if !config.waf_profile.contains_key(profile) {
                 errors.push(format!(
                     "route '{}' references unknown waf_profile '{}'",
@@ -1247,11 +1455,8 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
 
     // Upstream URLs must be valid
     for (name, up) in &config.upstream {
-        let all_urls = up.get_urls();
-        if all_urls.is_empty() {
-            errors.push(format!("upstream '{name}' must have at least one url"));
-        }
-        for u in all_urls {
+        // (an upstream with no endpoint is refused at parse time, see UpstreamConfig)
+        for u in up.get_urls() {
             if u.parse::<hyper::Uri>().is_err() {
                 errors.push(format!("upstream.{name}.url '{u}' is not a valid URL"));
             }
@@ -1271,6 +1476,17 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
         }
     }
 
+    // [server] internal_networks — a bad entry must be an error: dropping it would
+    // leave the list shorter, or empty, and an empty list means the permissive
+    // built-in "any private address" rule.
+    for cidr in &config.server.internal_networks {
+        if !crate::security::is_valid_cidr(cidr) {
+            errors.push(format!(
+                "server.internal_networks '{cidr}' is not a valid CIDR (e.g. \"10.20.0.0/24\" or \"127.0.0.1\")"
+            ));
+        }
+    }
+
     // [admin] — listen must be a real socket address; auth a known mode.
     if let Some(ref admin) = config.admin {
         if admin.listen.parse::<std::net::SocketAddr>().is_err() {
@@ -1279,11 +1495,28 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                 admin.listen
             ));
         }
-        if !matches!(admin.auth.as_str(), "internal-ip" | "mtls") {
-            errors.push(format!(
-                "admin.auth '{}' must be \"internal-ip\" or \"mtls\"",
-                admin.auth
-            ));
+        match admin.auth.as_str() {
+            "internal-ip" => {
+                // `internal-ip` authorizes any loopback/private-range *peer*, and the
+                // authorized peer can replace the whole running config. Bound to a
+                // routable address (or published from a container, where a bridge
+                // SNATs every client to a private address) that is every host on the
+                // network, so it is only safe on loopback. Routable binds need mtls.
+                if let Ok(addr) = admin.listen.parse::<std::net::SocketAddr>() {
+                    if !addr.ip().is_loopback() {
+                        errors.push(format!(
+                            "admin.listen '{}' is not a loopback address but admin.auth = \"internal-ip\" \
+                             trusts every private-range peer, and that peer can replace the whole config. \
+                             Bind 127.0.0.1 (reach it over an SSH tunnel or a sidecar) or set admin.auth = \"mtls\"",
+                            admin.listen
+                        ));
+                    }
+                }
+            }
+            "mtls" => {}
+            other => errors.push(format!(
+                "admin.auth '{other}' must be \"internal-ip\" or \"mtls\""
+            )),
         }
         if admin.rate_limit_rps == 0 {
             errors.push("admin.rate_limit_rps must be > 0".to_string());
@@ -1354,428 +1587,12 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     errors
 }
 
-/// Resolve upstream name to URLs. Checks new `[upstream.X]` first, then legacy `[upstreams]`.
-/// Returns Err if the upstream name is not defined — callers propagate the
-/// error to reject the config rather than panicking (important during hot-reload).
-fn resolve_upstream(config: &ZionConfig, name: &str) -> Result<Vec<String>, String> {
-    if let Some(up) = config.upstream.get(name) {
-        return Ok(up.get_urls());
-    }
-    if let Some(url) = config.upstreams.get(name) {
-        return Ok(vec![url.clone()]);
-    }
-    Err(format!(
-        "Unknown upstream '{name}' — define it in [upstream.{name}] or [upstreams]"
-    ))
-}
-
-/// Host-aware L7 router (ADR-0010). Holds the hostless/shared radix tree, one
-/// tree per exact bound host, and one tree per `*.suffix` wildcard. A route with
-/// no `hosts` lands in `default` and is reachable from every authority (the
-/// shared fallback layer). When no route declares `hosts`, `active` is false and
-/// lookups go straight to `default` — identical, and identically cheap, to the
-/// pre-host-routing single router. Precedence: exact host > most-specific
-/// wildcard > shared.
-#[derive(Debug)]
-pub struct HostRouter {
-    /// Hostless / shared routes — matched for every authority.
-    default: Router<Arc<ResolvedRoute>>,
-    /// Exact-host radix trees, keyed by normalized authority.
-    by_host: HashMap<Box<str>, Router<Arc<ResolvedRoute>>>,
-    /// Wildcard trees keyed by their dotted suffix (`*.example.com` →
-    /// `.example.com`), sorted longest-suffix-first so the most specific wins.
-    /// A request host matches when it `ends_with` the suffix.
-    wildcards: Vec<(String, Router<Arc<ResolvedRoute>>)>,
-    /// True iff at least one route is host-bound (exact or wildcard). Lets the
-    /// hot path skip authority extraction entirely in the hostless deployment.
-    active: bool,
-}
-
-impl Default for HostRouter {
-    fn default() -> Self {
-        Self {
-            default: Router::new(),
-            by_host: HashMap::new(),
-            wildcards: Vec::new(),
-            active: false,
-        }
-    }
-}
-
-impl HostRouter {
-    /// Whether any host-bound route exists. Callers gate authority extraction
-    /// and cache-key hashing on this, so a hostless deployment pays nothing.
-    #[inline]
-    pub fn host_routing_active(&self) -> bool {
-        self.active
-    }
-
-    /// Resolve `(host, path)` to a route, per ADR-0010's hostless-as-shared-layer
-    /// rule with precedence exact > wildcard > shared: an exact-host tree wins;
-    /// otherwise the most-specific matching `*.suffix` wildcard; then the shared
-    /// `default` tree. On a path-miss within the selected host tree we still fall
-    /// through to shared (shared routes are reachable from every host). `host` is
-    /// the normalized request authority ([`crate::security::normalize_host`]), or
-    /// `None` when absent/invalid — then only the shared layer is consulted.
-    #[inline]
-    pub fn at(&self, host: Option<&str>, path: &str) -> Option<&Arc<ResolvedRoute>> {
-        if self.active {
-            if let Some(h) = host {
-                if let Some(tree) = self.by_host.get(h) {
-                    // Exact host wins outright (nginx-style); path-miss → shared.
-                    if let Ok(m) = tree.at(path) {
-                        return Some(m.value);
-                    }
-                } else {
-                    // No exact host: the most-specific matching wildcard, if any.
-                    // `wildcards` is sorted longest-suffix-first, so the first
-                    // `ends_with` hit is the most specific one.
-                    for (suffix, tree) in &self.wildcards {
-                        if h.ends_with(suffix.as_str()) {
-                            if let Ok(m) = tree.at(path) {
-                                return Some(m.value);
-                            }
-                            break; // most-specific wildcard chosen; fall to shared
-                        }
-                    }
-                }
-            }
-        }
-        self.default.at(path).ok().map(|m| m.value)
-    }
-}
-
-/// Accumulates the routes of a single host-group into one radix tree, deferring
-/// the catch-all bare-prefix and trailing-slash aliases until every explicit
-/// route of the group is inserted (so an explicit route always wins a conflict).
-struct RouterBuilder {
-    router: Router<Arc<ResolvedRoute>>,
-    aliases: Vec<(String, Arc<ResolvedRoute>)>,
-}
-
-impl Default for RouterBuilder {
-    fn default() -> Self {
-        Self {
-            router: Router::new(),
-            aliases: Vec::new(),
-        }
-    }
-}
-
-impl RouterBuilder {
-    /// Insert one explicit route and record its bare-prefix / trailing-slash
-    /// alias for the deferred second pass.
-    fn insert(&mut self, path: &str, resolved: Arc<ResolvedRoute>) -> Result<(), String> {
-        // A matchit catch-all "<prefix>/{*name}" does NOT match the bare
-        // "<prefix>" (nor the root "/" when the prefix is empty), so a
-        // "/{*rest}" route silently 404s on "/" even though it is meant to be
-        // the fallback for everything. Record the bare prefix so we can also
-        // map it to this route in a second pass (after all explicit routes).
-        match catchall_bare_prefix(path) {
-            Some(bare) => {
-                self.router
-                    .insert(path.to_string(), resolved.clone())
-                    .map_err(|e| format!("Bad route pattern '{path}': {e}"))?;
-                self.aliases.push((bare, resolved));
-            }
-            None => {
-                // Non-catch-all: also alias the trailing-slash-toggled variant
-                // so "/x" and "/x/" resolve to the SAME route. matchit treats
-                // them as distinct, so "/x/" would otherwise fall through to a
-                // different (often more permissive) route — e.g. a stricter
-                // per-route WAF profile silently downgraded.
-                match trailing_slash_variant(path) {
-                    Some(variant) => {
-                        self.router
-                            .insert(path.to_string(), resolved.clone())
-                            .map_err(|e| format!("Bad route pattern '{path}': {e}"))?;
-                        self.aliases.push((variant, resolved));
-                    }
-                    None => {
-                        self.router
-                            .insert(path.to_string(), resolved)
-                            .map_err(|e| format!("Bad route pattern '{path}': {e}"))?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Apply the deferred aliases and return the finished tree. Alias inserts
-    /// are best-effort: a conflict means an explicit route already owns the
-    /// slot — exactly the precedence we want (matchit specificity then makes an
-    /// exact prefix win over a less-specific parent catch-all, e.g. "/api" →
-    /// "/api/{*rest}", not the root "/{*rest}").
-    fn finish(mut self) -> Router<Arc<ResolvedRoute>> {
-        for (alias, resolved) in self.aliases {
-            let _ = self.router.insert(alias, resolved);
-        }
-        self.router
-    }
-}
-
-/// Build the host-aware router from config routes, pre-resolving all references.
-/// A route with `hosts` is inserted into each of its host trees; a route without
-/// `hosts` goes into the shared/default tree (ADR-0010, hostless-as-shared).
-///
-/// Returns `Err` if any route references an unknown upstream, profile, or
-/// contains an invalid pattern. The caller (boot path or hot-reload) decides
-/// whether to abort or log-and-keep the previous snapshot.
-pub fn build_router(config: &ZionConfig) -> Result<HostRouter, String> {
-    let router = build_router_quiet(config)?;
-    print_routes_table(&config.route);
-    Ok(router)
-}
-
-/// [`build_router`] without the boot-banner routes table — for callers that
-/// build a router as a validation step, not to serve traffic (`zion import`'s
-/// self-validation gate, ADR-0011).
-pub fn build_router_quiet(config: &ZionConfig) -> Result<HostRouter, String> {
-    let mut default = RouterBuilder::default();
-    let mut by_host: HashMap<Box<str>, RouterBuilder> = HashMap::new();
-
-    let mut wild: HashMap<String, RouterBuilder> = HashMap::new();
-
-    for route in &config.route {
-        let resolved = resolve_route(config, route)?;
-        match &route.hosts {
-            // Shared route: reachable from every authority.
-            None => default.insert(&route.path, resolved)?,
-            // Host-bound. Validation guarantees each entry is either a canonical
-            // exact host or a `*.<canonical-domain>` wildcard.
-            Some(hosts) => {
-                let mut seen_exact = std::collections::HashSet::new();
-                let mut seen_wild = std::collections::HashSet::new();
-                for h in hosts {
-                    if let Some(rest) = h.strip_prefix("*.") {
-                        // Wildcard: the match key is the dotted, normalized
-                        // suffix (`*.example.com` → `.example.com`).
-                        let domain = crate::security::normalize_host(rest).ok_or_else(|| {
-                            format!("route '{}': invalid wildcard host '{}'", route.path, h)
-                        })?;
-                        let suffix = format!(".{domain}");
-                        // A suffix repeated in one route's list inserts once.
-                        if !seen_wild.insert(suffix.clone()) {
-                            continue;
-                        }
-                        wild.entry(suffix)
-                            .or_default()
-                            .insert(&route.path, resolved.clone())?;
-                    } else {
-                        let key = crate::security::normalize_host(h)
-                            .ok_or_else(|| format!("route '{}': invalid host '{}'", route.path, h))?
-                            .into_owned();
-                        // A host repeated in one route's list must insert once,
-                        // not twice into the same tree (matchit rejects a dup).
-                        if !seen_exact.insert(key.clone()) {
-                            continue;
-                        }
-                        by_host
-                            .entry(key.into_boxed_str())
-                            .or_default()
-                            .insert(&route.path, resolved.clone())?;
-                    }
-                }
-            }
-        }
-    }
-
-    let active = !by_host.is_empty() || !wild.is_empty();
-    let by_host = by_host
-        .into_iter()
-        .map(|(host, builder)| (host, builder.finish()))
-        .collect();
-    // Longest suffix first so the most specific wildcard wins at lookup; the
-    // content tiebreak keeps the order deterministic across rebuilds.
-    let mut wildcards: Vec<(String, Router<Arc<ResolvedRoute>>)> = wild
-        .into_iter()
-        .map(|(suffix, builder)| (suffix, builder.finish()))
-        .collect();
-    wildcards.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
-
-    Ok(HostRouter {
-        default: default.finish(),
-        by_host,
-        wildcards,
-        active,
-    })
-}
-
-/// Resolve one `[[route]]` into its fully pre-computed [`ResolvedRoute`]
-/// (upstream URLs, WAF/cache profiles, CSP, auth, CORS) — everything the hot
-/// path needs, computed once at build. Pure: no router insertion, so
-/// `build_router` can place the result into one or more host-scoped trees.
-fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<ResolvedRoute>, String> {
-    // A static route (ADR-0015) serves from disk and needs no upstream — ignore
-    // any stray `upstream` field so `validate_semantics` and `build_router`
-    // agree (both skip the upstream for a static route).
-    let upstream_url = if route.mode == RouteMode::Static {
-        Vec::new()
-    } else {
-        resolve_upstream(config, &route.upstream)?
-    };
-
-    // Resolve WAF: named profile > legacy bool flag
-    let waf = if let Some(ref profile_name) = route.waf_profile {
-        Some(
-            config
-                .waf_profile
-                .get(profile_name)
-                .ok_or_else(|| {
-                    format!(
-                        "Unknown waf_profile '{}' in route {}",
-                        profile_name, route.path
-                    )
-                })?
-                .clone(),
-        )
-    } else if route.waf {
-        // Legacy: create inline profile from max_body_mb
-        Some(WafProfile {
-            max_body_mb: route.max_body_mb.unwrap_or(10),
-            ..WafProfile::default()
-        })
-    } else {
-        // Footgun guard: `max_body_mb` is enforced by the WAF body gate, so
-        // on a WAF-off route it has no effect. Surface it at boot rather
-        // than silently dropping the operator's intended size cap (a no-WAF
-        // route otherwise streams the body to the upstream, hyper-framed).
-        if route.max_body_mb.is_some() {
-            eprintln!(
-                "  ⚠ route '{}': max_body_mb is set but WAF is off (no waf=true / waf_profile) \
-                     — the body-size cap is NOT enforced; enable WAF or remove max_body_mb",
-                route.path
-            );
-        }
-        None
-    };
-
-    // Resolve cache: named profile > legacy mode=static_cache
-    let cache = if let Some(ref profile_name) = route.cache_profile {
-        Some(
-            config
-                .cache_profile
-                .get(profile_name)
-                .ok_or_else(|| {
-                    format!(
-                        "Unknown cache_profile '{}' in route {}",
-                        profile_name, route.path
-                    )
-                })?
-                .clone(),
-        )
-    } else if route.mode == RouteMode::StaticCache {
-        // Default in-RAM profile for a profile-less static_cache route:
-        // conservative 1h TTL (default_ttl), NOT immutable. Name an explicit
-        // [cache_profile] with a longer ttl_seconds for content-hashed assets.
-        Some(CacheProfile {
-            mode: CacheMode::Memory,
-            max_entries: default_max_entries(),
-            ttl_seconds: default_ttl(),
-        })
-    } else {
-        None
-    };
-
-    // Pre-parse the FIRST upstream URI at startup for legacy fallback. A static
-    // route has no upstream, so it gets placeholder parts the Static dispatch
-    // arm never reads.
-    let (upstream_scheme, upstream_authority) = if upstream_url.is_empty() {
-        ("http".parse().unwrap(), "127.0.0.1".parse().unwrap())
-    } else {
-        let upstream_uri: hyper::Uri = upstream_url[0]
-            .parse()
-            .map_err(|e| format!("Invalid upstream URL '{}': {}", upstream_url[0], e))?;
-        let scheme = upstream_uri
-            .scheme()
-            .cloned()
-            .unwrap_or_else(|| "http".parse().unwrap());
-        let authority = upstream_uri
-            .authority()
-            .cloned()
-            .ok_or_else(|| format!("Upstream '{}' has no authority", upstream_url[0]))?;
-        (scheme, authority)
-    };
-
-    // Pre-parse CSP at startup for zero-cost injection at runtime
-    let csp = match route.csp.as_ref() {
-        Some(s) => Some(
-            hyper::header::HeaderValue::from_str(s)
-                .map_err(|e| format!("Invalid CSP in route '{}': {}", route.path, e))?,
-        ),
-        None => None,
-    };
-
-    // Resolve auth profile at startup (feature-gated)
-    #[cfg(feature = "auth")]
-    let auth = match route.auth_profile.as_ref() {
-        Some(name) => {
-            let profile_config = config.auth_profile.get(name).ok_or_else(|| {
-                format!("Auth profile '{}' not found (route '{}')", name, route.path)
-            })?;
-            let resolved = crate::auth::resolve_auth_profile(profile_config)
-                .map_err(|e| format!("Auth profile '{}' (route '{}'): {}", name, route.path, e))?;
-            eprintln!(
-                "  auth: route {} → profile '{}' (alg={})",
-                route.path, name, profile_config.algorithm
-            );
-            Some(resolved)
-        }
-        None => None,
-    };
-
-    let cors = route
-        .cors
-        .as_ref()
-        .map(|c| Arc::new(crate::security::CorsHeaders::from_config(c)));
-
-    // Static file serving (ADR-0015): the serve dir + the literal prefix to
-    // strip from the request path. Not canonicalized here — existence is a
-    // per-request check so an imported config validates offline.
-    let (serve_dir, static_prefix) = if route.mode == RouteMode::Static {
-        let dir = route
-            .serve_dir
-            .as_ref()
-            .ok_or_else(|| format!("route '{}' is mode=static but has no serve_dir", route.path))?;
-        let prefix = route
-            .path
-            .split("{*")
-            .next()
-            .unwrap_or("/")
-            .trim_end_matches('/')
-            .to_string();
-        (Some(std::path::PathBuf::from(dir)), prefix)
-    } else {
-        (None, String::new())
-    };
-
-    Ok(Arc::new(ResolvedRoute {
-        upstream_url,
-        upstream_scheme,
-        upstream_authority,
-        mode: route.mode.clone(),
-        serve_dir,
-        spa_fallback: route.spa_fallback,
-        precompressed: route.precompressed,
-        static_prefix,
-        waf,
-        waf_shadow: route.waf_shadow,
-        cache,
-        internal_only: route.internal_only,
-        csp,
-        #[cfg(feature = "auth")]
-        auth,
-        cors,
-    }))
-}
-
 /// If `path` is a matchit catch-all (`<prefix>/{*name}`), return the bare
 /// prefix the catch-all should also serve (`/` for a root catch-all). matchit's
 /// catch-all does not match the bare prefix, so without registering it a
 /// `/{*rest}` route returns 404 on `/` — surprising for a "match everything"
 /// fallback. Returns `None` for non-catch-all paths.
-fn catchall_bare_prefix(path: &str) -> Option<String> {
+pub(crate) fn catchall_bare_prefix(path: &str) -> Option<String> {
     let slash = path.rfind('/')?;
     let seg = &path[slash + 1..];
     if seg.starts_with("{*") && seg.ends_with('}') {
@@ -1794,7 +1611,7 @@ fn catchall_bare_prefix(path: &str) -> Option<String> {
 /// SAME route. matchit treats them as distinct, so without this "/x/" falls
 /// through to whatever broader route matches — silently downgrading a stricter
 /// per-route WAF profile. Returns `None` for the bare root "/".
-fn trailing_slash_variant(path: &str) -> Option<String> {
+pub(crate) fn trailing_slash_variant(path: &str) -> Option<String> {
     if path == "/" {
         None
     } else if let Some(stripped) = path.strip_suffix('/') {
@@ -1834,138 +1651,10 @@ pub(crate) fn compile_path_set(patterns: &[String]) -> Result<matchit::Router<()
     Ok(router)
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// ROUTES MINI-TABLE (boot-time visualization)
-// ═══════════════════════════════════════════════════════════════════
-
-/// Print the configured routes as a styled mini-table. Replaces the
-/// per-route `eprintln!("route ... [waf=, cache=, mode=]")` line with a
-/// scannable layout: aligned paths, dim arrow, cyan upstream, semantic
-/// tags (`waf`, `cache`, `sse`, `ws`, `static`, `internal`) colored by
-/// category. Falls back to plain ASCII when stderr is not a TTY or when
-/// `NO_COLOR` / `ZION_BOOT_PLAIN` is set.
-fn print_routes_table(routes: &[RouteConfig]) {
-    use std::io::IsTerminal;
-
-    let plain =
-        std::env::var_os("NO_COLOR").is_some() || std::env::var_os("ZION_BOOT_PLAIN").is_some();
-    let color = !plain && std::io::stderr().is_terminal();
-
-    // Cap path column at 40 chars so very long matchers don't blow up the
-    // layout. Truncate with an ellipsis when over.
-    const PATH_CAP: usize = 40;
-    let max_path_chars = routes
-        .iter()
-        .map(|r| r.path.chars().count().min(PATH_CAP))
-        .max()
-        .unwrap_or(0);
-
-    let header_dim = if color { "\x1b[2m" } else { "" };
-    let arrow_dim = if color { "\x1b[2m" } else { "" };
-    let cyan = if color { "\x1b[38;5;51m" } else { "" };
-    let reset = if color { "\x1b[0m" } else { "" };
-
-    eprintln!("  {}routes ({}){}", header_dim, routes.len(), reset);
-
-    for route in routes {
-        let path = truncate_chars(&route.path, PATH_CAP);
-        let pad = " ".repeat(max_path_chars.saturating_sub(path.chars().count()));
-        let tags = render_route_tags(route, color);
-        eprintln!(
-            "    {}{} {}→{} {}{}{}{}",
-            path,
-            pad,
-            arrow_dim,
-            reset,
-            cyan,
-            route.upstream,
-            reset,
-            if tags.is_empty() {
-                String::new()
-            } else {
-                format!("    {tags}")
-            },
-        );
-    }
-}
-
-/// Build the tag suffix for a route: a `·`-joined list of colored chips
-/// (`waf`, `sse`, `ws`, `static`, `cache`, `internal`). Returns "" when
-/// the route is a plain pass-through with no special features.
-fn render_route_tags(route: &RouteConfig, color: bool) -> String {
-    let reset = if color { "\x1b[0m" } else { "" };
-    let dim_sep = if color { "\x1b[2m" } else { "" };
-    let green = if color { "\x1b[38;5;46m" } else { "" }; // security ON
-    let yellow = if color { "\x1b[38;5;220m" } else { "" }; // perf / restricted
-    let cyan = if color { "\x1b[38;5;51m" } else { "" }; // streaming / special
-
-    let mut tags: Vec<String> = Vec::new();
-
-    match route.mode {
-        RouteMode::SseStream => tags.push(format!("{cyan}sse{reset}")),
-        RouteMode::Websocket => tags.push(format!("{cyan}ws{reset}")),
-        RouteMode::StaticCache => tags.push(format!("{cyan}static{reset}")),
-        RouteMode::Static => tags.push(format!("{cyan}files{reset}")),
-        RouteMode::Standard => {}
-    }
-    if route.waf || route.waf_profile.is_some() {
-        if route.waf_shadow {
-            // Distinct tag — the operator must see at a glance which routes
-            // are simulating vs enforcing. Amber matches "warning" semantics.
-            tags.push(format!("{yellow}waf:shadow{reset}"));
-        } else {
-            tags.push(format!("{green}waf{reset}"));
-        }
-    }
-    if route.cache_profile.is_some() {
-        tags.push(format!("{yellow}cache{reset}"));
-    }
-    if route.internal_only {
-        tags.push(format!("{yellow}internal{reset}"));
-    }
-
-    if tags.is_empty() {
-        return String::new();
-    }
-    let sep = format!(" {dim_sep}·{reset} ");
-    tags.join(&sep)
-}
-
-fn truncate_chars(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max - 1).collect();
-        out.push('…');
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn route(path: &str) -> RouteConfig {
-        RouteConfig {
-            path: path.into(),
-            hosts: None,
-            upstream: "backend".into(),
-            mode: RouteMode::Standard,
-            serve_dir: None,
-            spa_fallback: false,
-            precompressed: false,
-            internal_only: false,
-            waf_profile: None,
-            cache_profile: None,
-            csp: None,
-            auth_profile: None,
-            waf: false,
-            max_body_mb: None,
-            waf_shadow: false,
-            cors: None,
-        }
-    }
+    use crate::routing::{build_router, build_router_quiet};
 
     #[cfg(feature = "tls-fingerprint")]
     #[test]
@@ -2157,6 +1846,145 @@ mod tests {
         );
     }
 
+    fn one_route(route_body: &str) -> Result<ZionConfig, String> {
+        parse_schema(
+            &format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+                 [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+                 [waf_profile.strict]\n[[route]]\npath=\"/{{*rest}}\"\n{route_body}"
+            ),
+            "t",
+        )
+    }
+
+    #[test]
+    fn shipped_example_configs_still_parse() {
+        // Parsing is now where contradictory routes/upstreams are refused, so every
+        // config the repo ships must clear it. Schema-level only (no cert files).
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let files = [
+            "zion.example.toml",
+            "tests/zion-test.toml",
+            "examples/multi-site.toml",
+            "benchmarks/zion-bench-tls-waf.toml",
+            "benchmarks/zion-bench-tls-waf-cache.toml",
+            "benchmarks/zion-docker-full.toml",
+            "benchmarks/zion-bench-tls-cache.toml",
+            "benchmarks/zion-bench-tls.toml",
+            "benchmarks/baseline/zion-lab.toml",
+            "benchmarks/zion-docker-waf.toml",
+            "benchmarks/zion-docker.toml",
+            "configs/full-stack.toml",
+            "configs/basic.toml",
+            "configs/waf-strict.toml",
+            "benches/e2e/config/zion-fullstack.toml",
+        ];
+        let mut bad = Vec::new();
+        for f in files {
+            let raw = std::fs::read_to_string(root.join(f)).unwrap_or_else(|e| panic!("{f}: {e}"));
+            if let Err(e) = parse_schema(&raw, f) {
+                bad.push(format!("{f}: {e}"));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "shipped configs no longer parse:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    #[test]
+    fn waf_is_one_policy_and_contradictions_cannot_be_built() {
+        // ZION-DOM-01: `waf`, `waf_profile` and `max_body_mb` are one decision.
+        let e = one_route("upstream=\"be\"\nwaf=true\nwaf_profile=\"strict\"\n")
+            .err()
+            .expect("waf = true next to a waf_profile is contradictory");
+        assert!(e.contains("both `waf = true` and `waf_profile`"), "{e}");
+        let e = one_route("upstream=\"be\"\nwaf_profile=\"strict\"\nmax_body_mb=500\n")
+            .err()
+            .expect("a route-level max_body_mb is dead next to a waf_profile");
+        assert!(
+            e.contains("max_body_mb") && e.contains("waf_profile"),
+            "{e}"
+        );
+
+        let policy = |body: &str| one_route(body).unwrap().route[0].waf.clone();
+        assert_eq!(
+            policy("upstream=\"be\"\nwaf_profile=\"strict\"\n"),
+            WafPolicy::Profile("strict".into())
+        );
+        assert_eq!(
+            policy("upstream=\"be\"\nwaf=true\nmax_body_mb=50\n"),
+            WafPolicy::Inline {
+                max_body_mb: Some(50)
+            }
+        );
+        assert_eq!(
+            policy("upstream=\"be\"\n"),
+            WafPolicy::Off {
+                ignored_max_body_mb: None
+            }
+        );
+        // a max_body_mb on a WAF-off route stays a boot WARNING (kept for
+        // compatibility), not an error
+        assert_eq!(
+            policy("upstream=\"be\"\nmax_body_mb=50\n"),
+            WafPolicy::Off {
+                ignored_max_body_mb: Some(50)
+            }
+        );
+        assert!(!WafPolicy::Off {
+            ignored_max_body_mb: Some(1)
+        }
+        .is_enabled());
+        assert!(WafPolicy::Inline { max_body_mb: None }.is_enabled());
+    }
+
+    #[test]
+    fn a_route_is_either_an_upstream_or_a_directory() {
+        // ZION-DOM-02: the two shapes carry disjoint data.
+        let c = one_route("upstream=\"be\"\nmode=\"sse_stream\"\n").unwrap();
+        assert_eq!(
+            c.route[0].target,
+            RouteTarget::Upstream {
+                name: "be".into(),
+                mode: UpstreamMode::SseStream
+            }
+        );
+        assert_eq!(c.route[0].mode(), RouteMode::SseStream);
+        assert_eq!(c.route[0].upstream_name(), Some("be"));
+
+        let c = one_route("mode=\"static\"\nserve_dir=\"/srv\"\nspa_fallback=true\n").unwrap();
+        assert_eq!(
+            c.route[0].target,
+            RouteTarget::Static {
+                serve_dir: "/srv".into(),
+                spa_fallback: true,
+                precompressed: false
+            }
+        );
+        assert_eq!(c.route[0].mode(), RouteMode::Static);
+        assert_eq!(c.route[0].upstream_name(), None);
+
+        // the illegal mixtures do not parse
+        for (body, needle) in [
+            ("mode=\"static\"\n", "no serve_dir"),
+            ("mode=\"static\"\nserve_dir=\"\"\n", "no serve_dir"),
+            (
+                "mode=\"static\"\nserve_dir=\"/s\"\nupstream=\"be\"\n",
+                "sets upstream",
+            ),
+            ("upstream=\"be\"\nserve_dir=\"/s\"\n", "static-only"),
+            ("upstream=\"be\"\nspa_fallback=true\n", "static-only"),
+            ("upstream=\"be\"\nprecompressed=true\n", "static-only"),
+        ] {
+            let e = one_route(body)
+                .err()
+                .unwrap_or_else(|| panic!("{body:?} must not parse"));
+            assert!(e.contains(needle), "{body:?} -> {e}");
+        }
+    }
+
     #[test]
     fn static_route_builds_without_an_upstream() {
         let toml = r#"
@@ -2200,8 +2028,13 @@ path = "/{*rest}"
 upstream = ""
 mode = "static"
 "#;
-        let cfg = parse_schema(toml, "test").expect("parse");
-        assert!(validate_semantics(&cfg, "test").is_err());
+        // ZION-DOM-02: this used to parse and only fail later, in validation. A
+        // static route with no serve_dir is now not constructible at all.
+        let err = parse_schema(toml, "test")
+            .err()
+            .expect("a static route with no serve_dir must not parse");
+        assert!(err.contains("mode=static but has no serve_dir"), "{err}");
+        assert!(validate_str(toml, "test").is_err());
     }
 
     #[test]
@@ -2226,122 +2059,6 @@ url = "http://127.0.0.1:8080"
 "#;
         let cfg = parse_schema(toml, "test").expect("parse");
         assert!(validate_semantics(&cfg, "test").is_err());
-    }
-
-    #[test]
-    fn route_tags_plain_passthrough_is_empty() {
-        let r = route("/static");
-        assert_eq!(render_route_tags(&r, false), "");
-    }
-
-    #[test]
-    fn route_tags_waf_only() {
-        let mut r = route("/api");
-        r.waf = true;
-        assert_eq!(render_route_tags(&r, false), "waf");
-    }
-
-    #[test]
-    fn route_tags_named_waf_profile_counts() {
-        let mut r = route("/api");
-        r.waf_profile = Some("strict".into());
-        assert_eq!(render_route_tags(&r, false), "waf");
-    }
-
-    #[test]
-    fn route_tags_static_with_cache() {
-        let mut r = route("/_next/static");
-        r.mode = RouteMode::StaticCache;
-        r.cache_profile = Some("immutable".into());
-        // Mode tag first, then perf tag
-        assert_eq!(render_route_tags(&r, false), "static · cache");
-    }
-
-    #[test]
-    fn route_tags_sse_stream() {
-        let mut r = route("/events");
-        r.mode = RouteMode::SseStream;
-        assert_eq!(render_route_tags(&r, false), "sse");
-    }
-
-    #[test]
-    fn route_tags_websocket() {
-        let mut r = route("/ws");
-        r.mode = RouteMode::Websocket;
-        assert_eq!(render_route_tags(&r, false), "ws");
-    }
-
-    #[test]
-    fn route_tags_internal_marked() {
-        let mut r = route("/metrics");
-        r.internal_only = true;
-        assert_eq!(render_route_tags(&r, false), "internal");
-    }
-
-    #[test]
-    fn route_tags_shadow_replaces_waf_tag() {
-        // waf=true alone → "waf"
-        let mut r = route("/api");
-        r.waf = true;
-        assert_eq!(render_route_tags(&r, false), "waf");
-        // waf=true + shadow → "waf:shadow" so the visual distinction is
-        // unmissable when scanning the boot output.
-        r.waf_shadow = true;
-        assert_eq!(render_route_tags(&r, false), "waf:shadow");
-    }
-
-    #[test]
-    fn route_tags_shadow_with_named_profile() {
-        let mut r = route("/api");
-        r.waf_profile = Some("strict".into());
-        r.waf_shadow = true;
-        assert_eq!(render_route_tags(&r, false), "waf:shadow");
-    }
-
-    #[test]
-    fn route_tags_shadow_no_waf_attached_no_tag() {
-        // Shadow without any WAF profile attached → no tag (logical no-op).
-        let mut r = route("/static");
-        r.waf_shadow = true;
-        // We still don't render anything because there's no WAF on the route.
-        // Treating shadow as a strict modifier of the waf tag.
-        assert_eq!(render_route_tags(&r, false), "");
-    }
-
-    #[test]
-    fn route_tags_color_uses_ansi_per_category() {
-        let mut r = route("/api");
-        r.waf = true;
-        r.internal_only = true;
-        let tagged = render_route_tags(&r, true);
-        // Green for waf (security), amber for internal (restricted), dim
-        // separator between them.
-        assert!(tagged.contains("\x1b[38;5;46mwaf"), "got: {tagged}");
-        assert!(tagged.contains("\x1b[38;5;220minternal"), "got: {tagged}");
-        assert!(
-            tagged.contains("\x1b[2m·"),
-            "expected dim separator: {tagged}"
-        );
-    }
-
-    #[test]
-    fn truncate_chars_keeps_short_unchanged() {
-        assert_eq!(truncate_chars("/api", 40), "/api");
-    }
-
-    #[test]
-    fn truncate_chars_clips_long_with_ellipsis() {
-        let long = "/api/v1/very/long/nested/path/that/exceeds/the/cap/easily";
-        let out = truncate_chars(long, 20);
-        assert_eq!(out.chars().count(), 20);
-        assert!(out.ends_with('…'));
-    }
-
-    #[test]
-    fn truncate_chars_handles_unicode() {
-        // Em-dashes and box characters count as 1 each
-        let s = "abc—def★ghi";
-        assert_eq!(truncate_chars(s, 5).chars().count(), 5);
     }
 
     fn minimal_toml() -> &'static str {
@@ -2717,6 +2434,122 @@ enabledd = true
     }
 
     #[test]
+    fn internal_networks_entries_are_validated() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n{NET}\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let with = |net: &str| {
+            validate_str(&base.replace("{NET}", net), "t")
+                .err()
+                .unwrap_or_default()
+        };
+        let e = with("internal_networks=[\"10.0.0.0/99\"]\n");
+        assert!(e.contains("server.internal_networks '10.0.0.0/99'"), "{e}");
+        // a good list raises no internal_networks error (other errors may exist: cert files)
+        let e = with("internal_networks=[\"10.20.0.0/24\",\"127.0.0.1\"]\n");
+        assert!(!e.contains("internal_networks"), "{e}");
+    }
+
+    #[test]
+    fn admin_internal_ip_must_bind_loopback() {
+        // ZION-AUTH-01: `internal-ip` trusts every private-range peer, and that peer
+        // can replace the whole config, so it is only allowed on loopback.
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let admin = |listen: &str, auth: &str| {
+            let toml = format!("{base}[admin]\nlisten=\"{listen}\"\nauth=\"{auth}\"\n");
+            validate_str(&toml, "test").err().unwrap_or_default()
+        };
+        // routable / wildcard / container-bridge binds are refused
+        for bad in [
+            "0.0.0.0:9180",
+            "10.0.0.5:9180",
+            "192.168.1.10:9180",
+            "[::]:9180",
+            "172.17.0.2:9180",
+        ] {
+            let e = admin(bad, "internal-ip");
+            assert!(
+                e.contains("not a loopback address") && e.contains("mtls"),
+                "{bad} with internal-ip must be rejected with guidance, got: {e}"
+            );
+        }
+        // loopback stays fine (the failure, if any, is only the missing cert files)
+        for ok in ["127.0.0.1:9180", "127.0.0.2:9180", "[::1]:9180"] {
+            let e = admin(ok, "internal-ip");
+            assert!(
+                !e.contains("not a loopback address"),
+                "{ok} must be accepted: {e}"
+            );
+        }
+        // mtls may bind anywhere: the handshake, not the peer IP, is the gate
+        let e = admin("0.0.0.0:9180", "mtls");
+        assert!(
+            !e.contains("not a loopback address"),
+            "mtls on a routable bind: {e}"
+        );
+    }
+
+    const MIN_DOC: &str = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+         [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+         [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+
+    #[test]
+    fn an_unversioned_file_is_schema_one_not_whatever_is_current() {
+        // ZION-DOM-03: absent must mean a fixed, documented version.
+        let cfg = parse_schema(MIN_DOC, "t").unwrap();
+        assert_eq!(cfg.schema_version, LEGACY_SCHEMA_VERSION);
+        assert_eq!(
+            LEGACY_SCHEMA_VERSION, 1,
+            "the meaning of an unversioned file must never change"
+        );
+        let v1 = parse_schema(&format!("schema_version = 1\n{MIN_DOC}"), "t").unwrap();
+        assert_eq!(v1.schema_version, 1);
+        // 0 is not a version
+        let e = parse_schema(&format!("schema_version = 0\n{MIN_DOC}"), "t")
+            .err()
+            .expect("0 must be rejected");
+        assert!(e.contains("schema_version = 0"), "{e}");
+    }
+
+    #[test]
+    fn every_supported_schema_version_has_a_reader() {
+        // Bumping CURRENT_SCHEMA_VERSION without adding its arm to `upgrade_schema`
+        // (and a fixture for it) must fail here, not misread users' old files.
+        for v in LEGACY_SCHEMA_VERSION..=CURRENT_SCHEMA_VERSION {
+            let doc = format!("schema_version = {v}\n{MIN_DOC}");
+            let cfg =
+                parse_schema(&doc, "t").unwrap_or_else(|e| panic!("schema {v} has no reader: {e}"));
+            assert_eq!(cfg.schema_version, v);
+        }
+    }
+
+    #[test]
+    fn an_upstream_is_a_single_non_empty_endpoint_list() {
+        // ZION-DOM-04: url / urls are two spellings of one thing.
+        let doc = |up: &str| format!("{MIN_DOC}[upstream.a]\n{up}\n");
+        let ups = |up: &str| parse_schema(&doc(up), "t").map(|c| c.upstream["a"].urls().to_vec());
+        assert_eq!(ups("url=\"http://x:1\"").unwrap(), ["http://x:1"]);
+        assert_eq!(
+            ups("urls=[\"http://x:1\",\"http://y:2\"]").unwrap(),
+            ["http://x:1", "http://y:2"]
+        );
+        // both written: merged once, `urls` first then `url` (the documented order)
+        assert_eq!(
+            ups("urls=[\"http://x:1\"]\nurl=\"http://y:2\"").unwrap(),
+            ["http://x:1", "http://y:2"]
+        );
+        // neither: refused at parse time, so no later code can see an empty list
+        for none in ["", "urls=[]", "keepalive=8"] {
+            let e = ups(none).unwrap_err();
+            assert!(e.contains("at least one endpoint"), "{none:?} -> {e}");
+        }
+        // unknown keys are still rejected
+        assert!(ups("url=\"http://x:1\"\nbogus=1").is_err());
+    }
+
+    #[test]
     fn schema_version_handshake() {
         let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
              [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
@@ -2906,7 +2739,7 @@ upstream = "backend"
     fn parse_named_upstream() {
         let config: ZionConfig = toml::from_str(profile_toml()).unwrap();
         let api = config.upstream.get("api").unwrap();
-        assert_eq!(api.url.as_deref(), Some("http://127.0.0.1:8000"));
+        assert_eq!(api.urls(), ["http://127.0.0.1:8000".to_string()]);
         assert_eq!(api.connect_timeout_ms, 5000);
         assert_eq!(api.keepalive, 128);
         assert!(!api.tls); // default false
@@ -3224,94 +3057,7 @@ cache_profile = "nonexistent"
         assert!(!profile.streaming);
     }
 
-    #[test]
-    fn resolve_upstream_prefers_new_format_over_legacy() {
-        let toml_str = r#"
-[server]
-listen_http = "0.0.0.0:80"
-listen_https = "0.0.0.0:443"
-[tls]
-cert_path = "/tmp/c.pem"
-key_path = "/tmp/k.pem"
-[upstream.api]
-url = "http://new:9000"
-[upstreams]
-api = "http://old:8000"
-[[route]]
-path = "/test"
-upstream = "api"
-"#;
-        let config: ZionConfig = toml::from_str(toml_str).unwrap();
-        let router = build_router(&config).unwrap();
-        let route = router.at(None, "/test").unwrap();
-        // New [upstream.X] takes precedence over [upstreams] legacy
-        assert_eq!(route.upstream_url[0], "http://new:9000");
-    }
-
     // ── Host-based L7 routing (ADR-0010) ──────────────────────────────────
-
-    #[test]
-    fn host_router_exact_and_shared_fallback() {
-        // Two host-bound routes on the SAME path + a shared catch-all — exactly
-        // what path-only routing could not express (ADR-0010).
-        let toml_str = r#"
-[server]
-listen_http = "0.0.0.0:80"
-listen_https = "0.0.0.0:443"
-[tls]
-cert_path = "/tmp/c.pem"
-key_path = "/tmp/k.pem"
-[upstream.api]
-url = "http://127.0.0.1:8000"
-[upstream.app]
-url = "http://127.0.0.1:3000"
-[upstream.fallback]
-url = "http://127.0.0.1:9000"
-[[route]]
-path = "/{*rest}"
-hosts = ["api.example.com"]
-upstream = "api"
-[[route]]
-path = "/{*rest}"
-hosts = ["app.example.com"]
-upstream = "app"
-[[route]]
-path = "/{*rest}"
-upstream = "fallback"
-"#;
-        let config: ZionConfig = toml::from_str(toml_str).unwrap();
-        let router = build_router(&config).unwrap();
-        assert!(router.active);
-
-        // Same path, different host → different backend (the whole point).
-        assert_eq!(
-            router
-                .at(Some("api.example.com"), "/x")
-                .unwrap()
-                .upstream_url[0],
-            "http://127.0.0.1:8000"
-        );
-        assert_eq!(
-            router
-                .at(Some("app.example.com"), "/x")
-                .unwrap()
-                .upstream_url[0],
-            "http://127.0.0.1:3000"
-        );
-        // Unknown host → shared/default layer.
-        assert_eq!(
-            router
-                .at(Some("other.example.com"), "/x")
-                .unwrap()
-                .upstream_url[0],
-            "http://127.0.0.1:9000"
-        );
-        // No host (e.g. HTTP/1.0) → shared layer.
-        assert_eq!(
-            router.at(None, "/x").unwrap().upstream_url[0],
-            "http://127.0.0.1:9000"
-        );
-    }
 
     #[test]
     fn host_router_falls_back_to_shared_on_path_miss() {
@@ -3357,81 +3103,5 @@ upstream = "shared"
         );
         // A path in NO tree → 404 (None).
         assert!(router.at(Some("api.example.com"), "/nope").is_none());
-    }
-
-    #[test]
-    fn hostless_config_is_not_active() {
-        // No route declares `hosts` ⇒ host routing inactive ⇒ the shared tree
-        // behaves exactly as the pre-ADR-0010 single router.
-        let config: ZionConfig = toml::from_str(minimal_toml()).unwrap();
-        let router = build_router(&config).unwrap();
-        assert!(!router.active);
-        // A host is simply ignored — everything resolves via the shared tree.
-        assert!(router.at(Some("whatever.example.com"), "/api/x").is_some());
-        assert!(router.at(None, "/api/x").is_some());
-    }
-
-    #[test]
-    fn host_router_wildcard_and_precedence() {
-        fn url<'a>(r: &'a HostRouter, host: &str, path: &str) -> &'a str {
-            r.at(Some(host), path)
-                .expect("route should resolve")
-                .upstream_url[0]
-                .as_str()
-        }
-        let toml_str = r#"
-[server]
-listen_http = "0.0.0.0:80"
-listen_https = "0.0.0.0:443"
-[tls]
-cert_path = "/tmp/c.pem"
-key_path = "/tmp/k.pem"
-[upstream.exact]
-url = "http://127.0.0.1:8000"
-[upstream.wild]
-url = "http://127.0.0.1:8001"
-[upstream.deep]
-url = "http://127.0.0.1:8002"
-[upstream.shared]
-url = "http://127.0.0.1:9000"
-[[route]]
-path = "/{*rest}"
-hosts = ["api.example.com"]
-upstream = "exact"
-[[route]]
-path = "/{*rest}"
-hosts = ["*.example.com"]
-upstream = "wild"
-[[route]]
-path = "/{*rest}"
-hosts = ["*.api.example.com"]
-upstream = "deep"
-[[route]]
-path = "/{*rest}"
-upstream = "shared"
-"#;
-        let config: ZionConfig = toml::from_str(toml_str).unwrap();
-        let router = build_router(&config).unwrap();
-        assert!(router.active);
-
-        // Exact host beats any wildcard.
-        assert_eq!(
-            url(&router, "api.example.com", "/x"),
-            "http://127.0.0.1:8000"
-        );
-        // A subdomain with no exact entry matches the wildcard.
-        assert_eq!(
-            url(&router, "foo.example.com", "/x"),
-            "http://127.0.0.1:8001"
-        );
-        // The most-specific wildcard wins (`*.api.example.com` > `*.example.com`).
-        assert_eq!(
-            url(&router, "v1.api.example.com", "/x"),
-            "http://127.0.0.1:8002"
-        );
-        // The apex (no leading label) does NOT match `*.example.com` → shared.
-        assert_eq!(url(&router, "example.com", "/x"), "http://127.0.0.1:9000");
-        // An unrelated host → shared.
-        assert_eq!(url(&router, "other.org", "/x"), "http://127.0.0.1:9000");
     }
 }

@@ -67,6 +67,27 @@ pub struct AuditConfig {
     /// so the on-disk ceiling is `max_size_mb * (max_files + 1)`.
     #[serde(default = "default_max_files")]
     pub max_files: usize,
+    /// How often (milliseconds) the active segment is `fsync`ed. Each record is
+    /// flushed to the OS page cache as it is written, which survives `kill -9`
+    /// but not a power loss or kernel crash; this bounds how much a power loss
+    /// can take: at most the records of the last interval. `0` disables the
+    /// periodic sync (the pre-fix behaviour: page cache only). Default 1000. A
+    /// segment is always synced before it is sealed at rotation, and the
+    /// directory is synced after the rename, regardless of this setting.
+    #[serde(default = "default_sync_interval_ms")]
+    pub sync_interval_ms: u64,
+    /// Label for the HMAC key, written into every `chain_init`/`chain_rotate`
+    /// marker (`key_id=...`) so a verifier knows which key signed a chain. Change
+    /// it whenever the key changes. Default: a short fingerprint derived from the
+    /// key (it reveals nothing about the key itself). 1-64 chars of
+    /// `[A-Za-z0-9._-]`.
+    pub key_id: Option<String>,
+    /// Env var holding the *previous* HMAC key during a rotation. It is never used
+    /// to sign; it lets the writer check the tail of a segment written under the
+    /// old key (so `prev_head` stays verified across the rotation) and gives the
+    /// operator one place to keep the outgoing key while old segments are
+    /// verified. Optional.
+    pub previous_key_env: Option<String>,
 }
 
 fn default_key_env() -> String {
@@ -83,6 +104,10 @@ fn default_max_size_mb() -> Option<u64> {
 
 fn default_max_files() -> usize {
     10
+}
+
+fn default_sync_interval_ms() -> u64 {
+    1000
 }
 
 /// `[redact]` block. Lists are case-insensitive. Empty = no redaction.
@@ -359,97 +384,248 @@ impl AuditHandle {
                 observability::AUDIT_EVENTS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 true
             }
-            Err(_) => {
+            // Queue full: back-pressure. The writer is alive and will catch up.
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 observability::AUDIT_EVENTS_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            // Channel closed: the writer has exited (disk full, fd revoked, or
+            // shutdown). Every later event is lost, which is a different failure
+            // from back-pressure and must not look like one. The drop is still
+            // counted; `zion_audit_writer_up == 0` is the explicit signal, and
+            // we log once so it is not only inferable from a rising counter.
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                observability::AUDIT_EVENTS_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                if !WRITER_DEAD_LOGGED.swap(true, Ordering::Relaxed) {
+                    crate::logging::error(
+                        "audit",
+                        "audit writer is not running — every audit event is being dropped (see zion_audit_writer_up)",
+                    );
+                }
                 false
             }
         }
     }
 }
 
-/// Spawn the audit writer. Returns a handle the rest of the system clones
-/// into `AppState`. If `cfg.enabled` is `false` or the key is missing /
-/// path is missing / file open fails, returns a no-op handle and logs a
-/// warning — we never want an audit-config error to block boot.
-pub fn spawn_writer(cfg: &AuditConfig) -> AuditHandle {
+/// Logged once when the writer is found dead; see [`AuditHandle::emit`].
+static WRITER_DEAD_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Smallest accepted HMAC key: the SHA-256 output length (RFC 2104 §3). A shorter
+/// key is guessable, and with it an attacker who can write the log can forge a
+/// valid chain.
+const MIN_KEY_BYTES: usize = 32;
+
+/// Owner of the running writer task. Keep it for the life of the process and call
+/// [`AuditWriter::shutdown`] on the way out: the queue can hold thousands of
+/// events, and without an explicit stop the runtime is dropped and the task
+/// aborted before it drains them.
+pub struct AuditWriter {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl AuditWriter {
+    /// Stop accepting events, let the writer drain everything already queued,
+    /// flush and fsync, then wait for it to exit — at most `timeout`. Returns
+    /// `true` if it finished in time.
+    pub async fn shutdown(mut self, timeout: std::time::Duration) -> bool {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(());
+        }
+        tokio::time::timeout(timeout, &mut self.join).await.is_ok()
+    }
+}
+
+/// Load an HMAC key from `env_name`. `Ok(None)` if the variable is unset or
+/// empty; the bytes are wiped from our copy on drop.
+fn load_key_bytes(env_name: &str) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+    match std::env::var(env_name) {
+        Ok(s) if !s.is_empty() => Some(zeroize::Zeroizing::new(s.into_bytes())),
+        _ => None,
+    }
+}
+
+/// Default `key_id`: a short fingerprint derived from the key. It is an HMAC of a
+/// fixed label under the key, so it identifies the key without revealing it.
+fn derive_key_id(key: &hmac::Key) -> String {
+    let tag = hmac::sign(key, b"ZION-AUDIT-KEY-ID-V1");
+    hex_encode(&tag.as_ref()[..8])
+}
+
+/// Spawn the audit writer. Returns the handle the rest of the system clones into
+/// `AppState`, and the [`AuditWriter`] to shut down on exit. `(noop, None)` when
+/// `cfg.enabled` is `false`.
+///
+/// When audit IS enabled, a missing path, a missing/empty key, or a key shorter
+/// than 32 bytes is an `Err`: the operator asked for a tamper-evident trail, and
+/// booting without one because of a typo in `key_env` or a missing secret mount
+/// would silently remove it. The caller refuses to start.
+pub fn spawn_writer(cfg: &AuditConfig) -> Result<(AuditHandle, Option<AuditWriter>), String> {
     if !cfg.enabled {
-        return AuditHandle::noop();
+        return Ok((AuditHandle::noop(), None));
     }
 
-    let path = match cfg.path.as_deref() {
-        Some(p) => p.to_string(),
-        None => {
-            crate::logging::warn(
-                "audit",
-                "audit.enabled=true but audit.path not set — disabling audit log",
-            );
-            return AuditHandle::noop();
-        }
-    };
+    let path = cfg
+        .path
+        .clone()
+        .ok_or("[audit] enabled = true but audit.path is not set")?;
 
-    let key_bytes = match std::env::var(&cfg.key_env) {
-        Ok(s) if !s.is_empty() => s.into_bytes(),
-        _ => {
-            crate::logging::warn(
-                "audit",
-                &format!(
-                    "audit.enabled=true but env var {} is empty/unset — disabling audit log",
-                    cfg.key_env
-                ),
-            );
-            return AuditHandle::noop();
-        }
-    };
-
-    // RFC 2104 recommends the key be at least the hash output length (32B
-    // for SHA-256). Shorter keys are accepted but reduce the security
-    // ceiling — surface a warning so an operator can fix it.
-    if key_bytes.len() < 32 {
-        crate::logging::warn(
-            "audit",
-            &format!(
-                "audit HMAC key is {} bytes; recommended minimum is 32 (HMAC-SHA256 block-size). Continuing.",
-                key_bytes.len()
-            ),
-        );
+    let key_bytes = load_key_bytes(&cfg.key_env).ok_or_else(|| {
+        format!(
+            "[audit] enabled = true but env var {} is empty or unset — refusing to start without the audit HMAC key",
+            cfg.key_env
+        )
+    })?;
+    if key_bytes.len() < MIN_KEY_BYTES {
+        return Err(format!(
+            "[audit] HMAC key in {} is {} bytes; the minimum is {MIN_KEY_BYTES} (HMAC-SHA256 output size)",
+            cfg.key_env,
+            key_bytes.len()
+        ));
     }
-
     let key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
+
+    let key_id = match cfg.key_id.as_deref() {
+        Some(id) => {
+            let ok = !id.is_empty()
+                && id.len() <= 64
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+            if !ok {
+                return Err(format!(
+                    "[audit] key_id {id:?} must be 1-64 characters of [A-Za-z0-9._-]"
+                ));
+            }
+            id.to_string()
+        }
+        None => derive_key_id(&key),
+    };
+
+    // Optional previous key (rotation overlap). Absent/short is a warning, not an
+    // error: the current key is what signs, and `prev_head` simply reads
+    // `unverified` across the rotation.
+    let previous_key = cfg.previous_key_env.as_deref().and_then(|env| {
+        match load_key_bytes(env) {
+            Some(b) if b.len() >= MIN_KEY_BYTES => Some(hmac::Key::new(hmac::HMAC_SHA256, &b)),
+            Some(b) => {
+                crate::logging::warn(
+                    "audit",
+                    &format!("audit previous key in {env} is {} bytes (< {MIN_KEY_BYTES}) — ignoring it", b.len()),
+                );
+                None
+            }
+            None => {
+                crate::logging::warn(
+                    "audit",
+                    &format!("audit previous_key_env {env} is empty/unset — the previous chain cannot be checked across the key rotation"),
+                );
+                None
+            }
+        }
+    });
+
     let (tx, rx) = tokio::sync::mpsc::channel::<AuditEvent>(cfg.queue_depth);
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
     // `max_size_mb = None` or `0` disables rotation (unbounded); otherwise the
     // active segment rotates once it crosses the byte cap.
-    let max_size_bytes = cfg
-        .max_size_mb
-        .filter(|&mb| mb > 0)
-        .map(|mb| mb.saturating_mul(1024 * 1024));
-    tokio::spawn(writer_loop(path, key, rx, max_size_bytes, cfg.max_files));
+    let opts = WriterOpts {
+        max_size_bytes: cfg
+            .max_size_mb
+            .filter(|&mb| mb > 0)
+            .map(|mb| mb.saturating_mul(1024 * 1024)),
+        max_files: cfg.max_files,
+        sync_interval: (cfg.sync_interval_ms > 0)
+            .then(|| std::time::Duration::from_millis(cfg.sync_interval_ms)),
+        key_id,
+        previous_key,
+    };
+    observability::AUDIT_ENABLED.store(1, Ordering::Relaxed);
+    let join = tokio::spawn(writer_loop(path, key, rx, stop_rx, opts));
 
-    AuditHandle { inner: Some(tx) }
+    Ok((
+        AuditHandle { inner: Some(tx) },
+        Some(AuditWriter {
+            stop: Some(stop_tx),
+            join,
+        }),
+    ))
+}
+
+/// Everything the writer needs besides the path, key and channels.
+struct WriterOpts {
+    max_size_bytes: Option<u64>,
+    max_files: usize,
+    sync_interval: Option<std::time::Duration>,
+    key_id: String,
+    previous_key: Option<hmac::Key>,
+}
+
+/// Marks the writer as down on every exit path, including a panic.
+struct WriterUpGuard;
+impl WriterUpGuard {
+    fn up() -> Self {
+        observability::AUDIT_WRITER_UP.store(1, Ordering::Relaxed);
+        Self
+    }
+}
+impl Drop for WriterUpGuard {
+    fn drop(&mut self) {
+        observability::AUDIT_WRITER_UP.store(0, Ordering::Relaxed);
+    }
+}
+
+fn note_write_failure() {
+    observability::AUDIT_WRITE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+fn note_write_ok() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    observability::AUDIT_LAST_WRITE_TIMESTAMP_SECONDS.store(now, Ordering::Relaxed);
 }
 
 async fn writer_loop(
     path: String,
     key: hmac::Key,
     mut rx: tokio::sync::mpsc::Receiver<AuditEvent>,
-    max_size_bytes: Option<u64>,
-    max_files: usize,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+    opts: WriterOpts,
 ) {
     use tokio::io::AsyncWriteExt;
 
+    let WriterOpts {
+        max_size_bytes,
+        max_files,
+        sync_interval,
+        key_id,
+        previous_key,
+    } = opts;
+
     // Open the initial segment and anchor the chain. Mirrors the process-restart
-    // model: a fresh chain from genesis + a boundary marker (we never continue
-    // from an on-disk tail — that would mean trusting an unverified value).
+    // model: a fresh chain from genesis + a boundary marker. The marker records
+    // the verified head of any chain already on disk (`prev_head=`), so a
+    // verifier can check continuity without the writer trusting the tail.
     let Some((mut file, mut prev_hash, mut bytes_written)) = open_and_anchor(
         &path,
         &key,
+        previous_key.as_ref(),
+        &key_id,
         "chain_init",
         "audit chain initialized at process start",
     )
     .await
     else {
+        note_write_failure();
         return; // fatal open error already logged
     };
+    // From here until this task ends the writer counts as up (also on panic).
+    let _up = WriterUpGuard::up();
 
     let mut seq: u64 = 1;
     // Tracks whether flush is currently failing, so we log the degraded↔healthy
@@ -468,8 +644,61 @@ async fn writer_loop(
     // false, so an opt-out deployment keeps its intended unbounded behaviour.)
     let mut rotation_broken = false;
     let mut shed_logged = false;
+    // Durability (ZION-DATA-01): `dirty` = records flushed to the OS page cache
+    // but not yet fsynced; `last_sync` anchors the interval. A power loss can
+    // then take at most `sync_interval` of records instead of an unbounded tail.
+    let mut dirty = false;
+    let mut last_sync = std::time::Instant::now();
+    let mut sync_degraded = false;
 
-    while let Some(mut event) = rx.recv().await {
+    // Set once `AuditWriter::shutdown` fires: the queue is closed to new events
+    // but everything already in it is still written before the task exits.
+    let mut stopping = false;
+
+    enum Wake {
+        Event(Option<AuditEvent>),
+        SyncDue,
+        Stop,
+    }
+
+    loop {
+        if let Some(iv) = sync_interval {
+            if dirty && last_sync.elapsed() >= iv {
+                sync_active(&mut file, &mut sync_degraded).await;
+                dirty = false;
+                last_sync = std::time::Instant::now();
+            }
+        }
+        // While records are unsynced, wake at the sync deadline even if no event
+        // arrives, so an idle log still reaches stable storage.
+        let wait = match (dirty, sync_interval) {
+            (true, Some(iv)) => Some(iv.saturating_sub(last_sync.elapsed())),
+            _ => None,
+        };
+        let wake = tokio::select! {
+            biased;
+            // A dropped sender counts as a stop too.
+            _ = &mut stop, if !stopping => Wake::Stop,
+            w = async {
+                match wait {
+                    Some(w) => match tokio::time::timeout(w, rx.recv()).await {
+                        Ok(ev) => Wake::Event(ev),
+                        Err(_) => Wake::SyncDue,
+                    },
+                    None => Wake::Event(rx.recv().await),
+                }
+            } => w,
+        };
+        let mut event = match wake {
+            Wake::Stop => {
+                rx.close(); // no new events; queued ones still drain via recv()
+                stopping = true;
+                continue;
+            }
+            Wake::SyncDue => continue,  // the check above syncs
+            Wake::Event(None) => break, // closed and drained
+            Wake::Event(Some(e)) => e,
+        };
         // Shed when a configured rotation has broken and the segment is already
         // at/over its cap: drop the event (counted) instead of appending and
         // growing the file without bound. Self-heals only on restart — the
@@ -501,6 +730,7 @@ async fn writer_loop(
                     if file.write_all(line.as_bytes()).await.is_err() {
                         // Terminal: the buffer can't even accept the record
                         // (disk full / fd revoked). Stop rather than spin.
+                        note_write_failure();
                         crate::logging::error(
                             "audit",
                             "audit log write failed — buffer cannot accept data (disk full / fd revoked), exiting writer",
@@ -510,19 +740,19 @@ async fn writer_loop(
                     prev_hash = new_prev;
                     seq += 1;
                     bytes_written += line.len() as u64;
-                    // Flush each event — durability over throughput, but note
-                    // the scope: `BufWriter::flush` pushes bytes to the OS page
-                    // cache, not to stable storage. This survives a process
-                    // kill -9 (the kernel keeps the bytes) but NOT a power loss
-                    // or kernel crash, which can drop not-yet-synced records.
-                    // That is a deliberate throughput trade-off; add an
-                    // `sync_data` here (or open O_SYNC) if media durability is
-                    // required. A flush failure (transient ENOSPC, slow network
-                    // FS) does NOT kill the writer: the record stays buffered
-                    // and a later flush retries it, so audit self-heals once the
-                    // disk recovers. Log the degraded↔healthy transition once.
+                    // Flush each event to the OS page cache. That survives a
+                    // process kill -9 (the kernel keeps the bytes) but not a
+                    // power loss or kernel crash, so the periodic `sync_active`
+                    // above bounds the exposure to `sync_interval` (and rotation
+                    // always syncs before sealing). A flush failure (transient
+                    // ENOSPC, slow network FS) does NOT kill the writer: the
+                    // record stays buffered and a later flush retries it, so
+                    // audit self-heals once the disk recovers. Log the
+                    // degraded↔healthy transition once.
                     match file.flush().await {
                         Ok(()) => {
+                            dirty = true;
+                            note_write_ok();
                             if flush_degraded {
                                 crate::logging::warn(
                                     "audit",
@@ -532,6 +762,7 @@ async fn writer_loop(
                             }
                         }
                         Err(e) => {
+                            note_write_failure();
                             if !flush_degraded {
                                 crate::logging::error(
                                     "audit",
@@ -567,11 +798,23 @@ async fn writer_loop(
                             &format!("audit log flush before rotation failed ({e}) — buffered records in the outgoing segment may be lost"),
                         );
                     }
+                    // The outgoing segment is about to be renamed away for good,
+                    // so make it durable first — independent of `sync_interval`.
+                    if let Err(e) = file.get_ref().sync_data().await {
+                        crate::logging::warn(
+                            "audit",
+                            &format!("audit log fsync before rotation failed ({e}) — the sealed segment may not survive a power loss"),
+                        );
+                    }
+                    dirty = false;
+                    last_sync = std::time::Instant::now();
                     let _ = file.shutdown().await; // best-effort close of the outgoing fd
                     match rotate_paths(&path, max_files).await {
                         Ok(rotated_to) => match open_and_anchor(
                             &path,
                             &key,
+                            previous_key.as_ref(),
+                            &key_id,
                             "chain_rotate",
                             &format!("audit chain re-anchored after size rotation → {rotated_to}"),
                         )
@@ -605,6 +848,8 @@ async fn writer_loop(
                             match open_and_anchor(
                                 &path,
                                 &key,
+                                previous_key.as_ref(),
+                                &key_id,
                                 "chain_init",
                                 "audit chain re-anchored (rotation failed; resuming on the current segment)",
                             )
@@ -628,26 +873,200 @@ async fn writer_loop(
     }
     if file.flush().await.is_err() {
         crate::logging::warn("audit", "final audit log flush failed on writer shutdown");
+    } else if dirty {
+        sync_active(&mut file, &mut sync_degraded).await;
     }
 }
 
+/// Flush and `fsync` the active segment so its records reach stable storage.
+/// Best-effort: a failure is logged once per degraded stretch and the writer
+/// keeps going (the records stay in the page cache, as before this existed).
+async fn sync_active(file: &mut tokio::io::BufWriter<tokio::fs::File>, degraded: &mut bool) {
+    use tokio::io::AsyncWriteExt;
+    let res = match file.flush().await {
+        Ok(()) => file.get_ref().sync_data().await,
+        Err(e) => Err(e),
+    };
+    match res {
+        Ok(()) => {
+            if *degraded {
+                crate::logging::warn("audit", "audit log fsync recovered — durability restored");
+                *degraded = false;
+            }
+        }
+        Err(e) => {
+            note_write_failure();
+            if !*degraded {
+                crate::logging::error(
+                    "audit",
+                    &format!("audit log fsync failing ({e}) — records are in the page cache but not durable against power loss"),
+                );
+                *degraded = true;
+            }
+        }
+    }
+}
+
+/// Best-effort `fsync` of `path`'s parent directory so a `rename` into it
+/// survives power loss. A filesystem that refuses to sync a directory handle must
+/// not fail an otherwise-successful rotation.
+async fn fsync_parent_dir(path: &str) {
+    let dir = std::path::Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    if let Ok(f) = tokio::fs::File::open(dir).await {
+        let _ = f.sync_all().await;
+    }
+}
+
+/// What the tail of an existing segment says about the chain written before this
+/// open (ZION-DATA-04).
+#[derive(Debug, PartialEq, Eq)]
+enum PrevHead {
+    /// New or empty segment: nothing precedes this anchor.
+    Empty,
+    /// The last record is well-formed and its HMAC verifies under our key.
+    Verified {
+        hmac: String,
+        seq: u64,
+        /// True when it verified under the previous (rotated-out) key.
+        previous_key: bool,
+    },
+    /// The segment has content but its last line is not a valid signed record:
+    /// a torn write, tampering, or a different HMAC key.
+    Unverified,
+}
+
+/// How much of the segment's end is read to find its last record. Records are a
+/// few hundred bytes; a line that does not fit is treated as unverifiable.
+const TAIL_WINDOW: u64 = 64 * 1024;
+
+/// Judge the last record in `tail` (the final bytes of a segment). Pure, so it is
+/// unit-tested without a filesystem. `at_file_start` says whether `tail` begins at
+/// byte 0 — if not, a first line without a preceding newline may be cut off.
+fn verify_tail(
+    key: &hmac::Key,
+    prev_key: Option<&hmac::Key>,
+    tail: &[u8],
+    at_file_start: bool,
+) -> PrevHead {
+    match verify_tail_with(key, tail, at_file_start) {
+        PrevHead::Unverified => match prev_key {
+            Some(pk) => match verify_tail_with(pk, tail, at_file_start) {
+                PrevHead::Verified { hmac, seq, .. } => PrevHead::Verified {
+                    hmac,
+                    seq,
+                    previous_key: true,
+                },
+                other => other,
+            },
+            None => PrevHead::Unverified,
+        },
+        other => other,
+    }
+}
+
+fn verify_tail_with(key: &hmac::Key, tail: &[u8], at_file_start: bool) -> PrevHead {
+    if tail.is_empty() {
+        return PrevHead::Empty;
+    }
+    // Every record is written as one line ending in `\n`; a tail that does not end
+    // in one was cut mid-write.
+    if tail.last() != Some(&b'\n') {
+        return PrevHead::Unverified;
+    }
+    let Ok(text) = std::str::from_utf8(tail) else {
+        return PrevHead::Unverified;
+    };
+    let body = text.trim_end_matches('\n');
+    let (line, complete) = match body.rfind('\n') {
+        Some(i) => (&body[i + 1..], true),
+        None => (body, at_file_start), // no newline before it: complete only from byte 0
+    };
+    if !complete || line.is_empty() {
+        return PrevHead::Unverified;
+    }
+    // Records serialize as `{<event fields>,"prev_hash":"..","hmac":".."}`, so the
+    // signed canonical JSON is everything before `,"prev_hash"` plus a `}`.
+    let Some(split) = line.rfind(",\"prev_hash\":\"") else {
+        return PrevHead::Unverified;
+    };
+    let event_json = format!("{}}}", &line[..split]);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return PrevHead::Unverified;
+    };
+    let (Some(prev), Some(mac), Some(seq)) = (
+        v["prev_hash"].as_str(),
+        v["hmac"].as_str(),
+        v["seq"].as_u64(),
+    ) else {
+        return PrevHead::Unverified;
+    };
+    let expected = compute_hmac(key, &event_json, prev);
+    if aws_lc_rs::constant_time::verify_slices_are_equal(expected.as_bytes(), mac.as_bytes())
+        .is_ok()
+    {
+        PrevHead::Verified {
+            hmac: mac.to_string(),
+            seq,
+            previous_key: false,
+        }
+    } else {
+        PrevHead::Unverified
+    }
+}
+
+/// Read the last [`TAIL_WINDOW`] bytes of `file` and judge them. The bool is
+/// true when the segment ends mid-line (no trailing `\n`), so the caller can
+/// terminate that fragment before appending the next record to it.
+async fn read_prev_head(
+    file: &mut tokio::fs::File,
+    len: u64,
+    key: &hmac::Key,
+    prev_key: Option<&hmac::Key>,
+) -> (PrevHead, bool) {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    if len == 0 {
+        return (PrevHead::Empty, false);
+    }
+    let start = len.saturating_sub(TAIL_WINDOW);
+    let mut buf = vec![0u8; (len - start) as usize];
+    if file.seek(std::io::SeekFrom::Start(start)).await.is_err()
+        || file.read_exact(&mut buf).await.is_err()
+    {
+        return (PrevHead::Unverified, false);
+    }
+    let torn = buf.last() != Some(&b'\n');
+    (verify_tail(key, prev_key, &buf, start == 0), torn)
+}
+
 /// Open (create + append) the segment at `path` and write a re-anchor marker so
-/// verifiers see the boundary — the same fresh-chain-from-genesis model used at
-/// process restart. Returns `(writer, chain_head_hash, current_segment_bytes)`,
-/// or `None` on a fatal open error (already logged). If the marker itself can't
-/// be written, the writer is still returned with the chain head at genesis
-/// (matching the pre-rotation degraded behavior).
+/// verifiers see the boundary. The new chain still starts at genesis (each
+/// segment verifies independently, ADR-0017), but the signed marker records the
+/// verified head of whatever chain already sits at the end of the file
+/// (`prev_head=<hmac>; prev_seq=<n>`, or `none` / `unverified`). A verifier can
+/// therefore check that the previous chain ends where the marker says it does,
+/// which makes a truncated or removed tail detectable across restarts — without
+/// this writer ever *continuing* a chain from an unverified value. Returns
+/// `(writer, chain_head_hash, current_segment_bytes)`, or `None` on a fatal open
+/// error (already logged). If the marker itself can't be written, the writer is
+/// still returned with the chain head at genesis (the pre-rotation degraded
+/// behaviour).
 async fn open_and_anchor(
     path: &str,
     key: &hmac::Key,
+    prev_key: Option<&hmac::Key>,
+    key_id: &str,
     kind: &'static str,
     context: &str,
 ) -> Option<(tokio::io::BufWriter<tokio::fs::File>, String, u64)> {
     use tokio::io::AsyncWriteExt;
 
-    let file = match tokio::fs::OpenOptions::new()
+    let mut file = match tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .read(true) // to inspect the existing tail; writes still append
         .open(path)
         .await
     {
@@ -663,6 +1082,28 @@ async fn open_and_anchor(
     // A pre-existing file (a restart onto an old segment) already carries bytes;
     // count them so rotation still fires on schedule instead of never.
     let existing = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let (prev, torn_tail) = read_prev_head(&mut file, existing, key, prev_key).await;
+    let prev_note = match &prev {
+        PrevHead::Empty => "prev_head=none".to_string(),
+        PrevHead::Verified {
+            hmac,
+            seq,
+            previous_key: false,
+        } => format!("prev_head={hmac}; prev_seq={seq}"),
+        // Signed under the outgoing key: still verified, and a verifier is told which key to use.
+        PrevHead::Verified {
+            hmac,
+            seq,
+            previous_key: true,
+        } => format!("prev_head={hmac}; prev_seq={seq}; prev_key=previous"),
+        PrevHead::Unverified => {
+            crate::logging::warn(
+                "audit",
+                &format!("audit log {path}: the last record is not a valid signed record (torn write, tampering, or a different HMAC key) — anchoring a fresh chain and recording prev_head=unverified"),
+            );
+            "prev_head=unverified".to_string()
+        }
+    };
     let mut file = tokio::io::BufWriter::new(file);
 
     let genesis = genesis_hash(key);
@@ -674,13 +1115,21 @@ async fn open_and_anchor(
         remote_ip: None,
         method: None,
         path: None,
-        detail: Some(format!("{context}; genesis={}", &genesis[..16])),
+        detail: Some(format!(
+            "{context}; genesis={}; key_id={key_id}; {prev_note}",
+            &genesis[..16]
+        )),
     };
     let mut head = genesis.clone();
     let mut bytes = existing;
     if let Ok((signed, new_prev)) = sign_event(key, init, genesis) {
         if let Ok(mut line) = serde_json::to_string(&signed) {
             line.push('\n'); // one all-or-nothing record write (no orphaned line)
+            if torn_tail {
+                // The previous run died mid-record. Terminate that fragment so the
+                // marker starts on its own line and stays parseable.
+                line.insert(0, '\n');
+            }
             if file.write_all(line.as_bytes()).await.is_ok() && file.flush().await.is_ok() {
                 head = new_prev;
                 bytes += line.len() as u64;
@@ -710,6 +1159,8 @@ async fn rotate_paths(path: &str, max_files: usize) -> std::io::Result<String> {
         rotated = format!("{path}.{stamp}.{n}");
     }
     tokio::fs::rename(path, &rotated).await?;
+    // Make the rename itself durable, not just the file's contents.
+    fsync_parent_dir(path).await;
     prune_old_segments(path, max_files).await;
     Ok(rotated)
 }
@@ -945,7 +1396,7 @@ mod tests {
             queue_depth: 16,
             ..Default::default()
         };
-        let h = spawn_writer(&cfg);
+        let (h, _writer) = spawn_writer(&cfg).expect("writer starts");
         assert!(h.emit(AuditEvent {
             seq: 0, // will be overwritten by writer
             ts: String::new(),
@@ -984,10 +1435,374 @@ mod tests {
         panic!("writer did not emit two lines within 1s");
     }
 
+    // ── Boot policy, key identity, shutdown (ZION-SEC-01/02/04, CONC-01/02) ─
+
+    fn spawn_err(cfg: &AuditConfig) -> String {
+        match spawn_writer(cfg) {
+            Ok(_) => panic!("spawn_writer was expected to refuse this config"),
+            Err(e) => e,
+        }
+    }
+
+    fn cfg_for(path: &std::path::Path, key_env: &str) -> AuditConfig {
+        AuditConfig {
+            enabled: true,
+            path: Some(path.to_string_lossy().into_owned()),
+            key_env: key_env.into(),
+            queue_depth: 512,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_audit_refuses_to_start_without_a_valid_key() {
+        let dir = tempdir();
+        let path = dir.join("audit.log");
+
+        // disabled: nothing to do, not an error
+        let (h, w) = spawn_writer(&AuditConfig::default()).expect("disabled is fine");
+        assert!(w.is_none() && !h.emit(make_event(1, "x")));
+
+        // no path
+        let mut c = cfg_for(&path, "ZION_TEST_SEC01_A");
+        c.path = None;
+        assert!(spawn_err(&c).contains("audit.path"));
+
+        // key env unset -> error naming the variable (the typo-in-key_env case)
+        std::env::remove_var("ZION_TEST_SEC01_MISSING");
+        let e = spawn_err(&cfg_for(&path, "ZION_TEST_SEC01_MISSING"));
+        assert!(
+            e.contains("ZION_TEST_SEC01_MISSING") && e.contains("refusing to start"),
+            "{e}"
+        );
+
+        // empty key -> same
+        std::env::set_var("ZION_TEST_SEC01_EMPTY", "");
+        assert!(spawn_writer(&cfg_for(&path, "ZION_TEST_SEC01_EMPTY")).is_err());
+
+        // 31 bytes is too short, 32 is accepted
+        std::env::set_var("ZION_TEST_SEC04_SHORT", "x".repeat(31));
+        let e = spawn_err(&cfg_for(&path, "ZION_TEST_SEC04_SHORT"));
+        assert!(e.contains("31 bytes") && e.contains("minimum is 32"), "{e}");
+        std::env::set_var("ZION_TEST_SEC04_OK", "x".repeat(32));
+        let (_h, w) =
+            spawn_writer(&cfg_for(&path, "ZION_TEST_SEC04_OK")).expect("32 bytes is fine");
+        assert!(w.unwrap().shutdown(std::time::Duration::from_secs(5)).await);
+
+        // key_id must be a simple label
+        std::env::set_var("ZION_TEST_SEC02_KEY", "k".repeat(40));
+        for bad in ["", "has space", "semi;colon", &"a".repeat(65)] {
+            let mut c = cfg_for(&path, "ZION_TEST_SEC02_KEY");
+            c.key_id = Some(bad.to_string());
+            assert!(spawn_err(&c).contains("key_id"), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn marker_names_the_signing_key() {
+        std::env::set_var("ZION_TEST_SEC02_MARK", "m".repeat(40));
+        // configured label
+        let dir = tempdir();
+        let path = dir.join("audit.log");
+        let mut c = cfg_for(&path, "ZION_TEST_SEC02_MARK");
+        c.key_id = Some("2026-10".into());
+        let (_h, w) = spawn_writer(&c).unwrap();
+        assert!(w.unwrap().shutdown(std::time::Duration::from_secs(5)).await);
+        assert!(
+            marker_details(&path)[0].contains("key_id=2026-10;"),
+            "{:?}",
+            marker_details(&path)
+        );
+
+        // default: a 16-hex fingerprint that does not contain the key
+        let dir = tempdir();
+        let path = dir.join("audit.log");
+        let (_h, w) = spawn_writer(&cfg_for(&path, "ZION_TEST_SEC02_MARK")).unwrap();
+        assert!(w.unwrap().shutdown(std::time::Duration::from_secs(5)).await);
+        let d = marker_details(&path).remove(0);
+        let id = d
+            .split("key_id=")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        assert_eq!(id.len(), 16);
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!d.contains(&"m".repeat(40)));
+    }
+
+    #[test]
+    fn previous_key_keeps_the_tail_verifiable_across_a_rotation() {
+        let old = test_key();
+        let new = hmac::Key::new(hmac::HMAC_SHA256, b"rotated-in-32-byte-secret-key-xxx");
+        let (line, mac) = signed_line(&old, 3, &genesis_hash(&old));
+        // Without the outgoing key the old chain cannot be checked...
+        assert_eq!(
+            verify_tail(&new, None, line.as_bytes(), true),
+            PrevHead::Unverified
+        );
+        // ...with it, the head is verified and flagged as signed by the previous key.
+        assert_eq!(
+            verify_tail(&new, Some(&old), line.as_bytes(), true),
+            PrevHead::Verified {
+                hmac: mac,
+                seq: 3,
+                previous_key: true
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_every_queued_event_before_exiting() {
+        std::env::set_var("ZION_TEST_CONC01_KEY", "d".repeat(40));
+        let dir = tempdir();
+        let path = dir.join("audit.log");
+        let (h, w) = spawn_writer(&cfg_for(&path, "ZION_TEST_CONC01_KEY")).unwrap();
+        for i in 0..300 {
+            let mut e = make_event(0, "auth_success");
+            e.detail = Some(format!("queued-{i}"));
+            assert!(h.emit(e));
+        }
+        // Stop straight away: the queue is not empty yet. Everything in it must
+        // still reach the file, and the writer must exit within the timeout.
+        assert!(
+            w.unwrap()
+                .shutdown(std::time::Duration::from_secs(10))
+                .await
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 1 + 300, "chain_init + all 300 events");
+        assert!(
+            text.contains("queued-299"),
+            "the newest event must not be lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_writer_is_told_apart_from_a_full_queue() {
+        std::env::set_var("ZION_TEST_CONC02_KEY", "e".repeat(40));
+        let dir = tempdir();
+        let path = dir.join("audit.log");
+        let (h, w) = spawn_writer(&cfg_for(&path, "ZION_TEST_CONC02_KEY")).unwrap();
+        assert!(w.unwrap().shutdown(std::time::Duration::from_secs(5)).await);
+        let before = observability::AUDIT_EVENTS_DROPPED_TOTAL.load(Ordering::Relaxed);
+        // The channel is closed now: emit fails and is still counted as dropped.
+        assert!(!h.emit(make_event(1, "auth_success")));
+        assert!(observability::AUDIT_EVENTS_DROPPED_TOTAL.load(Ordering::Relaxed) > before);
+        // (the writer-down gauge itself is process-global, so it is asserted in
+        // the metrics render test, not here where tests run in parallel)
+    }
+
+    // ── Chain continuity across restarts (ZION-DATA-04) ─────────────────
+
+    fn signed_line(key: &hmac::Key, seq: u64, prev: &str) -> (String, String) {
+        let (signed, mac) =
+            sign_event(key, make_event(seq, "auth_success"), prev.to_string()).expect("sign");
+        let mut line = serde_json::to_string(&signed).unwrap();
+        line.push('\n');
+        (line, mac)
+    }
+
+    #[test]
+    fn verify_tail_accepts_a_valid_last_record() {
+        let key = test_key();
+        let genesis = genesis_hash(&key);
+        let (l1, h1) = signed_line(&key, 1, &genesis);
+        let (l2, h2) = signed_line(&key, 2, &h1);
+        let both = format!("{l1}{l2}");
+        assert_eq!(
+            verify_tail(&key, None, both.as_bytes(), true),
+            PrevHead::Verified {
+                hmac: h2,
+                seq: 2,
+                previous_key: false
+            }
+        );
+    }
+
+    #[test]
+    fn verify_tail_flags_torn_wrong_key_and_garbage() {
+        let key = test_key();
+        let (l1, _) = signed_line(&key, 1, &genesis_hash(&key));
+        assert_eq!(verify_tail(&key, None, b"", true), PrevHead::Empty);
+        // cut mid-record: no trailing newline
+        assert_eq!(
+            verify_tail(&key, None, l1.trim_end().as_bytes(), true),
+            PrevHead::Unverified
+        );
+        // valid shape, different HMAC key
+        let other = hmac::Key::new(hmac::HMAC_SHA256, b"another-32-byte-secret-key-xxxxxx");
+        assert_eq!(
+            verify_tail(&other, None, l1.as_bytes(), true),
+            PrevHead::Unverified
+        );
+        // not JSON at all
+        assert_eq!(
+            verify_tail(&key, None, b"hello world\n", true),
+            PrevHead::Unverified
+        );
+        // tampered field breaks the MAC
+        let forged = l1.replace("auth_success", "auth_failure");
+        assert_eq!(
+            verify_tail(&key, None, forged.as_bytes(), true),
+            PrevHead::Unverified
+        );
+        // a lone line that may have been cut off at the window start is not trusted
+        assert_eq!(
+            verify_tail(&key, None, l1.as_bytes(), false),
+            PrevHead::Unverified
+        );
+    }
+
+    fn marker_details(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["kind"] == "chain_init")
+            .map(|v| v["detail"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn restart_marker_records_the_previous_chain_head() {
+        let dir = tempdir();
+        let path = run_writer(&dir, None, 0, 3).await;
+        let last: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        // Second process start onto the same segment.
+        let path = run_writer(&dir, None, 0, 1).await;
+        let m = marker_details(&path);
+        assert_eq!(m.len(), 2, "one chain_init per process start");
+        assert!(m[0].contains("prev_head=none"), "fresh file: {}", m[0]);
+        let want = format!("prev_head={}; prev_seq=3", last["hmac"].as_str().unwrap());
+        assert!(
+            m[1].contains(&want),
+            "marker must carry the old head: {}",
+            m[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn torn_tail_is_flagged_and_does_not_corrupt_the_marker() {
+        let dir = tempdir();
+        let path = run_writer(&dir, None, 0, 2).await;
+        // Simulate a crash mid-record: a fragment with no trailing newline.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(br#"{"seq":9,"ts":"2026-01-01T00:00:0"#)
+                .unwrap();
+        }
+        let path = run_writer(&dir, None, 0, 1).await;
+        let m = marker_details(&path);
+        assert_eq!(
+            m.len(),
+            2,
+            "the marker after the torn tail must still parse"
+        );
+        assert!(m[1].contains("prev_head=unverified"), "{}", m[1]);
+        // and the fragment sits on its own line, not glued to the marker
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text
+            .lines()
+            .any(|l| l.starts_with(r#"{"seq":9,"ts":"2026-01-01T00:00:0"#)
+                && !l.contains("chain_init")));
+    }
+
+    // ── Durability (ZION-DATA-01) ─────────────────────────────────────────
+
+    #[test]
+    fn sync_interval_defaults_to_one_second_and_can_be_disabled() {
+        let d: AuditConfig = toml::from_str("enabled = true").unwrap();
+        assert_eq!(d.sync_interval_ms, 1000);
+        let off: AuditConfig = toml::from_str("enabled = true\nsync_interval_ms = 0").unwrap();
+        assert_eq!(off.sync_interval_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn periodic_sync_keeps_the_writer_alive_across_idle_gaps() {
+        // Exercises the idle-deadline branch: events, a gap longer than the sync
+        // interval (the writer must wake on its own and fsync), then more events.
+        // fsync itself is not observable from here; what is checked is that the
+        // timed path neither loses records nor hangs the writer.
+        let dir = tempdir();
+        let path = dir.join("audit.log");
+        let key = hmac::Key::new(hmac::HMAC_SHA256, b"this-is-a-32-byte-test-secret!ab");
+        let (tx, rx) = tokio::sync::mpsc::channel::<AuditEvent>(64);
+        let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let jh = tokio::spawn(writer_loop(
+            path.to_string_lossy().into_owned(),
+            key,
+            rx,
+            stop_rx,
+            test_opts(None, 0, Some(std::time::Duration::from_millis(20))),
+        ));
+        for round in 0..3 {
+            for i in 0..3 {
+                let mut e = make_event(0, "auth_success");
+                e.detail = Some(format!("r{round}-e{i}"));
+                tx.send(e).await.unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        }
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), jh)
+            .await
+            .expect("writer must exit after the channel closes")
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            1 + 9,
+            "chain_init + 9 events, none lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_syncs_the_directory_and_keeps_every_event() {
+        // The seal path now fsyncs the outgoing segment and the directory; it must
+        // still lose nothing and leave a parseable active segment.
+        let dir = tempdir();
+        let path = run_writer(&dir, Some(600), 5, 12).await;
+        assert!(
+            !rotated_segments(&dir).is_empty(),
+            "rotation must have fired"
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()));
+    }
+
     // ── Rotation (issue #288) ────────────────────────────────────────────
     // Drive `writer_loop` directly with a tiny *byte* cap (spawn_writer's
     // MB→bytes conversion is bypassed) so rotation fires in a handful of
     // events — deterministic and fast.
+
+    fn test_opts(
+        max_size_bytes: Option<u64>,
+        max_files: usize,
+        sync_interval: Option<std::time::Duration>,
+    ) -> WriterOpts {
+        WriterOpts {
+            max_size_bytes,
+            max_files,
+            sync_interval,
+            key_id: "test-key".into(),
+            previous_key: None,
+        }
+    }
 
     async fn run_writer(
         dir: &std::path::Path,
@@ -998,12 +1813,13 @@ mod tests {
         let path = dir.join("audit.log");
         let key = hmac::Key::new(hmac::HMAC_SHA256, b"this-is-a-32-byte-test-secret!ab");
         let (tx, rx) = tokio::sync::mpsc::channel::<AuditEvent>(256);
+        let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let jh = tokio::spawn(writer_loop(
             path.to_string_lossy().into_owned(),
             key,
             rx,
-            max_bytes,
-            max_files,
+            stop_rx,
+            test_opts(max_bytes, max_files, None),
         ));
         for i in 0..n_events {
             tx.send(AuditEvent {

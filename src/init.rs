@@ -168,7 +168,12 @@ pub fn run(opts: InitOpts) -> i32 {
     }
 
     let toml = render_toml(&resolved);
-    if let Err(e) = std::fs::write(&resolved.output, &toml) {
+    // Atomic replace (temp + fsync + rename): `zion init --force` overwrites the
+    // file the daemon and its hot-reload watcher read, so a kill or ENOSPC
+    // mid-write must leave the old config intact, not a truncated one.
+    if let Err(e) =
+        crate::atomic_file::write_atomic_config(Path::new(&resolved.output), toml.as_bytes())
+    {
         eprintln!("error: failed to write {}: {}", resolved.output, e);
         return 2;
     }

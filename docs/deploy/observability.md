@@ -45,6 +45,10 @@ feature-gated series (absent, not zero, without the feature) is called out.
 | `zion_requests_total` | counter | Total HTTP requests processed |
 | `zion_requests_by_status{class="2xx"/"4xx"/"5xx"}` | counter | Responses by status class |
 | `zion_config_generation` | counter | Config hot-reload generation (increments on every atomic swap) |
+| `zion_config_reload_failures_total` | counter | Reloads that were rejected (parse/validation/rebuild error, or a change of the `[tls]` cert/key paths) or that panicked. The previous config keeps serving, so this is the only signal that a bad `zion.toml` was pushed. Alert on `increase(...[10m]) > 0` |
+| `zion_config_last_reload_success_timestamp_seconds` | gauge | Unix time of the last successful reload (0 until the first) |
+| `zion_upstream_up{upstream}` | gauge | `1` if the upstream is in rotation, `0` if it is ejected (the proxy answers 503 for it until it recovers). One series per configured upstream URL (credentials in the URL are stripped from the label) |
+| `zion_upstream_failovers_total` | counter | Requests retried on another upstream after a transport failure. A steady rate with every `zion_upstream_up` at `1` means members are flapping |
 | `zion_websocket_upgrades` | counter | WebSocket upgrades completed |
 
 **Cache**

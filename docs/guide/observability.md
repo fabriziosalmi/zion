@@ -20,7 +20,7 @@ The `tracing` crate is initialized at boot. Filtering follows `RUST_LOG` (full `
 
 | `log_format` | Output |
 |---|---|
-| `text` *(default)* | pretty multi-line, ANSI-colored on a TTY |
+| `text` *(default)* | on a TTY: pretty, ANSI-colored. When stderr is **not** a terminal (journald, `docker logs`, a file): one line per event, `<UTC timestamp> <LEVEL> <event>: <message>`, so lines can be ordered and filtered by subsystem |
 | `json` | one JSON object per line — wire-compatible with Loki / ELK / Datadog |
 
 ### W3C Trace Context propagation
@@ -61,7 +61,11 @@ Six reliability counters are exposed alongside the existing ones:
 |---|---|
 | `zion_panics_total` | Worker panics caught by the panic hook. |
 | `zion_audit_events_total` | Audit-log events emitted (signed + chained). |
-| `zion_audit_events_dropped_total` | Audit events dropped because the writer queue was full. Non-zero values mean either the disk is slow or `audit.queue_depth` is too small. |
+| `zion_audit_events_dropped_total` | Audit events dropped: the queue was full (slow disk or `audit.queue_depth` too small) **or** the writer has exited. Use `zion_audit_writer_up` to tell them apart. |
+| `zion_audit_write_failures_total` | Write, flush or fsync errors on the audit log. Non-zero means records are at risk. |
+| `zion_audit_enabled` (gauge) | `1` when `[audit] enabled = true` started a writer. |
+| `zion_audit_writer_up` (gauge) | `1` while the writer task is running, `0` once it has exited (disk full, fd revoked, reopen failure). Alert on `zion_audit_enabled == 1 and zion_audit_writer_up == 0`. |
+| `zion_audit_last_write_timestamp_seconds` (gauge) | Unix time of the last record flushed successfully. |
 | `zion_traces_emitted_total` | Request spans observed (one per request). |
 | `zion_traces_invalid_total` | Inbound `traceparent` headers rejected as malformed. |
 | `zion_admin_rejects_total` | Admin-API requests rejected (auth or rate-limit) at `[admin]`. |
@@ -204,13 +208,35 @@ key_env = "ZION_AUDIT_HMAC_KEY"   # default; the secret never lives in zion.toml
 queue_depth = 4096                # bounded mpsc — events overflow ⇒ dropped + counted
 max_size_mb = 100                 # rotate the active segment at this size; null/0 ⇒ unbounded
 max_files   = 10                  # rotated segments to keep (oldest pruned first); 0 ⇒ keep all
+sync_interval_ms = 1000           # fsync the active segment this often; 0 ⇒ page cache only
+# key_id = "2026-10"              # label for the HMAC key, written into every chain marker
+# previous_key_env = "ZION_AUDIT_HMAC_KEY_PREV"   # outgoing key during a rotation (never signs)
 
 [redact]
 headers      = ["authorization", "cookie", "x-api-key"]
 query_params = ["token", "api_key", "session"]
 ```
 
-The HMAC key is taken from the named environment variable. RFC 2104 recommends ≥ 32 bytes for HMAC-SHA256; shorter keys are accepted but Zion logs a warning at boot.
+The HMAC key is taken from the named environment variable and must be **at least 32 bytes** (the SHA-256 output size). With `enabled = true`, a missing `path`, an unset or empty key variable, or a key under 32 bytes makes Zion **refuse to start**: a typo in `key_env` or a missing secret mount must not silently remove the tamper-evident trail you asked for. (`enabled = false`, the default, never reads the variable.)
+
+On `SIGTERM` the writer is stopped after the connections have drained: it writes everything still queued, flushes and `fsync`s, and Zion waits up to 5 seconds for it. If that takes longer the daemon logs `audit writer did not finish within 5s`.
+
+### Key rotation
+
+Each chain begins with a `chain_init` / `chain_rotate` marker whose signed `detail` carries `key_id=<label>`. Set `[audit] key_id` to a label of your choosing (`[A-Za-z0-9._-]`, up to 64 characters); if you don't, Zion derives a 16-hex fingerprint from the key, which identifies it without revealing it. A verifier reads the marker to learn which key signed the records that follow.
+
+To rotate without losing the ability to verify history:
+
+1. Keep the outgoing key available to whoever verifies the log, filed under its `key_id`.
+2. Put the new key in the environment variable named by `key_env`, set a new `key_id`, and set `previous_key_env` to a variable holding the outgoing key. Restart.
+3. The first marker after the restart records `prev_head=…; prev_seq=…; prev_key=previous` when the tail of the existing segment verified under the outgoing key, so continuity across the rotation is checkable. Without `previous_key_env` it reads `prev_head=unverified`.
+4. Once the old segments are archived, drop `previous_key_env`.
+
+The previous key is only ever used to check the tail; it never signs anything. Verifying old segments is done with the old key, chosen by the `key_id` in each chain's marker.
+
+### Durability
+
+Every record is flushed to the OS page cache as it is written, which survives `kill -9` but **not** a power loss or kernel crash. `sync_interval_ms` (default `1000`) bounds that exposure: the writer `fsync`s the active segment at that interval — including when the log has gone idle — so a power loss can take at most the last interval of records. Set `0` to skip the periodic sync and accept the page-cache-only behaviour for throughput. Independently of this setting, a segment is `fsync`ed before it is sealed at rotation and the directory is `fsync`ed after the rename, so a sealed segment and its name survive power loss. A failing `fsync` is logged once (`audit log fsync failing`) and never stops the writer.
 
 ### Rotation and disk usage
 
@@ -242,13 +268,26 @@ python3 - <<'PY'
 import hmac, hashlib, json, sys, os
 
 key = os.environ["KEY"].encode()
-prev = hmac.new(key, b"ZION-AUDIT-GENESIS-V1", hashlib.sha256).hexdigest()
+genesis = hmac.new(key, b"ZION-AUDIT-GENESIS-V1", hashlib.sha256).hexdigest()
+prev = genesis
+last_head = None   # hmac of the last record of the previous chain
 ok = 0
 for i, line in enumerate(open("/var/log/zion/audit.jsonl")):
     rec = json.loads(line)
     body = rec.copy()
     expected_prev = body.pop("prev_hash")
     expected_hmac = body.pop("hmac")
+    if rec["kind"] in ("chain_init", "chain_rotate"):
+        # A new chain starts at genesis. A restart onto an existing segment
+        # also states the head it found; it must match what we just verified.
+        prev = genesis
+        detail = rec.get("detail", "")
+        if "prev_head=" in detail and last_head is not None:
+            claimed = detail.split("prev_head=")[1].split(";")[0]
+            if claimed not in ("none", "unverified") and claimed != last_head:
+                sys.exit(f"line {i}: marker says the previous chain ended at "
+                         f"{claimed[:16]}, but it ends at {last_head[:16]} "
+                         "(records removed or altered)")
     if expected_prev != prev:
         sys.exit(f"chain break at line {i}: prev mismatch")
     canon = json.dumps(body, separators=(",", ":"))  # match serde compact
@@ -256,6 +295,7 @@ for i, line in enumerate(open("/var/log/zion/audit.jsonl")):
     if sig != expected_hmac:
         sys.exit(f"signature mismatch at line {i}")
     prev = expected_hmac
+    last_head = expected_hmac
     ok += 1
 print(f"verified {ok} records")
 PY
@@ -271,7 +311,13 @@ The writer task runs in `tokio::spawn`. If:
 - the file cannot be opened at startup, audit is **silently disabled** (with an error log) and the rest of the daemon continues.
 - a write fails mid-run (disk full, fd revoked), the writer task exits and subsequent events are dropped. A monitor on `zion_audit_events_dropped_total > 0` is the recommended alert.
 
-Each restart begins a **fresh chain** anchored at the genesis tag. A `chain_init` record is emitted as `seq=0` so a verifier can spot the boundary. Continuing a chain across restarts would require trusting the on-disk tail value, which defeats tamper-evidence.
+Each restart begins a **fresh chain** anchored at the genesis tag. A `chain_init` record is emitted as `seq=0` so a verifier can spot the boundary. The writer never *continues* a chain from the on-disk tail, since that would mean trusting an unverified value. Instead the signed marker records what it found there, in its `detail`:
+
+- `prev_head=<64 hex>; prev_seq=<n>` — the last record of the existing segment was well-formed and its HMAC verified under the current key; the hex is that record's `hmac`.
+- `prev_head=none` — the segment was new or empty.
+- `prev_head=unverified` — the segment ended in something that is not a valid signed record (a write cut short by a crash, tampering, or a different HMAC key). The daemon also logs a warning, and the fragment is closed with a newline so the marker stays on its own line.
+
+A verifier can compare `prev_head` with the `hmac` of the last record of the preceding chain in the same file. A mismatch means records were removed from, or altered at, the end of that chain after the restart. Removing the tail of the *last* chain before a restart is still invisible, exactly as before: nothing has been written after it yet to contradict it. Ship segments to write-once storage if you need that.
 
 ## Panic hook
 

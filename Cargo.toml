@@ -1,6 +1,6 @@
 [package]
 name = "zion"
-version = "0.8.4"
+version = "0.9.0"
 edition = "2021"
 # MSRV is the *core* default-features build (TLS proxy + WAF + cache + metrics).
 # Opt-in features (acme, auth, init, http3) pull crypto/i18n crates that have
@@ -18,7 +18,6 @@ keywords = ["proxy", "tls", "waf", "http3", "reverse-proxy"]
 categories = ["network-programming", "web-programming::http-server"]
 exclude = [
     ".github/**",
-    ".gitlab-ci.yml",
     "benchmarks/**",
     "docs/**",
     "deploy/**",
@@ -89,6 +88,9 @@ hyper-rustls = { version = "0.27", features = ["http1", "http2", "webpki-roots",
 # WAF: SIMD-accelerated JSON validation (10x faster than serde_json for validation)
 simd-json = "0.14"
 itoa = "1.0.18"
+# Already in the graph via aws-lc-rs/rustls; direct so key buffers (audit HMAC key,
+# JWT secrets, mesh seed) are wiped on drop instead of lingering in freed heap.
+zeroize = "1.8"
 ryu = "1.0.23"
 tokio-stream = "0.1.18"
 core_affinity = "0.8"
@@ -199,6 +201,11 @@ optional = true
 version = "0.10"
 optional = true
 default-features = false
+
+# `zion_tsan` is set by .github/workflows/concurrency.yml (RUSTFLAGS) to build without
+# mimalloc under ThreadSanitizer; declare it so `unexpected_cfgs` does not warn.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zion_tsan)'] }
 
 [features]
 default = []

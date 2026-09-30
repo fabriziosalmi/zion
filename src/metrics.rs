@@ -435,6 +435,10 @@ pub struct Metrics {
     /// operator alert on node-saturation shedding directly instead of inferring
     /// it from `active_connections` approaching the limit.
     pub connections_rejected_global: AtomicU64,
+    /// Requests that failed against one upstream and were retried on another
+    /// (the eager HA failover in `proxy::proxy_pass`). Rate > 0 with no upstream
+    /// marked down means members are flapping.
+    pub upstream_failovers_total: AtomicU64,
     /// Requests denied (403) by tag-driven enforcement because the origin
     /// class is on the `[sovereign.enforce] deny` list (#150).
     pub enforcement_denied_class: AtomicU64,
@@ -557,6 +561,7 @@ impl Metrics {
             tls_fp_route_denied: AtomicU64::new(0),
             connections_rejected_per_ip: AtomicU64::new(0),
             connections_rejected_global: AtomicU64::new(0),
+            upstream_failovers_total: AtomicU64::new(0),
             enforcement_denied_class: AtomicU64::new(0),
             enforcement_denied_mesh_score: AtomicU64::new(0),
             tarpit_active: AtomicU64::new(0),
@@ -689,6 +694,50 @@ impl Metrics {
         }
     }
 
+    /// `render` plus one `zion_upstream_up{upstream="..."}` series per configured
+    /// upstream, read live from the health map (never cached: a flip must show on
+    /// the next scrape, and the series count is bounded by the config). For
+    /// OpenMetrics the `# EOF` terminator has to stay last, so it is re-attached
+    /// after the extra series.
+    pub fn render_with_upstreams(
+        &self,
+        openmetrics: bool,
+        health: &crate::health::HealthMap,
+    ) -> bytes::Bytes {
+        let base = self.render(openmetrics);
+        if health.is_empty() {
+            return base;
+        }
+        let mut rows: Vec<(&String, bool)> = health
+            .iter()
+            .map(|(url, h)| (url, h.healthy.load(Relaxed)))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut extra = String::with_capacity(96 + rows.len() * 64);
+        extra.push_str(
+            "# HELP zion_upstream_up 1 if the upstream is in rotation, 0 if it is ejected (503 until it recovers).\n# TYPE zion_upstream_up gauge\n",
+        );
+        for (url, up) in rows {
+            extra.push_str("zion_upstream_up{upstream=\"");
+            extra.push_str(&escape_label(&redact_userinfo(url)));
+            extra.push_str("\"} ");
+            extra.push(if up { '1' } else { '0' });
+            extra.push('\n');
+        }
+
+        let text: &[u8] = base.as_ref();
+        let (head, tail): (&[u8], &[u8]) = match text.strip_suffix(b"# EOF\n") {
+            Some(h) if openmetrics => (h, b"# EOF\n"),
+            _ => (text, b""),
+        };
+        let mut out = bytes::BytesMut::with_capacity(head.len() + extra.len() + tail.len());
+        out.extend_from_slice(head);
+        out.extend_from_slice(extra.as_bytes());
+        out.extend_from_slice(tail);
+        out.freeze()
+    }
+
     /// Build one exposition variant into a fresh buffer. See [`Metrics::render`].
     fn render_body(&self, openmetrics: bool) -> bytes::Bytes {
         // Preallocate estimated capacity to avoid reallocations
@@ -743,6 +792,25 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(crate::reload::current_generation())
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+        // A rejected or panicked reload leaves the old snapshot serving and never
+        // moves the generation above; count them so a bad zion.toml is visible.
+        out.extend_from_slice(
+            b"# HELP zion_config_reload_failures_total Config reloads rejected (parse/validation/rebuild error, TLS path change) or that panicked; the previous config keeps serving.\n\
+                                # TYPE zion_config_reload_failures_total counter\n\
+                                zion_config_reload_failures_total ",
+        );
+        out.extend_from_slice(itoa_buf.format(crate::reload::reload_failures()).as_bytes());
+        out.extend_from_slice(
+            b"\n# HELP zion_config_last_reload_success_timestamp_seconds Unix time of the last successful config reload (0 until the first).\n\
+                                # TYPE zion_config_last_reload_success_timestamp_seconds gauge\n\
+                                zion_config_last_reload_success_timestamp_seconds ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(crate::reload::last_reload_success_timestamp())
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");
@@ -1182,6 +1250,17 @@ impl Metrics {
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");
+        out.extend_from_slice(
+            b"# HELP zion_upstream_failovers_total Requests retried on another upstream after a transport failure (eager HA failover).\n\
+                                # TYPE zion_upstream_failovers_total counter\n\
+                                zion_upstream_failovers_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.upstream_failovers_total.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
 
         self.request_duration.render(
             "zion_request_duration_seconds",
@@ -1380,6 +1459,26 @@ impl Drop for ConnectionGuard {
 // ═══════════════════════════════════════════════════════════════════
 // TESTS
 // ═══════════════════════════════════════════════════════════════════
+
+/// Prometheus label-value escaping: backslash, double quote and newline.
+fn escape_label(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// Drop a `user:pass@` prefix from a URL's authority so credentials embedded in a
+/// configured upstream URL never end up as a metric label.
+fn redact_userinfo(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let rest = &url[scheme_end + 3..];
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        if let Some(at) = rest[..authority_end].rfind('@') {
+            return format!("{}{}", &url[..scheme_end + 3], &rest[at + 1..]);
+        }
+    }
+    url.to_string()
+}
 
 #[cfg(test)]
 mod tests {
@@ -1608,6 +1707,101 @@ mod tests {
         assert!(out.contains("zion_process_resident_memory_bytes "));
         assert!(out.contains("# TYPE zion_process_open_fds gauge"));
         assert!(out.contains("zion_process_open_fds "));
+    }
+
+    fn health_of(pairs: &[(&str, bool)]) -> crate::health::HealthMap {
+        let mut m = fnv::FnvHashMap::default();
+        for (url, up) in pairs {
+            let h = crate::health::UpstreamHealth::new_healthy();
+            h.healthy.store(*up, Relaxed);
+            m.insert(url.to_string(), std::sync::Arc::new(h));
+        }
+        std::sync::Arc::new(m)
+    }
+
+    #[test]
+    fn upstream_up_gauge_reports_every_configured_upstream() {
+        // ZION-OBS-03: an ejected backend must be visible to Prometheus, not only
+        // in the JSON snapshot / TUI.
+        let m = Metrics::new();
+        let health = health_of(&[("http://b:9000", false), ("http://a:8000", true)]);
+        let out = String::from_utf8(m.render_with_upstreams(false, &health).to_vec()).unwrap();
+        assert!(out.contains("# TYPE zion_upstream_up gauge"));
+        assert!(out.contains("zion_upstream_up{upstream=\"http://a:8000\"} 1\n"));
+        assert!(out.contains("zion_upstream_up{upstream=\"http://b:9000\"} 0\n"));
+        // deterministic order (sorted by URL), so scrapes diff cleanly
+        assert!(out.find("http://a:8000").unwrap() < out.find("http://b:9000").unwrap());
+        // the failover counter is part of the base render
+        assert!(out.contains("# TYPE zion_upstream_failovers_total counter"));
+        assert!(out.contains("\nzion_upstream_failovers_total 0\n"));
+    }
+
+    #[test]
+    fn upstream_series_keep_the_openmetrics_eof_last() {
+        let m = Metrics::new();
+        let health = health_of(&[("http://a:8000", true)]);
+        let om = String::from_utf8(m.render_with_upstreams(true, &health).to_vec()).unwrap();
+        assert!(om.ends_with("# EOF\n"), "OpenMetrics must end with # EOF");
+        assert_eq!(om.matches("# EOF").count(), 1);
+        assert!(om.find("zion_upstream_up{").unwrap() < om.rfind("# EOF").unwrap());
+        // classic output never carries an EOF
+        let classic = String::from_utf8(m.render_with_upstreams(false, &health).to_vec()).unwrap();
+        assert!(!classic.contains("# EOF"));
+    }
+
+    #[test]
+    fn upstream_label_never_leaks_credentials_or_breaks_out() {
+        assert_eq!(
+            redact_userinfo("http://user:pw@host:80/p@th"),
+            "http://host:80/p@th"
+        );
+        assert_eq!(redact_userinfo("http://host:80"), "http://host:80");
+        assert_eq!(escape_label("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+        let m = Metrics::new();
+        let health = health_of(&[("http://u:secret@h:1", true)]);
+        let out = String::from_utf8(m.render_with_upstreams(false, &health).to_vec()).unwrap();
+        assert!(!out.contains("secret"), "credentials leaked into a label");
+        assert!(out.contains("upstream=\"http://h:1\""));
+    }
+
+    #[test]
+    fn no_upstream_series_when_there_are_no_upstreams() {
+        let m = Metrics::new();
+        let empty = health_of(&[]);
+        let out = String::from_utf8(m.render_with_upstreams(false, &empty).to_vec()).unwrap();
+        assert!(!out.contains("zion_upstream_up"));
+    }
+
+    #[test]
+    fn exposition_lines_are_well_formed() {
+        // Every sample sits on its own line: a `# HELP`/`# TYPE` glued onto the end
+        // of a previous value (a lost newline between two hand-built blocks) makes
+        // the whole scrape unparseable.
+        let m = Metrics::new();
+        let health = health_of(&[("http://a:8000", true)]);
+        for om in [false, true] {
+            let out = String::from_utf8(m.render_with_upstreams(om, &health).to_vec()).unwrap();
+            for line in out.lines() {
+                if line.contains("# HELP") || line.contains("# TYPE") || line.contains("# EOF") {
+                    assert!(line.starts_with('#'), "comment glued to a sample: {line:?}");
+                } else if !line.is_empty() {
+                    let (name, value) = line.rsplit_once(' ').expect("sample is `name value`");
+                    assert!(
+                        !name.is_empty() && value.parse::<f64>().is_ok(),
+                        "bad sample line: {line:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn config_reload_series_are_exposed() {
+        let m = Metrics::new();
+        let out = String::from_utf8(m.render(false).to_vec()).unwrap();
+        // ZION-OBS-02: a rejected reload must be visible on /metrics.
+        assert!(out.contains("# TYPE zion_config_reload_failures_total counter"));
+        assert!(out.contains("# TYPE zion_config_last_reload_success_timestamp_seconds gauge"));
     }
 
     #[test]

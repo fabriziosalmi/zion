@@ -57,13 +57,15 @@ waf = true
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `secret` | string | — | HMAC shared secret literal (HS256/HS384/HS512). **Prefer `secret_env`.** |
+| `secret` | string | — | HMAC shared secret literal (HS256/HS384/HS512). **Deprecated: use `secret_env`.** Zion warns at boot when it is set. It is redacted from debug output and wiped from memory when the config is dropped. |
 | `secret_env` | string | — | Name of an env var holding the HMAC secret. Preferred over `secret`; wins when both are set. |
 | `jwks_url` | string | — | JWKS endpoint URL (for RS256/ES256, auto-refreshed hourly) |
 | `algorithm` | string | `HS256` | JWT algorithm. Auto-selects RS256 when `jwks_url` is set without `secret` |
 | `issuer` | string | — | Expected `iss` claim (optional) |
 | `audience` | string | — | Expected `aud` claim (optional) |
 | `forward_claims` | bool | `true` | Inject `X-Auth-Subject` and `X-Auth-Email` headers to upstream |
+| `leeway_secs` | integer | `30` | Clock-skew tolerance applied to `exp`/`nbf`. `0` is allowed; above `300` is rejected. |
+| `max_token_lifetime_secs` | integer | — | Reject tokens whose `exp` is further in the future than this (plus `leeway_secs`). Unset = no cap. See [Token lifetime and revocation](#token-lifetime-and-revocation). |
 
 ## Supported algorithms
 
@@ -107,6 +109,12 @@ Consequences for operators:
 
 - **Issue short-lived tokens.** The token lifetime is your effective revocation
   window — a leaked token cannot be invalidated before `exp`. Minutes, not days.
+  Set `max_token_lifetime_secs` to the longest lifetime you actually issue (for
+  example `900`) and Zion rejects any token whose `exp` is further out, so a
+  mis-issued or forged-by-a-leaked-key token with a far-future `exp` is refused
+  instead of living for years. There is still no revocation list or `jti` check.
+- `aud` may be a single string or an array (OIDC providers commonly send an
+  array); the profile's `audience` must appear in it.
 - A logout / key-compromise event cannot be enforced at the edge mid-lifetime;
   rotate the signing key (or JWKS) to invalidate outstanding tokens en masse.
 - If per-token revocation matters for your deployment, terminate auth at a
@@ -118,7 +126,7 @@ Consequences for operators:
 - JWKS is fetched at startup and refreshed every **1 hour**
 - On fetch failure, retries with **exponential backoff** (5s, 10s, 20s, ... up to 1h)
 - HTTP client failure is retried indefinitely (never gives up permanently)
-- Clock skew tolerance: **30 seconds** (leeway for distributed systems)
+- Clock skew tolerance: **30 seconds** by default (`leeway_secs`, at most 300)
 
 ## Bearer token extraction
 

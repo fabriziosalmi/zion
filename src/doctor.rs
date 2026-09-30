@@ -210,11 +210,7 @@ fn check_upstreams_reachable(cfg: &crate::config::ZionConfig) -> Check {
 /// run without either, but the operator should know.
 fn check_security_posture(cfg: &crate::config::ZionConfig) -> Check {
     let rate_off = cfg.server.rate_limit_rps == 0;
-    let waf_routes = cfg
-        .route
-        .iter()
-        .filter(|r| r.waf_profile.is_some() || r.waf)
-        .count();
+    let waf_routes = cfg.route.iter().filter(|r| r.waf.is_enabled()).count();
     let total = cfg.route.len();
 
     let mut notes = Vec::new();
@@ -725,14 +721,20 @@ waf = true
     }
 
     #[test]
-    fn hardware_crypto_passes_on_aes_box() {
+    fn hardware_crypto_status_matches_the_cpu_features() {
         let p = synth_platform();
         let c = check_hardware_crypto(&p);
         assert_eq!(c.name, "hardware crypto");
-        // Test host (M-series Mac or modern x86) should have AES.
-        if p.has_aes_ni {
-            assert_eq!(c.status, Status::Ok);
-        }
+        // The check is Ok only with AES *and* SHA-256 hardware; AES without SHA is a
+        // Warn (older Intel, e.g. Skylake, has AES-NI but no SHA extensions), and no
+        // AES is a Warn too. The test host's CPU decides which branch is taken, so
+        // assert the contract for whichever one it is, not that every AES box has SHA.
+        let expected = if p.has_aes_ni && p.has_sha256 {
+            Status::Ok
+        } else {
+            Status::Warn
+        };
+        assert_eq!(c.status, expected);
     }
 
     #[test]

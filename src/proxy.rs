@@ -72,15 +72,32 @@ pub type HttpClient = Client<
     ZionBody,
 >;
 
-/// Build the shared HTTP client with connection pooling and H2 upstream support.
-/// HTTP/2 multiplexing eliminates head-of-line blocking for HTTPS upstreams.
-pub fn build_http_client() -> HttpClient {
+/// Default per-upstream TCP connect deadline (`connect_timeout_ms`).
+pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 3000;
+
+/// Build an HTTP client with connection pooling and H2 upstream support, whose
+/// connector abandons a TCP connect after `connect_timeout_ms` (`0` = no connect
+/// deadline). HTTP/2 multiplexing eliminates head-of-line blocking for HTTPS
+/// upstreams.
+///
+/// Without a connector deadline a black-holed upstream (packets dropped, no RST)
+/// is bounded only by the overall 30s request timeout, so every HA failover
+/// attempt against it costs ~30s before the next member is tried. The deadline
+/// covers the TCP connect only; the TLS handshake and the response stay bounded
+/// by that overall timeout.
+pub fn build_http_client(connect_timeout_ms: u64) -> HttpClient {
+    let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
+    // The TLS wrapper needs to see `https://` URIs; it does its own scheme check.
+    http.enforce_http(false);
+    http.set_connect_timeout(
+        (connect_timeout_ms > 0).then(|| std::time::Duration::from_millis(connect_timeout_ms)),
+    );
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()
         .enable_http1()
         .enable_http2()
-        .build();
+        .wrap_connector(http);
 
     Client::builder(TokioExecutor::new())
         .pool_idle_timeout(std::time::Duration::from_secs(30))
@@ -433,6 +450,9 @@ pub async fn proxy_pass_ha(
             Ok(resp) => return Ok(resp),
             Err(e) => {
                 let connect = e.is_connect();
+                crate::metrics::METRICS
+                    .upstream_failovers_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::logging::warn(
                     "proxy",
                     &format!("failover: upstream {url} error (connect={connect}): {e}"),
@@ -535,9 +555,9 @@ pub async fn proxy_pass_stream(
 /// backend (TCP/TLS completes but the HTTP response never arrives, or arrives
 /// at a trickle) would otherwise pin the request (and the conn-limit permit
 /// plus per-IP slot it holds) up to the 1h connection cap — a DoS amplifier.
-/// 504 on elapse. Per-upstream `connect_timeout_ms` covers only the connect
-/// phase and is not yet wired to the shared pooled client; this overall bound
-/// is what closes the hang.
+/// 504 on elapse. The per-upstream `connect_timeout_ms` bounds only the TCP
+/// connect (it is applied to the connector, see `build_http_client`); this
+/// overall bound is what closes a hang *after* connect.
 const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Hard ceiling on a request body buffered for HA replay. Failover has to hold
@@ -842,6 +862,50 @@ async fn send_ws_upgrade(
 
 #[cfg(test)]
 mod tests {
+    /// Time a GET to a black-holed address (TEST-NET-1: packets dropped, no RST) on
+    /// a client built with `connect_timeout_ms`, capped at `cap` so a client with no
+    /// deadline cannot hold the test for the full 30s.
+    async fn time_blackhole(
+        connect_timeout_ms: u64,
+        cap: std::time::Duration,
+    ) -> std::time::Duration {
+        use http_body_util::BodyExt;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let client = build_http_client(connect_timeout_ms);
+        let req = Request::builder()
+            .uri("http://192.0.2.1:81/")
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        let _ = tokio::time::timeout(cap, client.request(req)).await;
+        started.elapsed()
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_is_applied_to_the_connector() {
+        // ZION-REL-01: with a 300ms connect deadline the attempt is abandoned
+        // quickly instead of waiting for the 30s request timeout. (On a network
+        // that answers ENETUNREACH at once this passes trivially; on one that drops
+        // the packets it is the real check.)
+        let bounded = time_blackhole(300, std::time::Duration::from_secs(10)).await;
+        assert!(
+            bounded < std::time::Duration::from_secs(4),
+            "a 300ms connect deadline must abandon a black-holed connect fast, took {bounded:?}"
+        );
+    }
+
+    #[test]
+    fn default_connect_timeout_is_in_sync_with_the_config_default() {
+        assert_eq!(
+            crate::config::default_connect_timeout(),
+            DEFAULT_CONNECT_TIMEOUT_MS
+        );
+    }
+
     use super::*;
     use hyper::http::uri::{Authority, Scheme};
 
@@ -1040,7 +1104,7 @@ mod tests {
         let health_map: crate::health::HealthMap = std::sync::Arc::new(Default::default());
 
         let resp = proxy_pass_ha(
-            &build_http_client(),
+            &build_http_client(DEFAULT_CONNECT_TIMEOUT_MS),
             req,
             &pool,
             &scheme(),

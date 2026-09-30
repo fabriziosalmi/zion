@@ -351,7 +351,12 @@ pub fn run(opts: ImportOpts) -> i32 {
 
     match &opts.output {
         Some(path) => {
-            if let Err(e) = std::fs::write(path, &conversion.toml) {
+            // Atomic replace: `-o` is routinely pointed at the live zion.toml when
+            // migrating a proxy, exactly when a torn write hurts most.
+            if let Err(e) = crate::atomic_file::write_atomic_config(
+                std::path::Path::new(path),
+                conversion.toml.as_bytes(),
+            ) {
                 eprintln!("zion import: cannot write {path}: {e}");
                 return 1;
             }

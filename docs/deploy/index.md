@@ -159,6 +159,7 @@ Zion handles `SIGINT` (Ctrl+C) and `SIGTERM`:
 1. Stop accepting new connections
 2. Wait up to **30 seconds** for in-flight connections to complete
 3. If drain timeout expires, force exit with a warning log
+4. Stop the audit-log writer (when `[audit]` is enabled): it writes everything still queued, flushes and `fsync`s; Zion waits up to **5 seconds** for it (`audit writer did not finish within 5s` if it takes longer)
 
 This works by acquiring all semaphore permits (connection limit). When all active connections release their permits, the drain is complete.
 
@@ -170,6 +171,21 @@ holds a no-reachable-panic doctrine, so a panic signals a bug, not expected
 load): keep Zion under a supervisor that restarts on non-zero/abnormal exit
 (systemd `Restart=on-failure`, Kubernetes `restartPolicy`), and rely on multiple
 replicas + a load balancer to absorb the loss of one instance.
+
+## State that does not survive a restart
+
+Some enforcement state is deliberately process-local and starts empty after every
+restart, including a supervisor-driven crash-loop recovery:
+
+- **`[tls.fingerprint]` bans** (a rejected-unknown JA4 fingerprint is refused for a
+  while): the ban set is in memory, so a restarted instance admits a previously
+  banned fingerprint again until it is re-detected. Enforcement therefore resets at
+  exactly the moment the service is unstable. Run more than one replica so a
+  restart of one does not reset the fleet, and treat a restart as clearing the ban
+  list when you reason about an incident.
+- **Per-IP rate-limit and connection counters** restart from zero.
+- **The mesh identity** (`[sovereign_aimp]`) is persisted, but claims the mesh has
+  not yet re-gossiped are not.
 
 ## Certificate renewal
 

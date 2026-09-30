@@ -87,7 +87,7 @@ pub fn quinn_server_config_from_rustls(
 pub fn spawn_quic_listener(
     addr: SocketAddr,
     tls: &TlsConfig,
-    state: Arc<crate::AppState>,
+    state: Arc<crate::state::AppState>,
     reload_rx: Option<tokio::sync::watch::Receiver<Option<Arc<rustls::ServerConfig>>>>,
 ) -> Result<(), String> {
     let server_config = build_quinn_server_config(tls)?;
@@ -233,7 +233,7 @@ where
 async fn handle_h3_request<S>(
     req: hyper::Request<()>,
     stream: h3::server::RequestStream<S, Bytes>,
-    state: Arc<crate::AppState>,
+    state: Arc<crate::state::AppState>,
     remote_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>>
 where

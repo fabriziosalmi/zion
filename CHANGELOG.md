@@ -4,6 +4,211 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-30
+
+**Audit remediation.** Closes the findings of the 2026-09-30 code audit: the
+request pipeline and config schema are restructured so illegal states cannot be
+built, the audit log survives power loss and shutdown, and the reload and upstream
+paths are observable. This is a **MINOR** release because several checks that used
+to warn (or pass silently) now refuse to start or to parse. Read the upgrade notes
+before deploying.
+
+### ⚠️ Upgrade notes
+
+Things that used to boot and now do not, or that behave differently:
+
+- **`[audit] enabled = true` needs a valid key.** An unset or empty key variable, a
+  key under 32 bytes, or a missing `path` is now a boot error (was a warning and a
+  silently disabled audit log). The library's `audit::spawn_writer` returns a
+  `Result` and an `AuditWriter` to shut down.
+- **`admin.auth = "internal-ip"` requires a loopback `admin.listen`.** A routable or
+  wildcard bind now needs `admin.auth = "mtls"`.
+- **A reload that changes `tls.cert_path` / `tls.key_path` is rejected**, and so is
+  one that moves `listen_https` in the `io-uring-accept` build. Both need a restart.
+- **`connect_timeout_ms` is now enforced.** It was parsed and ignored; a value below
+  your upstream's real connect latency will now cause failovers.
+- **Contradictory settings are refused when the config is parsed:** `waf = true` with
+  a `waf_profile`, a route-level `max_body_mb` with a `waf_profile`, a static route
+  without `serve_dir` (or with `upstream`), static-only keys on a proxy route, an
+  `[upstream.*]` with neither `url` nor `urls`, and `schema_version = 0`. Errors now
+  read `Invalid TOML in <file>` and report the first problem, not all of them.
+- **The plaintext `:80` ACME-challenge fallback** only serves routes with no
+  `auth_profile`, no `internal_only` and a real upstream (not `mode = "static"`).
+  Serve challenges for an external ACME client from a public route.
+- **Text logs on a non-TTY** now start with a UTC timestamp, level and event
+  (`2026-09-30T06:26:36Z INFO  config: ...`). JSON logs and TTY output are unchanged.
+- A literal JWT `secret` in `zion.toml` now logs a deprecation warning; use
+  `secret_env`.
+
+New, opt-in: `[audit] sync_interval_ms`, `key_id`, `previous_key_env`; `[server]
+internal_networks`; `[auth_profile.*] leeway_secs`, `max_token_lifetime_secs`.
+
+### Security
+
+⚠️ **Behaviour change (stricter startup).** With `[audit] enabled = true`, Zion now
+**refuses to start** when the HMAC key variable is unset/empty, when the key is
+under 32 bytes, or when `path` is missing. Previously it logged a warning and ran
+with the audit log silently disabled (a typo in `key_env`, or a missing secret
+mount, removed the tamper-evident trail with no signal). `spawn_writer` in the
+library now returns a `Result`. Fix the key (or set `enabled = false`) before
+upgrading.
+
+- **Audit log shutdown drain.** The writer is now stopped explicitly after the
+  connection drain: it writes everything still queued, flushes and fsyncs, and
+  Zion waits up to 5s. Before, a SIGTERM with a backlog (up to `queue_depth`
+  events) dropped the runtime and lost the newest events.
+- **Audit writer liveness.** New `zion_audit_enabled`, `zion_audit_writer_up`,
+  `zion_audit_write_failures_total` and `zion_audit_last_write_timestamp_seconds`.
+  A writer that died on a disk-full error is now distinguishable from a full
+  queue (the drop counter alone could not tell them apart), and is logged once.
+- **Audit key identity and rotation.** New `[audit] key_id` (default: a derived
+  fingerprint) is written into every chain marker, and `previous_key_env` lets the
+  writer verify the tail of a segment signed with the outgoing key across a
+  rotation. Documented rotation procedure in the observability guide.
+- **JWT:** `aud` may be an array (such tokens were rejected because the claim only
+  deserialized as a string). New `leeway_secs` (default 30, max 300) and
+  `max_token_lifetime_secs` (reject tokens whose `exp` is too far out; there is
+  still no revocation list). A literal `secret` is deprecated (boot warning) and
+  is now redacted from `Debug` output.
+- **Secrets are wiped on drop** (audit HMAC key, JWT secrets, mesh identity seed)
+  via the `zeroize` crate, already in the dependency graph. The mesh identity seed
+  is now checked on load: a seed readable by group/other is tightened to `0600`
+  (or, if that fails, replaced), with a warning. The systemd unit sets
+  `LimitCORE=0`. Not covered: copies inside `hmac::Key` / `jsonwebtoken`, and the
+  process environment itself.
+
+### CI
+
+- **Miri and ThreadSanitizer over the concurrent code** (`.github/workflows/concurrency.yml`,
+  weekly, on demand, and on PRs touching those modules). Miri interprets the pure
+  atomics/data-structure tests (connlimit, health/backoff, tarpit, rate limiter,
+  metrics, the NUMA map); TSAN runs the real threaded tests, including the async audit
+  writer, the L1/L2 cache, hot reload and the chaos suite, with std rebuilt under the
+  sanitizer. Both are clean today. Nothing was suppressed: the only reports we saw
+  came from mimalloc (which neither tool understands), so both tools build with the
+  system allocator (`cfg(miri)` / `--cfg zion_tsan` in `src/main.rs`). Not covered:
+  loom models of the health state machine, and the async audit tests under Miri (its
+  IO driver support is limited). Verified locally on macOS and on Linux x86_64 (Miri
+  and TSAN both clean); the first run on a GitHub runner is still pending.
+
+### Config schema
+
+⚠️ **Behaviour change (stricter parsing).** Contradictory route and upstream
+settings are now refused when the config is *parsed*, instead of being accepted and
+silently ignored (or rejected only by a later validation step):
+
+- `waf = true` together with a `waf_profile` on one route (the profile won and
+  `waf = true` did nothing), and a route-level `max_body_mb` next to a
+  `waf_profile` (the profile's own cap applied). A `max_body_mb` on a WAF-off route
+  is still only a boot warning.
+- A static route with no `serve_dir`, a static route that sets `upstream`, and a
+  proxy route that sets `serve_dir` / `spa_fallback` / `precompressed`. The
+  messages are unchanged; they now surface as `Invalid TOML in <file>` and, being
+  parse errors, report the first problem rather than all of them.
+- An `[upstream.*]` table with neither `url` nor `urls`. If both are written they
+  are still merged (`urls` first, then `url`).
+- `schema_version = 0`. An unversioned file is now defined as **schema 1** (before:
+  "compatible with whatever"), and every supported version has a reader in
+  `upgrade_schema`, enforced by a test, so bumping the current version without one
+  fails the build.
+
+Internally `RouteConfig` is now a validated type (`RouteTarget` = upstream *or*
+static directory, `WafPolicy`), and `UpstreamConfig` holds a single non-empty
+endpoint list. The TOML surface is unchanged. All 15 example configs shipped in
+the repo and every route/upstream block in the docs were checked against the new
+parser.
+
+### Access control
+
+- **`:80` ACME fallback no longer bypasses auth.** An unmatched
+  `/.well-known/acme-challenge/*` request on plaintext port 80 was proxied straight
+  to the matching route, skipping the JWT gate, `internal_only`, the WAF and the
+  `X-Auth-*` scrub, so a client could reach an authenticated upstream with a forged
+  `X-Auth-Subject`. It is now used only for a route with no `auth_profile`, no
+  `internal_only` and a real upstream (a static route's placeholder upstream is
+  `127.0.0.1`, which the old code would have proxied to), and inbound `X-Auth-*` is
+  stripped. Serve external-client challenges from a public route.
+- **⚠️ `admin.auth = "internal-ip"` requires a loopback `admin.listen`.** The peer
+  it trusts can replace the whole running config, and behind a container bridge
+  every client looks private. A routable/wildcard bind with `internal-ip` is now a
+  startup error; use `mtls` for those. The default (`127.0.0.1:9180`) is unchanged.
+- **New `[server] internal_networks`** (CIDR allowlist) for `/metrics`, the snapshot,
+  `/_zion/cache/purge` and `internal_only` routes, whose built-in rule is "any
+  private-range peer" (network position, not identity). Unset keeps the old
+  behaviour, so nothing changes until you opt in. Zion now warns at boot when a
+  non-loopback listener has neither `internal_networks` nor `trusted_proxies`, the
+  shape where a private-range load balancer makes every client look internal.
+  Invalid CIDRs are rejected at load.
+
+### Observability
+
+- **Config reload failures are visible.** `zion_config_reload_failures_total` and
+  `zion_config_last_reload_success_timestamp_seconds`: a rejected or panicked
+  reload (file watcher and admin API) left the old config serving with nothing on
+  `/metrics`, and `zion_config_generation` cannot tell "rejected" from "nobody
+  reloaded".
+- **Per-upstream health on `/metrics`.** `zion_upstream_up{upstream}` (one series
+  per configured upstream, read live, sorted; userinfo stripped from the label)
+  and `zion_upstream_failovers_total`. Previously an ejected backend or a silent
+  failover was visible only in the JSON snapshot and the TUI.
+- **Text logs are orderable off a terminal.** When stderr is not a TTY, text-mode
+  lines are `<UTC timestamp> <LEVEL> <event>: <message>`; on a TTY they are
+  unchanged. JSON mode is unchanged.
+
+### Changed (behaviour)
+
+- **`connect_timeout_ms` is now enforced.** It was parsed and defaulted to 3000 but
+  never applied, so a black-holed upstream (packets dropped, no RST) cost the full
+  30s request timeout on every HA failover attempt. It is now set on the HTTP
+  connector (one client per distinct value, created on first use so pools survive
+  reloads); `0` disables it. It covers the TCP connect only. Measured on a
+  black-holed address: 0.31s with a 300ms deadline, versus running to the
+  10s test cap without one. Configs that set an aggressive value now fail over
+  that fast, which is the point, but a value below your upstream's real connect
+  latency will now cause failovers.
+- **`--features io-uring-accept`: a reload that moves `listen_https` is now
+  rejected** (was: accepted, and only warned by the supervisor, leaving the running
+  socket contradicting the published config).
+- **A reload that changes `tls.cert_path` / `tls.key_path` is now rejected** (was:
+  accepted with a WARN while the TLS watcher kept watching the boot-time paths, so
+  renewals at the new path were never picked up). The running config is untouched;
+  change the paths with a restart.
+
+### Fixed
+
+- **Audit log: bounded power-loss window.** Records were only flushed to the OS
+  page cache, so a power loss or kernel crash could drop an unbounded tail with no
+  marker that anything was lost. The writer now `fsync`s the active segment every
+  `[audit] sync_interval_ms` (default 1000; `0` restores the old page-cache-only
+  behaviour), always `fsync`s a segment before sealing it at rotation, and
+  `fsync`s the directory after the rename.
+- **Audit log: restarts leave a checkable trail.** The `chain_init` marker written
+  at start now records the verified head of the chain already on disk
+  (`prev_head=<hmac>; prev_seq=<n>`, or `none` / `unverified`), so removing the end
+  of an earlier chain after a restart is detectable. The chain itself still
+  restarts at genesis (ADR-0017). A segment that ended mid-record no longer gets
+  the marker glued onto the fragment; the fragment is closed with a newline.
+- **`zion init` and `zion import -o` replace `zion.toml` atomically** (temp file,
+  fsync, rename) instead of truncating it in place, so a kill or `ENOSPC`
+  mid-write no longer leaves an empty or partial config where the daemon and its
+  hot-reload watcher read it. An existing file keeps its permissions and a
+  symlinked path is written through; a new file is `0644`.
+
+### Changed
+
+- **Internal module boundaries (no behaviour change).** The crate root
+  (`main.rs`) no longer doubles as the shared kernel: `AppState`,
+  `ResolvedAppConfig` and the per-source limiters moved to `state.rs`, and the
+  request-ID/response helpers to `http_util.rs`, so `dispatch`, `listener`,
+  `admin`, `quic`, `tls_fp` and `reload` depend on those modules instead of the
+  file that wires them. Route resolution (`ResolvedRoute`, `HostRouter`,
+  `build_router`) moved from `config.rs` to `routing.rs`, leaving `config.rs` as
+  the serde schema plus validation. The 18 unit tests that exercise routing
+  internals moved with the code; the test count is unchanged (913).
+- Fix the `ResolvedAppConfig` doc comment, which still described the config
+  snapshot as a plain `Arc` with no swap; it is `Arc<ArcSwap<..>>` and is
+  reloaded by the `reload.rs` watcher.
+
 ## [0.8.4] - 2026-09-08
 
 **ACME renewal-loop liveness + owner-only cert-key writes.** A confirming
@@ -27,6 +232,8 @@ Both are closed here. No behaviour change for a correct config.
   typically world-readable `0644`), unlike the hardened `0600` atomic path
   already used for the ACME account and mesh identity keys. Both now use
   `write_cert_key_atomic` (created `0600`, never wider even in transit).
+
+## [0.8.3] - 2026-09-08
 
 **Fail-closed security fixes.** A deeper re-audit of v0.8.2 surfaced two HIGH
 fail-opens (one a residual gap in the v0.8.0 AIMP-listen fix); this closes both.

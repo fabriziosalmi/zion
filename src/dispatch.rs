@@ -30,17 +30,16 @@
 
 use crate::audit;
 use crate::audit::AuditEvent;
-use crate::proxy::ZionBody;
-use crate::{
-    cache, config, health, logging, metrics, observability, proxy, security, waf, AppState,
-};
-use crate::{
+use crate::http_util::{
     empty_response, generate_request_id, inject_security_headers, method_not_allowed,
-    text_response, REQUEST_COUNTER,
+    text_response, HEX_DIGITS, REQUEST_COUNTER,
 };
+use crate::proxy::ZionBody;
+use crate::state::AppState;
+use crate::{cache, config, health, logging, metrics, observability, proxy, security, waf};
 // `unauthorized` is only referenced from the JWT/OIDC auth gate.
 #[cfg(feature = "auth")]
-use crate::unauthorized;
+use crate::http_util::unauthorized;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
@@ -50,7 +49,7 @@ use std::sync::Arc;
 #[cfg(feature = "auth")]
 use crate::auth;
 
-use crate::config::ResolvedRoute;
+use crate::routing::ResolvedRoute;
 use http_body_util::Limited;
 
 /// Issue #151: turn an enforcement *deny* into a bounded held (tarpit)
@@ -236,8 +235,8 @@ fn route_cache_key(host: Option<&str>, path: &str) -> u64 {
 fn trace_id_to_hex(bytes: &[u8; 16]) -> String {
     let mut s = String::with_capacity(32);
     for &b in bytes {
-        s.push(crate::HEX_DIGITS[(b >> 4) as usize] as char);
-        s.push(crate::HEX_DIGITS[(b & 0xF) as usize] as char);
+        s.push(HEX_DIGITS[(b >> 4) as usize] as char);
+        s.push(HEX_DIGITS[(b & 0xF) as usize] as char);
     }
     s
 }
@@ -251,7 +250,7 @@ const RESERVED_IDENTITY_HEADERS: [&str; 2] = ["x-auth-subject", "x-auth-email"];
 /// Strip every reserved identity header off an inbound request. Idempotent, and
 /// clears repeated copies (hyper lower-cases header names, so one `remove` per
 /// name suffices).
-fn scrub_reserved_identity_headers(headers: &mut hyper::HeaderMap) {
+pub(crate) fn scrub_reserved_identity_headers(headers: &mut hyper::HeaderMap) {
     for name in RESERVED_IDENTITY_HEADERS {
         headers.remove(name);
     }
@@ -483,7 +482,7 @@ async fn process_request_inner(
         // Without this, the built-in handler takes precedence over the route
         // config's internal_only flag, exposing metrics to external clients.
         if path == "/metrics" {
-            if !is_internal_ip(&client_ip) {
+            if !cfg.internal_networks.contains(&client_ip) {
                 return Ok(empty_response(StatusCode::FORBIDDEN));
             }
             // Content-negotiate: serve OpenMetrics (histogram exemplars + EOF)
@@ -501,7 +500,7 @@ async fn process_request_inner(
             } else {
                 "text/plain; version=0.0.4; charset=utf-8"
             };
-            let body = metrics::METRICS.render(openmetrics);
+            let body = metrics::METRICS.render_with_upstreams(openmetrics, &state.cfg().health_map);
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", content_type)
@@ -511,7 +510,7 @@ async fn process_request_inner(
         // Live JSON snapshot — what `zion top` and dashboards consume.
         // Same internal-only gate as /metrics: never expose to the world.
         if path == "/_zion/snapshot.json" {
-            if !is_internal_ip(&client_ip) {
+            if !cfg.internal_networks.contains(&client_ip) {
                 return Ok(empty_response(StatusCode::FORBIDDEN));
             }
             let platform = crate::bootstrap::detect();
@@ -539,7 +538,7 @@ async fn process_request_inner(
         // immediately instead of waiting out the TTL. Internal-only + POST
         // (mutating). `?prefix=/path` purges matching keys; no prefix = all.
         if path == "/_zion/cache/purge" {
-            if !is_internal_ip(&client_ip) {
+            if !cfg.internal_networks.contains(&client_ip) {
                 return Ok(empty_response(StatusCode::FORBIDDEN));
             }
             if *req.method() != hyper::Method::POST {
@@ -680,7 +679,7 @@ async fn process_request_inner(
     }
 
     // --- Gate: internal_only ---
-    if rule.internal_only && !is_internal_ip(&client_ip) {
+    if rule.internal_only && !cfg.internal_networks.contains(&client_ip) {
         return Ok(empty_response(StatusCode::FORBIDDEN));
     }
 
@@ -1172,16 +1171,16 @@ async fn process_request_inner(
         let mut buf = [0u8; 55]; // "00-" + 32hex + "-" + 16hex + "-01"
         buf[0..3].copy_from_slice(b"00-");
         for (i, &byte) in tid.iter().enumerate() {
-            buf[3 + i * 2] = crate::HEX_DIGITS[(byte >> 4) as usize];
-            buf[3 + i * 2 + 1] = crate::HEX_DIGITS[(byte & 0xF) as usize];
+            buf[3 + i * 2] = HEX_DIGITS[(byte >> 4) as usize];
+            buf[3 + i * 2 + 1] = HEX_DIGITS[(byte & 0xF) as usize];
         }
         buf[35] = b'-';
         // span_id: same 8 trailing bytes — sequence is unique within a process
         // for the lifetime of `REQUEST_COUNTER`. A future change can split
         // span IDs from request IDs; for now they coincide.
         for i in 0..8 {
-            buf[36 + i * 2] = crate::HEX_DIGITS[(tid[8 + i] >> 4) as usize];
-            buf[36 + i * 2 + 1] = crate::HEX_DIGITS[(tid[8 + i] & 0xF) as usize];
+            buf[36 + i * 2] = HEX_DIGITS[(tid[8 + i] >> 4) as usize];
+            buf[36 + i * 2 + 1] = HEX_DIGITS[(tid[8 + i] & 0xF) as usize];
         }
         buf[52..55].copy_from_slice(b"-01");
         // SAFETY: all bytes are ASCII hex, '-', or '0'/'1'
@@ -1283,7 +1282,7 @@ async fn process_request_inner(
             }
             config::RouteMode::SseStream => {
                 proxy::proxy_pass_stream(
-                    &state.http_client,
+                    &state.client_for(rule.connect_timeout_ms),
                     req,
                     &dyn_scheme,
                     &dyn_authority,
@@ -1295,7 +1294,7 @@ async fn process_request_inner(
             }
             config::RouteMode::Standard => {
                 proxy::proxy_pass_ha(
-                    &state.http_client,
+                    &state.client_for(rule.connect_timeout_ms),
                     req,
                     &rule.upstream_url,
                     &dyn_scheme,
@@ -1309,7 +1308,7 @@ async fn process_request_inner(
             }
             config::RouteMode::Websocket => {
                 proxy::proxy_pass(
-                    &state.http_client,
+                    &state.client_for(rule.connect_timeout_ms),
                     req,
                     &dyn_scheme,
                     &dyn_authority,
@@ -1759,7 +1758,7 @@ async fn handle_static_cache(
     // would later be served to a GET (method-confusion cache poisoning).
     if *req.method() != hyper::Method::GET {
         return proxy::proxy_pass(
-            &state.http_client,
+            &state.client_for(rule.connect_timeout_ms),
             req,
             dyn_scheme,
             dyn_authority,
@@ -1884,7 +1883,7 @@ async fn handle_static_cache(
     // (channel closed without receiving `true`), they re-check the cache,
     // miss, and fall through to fetch themselves.
     let resp = match proxy::proxy_pass(
-        &state.http_client,
+        &state.client_for(rule.connect_timeout_ms),
         req,
         dyn_scheme,
         dyn_authority,
@@ -2089,12 +2088,6 @@ async fn handle_static_cache(
     Ok(resp)
 }
 
-/// Check if an IP is internal — delegates to security module.
-#[inline]
-fn is_internal_ip(ip: &std::net::IpAddr) -> bool {
-    security::is_internal_ip(ip)
-}
-
 // ==========================================================================
 // Thread-local route LRU
 // --------------------------------------------------------------------------
@@ -2250,6 +2243,7 @@ mod route_cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::is_internal_ip;
 
     #[test]
     fn route_cache_key_is_host_scoped() {
