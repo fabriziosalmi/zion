@@ -78,6 +78,7 @@ mod tls;
 #[cfg(feature = "tui")]
 mod tui;
 mod vary;
+mod via;
 // `uring.rs` compiles on every target — the io_uring-accept inner
 // module (spawn_uring_accept, issue #51) is feature-gated *inside* the
 // file, so on non-Linux or without `io-uring-accept` this module is

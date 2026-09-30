@@ -6,6 +6,7 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **`Via` and loop detection** (RFC 9110 §7.6.3). Forwarded requests now carry `Via: <protocol> zion-XXXXXXXX` (random per process) after any earlier hop's entry, and a request whose `Via` already names this process is refused with `508 Loop Detected` ahead of the rate limiter, routing and the built-in endpoints, instead of bouncing between hops (for example an upstream that points back at zion) until a connection limit stops it. New counter `zion_loops_detected`. Upstreams will see a new `Via` request header.
 - **Cache: a successful `POST`/`PUT`/`PATCH`/`DELETE` invalidates the cache entries for its URI** (RFC 9111 §4.4): the path, its query variants and every encoding/`Vary` variant, but not longer paths that start the same, plus the same-origin URIs named in the response's `Location` / `Content-Location`. Errors (status 400 and above) invalidate nothing. New counter `zion_cache_invalidations`. Per instance: replicas do not tell each other.
 
 ### Fixed

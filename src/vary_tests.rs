@@ -32,6 +32,8 @@ struct Origin {
     last_lang: Mutex<Option<String>>,
     /// A `Set-Cookie` value the origin adds to its answers, if any.
     set_cookie: Mutex<Option<String>>,
+    /// Every `Via` value of the last request the origin saw, joined with ", ".
+    last_via: Mutex<Option<String>>,
     /// The status the origin answers with (200 unless a test says otherwise).
     status: std::sync::atomic::AtomicU16,
     /// An extra response header (name, value), e.g. `Content-Location`.
@@ -53,6 +55,15 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                     let o = o.clone();
                     async move {
                         o.hits.fetch_add(1, Ordering::Relaxed);
+                        *o.last_via.lock().unwrap() = {
+                            let v: Vec<&str> = req
+                                .headers()
+                                .get_all("via")
+                                .iter()
+                                .filter_map(|x| x.to_str().ok())
+                                .collect();
+                            (!v.is_empty()).then(|| v.join(", "))
+                        };
                         *o.last_lang.lock().unwrap() = req
                             .headers()
                             .get("accept-language")
@@ -138,6 +149,7 @@ async fn rig_cc(vary: &str, cc: &str) -> (Arc<Origin>, Arc<AppState>) {
         cc: Mutex::new(cc.into()),
         last_lang: Mutex::new(None),
         set_cookie: Mutex::new(None),
+        last_via: Mutex::new(None),
         status: std::sync::atomic::AtomicU16::new(200),
         extra: Mutex::new(None),
     });
@@ -636,5 +648,84 @@ async fn a_location_on_another_origin_is_not_acted_on() {
         fetch(&st, "/other", &[]).await.0,
         "HIT",
         "a response must not be able to evict URIs of another origin's path space"
+    );
+}
+
+// ── Via on what is forwarded ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn forwarded_requests_name_this_proxy_in_via_and_keep_earlier_hops() {
+    let (o, st) = rig("").await;
+    fetch(&st, "/via1", &[]).await;
+    assert_eq!(
+        o.last_via.lock().unwrap().as_deref(),
+        Some(format!("1.1 {}", crate::via::pseudonym()).as_str()),
+        "no inbound Via: just this proxy"
+    );
+    fetch(&st, "/via2", &[("via", "1.0 edge")]).await;
+    assert_eq!(
+        o.last_via.lock().unwrap().as_deref(),
+        Some(format!("1.0 edge, 1.1 {}", crate::via::pseudonym()).as_str()),
+        "an earlier hop is kept, this proxy is appended"
+    );
+}
+
+/// End to end: an upstream that points back at this very proxy. Without loop detection
+/// the request would bounce forever; with it, the second pass is refused (508) and that
+/// answer travels back to the client. Exactly two passes go through the pipeline.
+#[tokio::test]
+async fn an_upstream_that_points_back_at_the_proxy_is_cut_after_one_bounce() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let st = state_for(port);
+    let passes = Arc::new(AtomicUsize::new(0));
+    {
+        let (st, passes) = (st.clone(), passes.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (st, passes) = (st.clone(), passes.clone());
+                tokio::spawn(async move {
+                    let svc =
+                        hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                            let (st, passes) = (st.clone(), passes.clone());
+                            async move {
+                                passes.fetch_add(1, Ordering::Relaxed);
+                                // the "upstream" hands the request straight back to the proxy
+                                process_request(
+                                    req.map(|b| b.boxed()),
+                                    st,
+                                    "127.0.0.1:1".parse::<SocketAddr>().unwrap(),
+                                    false,
+                                )
+                                .await
+                            }
+                        });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+    }
+    let resp = process_request(
+        get("/loop", &[]),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        508,
+        "the looping request is refused"
+    );
+    assert_eq!(
+        passes.load(Ordering::Relaxed),
+        1,
+        "it went to the upstream once, not forever"
     );
 }

@@ -52,6 +52,8 @@ pub(super) enum Gate {
     Method,
     /// 425 for a state-changing method in early data.
     EarlyData,
+    /// 508 for a request whose `Via` already names this process (it has looped).
+    LoopDetection,
     /// 429 once the client's per-IP budget is spent.
     RateLimit,
     /// Sovereign enforcement: deny an opted-in IP class.
@@ -73,6 +75,7 @@ pub(super) const PRE_ROUTING: &[Gate] = &[
     Gate::UriLength,
     Gate::Method,
     Gate::EarlyData,
+    Gate::LoopDetection,
     Gate::RateLimit,
     #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
     Gate::SovereignClass,
@@ -97,6 +100,7 @@ pub(super) async fn run_pre_routing(
             Gate::UriLength => uri_length(req),
             Gate::Method => method_whitelist(req),
             Gate::EarlyData => early_data(ctx, req),
+            Gate::LoopDetection => loop_detection(req),
             Gate::RateLimit => rate_limit(ctx, state),
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             Gate::SovereignClass => sovereign_class(ctx, req).await,
@@ -162,6 +166,18 @@ fn early_data(ctx: &PreCtx, req: &Request<ZionBody>) -> Option<Response<ZionBody
         return Some(empty_response(StatusCode::from_u16(425).unwrap()));
     }
     None
+}
+
+/// Gate: a request that already went through this process is bouncing between hops
+/// (an upstream that points back at us); refuse it instead of feeding the loop.
+fn loop_detection(req: &Request<ZionBody>) -> Option<Response<ZionBody>> {
+    if !crate::via::is_loop(req.headers()) {
+        return None;
+    }
+    metrics::METRICS
+        .loops_detected
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(empty_response(StatusCode::LOOP_DETECTED))
 }
 
 /// Gate: per-IP rate limit.
@@ -531,6 +547,7 @@ mod tests {
             Gate::UriLength,
             Gate::Method,
             Gate::EarlyData,
+            Gate::LoopDetection,
             Gate::RateLimit,
         ];
         assert_eq!(&PRE_ROUTING[..always.len()], &always);

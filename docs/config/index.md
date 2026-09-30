@@ -38,6 +38,18 @@ in the CHANGELOG), together with a reader for the version it replaces.
 | `xff_mode` | string | `"append"` | Outbound XFF policy: `"append"`, `"rewrite"` (strip inbound, emit one trusted entry), or `"drop"` |
 | `log_format` | string | `"text"` | `"text"` or `"json"` (structured) |
 
+### `Via` and loop detection
+
+Every request zion forwards carries `Via: <protocol> zion-XXXXXXXX` (RFC 9110 §7.6.3),
+appended after any `Via` an earlier hop wrote; the protocol is the one the request
+arrived over (`1.1`, `2`, …). The pseudonym is random **per process**, so two Zion tiers
+in a chain (an edge in front of an origin) are different hops. A request whose `Via`
+already names this process has gone round a loop, typically an upstream that points back at
+zion, and is refused with **`508 Loop Detected`** before any rate limit, route lookup or
+built-in endpoint (`zion_loops_detected` counts them). `Via` is not added to responses.
+There is no `Max-Forwards` handling: it only applies to `TRACE`/`OPTIONS`, and `TRACE` is
+refused.
+
 ## `[tls]`
 
 | Key | Type | Default | Description |
