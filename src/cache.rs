@@ -31,6 +31,10 @@ pub struct CachedMeta {
     /// `last_modified` backs `If-Modified-Since`.
     pub etag: Option<HeaderValue>,
     pub last_modified: Option<HeaderValue>,
+    /// `stale-while-revalidate=N` from the origin (RFC 5861), in seconds; `0` =
+    /// not offered. While an entry is at most this far past its freshness
+    /// lifetime it may be served stale while a background refresh runs.
+    pub stale_while_revalidate_secs: u64,
 }
 
 /// Result of a cache hit — body + preserved metadata.
@@ -651,6 +655,7 @@ mod tests {
             status: StatusCode::OK,
             etag: None,
             last_modified: None,
+            stale_while_revalidate_secs: 0,
         }
     }
 
@@ -687,6 +692,7 @@ mod tests {
             status: StatusCode::OK,
             etag: None,
             last_modified: None,
+            stale_while_revalidate_secs: 0,
         };
         cache.insert("/a.js", Bytes::from("v2"), meta2, 3600, 0, 100);
         let hit = cache.get("/a.js").fresh().unwrap();
@@ -848,6 +854,7 @@ mod tests {
             status: StatusCode::OK,
             etag: None,
             last_modified: None,
+            stale_while_revalidate_secs: 0,
         };
         cache.insert("/no-ct", Bytes::from("data"), meta, 3600, 0, 100);
         let hit = cache.get("/no-ct").fresh().unwrap();
@@ -863,6 +870,7 @@ mod tests {
             status: StatusCode::NOT_MODIFIED,
             etag: None,
             last_modified: None,
+            stale_while_revalidate_secs: 0,
         };
         cache.insert("/304", Bytes::new(), meta, 3600, 0, 100);
         let hit = cache.get("/304").fresh().unwrap();

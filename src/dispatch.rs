@@ -1151,6 +1151,174 @@ async fn process_request_inner(
     Ok(resp)
 }
 
+/// Everything a background stale-while-revalidate refresh needs, owned so it can
+/// outlive the request that triggered it.
+struct SwrRefresh {
+    state: Arc<AppState>,
+    key: Arc<str>,
+    stale: cache::CacheHit,
+    request: Request<ZionBody>,
+    connect_timeout_ms: u64,
+    scheme: hyper::http::uri::Scheme,
+    authority: hyper::http::uri::Authority,
+    remote_addr: SocketAddr,
+    xff_mode: proxy::XffMode,
+    cache_ttl: u64,
+    cache_max: usize,
+}
+
+/// The request a background refresh sends: the same target and content
+/// negotiation as the one that found the entry stale, but NOT the caller's
+/// credentials. The refresh is on behalf of the cache, not of that client, so
+/// `Authorization` / `Cookie` / `Proxy-Authorization` and any conditional or range
+/// header are dropped (the stored validators are added when it is sent).
+fn swr_request(req: &Request<ZionBody>) -> Request<ZionBody> {
+    let mut out = Request::builder()
+        .method(hyper::Method::GET)
+        .uri(req.uri().clone())
+        .version(req.version())
+        .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+        .expect("a GET with a copied URI builds");
+    for (name, value) in req.headers() {
+        if matches!(
+            *name,
+            hyper::header::AUTHORIZATION
+                | hyper::header::COOKIE
+                | hyper::header::PROXY_AUTHORIZATION
+                | hyper::header::IF_NONE_MATCH
+                | hyper::header::IF_MODIFIED_SINCE
+                | hyper::header::IF_MATCH
+                | hyper::header::IF_UNMODIFIED_SINCE
+                | hyper::header::IF_RANGE
+                | hyper::header::RANGE
+                | hyper::header::CONTENT_LENGTH
+                | hyper::header::TRANSFER_ENCODING
+        ) {
+            continue;
+        }
+        out.headers_mut().append(name.clone(), value.clone());
+    }
+    out
+}
+
+/// Start a background refresh of a stale entry, at most one per key (the
+/// singleflight map) and at most [`MAX_SWR_REFRESHES`] at a time. When either
+/// limit says no, nothing is started and the caller still serves the stale copy.
+fn spawn_swr_refresh(job: SwrRefresh) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(permit) = SWR_BUDGET.try_acquire() else {
+        metrics::METRICS
+            .cache_swr_refresh_skipped
+            .fetch_add(1, Relaxed);
+        return;
+    };
+    let (tx, inserted) = job
+        .state
+        .inflight
+        .get_or_insert_with(job.key.clone(), || tokio::sync::watch::channel(false).0);
+    if !inserted {
+        return; // a fetch or refresh for this key is already running
+    }
+    tokio::spawn(async move {
+        let _permit = permit;
+        let ok = tokio::time::timeout(SWR_REFRESH_TIMEOUT, run_swr_refresh(&job))
+            .await
+            .unwrap_or(false);
+        if ok {
+            metrics::METRICS.cache_swr_refreshes.fetch_add(1, Relaxed);
+        } else {
+            metrics::METRICS
+                .cache_swr_refresh_failures
+                .fetch_add(1, Relaxed);
+        }
+        job.state.inflight.remove(&job.key);
+        if ok {
+            let _ = tx.send(true);
+        }
+    });
+}
+
+/// One refresh: a conditional GET with the stored validators. A `304` revives the
+/// stored body; a cacheable `200` replaces it. Anything else leaves the stale entry
+/// as it is (it is no longer served stale once outside its window).
+async fn run_swr_refresh(job: &SwrRefresh) -> bool {
+    let mut req = swr_request(&job.request);
+    add_conditional_headers(req.headers_mut(), &job.stale.meta);
+    let resp = match proxy::proxy_pass(
+        &job.state.client_for(job.connect_timeout_ms),
+        req,
+        &job.scheme,
+        &job.authority,
+        Some(job.remote_addr),
+        "https",
+        job.xff_mode,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+
+    if resp.status() == StatusCode::NOT_MODIFIED {
+        let initial_age = upstream_age(resp.headers());
+        let ttl = origin_freshness(resp.headers())
+            .map(|o| o.min(job.cache_ttl))
+            .unwrap_or(job.cache_ttl);
+        let mut meta = job.stale.meta.clone();
+        if resp.headers().contains_key(hyper::header::CACHE_CONTROL) {
+            meta.stale_while_revalidate_secs = origin_swr(resp.headers());
+        }
+        job.state.static_cache.refresh(
+            &job.key,
+            job.stale.body.clone(),
+            meta,
+            ttl,
+            initial_age,
+            job.cache_max,
+        );
+        metrics::METRICS
+            .cache_revalidations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    if resp.status() != StatusCode::OK {
+        return false;
+    }
+
+    let (parts, body) = resp.into_parts();
+    let initial_age = upstream_age(&parts.headers);
+    let ttl = origin_freshness(&parts.headers)
+        .map(|o| o.min(job.cache_ttl))
+        .unwrap_or(job.cache_ttl);
+    // The refresh carries no credentials, so the request is not "authenticated".
+    if !is_shared_cacheable(false, &parts.headers, ttl, initial_age) {
+        return false;
+    }
+    let Ok(collected) = http_body_util::Limited::new(body, MAX_CACHEABLE_BODY)
+        .collect()
+        .await
+    else {
+        return false;
+    };
+    let meta = cache::CachedMeta {
+        content_type: parts.headers.get(hyper::header::CONTENT_TYPE).cloned(),
+        content_encoding: parts.headers.get(hyper::header::CONTENT_ENCODING).cloned(),
+        status: parts.status,
+        etag: parts.headers.get(hyper::header::ETAG).cloned(),
+        last_modified: parts.headers.get(hyper::header::LAST_MODIFIED).cloned(),
+        stale_while_revalidate_secs: origin_swr(&parts.headers),
+    };
+    job.state.static_cache.insert(
+        &job.key,
+        collected.to_bytes(),
+        meta,
+        ttl,
+        initial_age,
+        job.cache_max,
+    );
+    true
+}
+
 /// Serve from RAM cache or fetch from upstream, then cache.
 /// Preserves Content-Type and status from upstream to prevent MIME-sniff
 /// issues (S-05: browsers blocked cached CSS/JS without Content-Type
@@ -1195,6 +1363,90 @@ fn origin_freshness(headers: &hyper::HeaderMap) -> Option<u64> {
         }
     }
     None
+}
+
+/// Longest `stale-while-revalidate` window honoured, whatever the origin asks for.
+const MAX_SWR_SECS: u64 = 86_400;
+
+/// Most stale-while-revalidate refreshes running at once, across all keys. One
+/// refresh per key is already guaranteed by the singleflight map; this bounds the
+/// total so a burst of distinct expiring keys cannot spawn unbounded origin traffic.
+const MAX_SWR_REFRESHES: usize = 64;
+
+/// How long a background refresh may run before it is abandoned.
+const SWR_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A bounded budget of concurrent refreshes.
+struct SwrBudget {
+    active: std::sync::atomic::AtomicUsize,
+    max: usize,
+}
+
+static SWR_BUDGET: SwrBudget = SwrBudget {
+    active: std::sync::atomic::AtomicUsize::new(0),
+    max: MAX_SWR_REFRESHES,
+};
+
+/// A slot in a [`SwrBudget`]; released on drop (also on panic/abort).
+struct SwrPermit(&'static SwrBudget);
+
+impl SwrBudget {
+    fn try_acquire(&'static self) -> Option<SwrPermit> {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let mut cur = self.active.load(Acquire);
+        loop {
+            if cur >= self.max {
+                return None;
+            }
+            match self
+                .active
+                .compare_exchange_weak(cur, cur + 1, AcqRel, Acquire)
+            {
+                Ok(_) => return Some(SwrPermit(self)),
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+}
+
+impl Drop for SwrPermit {
+    fn drop(&mut self) {
+        self.0
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// `stale-while-revalidate=N` (RFC 5861 §3) from a response's `Cache-Control`, in
+/// seconds, capped at [`MAX_SWR_SECS`]. `0` when absent or unparsable.
+fn origin_swr(headers: &hyper::HeaderMap) -> u64 {
+    let Some(cc) = headers
+        .get(hyper::header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return 0;
+    };
+    for part in cc.to_ascii_lowercase().split(',') {
+        if let Some(rest) = part.trim().strip_prefix("stale-while-revalidate") {
+            if let Some(val) = rest.trim_start().strip_prefix('=') {
+                if let Ok(secs) = val.trim().trim_matches('"').parse::<u64>() {
+                    return secs.min(MAX_SWR_SECS);
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Test hook: `origin_swr` over a bare `Cache-Control` value.
+#[cfg(test)]
+pub(crate) fn origin_swr_for_tests(cache_control: &str) -> u64 {
+    let mut h = hyper::HeaderMap::new();
+    h.insert(
+        hyper::header::CACHE_CONTROL,
+        hyper::header::HeaderValue::from_str(cache_control).unwrap(),
+    );
+    origin_swr(&h)
 }
 
 /// RFC 9111 storability decision for zion's **shared** cache: `true` if a 200
@@ -1520,6 +1772,38 @@ async fn handle_static_cache(
                 return Ok(cache_hit_response(hit));
             }
             cache::CacheLookup::Stale(hit) => {
+                // stale-while-revalidate (RFC 5861): inside the window the origin
+                // offered, answer NOW with the stale copy and refresh in the
+                // background, so the client does not wait for the origin.
+                // `age_secs` is whole seconds (floored), so the real staleness is in
+                // [staleness, staleness + 1): `<` keeps us from ever serving past the
+                // window the origin allowed.
+                let staleness = hit.age_secs.saturating_sub(hit.max_age_secs);
+                if hit.meta.stale_while_revalidate_secs > 0
+                    && staleness < hit.meta.stale_while_revalidate_secs
+                {
+                    if client_conditional_hit(req.headers(), &hit.meta) {
+                        return Ok(not_modified_response(&hit));
+                    }
+                    let refresh = SwrRefresh {
+                        state: state.clone(),
+                        key: Arc::from(cache_key.as_str()),
+                        stale: hit.clone(),
+                        request: swr_request(&req),
+                        connect_timeout_ms: rule.connect_timeout_ms,
+                        scheme: dyn_scheme.clone(),
+                        authority: dyn_authority.clone(),
+                        remote_addr,
+                        xff_mode,
+                        cache_ttl,
+                        cache_max,
+                    };
+                    spawn_swr_refresh(refresh);
+                    crate::metrics::METRICS
+                        .cache_swr_served
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(cache_response(hit, "STALE-WHILE-REVALIDATE"));
+                }
                 // Only revalidate when we hold a validator; without one a
                 // conditional GET is pointless, so fall through to a full fetch.
                 if hit.meta.etag.is_some() || hit.meta.last_modified.is_some() {
@@ -1608,10 +1892,14 @@ async fn handle_static_cache(
             let effective_ttl = origin_freshness(resp.headers())
                 .map(|o| o.min(cache_ttl))
                 .unwrap_or(cache_ttl);
+            let mut refreshed_meta = hit.meta.clone();
+            if resp.headers().contains_key(hyper::header::CACHE_CONTROL) {
+                refreshed_meta.stale_while_revalidate_secs = origin_swr(resp.headers());
+            }
             state.static_cache.refresh(
                 &path_owned,
                 hit.body.clone(),
-                hit.meta.clone(),
+                refreshed_meta,
                 effective_ttl,
                 initial_age,
                 cache_max,
@@ -1678,6 +1966,7 @@ async fn handle_static_cache(
             status: parts.status,
             etag,
             last_modified,
+            stale_while_revalidate_secs: origin_swr(&parts.headers),
         };
 
         let (sender, receiver) =
@@ -1933,6 +2222,25 @@ mod route_cache {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn swr_budget_is_bounded_and_released() {
+        static B: SwrBudget = SwrBudget {
+            active: std::sync::atomic::AtomicUsize::new(0),
+            max: 3,
+        };
+        let held: Vec<_> = (0..3)
+            .map(|_| B.try_acquire().expect("within budget"))
+            .collect();
+        assert!(B.try_acquire().is_none(), "a 4th refresh must be refused");
+        drop(held);
+        let again: Vec<_> = (0..3)
+            .map(|_| B.try_acquire().expect("slots released"))
+            .collect();
+        assert_eq!(again.len(), 3);
+        drop(again);
+        assert_eq!(B.active.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
     use super::*;
     use crate::security::is_internal_ip;
 
@@ -2161,6 +2469,7 @@ mod tests {
             status: hyper::StatusCode::OK,
             etag: etag.map(|e| e.parse().unwrap()),
             last_modified: lm.map(|l| l.parse().unwrap()),
+            stale_while_revalidate_secs: 0,
         };
         let req = |name: hyper::header::HeaderName, val: &str| {
             let mut h = hyper::HeaderMap::new();

@@ -80,6 +80,29 @@ the origin (`If-None-Match` from the stored `ETag`, `If-Modified-Since` from
   (§4.2.4): zion serves the stale body (`X-Zion-Cache: STALE`) rather than
   failing, so a flapping origin doesn't take cached content down.
 
+### stale-while-revalidate (RFC 5861)
+
+When the origin sends `Cache-Control: max-age=N, stale-while-revalidate=M`, an entry
+that is at most `M` seconds past its freshness lifetime is **served immediately**
+(`X-Zion-Cache: STALE-WHILE-REVALIDATE`, with its real `Age`) and refreshed in the
+background, so the client does not wait for the origin round trip. `M` is capped at
+24 hours. Outside the window the behaviour is the synchronous revalidation above.
+
+- **One refresh per key**: it goes through the same singleflight as a cache fill, so
+  any number of requests for a stale key cause one refresh; at most 64 run at once
+  across all keys, and each is abandoned after 30 s. When the cap is reached the
+  stale copy is still served and `zion_cache_swr_refresh_skipped` counts it.
+- **Not on the caller's behalf**: the refresh is a `GET` to the same target with the
+  same content negotiation, but without the caller's `Authorization`, `Cookie`,
+  `Proxy-Authorization`, conditional or `Range` headers. It is conditional on the
+  stored `ETag` / `Last-Modified`: a `304` revives the stored body, a cacheable `200`
+  replaces it. Anything else leaves the stale entry in place; once outside its window
+  it is no longer served stale.
+- Metrics: `zion_cache_swr_served`, `zion_cache_swr_refreshes`,
+  `zion_cache_swr_refresh_failures`, `zion_cache_swr_refresh_skipped`.
+- A client request with `Cache-Control: no-cache` / `max-age=0` still forces a fresh
+  fetch; `only-if-cached` never contacts the origin.
+
 A stale entry with **no validator** can't be revalidated, so it is re-fetched in
 full (a normal miss). The stale body is kept in cache until it is revalidated or
 evicted by capacity — it is never served without one of the checks above.
@@ -139,6 +162,7 @@ $ curl -sX POST 'http://127.0.0.1/_zion/cache/purge?prefix=/static/app.js'
 | Request `Cache-Control` (no-cache/no-store/max-age=0/only-if-cached) | 9111 §5.2.1 | Yes |
 | Client conditional → `304` (If-None-Match / If-Modified-Since) | 9110 §13 | Yes |
 | Origin-side revalidation (stale → conditional GET → 304) | 9111 §4.3 | Yes (`REVALIDATED`; stale-if-error §4.2.4) |
+| `stale-while-revalidate` (serve stale, refresh in the background) | 5861 §3 | Yes (`STALE-WHILE-REVALIDATE`) |
 
 See also [Hot-reload](/deploy/hot-reload) (cache survives config reloads) and the
 [two-level-cache ADR](/adr/0003-two-level-cache-with-generation).
