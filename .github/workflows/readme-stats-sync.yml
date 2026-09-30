@@ -16,6 +16,7 @@ permissions:
 
 jobs:
   check:
+    name: readme-stats-sync
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
