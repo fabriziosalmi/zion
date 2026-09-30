@@ -135,6 +135,8 @@ mod dispatch;
 mod gate_order_tests;
 #[cfg(test)]
 mod swr_tests;
+#[cfg(test)]
+mod vary_tests;
 pub(crate) use dispatch::process_request;
 mod http_util;
 mod state;
