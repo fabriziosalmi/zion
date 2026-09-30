@@ -23,8 +23,13 @@ only, never a hard gate**.
 
 ## Reproduce
 
+`requirements.txt` holds the version floors we ask for; `requirements.lock` is the
+hashed, fully-resolved set (all platforms, Python >= 3.11) that CI audits and that you
+should install. After editing `requirements.txt`, regenerate it with the command in
+the lock's first lines (`uv pip compile ... --universal --generate-hashes`).
+
 ```bash
-pip install -r ml/requirements.txt
+pip install --require-hashes -r ml/requirements.lock
 
 # 1. (only if the Rust extractor or signatures changed) refresh the fixtures:
 cargo test --features ml-waf gen_golden_features -- --ignored --nocapture

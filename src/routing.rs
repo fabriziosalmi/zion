@@ -651,6 +651,7 @@ waf = true
             cache_profile: None,
             csp: None,
             auth_profile: None,
+            public: false,
             cors: None,
         }
     }

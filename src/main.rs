@@ -811,7 +811,30 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                     },
                     _ => Some(admin::AdminAuth::InternalIp),
                 };
-                if let Some(auth) = auth {
+                // A configured write token that cannot be loaded must not silently
+                // open writes to every peer that passes `auth`: no admin API at all.
+                let write_token = match admin_cfg.write_token_env.as_deref() {
+                    None => Ok(None),
+                    Some(name) => match std::env::var(name) {
+                        Ok(v) if v.len() >= 32 => Ok(Some(zeroize::Zeroizing::new(v.into_bytes()))),
+                        Ok(v) if !v.is_empty() => Err(format!(
+                            "{name} holds {} bytes; a write token needs at least 32",
+                            v.len()
+                        )),
+                        _ => Err(format!("{name} is unset or empty")),
+                    },
+                };
+                let auth_and_token = match write_token {
+                    Err(e) => {
+                        logging::error(
+                            "admin",
+                            &format!("admin.write_token_env: {e} — admin API NOT spawned"),
+                        );
+                        None
+                    }
+                    Ok(t) => auth.map(|a| (a, t)),
+                };
+                if let Some((auth, write_token)) = auth_and_token {
                     let ctx = std::sync::Arc::new(admin::AdminReloadCtx {
                         conn_limit_max: platform.conn_limit,
                         change_notifier: Some(config_change_tx.clone()),
@@ -819,6 +842,8 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                         boot_tls_cert: Some(config.tls.cert_path.clone()),
                         boot_tls_key: Some(config.tls.key_path.clone()),
                         rate_limiter: admin::AdminRateLimiter::new(admin_cfg.rate_limit_rps),
+                        write_token,
+                        persist_push: admin_cfg.persist_push,
                     });
                     admin::spawn_admin_listener(state.clone(), addr, ctx, auth);
                 }

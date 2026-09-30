@@ -100,10 +100,21 @@ cannot forge them.
 ## Token lifetime and revocation
 
 Zion validates a token's **signature, expiry (`exp`), and not-before (`nbf`)**
-on every request, but it has **no revocation or replay defense**: there is no
-denylist, no OIDC introspection, and no `jti`/nonce replay check. A valid token
-is accepted until it expires, and can be replayed any number of times within
-its lifetime.
+on every request. It has **no replay defense** (a valid token can be presented any
+number of times within its lifetime) and no OIDC introspection. It does have a
+small per-instance **revocation list** keyed on the `jti` claim, described below.
+
+### Revoking a token
+
+`POST /admin/revoke` on the [admin API](/deploy/admin-api) with
+`{"jti":"<token id>","exp":<the token's exp, unix seconds>}` denies that token id
+until `exp`; a request carrying it gets `403`. Limits you should know about:
+
+- Only a token that **carries a `jti`** can be revoked. Issue one on every token.
+- The list is **in memory and per instance**: it is lost on restart, and with
+  several Zion instances you revoke on each. It is capped at 100 000 live entries.
+- It is a stop-gap for a leaked token, not a session system. For revocation that
+  must survive restarts or span a fleet, keep tokens short-lived and rotate the key.
 
 Consequences for operators:
 
@@ -112,14 +123,14 @@ Consequences for operators:
   Set `max_token_lifetime_secs` to the longest lifetime you actually issue (for
   example `900`) and Zion rejects any token whose `exp` is further out, so a
   mis-issued or forged-by-a-leaked-key token with a far-future `exp` is refused
-  instead of living for years. There is still no revocation list or `jti` check.
+  instead of living for years.
 - `aud` may be a single string or an array (OIDC providers commonly send an
   array); the profile's `audience` must appear in it.
 - A logout / key-compromise event cannot be enforced at the edge mid-lifetime;
   rotate the signing key (or JWKS) to invalidate outstanding tokens en masse.
-- If per-token revocation matters for your deployment, terminate auth at a
-  service that maintains a denylist / introspection endpoint, and use Zion's
-  gate as defense in depth.
+- If revocation must be durable or fleet-wide, terminate auth at a service that
+  maintains a denylist / introspection endpoint, and use Zion's gate as defense in
+  depth.
 
 ### JWKS refresh
 

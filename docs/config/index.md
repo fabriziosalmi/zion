@@ -33,6 +33,7 @@ in the CHANGELOG), together with a reader for the version it replaces.
 | `rate_limit_max_tracked_ips` | usize | `100000` | Distinct client IPs the per-IP limiter tracks; at the cap stale entries are evicted, and if all are live a new IP is denied (fail-closed) |
 | `max_connections_per_ip` | u32? | none | Per-IP concurrent-connection cap, enforced at accept (before the TLS handshake) |
 | `trusted_proxies` | string[] | `[]` | CIDRs whose inbound `X-Forwarded-For` is trusted for client-IP resolution |
+| `require_route_auth` | bool | `false` | Refuse a config in which a `[[route]]` has none of `auth_profile`, `public = true` or `internal_only = true`, so a route added without an auth decision fails at load instead of serving unauthenticated |
 | `internal_networks` | string[] | `[]` | CIDRs (or bare IPs) allowed to use the internal-only endpoints (`/metrics`, `/_zion/snapshot.json`, `/_zion/cache/purge`) and `internal_only` routes. Empty keeps the built-in rule: any loopback / private-range / link-local / ULA peer. That rule tests network position, not identity: behind a private-range load balancer, Kubernetes SNAT or a Docker bridge every client looks internal. Set this (and `trusted_proxies`) to name the hosts that really are. Zion warns at boot when neither is set on a non-loopback listener |
 | `xff_mode` | string | `"append"` | Outbound XFF policy: `"append"`, `"rewrite"` (strip inbound, emit one trusted entry), or `"drop"` |
 | `log_format` | string | `"text"` | `"text"` or `"json"` (structured) |
@@ -94,6 +95,7 @@ Legacy format `[upstreams]` (flat key-value map of name to URL) is also supporte
 | `upstream` | string | **required** | Name of upstream to forward to |
 | `mode` | string | `"standard"` | `standard`, `sse_stream`, `static_cache`, `websocket` |
 | `internal_only` | bool | `false` | Restrict to private/loopback IPs |
+| `public` | bool | `false` | Declare the route deliberately unauthenticated; the explicit opt-out under `require_route_auth`. Cannot be combined with `auth_profile` |
 | `waf_profile` | string | none | Name of WAF profile to apply |
 | `cache_profile` | string | none | Name of cache profile to apply |
 | `waf` | bool | `false` | Legacy: enable WAF with defaults |
