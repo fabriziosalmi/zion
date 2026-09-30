@@ -4,6 +4,15 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-30
+
+Follow-up to 0.9.0: the remaining findings of the same audit. Everything new is
+opt-in and defaults to the old behaviour, except one Helm check (below).
+
+### ⚠️ Upgrade notes
+
+- **Helm:** `persistence.enabled = true` with a `ReadWriteOnce` volume and `replicaCount > 1` (the chart default is `2`) now fails at `helm template` / `helm install` time with an explanatory message, instead of rendering a second pod that sits `Pending` on Multi-Attach. Set `replicaCount: 1`, use `ReadWriteMany`, or disable persistence.
+
 ### Changed
 
 - **Internal: the request pipeline's pre-routing gates are now an ordered list** (`dispatch/gates.rs`, `PRE_ROUTING`) of small functions instead of ~250 lines of inline control flow in `process_request_inner` (#422). No behaviour change: the order (URI length, method, 0-RTT, rate limit, then the feature-gated sovereign / JA4 / mesh gates, then the built-in endpoints, route lookup, CORS, `internal_only`) is pinned by golden tests written against the old code first.
@@ -17,6 +26,11 @@ All notable changes to Zion Edge Gateway are documented here.
 - **`[admin] persist_push`** (#419): a validated `POST /admin/config` is written back to `zion.toml`. Default off.
 - **`POST /admin/revoke`** (#418): deny a JWT by `jti` until its expiry. In-memory and per instance; only tokens with a `jti` can be revoked.
 - **`ml/requirements.lock`** (#420): a hashed, universal (all platforms) lock made with `uv pip compile`. The `pip-audit` job now audits it with `--require-hashes` instead of `--no-deps`, so transitive advisories are covered.
+
+### CI
+
+- The stability-soak gate no longer fails healthy builds: its fd-drift limit now follows the run's own noise, and the verdict has a self-test against real runs with injected leaks (#443).
+- New informational `coverage.yml`; `concurrency.yml` (Miri + ThreadSanitizer) now runs on the nightly toolchain; the `version-sync`, `readme-stats-sync` and `gitleaks` jobs have unambiguous names.
 
 ### Fixed
 
