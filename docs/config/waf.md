@@ -92,6 +92,8 @@ max_body_mb = 10
 
 This creates an implicit profile with default values and the specified `max_body_mb`. Named profiles are recommended for new configurations.
 
+A route has **one** WAF policy: `waf = true` (inline), a `waf_profile`, or neither. Combining `waf = true` with `waf_profile` is a load-time error (the profile would win and `waf = true` would do nothing), and so is a route-level `max_body_mb` next to a `waf_profile` (the profile carries its own cap, so set `max_body_mb` inside the `[waf_profile.<name>]` table). A `max_body_mb` on a route with no WAF is still accepted, with a boot warning that the cap is not enforced.
+
 ## WAF behavior by HTTP method
 
 | Method | Body inspected | Gates applied |

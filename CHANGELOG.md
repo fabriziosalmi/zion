@@ -38,6 +38,33 @@ upgrading.
   `LimitCORE=0`. Not covered: copies inside `hmac::Key` / `jsonwebtoken`, and the
   process environment itself.
 
+### Config schema
+
+⚠️ **Behaviour change (stricter parsing).** Contradictory route and upstream
+settings are now refused when the config is *parsed*, instead of being accepted and
+silently ignored (or rejected only by a later validation step):
+
+- `waf = true` together with a `waf_profile` on one route (the profile won and
+  `waf = true` did nothing), and a route-level `max_body_mb` next to a
+  `waf_profile` (the profile's own cap applied). A `max_body_mb` on a WAF-off route
+  is still only a boot warning.
+- A static route with no `serve_dir`, a static route that sets `upstream`, and a
+  proxy route that sets `serve_dir` / `spa_fallback` / `precompressed`. The
+  messages are unchanged; they now surface as `Invalid TOML in <file>` and, being
+  parse errors, report the first problem rather than all of them.
+- An `[upstream.*]` table with neither `url` nor `urls`. If both are written they
+  are still merged (`urls` first, then `url`).
+- `schema_version = 0`. An unversioned file is now defined as **schema 1** (before:
+  "compatible with whatever"), and every supported version has a reader in
+  `upgrade_schema`, enforced by a test, so bumping the current version without one
+  fails the build.
+
+Internally `RouteConfig` is now a validated type (`RouteTarget` = upstream *or*
+static directory, `WafPolicy`), and `UpstreamConfig` holds a single non-empty
+endpoint list. The TOML surface is unchanged. All 15 example configs shipped in
+the repo and every route/upstream block in the docs were checked against the new
+parser.
+
 ### Access control
 
 - **`:80` ACME fallback no longer bypasses auth.** An unmatched

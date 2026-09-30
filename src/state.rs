@@ -145,9 +145,13 @@ impl ResolvedAppConfig {
         // The same URL can appear in many routes — dedup via FnvHashMap.
         let mut map = fnv::FnvHashMap::default();
         for route in &config.route {
-            let urls = if let Some(up) = config.upstream.get(&route.upstream) {
+            // A static route has no upstream to probe.
+            let Some(name) = route.upstream_name() else {
+                continue;
+            };
+            let urls = if let Some(up) = config.upstream.get(name) {
                 up.get_urls()
-            } else if let Some(url) = config.upstreams.get(&route.upstream) {
+            } else if let Some(url) = config.upstreams.get(name) {
                 vec![url.clone()]
             } else {
                 continue;

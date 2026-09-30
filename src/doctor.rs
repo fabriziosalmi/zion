@@ -210,11 +210,7 @@ fn check_upstreams_reachable(cfg: &crate::config::ZionConfig) -> Check {
 /// run without either, but the operator should know.
 fn check_security_posture(cfg: &crate::config::ZionConfig) -> Check {
     let rate_off = cfg.server.rate_limit_rps == 0;
-    let waf_routes = cfg
-        .route
-        .iter()
-        .filter(|r| r.waf_profile.is_some() || r.waf)
-        .count();
+    let waf_routes = cfg.route.iter().filter(|r| r.waf.is_enabled()).count();
     let total = cfg.route.len();
 
     let mut notes = Vec::new();

@@ -15,9 +15,12 @@ schema_version = 1
 
 It is read **before** the strict parse. If the file targets a schema **newer**
 than the running binary understands, Zion exits with targeted upgrade guidance
-instead of a generic "unknown field" error. Omit it (the default) and the config
-is treated as compatible; the current schema version is `1`. Bump it only when a
-breaking config change lands (documented in the CHANGELOG).
+instead of a generic "unknown field" error. Omit it (the default) and the file is read as
+**schema 1**, the schema every config written before the handshake used. That is a
+fixed meaning, not "whatever is current": when a later schema ships, an unversioned
+file is still read as schema 1 and migrated. `0` is rejected. The current schema
+version is `1`; it is bumped only when a breaking config change lands (documented
+in the CHANGELOG), together with a reader for the version it replaces.
 
 ## `[server]`
 
@@ -51,7 +54,7 @@ breaking config change lands (documented in the CHANGELOG).
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `url` | string | `url` **or** `urls` required | Single upstream URL (e.g. `"http://127.0.0.1:8000"`) |
+| `url` | string | `url` **or** `urls` required | Single upstream URL (e.g. `"http://127.0.0.1:8000"`). An upstream with neither is a load-time error. If both are written they are merged, `urls` first then `url` |
 | `urls` | string[] | `[]` | Multiple upstream URLs (latency-routed); use instead of `url` |
 | `connect_timeout_ms` | u64 | `3000` | TCP connect deadline in milliseconds, applied to the connector of the client that serves this upstream: a black-holed member (packets dropped, no RST) is abandoned after this long and the next HA member is tried. `0` = none. Covers the TCP connect only; the TLS handshake and the response are bounded by the 30 s request timeout |
 | `keepalive` | usize | `64` | Max idle keepalive connections |

@@ -11,7 +11,7 @@
 
 use crate::config::{
     catchall_bare_prefix, default_max_entries, default_ttl, trailing_slash_variant, CacheMode,
-    CacheProfile, RouteConfig, RouteMode, WafProfile, ZionConfig,
+    CacheProfile, RouteConfig, RouteMode, RouteTarget, WafPolicy, WafProfile, ZionConfig,
 };
 use matchit::Router;
 use std::collections::HashMap;
@@ -330,15 +330,14 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
     // A static route (ADR-0015) serves from disk and needs no upstream — ignore
     // any stray `upstream` field so `validate_semantics` and `build_router`
     // agree (both skip the upstream for a static route).
-    let upstream_url = if route.mode == RouteMode::Static {
-        Vec::new()
-    } else {
-        resolve_upstream(config, &route.upstream)?
+    let upstream_url = match &route.target {
+        RouteTarget::Static { .. } => Vec::new(),
+        RouteTarget::Upstream { name, .. } => resolve_upstream(config, name)?,
     };
 
-    // Resolve WAF: named profile > legacy bool flag
-    let waf = if let Some(ref profile_name) = route.waf_profile {
-        Some(
+    // Resolve WAF from the route's single policy value.
+    let waf = match &route.waf {
+        WafPolicy::Profile(profile_name) => Some(
             config
                 .waf_profile
                 .get(profile_name)
@@ -349,26 +348,28 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
                     )
                 })?
                 .clone(),
-        )
-    } else if route.waf {
-        // Legacy: create inline profile from max_body_mb
-        Some(WafProfile {
-            max_body_mb: route.max_body_mb.unwrap_or(10),
+        ),
+        // Legacy `waf = true`: an inline profile from max_body_mb.
+        WafPolicy::Inline { max_body_mb } => Some(WafProfile {
+            max_body_mb: max_body_mb.unwrap_or(10),
             ..WafProfile::default()
-        })
-    } else {
-        // Footgun guard: `max_body_mb` is enforced by the WAF body gate, so
-        // on a WAF-off route it has no effect. Surface it at boot rather
-        // than silently dropping the operator's intended size cap (a no-WAF
-        // route otherwise streams the body to the upstream, hyper-framed).
-        if route.max_body_mb.is_some() {
-            eprintln!(
-                "  ⚠ route '{}': max_body_mb is set but WAF is off (no waf=true / waf_profile) \
+        }),
+        WafPolicy::Off {
+            ignored_max_body_mb,
+        } => {
+            // Footgun guard: `max_body_mb` is enforced by the WAF body gate, so
+            // on a WAF-off route it has no effect. Surface it at boot rather
+            // than silently dropping the operator's intended size cap (a no-WAF
+            // route otherwise streams the body to the upstream, hyper-framed).
+            if ignored_max_body_mb.is_some() {
+                eprintln!(
+                    "  ⚠ route '{}': max_body_mb is set but WAF is off (no waf=true / waf_profile) \
                      — the body-size cap is NOT enforced; enable WAF or remove max_body_mb",
-                route.path
-            );
+                    route.path
+                );
+            }
+            None
         }
-        None
     };
 
     // Resolve cache: named profile > legacy mode=static_cache
@@ -385,7 +386,7 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
                 })?
                 .clone(),
         )
-    } else if route.mode == RouteMode::StaticCache {
+    } else if route.mode() == RouteMode::StaticCache {
         // Default in-RAM profile for a profile-less static_cache route:
         // conservative 1h TTL (default_ttl), NOT immutable. Name an explicit
         // [cache_profile] with a longer ttl_seconds for content-hashed assets.
@@ -453,36 +454,42 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
     // Static file serving (ADR-0015): the serve dir + the literal prefix to
     // strip from the request path. Not canonicalized here — existence is a
     // per-request check so an imported config validates offline.
-    let (serve_dir, static_prefix) = if route.mode == RouteMode::Static {
-        let dir = route
-            .serve_dir
-            .as_ref()
-            .ok_or_else(|| format!("route '{}' is mode=static but has no serve_dir", route.path))?;
-        let prefix = route
-            .path
-            .split("{*")
-            .next()
-            .unwrap_or("/")
-            .trim_end_matches('/')
-            .to_string();
-        (Some(std::path::PathBuf::from(dir)), prefix)
-    } else {
-        (None, String::new())
+    let (serve_dir, spa_fallback, precompressed, static_prefix) = match &route.target {
+        RouteTarget::Static {
+            serve_dir,
+            spa_fallback,
+            precompressed,
+        } => {
+            let prefix = route
+                .path
+                .split("{*")
+                .next()
+                .unwrap_or("/")
+                .trim_end_matches('/')
+                .to_string();
+            (
+                Some(std::path::PathBuf::from(serve_dir)),
+                *spa_fallback,
+                *precompressed,
+                prefix,
+            )
+        }
+        RouteTarget::Upstream { .. } => (None, false, false, String::new()),
     };
 
     Ok(Arc::new(ResolvedRoute {
         upstream_url,
-        connect_timeout_ms: config
-            .upstream
-            .get(route.upstream.as_str())
+        connect_timeout_ms: route
+            .upstream_name()
+            .and_then(|name| config.upstream.get(name))
             .map(|u| u.connect_timeout_ms)
             .unwrap_or(crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS),
         upstream_scheme,
         upstream_authority,
-        mode: route.mode.clone(),
+        mode: route.mode(),
         serve_dir,
-        spa_fallback: route.spa_fallback,
-        precompressed: route.precompressed,
+        spa_fallback,
+        precompressed,
         static_prefix,
         waf,
         waf_shadow: route.waf_shadow,
@@ -539,7 +546,7 @@ fn print_routes_table(routes: &[RouteConfig]) {
             arrow_dim,
             reset,
             cyan,
-            route.upstream,
+            route.upstream_name().unwrap_or(""),
             reset,
             if tags.is_empty() {
                 String::new()
@@ -562,14 +569,14 @@ fn render_route_tags(route: &RouteConfig, color: bool) -> String {
 
     let mut tags: Vec<String> = Vec::new();
 
-    match route.mode {
+    match route.mode() {
         RouteMode::SseStream => tags.push(format!("{cyan}sse{reset}")),
         RouteMode::Websocket => tags.push(format!("{cyan}ws{reset}")),
         RouteMode::StaticCache => tags.push(format!("{cyan}static{reset}")),
         RouteMode::Static => tags.push(format!("{cyan}files{reset}")),
         RouteMode::Standard => {}
     }
-    if route.waf || route.waf_profile.is_some() {
+    if route.waf.is_enabled() {
         if route.waf_shadow {
             // Distinct tag — the operator must see at a glance which routes
             // are simulating vs enforcing. Amber matches "warning" semantics.
@@ -606,6 +613,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::UpstreamMode;
 
     fn minimal_toml() -> &'static str {
         r#"
@@ -631,21 +639,29 @@ waf = true
         RouteConfig {
             path: path.into(),
             hosts: None,
-            upstream: "backend".into(),
-            mode: RouteMode::Standard,
-            serve_dir: None,
-            spa_fallback: false,
-            precompressed: false,
+            target: RouteTarget::Upstream {
+                name: "backend".into(),
+                mode: UpstreamMode::Standard,
+            },
             internal_only: false,
-            waf_profile: None,
+            waf: WafPolicy::Off {
+                ignored_max_body_mb: None,
+            },
+            waf_shadow: false,
             cache_profile: None,
             csp: None,
             auth_profile: None,
-            waf: false,
-            max_body_mb: None,
-            waf_shadow: false,
             cors: None,
         }
+    }
+
+    /// The same route with a different proxying flavour.
+    fn with_mode(mut r: RouteConfig, mode: UpstreamMode) -> RouteConfig {
+        r.target = RouteTarget::Upstream {
+            name: "backend".into(),
+            mode,
+        };
+        r
     }
 
     #[test]
@@ -657,21 +673,21 @@ waf = true
     #[test]
     fn route_tags_waf_only() {
         let mut r = route("/api");
-        r.waf = true;
+        r.waf = WafPolicy::Inline { max_body_mb: None };
         assert_eq!(render_route_tags(&r, false), "waf");
     }
 
     #[test]
     fn route_tags_named_waf_profile_counts() {
         let mut r = route("/api");
-        r.waf_profile = Some("strict".into());
+        r.waf = WafPolicy::Profile("strict".into());
         assert_eq!(render_route_tags(&r, false), "waf");
     }
 
     #[test]
     fn route_tags_static_with_cache() {
         let mut r = route("/_next/static");
-        r.mode = RouteMode::StaticCache;
+        r = with_mode(r, UpstreamMode::StaticCache);
         r.cache_profile = Some("immutable".into());
         // Mode tag first, then perf tag
         assert_eq!(render_route_tags(&r, false), "static · cache");
@@ -680,14 +696,14 @@ waf = true
     #[test]
     fn route_tags_sse_stream() {
         let mut r = route("/events");
-        r.mode = RouteMode::SseStream;
+        r = with_mode(r, UpstreamMode::SseStream);
         assert_eq!(render_route_tags(&r, false), "sse");
     }
 
     #[test]
     fn route_tags_websocket() {
         let mut r = route("/ws");
-        r.mode = RouteMode::Websocket;
+        r = with_mode(r, UpstreamMode::Websocket);
         assert_eq!(render_route_tags(&r, false), "ws");
     }
 
@@ -702,7 +718,7 @@ waf = true
     fn route_tags_shadow_replaces_waf_tag() {
         // waf=true alone → "waf"
         let mut r = route("/api");
-        r.waf = true;
+        r.waf = WafPolicy::Inline { max_body_mb: None };
         assert_eq!(render_route_tags(&r, false), "waf");
         // waf=true + shadow → "waf:shadow" so the visual distinction is
         // unmissable when scanning the boot output.
@@ -713,7 +729,7 @@ waf = true
     #[test]
     fn route_tags_shadow_with_named_profile() {
         let mut r = route("/api");
-        r.waf_profile = Some("strict".into());
+        r.waf = WafPolicy::Profile("strict".into());
         r.waf_shadow = true;
         assert_eq!(render_route_tags(&r, false), "waf:shadow");
     }
@@ -731,7 +747,7 @@ waf = true
     #[test]
     fn route_tags_color_uses_ansi_per_category() {
         let mut r = route("/api");
-        r.waf = true;
+        r.waf = WafPolicy::Inline { max_body_mb: None };
         r.internal_only = true;
         let tagged = render_route_tags(&r, true);
         // Green for waf (security), amber for internal (restricted), dim
