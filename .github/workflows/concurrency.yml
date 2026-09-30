@@ -51,6 +51,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # rust-toolchain.toml pins the repo to 1.88.0 and beats the action's default
+  # toolchain; both tools need nightly (miri component, -Z flags), so say so here.
+  RUSTUP_TOOLCHAIN: nightly
 
 jobs:
   miri:
