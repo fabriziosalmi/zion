@@ -95,6 +95,24 @@ fn commit(tmp: &Path, dest: &Path) -> Result<(), String> {
     })
 }
 
+/// Hard-link the file currently at `path` (if any) to a sibling backup name.
+fn backup_link(path: &Path) -> Option<std::path::PathBuf> {
+    if !path.exists() {
+        return None;
+    }
+    let mut name = path.file_name()?.to_os_string();
+    name.push(format!(".zion-bak-{}", std::process::id()));
+    let bak = path.with_file_name(name);
+    let _ = std::fs::remove_file(&bak);
+    std::fs::hard_link(path, &bak).ok().map(|()| bak)
+}
+
+fn discard(bak: Option<&Path>) {
+    if let Some(b) = bak {
+        let _ = std::fs::remove_file(b);
+    }
+}
+
 /// Best-effort `fsync` of a directory so a rename into it is durable across
 /// power loss (not merely a process crash). A filesystem that refuses to fsync a
 /// read-only dir handle must not fail an otherwise-successful write.
@@ -166,9 +184,28 @@ pub fn write_cert_key_atomic(
             return Err(e);
         }
     };
-    // Both staged + fsynced. Commit key first, then cert.
-    commit(&key_tmp, key_path)?;
-    commit(&cert_tmp, cert_path)?;
+    // Both staged + fsynced. Keep a link to the current key so a failed cert commit
+    // can put it back: without it the disk would hold the NEW key beside the OLD
+    // cert, and a fresh boot could not load that pair.
+    let key_bak = backup_link(key_path);
+    if let Err(e) = commit(&key_tmp, key_path) {
+        let _ = std::fs::remove_file(&cert_tmp);
+        discard(key_bak.as_deref());
+        return Err(e);
+    }
+    if let Err(e) = commit(&cert_tmp, cert_path) {
+        return Err(match key_bak {
+            Some(bak) => match std::fs::rename(&bak, key_path) {
+                Ok(()) => format!("{e} (previous key restored)"),
+                Err(re) => format!(
+                    "{e}; ALSO could not restore the previous key from '{}': {re}",
+                    bak.display()
+                ),
+            },
+            None => e,
+        });
+    }
+    discard(key_bak.as_deref());
     fsync_dir(dir_of(key_path));
     if dir_of(cert_path) != dir_of(key_path) {
         fsync_dir(dir_of(cert_path));
@@ -202,6 +239,29 @@ mod tests {
         write_atomic_0600(&p, b"secret").unwrap();
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "key file must be created owner-only");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_cert_commit_restores_the_previous_key() {
+        let dir = std::env::temp_dir().join(format!("zion-atomic-rb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (key, cert) = (dir.join("k.pem"), dir.join("c.pem"));
+        write_cert_key_atomic(&key, b"KEY-1", &cert, b"CERT-1").unwrap();
+        // A non-empty directory where the cert must land makes its rename fail.
+        std::fs::remove_file(&cert).unwrap();
+        std::fs::create_dir_all(cert.join("blocker")).unwrap();
+        let e = write_cert_key_atomic(&key, b"KEY-2", &cert, b"CERT-2").unwrap_err();
+        assert!(e.contains("previous key restored"), "{e}");
+        assert_eq!(std::fs::read(&key).unwrap(), b"KEY-1", "old key must be back");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("zion-bak") || n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "stray files: {leftovers:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
