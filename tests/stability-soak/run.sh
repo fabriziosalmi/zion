@@ -38,7 +38,9 @@
 #   RSS_BUDGET_BPS (default 600) steady-state RSS slope budget, bytes/sec
 #   RSS_BUDGET_PCT (default 10)  and 24h-extrapolated growth < PCT% of steady
 #   FD_MARGIN (default 40)      allowed fd range under concurrency
-#   FD_DRIFT  (default 3)       allowed last-decile − first-decile fd drift
+#   FD_DRIFT  (default 3)       floor of the allowed second-half − first-half fd drift
+#   FD_SIGMA  (default 5)       the limit is max(FD_DRIFT, FD_SIGMA x this run's own noise);
+#                               see analyze.sh
 #   ZION_BIN / BACKEND_BIN      prebuilt binaries (CI/container builds them once)
 set -euo pipefail
 
@@ -47,7 +49,8 @@ DURATION="${DURATION:-120}"; WARMUP="${WARMUP:-20}"; INTERVAL="${INTERVAL:-5}"
 WORKERS="${WORKERS:-20}"; RELOADS="${RELOADS:-40}"; CARDINALITY="${CARDINALITY:-20000}"
 MAX_ENTRIES="${MAX_ENTRIES:-2000}"; RATE_LIMIT_RPS="${RATE_LIMIT_RPS:-200}"
 RSS_BUDGET_BPS="${RSS_BUDGET_BPS:-600}"; RSS_BUDGET_PCT="${RSS_BUDGET_PCT:-10}"
-FD_MARGIN="${FD_MARGIN:-40}"; FD_DRIFT="${FD_DRIFT:-3}"
+FD_MARGIN="${FD_MARGIN:-40}"; FD_DRIFT="${FD_DRIFT:-3}"; FD_SIGMA="${FD_SIGMA:-5}"
+export WARMUP RELOADS RSS_BUDGET_BPS RSS_BUDGET_PCT FD_MARGIN FD_DRIFT FD_SIGMA
 HTTPS_PORT=4433; ADMIN_PORT=9180; BACKEND_PORT=9090
 [ "$MAX_ENTRIES" -gt 0 ] || { echo "MAX_ENTRIES must be > 0 (else the cache never evicts)"; exit 2; }
 [ "$RATE_LIMIT_RPS" -gt 0 ] || { echo "RATE_LIMIT_RPS must be > 0 (else the rate map stays empty)"; exit 2; }
@@ -235,64 +238,8 @@ awk 'NR==1{next}{printf "    %5ds  %8.1f  %4d  %d\n", $1, $2/1048576, $3, $4}' "
 # significant, over budget, AND still ~as steep as the overall slope
 # (tail/overall >= 0.5 — i.e. still climbing at the end, not settling).
 step "analysis"
-awk -v warmup="$WARMUP" -v budget_bps="$RSS_BUDGET_BPS" -v budget_pct="$RSS_BUDGET_PCT" \
-    -v fd_margin="$FD_MARGIN" -v fd_drift="$FD_DRIFT" -v gen0="$gen0" -v gen1="$gen1" -v reloads="$RELOADS" '
-NR==1 { next }                                   # header
-{
-    t=$1; rss=$2; fd=$3
-    if (t < warmup) next                          # exclude the warm-up ramp
-    n++; X[n]=t; Yr[n]=rss; Yf[n]=fd
-    if (fd>fmax||fmax==0) fmax=fd
-    if (fmin==0||fd<fmin) fmin=fd
-}
-END {
-    if (n < 8) { printf "  FAIL — only %d post-warmup samples (need >=8); soak too short\n", n; exit 1 }
-    # overall least-squares slope over [1..n]
-    Sx=0;Sy=0;Sxx=0;Sxy=0;Syy=0
-    for(i=1;i<=n;i++){Sx+=X[i];Sy+=Yr[i];Sxx+=X[i]*X[i];Sxy+=X[i]*Yr[i];Syy+=Yr[i]*Yr[i]}
-    Sxxc=Sxx-Sx*Sx/n; Sxyc=Sxy-Sx*Sy/n; Syyc=Syy-Sy*Sy/n
-    m=Sxyc/Sxxc; Se2=Syyc-m*Sxyc; vm=(Se2/(n-2))/Sxxc; if(vm<0)vm=0; se_m=sqrt(vm)
-    med=Sy/n; pct=(med>0)?100.0*m*86400.0/med:0
-    # tail least-squares slope over [ts..n] = last 60% of post-warmup samples
-    ts=int(n*0.4)+1; if(ts<1)ts=1; nt=n-ts+1
-    Tx=0;Ty=0;Txx=0;Txy=0;Tyy=0
-    for(i=ts;i<=n;i++){Tx+=X[i];Ty+=Yr[i];Txx+=X[i]*X[i];Txy+=X[i]*Yr[i];Tyy+=Yr[i]*Yr[i]}
-    Txxc=Txx-Tx*Tx/nt; Txyc=Txy-Tx*Ty/nt; Tyyc=Tyy-Ty*Ty/nt
-    mt=Txyc/Txxc; TSe2=Tyyc-mt*Txyc; vmt=(nt>2)?(TSe2/(nt-2))/Txxc:0; if(vmt<0)vmt=0; se_mt=sqrt(vmt)
-    medt=Ty/nt; pctt=(medt>0)?100.0*mt*86400.0/medt:0
-    ratio=(m>0)?mt/m:0
-    # fd stats: first-half vs second-half MEAN drift. Half-means rather than
-    # 2-sample deciles, so the per-sample in-flight-connection jitter averages
-    # out: a real socket leak is a monotonic staircase whose second-half mean
-    # sits clearly above the first-half, while a bounded band has matching
-    # halves within noise. A 2-sample decile was noise-dominated on the short
-    # gate and flagged phantom drift.
-    h=int(n/2); if (h<1) h=1
-    for(i=1;i<=h;i++){ ff+=Yf[i] } ff/=h
-    for(i=h+1;i<=n;i++){ fl+=Yf[i] } fl/=(n-h)
-    fd_range = fmax - fmin; fd_dr = fl - ff
-
-    printf "  samples (post-warmup): %d over %ds (tail %d)\n", n, (X[n]-X[1]), nt
-    printf "  RSS: mean %.1f MiB | overall slope %.1f B/s (%.2f%%/24h) | tail slope %.1f B/s (3-sigma %.1f, %.2f%%/24h) | tail/overall %.2f\n", \
-        med/1048576.0, m, pct, mt, 3*se_mt, pctt, ratio
-    printf "  fd : min %d, max %d, range %d, half-drift %.1f\n", fmin, fmax, fd_range, fd_dr
-    printf "  reloads: generation %d -> %d (%d swaps under load)\n", gen0, gen1, gen1-gen0
-
-    fail=0
-    significant = (mt > 3*se_mt)                   # tail slope clearly above noise
-    over_budget = (mt >= budget_bps) && (pctt >= budget_pct)
-    sustained   = (ratio >= 0.5)                   # not decelerating toward a plateau
-    if (significant && over_budget && sustained) {
-        printf "  RSS LEAK: tail slope %.1f B/s is significant, over budget (>= %d B/s and >= %d%%/24h), and SUSTAINED (tail/overall %.2f >= 0.5 — still climbing at the end, not a bounded ramp)\n", mt, budget_bps, budget_pct, ratio
-        fail=1
-    }
-    if (fd_range > fd_margin) { printf "  FD range %d exceeds margin %d (unbounded fd growth?)\n", fd_range, fd_margin; fail=1 }
-    if (fd_dr > fd_drift)     { printf "  FD half-drift %.1f exceeds %d (fd staircase = leaked sockets)\n", fd_dr, fd_drift; fail=1 }
-    if ((gen1-gen0) < reloads/2) { printf "  only %d swaps observed (< %d); reloads did not run under load\n", gen1-gen0, reloads/2; fail=1 }
-    exit fail
-}
-' "$WORK/samples.tsv"
-rc=$?
+rc=0
+"$ROOT/tests/stability-soak/analyze.sh" "$WORK/samples.tsv" "$gen0" "$gen1" || rc=$?
 
 step "result"
 if [ "$rc" -eq 0 ]; then

@@ -45,8 +45,15 @@ log on disk, off by default) are out of scope and tracked in their own issues.
   the curve shape is auditable, not just the summary slope.
 - **fds:** bounded range and no first-half-to-second-half mean drift — a leaked
   socket shows as a clean upward staircase; the half-means average out the
-  per-sample in-flight-connection jitter (a 2-sample decile was noise-dominated
-  on the short gate and flagged phantom drift).
+  per-sample in-flight-connection jitter. The drift limit is
+  `max(FD_DRIFT, FD_SIGMA × noise)`, where the noise is estimated from the run's
+  own residuals around its fd trend (a leak is a trend, so it does not inflate
+  it). A fixed limit of 3 sat inside the noise (healthy runs measured a
+  half-drift sd of ~1.9) and failed a good build about one run in ten. Measured
+  resolution of the 3-minute gate: a leak of one fd per reload is caught 6 times
+  in 6, one per ~1.2 reloads 5 in 6, one per ~1.5 reloads 3 in 6; anything
+  slower is left to the 2-hour nightly. `analyze-selftest.sh` pins this against
+  real healthy runs (`fixtures/`) with injected leaks, and runs before the soak.
 - **reloads:** the config generation must have advanced under load (else the
   swaps didn't overlap the traffic and the Arc lifecycle wasn't tested).
 
@@ -74,4 +81,4 @@ cron is the authoritative slope/fd verdict and uploads `soak-samples.tsv` as a
 14-day artifact. Both on `ubuntu-latest` (GitHub-hosted jobs run up to 6h).
 
 Tunables (env): `DURATION WARMUP INTERVAL WORKERS RELOADS CARDINALITY
-MAX_ENTRIES RATE_LIMIT_RPS RSS_BUDGET_BPS RSS_BUDGET_PCT FD_MARGIN FD_DRIFT`.
+MAX_ENTRIES RATE_LIMIT_RPS RSS_BUDGET_BPS RSS_BUDGET_PCT FD_MARGIN FD_DRIFT FD_SIGMA`.
