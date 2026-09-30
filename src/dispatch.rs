@@ -36,7 +36,7 @@ use crate::http_util::{
 };
 use crate::proxy::ZionBody;
 use crate::state::AppState;
-use crate::{cache, config, health, logging, metrics, observability, proxy, security, waf};
+use crate::{cache, config, health, logging, metrics, observability, proxy, security, vary, waf};
 // `unauthorized` is only referenced from the JWT/OIDC auth gate.
 #[cfg(feature = "auth")]
 use crate::http_util::unauthorized;
@@ -1151,11 +1151,23 @@ async fn process_request_inner(
     Ok(resp)
 }
 
+/// The key a request's cache entry lives under: its primary key, or — when that key's
+/// responses are known to vary — the secondary key for this request's varied headers.
+/// `None` when a varied header value is too long to key on.
+fn lookup_key(state: &AppState, primary: &str, headers: &hyper::HeaderMap) -> Option<String> {
+    match state.static_cache.vary.get(primary) {
+        Some(rule) => vary::variant_key(primary, &rule.names, headers),
+        None => Some(primary.to_string()),
+    }
+}
+
 /// Everything a background stale-while-revalidate refresh needs, owned so it can
 /// outlive the request that triggered it.
 struct SwrRefresh {
     state: Arc<AppState>,
     key: Arc<str>,
+    /// The primary key `key` was derived from (they are equal unless the key varies).
+    primary_key: Arc<str>,
     stale: cache::CacheHit,
     request: Request<ZionBody>,
     connect_timeout_ms: u64,
@@ -1292,6 +1304,17 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
         .unwrap_or(job.cache_ttl);
     // The refresh carries no credentials, so the request is not "authenticated".
     if !is_shared_cacheable(false, &parts.headers, ttl, initial_age) {
+        return false;
+    }
+    // It refreshes ONE entry. If the origin's Vary no longer matches what that entry
+    // was keyed on, the new body belongs to a different key: leave the old entry alone.
+    let rule = job.state.static_cache.vary.get(&job.primary_key);
+    let same_shape = match (vary::policy(&parts.headers), rule) {
+        (vary::VaryPolicy::None, None) => true,
+        (vary::VaryPolicy::Keyed(names), Some(rule)) => names == rule.names,
+        _ => false,
+    };
+    if !same_shape {
         return false;
     }
     let Ok(collected) = http_body_util::Limited::new(body, MAX_CACHEABLE_BODY)
@@ -1498,22 +1521,10 @@ fn is_shared_cacheable(
         }
     }
 
-    // §4.1: a stored response that varies must be matched on the varied headers.
-    // We fold `Accept-Encoding` into the cache key (see `accept_encoding_key`),
-    // so a response varying SOLELY on Accept-Encoding is safe to store. Any other
-    // varied header (Accept, Cookie, Accept-Language, User-Agent, `*`, …) we can't
-    // key on — don't store it, or we'd serve one variant to every requester.
-    let vary_safe = resp_headers
-        .get(hyper::header::VARY)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.split(',')
-                .map(|t| t.trim())
-                .filter(|t| !t.is_empty())
-                .all(|t| t.eq_ignore_ascii_case("accept-encoding"))
-        })
-        .unwrap_or(true); // no Vary → safe
-    vary_safe
+    // §4.1: a response that varies is stored under a secondary key built from the
+    // request headers it names (see `vary`). Only `Vary: *` and varied credential
+    // headers (per-user responses) remain unstorable.
+    !matches!(vary::policy(resp_headers), vary::VaryPolicy::Uncacheable)
 }
 
 /// Canonical `Accept-Encoding` fragment for the cache key (RFC 9111 §4.1, the
@@ -1743,7 +1754,27 @@ async fn handle_static_cache(
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or_else(|| req.uri().path());
-    let cache_key = format!("{pq}\u{1f}{}", accept_encoding_key(req.headers()));
+    let primary_key = format!("{pq}\u{1f}{}", accept_encoding_key(req.headers()));
+    // If this primary key's responses vary (RFC 9111 §4.1), the entry for THIS request
+    // lives under a secondary key built from the varied request headers.
+    let Some(cache_key) = lookup_key(&state, &primary_key, req.headers()) else {
+        // A varied request header too long to key on: do not touch the cache.
+        let mut resp = proxy::proxy_pass(
+            &state.client_for(rule.connect_timeout_ms),
+            req,
+            dyn_scheme,
+            dyn_authority,
+            Some(remote_addr),
+            "https",
+            xff_mode,
+        )
+        .await?;
+        resp.headers_mut().insert(
+            "X-Zion-Cache",
+            hyper::header::HeaderValue::from_static("BYPASS"),
+        );
+        return Ok(resp);
+    };
 
     // only-if-cached (§5.2.1.7): serve from cache or 504 — never fetch.
     if rcc_only_if_cached {
@@ -1788,6 +1819,7 @@ async fn handle_static_cache(
                     let refresh = SwrRefresh {
                         state: state.clone(),
                         key: Arc::from(cache_key.as_str()),
+                        primary_key: Arc::from(primary_key.as_str()),
                         stale: hit.clone(),
                         request: swr_request(&req),
                         connect_timeout_ms: rule.connect_timeout_ms,
@@ -1845,13 +1877,23 @@ async fn handle_static_cache(
         // Someone else is fetching — wait for them.
         let mut rx = tx.subscribe();
         let _ = rx.wait_for(|v| *v).await;
-        if let Some(hit) = state.static_cache.get(path_owned.as_ref()).fresh() {
+        // The fetcher may have just learned that this key varies, so the entry for
+        // THIS request can now live under a secondary key: look it up afresh.
+        let key_now = lookup_key(&state, &primary_key, req.headers());
+        if let Some(hit) = key_now
+            .as_deref()
+            .and_then(|k| state.static_cache.get(k).fresh())
+        {
             // get() already counted this hit — don't double-count it here.
             return Ok(cache_hit_response(hit));
         }
         // Cache miss/stale after wait (fetcher aborted, or stored a
         // non-cacheable response): loop to fetch ourselves.
     };
+
+    // The varied request headers must outlive `req`, which the fetch consumes: the
+    // response may reveal (via `Vary`) which of them the entry is keyed on.
+    let req_headers = req.headers().clone();
 
     // RAM miss — fetch from upstream.
     // On error, drop the inflight sender. Waiters' wait_for() returns Err
@@ -1932,25 +1974,63 @@ async fn handle_static_cache(
         // authenticated-request / freshness §4.2). A request `Cache-Control:
         // no-store` (§5.2.1.5) also forbids storing the response. On a bypass,
         // stream the body straight through without populating the shared cache.
-        if rcc_no_store
-            || !is_shared_cacheable(
+        let cacheable = !rcc_no_store
+            && is_shared_cacheable(
                 req_authenticated,
                 &parts.headers,
                 effective_ttl,
                 initial_age,
-            )
-        {
+            );
+        // Where the entry lives: the primary key, or — when the response varies — the
+        // secondary key of THIS request's varied headers (bounded; see `vary`).
+        let store_key: Option<Arc<str>> = if !cacheable {
+            None
+        } else {
+            match vary::policy(&parts.headers) {
+                vary::VaryPolicy::Uncacheable => None,
+                vary::VaryPolicy::None => {
+                    // Not varying (any more): forget an old rule so lookups use the primary key.
+                    state.static_cache.vary.remove(&primary_key);
+                    Some(Arc::from(primary_key.as_str()))
+                }
+                vary::VaryPolicy::Keyed(names) => state
+                    .static_cache
+                    .vary
+                    .install(
+                        &primary_key,
+                        names,
+                        // Outlive the variants' usefulness: a stale variant is kept for
+                        // revalidation / stale-while-revalidate, so the rule must still be
+                        // there to find it (the profile ceiling, plus any SWR window).
+                        cache_ttl
+                            .max(effective_ttl)
+                            .saturating_add(origin_swr(&parts.headers)),
+                        cache_max,
+                    )
+                    .and_then(|rule| {
+                        let vk = vary::variant_key(&primary_key, &rule.names, &req_headers)?;
+                        rule.admit(&vk).then(|| Arc::from(vk.as_str()))
+                    }),
+            }
+        };
+        let Some(store_key) = store_key else {
             // Stream the body straight to the client without caching.
             // Drop the inflight sender (no `true` sent): waiters fall through
             // to a fresh fetch, since cache will not be populated for this key.
             state.inflight.remove(&path_owned);
+            if cacheable {
+                // Storable in principle but refused by the Vary policy or its cap.
+                metrics::METRICS
+                    .cache_vary_uncached
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let mut resp = Response::from_parts(parts, body.map_err(hyper::Error::from).boxed());
             resp.headers_mut().insert(
                 "X-Zion-Cache",
                 hyper::header::HeaderValue::from_static("BYPASS"),
             );
             return Ok(resp);
-        }
+        };
 
         // Preserve Content-Type and Content-Encoding for cache (S-05 fix).
         // Without Content-Encoding, gzip-compressed bodies are served garbled.
@@ -1976,6 +2056,7 @@ async fn handle_static_cache(
 
         let state_clone = state.clone();
         let path_clone = path_owned.clone();
+        let store_key_clone = store_key.clone();
         let meta_clone = meta.clone();
         let tx_clone = tx.clone();
 
@@ -2027,7 +2108,7 @@ async fn handle_static_cache(
 
             if !cache_aborted {
                 state_clone.static_cache.insert(
-                    &path_clone,
+                    &store_key_clone,
                     cache_buffer.into(),
                     meta_clone,
                     effective_ttl,
@@ -2386,32 +2467,34 @@ mod tests {
     }
 
     #[test]
-    fn bypass_unsafe_vary_but_allow_accept_encoding() {
-        // §4.1: only `Accept-Encoding` is folded into the cache key, so any OTHER
-        // varied header (incl. ones the old block-list missed, like
-        // Accept-Language / User-Agent) is uncacheable — we can't key on it.
+    fn bypass_per_user_vary_but_key_the_rest() {
+        // §4.1: per-user `Vary` (`*`, Cookie, Authorization) is never stored; every
+        // other varied header gets a secondary key, `Accept-Encoding` being part of the
+        // primary key already.
         for v in [
-            "Accept",
             "Cookie",
             "Authorization",
             "*",
-            "Accept-Encoding, Accept",
-            "Accept-Language",
-            "User-Agent",
-            "Accept-Encoding, Accept-Language",
+            "Accept-Encoding, Cookie",
+            "Accept-Language, Authorization",
         ] {
             let h = hdr(hyper::header::VARY, v);
             assert!(!is_shared_cacheable(false, &h, TTL, 0), "unsafe vary: {v}");
         }
-        // Vary on Accept-Encoding (alone, any case, repeated) IS safe — the key
-        // now incorporates the canonical Accept-Encoding set.
+        // Everything else is stored under a secondary key (see `vary`), and
+        // Accept-Encoding is part of the primary key.
         for v in [
             "Accept-Encoding",
             "accept-encoding",
             "Accept-Encoding, accept-encoding",
+            "Accept",
+            "Accept-Language",
+            "User-Agent",
+            "Accept-Encoding, Accept-Language",
+            "Origin",
         ] {
             let h = hdr(hyper::header::VARY, v);
-            assert!(is_shared_cacheable(false, &h, TTL, 0), "safe vary: {v}");
+            assert!(is_shared_cacheable(false, &h, TTL, 0), "keyed vary: {v}");
         }
     }
 

@@ -38,8 +38,31 @@ uncached, marked `X-Zion-Cache: BYPASS`):
 | Status | **`200 OK` only.** |
 | Response `Cache-Control` | Not `private`, `no-store`, or `no-cache` (RFC 9111 §3.2 / §5.2.2). |
 | Authenticated request (§3.5) | A response to a request carrying `Authorization` is stored **only** if the origin explicitly opts in with `public`, `s-maxage`, or `must-revalidate` — otherwise one user's response could be served to another. |
-| `Vary` | Absent, or **solely `Accept-Encoding`** (which is folded into the key). Any other varied header (`Accept`, `Cookie`, `Accept-Language`, `User-Agent`, `*`) → not cached, since the key can't distinguish those variants (§4.1). |
+| `Vary` | Absent, or naming request headers zion can key on (see [Vary and secondary keys](#vary-and-secondary-keys)). **Not cached:** `Vary: *`, any varied credential header (`Cookie`, `Authorization`, `Proxy-Authorization`, `Set-Cookie`), more than 8 varied headers, or a variant over the per-key cap. |
 | Freshness | A positive effective TTL (see below); an object that arrives already older than its lifetime isn't stored. |
+
+## Vary and secondary keys
+
+When the origin answers with `Vary: Accept-Language` (or `Accept`, `Origin`, `X-Foo`, …)
+the response is only valid for requests that send the same value of those headers.
+zion remembers, per cache key, which request headers the origin varies on, and stores
+each variant under its own **secondary key** built from the values of those headers:
+
+- Two requests share a variant only when the varied header values are **identical**
+  (trimmed; repeated header lines are joined in order). `de` and `DE` are different
+  variants, and an **absent** header is a different variant from an **empty** one.
+- `Accept-Encoding` is part of the primary key already and is ignored here.
+- **Bounded:** at most 16 variants per key (`zion_cache_vary_uncached` counts
+  responses refused for that or another Vary reason; they are served, not stored), a
+  varied request value over 256 bytes bypasses the cache, and the rule index is bounded
+  by the route's `max_entries`.
+- **Never keyed, never stored:** `Vary: *` and varied credential headers. A response
+  that varies on `Cookie` is per-user; a shared cache must not keep a copy per session.
+- If the origin changes the set of headers it varies on, or stops varying, the key
+  follows on the next fetch; entries filed under the old key are no longer reachable.
+- A background [stale-while-revalidate](#stale-while-revalidate-rfc-5861) refresh
+  fetches the **same variant** it refreshes, and is discarded if the origin's `Vary`
+  no longer matches the key it was filed under.
 
 ## Cache key
 
@@ -157,7 +180,7 @@ $ curl -sX POST 'http://127.0.0.1/_zion/cache/purge?prefix=/static/app.js'
 |---|---|---|
 | `private` / `no-store` / `no-cache` response directives | 9111 §3.2, §5.2.2 | Yes |
 | Authenticated-request storage opt-in | 9111 §3.5 | Yes |
-| `Vary` matching (Accept-Encoding) | 9111 §4.1 | Yes (Accept-Encoding; others → uncached) |
+| `Vary` matching (secondary keys) | 9111 §4.1 | Yes (exact match on the varied headers, bounded; `*` and credential headers → uncached) |
 | Origin-driven freshness (`max-age` / `s-maxage`) + `Age` | 9111 §4.2 | Yes |
 | Request `Cache-Control` (no-cache/no-store/max-age=0/only-if-cached) | 9111 §5.2.1 | Yes |
 | Client conditional → `304` (If-None-Match / If-Modified-Since) | 9110 §13 | Yes |

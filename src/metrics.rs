@@ -412,6 +412,9 @@ pub struct Metrics {
     /// Stale entries served without starting a refresh because the global cap on
     /// concurrent background refreshes was reached.
     pub cache_swr_refresh_skipped: ShardedCounter,
+    /// Responses that were storable but refused because of their `Vary` (too many
+    /// variants for the key, the rule index full, or an overlong varied value).
+    pub cache_vary_uncached: ShardedCounter,
 
     // Global Counters (Cold Path or connection-level)
     pub websocket_upgrades: AtomicU64,
@@ -564,6 +567,7 @@ impl Metrics {
             cache_swr_refreshes: ShardedCounter::new(),
             cache_swr_refresh_failures: ShardedCounter::new(),
             cache_swr_refresh_skipped: ShardedCounter::new(),
+            cache_vary_uncached: ShardedCounter::new(),
             websocket_upgrades: AtomicU64::new(0),
             connections_total: AtomicU64::new(0),
             tls_handshake_errors: AtomicU64::new(0),
@@ -905,6 +909,11 @@ impl Metrics {
                 "zion_cache_swr_refresh_skipped",
                 "Stale entries served without a refresh because the concurrent-refresh cap was reached.",
                 &self.cache_swr_refresh_skipped,
+            ),
+            (
+                "zion_cache_vary_uncached",
+                "Storable responses not stored because of their Vary (variant cap, rule index full, overlong varied value).",
+                &self.cache_vary_uncached,
             ),
         ] {
             out.extend_from_slice(format!("# HELP {name} {help}\n# TYPE {name} counter\n{name} ").as_bytes());

@@ -19,13 +19,17 @@ use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct Origin {
     /// The `Vary` value the origin sends (empty = none).
     vary: Mutex<String>,
     /// Requests that reached the origin.
     hits: AtomicUsize,
+    /// The `Cache-Control` the origin sends.
+    cc: Mutex<String>,
+    /// `Accept-Language` of the last request the origin saw (None if absent).
+    last_lang: Mutex<Option<String>>,
 }
 
 /// `lang|foo|cookie|ae` of the request, so a body identifies who it was made for.
@@ -43,6 +47,11 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                     let o = o.clone();
                     async move {
                         o.hits.fetch_add(1, Ordering::Relaxed);
+                        *o.last_lang.lock().unwrap() = req
+                            .headers()
+                            .get("accept-language")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
                         let h = |n: &str| {
                             req.headers()
                                 .get(n)
@@ -59,7 +68,7 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                         );
                         let mut b = Response::builder()
                             .status(StatusCode::OK)
-                            .header("cache-control", "public, max-age=60");
+                            .header("cache-control", o.cc.lock().unwrap().clone());
                         let vary = o.vary.lock().unwrap().clone();
                         if !vary.is_empty() {
                             b = b.header("vary", vary);
@@ -107,9 +116,15 @@ cache_profile = "c"
 }
 
 async fn rig(vary: &str) -> (Arc<Origin>, Arc<AppState>) {
+    rig_cc(vary, "public, max-age=60").await
+}
+
+async fn rig_cc(vary: &str, cc: &str) -> (Arc<Origin>, Arc<AppState>) {
     let o = Arc::new(Origin {
         vary: Mutex::new(vary.into()),
         hits: AtomicUsize::new(0),
+        cc: Mutex::new(cc.into()),
+        last_lang: Mutex::new(None),
     });
     let port = start_origin(o.clone()).await;
     (o, state_for(port))
@@ -164,7 +179,8 @@ async fn settle() {
 /// the clients arrive, and whether or not the cache chooses to store the response.
 #[tokio::test]
 async fn no_client_ever_receives_another_clients_variant() {
-    let cases: &[(&str, &str, &[(&str, &str)], &[(&str, &str)])] = &[
+    type Headers = &'static [(&'static str, &'static str)];
+    let cases: &[(&str, &str, Headers, Headers)] = &[
         (
             "Accept-Language",
             "/l",
@@ -223,4 +239,207 @@ async fn accept_encoding_variants_do_not_cross() {
     assert!(plain.ends_with("<identity>"), "{plain}");
     let (_, gz2) = fetch(&st, "/e", &[("accept-encoding", "gzip")]).await;
     assert!(gz2.ends_with("<gzip>"), "{gz2}");
+}
+
+// ── behaviour: a secondary key per variant ──────────────────────────────────
+
+fn hits(o: &Origin) -> usize {
+    o.hits.load(Ordering::Relaxed)
+}
+
+#[tokio::test]
+async fn each_variant_is_cached_under_its_own_key() {
+    let (o, st) = rig("Accept-Language").await;
+    let de = [("accept-language", "de")];
+    let fr = [("accept-language", "fr")];
+
+    let (c, b) = fetch(&st, "/v", &de).await;
+    assert_eq!((c.as_str(), b.starts_with("<de>")), ("MISS", true));
+    settle().await;
+    let (c, b) = fetch(&st, "/v", &de).await;
+    assert_eq!(
+        (c.as_str(), b.starts_with("<de>")),
+        ("HIT", true),
+        "same variant is served from cache"
+    );
+    assert_eq!(hits(&o), 1);
+
+    let (c, b) = fetch(&st, "/v", &fr).await;
+    assert_eq!(
+        (c.as_str(), b.starts_with("<fr>")),
+        ("MISS", true),
+        "a different variant is not the cached one"
+    );
+    settle().await;
+    assert_eq!(hits(&o), 2);
+
+    // both now hit, each with its own body, and the origin is not asked again
+    for _ in 0..3 {
+        let (c, b) = fetch(&st, "/v", &de).await;
+        assert_eq!((c.as_str(), b.starts_with("<de>")), ("HIT", true));
+        let (c, b) = fetch(&st, "/v", &fr).await;
+        assert_eq!((c.as_str(), b.starts_with("<fr>")), ("HIT", true));
+    }
+    assert_eq!(hits(&o), 2);
+
+    // a variant nobody has asked for yet, and "no header at all", are their own entries
+    let (c, b) = fetch(&st, "/v", &[]).await;
+    assert_eq!((c.as_str(), b.starts_with("-|")), ("MISS", true));
+    settle().await;
+    let (c, _) = fetch(&st, "/v", &[]).await;
+    assert_eq!(c, "HIT");
+}
+
+#[tokio::test]
+async fn an_absent_header_and_an_empty_one_are_different_variants() {
+    let (o, st) = rig("X-Foo").await;
+    let (_, none) = fetch(&st, "/ae", &[]).await;
+    settle().await;
+    let (c, empty) = fetch(&st, "/ae", &[("x-foo", "")]).await;
+    settle().await;
+    assert_eq!(
+        c, "MISS",
+        "an empty X-Foo must not be answered with the no-X-Foo entry"
+    );
+    assert!(
+        none.contains("|-|") && empty.contains("|<>|"),
+        "{none} / {empty}"
+    );
+    assert_eq!(hits(&o), 2);
+}
+
+#[tokio::test]
+async fn per_user_vary_is_still_never_stored() {
+    for (n, vary) in ["Cookie", "*", "Accept-Language, Authorization"]
+        .iter()
+        .enumerate()
+    {
+        let (o, st) = rig(vary).await;
+        // a path of its own per case: the route cache is thread-local and keyed by path
+        let uri = format!("/u{n}");
+        for _ in 0..3 {
+            let (c, _) = fetch(&st, &uri, &[("cookie", "s=1")]).await;
+            assert_eq!(c, "BYPASS", "Vary: {vary}");
+            settle().await;
+        }
+        assert_eq!(
+            hits(&o),
+            3,
+            "Vary: {vary}: every request must reach the origin"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_number_of_variants_per_key_is_bounded() {
+    let (o, st) = rig("X-Foo").await;
+    let cap = crate::vary::MAX_VARIANTS_PER_KEY;
+    for i in 0..cap + 4 {
+        let v = format!("v{i}");
+        let (_, body) = fetch(&st, "/cap", &[("x-foo", v.as_str())]).await;
+        assert!(body.contains(&format!("<{v}>")), "{body}");
+        settle().await;
+    }
+    // the first `cap` are cached; the extra ones are served but not stored
+    let before = hits(&o);
+    for i in 0..cap {
+        let v = format!("v{i}");
+        let (c, _) = fetch(&st, "/cap", &[("x-foo", v.as_str())]).await;
+        assert_eq!(c, "HIT", "variant {i} within the cap");
+    }
+    assert_eq!(hits(&o), before);
+    let (c, _) = fetch(&st, "/cap", &[("x-foo", "v-last")]).await;
+    assert_eq!(c, "BYPASS", "a variant over the cap is not stored");
+    assert!(
+        crate::metrics::METRICS
+            .cache_vary_uncached
+            .load(Ordering::Relaxed)
+            > 0
+    );
+}
+
+#[tokio::test]
+async fn changing_the_vary_header_replaces_the_rule_without_mixing_variants() {
+    let (o, st) = rig("Accept-Language").await;
+    fetch(&st, "/chg", &[("accept-language", "de")]).await;
+    settle().await;
+    *o.vary.lock().unwrap() = "X-Foo".into();
+    // the stored entry is still keyed on Accept-Language until it is refetched; purge to force it
+    st.static_cache.purge_all();
+    let (_, b1) = fetch(&st, "/chg", &[("x-foo", "a"), ("accept-language", "de")]).await;
+    settle().await;
+    let (c, b2) = fetch(&st, "/chg", &[("x-foo", "b"), ("accept-language", "de")]).await;
+    assert_eq!(c, "MISS", "now keyed on X-Foo, so 'b' is not 'a'");
+    assert!(b1.contains("|<a>|") && b2.contains("|<b>|"), "{b1} / {b2}");
+}
+
+#[tokio::test]
+async fn an_origin_that_stops_varying_goes_back_to_one_shared_entry() {
+    let (o, st) = rig("Accept-Language").await;
+    fetch(&st, "/stop", &[("accept-language", "de")]).await;
+    settle().await;
+    *o.vary.lock().unwrap() = String::new();
+    st.static_cache.purge_all();
+    fetch(&st, "/stop", &[("accept-language", "de")]).await; // stored under the primary key
+    settle().await;
+    let (c, _) = fetch(&st, "/stop", &[("accept-language", "fr")]).await;
+    assert_eq!(c, "HIT", "no Vary any more: one entry serves everyone");
+}
+
+#[tokio::test]
+async fn simultaneous_first_requests_for_different_variants_each_get_their_own() {
+    let (_o, st) = rig("Accept-Language").await;
+    let (a, b) = tokio::join!(
+        fetch(&st, "/par", &[("accept-language", "de")]),
+        fetch(&st, "/par", &[("accept-language", "fr")]),
+    );
+    assert!(a.1.starts_with("<de>"), "{}", a.1);
+    assert!(b.1.starts_with("<fr>"), "{}", b.1);
+    settle().await;
+    let (c1, b1) = fetch(&st, "/par", &[("accept-language", "de")]).await;
+    let (c2, b2) = fetch(&st, "/par", &[("accept-language", "fr")]).await;
+    assert!(b1.starts_with("<de>") && b2.starts_with("<fr>"));
+    assert_eq!((c1.as_str(), c2.as_str()), ("HIT", "HIT"));
+}
+
+#[tokio::test]
+async fn purging_a_prefix_removes_the_variants_under_it() {
+    let (o, st) = rig("Accept-Language").await;
+    fetch(&st, "/pg/a", &[("accept-language", "de")]).await;
+    settle().await;
+    assert!(st.static_cache.purge_prefix("/pg/a") >= 1);
+    let (c, _) = fetch(&st, "/pg/a", &[("accept-language", "de")]).await;
+    assert_eq!(c, "MISS");
+    assert_eq!(hits(&o), 2);
+}
+
+#[tokio::test]
+async fn a_stale_variant_is_refreshed_as_itself() {
+    let (o, st) = rig_cc(
+        "Accept-Language",
+        "public, max-age=1, stale-while-revalidate=30",
+    )
+    .await;
+    fetch(&st, "/sw", &[("accept-language", "de")]).await;
+    settle().await;
+    fetch(&st, "/sw", &[("accept-language", "fr")]).await;
+    settle().await;
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+
+    let (c, b) = fetch(&st, "/sw", &[("accept-language", "de")]).await;
+    assert_eq!(c, "STALE-WHILE-REVALIDATE");
+    assert!(b.starts_with("<de>"), "{b}");
+    settle().await;
+    assert_eq!(
+        o.last_lang.lock().unwrap().as_deref(),
+        Some("de"),
+        "the refresh must ask for the same variant it is refreshing"
+    );
+    // nobody's entry was overwritten with somebody else's body
+    let (_, de) = fetch(&st, "/sw", &[("accept-language", "de")]).await;
+    let (_, fr) = fetch(&st, "/sw", &[("accept-language", "fr")]).await;
+    assert!(
+        de.starts_with("<de>") && fr.starts_with("<fr>"),
+        "{de} / {fr}"
+    );
 }

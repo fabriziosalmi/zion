@@ -312,6 +312,8 @@ pub struct StaticCache {
     /// global generation has advanced, the L1 entry is stale and re-fetched
     /// from L2. This prevents serving stale data for the TTL duration.
     generation: std::sync::atomic::AtomicU64,
+    /// Which request headers each primary key's responses vary on (RFC 9111 §4.1).
+    pub vary: crate::vary::VaryRules,
 }
 
 impl StaticCache {
@@ -332,6 +334,7 @@ impl StaticCache {
             l2,
             l1_max_entries: l1_max,
             generation: std::sync::atomic::AtomicU64::new(0),
+            vary: crate::vary::VaryRules::default(),
         }
     }
 
@@ -590,6 +593,7 @@ impl StaticCache {
     /// entries dropped. Lets a deploy hook invalidate immediately instead of
     /// waiting out the TTL.
     pub fn purge_all(&self) -> usize {
+        self.vary.clear();
         let n = if let Some(l2) = &self.l2 {
             let n = l2.len();
             l2.clear();
@@ -613,6 +617,7 @@ impl StaticCache {
     /// simply re-promote from L2 on next get. The common deploy case
     /// (invalidate `/assets/...`) is well served.
     pub fn purge_prefix(&self, prefix: &str) -> usize {
+        self.vary.remove_prefix(prefix);
         let mut removed = 0;
         if let Some(l2) = &self.l2 {
             let keys: Vec<Arc<str>> = l2
