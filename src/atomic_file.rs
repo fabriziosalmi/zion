@@ -254,7 +254,11 @@ mod tests {
         std::fs::create_dir_all(cert.join("blocker")).unwrap();
         let e = write_cert_key_atomic(&key, b"KEY-2", &cert, b"CERT-2").unwrap_err();
         assert!(e.contains("previous key restored"), "{e}");
-        assert_eq!(std::fs::read(&key).unwrap(), b"KEY-1", "old key must be back");
+        assert_eq!(
+            std::fs::read(&key).unwrap(),
+            b"KEY-1",
+            "old key must be back"
+        );
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())

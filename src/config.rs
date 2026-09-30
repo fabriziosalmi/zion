@@ -204,6 +204,12 @@ pub struct ServerConfig {
     /// Rate limit window in seconds. Default: 1.
     #[serde(default = "default_rate_window")]
     pub rate_limit_window_secs: u64,
+    /// Max distinct client IPs the per-IP rate limiter tracks. Default 100 000.
+    /// At the cap, stale entries are evicted; if every entry is live the new IP is
+    /// DENIED (fail-closed), so size this above the number of distinct clients you
+    /// expect inside one window. Each entry costs roughly 40 bytes.
+    #[serde(default = "default_rate_map_entries")]
+    pub rate_limit_max_tracked_ips: usize,
     /// Max *concurrent* connections from a single source IP.
     ///
     /// Tri-state (CVE-2026-49975 multi-connection hardening):
@@ -264,6 +270,10 @@ fn default_log_format() -> String {
 
 fn default_rate_window() -> u64 {
     1
+}
+
+fn default_rate_map_entries() -> usize {
+    crate::security::MAX_RATE_MAP_ENTRIES
 }
 
 // ============================================================================
@@ -1230,6 +1240,13 @@ fn deploy_errors(config: &ZionConfig) -> Vec<String> {
 /// Filesystem-free semantic checks; see [`validate_semantics`].
 fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     let mut errors: Vec<String> = Vec::new();
+
+    if config.server.rate_limit_max_tracked_ips == 0 {
+        errors.push(
+            "server.rate_limit_max_tracked_ips must be >= 1 (a cap of 0 would deny every new client)"
+                .to_string(),
+        );
+    }
 
     // Server addresses must parse
     if config

@@ -30,6 +30,7 @@ in the CHANGELOG), together with a reader for the version it replaces.
 | `listen_https` | string | **required** | HTTPS bind address (e.g. `"0.0.0.0:443"`) |
 | `rate_limit_rps` | u32 | `0` (disabled) | Max requests per IP per window |
 | `rate_limit_window_secs` | u64 | `1` | Rate limit window in seconds |
+| `rate_limit_max_tracked_ips` | usize | `100000` | Distinct client IPs the per-IP limiter tracks; at the cap stale entries are evicted, and if all are live a new IP is denied (fail-closed) |
 | `max_connections_per_ip` | u32? | none | Per-IP concurrent-connection cap, enforced at accept (before the TLS handshake) |
 | `trusted_proxies` | string[] | `[]` | CIDRs whose inbound `X-Forwarded-For` is trusted for client-IP resolution |
 | `internal_networks` | string[] | `[]` | CIDRs (or bare IPs) allowed to use the internal-only endpoints (`/metrics`, `/_zion/snapshot.json`, `/_zion/cache/purge`) and `internal_only` routes. Empty keeps the built-in rule: any loopback / private-range / link-local / ULA peer. That rule tests network position, not identity: behind a private-range load balancer, Kubernetes SNAT or a Docker bridge every client looks internal. Set this (and `trusted_proxies`) to name the hosts that really are. Zion warns at boot when neither is set on a non-loopback listener |

@@ -57,6 +57,7 @@ pub(crate) struct ResolvedAppConfig {
     pub(crate) rate_limit_rps: u32,
     /// Rate limiter window in seconds.
     pub(crate) rate_limit_window: u64,
+    pub(crate) rate_limit_max_tracked_ips: usize,
     /// Max concurrent connections per source IP. 0 = disabled. Read at
     /// accept, so a hot-reload retunes the cap without dropping live conns.
     pub(crate) max_connections_per_ip: u32,
@@ -108,6 +109,7 @@ impl ResolvedAppConfig {
             xff_mode: proxy::XffMode::Append,
             rate_limit_rps: 0,
             rate_limit_window: 1,
+            rate_limit_max_tracked_ips: crate::security::MAX_RATE_MAP_ENTRIES,
             max_connections_per_ip: 0,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             enforce: sovereign::EnforcePolicy::default(),
@@ -305,6 +307,7 @@ impl ResolvedAppConfig {
             xff_mode,
             rate_limit_rps: config.server.rate_limit_rps,
             rate_limit_window: config.server.rate_limit_window_secs,
+            rate_limit_max_tracked_ips: config.server.rate_limit_max_tracked_ips,
             max_connections_per_ip,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             enforce,

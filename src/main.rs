@@ -252,6 +252,9 @@ fn run() -> error::ZionResult<()> {
         cli::Command::Suggest(opts) => {
             std::process::exit(suggest::run(opts));
         }
+        cli::Command::Audit(args) => {
+            std::process::exit(audit::run_cli(&args));
+        }
         cli::Command::Import(opts) => {
             std::process::exit(import::run(opts));
         }
@@ -1865,6 +1868,7 @@ fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
     security::check_rate_limit(
         cfg.rate_limit_rps,
         cfg.rate_limit_window,
+        cfg.rate_limit_max_tracked_ips,
         &state.limiters.rate_map,
         ip,
     )

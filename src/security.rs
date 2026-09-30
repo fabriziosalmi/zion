@@ -165,8 +165,9 @@ impl RateEntry {
 /// Uses a single AtomicU64 per IP with packed window+count for atomic resets.
 /// Eliminates the CAS-store gap that could lose counts during window transitions.
 ///
-/// **Saturation policy: fail-CLOSED.** When the map hits `MAX_RATE_MAP_ENTRIES`,
-/// we attempt to evict stale entries (expired windows) in a bounded probe.
+/// **Saturation policy: fail-CLOSED.** When the map hits the cap
+/// (`max_tracked_ips`, default `MAX_RATE_MAP_ENTRIES`) we attempt to evict stale
+/// entries (expired windows) in a bounded probe.
 /// If eviction yields space, the new IP is tracked normally. If the map is
 /// genuinely full of active IPs (e.g. botnet), the request is denied —
 /// the safe default for a security gate.
@@ -174,6 +175,7 @@ impl RateEntry {
 pub fn check_rate_limit(
     rate_limit_rps: u32,
     rate_limit_window: u64,
+    max_tracked_ips: usize,
     rate_map: &crate::numa::NumaAwareMap<std::net::IpAddr, RateEntry>,
     ip: std::net::IpAddr,
 ) -> bool {
@@ -224,7 +226,7 @@ pub fn check_rate_limit(
 
     // First request from this IP — cap total tracked IPs to prevent memory exhaustion.
     // Fail-CLOSED: if we can't make room, deny rather than bypass the limiter.
-    if rate_map.len() >= MAX_RATE_MAP_ENTRIES {
+    if rate_map.len() >= max_tracked_ips {
         // Attempt to evict stale entries in a bounded probe (up to 8 random samples).
         // DashMap iteration is shard-sequential — we take the first stale entry.
         if !try_evict_stale(rate_map, current_window) {
@@ -596,6 +598,19 @@ mod proxy_tests {
     }
 
     #[test]
+    fn rate_map_cap_is_the_configured_one_and_fails_closed() {
+        let map = crate::numa::NumaAwareMap::new();
+        let ip = |n: u8| std::net::IpAddr::from([10, 0, 0, n]);
+        // cap of 2 distinct IPs: the third live client is denied, tracked ones are not
+        assert!(check_rate_limit(100, 3600, 2, &map, ip(1)));
+        assert!(check_rate_limit(100, 3600, 2, &map, ip(2)));
+        assert!(!check_rate_limit(100, 3600, 2, &map, ip(3)));
+        assert!(check_rate_limit(100, 3600, 2, &map, ip(1)));
+        // a larger cap admits it
+        assert!(check_rate_limit(100, 3600, 3, &map, ip(3)));
+    }
+
+    #[test]
     fn no_trusted_proxies_returns_socket_ip() {
         let tp = proxies(&[]);
         let socket: std::net::IpAddr = "1.2.3.4".parse().unwrap();
@@ -692,7 +707,7 @@ mod proptests {
             let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
             let mut allowed = 0;
             for _ in 0..burst {
-                if check_rate_limit(rps, 1, &map, ip) {
+                if check_rate_limit(rps, 1, MAX_RATE_MAP_ENTRIES, &map, ip) {
                     allowed += 1;
                 }
             }
@@ -716,7 +731,7 @@ mod proptests {
             let map = crate::numa::NumaAwareMap::new();
             let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 2).into();
             for _ in 0..burst {
-                prop_assert!(check_rate_limit(0, 1, &map, ip));
+                prop_assert!(check_rate_limit(0, 1, MAX_RATE_MAP_ENTRIES, &map, ip));
             }
         }
 
@@ -734,12 +749,12 @@ mod proptests {
             let mut allowed_a = 0;
             let mut allowed_b = 0;
             for _ in 0..burst_a {
-                if check_rate_limit(rps, 1, &map, ip_a) {
+                if check_rate_limit(rps, 1, MAX_RATE_MAP_ENTRIES, &map, ip_a) {
                     allowed_a += 1;
                 }
             }
             for _ in 0..burst_b {
-                if check_rate_limit(rps, 1, &map, ip_b) {
+                if check_rate_limit(rps, 1, MAX_RATE_MAP_ENTRIES, &map, ip_b) {
                     allowed_b += 1;
                 }
             }

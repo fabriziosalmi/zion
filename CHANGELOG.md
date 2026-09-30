@@ -4,6 +4,16 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`zion audit verify <segment>...`** checks the HMAC chain of audit segments offline (#419). Exit `0` verified, `1` a segment failed, `2` usage/key error.
+- **`[server] rate_limit_max_tracked_ips`** (default `100000`, unchanged) sets how many distinct client IPs the per-IP rate limiter tracks (#424). At the cap stale entries are evicted; if all are live a new IP is denied.
+
+### Fixed
+
+- A failed cert rename in `write_cert_key_atomic` now puts the previous key back, so a partial write never leaves a new key beside the old cert (#423).
+- **Helm:** `persistence.enabled` with a `ReadWriteOnce` volume now renders a fixed `replicas`, and refuses `replicaCount > 1` at template time instead of leaving the second pod `Pending` on Multi-Attach (#424).
+
 ## [0.9.0] - 2026-09-30
 
 **Audit remediation.** Closes the findings of the 2026-09-30 code audit: the

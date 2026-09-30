@@ -41,6 +41,8 @@ pub enum Command {
     /// Convert a foreign proxy config (nginx) into a validated `zion.toml`
     /// with an honest findings report (ADR-0011). Self-validated like suggest.
     Import(ImportOpts),
+    /// Offline audit-log tooling: `zion audit verify <segment>...`.
+    Audit(Vec<String>),
     /// Print version and exit 0.
     Version,
     /// Print help and exit 0.
@@ -211,6 +213,7 @@ pub(crate) fn parse_argv(args: &[String]) -> Command {
         "auto" => Command::Auto(parse_auto_opts(&args[1..])),
         "suggest" => Command::Suggest(parse_suggest_opts(&args[1..])),
         "import" => Command::Import(parse_import_opts(&args[1..])),
+        "audit" => Command::Audit(args[1..].to_vec()),
         "acme-soak" => Command::AcmeSoak,
         other => {
             // Anything else: surface as Unknown — caller prints help and exits 1.
@@ -461,6 +464,7 @@ pub fn print_help() {
             {bin} suggest [opts]         synthesize a validated zion.toml from a detected/declared backend\n  \
             {bin} import <nginx|traefik|caddy> convert an nginx / Traefik-compose / Caddyfile config to a validated zion.toml (honest findings)\n  \
             {bin} doctor                 run environment diagnostic checks\n  \
+            {bin} audit verify <file>... verify the HMAC chain of audit log segments (--key-env, --previous-key-env)\n  \
             {bin} bootstrap              dump detected platform as JSON (for CI / automation)\n  \
             {bin} --version              print version\n  \
             {bin} --help                 show this help\n\

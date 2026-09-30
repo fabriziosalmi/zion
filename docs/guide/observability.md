@@ -260,7 +260,19 @@ One JSON object per line. Fields:
 
 ### Verification
 
-A simple shell pipeline verifies the chain:
+The binary verifies segments offline:
+
+```bash
+export ZION_AUDIT_HMAC_KEY="$(cat /etc/zion/audit.key)"
+zion audit verify /var/log/zion/audit.jsonl /var/log/zion/audit.jsonl.*
+# ok   /var/log/zion/audit.jsonl: 4312 records, 3 chain(s)
+```
+
+Each segment is checked on its own: every record's HMAC, and that each `prev_hash` is the previous record's HMAC. A chain starts at a `chain_init` / `chain_rotate` marker signed from genesis. `--key-env VAR` picks another key variable, and `--previous-key-env VAR` supplies the outgoing key for segments written before a [key rotation](#key-rotation). The exit code is `0` when everything verified, `1` when a segment failed (the message names the line), `2` for a usage or key error.
+
+It catches a record that was edited, removed or reordered inside a chain. It cannot see the **end** of a chain being cut off, because nothing after it commits to it; the `prev_head=` in the next marker is what covers that. A last line with no newline is reported as a torn tail and not counted.
+
+The same check, as a script, for hosts without the binary:
 
 ```bash
 KEY="$(cat /etc/zion/audit.key)"   # the HMAC key, kept off-config
