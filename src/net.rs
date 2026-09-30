@@ -149,7 +149,14 @@ pub fn tune_accepted(_stream: &tokio::net::TcpStream) {}
 /// Default idle time before the kernel starts probing a silent connection.
 pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
 /// Seconds between probes, and probes sent before the connection is declared dead.
+// Each option exists on only some platforms (retries: not Windows), so the constants are
+// unused elsewhere.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
 const KEEPALIVE_INTERVAL_SECS: u64 = 10;
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const KEEPALIVE_RETRIES: u32 = 3;
 
 /// Turn on kernel TCP keepalive: after `idle_secs` of silence the kernel probes every
