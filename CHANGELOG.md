@@ -4,6 +4,45 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-30
+
+**Audit remediation.** Closes the findings of the 2026-09-30 code audit: the
+request pipeline and config schema are restructured so illegal states cannot be
+built, the audit log survives power loss and shutdown, and the reload and upstream
+paths are observable. This is a **MINOR** release because several checks that used
+to warn (or pass silently) now refuse to start or to parse. Read the upgrade notes
+before deploying.
+
+### ⚠️ Upgrade notes
+
+Things that used to boot and now do not, or that behave differently:
+
+- **`[audit] enabled = true` needs a valid key.** An unset or empty key variable, a
+  key under 32 bytes, or a missing `path` is now a boot error (was a warning and a
+  silently disabled audit log). The library's `audit::spawn_writer` returns a
+  `Result` and an `AuditWriter` to shut down.
+- **`admin.auth = "internal-ip"` requires a loopback `admin.listen`.** A routable or
+  wildcard bind now needs `admin.auth = "mtls"`.
+- **A reload that changes `tls.cert_path` / `tls.key_path` is rejected**, and so is
+  one that moves `listen_https` in the `io-uring-accept` build. Both need a restart.
+- **`connect_timeout_ms` is now enforced.** It was parsed and ignored; a value below
+  your upstream's real connect latency will now cause failovers.
+- **Contradictory settings are refused when the config is parsed:** `waf = true` with
+  a `waf_profile`, a route-level `max_body_mb` with a `waf_profile`, a static route
+  without `serve_dir` (or with `upstream`), static-only keys on a proxy route, an
+  `[upstream.*]` with neither `url` nor `urls`, and `schema_version = 0`. Errors now
+  read `Invalid TOML in <file>` and report the first problem, not all of them.
+- **The plaintext `:80` ACME-challenge fallback** only serves routes with no
+  `auth_profile`, no `internal_only` and a real upstream (not `mode = "static"`).
+  Serve challenges for an external ACME client from a public route.
+- **Text logs on a non-TTY** now start with a UTC timestamp, level and event
+  (`2026-09-30T06:26:36Z INFO  config: ...`). JSON logs and TTY output are unchanged.
+- A literal JWT `secret` in `zion.toml` now logs a deprecation warning; use
+  `secret_env`.
+
+New, opt-in: `[audit] sync_interval_ms`, `key_id`, `previous_key_env`; `[server]
+internal_networks`; `[auth_profile.*] leeway_secs`, `max_token_lifetime_secs`.
+
 ### Security
 
 ⚠️ **Behaviour change (stricter startup).** With `[audit] enabled = true`, Zion now
@@ -49,8 +88,8 @@ upgrading.
   came from mimalloc (which neither tool understands), so both tools build with the
   system allocator (`cfg(miri)` / `--cfg zion_tsan` in `src/main.rs`). Not covered:
   loom models of the health state machine, and the async audit tests under Miri (its
-  IO driver support is limited). The workflow was run locally on macOS; it has not
-  yet run on a GitHub runner.
+  IO driver support is limited). Verified locally on macOS and on Linux x86_64 (Miri
+  and TSAN both clean); the first run on a GitHub runner is still pending.
 
 ### Config schema
 
@@ -193,6 +232,8 @@ Both are closed here. No behaviour change for a correct config.
   typically world-readable `0644`), unlike the hardened `0600` atomic path
   already used for the ACME account and mesh identity keys. Both now use
   `write_cert_key_atomic` (created `0600`, never wider even in transit).
+
+## [0.8.3] - 2026-09-08
 
 **Fail-closed security fixes.** A deeper re-audit of v0.8.2 surfaced two HIGH
 fail-opens (one a residual gap in the v0.8.0 AIMP-listen fix); this closes both.
