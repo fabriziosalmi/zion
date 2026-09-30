@@ -1235,11 +1235,285 @@ fn now_iso8601() -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 4b. Offline verification — `zion audit verify`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Outcome of verifying one audit segment.
+#[derive(Debug, PartialEq, Eq)]
+pub struct VerifyReport {
+    /// Signed records checked.
+    pub records: u64,
+    /// Chains found: one per `chain_init` / `chain_rotate` marker (process start,
+    /// rotation), each re-anchored at genesis.
+    pub chains: u64,
+    /// The final line had no newline: a write cut short (crash, `kill -9`) or an
+    /// end-truncation. It is not counted in `records`.
+    pub torn_tail: bool,
+}
+
+/// Verify a whole segment: every record's HMAC, and that each record's `prev_hash`
+/// is the previous record's HMAC. A chain starts at a `chain_init` /
+/// `chain_rotate` marker whose `prev_hash` is the genesis tag; the marker may be
+/// signed by any of `keys` (a rotation switches key at a marker). Returns the
+/// 1-based line number and reason of the first record that does not verify.
+///
+/// This detects a modified, reordered or deleted record in the MIDDLE of a chain.
+/// It cannot detect removal of the END of a chain (nothing after it commits to it);
+/// that is what the `prev_head=` value in the next marker is for.
+pub fn verify_log(text: &str, keys: &[hmac::Key]) -> Result<VerifyReport, (usize, String)> {
+    let torn_tail = !text.is_empty() && !text.ends_with('\n');
+    let complete = if torn_tail {
+        text.rfind('\n').map_or("", |i| &text[..=i])
+    } else {
+        text
+    };
+    let mut report = VerifyReport {
+        records: 0,
+        chains: 0,
+        torn_tail,
+    };
+    // (key index, hmac of the previous record) of the chain being walked.
+    let mut chain: Option<(usize, String)> = None;
+    for (i, line) in complete.lines().enumerate() {
+        let n = i + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let bad = |why: &str| (n, why.to_string());
+        let v: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| bad(&format!("not valid JSON: {e}")))?;
+        let (Some(prev), Some(mac), Some(kind)) = (
+            v["prev_hash"].as_str(),
+            v["hmac"].as_str(),
+            v["kind"].as_str(),
+        ) else {
+            return Err(bad("missing kind / prev_hash / hmac"));
+        };
+        let split = line
+            .rfind(",\"prev_hash\":\"")
+            .ok_or_else(|| bad("no prev_hash field"))?;
+        let event_json = format!("{}}}", &line[..split]);
+        let is_marker = kind == "chain_init" || kind == "chain_rotate";
+        let key_idx = if is_marker {
+            // a new chain: must start at genesis under one of the known keys
+            let found = keys.iter().position(|k| prev == genesis_hash(k));
+            let Some(idx) = found else {
+                return Err(bad(
+                    "chain marker does not start at genesis under any supplied key \
+                     (wrong key, or the file was edited)",
+                ));
+            };
+            report.chains += 1;
+            idx
+        } else {
+            let Some((idx, ref head)) = chain else {
+                return Err(bad("record before any chain_init / chain_rotate marker"));
+            };
+            if prev != head {
+                return Err(bad(
+                    "prev_hash does not match the previous record (a record was removed, \
+                     reordered or altered)",
+                ));
+            }
+            idx
+        };
+        let expected = compute_hmac(&keys[key_idx], &event_json, prev);
+        if aws_lc_rs::constant_time::verify_slices_are_equal(expected.as_bytes(), mac.as_bytes())
+            .is_err()
+        {
+            return Err(bad(
+                "HMAC mismatch (record altered, or signed by another key)",
+            ));
+        }
+        chain = Some((key_idx, mac.to_string()));
+        report.records += 1;
+    }
+    Ok(report)
+}
+
+const VERIFY_USAGE: &str =
+    "usage: zion audit verify [--key-env VAR] [--previous-key-env VAR] <segment>...\n\
+  Verifies the HMAC chain of one or more audit segments (each verifies independently).\n\
+  --key-env           env var holding the HMAC key (default ZION_AUDIT_HMAC_KEY)\n\
+  --previous-key-env  env var holding an outgoing key, for segments that predate a rotation\n\
+  exit: 0 all verified, 1 a segment failed, 2 usage / key error";
+
+/// `zion audit verify …`: returns the process exit code.
+pub fn run_cli(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) != Some("verify") {
+        eprintln!("{VERIFY_USAGE}");
+        return 2;
+    }
+    let mut key_env = "ZION_AUDIT_HMAC_KEY".to_string();
+    let mut prev_env: Option<String> = None;
+    let mut files: Vec<&String> = Vec::new();
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--key-env" => match it.next() {
+                Some(v) => key_env = v.clone(),
+                None => {
+                    eprintln!("{VERIFY_USAGE}");
+                    return 2;
+                }
+            },
+            "--previous-key-env" => match it.next() {
+                Some(v) => prev_env = Some(v.clone()),
+                None => {
+                    eprintln!("{VERIFY_USAGE}");
+                    return 2;
+                }
+            },
+            "-h" | "--help" => {
+                println!("{VERIFY_USAGE}");
+                return 0;
+            }
+            _ => files.push(a),
+        }
+    }
+    if files.is_empty() {
+        eprintln!("{VERIFY_USAGE}");
+        return 2;
+    }
+    let mut keys = Vec::new();
+    for name in std::iter::once(&key_env).chain(prev_env.as_ref()) {
+        match load_key_bytes(name) {
+            Some(b) if b.len() >= MIN_KEY_BYTES => keys.push(hmac::Key::new(hmac::HMAC_SHA256, &b)),
+            Some(b) => {
+                eprintln!("zion audit verify: the key in {name} is {} bytes; the minimum is {MIN_KEY_BYTES}", b.len());
+                return 2;
+            }
+            None => {
+                eprintln!("zion audit verify: {name} is unset or empty");
+                return 2;
+            }
+        }
+    }
+    let mut failed = false;
+    for f in files {
+        let text = match std::fs::read(f) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) => {
+                eprintln!("FAIL {f}: cannot read: {e}");
+                failed = true;
+                continue;
+            }
+        };
+        match verify_log(&text, &keys) {
+            Ok(r) => {
+                let torn = if r.torn_tail {
+                    " (last line has no newline: torn write or truncated end, not counted)"
+                } else {
+                    ""
+                };
+                println!(
+                    "ok   {f}: {} records, {} chain(s){torn}",
+                    r.records, r.chains
+                );
+            }
+            Err((line, why)) => {
+                eprintln!("FAIL {f}: line {line}: {why}");
+                failed = true;
+            }
+        }
+    }
+    i32::from(failed)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 5. Tests.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
+    // ── zion audit verify ─────────────────────────────────────────────────────
+    fn vkey(b: u8) -> hmac::Key {
+        hmac::Key::new(hmac::HMAC_SHA256, &[b; 32])
+    }
+
+    /// Build a signed segment: marker + `n` events, chain anchored at genesis.
+    fn segment(key: &hmac::Key, marker: &'static str, n: usize) -> String {
+        let mut prev = genesis_hash(key);
+        let mut out = String::new();
+        for i in 0..=n {
+            let kind: &'static str = if i == 0 { marker } else { "request_blocked" };
+            let ev = AuditEvent {
+                seq: i as u64,
+                ts: "2026-09-30T00:00:00.000000Z".into(),
+                kind,
+                trace_id: None,
+                remote_ip: None,
+                method: None,
+                path: None,
+                detail: Some(format!("event {i}")),
+            };
+            let (signed, next) = sign_event(key, ev, prev).unwrap();
+            out.push_str(&serde_json::to_string(&signed).unwrap());
+            out.push('\n');
+            prev = next;
+        }
+        out
+    }
+
+    #[test]
+    fn verify_accepts_an_untouched_multi_chain_segment() {
+        let k = vkey(1);
+        let text = format!(
+            "{}{}",
+            segment(&k, "chain_init", 5),
+            segment(&k, "chain_init", 3)
+        );
+        let r = verify_log(&text, &[k]).unwrap();
+        assert_eq!((r.records, r.chains, r.torn_tail), (10, 2, false));
+    }
+
+    #[test]
+    fn verify_rejects_an_edited_a_removed_and_a_reordered_record() {
+        let k = vkey(1);
+        let text = segment(&k, "chain_init", 6);
+        let lines: Vec<&str> = text.lines().collect();
+        let join = |v: &[&str]| v.join("\n") + "\n";
+        // edited content
+        let mut edited = lines.clone();
+        let changed = edited[3].replace("event 3", "event X");
+        edited[3] = &changed;
+        assert_eq!(verify_log(&join(&edited), &[vkey(1)]).unwrap_err().0, 4);
+        // removed record
+        let mut removed = lines.clone();
+        removed.remove(3);
+        assert_eq!(verify_log(&join(&removed), &[vkey(1)]).unwrap_err().0, 4);
+        // reordered
+        let mut swapped = lines.clone();
+        swapped.swap(2, 3);
+        assert_eq!(verify_log(&join(&swapped), &[vkey(1)]).unwrap_err().0, 3);
+    }
+
+    #[test]
+    fn verify_rejects_the_wrong_key_and_headless_records() {
+        let text = segment(&vkey(1), "chain_init", 2);
+        assert_eq!(verify_log(&text, &[vkey(2)]).unwrap_err().0, 1);
+        let headless: String = text.lines().skip(1).map(|l| format!("{l}\n")).collect();
+        let (n, why) = verify_log(&headless, &[vkey(1)]).unwrap_err();
+        assert_eq!(n, 1);
+        assert!(why.contains("before any"), "{why}");
+    }
+
+    #[test]
+    fn verify_follows_a_key_rotation_and_flags_a_torn_tail() {
+        let (old, new) = (vkey(1), vkey(2));
+        let text = format!(
+            "{}{}",
+            segment(&old, "chain_init", 2),
+            segment(&new, "chain_rotate", 2)
+        );
+        assert_eq!(verify_log(&text, &[vkey(2), vkey(1)]).unwrap().chains, 2);
+        // a tail cut mid-record is reported, not treated as forgery of the rest
+        let cut = &text[..text.len() - 20];
+        let r = verify_log(cut, &[vkey(2), vkey(1)]).unwrap();
+        assert!(r.torn_tail);
+        assert_eq!(r.records, 5);
+    }
+
     use super::*;
 
     fn test_key() -> hmac::Key {
@@ -1382,6 +1656,57 @@ mod tests {
     fn audit_handle_noop_swallows_emit() {
         let h = AuditHandle::noop();
         assert!(!h.emit(make_event(1, "test")));
+    }
+
+    #[tokio::test]
+    async fn verifier_accepts_what_the_real_writer_wrote_across_a_restart() {
+        let dir = tempdir();
+        let path = dir.join("audit.log");
+        std::env::set_var(
+            "ZION_TEST_AUDIT_KEY_VERIFY",
+            "this-is-a-32-byte-test-secret!ab",
+        );
+        let cfg = AuditConfig {
+            enabled: true,
+            path: Some(path.to_string_lossy().into_owned()),
+            key_env: "ZION_TEST_AUDIT_KEY_VERIFY".into(),
+            queue_depth: 64,
+            ..Default::default()
+        };
+        for run in 0..2 {
+            let (h, w) = spawn_writer(&cfg).expect("writer starts");
+            for i in 0..20 {
+                assert!(h.emit(AuditEvent {
+                    seq: 0,
+                    ts: String::new(),
+                    kind: "request_blocked",
+                    trace_id: None,
+                    remote_ip: Some("10.0.0.5".into()),
+                    method: Some("GET".into()),
+                    path: Some(format!("/run{run}/{i}")),
+                    detail: Some("waf".into()),
+                }));
+            }
+            drop(h);
+            assert!(
+                w.expect("writer")
+                    .shutdown(std::time::Duration::from_secs(5))
+                    .await
+            );
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let key = hmac::Key::new(hmac::HMAC_SHA256, b"this-is-a-32-byte-test-secret!ab");
+        let r = verify_log(&text, &[key]).expect("the writer's own output must verify");
+        assert_eq!((r.records, r.chains), (42, 2), "2 markers + 40 events");
+        // flipping one byte of one record is caught, on the right line
+        let tampered = text.replacen("/run1/7", "/run1/8", 1);
+        let key = hmac::Key::new(hmac::HMAC_SHA256, b"this-is-a-32-byte-test-secret!ab");
+        let (line, _) = verify_log(&tampered, &[key]).unwrap_err();
+        assert_eq!(
+            line,
+            1 + 20 + 1 + 7 + 1,
+            "marker, run 0, marker, then run-1 event 7 (line 30)"
+        );
     }
 
     #[tokio::test]

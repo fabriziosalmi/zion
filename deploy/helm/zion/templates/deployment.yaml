@@ -5,7 +5,13 @@ metadata:
   labels:
     {{- include "zion.labels" . | nindent 4 }}
 spec:
-  {{- if not .Values.autoscaling.enabled }}
+  {{- /* A ReadWriteOnce PVC cannot back a second replica (Multi-Attach), so an
+         autoscaler must never own the replica count while persistence is on. */}}
+  {{- $rwo := and .Values.persistence.enabled (eq .Values.persistence.accessMode "ReadWriteOnce") }}
+  {{- if and $rwo (gt (int .Values.replicaCount) 1) }}
+  {{- fail "persistence.enabled with a ReadWriteOnce volume supports replicaCount: 1 only (a second pod would sit Pending on Multi-Attach). Disable persistence, use ReadWriteMany, or source certificates from a Secret." }}
+  {{- end }}
+  {{- if or (not .Values.autoscaling.enabled) $rwo }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
   selector:
