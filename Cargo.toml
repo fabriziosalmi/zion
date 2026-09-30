@@ -18,7 +18,6 @@ keywords = ["proxy", "tls", "waf", "http3", "reverse-proxy"]
 categories = ["network-programming", "web-programming::http-server"]
 exclude = [
     ".github/**",
-    ".gitlab-ci.yml",
     "benchmarks/**",
     "docs/**",
     "deploy/**",
