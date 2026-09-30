@@ -14,6 +14,8 @@ All notable changes to Zion Edge Gateway are documented here.
 - **`[admin] persist_push`** (#419): a validated `POST /admin/config` is written back to `zion.toml`. Default off.
 - **`POST /admin/revoke`** (#418): deny a JWT by `jti` until its expiry. In-memory and per instance; only tokens with a `jti` can be revoked.
 
+- **`ml/requirements.lock`** (#420): a hashed, universal (all platforms) lock made with `uv pip compile`. The `pip-audit` job now audits it with `--require-hashes` instead of `--no-deps`, so transitive advisories are covered.
+
 ### Fixed
 
 - A failed cert rename in `write_cert_key_atomic` now puts the previous key back, so a partial write never leaves a new key beside the old cert (#423).

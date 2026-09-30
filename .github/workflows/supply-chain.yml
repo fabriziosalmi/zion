@@ -59,10 +59,10 @@ jobs:
   # ml/ is dev-only (nothing ships into the Zion binary — tract-onnx does
   # inference in production), but torch/onnx/numpy/requests have their own
   # advisory stream that was previously covered by nothing. Uses the runner's
-  # preinstalled Python (no new pinned action). `--no-deps` audits the declared
-  # direct dependencies; full transitive + hashed coverage arrives with the ml
-  # lockfile (ZION-DEP-02, tracked separately — torch's cross-platform wheels
-  # make a hashed lock non-trivial).
+  # preinstalled Python (no new pinned action). It audits ml/requirements.lock, the
+  # hashed, fully-resolved (transitive) lock, so a vulnerable sub-dependency of
+  # torch/onnx/requests is caught too. Regenerate the lock with the `uv pip compile`
+  # command recorded in its header.
   pip-audit:
     name: pip-audit (python advisories)
     runs-on: ubuntu-latest
@@ -71,7 +71,7 @@ jobs:
       - name: Install pip-audit
         run: python3 -m pip install --user pip-audit
       - name: Run pip-audit
-        run: python3 -m pip_audit -r ml/requirements.txt --no-deps
+        run: python3 -m pip_audit -r ml/requirements.lock --require-hashes
 
   # ── 2. cargo-deny: advisories+licenses+bans+sources, all in one. ──────────
   deny:
