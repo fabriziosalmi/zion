@@ -108,6 +108,11 @@ mod aimp_cp;
 // ── Global allocator: mimalloc ──────────────────────────────────
 // ~2-3x faster than system malloc on small allocations.
 // Reduces allocator contention under high concurrency.
+// Not under Miri (it cannot call mimalloc's C functions) and not under
+// ThreadSanitizer (`--cfg zion_tsan`, set by `.github/workflows/concurrency.yml`):
+// TSAN does not intercept mimalloc, so memory freed by one thread and reused by
+// another looks like a data race. Both tools run against the system allocator.
+#[cfg(not(any(miri, zion_tsan)))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

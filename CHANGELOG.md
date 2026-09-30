@@ -38,6 +38,20 @@ upgrading.
   `LimitCORE=0`. Not covered: copies inside `hmac::Key` / `jsonwebtoken`, and the
   process environment itself.
 
+### CI
+
+- **Miri and ThreadSanitizer over the concurrent code** (`.github/workflows/concurrency.yml`,
+  weekly, on demand, and on PRs touching those modules). Miri interprets the pure
+  atomics/data-structure tests (connlimit, health/backoff, tarpit, rate limiter,
+  metrics, the NUMA map); TSAN runs the real threaded tests, including the async audit
+  writer, the L1/L2 cache, hot reload and the chaos suite, with std rebuilt under the
+  sanitizer. Both are clean today. Nothing was suppressed: the only reports we saw
+  came from mimalloc (which neither tool understands), so both tools build with the
+  system allocator (`cfg(miri)` / `--cfg zion_tsan` in `src/main.rs`). Not covered:
+  loom models of the health state machine, and the async audit tests under Miri (its
+  IO driver support is limited). The workflow was run locally on macOS; it has not
+  yet run on a GitHub runner.
+
 ### Config schema
 
 ⚠️ **Behaviour change (stricter parsing).** Contradictory route and upstream

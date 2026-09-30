@@ -203,6 +203,11 @@ version = "0.10"
 optional = true
 default-features = false
 
+# `zion_tsan` is set by .github/workflows/concurrency.yml (RUSTFLAGS) to build without
+# mimalloc under ThreadSanitizer; declare it so `unexpected_cfgs` does not warn.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zion_tsan)'] }
+
 [features]
 default = []
 io-uring-accept = ["io-uring"]
