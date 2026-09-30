@@ -25,6 +25,8 @@ struct Origin {
     delay_ms: AtomicU64,
     /// `Cache-Control` the origin sends.
     cache_control: Mutex<String>,
+    /// When set, the origin drops the connection without answering (a transport error).
+    down: std::sync::atomic::AtomicBool,
 }
 
 impl Origin {
@@ -54,6 +56,9 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                         let creds = req.headers().contains_key("authorization")
                             || req.headers().contains_key("cookie");
                         o.seen.lock().unwrap().push((inm.clone(), creds));
+                        if o.down.load(Ordering::Relaxed) {
+                            return Err("origin down");
+                        }
                         let d = o.delay_ms.load(Ordering::Relaxed);
                         if d > 0 {
                             tokio::time::sleep(Duration::from_millis(d)).await;
@@ -73,7 +78,7 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                                 .header("cache-control", &cc)
                                 .body(Full::new(Bytes::from(body)))
                         };
-                        Ok::<_, std::convert::Infallible>(resp.unwrap())
+                        Ok::<_, &'static str>(resp.unwrap())
                     }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
@@ -335,4 +340,86 @@ async fn without_the_directive_behaviour_is_unchanged() {
         "synchronous revalidation, as before"
     );
     assert!(a.took >= Duration::from_millis(250));
+}
+
+// ── directives that forbid serving a stale response (RFC 9111 §4.2.4, §5.2.2) ──
+
+const NO_STALE_DIRECTIVES: [&str; 3] = [
+    "public, max-age=1, must-revalidate, stale-while-revalidate=30",
+    "public, max-age=1, proxy-revalidate, stale-while-revalidate=30",
+    "public, s-maxage=1, stale-while-revalidate=30",
+];
+
+/// `must-revalidate`, `proxy-revalidate` and (for a shared cache) `s-maxage` forbid
+/// answering from a stale entry without validating it, so stale-while-revalidate must
+/// not apply: the client waits for the origin.
+#[tokio::test]
+async fn stale_while_revalidate_is_not_used_when_the_origin_forbids_stale() {
+    for (n, cc) in NO_STALE_DIRECTIVES.iter().enumerate() {
+        let (o, st) = origin_and_state(cc).await;
+        let uri = format!("/nsw{n}");
+        fetch(&st, &uri, &[]).await;
+        until("entry stored", || {
+            st.static_cache
+                .get(&format!("{uri}\u{1f}"))
+                .fresh()
+                .is_some()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        o.delay_ms.store(300, Ordering::Relaxed);
+        let a = fetch(&st, &uri, &[]).await;
+        assert_ne!(
+            a.cache, "STALE-WHILE-REVALIDATE",
+            "{cc}: a stale copy must not be served"
+        );
+        assert!(
+            a.took >= Duration::from_millis(250),
+            "{cc}: the client must wait for the origin, waited {:?}",
+            a.took
+        );
+    }
+}
+
+/// Serving stale because the origin is unreachable is also "generating a stale
+/// response": the same directives forbid it, and the client gets the error instead.
+#[tokio::test]
+async fn stale_if_error_is_not_used_when_the_origin_forbids_stale() {
+    for (n, cc) in NO_STALE_DIRECTIVES.iter().enumerate() {
+        let (o, st) = origin_and_state(cc).await;
+        let uri = format!("/nse{n}");
+        fetch(&st, &uri, &[]).await;
+        until("entry stored", || {
+            st.static_cache
+                .get(&format!("{uri}\u{1f}"))
+                .fresh()
+                .is_some()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        o.down.store(true, Ordering::Relaxed);
+        let addr: SocketAddr = "203.0.113.9:1".parse().unwrap();
+        let r = process_request(get(&uri, &[]), st.clone(), addr, false).await;
+        let stale = matches!(&r, Ok(resp) if resp.headers().get("x-zion-cache").is_some_and(|v| v == "STALE"));
+        assert!(
+            !stale,
+            "{cc}: an unreachable origin must not produce a stale answer"
+        );
+    }
+}
+
+/// Control: without those directives stale-if-error still works, so the test above is
+/// not passing merely because the harness cannot produce an origin failure.
+#[tokio::test]
+async fn stale_if_error_still_serves_a_stale_copy_otherwise() {
+    let (o, st) = origin_and_state("public, max-age=1").await;
+    fetch(&st, "/sie", &[]).await;
+    until("entry stored", || {
+        st.static_cache.get("/sie\u{1f}").fresh().is_some()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    o.down.store(true, Ordering::Relaxed);
+    let a = fetch(&st, "/sie", &[]).await;
+    assert_eq!((a.cache.as_str(), a.body.as_str()), ("STALE", "v1"));
 }

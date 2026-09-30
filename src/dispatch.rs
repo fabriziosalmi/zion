@@ -1279,6 +1279,7 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
         let mut meta = job.stale.meta.clone();
         if resp.headers().contains_key(hyper::header::CACHE_CONTROL) {
             meta.stale_while_revalidate_secs = origin_swr(resp.headers());
+            meta.must_revalidate = forbids_stale(resp.headers());
         }
         job.state.static_cache.refresh(
             &job.key,
@@ -1330,6 +1331,7 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
         etag: parts.headers.get(hyper::header::ETAG).cloned(),
         last_modified: parts.headers.get(hyper::header::LAST_MODIFIED).cloned(),
         stale_while_revalidate_secs: origin_swr(&parts.headers),
+        must_revalidate: forbids_stale(&parts.headers),
     };
     job.state.static_cache.insert(
         &job.key,
@@ -1438,6 +1440,24 @@ impl Drop for SwrPermit {
             .active
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
+}
+
+/// True when the response's `Cache-Control` forbids serving it stale without
+/// validation: `must-revalidate`, `proxy-revalidate`, or `s-maxage` (which carries
+/// the proxy-revalidate semantics for a shared cache, RFC 9111 §5.2.2.10). Matches
+/// whole directive names, not substrings.
+fn forbids_stale(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get_all(hyper::header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|d| {
+            let name = d.split('=').next().unwrap_or("").trim();
+            name.eq_ignore_ascii_case("must-revalidate")
+                || name.eq_ignore_ascii_case("proxy-revalidate")
+                || name.eq_ignore_ascii_case("s-maxage")
+        })
 }
 
 /// `stale-while-revalidate=N` (RFC 5861 §3) from a response's `Cache-Control`, in
@@ -1811,6 +1831,7 @@ async fn handle_static_cache(
                 // window the origin allowed.
                 let staleness = hit.age_secs.saturating_sub(hit.max_age_secs);
                 if hit.meta.stale_while_revalidate_secs > 0
+                    && !hit.meta.must_revalidate
                     && staleness < hit.meta.stale_while_revalidate_secs
                 {
                     if client_conditional_hit(req.headers(), &hit.meta) {
@@ -1916,13 +1937,30 @@ async fn handle_static_cache(
             // stale-if-error (RFC 9111 §4.2.4): if we were revalidating a stale
             // entry and the origin is unreachable, serve the stale body rather
             // than fail — a flapping origin doesn't take cached content down.
-            if let Some(hit) = revalidate {
+            if let Some(hit) = revalidate.filter(|h| !h.meta.must_revalidate) {
+                metrics::METRICS
+                    .cache_stale_if_error
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(cache_response(hit, "STALE"));
             }
             // tx drops at end of scope → channel closed → waiters get Err
             return Err(e);
         }
     };
+
+    // stale-if-error (RFC 9111 §4.2.4 / RFC 5861 §4): `proxy_pass` turns a transport
+    // failure into a 502 response instead of an `Err`, so an origin that is down or
+    // erroring reaches us as a 5xx. While revalidating a stale entry, that is the case
+    // to answer from the stale copy — unless the origin forbade stale responses.
+    if let Some(hit) = revalidate.as_ref() {
+        if matches!(resp.status().as_u16(), 500 | 502 | 503 | 504) && !hit.meta.must_revalidate {
+            state.inflight.remove(&path_owned);
+            metrics::METRICS
+                .cache_stale_if_error
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(cache_response(hit.clone(), "STALE"));
+        }
+    }
 
     // Revalidation outcome (RFC 9111 §4.3): a 304 confirms the stored entry is
     // still good — revive its freshness and serve the stored body without the
@@ -1937,6 +1975,7 @@ async fn handle_static_cache(
             let mut refreshed_meta = hit.meta.clone();
             if resp.headers().contains_key(hyper::header::CACHE_CONTROL) {
                 refreshed_meta.stale_while_revalidate_secs = origin_swr(resp.headers());
+                refreshed_meta.must_revalidate = forbids_stale(resp.headers());
             }
             state.static_cache.refresh(
                 &path_owned,
@@ -2047,6 +2086,7 @@ async fn handle_static_cache(
             etag,
             last_modified,
             stale_while_revalidate_secs: origin_swr(&parts.headers),
+            must_revalidate: forbids_stale(&parts.headers),
         };
 
         let (sender, receiver) =
@@ -2304,6 +2344,30 @@ mod route_cache {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn forbids_stale_matches_directive_names_only() {
+        let h = |v: &str| hdr(hyper::header::CACHE_CONTROL, v);
+        for yes in [
+            "must-revalidate",
+            "public, max-age=10, Must-Revalidate",
+            "proxy-revalidate",
+            "max-age=10, s-maxage=60",
+            "s-maxage=0",
+        ] {
+            assert!(forbids_stale(&h(yes)), "{yes}");
+        }
+        for no in [
+            "public, max-age=60",
+            "max-age=60, stale-while-revalidate=30",
+            "x-must-revalidate-not",
+            "no-store-s-maxage-ish",
+            "",
+        ] {
+            assert!(!forbids_stale(&h(no)), "{no}");
+        }
+        assert!(!forbids_stale(&hyper::HeaderMap::new()));
+    }
+
+    #[test]
     fn swr_budget_is_bounded_and_released() {
         static B: SwrBudget = SwrBudget {
             active: std::sync::atomic::AtomicUsize::new(0),
@@ -2553,6 +2617,7 @@ mod tests {
             etag: etag.map(|e| e.parse().unwrap()),
             last_modified: lm.map(|l| l.parse().unwrap()),
             stale_while_revalidate_secs: 0,
+            must_revalidate: false,
         };
         let req = |name: hyper::header::HeaderName, val: &str| {
             let mut h = hyper::HeaderMap::new();

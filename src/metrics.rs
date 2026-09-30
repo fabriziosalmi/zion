@@ -404,6 +404,8 @@ pub struct Metrics {
     pub cache_revalidations: ShardedCounter,
     /// Stale entries answered immediately under `stale-while-revalidate`.
     pub cache_swr_served: ShardedCounter,
+    /// Stale entries served because the origin failed while revalidating (stale-if-error).
+    pub cache_stale_if_error: ShardedCounter,
     /// Background refreshes that completed and updated the entry.
     pub cache_swr_refreshes: ShardedCounter,
     /// Background refreshes that ended without updating the entry (origin error,
@@ -564,6 +566,7 @@ impl Metrics {
             cache_misses: ShardedCounter::new(),
             cache_revalidations: ShardedCounter::new(),
             cache_swr_served: ShardedCounter::new(),
+            cache_stale_if_error: ShardedCounter::new(),
             cache_swr_refreshes: ShardedCounter::new(),
             cache_swr_refresh_failures: ShardedCounter::new(),
             cache_swr_refresh_skipped: ShardedCounter::new(),
@@ -890,6 +893,11 @@ impl Metrics {
         out.extend_from_slice(b"\n");
 
         for (name, help, ctr) in [
+            (
+                "zion_cache_stale_if_error",
+                "Stale entries served because the origin failed while revalidating (stale-if-error).",
+                &self.cache_stale_if_error,
+            ),
             (
                 "zion_cache_swr_served",
                 "Stale entries answered immediately under stale-while-revalidate.",

@@ -35,6 +35,11 @@ pub struct CachedMeta {
     /// not offered. While an entry is at most this far past its freshness
     /// lifetime it may be served stale while a background refresh runs.
     pub stale_while_revalidate_secs: u64,
+    /// The origin forbade serving this response once stale without validating it
+    /// (`must-revalidate`, `proxy-revalidate`, or `s-maxage`, which carries the
+    /// proxy-revalidate semantics for a shared cache: RFC 9111 §4.2.4, §5.2.2). It
+    /// must then neither be served stale-while-revalidate nor on an origin error.
+    pub must_revalidate: bool,
 }
 
 /// Result of a cache hit — body + preserved metadata.
@@ -661,6 +666,7 @@ mod tests {
             etag: None,
             last_modified: None,
             stale_while_revalidate_secs: 0,
+            must_revalidate: false,
         }
     }
 
@@ -698,6 +704,7 @@ mod tests {
             etag: None,
             last_modified: None,
             stale_while_revalidate_secs: 0,
+            must_revalidate: false,
         };
         cache.insert("/a.js", Bytes::from("v2"), meta2, 3600, 0, 100);
         let hit = cache.get("/a.js").fresh().unwrap();
@@ -860,6 +867,7 @@ mod tests {
             etag: None,
             last_modified: None,
             stale_while_revalidate_secs: 0,
+            must_revalidate: false,
         };
         cache.insert("/no-ct", Bytes::from("data"), meta, 3600, 0, 100);
         let hit = cache.get("/no-ct").fresh().unwrap();
@@ -876,6 +884,7 @@ mod tests {
             etag: None,
             last_modified: None,
             stale_while_revalidate_secs: 0,
+            must_revalidate: false,
         };
         cache.insert("/304", Bytes::new(), meta, 3600, 0, 100);
         let hit = cache.get("/304").fresh().unwrap();

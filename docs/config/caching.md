@@ -99,9 +99,15 @@ the origin (`If-None-Match` from the stored `ETag`, `If-Modified-Since` from
   counts these.
 - **`200 OK`** → the content changed: the new response replaces the stale entry
   and is served + cached as a normal fetch.
-- **Origin error** (unreachable / 5xx during revalidation) → **stale-if-error**
-  (§4.2.4): zion serves the stale body (`X-Zion-Cache: STALE`) rather than
+- **Origin error** (unreachable, or a `500`/`502`/`503`/`504` answer during
+  revalidation) → **stale-if-error** (§4.2.4): zion serves the stale body
+  (`X-Zion-Cache: STALE`, counted in `zion_cache_stale_if_error`) rather than
   failing, so a flapping origin doesn't take cached content down.
+- **When stale must not be served.** If the origin's response carried
+  `must-revalidate`, `proxy-revalidate` or `s-maxage` (which has the proxy-revalidate
+  meaning for a shared cache), zion never answers from that entry once it is stale:
+  neither stale-if-error nor stale-while-revalidate applies, and a failing origin
+  gives the client the error (RFC 9111 §4.2.4, §5.2.2).
 
 ### stale-while-revalidate (RFC 5861)
 
