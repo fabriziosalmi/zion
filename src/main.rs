@@ -77,6 +77,7 @@ mod tarpit;
 mod tls;
 #[cfg(feature = "tui")]
 mod tui;
+mod uri_norm;
 mod vary;
 mod via;
 // `uring.rs` compiles on every target — the io_uring-accept inner

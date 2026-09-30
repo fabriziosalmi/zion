@@ -190,6 +190,48 @@ async fn rate_limiter_answers_before_the_built_in_endpoints() {
     assert_eq!(get(&st, "198.51.100.7:1", "/healthz").await, 200);
 }
 
+// ── path normalization: a route's policy cannot be dodged by how the path is written ──
+
+#[tokio::test]
+async fn dot_segments_and_duplicate_slashes_cannot_dodge_a_route() {
+    let st = state(0);
+    // control: the plain path is refused for an external client
+    assert_eq!(get(&st, EXTERNAL, "/internal/x").await, 403);
+    for p in [
+        "/open/../internal/x",
+        "/open/%2e%2e/internal/x",
+        "/open/%2E%2E/internal/x",
+        "/open/.%2e/internal/x",
+        "/open/./../internal/x",
+        "/open/a/../../internal/x",
+        "//internal/x",
+        "/internal//x",
+        "/./internal/x",
+        "/%69nternal/x", // %69 = 'i'
+    ] {
+        assert_eq!(
+            get(&st, EXTERNAL, p).await,
+            403,
+            "{p} must be treated as /internal/x"
+        );
+    }
+    // an internal client is not blocked by any of them (it reaches the, dead, upstream)
+    for p in ["/open/../internal/x", "//internal/x"] {
+        assert_ne!(get(&st, INTERNAL, p).await, 403, "{p}");
+    }
+}
+
+#[tokio::test]
+async fn built_in_endpoints_are_reached_through_any_spelling_of_their_path() {
+    let st = state(0);
+    for p in ["//healthz", "/./healthz", "/open/../healthz", "/%68ealthz"] {
+        assert_eq!(get(&st, EXTERNAL, p).await, 200, "{p}");
+    }
+    for p in ["//metrics", "/open/../metrics"] {
+        assert_eq!(get(&st, EXTERNAL, p).await, 403, "{p}: still internal-only");
+    }
+}
+
 // ── loop detection (Via) ────────────────────────────────────────────────────
 
 fn own_via() -> String {
