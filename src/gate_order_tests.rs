@@ -1,0 +1,307 @@
+//! Golden tests for the ORDER of the request pipeline's gates (#422).
+//!
+//! Each case sends a request that trips two gates at once and pins which one
+//! answers. The pipeline's security value is in its ordering — a cheap 414 before
+//! a method check, the rate limiter before the built-in endpoints, route-level
+//! policy before the upstream — so a refactor that reorders two gates changes a
+//! status code here, loudly, instead of silently weakening a defence.
+//!
+//! These drive the real `process_request` with a real `AppState` (no sockets), and
+//! were written against the pipeline BEFORE it was restructured: they describe the
+//! behaviour to preserve, not the new code.
+
+use crate::config::ZionConfig;
+use crate::dispatch::process_request;
+use crate::proxy::ZionBody;
+use crate::state::AppState;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{Method, Request};
+use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+const EXTERNAL: &str = "203.0.113.9:40000"; // TEST-NET-3: not an internal address
+const INTERNAL: &str = "10.0.0.5:40000";
+const DEAD: &str = "http://127.0.0.1:10";
+
+fn config_toml(rate_limit_rps: u32) -> String {
+    format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+rate_limit_rps = {rate_limit_rps}
+
+[tls]
+cert_path = "/c"
+key_path = "/k"
+
+[upstreams]
+live = "http://127.0.0.1:9"
+dead = "{DEAD}"
+
+[auth_profile.p]
+secret = "test-secret-key-for-zion-gate-order"
+algorithm = "HS256"
+
+[[route]]
+path = "/open/{{*rest}}"
+upstream = "live"
+
+[[route]]
+path = "/internal/{{*rest}}"
+upstream = "live"
+internal_only = true
+
+[[route]]
+path = "/internal-down/{{*rest}}"
+upstream = "dead"
+internal_only = true
+
+[[route]]
+path = "/down/{{*rest}}"
+upstream = "dead"
+
+[[route]]
+path = "/down-authed/{{*rest}}"
+upstream = "dead"
+auth_profile = "p"
+
+[[route]]
+path = "/authed-waf/{{*rest}}"
+upstream = "live"
+auth_profile = "p"
+waf = true
+
+[[route]]
+path = "/waf/{{*rest}}"
+upstream = "live"
+waf = true
+
+[[route]]
+path = "/cors-internal/{{*rest}}"
+upstream = "live"
+internal_only = true
+[route.cors]
+allowed_origins = ["https://app.example"]
+"#
+    )
+}
+
+fn state(rate_limit_rps: u32) -> Arc<AppState> {
+    let cfg: ZionConfig = toml::from_str(&config_toml(rate_limit_rps)).expect("test config parses");
+    let st = AppState::for_tests(&cfg);
+    // `dead` answers no probe: mark it down so route selection sees that.
+    st.cfg()
+        .health_map
+        .get(DEAD)
+        .expect("dead upstream is in the health map")
+        .healthy
+        .store(false, Ordering::Relaxed);
+    st
+}
+
+fn req(method: Method, uri: &str, headers: &[(&str, &str)]) -> Request<ZionBody> {
+    let mut b = Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    b.body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+        .unwrap()
+}
+
+/// Status the pipeline answers with.
+async fn status(st: &Arc<AppState>, from: &str, r: Request<ZionBody>, early: bool) -> u16 {
+    let addr: SocketAddr = from.parse().unwrap();
+    process_request(r, st.clone(), addr, early)
+        .await
+        .expect("pipeline is infallible here")
+        .status()
+        .as_u16()
+}
+
+async fn get(st: &Arc<AppState>, from: &str, uri: &str) -> u16 {
+    status(st, from, req(Method::GET, uri, &[]), false).await
+}
+
+// ── pre-routing gates, in order ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn uri_length_answers_before_the_method_whitelist() {
+    let st = state(0);
+    let long = format!("/open/{}", "a".repeat(9000));
+    // TRACE would be 405; the oversized URI is refused first.
+    assert_eq!(
+        status(&st, EXTERNAL, req(Method::TRACE, &long, &[]), false).await,
+        414
+    );
+    // sanity: each gate alone behaves
+    assert_eq!(
+        status(&st, EXTERNAL, req(Method::TRACE, "/open/x", &[]), false).await,
+        405
+    );
+}
+
+#[tokio::test]
+async fn method_whitelist_answers_before_the_early_data_check() {
+    let st = state(0);
+    // TRACE in early data: 405, not 425.
+    assert_eq!(
+        status(&st, EXTERNAL, req(Method::TRACE, "/open/x", &[]), true).await,
+        405
+    );
+    // a whitelisted state-changing method in early data IS 425
+    assert_eq!(
+        status(&st, EXTERNAL, req(Method::POST, "/open/x", &[]), true).await,
+        425
+    );
+    // and GET in early data passes the gate (then 502/503 from the dead-port upstream
+    // is irrelevant: it is not 425)
+    assert_ne!(
+        status(&st, EXTERNAL, req(Method::GET, "/open/x", &[]), true).await,
+        425
+    );
+}
+
+#[tokio::test]
+async fn early_data_answers_before_the_rate_limiter() {
+    let st = state(1);
+    // burn the single token for this client
+    let _ = get(&st, EXTERNAL, "/healthz").await;
+    // over the limit AND early-data POST: 425 (the earlier gate) wins over 429
+    assert_eq!(
+        status(&st, EXTERNAL, req(Method::POST, "/open/x", &[]), true).await,
+        425
+    );
+}
+
+#[tokio::test]
+async fn rate_limiter_answers_before_the_built_in_endpoints() {
+    let st = state(1);
+    assert_eq!(
+        get(&st, EXTERNAL, "/healthz").await,
+        200,
+        "first request has budget"
+    );
+    // /healthz must not be a way around the limiter
+    assert_eq!(get(&st, EXTERNAL, "/healthz").await, 429);
+    // and another client's budget is independent
+    assert_eq!(get(&st, "198.51.100.7:1", "/healthz").await, 200);
+}
+
+// ── built-ins before routing ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn built_in_endpoints_answer_before_route_lookup() {
+    let st = state(0);
+    // none of these paths matches a route; they are served (or refused) by the
+    // built-in handlers, not turned into a 404
+    assert_eq!(get(&st, EXTERNAL, "/healthz").await, 200);
+    assert_eq!(get(&st, EXTERNAL, "/readyz").await, 200);
+    assert_eq!(
+        get(&st, EXTERNAL, "/metrics").await,
+        403,
+        "external peer refused"
+    );
+    assert_eq!(get(&st, INTERNAL, "/metrics").await, 200);
+    assert_eq!(get(&st, EXTERNAL, "/_zion/snapshot.json").await, 403);
+    assert_eq!(get(&st, INTERNAL, "/_zion/snapshot.json").await, 200);
+    // purge: internal check, then method
+    assert_eq!(get(&st, EXTERNAL, "/_zion/cache/purge").await, 403);
+    assert_eq!(
+        get(&st, INTERNAL, "/_zion/cache/purge").await,
+        405,
+        "GET is not POST"
+    );
+    assert_eq!(get(&st, INTERNAL, "/no-such-route").await, 404);
+}
+
+// ── route-level gates, in order ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn cors_preflight_answers_before_internal_only() {
+    let st = state(0);
+    // an external client preflighting an internal_only route with an allowed
+    // origin gets the 204 preflight answer, not the internal_only 403
+    let pre = req(
+        Method::OPTIONS,
+        "/cors-internal/x",
+        &[("origin", "https://app.example")],
+    );
+    assert_eq!(status(&st, EXTERNAL, pre, false).await, 204);
+    // a disallowed origin on a state-changing method is a CORS 403
+    let bad = req(
+        Method::POST,
+        "/cors-internal/x",
+        &[("origin", "https://evil.example")],
+    );
+    assert_eq!(status(&st, INTERNAL, bad, false).await, 403);
+    // with no Origin the request is just an internal_only one
+    assert_eq!(get(&st, EXTERNAL, "/cors-internal/x").await, 403);
+}
+
+#[tokio::test]
+async fn internal_only_answers_before_upstream_selection() {
+    let st = state(0);
+    // the upstream is down (would be 503) but the caller is not allowed in: 403
+    assert_eq!(get(&st, EXTERNAL, "/internal-down/x").await, 403);
+    // an internal caller does reach the upstream check
+    assert_eq!(get(&st, INTERNAL, "/internal-down/x").await, 503);
+}
+
+#[tokio::test]
+async fn upstream_availability_answers_before_auth() {
+    let st = state(0);
+    // a route with an auth profile and a dead upstream: no token, yet 503 not 401
+    assert_eq!(get(&st, EXTERNAL, "/down-authed/x").await, 503);
+    assert_eq!(get(&st, EXTERNAL, "/down/x").await, 503);
+}
+
+#[cfg(feature = "auth")]
+#[tokio::test]
+async fn auth_answers_before_the_waf() {
+    let st = state(0);
+    // a balanced-WAF pattern (php://input) on an authed+WAF route, with no token: 401 (auth first)
+    let q = "/authed-waf/x?f=php://input";
+    assert_eq!(get(&st, EXTERNAL, q).await, 401);
+}
+
+#[tokio::test]
+async fn waf_answers_before_the_request_is_dispatched() {
+    let st = state(0);
+    // WAF-on route, hostile query (php://input): rejected with 400 before any upstream is tried
+    let q = "/waf/x?f=php://input";
+    assert_eq!(get(&st, EXTERNAL, q).await, 400);
+}
+
+// ── the wrapper around all of it ────────────────────────────────────────────
+
+#[tokio::test]
+async fn every_outcome_carries_security_headers_and_the_request_id() {
+    let st = state(0);
+    for (uri, m) in [
+        ("/healthz", Method::GET),
+        ("/no-such-route", Method::GET),
+        ("/open/x", Method::TRACE),
+    ] {
+        let addr: SocketAddr = EXTERNAL.parse().unwrap();
+        let resp = process_request(
+            req(m, uri, &[("x-request-id", "abc-123")]),
+            st.clone(),
+            addr,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            resp.headers().contains_key("x-content-type-options"),
+            "{uri}: error and built-in responses get the security headers too"
+        );
+        assert_eq!(
+            resp.headers().get("x-request-id").unwrap(),
+            "abc-123",
+            "{uri}"
+        );
+    }
+}

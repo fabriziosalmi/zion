@@ -437,3 +437,41 @@ impl AppState {
             .clone()
     }
 }
+
+#[cfg(test)]
+impl AppState {
+    /// A fully wired `AppState` for in-process tests of the request pipeline: no
+    /// sockets, no certificate on disk (an empty SNI resolver stands in for TLS),
+    /// every limiter fresh. Health starts as `new_healthy` for every upstream.
+    pub(crate) fn for_tests(config: &config::ZionConfig) -> Arc<Self> {
+        // The daemon installs the process-wide provider at boot; tests do it here.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let resolved = ResolvedAppConfig::try_build(config, 1024).expect("test config builds");
+        let tls = tokio_rustls::TlsAcceptor::from(Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new())),
+        ));
+        Arc::new(AppState {
+            config: Arc::new(ArcSwap::from_pointee(resolved)),
+            tls_acceptor: Arc::new(ArcSwap::from_pointee(tls)),
+            http_client: proxy::build_http_client(proxy::DEFAULT_CONNECT_TIMEOUT_MS),
+            http_clients: dashmap::DashMap::new(),
+            static_cache: cache::StaticCache::new(),
+            conn_limit: Arc::new(Semaphore::new(1024)),
+            http_builder: Arc::new(AutoBuilder::new(TokioExecutor::new())),
+            acme_challenges: acme::new_challenge_store(),
+            limiters: Limiters {
+                rate_map: Arc::new(numa::NumaAwareMap::new()),
+                conn_per_ip: Arc::new(connlimit::PerIpConnLimiter::new()),
+                #[cfg(feature = "tls-fingerprint")]
+                tls_fp_bans: tls_fp::BanSet::new(),
+            },
+            inflight: numa::NumaAwareMap::new(),
+            audit: audit::AuditHandle::noop(),
+            redact: Arc::new(audit::CompiledRedaction::default()),
+            #[cfg(feature = "sovereign-aimp")]
+            aimp_cp: None,
+        })
+    }
+}
