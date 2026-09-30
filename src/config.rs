@@ -246,6 +246,14 @@ pub struct ServerConfig {
     /// accept, so a hot-reload retunes it without dropping live connections.
     #[serde(default)]
     pub max_connections_per_ip: Option<u32>,
+    /// Seconds of silence before the kernel starts TCP keepalive probes on client
+    /// connections (then every 10 s, dead after 3 unanswered). Frees the file
+    /// descriptor and connection slot of a peer that vanished without a FIN (power
+    /// loss, a NAT that dropped its mapping) in this + 30 s. Default 60; `0` = off.
+    /// Retuned live on reload for new connections. The upstream pool and WebSocket
+    /// dials use the 60 s default.
+    #[serde(default = "default_tcp_keepalive_secs")]
+    pub tcp_keepalive_secs: u64,
     /// Log format: "text" (default) or "json".
     #[serde(default = "default_log_format")]
     pub log_format: String,
@@ -281,6 +289,10 @@ pub struct ServerConfig {
 
 fn default_xff_mode() -> String {
     "append".to_string()
+}
+
+fn default_tcp_keepalive_secs() -> u64 {
+    crate::net::DEFAULT_TCP_KEEPALIVE_SECS
 }
 
 fn default_log_format() -> String {
@@ -1716,6 +1728,20 @@ pub(crate) fn compile_path_set(patterns: &[String]) -> Result<matchit::Router<()
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tcp_keepalive_secs_defaults_to_60_and_can_be_changed_or_turned_off() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n";
+        let rest = "[tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n[[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let parse =
+            |extra: &str| toml::from_str::<ZionConfig>(&format!("{base}{extra}\n{rest}")).unwrap();
+        assert_eq!(parse("").server.tcp_keepalive_secs, 60);
+        assert_eq!(
+            parse("tcp_keepalive_secs = 120").server.tcp_keepalive_secs,
+            120
+        );
+        assert_eq!(parse("tcp_keepalive_secs = 0").server.tcp_keepalive_secs, 0);
+    }
+
     use super::*;
     use crate::routing::{build_router, build_router_quiet};
 

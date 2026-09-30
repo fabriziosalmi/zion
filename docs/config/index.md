@@ -35,6 +35,7 @@ in the CHANGELOG), together with a reader for the version it replaces.
 | `trusted_proxies` | string[] | `[]` | CIDRs whose inbound `X-Forwarded-For` is trusted for client-IP resolution |
 | `require_route_auth` | bool | `false` | Refuse a config in which a `[[route]]` has none of `auth_profile`, `public = true` or `internal_only = true`, so a route added without an auth decision fails at load instead of serving unauthenticated |
 | `internal_networks` | string[] | `[]` | CIDRs (or bare IPs) allowed to use the internal-only endpoints (`/metrics`, `/_zion/snapshot.json`, `/_zion/cache/purge`) and `internal_only` routes. Empty keeps the built-in rule: any loopback / private-range / link-local / ULA peer. That rule tests network position, not identity: behind a private-range load balancer, Kubernetes SNAT or a Docker bridge every client looks internal. Set this (and `trusted_proxies`) to name the hosts that really are. Zion warns at boot when neither is set on a non-loopback listener |
+| `tcp_keepalive_secs` | u64 | `60` | Seconds of silence before the kernel probes a client connection (then every 10 s, dead after 3 unanswered), so a peer that vanished without a FIN frees its fd and connection slot in this + 30 s. `0` = off. Retuned on reload for new connections; pooled upstream sockets and WebSocket dials use 60 |
 | `xff_mode` | string | `"append"` | Outbound XFF policy: `"append"`, `"rewrite"` (strip inbound, emit one trusted entry), or `"drop"` |
 | `log_format` | string | `"text"` | `"text"` or `"json"` (structured) |
 

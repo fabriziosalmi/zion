@@ -89,6 +89,11 @@ pub fn build_http_client(connect_timeout_ms: u64) -> HttpClient {
     let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
     // The TLS wrapper needs to see `https://` URIs; it does its own scheme check.
     http.enforce_http(false);
+    // Kernel keepalive on pooled upstream sockets too: a pooled connection to a host
+    // that died silently would otherwise be handed to the next request and fail then.
+    http.set_keepalive(Some(std::time::Duration::from_secs(
+        crate::net::DEFAULT_TCP_KEEPALIVE_SECS,
+    )));
     http.set_connect_timeout(
         (connect_timeout_ms > 0).then(|| std::time::Duration::from_millis(connect_timeout_ms)),
     );
@@ -666,6 +671,7 @@ pub async fn proxy_websocket(
     };
     let _ = tcp_stream.set_nodelay(true);
     crate::net::tune_accepted(&tcp_stream);
+    crate::net::set_keepalive(&tcp_stream, crate::net::DEFAULT_TCP_KEEPALIVE_SECS);
 
     // Perform HTTP upgrade handshake with upstream
     *req.uri_mut() = upstream_uri;
