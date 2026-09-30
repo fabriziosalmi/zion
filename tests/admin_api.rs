@@ -54,34 +54,33 @@ impl Drop for Daemon {
 }
 
 fn config(dir: &std::path::Path, admin_port: u16, rps: u32, persist: bool) -> String {
-    format!(
-        r#"[server]
-listen_http = "127.0.0.1:{}"
-listen_https = "127.0.0.1:{}"
-rate_limit_rps = {rps}
-
-[tls]
-cert_path = "{d}/c.pem"
-key_path = "{d}/k.pem"
-hot_reload = false
-
-[upstreams]
-backend = "http://127.0.0.1:9"
-
-[[route]]
-path = "/{{*rest}}"
-upstream = "backend"
-
-[admin]
-listen = "127.0.0.1:{admin_port}"
-write_token_env = "ZION_TEST_ADMIN_WRITE_TOKEN"
-persist_push = {persist}
-rate_limit_rps = 1000
-"#,
-        free_port(),
-        free_port(),
-        d = dir.display(),
-    )
+    let d = dir.display().to_string();
+    [
+        "[server]".to_string(),
+        format!("listen_http = \"127.0.0.1:{}\"", free_port()),
+        format!("listen_https = \"127.0.0.1:{}\"", free_port()),
+        "rate_limit_rps = ".to_string() + &rps.to_string(),
+        String::new(),
+        "[tls]".to_string(),
+        format!("cert_path = \"{d}/c.pem\""),
+        format!("key_path = \"{d}/k.pem\""),
+        "hot_reload = false".to_string(),
+        String::new(),
+        "[upstreams]".to_string(),
+        "backend = \"http://127.0.0.1:9\"".to_string(),
+        String::new(),
+        "[[route]]".to_string(),
+        "path = \"/{*rest}\"".to_string(),
+        "upstream = \"backend\"".to_string(),
+        String::new(),
+        "[admin]".to_string(),
+        "listen = \"127.0.0.1:".to_string() + &admin_port.to_string() + "\"",
+        "write_token_env = \"ZION_TEST_ADMIN_WRITE_TOKEN\"".to_string(),
+        "persist_push = ".to_string() + &persist.to_string(),
+        "rate_limit_rps = 1000".to_string(),
+        String::new(),
+    ]
+    .join("\n")
 }
 
 /// The same config with another `rate_limit_rps`: listen ports must not change, or a
