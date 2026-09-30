@@ -61,6 +61,8 @@ pub(crate) struct ResolvedAppConfig {
     /// Max concurrent connections per source IP. 0 = disabled. Read at
     /// accept, so a hot-reload retunes the cap without dropping live conns.
     pub(crate) max_connections_per_ip: u32,
+    /// TCP keepalive idle seconds for accepted client sockets (0 = off).
+    pub(crate) tcp_keepalive_secs: u64,
     /// Resolved tag-driven enforcement policy (`[sovereign.enforce]`, #150).
     /// Lives under the geo-gated `[sovereign]` block (class deny needs the
     /// dataset). Disabled by default. Mesh-score deny additionally needs
@@ -111,6 +113,7 @@ impl ResolvedAppConfig {
             rate_limit_window: 1,
             rate_limit_max_tracked_ips: crate::security::MAX_RATE_MAP_ENTRIES,
             max_connections_per_ip: 0,
+            tcp_keepalive_secs: crate::net::DEFAULT_TCP_KEEPALIVE_SECS,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             enforce: sovereign::EnforcePolicy::default(),
             listen_http: None,
@@ -309,6 +312,7 @@ impl ResolvedAppConfig {
             rate_limit_window: config.server.rate_limit_window_secs,
             rate_limit_max_tracked_ips: config.server.rate_limit_max_tracked_ips,
             max_connections_per_ip,
+            tcp_keepalive_secs: config.server.tcp_keepalive_secs,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             enforce,
             listen_http,

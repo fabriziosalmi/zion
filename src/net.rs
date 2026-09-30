@@ -146,9 +146,94 @@ pub fn tune_accepted(stream: &tokio::net::TcpStream) {
 #[cfg(not(target_os = "linux"))]
 pub fn tune_accepted(_stream: &tokio::net::TcpStream) {}
 
+/// Default idle time before the kernel starts probing a silent connection.
+pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
+/// Seconds between probes, and probes sent before the connection is declared dead.
+// Each option exists on only some platforms (retries: not Windows), so the constants are
+// unused elsewhere.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
+const KEEPALIVE_INTERVAL_SECS: u64 = 10;
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+const KEEPALIVE_RETRIES: u32 = 3;
+
+/// Turn on kernel TCP keepalive: after `idle_secs` of silence the kernel probes every
+/// 10 s and gives up after 3 unanswered probes, so a client or upstream that vanished
+/// without a FIN (power loss, a NAT that dropped the mapping, a pulled cable) frees its
+/// file descriptor and connection slot in `idle_secs + 30` s instead of holding it until
+/// an application timeout. `0` leaves keepalive off. Best effort: a failure to set an
+/// option is ignored, the connection still works.
+pub fn set_keepalive(stream: &tokio::net::TcpStream, idle_secs: u64) {
+    if idle_secs == 0 {
+        return;
+    }
+    let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(idle_secs));
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    let ka = ka.with_interval(std::time::Duration::from_secs(
+        KEEPALIVE_INTERVAL_SECS.min(idle_secs),
+    ));
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let ka = ka.with_retries(KEEPALIVE_RETRIES);
+    let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&ka);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connected loopback pair; returns the client side.
+    async fn connected() -> tokio::net::TcpStream {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (c, _srv) = tokio::join!(tokio::net::TcpStream::connect(addr), l.accept());
+        c.unwrap()
+    }
+
+    #[tokio::test]
+    async fn keepalive_is_off_by_default_and_on_after_set() {
+        let s = connected().await;
+        assert!(
+            !socket2::SockRef::from(&s).keepalive().unwrap(),
+            "control: a fresh socket has none"
+        );
+        set_keepalive(&s, 45);
+        let sock = socket2::SockRef::from(&s);
+        assert!(sock.keepalive().unwrap(), "SO_KEEPALIVE must be on");
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                sock.tcp_keepalive_time().unwrap(),
+                std::time::Duration::from_secs(45)
+            );
+            assert_eq!(
+                sock.tcp_keepalive_interval().unwrap(),
+                std::time::Duration::from_secs(10)
+            );
+            assert_eq!(sock.tcp_keepalive_retries().unwrap(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_leaves_keepalive_off() {
+        let s = connected().await;
+        set_keepalive(&s, 0);
+        assert!(!socket2::SockRef::from(&s).keepalive().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_short_idle_time_shortens_the_probe_interval_too() {
+        let s = connected().await;
+        set_keepalive(&s, 5);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            socket2::SockRef::from(&s).tcp_keepalive_interval().unwrap(),
+            std::time::Duration::from_secs(5),
+            "the interval never exceeds the idle time"
+        );
+        assert!(socket2::SockRef::from(&s).keepalive().unwrap());
+    }
 
     #[tokio::test]
     async fn binds_ipv4_ephemeral_port() {
