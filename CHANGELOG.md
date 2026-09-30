@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Cache: a successful `POST`/`PUT`/`PATCH`/`DELETE` invalidates the cache entries for its URI** (RFC 9111 §4.4): the path, its query variants and every encoding/`Vary` variant, but not longer paths that start the same, plus the same-origin URIs named in the response's `Location` / `Content-Location`. Errors (status 400 and above) invalidate nothing. New counter `zion_cache_invalidations`. Per instance: replicas do not tell each other.
+
 ### Fixed
 
 - **Cache: a response that sets a cookie is no longer stored.** Cached hits never replayed `Set-Cookie`, but they did replay the body, so a personalised page that started a session could be served to other visitors. Any response with a `Set-Cookie` header is now streamed through uncached (`X-Zion-Cache: BYPASS`), whatever its `Cache-Control`. If you relied on caching such responses, have the origin stop sending `Set-Cookie` on them.

@@ -32,6 +32,10 @@ struct Origin {
     last_lang: Mutex<Option<String>>,
     /// A `Set-Cookie` value the origin adds to its answers, if any.
     set_cookie: Mutex<Option<String>>,
+    /// The status the origin answers with (200 unless a test says otherwise).
+    status: std::sync::atomic::AtomicU16,
+    /// An extra response header (name, value), e.g. `Content-Location`.
+    extra: Mutex<Option<(String, String)>>,
 }
 
 /// `lang|foo|cookie|ae` of the request, so a body identifies who it was made for.
@@ -69,8 +73,11 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                             h("accept-encoding")
                         );
                         let mut b = Response::builder()
-                            .status(StatusCode::OK)
+                            .status(StatusCode::from_u16(o.status.load(Ordering::Relaxed)).unwrap())
                             .header("cache-control", o.cc.lock().unwrap().clone());
+                        if let Some((k, v)) = o.extra.lock().unwrap().clone() {
+                            b = b.header(k, v);
+                        }
                         if let Some(c) = o.set_cookie.lock().unwrap().clone() {
                             b = b.header("set-cookie", c);
                         }
@@ -131,6 +138,8 @@ async fn rig_cc(vary: &str, cc: &str) -> (Arc<Origin>, Arc<AppState>) {
         cc: Mutex::new(cc.into()),
         last_lang: Mutex::new(None),
         set_cookie: Mutex::new(None),
+        status: std::sync::atomic::AtomicU16::new(200),
+        extra: Mutex::new(None),
     });
     let port = start_origin(o.clone()).await;
     (o, state_for(port))
@@ -143,6 +152,25 @@ fn get(uri: &str, headers: &[(&str, &str)]) -> Request<ZionBody> {
     }
     b.body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
         .unwrap()
+}
+
+/// Send a request with `method` and return the status.
+async fn send(st: &Arc<AppState>, method: Method, uri: &str) -> u16 {
+    let mut b = Request::builder().method(method).uri(uri);
+    b = b.header("accept-language", "de");
+    let req = b
+        .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+        .unwrap();
+    process_request(
+        req,
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap()
+    .status()
+    .as_u16()
 }
 
 /// (X-Zion-Cache, body)
@@ -480,4 +508,133 @@ async fn the_same_response_without_a_cookie_is_cached() {
     let (c, _) = fetch(&st, "/nc", &[]).await;
     assert_eq!(c, "HIT");
     assert_eq!(hits(&o), 1);
+}
+
+// ── RFC 9111 §4.4: a successful unsafe request invalidates what it may have changed ──
+
+/// Warm `/items/1` (and a query variant), mutate it, and report whether the next GET
+/// was served from cache (`HIT`) or had to be refetched.
+async fn warm_then_mutate(
+    tag: usize,
+    method: Method,
+    mutate_status: u16,
+) -> (String, String, String) {
+    // a path space of its own per call: the route cache is thread-local and keyed by path,
+    // so reusing a path across states would send requests to an earlier state's origin
+    let (p1, p1q, p10, pchild) = (
+        format!("/t{tag}/items/1"),
+        format!("/t{tag}/items/1?v=2"),
+        format!("/t{tag}/items/10"),
+        format!("/t{tag}/items/1/child"),
+    );
+    let (o, st) = rig("").await;
+    fetch(&st, &p1, &[]).await;
+    fetch(&st, &p1q, &[]).await;
+    fetch(&st, &p10, &[]).await; // a different resource with a longer name
+    fetch(&st, &pchild, &[]).await;
+    settle().await;
+    assert_eq!(fetch(&st, &p1, &[]).await.0, "HIT", "warm");
+    o.status.store(mutate_status, Ordering::Relaxed);
+    let got = send(&st, method, &p1).await;
+    assert_eq!(
+        got, mutate_status,
+        "the mutation must actually reach this test's origin"
+    );
+    o.status.store(200, Ordering::Relaxed);
+    settle().await;
+    (
+        fetch(&st, &p1, &[]).await.0,
+        fetch(&st, &p1q, &[]).await.0,
+        // neighbours that must NOT have been touched
+        format!(
+            "{}/{}",
+            fetch(&st, &p10, &[]).await.0,
+            fetch(&st, &pchild, &[]).await.0
+        ),
+    )
+}
+
+#[tokio::test]
+async fn a_successful_unsafe_request_evicts_the_target_and_only_the_target() {
+    for (n, m) in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE]
+        .into_iter()
+        .enumerate()
+    {
+        let (target, with_query, neighbours) = warm_then_mutate(n, m.clone(), 200).await;
+        assert_eq!(target, "MISS", "{m}: the target URI must be refetched");
+        assert_eq!(with_query, "MISS", "{m}: its query variants too");
+        assert_eq!(
+            neighbours, "HIT/HIT",
+            "{m}: /items/10 and /items/1/child must be left alone"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_failed_unsafe_request_invalidates_nothing() {
+    for (n, status) in [400u16, 403, 409, 500, 502].into_iter().enumerate() {
+        let (target, _, _) = warm_then_mutate(10 + n, Method::POST, status).await;
+        assert_eq!(
+            target, "HIT",
+            "a {status} answer changed nothing, so the entry stays"
+        );
+    }
+}
+
+#[tokio::test]
+async fn safe_methods_do_not_invalidate() {
+    for (n, m) in [Method::GET, Method::HEAD, Method::OPTIONS]
+        .into_iter()
+        .enumerate()
+    {
+        let (target, _, _) = warm_then_mutate(20 + n, m.clone(), 200).await;
+        assert_eq!(target, "HIT", "{m} must not evict");
+    }
+}
+
+#[tokio::test]
+async fn location_and_content_location_of_the_response_are_invalidated_too() {
+    for (n, header) in ["content-location", "location"].iter().enumerate() {
+        let (o, st) = rig("").await;
+        // a path of its own per case: the route cache is thread-local and keyed by path
+        let (other, elsewhere, mutate) = (
+            format!("/other{n}"),
+            format!("/elsewhere{n}"),
+            format!("/items/2{n}"),
+        );
+        fetch(&st, &other, &[]).await;
+        fetch(&st, &elsewhere, &[]).await;
+        settle().await;
+        assert_eq!(fetch(&st, &other, &[]).await.0, "HIT");
+        *o.extra.lock().unwrap() = Some((header.to_string(), other.clone()));
+        send(&st, Method::POST, &mutate).await;
+        *o.extra.lock().unwrap() = None;
+        settle().await;
+        assert_eq!(
+            fetch(&st, &other, &[]).await.0,
+            "MISS",
+            "{header}: the named URI is invalidated"
+        );
+        assert_eq!(
+            fetch(&st, &elsewhere, &[]).await.0,
+            "HIT",
+            "{header}: and nothing else"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_location_on_another_origin_is_not_acted_on() {
+    let (o, st) = rig("").await;
+    fetch(&st, "/other", &[]).await;
+    settle().await;
+    *o.extra.lock().unwrap() = Some(("location".into(), "http://evil.example/other".into()));
+    send(&st, Method::POST, "/items/3").await;
+    *o.extra.lock().unwrap() = None;
+    settle().await;
+    assert_eq!(
+        fetch(&st, "/other", &[]).await.0,
+        "HIT",
+        "a response must not be able to evict URIs of another origin's path space"
+    );
 }

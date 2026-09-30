@@ -1151,6 +1151,29 @@ async fn process_request_inner(
     Ok(resp)
 }
 
+/// The paths a response names in `Location` / `Content-Location` that are on the same
+/// origin as the request (RFC 9111 §4.4): a relative reference, or an absolute one
+/// whose authority is the request's own host. Anything pointing elsewhere is ignored,
+/// so a response can only ever evict URIs in its own origin's space.
+fn named_same_origin_paths(headers: &hyper::HeaderMap, request_host: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    for name in [hyper::header::LOCATION, hyper::header::CONTENT_LOCATION] {
+        for v in headers.get_all(&name) {
+            let Some(uri) = v.to_str().ok().and_then(|s| s.parse::<hyper::Uri>().ok()) else {
+                continue;
+            };
+            let same_origin = match uri.authority() {
+                None => true,
+                Some(a) => request_host.is_some_and(|h| a.as_str().eq_ignore_ascii_case(h)),
+            };
+            if same_origin && !uri.path().is_empty() {
+                out.push(uri.path().to_string());
+            }
+        }
+    }
+    out
+}
+
 /// The key a request's cache entry lives under: its primary key, or — when that key's
 /// responses are known to vary — the secondary key for this request's varied headers.
 /// `None` when a varied header value is too long to key on.
@@ -1739,7 +1762,17 @@ async fn handle_static_cache(
     // non-GET 200 stored under it — a HEAD's empty body, or a POST response —
     // would later be served to a GET (method-confusion cache poisoning).
     if *req.method() != hyper::Method::GET {
-        return proxy::proxy_pass(
+        // RFC 9111 §4.4: a successful unsafe request invalidates the cached responses
+        // for its target URI, and for the URIs its answer names in `Location` /
+        // `Content-Location` when they are on the same origin. Capture what that needs
+        // before `req` is consumed.
+        let invalidating = matches!(
+            *req.method(),
+            hyper::Method::POST | hyper::Method::PUT | hyper::Method::PATCH | hyper::Method::DELETE
+        );
+        let target_path = req.uri().path().to_string();
+        let request_host = crate::security::request_host(&req).map(|h| h.to_ascii_lowercase());
+        let resp = proxy::proxy_pass(
             &state.client_for(rule.connect_timeout_ms),
             req,
             dyn_scheme,
@@ -1748,7 +1781,21 @@ async fn handle_static_cache(
             "https",
             xff_mode,
         )
-        .await;
+        .await?;
+        if invalidating && resp.status().as_u16() < 400 {
+            let mut removed = state.static_cache.invalidate_path(&target_path);
+            for path in named_same_origin_paths(resp.headers(), request_host.as_deref()) {
+                if path != target_path {
+                    removed += state.static_cache.invalidate_path(&path);
+                }
+            }
+            if removed > 0 {
+                metrics::METRICS
+                    .cache_invalidations
+                    .fetch_add(removed as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        return Ok(resp);
     }
 
     // Cache TTL / capacity from the profile (mode=StaticCache without an

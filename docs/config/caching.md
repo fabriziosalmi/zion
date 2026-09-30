@@ -110,6 +110,19 @@ the origin (`If-None-Match` from the stored `ETag`, `If-Modified-Since` from
   neither stale-if-error nor stale-while-revalidate applies, and a failing origin
   gives the client the error (RFC 9111 §4.2.4, §5.2.2).
 
+### Invalidation by unsafe requests (RFC 9111 §4.4)
+
+When a `POST`, `PUT`, `PATCH` or `DELETE` to a cached route gets a non-error answer
+(below 400), zion drops the cached responses for that URI: the path itself, its query
+variants and every `Accept-Encoding` / `Vary` variant, but not longer paths that merely
+start the same (`/items/1` does not touch `/items/10` or `/items/1/child`). URIs named
+in the answer's `Location` / `Content-Location` are invalidated too when they are on the
+same origin (a relative reference, or the request's own host); a reference to another
+host is ignored. `zion_cache_invalidations` counts the entries dropped. A failed
+mutation changes nothing, so it evicts nothing. This is per zion instance: with several
+replicas, each one invalidates only what it served the mutation for (use
+`/_zion/cache/purge` or short TTLs for the rest).
+
 ### stale-while-revalidate (RFC 5861)
 
 When the origin sends `Cache-Control: max-age=N, stale-while-revalidate=M`, an entry

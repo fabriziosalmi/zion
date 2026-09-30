@@ -406,6 +406,9 @@ pub struct Metrics {
     pub cache_swr_served: ShardedCounter,
     /// Stale entries served because the origin failed while revalidating (stale-if-error).
     pub cache_stale_if_error: ShardedCounter,
+    /// Cache entries dropped because an unsafe request (POST/PUT/PATCH/DELETE)
+    /// succeeded on their URI (RFC 9111 §4.4).
+    pub cache_invalidations: ShardedCounter,
     /// Background refreshes that completed and updated the entry.
     pub cache_swr_refreshes: ShardedCounter,
     /// Background refreshes that ended without updating the entry (origin error,
@@ -567,6 +570,7 @@ impl Metrics {
             cache_revalidations: ShardedCounter::new(),
             cache_swr_served: ShardedCounter::new(),
             cache_stale_if_error: ShardedCounter::new(),
+            cache_invalidations: ShardedCounter::new(),
             cache_swr_refreshes: ShardedCounter::new(),
             cache_swr_refresh_failures: ShardedCounter::new(),
             cache_swr_refresh_skipped: ShardedCounter::new(),
@@ -893,6 +897,11 @@ impl Metrics {
         out.extend_from_slice(b"\n");
 
         for (name, help, ctr) in [
+            (
+                "zion_cache_invalidations",
+                "Cache entries dropped because a successful unsafe request (POST/PUT/PATCH/DELETE) changed their URI (RFC 9111 section 4.4).",
+                &self.cache_invalidations,
+            ),
             (
                 "zion_cache_stale_if_error",
                 "Stale entries served because the origin failed while revalidating (stale-if-error).",

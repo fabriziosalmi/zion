@@ -621,6 +621,37 @@ impl StaticCache {
     /// L1 entries (not just the prefix) — over-broad but safe: unaffected keys
     /// simply re-promote from L2 on next get. The common deploy case
     /// (invalidate `/assets/...`) is well served.
+    /// Drop every entry for `path` (RFC 9111 §4.4): the URI itself, every query
+    /// variant of it, and each `Accept-Encoding` / `Vary` variant — but not a longer
+    /// path that merely starts the same (`/a` does not touch `/ab` or `/a/b`). One scan
+    /// and one generation bump, however many keys go. Returns the entries removed.
+    pub fn invalidate_path(&self, path: &str) -> usize {
+        let exact = format!("{path}\u{1f}");
+        let with_query = format!("{path}?");
+        let hit = |k: &str| k.starts_with(&exact) || k.starts_with(&with_query);
+        self.vary.remove_prefix(&exact);
+        self.vary.remove_prefix(&with_query);
+        let mut removed = 0;
+        if let Some(l2) = &self.l2 {
+            l2.retain(|k, _| {
+                let drop = hit(k);
+                removed += usize::from(drop);
+                !drop
+            });
+        } else {
+            LOCAL_L2.with(|m| {
+                m.borrow_mut().retain(|k, _| {
+                    let drop = hit(k);
+                    removed += usize::from(drop);
+                    !drop
+                });
+            });
+        }
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        removed
+    }
+
     pub fn purge_prefix(&self, prefix: &str) -> usize {
         self.vary.remove_prefix(prefix);
         let mut removed = 0;
@@ -656,6 +687,72 @@ impl StaticCache {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalidate_path_removes_the_path_its_queries_and_variants_only() {
+        let cache = StaticCache::new();
+        let put = |k: &str| {
+            cache.insert(
+                k,
+                Bytes::from_static(b"x"),
+                default_meta(),
+                3600,
+                0,
+                100_000,
+            )
+        };
+        for k in [
+            "/a\u{1f}",
+            "/a\u{1f}gzip",
+            "/a?x=1\u{1f}",
+            "/a?x=2\u{1f}gzip",
+            "/a\u{1f}\u{1e}accept=de\u{1f}",
+            "/ab\u{1f}",
+            "/a/b\u{1f}",
+            "/b\u{1f}",
+        ] {
+            put(k);
+        }
+        assert_eq!(cache.invalidate_path("/a"), 5);
+        for gone in [
+            "/a\u{1f}",
+            "/a\u{1f}gzip",
+            "/a?x=1\u{1f}",
+            "/a?x=2\u{1f}gzip",
+        ] {
+            assert!(matches!(cache.get(gone), CacheLookup::Miss), "{gone}");
+        }
+        for kept in ["/ab\u{1f}", "/a/b\u{1f}", "/b\u{1f}"] {
+            assert!(cache.get(kept).fresh().is_some(), "{kept} must survive");
+        }
+    }
+
+    /// One invalidation over a full default-sized cache stays cheap.
+    #[test]
+    fn invalidate_path_cost_with_a_full_cache() {
+        let cache = StaticCache::new();
+        for i in 0..10_000 {
+            cache.insert(
+                &format!("/p/{i}\u{1f}"),
+                Bytes::from_static(b"x"),
+                default_meta(),
+                3600,
+                0,
+                100_000,
+            );
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            cache.invalidate_path("/nothing-here");
+        }
+        let per_call = t.elapsed() / 100;
+        // ~10 µs measured; the bound only guards against an accidental O(n²)
+        assert!(
+            per_call < std::time::Duration::from_millis(50),
+            "{per_call:?} per call"
+        );
+        assert_eq!(cache.len(), 10_000);
+    }
+
     use super::*;
 
     fn default_meta() -> CachedMeta {
