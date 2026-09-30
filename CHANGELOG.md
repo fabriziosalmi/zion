@@ -4,6 +4,40 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Security
+
+⚠️ **Behaviour change (stricter startup).** With `[audit] enabled = true`, Zion now
+**refuses to start** when the HMAC key variable is unset/empty, when the key is
+under 32 bytes, or when `path` is missing. Previously it logged a warning and ran
+with the audit log silently disabled (a typo in `key_env`, or a missing secret
+mount, removed the tamper-evident trail with no signal). `spawn_writer` in the
+library now returns a `Result`. Fix the key (or set `enabled = false`) before
+upgrading.
+
+- **Audit log shutdown drain.** The writer is now stopped explicitly after the
+  connection drain: it writes everything still queued, flushes and fsyncs, and
+  Zion waits up to 5s. Before, a SIGTERM with a backlog (up to `queue_depth`
+  events) dropped the runtime and lost the newest events.
+- **Audit writer liveness.** New `zion_audit_enabled`, `zion_audit_writer_up`,
+  `zion_audit_write_failures_total` and `zion_audit_last_write_timestamp_seconds`.
+  A writer that died on a disk-full error is now distinguishable from a full
+  queue (the drop counter alone could not tell them apart), and is logged once.
+- **Audit key identity and rotation.** New `[audit] key_id` (default: a derived
+  fingerprint) is written into every chain marker, and `previous_key_env` lets the
+  writer verify the tail of a segment signed with the outgoing key across a
+  rotation. Documented rotation procedure in the observability guide.
+- **JWT:** `aud` may be an array (such tokens were rejected because the claim only
+  deserialized as a string). New `leeway_secs` (default 30, max 300) and
+  `max_token_lifetime_secs` (reject tokens whose `exp` is too far out; there is
+  still no revocation list). A literal `secret` is deprecated (boot warning) and
+  is now redacted from `Debug` output.
+- **Secrets are wiped on drop** (audit HMAC key, JWT secrets, mesh identity seed)
+  via the `zeroize` crate, already in the dependency graph. The mesh identity seed
+  is now checked on load: a seed readable by group/other is tightened to `0600`
+  (or, if that fails, replaced), with a warning. The systemd unit sets
+  `LimitCORE=0`. Not covered: copies inside `hmac::Key` / `jsonwebtoken`, and the
+  process environment itself.
+
 ### Fixed
 
 - **Audit log: bounded power-loss window.** Records were only flushed to the OS

@@ -61,7 +61,11 @@ Six reliability counters are exposed alongside the existing ones:
 |---|---|
 | `zion_panics_total` | Worker panics caught by the panic hook. |
 | `zion_audit_events_total` | Audit-log events emitted (signed + chained). |
-| `zion_audit_events_dropped_total` | Audit events dropped because the writer queue was full. Non-zero values mean either the disk is slow or `audit.queue_depth` is too small. |
+| `zion_audit_events_dropped_total` | Audit events dropped: the queue was full (slow disk or `audit.queue_depth` too small) **or** the writer has exited. Use `zion_audit_writer_up` to tell them apart. |
+| `zion_audit_write_failures_total` | Write, flush or fsync errors on the audit log. Non-zero means records are at risk. |
+| `zion_audit_enabled` (gauge) | `1` when `[audit] enabled = true` started a writer. |
+| `zion_audit_writer_up` (gauge) | `1` while the writer task is running, `0` once it has exited (disk full, fd revoked, reopen failure). Alert on `zion_audit_enabled == 1 and zion_audit_writer_up == 0`. |
+| `zion_audit_last_write_timestamp_seconds` (gauge) | Unix time of the last record flushed successfully. |
 | `zion_traces_emitted_total` | Request spans observed (one per request). |
 | `zion_traces_invalid_total` | Inbound `traceparent` headers rejected as malformed. |
 | `zion_admin_rejects_total` | Admin-API requests rejected (auth or rate-limit) at `[admin]`. |
@@ -205,13 +209,30 @@ queue_depth = 4096                # bounded mpsc — events overflow ⇒ dropped
 max_size_mb = 100                 # rotate the active segment at this size; null/0 ⇒ unbounded
 max_files   = 10                  # rotated segments to keep (oldest pruned first); 0 ⇒ keep all
 sync_interval_ms = 1000           # fsync the active segment this often; 0 ⇒ page cache only
+# key_id = "2026-10"              # label for the HMAC key, written into every chain marker
+# previous_key_env = "ZION_AUDIT_HMAC_KEY_PREV"   # outgoing key during a rotation (never signs)
 
 [redact]
 headers      = ["authorization", "cookie", "x-api-key"]
 query_params = ["token", "api_key", "session"]
 ```
 
-The HMAC key is taken from the named environment variable. RFC 2104 recommends ≥ 32 bytes for HMAC-SHA256; shorter keys are accepted but Zion logs a warning at boot.
+The HMAC key is taken from the named environment variable and must be **at least 32 bytes** (the SHA-256 output size). With `enabled = true`, a missing `path`, an unset or empty key variable, or a key under 32 bytes makes Zion **refuse to start**: a typo in `key_env` or a missing secret mount must not silently remove the tamper-evident trail you asked for. (`enabled = false`, the default, never reads the variable.)
+
+On `SIGTERM` the writer is stopped after the connections have drained: it writes everything still queued, flushes and `fsync`s, and Zion waits up to 5 seconds for it. If that takes longer the daemon logs `audit writer did not finish within 5s`.
+
+### Key rotation
+
+Each chain begins with a `chain_init` / `chain_rotate` marker whose signed `detail` carries `key_id=<label>`. Set `[audit] key_id` to a label of your choosing (`[A-Za-z0-9._-]`, up to 64 characters); if you don't, Zion derives a 16-hex fingerprint from the key, which identifies it without revealing it. A verifier reads the marker to learn which key signed the records that follow.
+
+To rotate without losing the ability to verify history:
+
+1. Keep the outgoing key available to whoever verifies the log, filed under its `key_id`.
+2. Put the new key in the environment variable named by `key_env`, set a new `key_id`, and set `previous_key_env` to a variable holding the outgoing key. Restart.
+3. The first marker after the restart records `prev_head=…; prev_seq=…; prev_key=previous` when the tail of the existing segment verified under the outgoing key, so continuity across the rotation is checkable. Without `previous_key_env` it reads `prev_head=unverified`.
+4. Once the old segments are archived, drop `previous_key_env`.
+
+The previous key is only ever used to check the tail; it never signs anything. Verifying old segments is done with the old key, chosen by the `key_id` in each chain's marker.
 
 ### Durability
 

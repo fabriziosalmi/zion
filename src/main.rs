@@ -353,6 +353,19 @@ fn run() -> error::ZionResult<()> {
 /// geo) already hard-fail at parse via `deny_unknown_fields`, so they need no
 /// warning here — only the parse-clean-but-inert ones do.
 fn warn_feature_config_gaps(config: &config::ZionConfig) {
+    // A literal JWT HMAC secret in zion.toml is deprecated in favour of
+    // `secret_env` (the key ends up in version control / config management).
+    for (name, profile) in &config.auth_profile {
+        if profile.secret.is_some() && profile.secret_env.is_none() {
+            logging::warn(
+                "config",
+                &format!(
+                    "auth_profile '{name}' uses a literal `secret` in zion.toml — deprecated; \
+                     move the key to an environment variable and set `secret_env` instead."
+                ),
+            );
+        }
+    }
     #[cfg(not(feature = "auth"))]
     {
         let uses_auth = !config.auth_profile.is_empty()
@@ -538,7 +551,11 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     // spawned now; its handle clones into AppState. Both are cheap to
     // clone — `AuditHandle` wraps an `mpsc::Sender`, `CompiledRedaction`
     // is two small `Vec<String>`.
-    let audit_handle = audit::spawn_writer(&config.audit);
+    // A missing/short HMAC key or missing path with `[audit] enabled = true` is a
+    // boot error, not a silent downgrade: the operator asked for a tamper-evident
+    // trail. `audit_writer` is kept to drain the queue on shutdown.
+    let (audit_handle, audit_writer) =
+        audit::spawn_writer(&config.audit).map_err(error::ZionError::Config)?;
     let compiled_redact = Arc::new(config.redact.compile());
 
     // Optionally bootstrap the AIMP serverless control plane. When
@@ -1164,6 +1181,20 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                     drain_timeout.as_secs(),
                     remaining
                 ),
+            );
+        }
+    }
+
+    // Flush the audit queue last, after connections stopped producing events. The
+    // queue holds up to `queue_depth` events; dropping the runtime without this
+    // would abort the writer before it drained them.
+    if let Some(writer) = audit_writer {
+        if writer.shutdown(std::time::Duration::from_secs(5)).await {
+            logging::info("shutdown", "audit log drained and synced");
+        } else {
+            logging::warn(
+                "shutdown",
+                "audit writer did not finish within 5s — the newest audit events may be missing",
             );
         }
     }

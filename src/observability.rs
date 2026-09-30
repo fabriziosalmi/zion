@@ -33,6 +33,17 @@ use tracing_subscriber::EnvFilter;
 pub static PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static AUDIT_EVENTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static AUDIT_EVENTS_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Write, flush or fsync errors on the audit log. Bumped before the writer gives
+/// up, so a dying writer is visible as more than a rising drop count.
+pub static AUDIT_WRITE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// 1 once `[audit] enabled = true` booted a writer, else 0. Alert on
+/// `zion_audit_enabled == 1 and zion_audit_writer_up == 0`.
+pub static AUDIT_ENABLED: AtomicU64 = AtomicU64::new(0);
+/// 1 while the writer task is running, 0 once it has exited (write failure,
+/// reopen failure after rotation, or shutdown).
+pub static AUDIT_WRITER_UP: AtomicU64 = AtomicU64::new(0);
+/// Unix time (seconds) of the last record the writer flushed successfully.
+pub static AUDIT_LAST_WRITE_TIMESTAMP_SECONDS: AtomicU64 = AtomicU64::new(0);
 pub static TRACES_EMITTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static TRACES_INVALID_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static ADMIN_REJECTS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -58,6 +69,11 @@ pub fn render_counters(out: &mut bytes::BytesMut) {
             AUDIT_EVENTS_DROPPED_TOTAL.load(Ordering::Relaxed),
         ),
         (
+            "zion_audit_write_failures_total",
+            "Audit log write/flush/fsync errors. Non-zero means records are at risk; with zion_audit_writer_up == 0 the audit trail has stopped.",
+            AUDIT_WRITE_FAILURES_TOTAL.load(Ordering::Relaxed),
+        ),
+        (
             "zion_traces_emitted_total",
             "Total request spans emitted (one per request).",
             TRACES_EMITTED_TOTAL.load(Ordering::Relaxed),
@@ -80,6 +96,36 @@ pub fn render_counters(out: &mut bytes::BytesMut) {
         out.extend_from_slice(b"\n# TYPE ");
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(b" counter\n");
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b" ");
+        out.extend_from_slice(buf.format(val).as_bytes());
+        out.extend_from_slice(b"\n");
+    }
+    // Audit-writer liveness gauges (ZION-OBS-01).
+    for (name, help, val) in [
+        (
+            "zion_audit_enabled",
+            "1 when [audit] enabled=true booted a writer, else 0.",
+            AUDIT_ENABLED.load(Ordering::Relaxed),
+        ),
+        (
+            "zion_audit_writer_up",
+            "1 while the audit writer task is running, 0 once it has exited. Alert on zion_audit_enabled == 1 and zion_audit_writer_up == 0.",
+            AUDIT_WRITER_UP.load(Ordering::Relaxed),
+        ),
+        (
+            "zion_audit_last_write_timestamp_seconds",
+            "Unix time of the last audit record flushed successfully (0 before the first).",
+            AUDIT_LAST_WRITE_TIMESTAMP_SECONDS.load(Ordering::Relaxed),
+        ),
+    ] {
+        out.extend_from_slice(b"# HELP ");
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b" ");
+        out.extend_from_slice(help.as_bytes());
+        out.extend_from_slice(b"\n# TYPE ");
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b" gauge\n");
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(b" ");
         out.extend_from_slice(buf.format(val).as_bytes());
@@ -579,6 +625,11 @@ mod tests {
         assert!(text.contains("zion_panics_total 7"));
         assert!(text.contains("zion_audit_events_total 13"));
         assert!(text.contains("zion_audit_events_dropped_total"));
+        // ZION-OBS-01: explicit writer liveness, not only a rising drop counter.
+        assert!(text.contains("# TYPE zion_audit_writer_up gauge"));
+        assert!(text.contains("# TYPE zion_audit_enabled gauge"));
+        assert!(text.contains("# TYPE zion_audit_write_failures_total counter"));
+        assert!(text.contains("# TYPE zion_audit_last_write_timestamp_seconds gauge"));
         assert!(text.contains("zion_traces_emitted_total"));
         assert!(text.contains("zion_traces_invalid_total"));
     }

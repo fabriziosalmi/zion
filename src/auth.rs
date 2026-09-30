@@ -30,12 +30,64 @@ pub struct Claims {
     pub email: Option<String>,
     /// Issuer
     pub iss: Option<String>,
-    /// Audience (can be string or array — we accept string here)
-    pub aud: Option<String>,
+    /// Audience: RFC 7519 §4.1.3 allows a single string or an array of strings, and
+    /// OIDC providers commonly send an array. (Matching against the profile's
+    /// `audience` is done by `jsonwebtoken` on the raw claims; this field only has
+    /// to deserialize whatever shape the token carries.)
+    pub aud: Option<Audience>,
     /// Expiration (Unix timestamp)
     pub exp: Option<u64>,
     /// Not before (Unix timestamp)
     pub nbf: Option<u64>,
+}
+
+/// The `aud` claim: one audience or several.
+#[allow(dead_code)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Audience {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl From<&str> for Audience {
+    fn from(s: &str) -> Self {
+        Audience::One(s.to_string())
+    }
+}
+
+/// A secret string. It never appears in `Debug` output (so a stray `{:?}` of a
+/// config struct cannot write a signing key to a log or panic message) and its
+/// bytes are wiped when the value is dropped. Deserializes from a plain string.
+#[allow(dead_code)]
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+#[allow(dead_code)]
+impl Secret {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(s: &str) -> Self {
+        Secret(s.to_string())
+    }
 }
 
 /// Auth profile configuration (from TOML).
@@ -56,11 +108,13 @@ pub struct AuthProfileConfig {
     pub audience: Option<String>,
     /// HMAC secret for symmetric validation (base64 or raw string).
     ///
-    /// Prefer `secret_env` over this: a literal here puts a live signing key in
+    /// **Deprecated: use `secret_env`.** A literal here puts a live signing key in
     /// zion.toml, which tends to land in version control / config management in
-    /// plaintext, and anyone who reads the file can forge valid tokens.
+    /// plaintext, and anyone who reads the file can forge valid tokens. Zion
+    /// warns at boot when it is used. The value is redacted from `Debug` output
+    /// and wiped from memory when the config is dropped.
     #[serde(default)]
-    pub secret: Option<String>,
+    pub secret: Option<Secret>,
     /// Name of an environment variable holding the HMAC secret. Preferred over
     /// the literal `secret` — it keeps the signing key out of the config file,
     /// mirroring `[audit] key_env`. When both are set, `secret_env` wins.
@@ -75,7 +129,25 @@ pub struct AuthProfileConfig {
     /// Forward decoded claims as X-Auth-Subject, X-Auth-Email headers.
     #[serde(default = "default_true")]
     pub forward_claims: bool,
+    /// Clock-skew tolerance, in seconds, applied to `exp` and `nbf`. Default 30.
+    /// Zero is allowed; above 300 is rejected (a large leeway silently extends
+    /// every token's life).
+    #[serde(default = "default_leeway_secs")]
+    pub leeway_secs: u64,
+    /// Upper bound, in seconds, on how far in the future a token's `exp` may be.
+    /// Tokens that outlive it are rejected even though they are otherwise valid.
+    /// Zion has no revocation list, so this is the lever that bounds how long a
+    /// stolen or de-provisioned user's token keeps working: set it to the longest
+    /// token lifetime you actually issue (e.g. 900). Unset = no cap.
+    #[serde(default)]
+    pub max_token_lifetime_secs: Option<u64>,
 }
+
+fn default_leeway_secs() -> u64 {
+    30
+}
+#[cfg(feature = "auth")]
+const MAX_LEEWAY_SECS: u64 = 300;
 
 fn default_algorithm() -> String {
     "HS256".to_string()
@@ -93,6 +165,9 @@ pub struct ResolvedAuthProfile {
     pub jwk_set: Arc<arc_swap::ArcSwapOption<jsonwebtoken::jwk::JwkSet>>,
     pub validation: Arc<Validation>,
     pub forward_claims: bool,
+    /// See [`AuthProfileConfig::max_token_lifetime_secs`].
+    pub max_token_lifetime_secs: Option<u64>,
+    pub leeway_secs: u64,
 }
 
 #[cfg(feature = "auth")]
@@ -180,6 +255,22 @@ pub fn validate_token(token: &str, profile: &ResolvedAuthProfile) -> Result<Clai
             }
         })?;
 
+    // Bound how long a token can be valid for. There is no revocation list, so
+    // without this a token with a far-future `exp` (or a stolen one) stays valid
+    // until it expires.
+    if let Some(max) = profile.max_token_lifetime_secs {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let latest_allowed = now.saturating_add(max).saturating_add(profile.leeway_secs);
+        if token_data.claims.exp.unwrap_or(u64::MAX) > latest_allowed {
+            return Err(AuthError::InvalidToken(format!(
+                "token lifetime exceeds this profile's max_token_lifetime_secs ({max}s)"
+            )));
+        }
+    }
+
     Ok(token_data.claims)
 }
 
@@ -197,19 +288,29 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthPr
     // or empty env var is a hard error — failing closed beats silently falling
     // back to no symmetric key (which would then error as "neither configured"
     // and mask the operator's real mistake).
-    let effective_secret: Option<String> = if let Some(ref env_name) = config.secret_env {
-        match std::env::var(env_name) {
-            Ok(v) if !v.is_empty() => Some(v),
-            Ok(_) => return Err(format!("auth secret_env '{env_name}' is set but empty")),
-            Err(_) => {
-                return Err(format!(
-                    "auth secret_env '{env_name}' is not set in the environment"
-                ))
+    if config.leeway_secs > MAX_LEEWAY_SECS {
+        return Err(format!(
+            "auth leeway_secs = {} is too large (max {MAX_LEEWAY_SECS}): it silently extends every token's lifetime",
+            config.leeway_secs
+        ));
+    }
+    let effective_secret: Option<zeroize::Zeroizing<String>> =
+        if let Some(ref env_name) = config.secret_env {
+            match std::env::var(env_name) {
+                Ok(v) if !v.is_empty() => Some(zeroize::Zeroizing::new(v)),
+                Ok(_) => return Err(format!("auth secret_env '{env_name}' is set but empty")),
+                Err(_) => {
+                    return Err(format!(
+                        "auth secret_env '{env_name}' is not set in the environment"
+                    ))
+                }
             }
-        }
-    } else {
-        config.secret.clone()
-    };
+        } else {
+            config
+                .secret
+                .as_ref()
+                .map(|s| zeroize::Zeroizing::new(s.expose().to_string()))
+        };
 
     let mut alg_str = config.algorithm.clone();
     if alg_str == "HS256" && config.jwks_url.is_some() && effective_secret.is_none() {
@@ -322,8 +423,8 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthPr
         validation.set_audience(&[aud]);
     }
 
-    // Allow 30s clock skew for distributed systems
-    validation.leeway = 30;
+    // Clock-skew tolerance for distributed systems (default 30s, capped above).
+    validation.leeway = config.leeway_secs;
 
     Ok(ResolvedAuthProfile {
         jwks_url: config.jwks_url.clone(),
@@ -331,6 +432,8 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthPr
         jwk_set: jwk_set_arc,
         validation: Arc::new(validation),
         forward_claims: config.forward_claims,
+        max_token_lifetime_secs: config.max_token_lifetime_secs,
+        leeway_secs: config.leeway_secs,
     })
 }
 
@@ -371,7 +474,7 @@ mod tests {
             sub: Some("user-123".to_string()),
             email: Some("test@zion.dev".to_string()),
             iss: Some("zion-test".to_string()),
-            aud: Some("api.zion.dev".to_string()),
+            aud: Some("api.zion.dev".into()),
             exp: Some(u64::MAX), // far future
             nbf: Some(0),
         };
@@ -386,11 +489,13 @@ mod tests {
         let config = AuthProfileConfig {
             issuer: Some("zion-test".to_string()),
             audience: Some("api.zion.dev".to_string()),
-            secret: Some(secret.to_string()),
+            secret: Some(secret.into()),
             secret_env: None,
             jwks_url: None,
             algorithm: "HS256".to_string(),
             forward_claims: true,
+            leeway_secs: 30,
+            max_token_lifetime_secs: None,
         };
 
         let profile = resolve_auth_profile(&config).expect("valid test profile");
@@ -425,11 +530,13 @@ mod tests {
         let config = AuthProfileConfig {
             issuer: None,
             audience: None,
-            secret: Some("secret-b".to_string()), // wrong secret
+            secret: Some("secret-b".into()), // wrong secret
             secret_env: None,
             jwks_url: None,
             algorithm: "HS256".to_string(),
             forward_claims: true,
+            leeway_secs: 30,
+            max_token_lifetime_secs: None,
         };
 
         let profile = resolve_auth_profile(&config).expect("valid test profile");
@@ -461,11 +568,13 @@ mod tests {
         let config = AuthProfileConfig {
             issuer: None,
             audience: None,
-            secret: Some("secret".to_string()),
+            secret: Some("secret".into()),
             secret_env: None,
             jwks_url: None,
             algorithm: "HS256".to_string(),
             forward_claims: true,
+            leeway_secs: 30,
+            max_token_lifetime_secs: None,
         };
 
         let profile = resolve_auth_profile(&config).expect("valid test profile");
@@ -501,11 +610,13 @@ mod tests {
         let config = AuthProfileConfig {
             issuer: None,
             audience: None,
-            secret: Some("decoy-literal-that-must-be-ignored".to_string()),
+            secret: Some("decoy-literal-that-must-be-ignored".into()),
             secret_env: Some(var.clone()),
             jwks_url: None,
             algorithm: "HS256".to_string(),
             forward_claims: true,
+            leeway_secs: 30,
+            max_token_lifetime_secs: None,
         };
         let profile = resolve_auth_profile(&config).expect("secret_env resolves");
         assert!(
@@ -523,10 +634,138 @@ mod tests {
             jwks_url: None,
             algorithm: "HS256".to_string(),
             forward_claims: true,
+            leeway_secs: 30,
+            max_token_lifetime_secs: None,
         };
         assert!(
             resolve_auth_profile(&missing).is_err(),
             "missing secret_env must fail closed"
         );
+    }
+
+    // ── ZION-AUTH-04/05, SEC-05/06 ─────────────────────────────────────────
+
+    #[cfg(feature = "auth")]
+    fn hmac_cfg(audience: Option<&str>, leeway: u64, cap: Option<u64>) -> AuthProfileConfig {
+        AuthProfileConfig {
+            issuer: None,
+            audience: audience.map(str::to_string),
+            secret: Some("unit-test-secret".into()),
+            secret_env: None,
+            jwks_url: None,
+            algorithm: "HS256".to_string(),
+            forward_claims: true,
+            leeway_secs: leeway,
+            max_token_lifetime_secs: cap,
+        }
+    }
+
+    #[cfg(feature = "auth")]
+    fn token_with(exp: u64, aud: Option<Audience>) -> String {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        let claims = Claims {
+            sub: Some("u".into()),
+            email: None,
+            iss: None,
+            aud,
+            exp: Some(exp),
+            nbf: Some(0),
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"unit-test-secret"),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "auth")]
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[cfg(feature = "auth")]
+    #[test]
+    fn array_audience_is_accepted_when_it_contains_the_configured_one() {
+        // OIDC providers commonly emit `aud` as an array; that used to fail to
+        // deserialize and the token was rejected outright.
+        let p = resolve_auth_profile(&hmac_cfg(Some("api.zion.dev"), 30, None)).unwrap();
+        let ok = token_with(
+            u64::MAX,
+            Some(Audience::Many(vec!["other".into(), "api.zion.dev".into()])),
+        );
+        assert!(
+            validate_token(&ok, &p).is_ok(),
+            "array containing our audience"
+        );
+        // ...and audience scoping still works: an array without it is refused.
+        let bad = token_with(u64::MAX, Some(Audience::Many(vec!["other".into()])));
+        assert!(
+            validate_token(&bad, &p).is_err(),
+            "array without our audience"
+        );
+        // the single-string form is unchanged
+        let one = token_with(u64::MAX, Some("api.zion.dev".into()));
+        assert!(validate_token(&one, &p).is_ok());
+    }
+
+    #[cfg(feature = "auth")]
+    #[test]
+    fn max_token_lifetime_rejects_tokens_that_outlive_the_policy() {
+        let capped = resolve_auth_profile(&hmac_cfg(None, 30, Some(900))).unwrap();
+        let short = token_with(now() + 600, None);
+        let long = token_with(now() + 86_400, None);
+        let forever = token_with(u64::MAX, None);
+        assert!(validate_token(&short, &capped).is_ok(), "within the cap");
+        for t in [&long, &forever] {
+            let e = validate_token(t, &capped).unwrap_err();
+            assert!(
+                matches!(&e, AuthError::InvalidToken(m) if m.contains("max_token_lifetime_secs")),
+                "{e:?}"
+            );
+        }
+        // no cap configured: unchanged behaviour
+        let open = resolve_auth_profile(&hmac_cfg(None, 30, None)).unwrap();
+        assert!(validate_token(&forever, &open).is_ok());
+    }
+
+    #[cfg(feature = "auth")]
+    #[test]
+    fn leeway_is_configurable_and_bounded() {
+        let just_expired = token_with(now() - 10, None);
+        let strict = resolve_auth_profile(&hmac_cfg(None, 0, None)).unwrap();
+        assert!(matches!(
+            validate_token(&just_expired, &strict),
+            Err(AuthError::Expired)
+        ));
+        let lenient = resolve_auth_profile(&hmac_cfg(None, 30, None)).unwrap();
+        assert!(validate_token(&just_expired, &lenient).is_ok());
+        assert!(
+            resolve_auth_profile(&hmac_cfg(None, 301, None)).is_err(),
+            "an oversized leeway must be refused, not silently extend token lifetimes"
+        );
+    }
+
+    #[test]
+    fn literal_secret_is_redacted_from_debug_and_parses_from_toml() {
+        let cfg: AuthProfileConfig =
+            toml::from_str("secret = \"super-secret-signing-key\"\naudience = \"a\"").unwrap();
+        assert_eq!(
+            cfg.secret.as_ref().unwrap().expose(),
+            "super-secret-signing-key"
+        );
+        assert_eq!(cfg.leeway_secs, 30, "default leeway");
+        assert_eq!(cfg.max_token_lifetime_secs, None);
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("super-secret-signing-key"),
+            "secret leaked into Debug: {dbg}"
+        );
+        assert!(dbg.contains("<redacted>"));
+        // the bare wrapper too
+        assert_eq!(format!("{:?}", Secret::from("x")), "Secret(<redacted>)");
     }
 }

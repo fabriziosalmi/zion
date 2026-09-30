@@ -36,7 +36,7 @@ async fn audit_queue_overflow_drops_excess_events() {
         queue_depth: 4,
         ..Default::default()
     };
-    let h = spawn_writer(&cfg);
+    let (h, _writer) = spawn_writer(&cfg).expect("audit writer must start");
 
     // Hammer the writer with way more events than the queue can hold,
     // synchronously and as fast as `try_send` allows. Some MUST be
@@ -107,7 +107,7 @@ async fn audit_writer_survives_burst_then_drains() {
         queue_depth: 64,
         ..Default::default()
     };
-    let h = spawn_writer(&cfg);
+    let (h, _writer) = spawn_writer(&cfg).expect("audit writer must start");
 
     // Burst within capacity — nothing should drop.
     for i in 0..32 {

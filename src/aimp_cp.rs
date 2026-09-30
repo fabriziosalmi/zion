@@ -877,13 +877,16 @@ async fn run_anti_entropy(
 /// non-root user that doesn't own that directory — there the operator
 /// is expected to point `identity_path` at a path the service can write.
 fn load_or_generate_identity(path: &std::path::Path) -> Result<Identity, String> {
-    // Try to load an existing seed.
-    if path.exists() {
-        match std::fs::read(path) {
+    // Try to load an existing seed — but only one whose permissions we can vouch
+    // for. A seed restored from a backup or created by another tool is often
+    // 0644, which would expose the node's Ed25519 identity to every local user.
+    if path.exists() && seed_permissions_ok(path) {
+        // Wipe our copies of the key material once the identity is built.
+        match std::fs::read(path).map(zeroize::Zeroizing::new) {
             Ok(bytes) if bytes.len() == 32 => {
-                let mut seed = [0u8; 32];
+                let mut seed = zeroize::Zeroizing::new([0u8; 32]);
                 seed.copy_from_slice(&bytes);
-                return Ok(Identity::from_secret_bytes(seed));
+                return Ok(Identity::from_secret_bytes(*seed));
             }
             Ok(other) => {
                 eprintln!(
@@ -903,7 +906,7 @@ fn load_or_generate_identity(path: &std::path::Path) -> Result<Identity, String>
 
     // Generate fresh and try to persist.
     let identity = Identity::new();
-    let secret = identity.secret_bytes();
+    let secret = zeroize::Zeroizing::new(identity.secret_bytes());
 
     // Atomic write, created 0600 up front with the error PROPAGATED (not the old
     // create-then-chmod-then-swallow, which could rename a world-readable seed if
@@ -919,6 +922,47 @@ fn load_or_generate_identity(path: &std::path::Path) -> Result<Identity, String>
     Ok(identity)
 }
 
+/// Refuse to use a mesh identity seed that group/other can read. On Unix, a seed
+/// with any `0o077` bit set is tightened to `0600` in place; if that is not
+/// possible the seed is treated as unusable (the caller then generates a fresh
+/// identity and persists it `0600` via an atomic rewrite). The seed may already
+/// have been readable by other local users, so the operator is told to consider
+/// the identity exposed. Non-Unix: no mode bits to check.
+fn seed_permissions_ok(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(md) = std::fs::metadata(path) else {
+            return true; // unreadable is handled by the caller's read()
+        };
+        let mode = md.permissions().mode() & 0o777;
+        if mode & 0o077 == 0 {
+            return true;
+        }
+        match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => {
+                eprintln!(
+                    "aimp_cp: warn: identity_path {} had mode {mode:04o} (readable by group/other) — tightened to 0600. Other local users may have read the seed: delete the file to rotate this node's identity if that matters",
+                    path.display()
+                );
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "aimp_cp: warn: identity_path {} has mode {mode:04o} and cannot be tightened ({e}) — not using it; generating a new identity",
+                    path.display()
+                );
+                false
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -929,6 +973,31 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Seed permissions (ZION-SEC-03) ────────────────────────────────────
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_identity_seed_is_tightened_not_used_as_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("zion-seed-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aimp-identity.bin");
+        let seed = [7u8; 32];
+        std::fs::write(&path, seed).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let id = load_or_generate_identity(&path).unwrap();
+        // still the same identity (restoring from backup must not rotate it)...
+        assert_eq!(id.secret_bytes().as_ref(), &seed[..]);
+        // ...but the file is no longer readable by group/other
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // an already-private seed is left alone
+        let id2 = load_or_generate_identity(&path).unwrap();
+        assert_eq!(id2.secret_bytes().as_ref(), &seed[..]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     // ── Reputation-table bounding (issue #287) ───────────────────────────
     fn mk_rep(ts_secs: u64) -> WafReputation {
