@@ -45,7 +45,7 @@ fn dir_of(path: &Path) -> &Path {
 /// Write `bytes` to a fresh `0o600` temp sibling of `dest`, `fsync` it, and
 /// return the temp path — staged but NOT yet visible at `dest`. Call
 /// [`commit`] to atomically move it into place, or drop it to abandon.
-fn stage(dest: &Path, bytes: &[u8], tag: &str) -> Result<PathBuf, String> {
+fn stage(dest: &Path, bytes: &[u8], tag: &str, mode: u32) -> Result<PathBuf, String> {
     if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -56,14 +56,23 @@ fn stage(dest: &Path, bytes: &[u8], tag: &str) -> Result<PathBuf, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600); // created 0o600 — never wider, even in transit
+        opts.mode(mode); // secrets pass 0o600 — never wider, even in transit
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     let mut f = opts
         .open(&tmp)
         .map_err(|e| format!("cannot create temp file '{}': {e}", tmp.display()))?;
 
     let write = (|| -> std::io::Result<()> {
         f.write_all(bytes)?;
+        // `mode` above is masked by the umask at creation; set it explicitly so
+        // a config file keeps exactly the mode we were asked for.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
         f.sync_all()?; // fsync the data before it can be renamed over a live file
         Ok(())
     })();
@@ -101,9 +110,37 @@ fn fsync_dir(_dir: &Path) {}
 /// Atomically write `bytes` to `path`, owner-only (`0o600`). All-or-nothing: on
 /// any error `path` is left untouched.
 pub fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = stage(path, bytes, "s")?;
+    let tmp = stage(path, bytes, "s", 0o600)?;
     commit(&tmp, path)?;
     fsync_dir(dir_of(path));
+    Ok(())
+}
+
+/// Atomically replace a non-secret config file (`zion.toml`): temp sibling,
+/// `fsync`, `rename`, directory `fsync`. All-or-nothing — a kill or `ENOSPC`
+/// mid-write leaves the previous file intact instead of a truncated one that the
+/// hot-reload watcher (or the next boot) would read.
+///
+/// Unlike [`write_atomic_0600`] this is for files that are meant to be readable:
+///   * an existing destination keeps its permission bits (a `0640` config stays
+///     `0640`); a new file is `0644`;
+///   * a symlinked destination is written *through* (the link survives, its
+///     target is replaced) rather than being swapped for a regular file.
+pub fn write_atomic_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    // Write through a symlink to the real file; a missing path is used as-is.
+    let dest = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(&dest)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(0o644)
+    };
+    #[cfg(not(unix))]
+    let mode = 0o644;
+    let tmp = stage(&dest, bytes, "c", mode)?;
+    commit(&tmp, &dest)?;
+    fsync_dir(dir_of(&dest));
     Ok(())
 }
 
@@ -121,8 +158,8 @@ pub fn write_cert_key_atomic(
     cert_path: &Path,
     cert_bytes: &[u8],
 ) -> Result<(), String> {
-    let key_tmp = stage(key_path, key_bytes, "key")?;
-    let cert_tmp = match stage(cert_path, cert_bytes, "cert") {
+    let key_tmp = stage(key_path, key_bytes, "key", 0o600)?;
+    let cert_tmp = match stage(cert_path, cert_bytes, "cert", 0o600) {
         Ok(t) => t,
         Err(e) => {
             let _ = std::fs::remove_file(&key_tmp);
@@ -165,6 +202,69 @@ mod tests {
         write_atomic_0600(&p, b"secret").unwrap();
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "key file must be created owner-only");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_write_replaces_atomically_and_defaults_to_0644() {
+        let dir = std::env::temp_dir().join(format!("zion-atomic-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("zion.toml");
+        write_atomic_config(&p, b"old = 1\n").unwrap();
+        write_atomic_config(&p, b"new = 2\n").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"new = 2\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o644, "a new config is world-readable, not 0600");
+        }
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0, "no temp file may remain");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_write_preserves_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("zion-atomic-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("zion.toml");
+        std::fs::write(&p, b"a").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_atomic_config(&p, b"b").unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "an existing config keeps its permissions");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_write_goes_through_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("zion-atomic-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.toml");
+        let link = dir.join("zion.toml");
+        std::fs::write(&real, b"a").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_atomic_config(&link, b"b").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive"
+        );
+        assert_eq!(
+            std::fs::read(&real).unwrap(),
+            b"b",
+            "the target is replaced"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

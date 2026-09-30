@@ -42,6 +42,10 @@ Consequences of re-anchoring:
   one rotated file without holding the others.
 - **Full-history verification** concatenates the segments in timestamp order,
   exactly as it already concatenates across restarts.
+- A restart onto an existing segment records the verified head of the chain it
+  found in the signed marker (`prev_head=`), so removing the end of an earlier
+  chain after a restart is detectable. Sealing a segment `fsync`s it and the
+  directory, and the active segment is `fsync`ed every `sync_interval_ms`.
 - Cross-segment deletion is not self-detecting within a single segment's chain —
   but this is **no weaker than the pre-rotation guarantee**, which already reset
   per restart. Operators who need append-only durability across the whole history

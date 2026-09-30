@@ -4,6 +4,26 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Audit log: bounded power-loss window.** Records were only flushed to the OS
+  page cache, so a power loss or kernel crash could drop an unbounded tail with no
+  marker that anything was lost. The writer now `fsync`s the active segment every
+  `[audit] sync_interval_ms` (default 1000; `0` restores the old page-cache-only
+  behaviour), always `fsync`s a segment before sealing it at rotation, and
+  `fsync`s the directory after the rename.
+- **Audit log: restarts leave a checkable trail.** The `chain_init` marker written
+  at start now records the verified head of the chain already on disk
+  (`prev_head=<hmac>; prev_seq=<n>`, or `none` / `unverified`), so removing the end
+  of an earlier chain after a restart is detectable. The chain itself still
+  restarts at genesis (ADR-0017). A segment that ended mid-record no longer gets
+  the marker glued onto the fragment; the fragment is closed with a newline.
+- **`zion init` and `zion import -o` replace `zion.toml` atomically** (temp file,
+  fsync, rename) instead of truncating it in place, so a kill or `ENOSPC`
+  mid-write no longer leaves an empty or partial config where the daemon and its
+  hot-reload watcher read it. An existing file keeps its permissions and a
+  symlinked path is written through; a new file is `0644`.
+
 ### Changed
 
 - **Internal module boundaries (no behaviour change).** The crate root
