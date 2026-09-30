@@ -70,6 +70,11 @@ jobs:
         run: cargo build --release --locked --bin zion
       - name: Build bench backend (release)
         run: cargo build --release --manifest-path benchmarks/backend/Cargo.toml
+      # The verdict is a statistic over ~27 noisy samples. This checks, in seconds,
+      # that it passes real healthy runs and refuses an injected leak, so a change to
+      # the thresholds cannot silently make the gate flaky or blind.
+      - name: Verdict self-test
+        run: ./tests/stability-soak/analyze-selftest.sh
       - name: Soak (fast gate — gross-leak catch)
         env:
           NO_COLOR: "1"
