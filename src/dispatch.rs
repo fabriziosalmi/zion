@@ -31,8 +31,8 @@
 use crate::audit;
 use crate::audit::AuditEvent;
 use crate::http_util::{
-    empty_response, generate_request_id, inject_security_headers, method_not_allowed,
-    text_response, HEX_DIGITS, REQUEST_COUNTER,
+    empty_response, generate_request_id, inject_security_headers, text_response, HEX_DIGITS,
+    REQUEST_COUNTER,
 };
 use crate::proxy::ZionBody;
 use crate::state::AppState;
@@ -51,6 +51,8 @@ use crate::auth;
 
 use crate::routing::ResolvedRoute;
 use http_body_util::Limited;
+
+mod gates;
 
 /// Issue #151: turn an enforcement *deny* into a bounded held (tarpit)
 /// response when the operator enabled it, otherwise the plain immediate
@@ -272,60 +274,6 @@ async fn process_request_inner(
     // (Acquire load + Arc refcount bump).
     let cfg = state.cfg();
 
-    // ── Pre-routing security gates (zero-cost, before any processing) ──
-
-    // Scrub reserved identity headers off every inbound request. Zion owns
-    // `X-Auth-Subject` / `X-Auth-Email`: upstreams trust them as *verified*
-    // claims, so any copy a client sent must die at the trust boundary here,
-    // BEFORE the auth gate re-injects the authenticated values. Stripping is
-    // unconditional (not `#[cfg(feature = "auth")]`): a build without the auth
-    // gate, or a route with no auth profile, still forwards to an upstream and
-    // must never carry a client-spoofed identity. The auth gate's later
-    // `insert` replaces, but only on the paths where a claim is present — an
-    // absent `sub`, `forward_claims = false`, or no profile at all would
-    // otherwise let the spoofed header ride through. Reserved header names are
-    // ASCII-lowercased by hyper, so one `remove` per name clears every copy.
-    scrub_reserved_identity_headers(req.headers_mut());
-
-    // Gate: URI length (reject oversized URIs before routing).
-    // Check full path+query, not just path — an attacker could send a short
-    // path with an enormous query string to consume memory downstream.
-    let uri_len = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str().len())
-        .unwrap_or_else(|| req.uri().path().len());
-    if uri_len > MAX_URI_LEN {
-        return Ok(empty_response(StatusCode::URI_TOO_LONG));
-    }
-
-    // Gate: HTTP method whitelist (block TRACE/CONNECT/exotic methods)
-    if !matches!(
-        *req.method(),
-        hyper::Method::GET
-            | hyper::Method::POST
-            | hyper::Method::PUT
-            | hyper::Method::PATCH
-            | hyper::Method::DELETE
-            | hyper::Method::HEAD
-            | hyper::Method::OPTIONS
-    ) {
-        return Ok(method_not_allowed(
-            "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
-        ));
-    }
-
-    // Gate: 0-RTT replay protection (RFC 8470 — 425 Too Early).
-    // TLS 1.3 early data is inherently replay-vulnerable. Only idempotent
-    // methods (GET/HEAD) are safe — state-changing methods could be replayed
-    // by a network adversary capturing the ClientHello + early data.
-    if early_data_rejected(is_early_data, req.method()) {
-        // SAFETY: 425 "Too Early" (RFC 8470) is a valid HTTP status code in
-        // the 100..1000 range that hyper accepts. The literal `425` is a
-        // compile-time constant; `from_u16` rejects only out-of-range u16s.
-        return Ok(empty_response(StatusCode::from_u16(425).unwrap()));
-    }
-
     // ── Resolve real client IP (proxy-aware) ──
     // When trusted_proxies is configured, extract the real client IP from
     // X-Forwarded-For using the rightmost-untrusted-hop algorithm.
@@ -344,225 +292,23 @@ async fn process_request_inner(
     // the upstream proxy's address.
     let forward_addr = SocketAddr::new(client_ip, 0);
 
-    // Gate: per-IP rate limit (zero cost when disabled)
-    // Placed BEFORE health endpoints so /healthz can't bypass rate limiting for DDoS.
-    if !check_rate_limit(&state, client_ip) {
-        metrics::METRICS
-            .rate_limited
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Ok(empty_response(StatusCode::TOO_MANY_REQUESTS));
+    // ── Pre-routing security gates (zero-cost, before any processing) ──
+    // The gates and their ORDER live in `gates::PRE_ROUTING`; the order is pinned
+    // by `gates::tests::pre_routing_order` and `gate_order_tests`. The rate
+    // limiter runs before the built-in endpoints, so `/healthz` cannot dodge it.
+    let ctx = gates::PreCtx {
+        cfg: cfg.clone(),
+        client_ip,
+        remote_addr,
+        is_early_data,
+    };
+    if let Some(resp) = gates::run_pre_routing(&ctx, &state, &mut req).await {
+        return Ok(resp);
     }
 
-    // ── Sovereign Edge: IP classification (zero cost when feature is off or disabled) ──
-    //
-    // Track D fix: previously this branch did `format!("ip=… class=…")` once
-    // per *every* request when `sovereign_log_classification` was on — that's
-    // a heap allocation on the hot path with no opt-out. We now:
-    //
-    //   1. Always bump a per-class atomic counter (4 ns) so /metrics carries
-    //      `zion_sovereign_classifications_total{class="…"}` whether the
-    //      operator opted into logging or not.
-    //   2. When `log_classification = true`, emit a zero-alloc
-    //      `tracing::info!()` event using the class's `&'static str` label
-    //      and `Display` impl for the IP. The event is a no-op when no
-    //      subscriber consumes it; with the JSON subscriber attached it
-    //      still beats `format!` because the formatter writes directly to
-    //      the subscriber's buffer instead of materialising a `String`.
-    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
-    {
-        use crate::sovereign;
-        if cfg.sovereign_enabled {
-            let ip_class = sovereign::classify(client_ip);
-            sovereign::record_classification(ip_class);
-            req.extensions_mut().insert(ip_class);
-            // Tag-driven enforcement (#150): deny classes the operator
-            // opted in. Off by default; the local WAF / rate-limit / auth
-            // gates stay authoritative — this only adds a deny on top.
-            if cfg.enforce.denies_class(ip_class.as_str()) {
-                metrics::METRICS
-                    .enforcement_denied_class
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(deny_or_tarpit(&cfg.enforce, StatusCode::FORBIDDEN).await);
-            }
-            if cfg.sovereign_log_classification && ip_class != sovereign::IpClass::Unknown {
-                tracing::info!(
-                    target: "sovereign",
-                    ip = %client_ip,
-                    class = ip_class.as_str(),
-                    "classified",
-                );
-            }
-        }
-    }
-
-    // ── JA4 per-fingerprint route restriction (#27 follow-up) ──
-    //
-    // Request-level policy, so the deny is HTTP-level: the handshake already
-    // happened, and on HTTP/2 dropping the connection would kill unrelated
-    // in-flight requests — 403, like the sovereign enforcement gate above.
-    // The `X-Client-TLS-JA4` header is Zion's OWN attestation (any inbound
-    // copy is stripped and the verified value re-injected at the listener —
-    // see `tls_fp::apply_headers`), so trusting it here is sound. Like every
-    // pre-routing gate, this early return never reaches the access log; the
-    // `zion_tls_fp_route_denied` metric is the operator signal. Policy, mode
-    // handling, metric, and (debug) logging all live in `route_gate` — and
-    // note the gate covers the WHOLE request surface reaching dispatch
-    // (built-in /metrics included). /healthz and /readyz are exempt INSIDE
-    // route_gate: HTTP/3 bridges into dispatch directly (quic.rs), so the
-    // health exemption must be the gate's own property, not an accident of
-    // the :443 listener fast path.
-    #[cfg(feature = "tls-fingerprint")]
-    if let Some(fp) = cfg.tls_fingerprint.as_ref() {
-        if let Some(ja4) = req
-            .headers()
-            .get(crate::tls_fp::HDR_JA4)
-            .and_then(|v| v.to_str().ok())
-        {
-            if fp.route_gate(ja4, req.uri().path()) == crate::tls_fp::GateDecision::Reject {
-                return Ok(empty_response(StatusCode::FORBIDDEN));
-            }
-        }
-    }
-
-    // ── AIMP mesh score lookup (signal, not gate) ──
-    //
-    // If the AIMP control plane is up and has a reputation entry for
-    // `client_ip` (received via gossip from another zion node), inject
-    // the score into the request headers as `X-Zion-Mesh-Score`. The
-    // header travels to the upstream so application code can use it
-    // as one more signal alongside its own anti-abuse logic.
-    //
-    // We deliberately do NOT use this score as a hard gate here — the
-    // local WAF / rate-limiter / auth decisions remain authoritative.
-    // The mesh is advisory only, by design (see issue #65).
-    #[cfg(feature = "sovereign-aimp")]
-    if let Some(cp) = state.aimp_cp.as_ref() {
-        if let Some(rep) = cp.lookup(&client_ip) {
-            // Issue #69: count score-lookup hits. Bumped on the
-            // *positive* path only — the bare `cp.is_some()` is not
-            // a useful signal because every request takes that
-            // branch when the feature is on; the operator wants to
-            // see the rate of mesh-influenced requests.
-            metrics::METRICS
-                .mesh_score_lookups
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Tag-driven enforcement (#150): deny low-reputation sources
-            // when the operator set a threshold. Promotes the mesh score
-            // from advisory header to optional hard gate (ADR-0008). The
-            // policy lives under the geo-gated `[sovereign]` block, so this
-            // deny is only compiled when geo is on too.
-            #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
-            if cfg.enforce.denies_score(rep.score) {
-                metrics::METRICS
-                    .enforcement_denied_mesh_score
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(deny_or_tarpit(&cfg.enforce, StatusCode::FORBIDDEN).await);
-            }
-            // 3 decimals so log/grep humans see a stable string;
-            // upstreams parse as f32 and tolerate any precision.
-            let formatted = format!("{:.3}", rep.score);
-            if let Ok(val) = hyper::header::HeaderValue::from_str(&formatted) {
-                req.headers_mut().insert(
-                    hyper::header::HeaderName::from_static("x-zion-mesh-score"),
-                    val,
-                );
-            }
-        }
-    }
-
-    // ── Built-in health endpoints (no routing, no upstream) ──
-    {
-        let path = req.uri().path();
-        if path == "/healthz" {
-            return Ok(text_response(StatusCode::OK, "ok"));
-        }
-        if path == "/readyz" {
-            return Ok(text_response(StatusCode::OK, "ready"));
-        }
-        // S-02 FIX: /metrics restricted to internal IPs only.
-        // Without this, the built-in handler takes precedence over the route
-        // config's internal_only flag, exposing metrics to external clients.
-        if path == "/metrics" {
-            if !cfg.internal_networks.contains(&client_ip) {
-                return Ok(empty_response(StatusCode::FORBIDDEN));
-            }
-            // Content-negotiate: serve OpenMetrics (histogram exemplars + EOF)
-            // only when the scraper accepts it, otherwise classic Prometheus
-            // 0.0.4. Emitting OpenMetrics exemplars under the classic
-            // content-type makes /metrics unparseable by a standard Prometheus.
-            let openmetrics = req
-                .headers()
-                .get(hyper::header::ACCEPT)
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.contains("application/openmetrics-text"))
-                .unwrap_or(false);
-            let content_type = if openmetrics {
-                "application/openmetrics-text; version=1.0.0; charset=utf-8"
-            } else {
-                "text/plain; version=0.0.4; charset=utf-8"
-            };
-            let body = metrics::METRICS.render_with_upstreams(openmetrics, &state.cfg().health_map);
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", content_type)
-                .body(Full::new(body).map_err(|never| match never {}).boxed())
-                .unwrap());
-        }
-        // Live JSON snapshot — what `zion top` and dashboards consume.
-        // Same internal-only gate as /metrics: never expose to the world.
-        if path == "/_zion/snapshot.json" {
-            if !cfg.internal_networks.contains(&client_ip) {
-                return Ok(empty_response(StatusCode::FORBIDDEN));
-            }
-            let platform = crate::bootstrap::detect();
-            let mut rows: Vec<metrics::UpstreamRow<'_>> = cfg
-                .health_map
-                .iter()
-                .map(|(url, h)| metrics::UpstreamRow {
-                    url: url.as_str(),
-                    healthy: h.healthy.load(std::sync::atomic::Ordering::Relaxed),
-                    latency_us: h.latency_us.load(std::sync::atomic::Ordering::Relaxed),
-                })
-                .collect();
-            // Stable order — keep the TUI from flickering as DashMap-style
-            // iteration drifts. URL is unique so this is total-order.
-            rows.sort_by(|a, b| a.url.cmp(b.url));
-            let body = metrics::snapshot_json(platform, &rows);
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/json; charset=utf-8")
-                .header("Cache-Control", "no-store")
-                .body(Full::new(body).map_err(|never| match never {}).boxed())
-                .unwrap());
-        }
-        // Cache purge — flush the in-RAM cache so a deploy can invalidate
-        // immediately instead of waiting out the TTL. Internal-only + POST
-        // (mutating). `?prefix=/path` purges matching keys; no prefix = all.
-        if path == "/_zion/cache/purge" {
-            if !cfg.internal_networks.contains(&client_ip) {
-                return Ok(empty_response(StatusCode::FORBIDDEN));
-            }
-            if *req.method() != hyper::Method::POST {
-                return Ok(method_not_allowed("POST"));
-            }
-            let prefix = req.uri().query().and_then(|q| {
-                q.split('&')
-                    .find_map(|kv| kv.strip_prefix("prefix="))
-                    .map(|p| p.to_string())
-            });
-            let (removed, scope) = match &prefix {
-                Some(p) => (state.static_cache.purge_prefix(p), format!("{p:?}")),
-                None => (state.static_cache.purge_all(), "\"all\"".to_string()),
-            };
-            crate::logging::info("cache", &format!("purge scope={scope} removed={removed}"));
-            let body = Bytes::from(format!("{{\"purged\":{removed},\"scope\":{scope}}}\n"));
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/json; charset=utf-8")
-                .header("Cache-Control", "no-store")
-                .body(Full::new(body).map_err(|never| match never {}).boxed())
-                .unwrap());
-        }
+    // ── Built-in endpoints (no routing, no upstream) ──
+    if let Some(resp) = gates::builtin_endpoint(&ctx, &state, &req) {
+        return Ok(resp);
     }
 
     // ── Route lookup (thread-local LRU + radix tree fallback) ──
@@ -617,71 +363,15 @@ async fn process_request_inner(
         }
     };
 
-    // ── CORS (Per-Route) ──
-    // Clone origin HeaderValue (16 bytes, ref-counted) to release the
-    // immutable borrow on req before any mutations below.
-    let req_origin: Option<hyper::header::HeaderValue> = if rule.cors.is_some() {
-        req.headers().get(hyper::header::ORIGIN).cloned()
-    } else {
-        None
-    };
-
-    // Pre-compute CORS allow origin for response injection later
-    let cors_allow_origin: Option<hyper::header::HeaderValue> = req_origin
-        .as_ref()
-        .and_then(|v| v.to_str().ok())
-        .and_then(|o| rule.cors.as_ref().and_then(|c| c.check_origin(o)));
-
-    if let Some(ref cors) = rule.cors {
-        // An origin is present: reuse the `cors_allow_origin` computed above
-        // instead of calling `check_origin` (and re-lowercasing the origin) a
-        // second time per request.
-        if req_origin.is_some() {
-            match cors_allow_origin.as_ref() {
-                Some(allow_origin) => {
-                    // Pre-flight OPTIONS — respond immediately without proxying.
-                    if *req.method() == hyper::Method::OPTIONS {
-                        let mut resp = empty_response(StatusCode::NO_CONTENT);
-                        let h = resp.headers_mut();
-                        h.insert(
-                            hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                            allow_origin.clone(),
-                        );
-                        h.insert(
-                            hyper::header::ACCESS_CONTROL_ALLOW_METHODS,
-                            cors.allow_methods.clone(),
-                        );
-                        h.insert(
-                            hyper::header::ACCESS_CONTROL_ALLOW_HEADERS,
-                            cors.allow_headers.clone(),
-                        );
-                        h.insert(hyper::header::ACCESS_CONTROL_MAX_AGE, cors.max_age.clone());
-                        inject_security_headers(&mut resp);
-                        return Ok(resp);
-                    }
-                }
-                None => {
-                    // Origin present but not allowed — block state-changing
-                    // methods AND preflight.
-                    if *req.method() == hyper::Method::OPTIONS
-                        || matches!(
-                            *req.method(),
-                            hyper::Method::POST
-                                | hyper::Method::PUT
-                                | hyper::Method::PATCH
-                                | hyper::Method::DELETE
-                        )
-                    {
-                        return Ok(empty_response(StatusCode::FORBIDDEN));
-                    }
-                }
-            }
-        }
+    // ── CORS (per-route): a preflight or a refused origin answers here ──
+    let (cors_allow_origin, cors_answer) = gates::cors_gate(&rule, &req);
+    if let Some(resp) = cors_answer {
+        return Ok(resp);
     }
 
     // --- Gate: internal_only ---
-    if rule.internal_only && !cfg.internal_networks.contains(&client_ip) {
-        return Ok(empty_response(StatusCode::FORBIDDEN));
+    if let Some(resp) = gates::internal_only(&rule, &cfg, client_ip) {
+        return Ok(resp);
     }
 
     // --- Gate: Upstream health check + Latency Routing (B-04) ---
