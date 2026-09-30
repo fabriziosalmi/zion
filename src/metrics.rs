@@ -408,6 +408,9 @@ pub struct Metrics {
     pub cache_swr_served: ShardedCounter,
     /// Stale entries served because the origin failed while revalidating (stale-if-error).
     pub cache_stale_if_error: ShardedCounter,
+    /// Responses not stored because they exceeded the profile's `max_object_mb`
+    /// (declared up front, or discovered while streaming).
+    pub cache_too_large: ShardedCounter,
     /// Cache entries dropped because an unsafe request (POST/PUT/PATCH/DELETE)
     /// succeeded on their URI (RFC 9111 §4.4).
     pub cache_invalidations: ShardedCounter,
@@ -573,6 +576,7 @@ impl Metrics {
             cache_revalidations: ShardedCounter::new(),
             cache_swr_served: ShardedCounter::new(),
             cache_stale_if_error: ShardedCounter::new(),
+            cache_too_large: ShardedCounter::new(),
             cache_invalidations: ShardedCounter::new(),
             cache_swr_refreshes: ShardedCounter::new(),
             cache_swr_refresh_failures: ShardedCounter::new(),
@@ -911,6 +915,11 @@ impl Metrics {
                 "zion_cache_invalidations",
                 "Cache entries dropped because a successful unsafe request (POST/PUT/PATCH/DELETE) changed their URI (RFC 9111 section 4.4).",
                 &self.cache_invalidations,
+            ),
+            (
+                "zion_cache_too_large",
+                "Responses not stored because they exceeded the cache profile's max_object_mb.",
+                &self.cache_too_large,
             ),
             (
                 "zion_cache_stale_if_error",
