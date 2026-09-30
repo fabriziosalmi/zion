@@ -352,7 +352,31 @@ fn run() -> error::ZionResult<()> {
 /// Sections gated on the struct field itself (`[sovereign_aimp]`, sovereign
 /// geo) already hard-fail at parse via `deny_unknown_fields`, so they need no
 /// warning here — only the parse-clean-but-inert ones do.
+/// Do the internal-only gates (`/metrics`, snapshot, cache purge, `internal_only`
+/// routes) rest on "the peer has a private address" while the listener is
+/// reachable from beyond loopback and nothing says which private peers are real?
+/// In that shape a private-range load balancer, Kubernetes SNAT or a Docker bridge
+/// makes every internet client look internal. Pure, so it is unit-tested.
+fn internal_gates_trust_any_private_peer(server: &config::ServerConfig) -> bool {
+    let routable = server
+        .listen_https
+        .parse::<std::net::SocketAddr>()
+        .map(|a| !a.ip().is_loopback())
+        .unwrap_or(true);
+    routable && server.trusted_proxies.is_empty() && server.internal_networks.is_empty()
+}
+
 fn warn_feature_config_gaps(config: &config::ZionConfig) {
+    if internal_gates_trust_any_private_peer(&config.server) {
+        logging::warn(
+            "config",
+            "internal-only endpoints (/metrics, /_zion/snapshot.json, /_zion/cache/purge, \
+             routes with internal_only) accept ANY private-range peer. Behind a private-range \
+             load balancer, Kubernetes SNAT or a Docker bridge, every internet client looks \
+             internal and can purge the cache and read metrics. Set [server] trusted_proxies \
+             (so the real client IP is used) or [server] internal_networks (an explicit allowlist).",
+        );
+    }
     // A literal JWT HMAC secret in zion.toml is deprecated in favour of
     // `secret_env` (the key ends up in version control / config management).
     for (name, profile) in &config.auth_profile {
@@ -1727,11 +1751,11 @@ async fn handle_http(
     // `zion top` can connect from the same host without dragging in a TLS
     // client. Same internal-IP gate as the HTTPS handler.
     if path == "/_zion/snapshot.json" {
-        if !security::is_internal_ip(&remote_addr.ip()) {
+        let cfg = state.cfg();
+        if !cfg.internal_networks.contains(&remote_addr.ip()) {
             return Ok(empty_response(StatusCode::FORBIDDEN));
         }
         let platform = bootstrap::detect();
-        let cfg = state.cfg();
         let mut rows: Vec<metrics::UpstreamRow<'_>> = cfg
             .health_map
             .iter()
@@ -1776,7 +1800,12 @@ async fn handle_http(
             };
             cfg.router.at(host.as_deref(), path).cloned()
         };
-        if let Some(rule) = rule {
+        // Only a route with nothing to bypass may take this shortcut; otherwise fall
+        // through to the redirect (the HTTPS pipeline then applies auth/WAF).
+        if let Some(rule) = rule.filter(|r| r.serves_acme_fallback()) {
+            // This path skips process_request, so drop the identity headers the
+            // pipeline would have scrubbed: upstreams trust X-Auth-* as verified.
+            dispatch::scrub_reserved_identity_headers(req.headers_mut());
             return proxy::proxy_pass(
                 &state.client_for(rule.connect_timeout_ms),
                 req,
@@ -1879,5 +1908,50 @@ mod h2_limit_tests {
             H2_KEEPALIVE_TIMEOUT <= H2_KEEPALIVE_INTERVAL,
             "keep-alive timeout should not exceed the interval"
         );
+    }
+}
+
+#[cfg(test)]
+mod internal_gate_warning_tests {
+    use super::*;
+
+    fn server(https: &str, proxies: &[&str], nets: &[&str]) -> config::ServerConfig {
+        let toml = format!(
+            "listen_http=\"0.0.0.0:80\"\nlisten_https=\"{https}\"\ntrusted_proxies={proxies:?}\ninternal_networks={nets:?}\n"
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn warns_only_when_routable_and_nothing_names_the_real_peers() {
+        // ZION-AUTH-03: the risky shape is a reachable listener + "private address"
+        // as the only proof of being internal.
+        assert!(internal_gates_trust_any_private_peer(&server(
+            "0.0.0.0:443",
+            &[],
+            &[]
+        )));
+        assert!(internal_gates_trust_any_private_peer(&server(
+            "10.0.0.5:443",
+            &[],
+            &[]
+        )));
+        // loopback-only listener: nobody remote can reach it
+        assert!(!internal_gates_trust_any_private_peer(&server(
+            "127.0.0.1:443",
+            &[],
+            &[]
+        )));
+        // trusted_proxies lets Zion see the real client; an allowlist names the peers
+        assert!(!internal_gates_trust_any_private_peer(&server(
+            "0.0.0.0:443",
+            &["10.0.0.0/8"],
+            &[]
+        )));
+        assert!(!internal_gates_trust_any_private_peer(&server(
+            "0.0.0.0:443",
+            &[],
+            &["10.20.0.0/24"]
+        )));
     }
 }

@@ -38,6 +38,28 @@ upgrading.
   `LimitCORE=0`. Not covered: copies inside `hmac::Key` / `jsonwebtoken`, and the
   process environment itself.
 
+### Access control
+
+- **`:80` ACME fallback no longer bypasses auth.** An unmatched
+  `/.well-known/acme-challenge/*` request on plaintext port 80 was proxied straight
+  to the matching route, skipping the JWT gate, `internal_only`, the WAF and the
+  `X-Auth-*` scrub, so a client could reach an authenticated upstream with a forged
+  `X-Auth-Subject`. It is now used only for a route with no `auth_profile`, no
+  `internal_only` and a real upstream (a static route's placeholder upstream is
+  `127.0.0.1`, which the old code would have proxied to), and inbound `X-Auth-*` is
+  stripped. Serve external-client challenges from a public route.
+- **⚠️ `admin.auth = "internal-ip"` requires a loopback `admin.listen`.** The peer
+  it trusts can replace the whole running config, and behind a container bridge
+  every client looks private. A routable/wildcard bind with `internal-ip` is now a
+  startup error; use `mtls` for those. The default (`127.0.0.1:9180`) is unchanged.
+- **New `[server] internal_networks`** (CIDR allowlist) for `/metrics`, the snapshot,
+  `/_zion/cache/purge` and `internal_only` routes, whose built-in rule is "any
+  private-range peer" (network position, not identity). Unset keeps the old
+  behaviour, so nothing changes until you opt in. Zion now warns at boot when a
+  non-loopback listener has neither `internal_networks` nor `trusted_proxies`, the
+  shape where a private-range load balancer makes every client look internal.
+  Invalid CIDRs are rejected at load.
+
 ### Observability
 
 - **Config reload failures are visible.** `zion_config_reload_failures_total` and

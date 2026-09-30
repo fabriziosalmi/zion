@@ -29,6 +29,7 @@ breaking config change lands (documented in the CHANGELOG).
 | `rate_limit_window_secs` | u64 | `1` | Rate limit window in seconds |
 | `max_connections_per_ip` | u32? | none | Per-IP concurrent-connection cap, enforced at accept (before the TLS handshake) |
 | `trusted_proxies` | string[] | `[]` | CIDRs whose inbound `X-Forwarded-For` is trusted for client-IP resolution |
+| `internal_networks` | string[] | `[]` | CIDRs (or bare IPs) allowed to use the internal-only endpoints (`/metrics`, `/_zion/snapshot.json`, `/_zion/cache/purge`) and `internal_only` routes. Empty keeps the built-in rule: any loopback / private-range / link-local / ULA peer. That rule tests network position, not identity: behind a private-range load balancer, Kubernetes SNAT or a Docker bridge every client looks internal. Set this (and `trusted_proxies`) to name the hosts that really are. Zion warns at boot when neither is set on a non-loopback listener |
 | `xff_mode` | string | `"append"` | Outbound XFF policy: `"append"`, `"rewrite"` (strip inbound, emit one trusted entry), or `"drop"` |
 | `log_format` | string | `"text"` | `"text"` or `"json"` (structured) |
 

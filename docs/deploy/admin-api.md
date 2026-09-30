@@ -13,7 +13,7 @@ auth = "internal-ip"        # default — see Authentication
 rate_limit_rps = 10         # default — global req/s ceiling
 ```
 
-Every field has the default shown, so a bare `[admin]` block is enough to turn it on with safe defaults. The block is validated at load: `listen` must be a real socket address, `auth` must be `internal-ip` or `mtls`, `rate_limit_rps` must be `> 0`. A typo fails fast at startup, exactly like the rest of `zion.toml`.
+Every field has the default shown, so a bare `[admin]` block is enough to turn it on with safe defaults. The block is validated at load: `listen` must be a real socket address, `auth` must be `internal-ip` or `mtls`, `rate_limit_rps` must be `> 0`, and `auth = "internal-ip"` requires a **loopback** `listen` (`127.0.0.1`, `::1`): it trusts every private-range peer, and that peer can replace the running config, so a routable or container-published bind needs `auth = "mtls"`. A typo fails fast at startup, exactly like the rest of `zion.toml`.
 
 ## Endpoints
 
@@ -93,7 +93,7 @@ $ curl --cert operator.crt --key operator.key -k https://zion-host:9180/admin/co
 ```
 
 ::: warning
-With `internal-ip`, `127.0.0.1` (the default) is the safe bind: it trusts every host in the loopback and private ranges, so on a shared network reach it via an SSH tunnel or a sidecar rather than binding a routable interface. Use `mtls` when you need the admin API reachable across the network.
+`internal-ip` is only accepted on a loopback bind (`127.0.0.1`, the default): it trusts every host in the loopback and private ranges, and inside a container a bridge SNATs every client to a private address. Configuring it with `0.0.0.0` or any routable address is a startup error. Reach the loopback listener over an SSH tunnel or a sidecar, or use `mtls` when the admin API must be reachable across the network.
 :::
 
 ## Rate limiting

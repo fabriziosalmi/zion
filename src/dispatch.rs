@@ -250,7 +250,7 @@ const RESERVED_IDENTITY_HEADERS: [&str; 2] = ["x-auth-subject", "x-auth-email"];
 /// Strip every reserved identity header off an inbound request. Idempotent, and
 /// clears repeated copies (hyper lower-cases header names, so one `remove` per
 /// name suffices).
-fn scrub_reserved_identity_headers(headers: &mut hyper::HeaderMap) {
+pub(crate) fn scrub_reserved_identity_headers(headers: &mut hyper::HeaderMap) {
     for name in RESERVED_IDENTITY_HEADERS {
         headers.remove(name);
     }
@@ -482,7 +482,7 @@ async fn process_request_inner(
         // Without this, the built-in handler takes precedence over the route
         // config's internal_only flag, exposing metrics to external clients.
         if path == "/metrics" {
-            if !is_internal_ip(&client_ip) {
+            if !cfg.internal_networks.contains(&client_ip) {
                 return Ok(empty_response(StatusCode::FORBIDDEN));
             }
             // Content-negotiate: serve OpenMetrics (histogram exemplars + EOF)
@@ -510,7 +510,7 @@ async fn process_request_inner(
         // Live JSON snapshot — what `zion top` and dashboards consume.
         // Same internal-only gate as /metrics: never expose to the world.
         if path == "/_zion/snapshot.json" {
-            if !is_internal_ip(&client_ip) {
+            if !cfg.internal_networks.contains(&client_ip) {
                 return Ok(empty_response(StatusCode::FORBIDDEN));
             }
             let platform = crate::bootstrap::detect();
@@ -538,7 +538,7 @@ async fn process_request_inner(
         // immediately instead of waiting out the TTL. Internal-only + POST
         // (mutating). `?prefix=/path` purges matching keys; no prefix = all.
         if path == "/_zion/cache/purge" {
-            if !is_internal_ip(&client_ip) {
+            if !cfg.internal_networks.contains(&client_ip) {
                 return Ok(empty_response(StatusCode::FORBIDDEN));
             }
             if *req.method() != hyper::Method::POST {
@@ -679,7 +679,7 @@ async fn process_request_inner(
     }
 
     // --- Gate: internal_only ---
-    if rule.internal_only && !is_internal_ip(&client_ip) {
+    if rule.internal_only && !cfg.internal_networks.contains(&client_ip) {
         return Ok(empty_response(StatusCode::FORBIDDEN));
     }
 
@@ -2088,12 +2088,6 @@ async fn handle_static_cache(
     Ok(resp)
 }
 
-/// Check if an IP is internal — delegates to security module.
-#[inline]
-fn is_internal_ip(ip: &std::net::IpAddr) -> bool {
-    security::is_internal_ip(ip)
-}
-
 // ==========================================================================
 // Thread-local route LRU
 // --------------------------------------------------------------------------
@@ -2249,6 +2243,7 @@ mod route_cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::is_internal_ip;
 
     #[test]
     fn route_cache_key_is_host_scoped() {

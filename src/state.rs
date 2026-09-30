@@ -48,6 +48,9 @@ pub(crate) struct ResolvedAppConfig {
     pub(crate) health_map: health::HealthMap,
     /// Trusted proxy CIDRs for X-Forwarded-For IP resolution.
     pub(crate) trusted_proxies: security::TrustedProxies,
+    /// Peers that count as internal for `/metrics`, the snapshot, cache purge and
+    /// `internal_only` routes. See [`security::InternalNetworks`].
+    pub(crate) internal_networks: security::InternalNetworks,
     /// Outbound XFF policy (append / rewrite / drop). See proxy::XffMode.
     pub(crate) xff_mode: proxy::XffMode,
     /// Per-IP rate limiter target (RPS). 0 = disabled.
@@ -101,6 +104,7 @@ impl ResolvedAppConfig {
             router: routing::HostRouter::default(),
             health_map,
             trusted_proxies: security::TrustedProxies::from_config(&[]),
+            internal_networks: security::InternalNetworks::default(),
             xff_mode: proxy::XffMode::Append,
             rate_limit_rps: 0,
             rate_limit_window: 1,
@@ -156,6 +160,8 @@ impl ResolvedAppConfig {
         let health_map = Arc::new(map);
 
         let trusted_proxies = security::TrustedProxies::from_config(&config.server.trusted_proxies);
+        let internal_networks =
+            security::InternalNetworks::from_config(&config.server.internal_networks);
 
         // Parse the configured XFF policy. Unknown values fall back to
         // Append (silent fallback would weaken upstream IP integrity).
@@ -291,6 +297,7 @@ impl ResolvedAppConfig {
             router,
             health_map,
             trusted_proxies,
+            internal_networks,
             xff_mode,
             rate_limit_rps: config.server.rate_limit_rps,
             rate_limit_window: config.server.rate_limit_window_secs,

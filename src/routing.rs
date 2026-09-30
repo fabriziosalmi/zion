@@ -55,6 +55,25 @@ pub struct ResolvedRoute {
     pub cors: Option<std::sync::Arc<crate::security::CorsHeaders>>,
 }
 
+impl ResolvedRoute {
+    /// May the plaintext `:80` listener hand an ACME-challenge request that no
+    /// in-memory token matched to this route's upstream (for external clients such
+    /// as certbot)? That fallback proxies without going through the request
+    /// pipeline, so it skips the auth gate, `internal_only`, and the WAF. It is
+    /// therefore only allowed for a route that has none of those protections to
+    /// bypass, and one that actually has an upstream: a static route's placeholder
+    /// upstream is `127.0.0.1`, which would send the request to a local port 80.
+    /// ACME challenge paths are public by nature (the CA fetches them without
+    /// credentials), so serve them from a route that is public too.
+    pub fn serves_acme_fallback(&self) -> bool {
+        #[cfg(feature = "auth")]
+        let authed = self.auth.is_some();
+        #[cfg(not(feature = "auth"))]
+        let authed = false;
+        !self.internal_only && !authed && self.mode != RouteMode::Static
+    }
+}
+
 /// Resolve upstream name to URLs. Checks new `[upstream.X]` first, then legacy `[upstreams]`.
 /// Returns Err if the upstream name is not defined — callers propagate the
 /// error to reject the config rather than panicking (important during hot-reload).
@@ -906,5 +925,50 @@ upstream = "shared"
         assert_eq!(url(&router, "example.com", "/x"), "http://127.0.0.1:9000");
         // An unrelated host → shared.
         assert_eq!(url(&router, "other.org", "/x"), "http://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn acme_fallback_is_refused_for_routes_with_something_to_bypass() {
+        // ZION-AUTH-02: the plaintext :80 ACME fallback skips auth, internal_only
+        // and the WAF, and a static route's placeholder upstream is 127.0.0.1.
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n";
+        let cfg =
+            |routes: &str| -> ZionConfig { toml::from_str(&format!("{base}{routes}")).unwrap() };
+        let c = cfg("[[route]]\npath=\"/public/{*rest}\"\nupstream=\"be\"\n\
+             [[route]]\npath=\"/internal/{*rest}\"\nupstream=\"be\"\ninternal_only=true\n\
+             [[route]]\npath=\"/site/{*rest}\"\nmode=\"static\"\nserve_dir=\"/srv\"\n");
+        let router = build_router_quiet(&c).unwrap();
+        let get = |p: &str| router.at(None, p).unwrap().clone();
+        assert!(
+            get("/public/x").serves_acme_fallback(),
+            "a plain public route may"
+        );
+        assert!(
+            !get("/internal/x").serves_acme_fallback(),
+            "internal_only must not"
+        );
+        assert!(
+            !get("/site/x").serves_acme_fallback(),
+            "static has no real upstream"
+        );
+    }
+
+    #[cfg(feature = "auth")]
+    #[test]
+    fn acme_fallback_is_refused_for_an_authenticated_route() {
+        // The finding's exact scenario: a catch-all protected by auth_profile must
+        // not be reachable on :80 without a token via the ACME fallback.
+        let toml = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [auth_profile.p]\nsecret=\"unit-test-secret\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\nauth_profile=\"p\"\n";
+        let c: ZionConfig = toml::from_str(toml).unwrap();
+        let router = build_router_quiet(&c).unwrap();
+        let rule = router.at(None, "/.well-known/acme-challenge/x").unwrap();
+        assert!(
+            !rule.serves_acme_fallback(),
+            "auth-protected route must not bypass auth on :80"
+        );
     }
 }

@@ -482,6 +482,52 @@ impl CidrRange {
     }
 }
 
+/// Is `s` a well-formed CIDR (or bare IP) whose prefix fits its address family?
+/// `CidrRange::parse` alone would accept `10.0.0.0/99`; config validation uses this
+/// so a typo is an error, not a silently-different network.
+pub fn is_valid_cidr(s: &str) -> bool {
+    CidrRange::parse(s).is_some_and(|c| {
+        let max = if c.network.is_ipv4() { 32 } else { 128 };
+        c.prefix_len <= max
+    })
+}
+
+/// Which peers count as "internal" for the data-plane's internal-only gates:
+/// `/metrics`, `/_zion/snapshot.json`, `/_zion/cache/purge` and routes marked
+/// `internal_only`.
+///
+/// Default (empty list): any loopback / RFC 1918 / link-local / ULA address, as
+/// [`is_internal_ip`]. That is a *network position* test, not authentication: behind
+/// a private-range load balancer, Kubernetes SNAT or a Docker bridge every internet
+/// client presents a private address and passes it. `[server] internal_networks`
+/// replaces the default with an explicit allowlist, so only the hosts the operator
+/// names are internal.
+#[derive(Clone, Debug, Default)]
+pub struct InternalNetworks {
+    cidrs: Vec<CidrRange>,
+}
+
+impl InternalNetworks {
+    /// Build from `[server] internal_networks`. Entries are validated at config
+    /// load ([`is_valid_cidr`]); one that still fails to parse is dropped, which can
+    /// only make the allowlist *smaller*, never wider.
+    pub fn from_config(cidrs: &[String]) -> Self {
+        Self {
+            cidrs: cidrs.iter().filter_map(|s| CidrRange::parse(s)).collect(),
+        }
+    }
+
+    /// Is `ip` an internal peer under the active policy?
+    #[inline]
+    pub fn contains(&self, ip: &std::net::IpAddr) -> bool {
+        if self.cidrs.is_empty() {
+            is_internal_ip(ip)
+        } else {
+            self.cidrs.iter().any(|c| c.contains(ip))
+        }
+    }
+}
+
 impl TrustedProxies {
     /// Parse trusted proxy CIDR list from config.
     /// Invalid CIDRs are logged and skipped.
@@ -772,5 +818,79 @@ mod normalize_host_tests {
         // A bare (illegal) IPv6 literal must not be mangled by the port splitter
         // into a truncated key — it stays intact and simply misses the host map.
         assert_eq!(normalize_host("::1").as_deref(), Some("::1"));
+    }
+}
+
+#[cfg(test)]
+mod internal_networks_tests {
+    use super::*;
+
+    // ── ZION-AUTH-03: which peers count as "internal" ─────────────────────
+
+    #[test]
+    fn default_is_the_private_range_rule() {
+        let n = InternalNetworks::default();
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.9",
+            "192.168.1.1",
+            "169.254.1.1",
+            "::1",
+            "fd00::1",
+        ] {
+            assert!(
+                n.contains(&ip.parse().unwrap()),
+                "{ip} is internal by default"
+            );
+        }
+        for ip in ["8.8.8.8", "203.0.113.7", "2001:db8::1"] {
+            assert!(!n.contains(&ip.parse().unwrap()), "{ip} is public");
+        }
+    }
+
+    #[test]
+    fn an_explicit_list_replaces_the_private_range_rule() {
+        // The point of the setting: a private address that is NOT listed (a load
+        // balancer, a SNAT hop, a neighbour on the bridge) is no longer internal.
+        let n = InternalNetworks::from_config(&["10.20.0.0/24".into(), "127.0.0.1".into()]);
+        assert!(n.contains(&"10.20.0.5".parse().unwrap()));
+        assert!(n.contains(&"127.0.0.1".parse().unwrap()));
+        assert!(
+            !n.contains(&"10.99.0.1".parse().unwrap()),
+            "private but not listed"
+        );
+        assert!(
+            !n.contains(&"192.168.1.1".parse().unwrap()),
+            "private but not listed"
+        );
+        assert!(
+            !n.contains(&"::1".parse().unwrap()),
+            "v6 loopback was not listed"
+        );
+        assert!(!n.contains(&"8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_validation_rejects_typos_instead_of_widening_or_shrinking() {
+        for ok in [
+            "10.0.0.0/24",
+            "127.0.0.1",
+            "0.0.0.0/0",
+            "::1/128",
+            "fd00::/8",
+        ] {
+            assert!(is_valid_cidr(ok), "{ok}");
+        }
+        for bad in [
+            "10.0.0.0/99",
+            "::/129",
+            "not-an-ip",
+            "10.0.0.0/",
+            "10.0.0/24",
+            "",
+        ] {
+            assert!(!is_valid_cidr(bad), "{bad:?} must be rejected");
+        }
     }
 }

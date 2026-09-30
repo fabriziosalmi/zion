@@ -223,6 +223,16 @@ pub struct ServerConfig {
     /// Example: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// Peers allowed to use the internal-only endpoints (`/metrics`,
+    /// `/_zion/snapshot.json`, `/_zion/cache/purge`) and routes marked
+    /// `internal_only`, as CIDRs (bare IPs allowed). Empty (default) keeps the
+    /// built-in rule: any loopback / private-range / link-local / ULA peer. That
+    /// rule is a network-position test, so behind a private-range load balancer,
+    /// Kubernetes SNAT or a Docker bridge every client looks internal; set this (and
+    /// `trusted_proxies`) to name exactly which hosts are. Example: `["127.0.0.1/32",
+    /// "10.20.0.0/24"]`.
+    #[serde(default)]
+    pub internal_networks: Vec<String>,
     /// X-Forwarded-For policy applied to outbound requests to upstreams.
     ///
     /// * `"append"` (default): preserve any inbound XFF chain and append
@@ -1234,6 +1244,17 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
         }
     }
 
+    // [server] internal_networks — a bad entry must be an error: dropping it would
+    // leave the list shorter, or empty, and an empty list means the permissive
+    // built-in "any private address" rule.
+    for cidr in &config.server.internal_networks {
+        if !crate::security::is_valid_cidr(cidr) {
+            errors.push(format!(
+                "server.internal_networks '{cidr}' is not a valid CIDR (e.g. \"10.20.0.0/24\" or \"127.0.0.1\")"
+            ));
+        }
+    }
+
     // [admin] — listen must be a real socket address; auth a known mode.
     if let Some(ref admin) = config.admin {
         if admin.listen.parse::<std::net::SocketAddr>().is_err() {
@@ -1242,11 +1263,28 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                 admin.listen
             ));
         }
-        if !matches!(admin.auth.as_str(), "internal-ip" | "mtls") {
-            errors.push(format!(
-                "admin.auth '{}' must be \"internal-ip\" or \"mtls\"",
-                admin.auth
-            ));
+        match admin.auth.as_str() {
+            "internal-ip" => {
+                // `internal-ip` authorizes any loopback/private-range *peer*, and the
+                // authorized peer can replace the whole running config. Bound to a
+                // routable address (or published from a container, where a bridge
+                // SNATs every client to a private address) that is every host on the
+                // network, so it is only safe on loopback. Routable binds need mtls.
+                if let Ok(addr) = admin.listen.parse::<std::net::SocketAddr>() {
+                    if !addr.ip().is_loopback() {
+                        errors.push(format!(
+                            "admin.listen '{}' is not a loopback address but admin.auth = \"internal-ip\" \
+                             trusts every private-range peer, and that peer can replace the whole config. \
+                             Bind 127.0.0.1 (reach it over an SSH tunnel or a sidecar) or set admin.auth = \"mtls\"",
+                            admin.listen
+                        ));
+                    }
+                }
+            }
+            "mtls" => {}
+            other => errors.push(format!(
+                "admin.auth '{other}' must be \"internal-ip\" or \"mtls\""
+            )),
         }
         if admin.rate_limit_rps == 0 {
             errors.push("admin.rate_limit_rps must be > 0".to_string());
@@ -2016,6 +2054,64 @@ enabledd = true
         assert!(
             err.contains("client_ca_path"),
             "auth=mtls without client_ca_path must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn internal_networks_entries_are_validated() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n{NET}\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let with = |net: &str| {
+            validate_str(&base.replace("{NET}", net), "t")
+                .err()
+                .unwrap_or_default()
+        };
+        let e = with("internal_networks=[\"10.0.0.0/99\"]\n");
+        assert!(e.contains("server.internal_networks '10.0.0.0/99'"), "{e}");
+        // a good list raises no internal_networks error (other errors may exist: cert files)
+        let e = with("internal_networks=[\"10.20.0.0/24\",\"127.0.0.1\"]\n");
+        assert!(!e.contains("internal_networks"), "{e}");
+    }
+
+    #[test]
+    fn admin_internal_ip_must_bind_loopback() {
+        // ZION-AUTH-01: `internal-ip` trusts every private-range peer, and that peer
+        // can replace the whole config, so it is only allowed on loopback.
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let admin = |listen: &str, auth: &str| {
+            let toml = format!("{base}[admin]\nlisten=\"{listen}\"\nauth=\"{auth}\"\n");
+            validate_str(&toml, "test").err().unwrap_or_default()
+        };
+        // routable / wildcard / container-bridge binds are refused
+        for bad in [
+            "0.0.0.0:9180",
+            "10.0.0.5:9180",
+            "192.168.1.10:9180",
+            "[::]:9180",
+            "172.17.0.2:9180",
+        ] {
+            let e = admin(bad, "internal-ip");
+            assert!(
+                e.contains("not a loopback address") && e.contains("mtls"),
+                "{bad} with internal-ip must be rejected with guidance, got: {e}"
+            );
+        }
+        // loopback stays fine (the failure, if any, is only the missing cert files)
+        for ok in ["127.0.0.1:9180", "127.0.0.2:9180", "[::1]:9180"] {
+            let e = admin(ok, "internal-ip");
+            assert!(
+                !e.contains("not a loopback address"),
+                "{ok} must be accepted: {e}"
+            );
+        }
+        // mtls may bind anywhere: the handshake, not the peer IP, is the gate
+        let e = admin("0.0.0.0:9180", "mtls");
+        assert!(
+            !e.contains("not a loopback address"),
+            "mtls on a routable bind: {e}"
         );
     }
 
