@@ -131,6 +131,8 @@ use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
 mod dispatch;
+#[cfg(test)]
+mod gate_order_tests;
 pub(crate) use dispatch::process_request;
 mod http_util;
 mod state;

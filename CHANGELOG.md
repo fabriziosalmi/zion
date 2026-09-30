@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Internal: the request pipeline's pre-routing gates are now an ordered list** (`dispatch/gates.rs`, `PRE_ROUTING`) of small functions instead of ~250 lines of inline control flow in `process_request_inner` (#422). No behaviour change: the order (URI length, method, 0-RTT, rate limit, then the feature-gated sovereign / JA4 / mesh gates, then the built-in endpoints, route lookup, CORS, `internal_only`) is pinned by golden tests written against the old code first.
+
 ### Added
 
 - **`zion audit verify <segment>...`** checks the HMAC chain of audit segments offline (#419). Exit `0` verified, `1` a segment failed, `2` usage/key error.
