@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Cache: responses with a `Vary` are now cached per variant** (RFC 9111 §4.1, #445). Before, any `Vary` other than `Accept-Encoding` made a response uncacheable. Now `Vary: Accept-Language` / `Accept` / `Origin` / … are stored under a secondary key built from the exact values of the varied request headers, at most 16 variants per key. `Vary: *` and varied credential headers (`Cookie`, `Authorization`, …) are still never stored. Responses that used to be `BYPASS` because of a `Vary` can now be `HIT`; new counter `zion_cache_vary_uncached` for storable responses refused by the Vary policy or its cap.
+
 ### Added
 
 - **Cache: `stale-while-revalidate`** (RFC 5861, #446). An entry within the origin's `stale-while-revalidate` window is served at once (`X-Zion-Cache: STALE-WHILE-REVALIDATE`) and refreshed in the background: one refresh per key through the existing singleflight, at most 64 at a time, 30 s each, without the caller's credentials. New counters `zion_cache_swr_served`, `zion_cache_swr_refreshes`, `zion_cache_swr_refresh_failures`, `zion_cache_swr_refresh_skipped`. Without the directive nothing changes.
