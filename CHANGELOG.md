@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Cache: `stale-while-revalidate`** (RFC 5861, #446). An entry within the origin's `stale-while-revalidate` window is served at once (`X-Zion-Cache: STALE-WHILE-REVALIDATE`) and refreshed in the background: one refresh per key through the existing singleflight, at most 64 at a time, 30 s each, without the caller's credentials. New counters `zion_cache_swr_served`, `zion_cache_swr_refreshes`, `zion_cache_swr_refresh_failures`, `zion_cache_swr_refresh_skipped`. Without the directive nothing changes.
+
 ## [0.9.1] - 2026-09-30
 
 Follow-up to 0.9.0: the remaining findings of the same audit. Everything new is

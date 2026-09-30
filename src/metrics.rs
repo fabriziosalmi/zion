@@ -402,6 +402,16 @@ pub struct Metrics {
     /// Stale entries revalidated to a 304 (RFC 9111 §4.3) — served from cache
     /// without re-downloading the body. A subset of "would-have-been misses".
     pub cache_revalidations: ShardedCounter,
+    /// Stale entries answered immediately under `stale-while-revalidate`.
+    pub cache_swr_served: ShardedCounter,
+    /// Background refreshes that completed and updated the entry.
+    pub cache_swr_refreshes: ShardedCounter,
+    /// Background refreshes that ended without updating the entry (origin error,
+    /// timeout, non-cacheable or non-200 answer).
+    pub cache_swr_refresh_failures: ShardedCounter,
+    /// Stale entries served without starting a refresh because the global cap on
+    /// concurrent background refreshes was reached.
+    pub cache_swr_refresh_skipped: ShardedCounter,
 
     // Global Counters (Cold Path or connection-level)
     pub websocket_upgrades: AtomicU64,
@@ -550,6 +560,10 @@ impl Metrics {
             cache_hits: ShardedCounter::new(),
             cache_misses: ShardedCounter::new(),
             cache_revalidations: ShardedCounter::new(),
+            cache_swr_served: ShardedCounter::new(),
+            cache_swr_refreshes: ShardedCounter::new(),
+            cache_swr_refresh_failures: ShardedCounter::new(),
+            cache_swr_refresh_skipped: ShardedCounter::new(),
             websocket_upgrades: AtomicU64::new(0),
             connections_total: AtomicU64::new(0),
             tls_handshake_errors: AtomicU64::new(0),
@@ -870,6 +884,33 @@ impl Metrics {
         );
         out.extend_from_slice(itoa_buf.format(self.cache_misses.load(Relaxed)).as_bytes());
         out.extend_from_slice(b"\n");
+
+        for (name, help, ctr) in [
+            (
+                "zion_cache_swr_served",
+                "Stale entries answered immediately under stale-while-revalidate.",
+                &self.cache_swr_served,
+            ),
+            (
+                "zion_cache_swr_refreshes",
+                "Background stale-while-revalidate refreshes that updated the entry.",
+                &self.cache_swr_refreshes,
+            ),
+            (
+                "zion_cache_swr_refresh_failures",
+                "Background refreshes that ended without updating the entry (origin error, timeout, non-cacheable or non-200).",
+                &self.cache_swr_refresh_failures,
+            ),
+            (
+                "zion_cache_swr_refresh_skipped",
+                "Stale entries served without a refresh because the concurrent-refresh cap was reached.",
+                &self.cache_swr_refresh_skipped,
+            ),
+        ] {
+            out.extend_from_slice(format!("# HELP {name} {help}\n# TYPE {name} counter\n{name} ").as_bytes());
+            out.extend_from_slice(itoa_buf.format(ctr.load(Relaxed)).as_bytes());
+            out.extend_from_slice(b"\n");
+        }
 
         out.extend_from_slice(
             b"# HELP zion_cache_revalidations Stale entries revalidated to a 304 (served from cache, body not re-downloaded).\n\
