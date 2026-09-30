@@ -6,6 +6,7 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Fixed
 
+- **Cache: a response that sets a cookie is no longer stored.** Cached hits never replayed `Set-Cookie`, but they did replay the body, so a personalised page that started a session could be served to other visitors. Any response with a `Set-Cookie` header is now streamed through uncached (`X-Zion-Cache: BYPASS`), whatever its `Cache-Control`. If you relied on caching such responses, have the origin stop sending `Set-Cookie` on them.
 - **Cache: stale responses are no longer served against the origin's instructions.** An entry stored from a response with `must-revalidate`, `proxy-revalidate` or `s-maxage` was still served stale by `stale-while-revalidate` (0.9.2) and `stale-if-error` (RFC 9111 §4.2.4 / §5.2.2 forbid that). They now apply only to responses that did not carry those directives.
 - **Cache: `stale-if-error` actually triggers.** The transport error reached the cache as a `502` response, not an error value, so the stale copy was never used and the client got the `502`. A `500`/`502`/`503`/`504` while revalidating a stale entry now serves the stale copy (`X-Zion-Cache: STALE`), counted in the new `zion_cache_stale_if_error`.
 

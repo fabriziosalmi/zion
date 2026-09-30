@@ -39,6 +39,7 @@ uncached, marked `X-Zion-Cache: BYPASS`):
 | Response `Cache-Control` | Not `private`, `no-store`, or `no-cache` (RFC 9111 §3.2 / §5.2.2). |
 | Authenticated request (§3.5) | A response to a request carrying `Authorization` is stored **only** if the origin explicitly opts in with `public`, `s-maxage`, or `must-revalidate` — otherwise one user's response could be served to another. |
 | `Vary` | Absent, or naming request headers zion can key on (see [Vary and secondary keys](#vary-and-secondary-keys)). **Not cached:** `Vary: *`, any varied credential header (`Cookie`, `Authorization`, `Proxy-Authorization`, `Set-Cookie`), more than 8 varied headers, or a variant over the per-key cap. |
+| `Set-Cookie` | The response must **not** set a cookie (any `Set-Cookie` header, whatever its `Cache-Control`). It starts or changes a session, so its body is for one client; it is streamed to that client and never stored. |
 | Freshness | A positive effective TTL (see below); an object that arrives already older than its lifetime isn't stored. |
 
 ## Vary and secondary keys

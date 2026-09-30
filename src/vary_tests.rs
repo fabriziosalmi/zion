@@ -30,6 +30,8 @@ struct Origin {
     cc: Mutex<String>,
     /// `Accept-Language` of the last request the origin saw (None if absent).
     last_lang: Mutex<Option<String>>,
+    /// A `Set-Cookie` value the origin adds to its answers, if any.
+    set_cookie: Mutex<Option<String>>,
 }
 
 /// `lang|foo|cookie|ae` of the request, so a body identifies who it was made for.
@@ -69,6 +71,9 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                         let mut b = Response::builder()
                             .status(StatusCode::OK)
                             .header("cache-control", o.cc.lock().unwrap().clone());
+                        if let Some(c) = o.set_cookie.lock().unwrap().clone() {
+                            b = b.header("set-cookie", c);
+                        }
                         let vary = o.vary.lock().unwrap().clone();
                         if !vary.is_empty() {
                             b = b.header("vary", vary);
@@ -125,6 +130,7 @@ async fn rig_cc(vary: &str, cc: &str) -> (Arc<Origin>, Arc<AppState>) {
         hits: AtomicUsize::new(0),
         cc: Mutex::new(cc.into()),
         last_lang: Mutex::new(None),
+        set_cookie: Mutex::new(None),
     });
     let port = start_origin(o.clone()).await;
     (o, state_for(port))
@@ -442,4 +448,36 @@ async fn a_stale_variant_is_refreshed_as_itself() {
         de.starts_with("<de>") && fr.starts_with("<fr>"),
         "{de} / {fr}"
     );
+}
+
+// ── Set-Cookie: a response that sets a cookie is personalised, never shared ──
+
+/// The body of a response that starts a session can carry that session's data.
+/// Headers are not replayed from the cache, but the BODY would be, to everyone.
+#[tokio::test]
+async fn a_response_that_sets_a_cookie_is_never_stored() {
+    let (o, st) = rig("").await;
+    *o.set_cookie.lock().unwrap() = Some("sid=alice; Path=/; HttpOnly".into());
+    for _ in 0..3 {
+        let (c, _) = fetch(&st, "/sc", &[]).await;
+        assert_eq!(c, "BYPASS", "a Set-Cookie response must not be cached");
+        settle().await;
+    }
+    assert_eq!(hits(&o), 3, "every request must reach the origin");
+    assert!(
+        st.static_cache.get("/sc\u{1f}").fresh().is_none(),
+        "nothing is stored"
+    );
+}
+
+/// Control: the same route without the cookie IS cached, so the test above fails for
+/// the reason it claims and not because the harness cannot cache.
+#[tokio::test]
+async fn the_same_response_without_a_cookie_is_cached() {
+    let (o, st) = rig("").await;
+    fetch(&st, "/nc", &[]).await;
+    settle().await;
+    let (c, _) = fetch(&st, "/nc", &[]).await;
+    assert_eq!(c, "HIT");
+    assert_eq!(hits(&o), 1);
 }

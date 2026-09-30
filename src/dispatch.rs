@@ -1515,6 +1515,14 @@ fn is_shared_cacheable(
         return false;
     }
 
+    // A response that sets a cookie starts or alters a session: its body is for that
+    // client. Cached hits do not replay headers, but they would replay the body to
+    // everyone, so it is never stored in the shared cache (what nginx and Varnish do by
+    // default). The client that triggered it still gets the response, cookie included.
+    if resp_headers.contains_key(hyper::header::SET_COOKIE) {
+        return false;
+    }
+
     let cc = resp_headers
         .get(hyper::header::CACHE_CONTROL)
         .and_then(|v| v.to_str().ok())
@@ -2343,6 +2351,26 @@ mod route_cache {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_set_cookie_response_is_not_storable_even_if_public() {
+        let mut h = hdr(
+            hyper::header::CACHE_CONTROL,
+            "public, max-age=600, s-maxage=600",
+        );
+        assert!(
+            is_shared_cacheable(false, &h, TTL, 0),
+            "control: storable without the cookie"
+        );
+        h.append(
+            hyper::header::SET_COOKIE,
+            hyper::header::HeaderValue::from_static("sid=1; HttpOnly"),
+        );
+        assert!(
+            !is_shared_cacheable(false, &h, TTL, 0),
+            "Set-Cookie wins over public / s-maxage"
+        );
+    }
+
     #[test]
     fn forbids_stale_matches_directive_names_only() {
         let h = |v: &str| hdr(hyper::header::CACHE_CONTROL, v);
