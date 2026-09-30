@@ -52,7 +52,7 @@ breaking config change lands (documented in the CHANGELOG).
 |---|---|---|---|
 | `url` | string | `url` **or** `urls` required | Single upstream URL (e.g. `"http://127.0.0.1:8000"`) |
 | `urls` | string[] | `[]` | Multiple upstream URLs (latency-routed); use instead of `url` |
-| `connect_timeout_ms` | u64 | `3000` | TCP connect timeout in milliseconds |
+| `connect_timeout_ms` | u64 | `3000` | TCP connect deadline in milliseconds, applied to the connector of the client that serves this upstream: a black-holed member (packets dropped, no RST) is abandoned after this long and the next HA member is tried. `0` = none. Covers the TCP connect only; the TLS handshake and the response are bounded by the 30 s request timeout |
 | `keepalive` | usize | `64` | Max idle keepalive connections |
 | `tls` | bool | `false` | Use HTTPS to connect to upstream |
 | `client_cert_path` / `client_key_path` | string? | none | Client cert + key for mTLS from Zion to the upstream |

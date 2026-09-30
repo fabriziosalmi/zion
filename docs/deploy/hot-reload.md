@@ -59,7 +59,7 @@ These three rules answer "what happens if I…" deterministically; nothing on th
 
 These do not hot-reload — they require a process restart:
 
-- The path of `[tls]` cert/key files in `zion.toml` itself — the cert *content* hot-reloads (TLS watcher reads the current path on each reload), but if you point `cert_path` at a brand-new file, the TLS watcher is still subscribed to the old directory until restart.
+- The path of `[tls]` cert/key files in `zion.toml` itself — the cert *content* hot-reloads, but the TLS watcher stays subscribed to the boot-time directories. A reload that changes `tls.cert_path` or `tls.key_path` is therefore **rejected** (`reload REJECTED (tls.cert_path changed …)`, counted in `zion_config_reload_failures_total`) and the running config is left untouched, instead of being accepted while renewals written to the new path are never picked up. Move the files, or restart to change the paths.
 - `[server.log_format]` — read once at startup by `logging::init`. Restart to switch between `text` and `json`.
 - HTTP/3 listener (`--features http3`) — currently rebuilds on TLS reload only; config-side QUIC settings (incl. listen address) are not hot-applied.
 - `[tls.acme]` (with `--features acme`) — the renewal task is spawned at boot from the initial config; changing email / domains / state_dir requires restart.

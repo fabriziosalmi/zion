@@ -574,12 +574,12 @@ pub struct UpstreamConfig {
     pub url: Option<String>,
     #[serde(default)]
     pub urls: Vec<String>,
-    /// Advisory only, for now. The shared pooled HTTP client is built once for
-    /// all upstreams, so this per-upstream connect deadline is NOT yet applied
-    /// to its connector — the connect phase is bounded by the overall
-    /// `UPSTREAM_REQUEST_TIMEOUT` (30s) instead. Set it for intent/forward
-    /// compatibility, but don't rely on a sub-second value speeding failover
-    /// against a black-holed upstream until it is wired to the connector.
+    /// TCP connect deadline for this upstream, in milliseconds (default 3000, `0`
+    /// = none). It is applied to the connector of the HTTP client used for routes
+    /// that point here, so a black-holed member (packets dropped, no RST) is
+    /// abandoned after this long and the next HA member is tried, instead of
+    /// costing the full 30s request timeout per attempt. It covers the TCP connect
+    /// only; the TLS handshake and the response are bounded by that 30s timeout.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_ms: u64,
     #[serde(default = "default_keepalive")]
@@ -604,7 +604,7 @@ impl UpstreamConfig {
     }
 }
 
-fn default_connect_timeout() -> u64 {
+pub(crate) fn default_connect_timeout() -> u64 {
     3000
 }
 fn default_keepalive() -> usize {

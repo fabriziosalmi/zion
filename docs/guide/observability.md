@@ -20,7 +20,7 @@ The `tracing` crate is initialized at boot. Filtering follows `RUST_LOG` (full `
 
 | `log_format` | Output |
 |---|---|
-| `text` *(default)* | pretty multi-line, ANSI-colored on a TTY |
+| `text` *(default)* | on a TTY: pretty, ANSI-colored. When stderr is **not** a terminal (journald, `docker logs`, a file): one line per event, `<UTC timestamp> <LEVEL> <event>: <message>`, so lines can be ordered and filtered by subsystem |
 | `json` | one JSON object per line — wire-compatible with Loki / ELK / Datadog |
 
 ### W3C Trace Context propagation

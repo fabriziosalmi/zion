@@ -38,6 +38,40 @@ upgrading.
   `LimitCORE=0`. Not covered: copies inside `hmac::Key` / `jsonwebtoken`, and the
   process environment itself.
 
+### Observability
+
+- **Config reload failures are visible.** `zion_config_reload_failures_total` and
+  `zion_config_last_reload_success_timestamp_seconds`: a rejected or panicked
+  reload (file watcher and admin API) left the old config serving with nothing on
+  `/metrics`, and `zion_config_generation` cannot tell "rejected" from "nobody
+  reloaded".
+- **Per-upstream health on `/metrics`.** `zion_upstream_up{upstream}` (one series
+  per configured upstream, read live, sorted; userinfo stripped from the label)
+  and `zion_upstream_failovers_total`. Previously an ejected backend or a silent
+  failover was visible only in the JSON snapshot and the TUI.
+- **Text logs are orderable off a terminal.** When stderr is not a TTY, text-mode
+  lines are `<UTC timestamp> <LEVEL> <event>: <message>`; on a TTY they are
+  unchanged. JSON mode is unchanged.
+
+### Changed (behaviour)
+
+- **`connect_timeout_ms` is now enforced.** It was parsed and defaulted to 3000 but
+  never applied, so a black-holed upstream (packets dropped, no RST) cost the full
+  30s request timeout on every HA failover attempt. It is now set on the HTTP
+  connector (one client per distinct value, created on first use so pools survive
+  reloads); `0` disables it. It covers the TCP connect only. Measured on a
+  black-holed address: 0.31s with a 300ms deadline, versus running to the
+  10s test cap without one. Configs that set an aggressive value now fail over
+  that fast, which is the point, but a value below your upstream's real connect
+  latency will now cause failovers.
+- **`--features io-uring-accept`: a reload that moves `listen_https` is now
+  rejected** (was: accepted, and only warned by the supervisor, leaving the running
+  socket contradicting the published config).
+- **A reload that changes `tls.cert_path` / `tls.key_path` is now rejected** (was:
+  accepted with a WARN while the TLS watcher kept watching the boot-time paths, so
+  renewals at the new path were never picked up). The running config is untouched;
+  change the paths with a restart.
+
 ### Fixed
 
 - **Audit log: bounded power-loss window.** Records were only flushed to the OS

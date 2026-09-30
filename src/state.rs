@@ -356,7 +356,13 @@ pub(crate) struct AppState {
     /// whole `AppState`.
     pub(crate) config: Arc<ArcSwap<ResolvedAppConfig>>,
     pub(crate) tls_acceptor: Arc<ArcSwap<tokio_rustls::TlsAcceptor>>,
+    /// Client for the default connect deadline (also used by the health prober).
     pub(crate) http_client: HttpClient,
+    /// Clients for every other `connect_timeout_ms` in use, built on first use.
+    /// A connector has one connect deadline, so upstreams with different values
+    /// need different clients; keeping them here (not in the reloadable config
+    /// snapshot) means their connection pools survive a hot reload.
+    pub(crate) http_clients: dashmap::DashMap<u64, HttpClient>,
     pub(crate) static_cache: cache::StaticCache,
     pub(crate) conn_limit: Arc<Semaphore>,
     pub(crate) http_builder: Arc<AutoBuilder<TokioExecutor>>,
@@ -399,5 +405,21 @@ impl AppState {
     #[inline]
     pub(crate) fn cfg(&self) -> Arc<ResolvedAppConfig> {
         self.config.load_full()
+    }
+
+    /// The pooled HTTP client whose connector enforces `connect_timeout_ms` (the
+    /// route's `[upstream.*] connect_timeout_ms`). Cheap: `HttpClient` is a
+    /// reference-counted handle onto the shared pool.
+    pub(crate) fn client_for(&self, connect_timeout_ms: u64) -> HttpClient {
+        if connect_timeout_ms == crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS {
+            return self.http_client.clone();
+        }
+        if let Some(c) = self.http_clients.get(&connect_timeout_ms) {
+            return c.clone();
+        }
+        self.http_clients
+            .entry(connect_timeout_ms)
+            .or_insert_with(|| crate::proxy::build_http_client(connect_timeout_ms))
+            .clone()
     }
 }

@@ -57,6 +57,21 @@ use tokio::sync::Notify;
 /// generation 0; the first successful reload makes it 1).
 pub(crate) static CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Reloads that were rejected or that panicked (file watcher and admin API). The
+/// old snapshot keeps serving, so without this an operator who pushes a bad
+/// `zion.toml` sees nothing on `/metrics`: `zion_config_generation` only counts
+/// successes and cannot tell "rejected" from "nobody reloaded".
+pub(crate) static CONFIG_RELOAD_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Unix time of the last successful reload (0 until the first one).
+pub(crate) static CONFIG_LAST_RELOAD_SUCCESS_TS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn reload_failures() -> u64 {
+    CONFIG_RELOAD_FAILURES.load(Ordering::Relaxed)
+}
+pub(crate) fn last_reload_success_timestamp() -> u64 {
+    CONFIG_LAST_RELOAD_SUCCESS_TS.load(Ordering::Relaxed)
+}
+
 /// Read the current config generation. Cheap (Relaxed load).
 #[inline]
 pub(crate) fn current_generation() -> u64 {
@@ -122,34 +137,64 @@ pub(crate) fn reload_now(
     boot_tls_cert_path: Option<&str>,
     boot_tls_key_path: Option<&str>,
 ) -> Result<u64, String> {
+    // Every reload, from either caller, is accounted for here so a rejection is
+    // visible on /metrics and not only as a stderr line.
+    let result = reload_now_inner(
+        source,
+        state_config,
+        conn_limit_max,
+        change_notifier,
+        boot_tls_cert_path,
+        boot_tls_key_path,
+    );
+    match &result {
+        Ok(_) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            CONFIG_LAST_RELOAD_SUCCESS_TS.store(now, Ordering::Relaxed);
+        }
+        Err(_) => {
+            CONFIG_RELOAD_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    result
+}
+
+fn reload_now_inner(
+    source: ConfigSource,
+    state_config: &Arc<ArcSwap<ResolvedAppConfig>>,
+    conn_limit_max: usize,
+    change_notifier: Option<&tokio::sync::watch::Sender<u64>>,
+    boot_tls_cert_path: Option<&str>,
+    boot_tls_key_path: Option<&str>,
+) -> Result<u64, String> {
     // 1. Resolve + validate the new config (file read or in-memory body).
     let new_config = match source {
         ConfigSource::File(path) => config::load_config(&path.to_string_lossy())?,
         ConfigSource::Body(body) => config::validate_str(&body, "admin push")?,
     };
 
-    // Warn if [tls] paths changed: the TLS file-watcher still points at the
-    // boot-time paths, so a cert/key path change needs a restart to take hold.
+    // Refuse a reload that moves the [tls] cert/key paths. The TLS file watcher is
+    // bound to the boot-time paths, so renewals written to a new path would never
+    // be picked up and the proxy would keep serving the old certificate until it
+    // expired, with only a warning as a signal. Rejecting keeps the running config
+    // and its watcher consistent; move the files and restart to change the paths.
     if let Some(boot_cert) = boot_tls_cert_path {
         if new_config.tls.cert_path != boot_cert {
-            logging::warn(
-                "reload",
-                &format!(
-                    "tls.cert_path changed ({boot_cert} → {}) — restart required for the TLS watcher to use the new path",
-                    new_config.tls.cert_path
-                ),
-            );
+            return Err(format!(
+                "tls.cert_path changed ({boot_cert} → {}): the TLS watcher is bound to the boot-time path, so changing it needs a restart — reload rejected, running config unchanged",
+                new_config.tls.cert_path
+            ));
         }
     }
     if let Some(boot_key) = boot_tls_key_path {
         if new_config.tls.key_path != boot_key {
-            logging::warn(
-                "reload",
-                &format!(
-                    "tls.key_path changed ({boot_key} → {}) — restart required for the TLS watcher to use the new path",
-                    new_config.tls.key_path
-                ),
-            );
+            return Err(format!(
+                "tls.key_path changed ({boot_key} → {}): the TLS watcher is bound to the boot-time path, so changing it needs a restart — reload rejected, running config unchanged",
+                new_config.tls.key_path
+            ));
         }
     }
 
@@ -164,6 +209,15 @@ pub(crate) fn reload_now(
         Ok(Err(e)) => return Err(format!("rebuild rejected new config: {e}")),
         Err(_) => return Err("rebuild panicked (router construction failed)".to_string()),
     };
+
+    // io-uring flavour: the accept thread is bound to the boot-time HTTPS socket
+    // and is never respawned, so a changed `listen_https` cannot take effect.
+    // Accepting the reload would publish a config the running socket contradicts
+    // (and only WARN in the supervisor), so reject it here, before the swap.
+    #[cfg(all(target_os = "linux", feature = "io-uring-accept"))]
+    if let Some(e) = https_rebind_unsupported(previous.listen_https, snapshot.listen_https) {
+        return Err(e);
+    }
 
     // A [tls.fingerprint] posture flip is a security change an operator wants
     // positively confirmed. The posture is (mode, on_unknown,
@@ -196,6 +250,26 @@ pub(crate) fn reload_now(
         let _ = tx.send(gen);
     }
     Ok(gen)
+}
+
+/// The reason a reload must be refused because it moves the HTTPS listener in a
+/// build that cannot rebind it (`--features io-uring-accept`), or `None` when the
+/// address is unchanged or unknown. Pure and compiled everywhere so it is tested
+/// on every platform; only the io-uring build calls it.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "io-uring-accept")),
+    allow(dead_code)
+)]
+fn https_rebind_unsupported(
+    running: Option<std::net::SocketAddr>,
+    wanted: Option<std::net::SocketAddr>,
+) -> Option<String> {
+    match (running, wanted) {
+        (Some(old), Some(new)) if old != new => Some(format!(
+            "listen_https changed ({old} → {new}): this build (--features io-uring-accept) cannot rebind the HTTPS listener on reload — reload rejected, running config unchanged; restart to move it"
+        )),
+        _ => None,
+    }
 }
 
 /// Spawn the config-file watcher. Returns immediately; the actual
@@ -330,10 +404,14 @@ pub(crate) fn spawn_config_watcher(
                     "config_watcher",
                     &format!("reload REJECTED ({e}), keeping previous snapshot"),
                 ),
-                Err(join_err) => logging::warn(
-                    "config_watcher",
-                    &format!("reload task panicked: {join_err}, keeping previous snapshot"),
-                ),
+                Err(join_err) => {
+                    // The task died before reload_now could account for it.
+                    CONFIG_RELOAD_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    logging::warn(
+                        "config_watcher",
+                        &format!("reload task panicked: {join_err}, keeping previous snapshot"),
+                    )
+                }
             }
         }
     });
@@ -795,6 +873,114 @@ mod tests {
         .expect("a valid body must reload");
         assert!(gen > before, "generation must advance: {gen} !> {before}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_moved_https_listener_is_refused_where_rebind_is_unsupported() {
+        // ZION-REL-04 (io-uring flavour): refuse instead of accept-and-not-apply.
+        let a: std::net::SocketAddr = "0.0.0.0:8443".parse().unwrap();
+        let b: std::net::SocketAddr = "0.0.0.0:9443".parse().unwrap();
+        assert!(
+            https_rebind_unsupported(Some(a), Some(a)).is_none(),
+            "unchanged"
+        );
+        assert!(
+            https_rebind_unsupported(Some(a), None).is_none(),
+            "unparsed: keep"
+        );
+        assert!(
+            https_rebind_unsupported(None, Some(b)).is_none(),
+            "nothing bound"
+        );
+        let e = https_rebind_unsupported(Some(a), Some(b)).unwrap();
+        assert!(
+            e.contains("0.0.0.0:8443") && e.contains("0.0.0.0:9443") && e.contains("restart"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn reload_now_counts_failures_and_stamps_successes() {
+        use arc_swap::ArcSwap;
+        let v0 = parse_inline(TOML_V1);
+        let snap0 = ResolvedAppConfig::try_build(&v0, TEST_CONN_LIMIT_MAX).unwrap();
+        let store = Arc::new(ArcSwap::from_pointee(snap0));
+        // Counters are process-global and other tests reload too, so assert on
+        // monotonic movement, not exact values.
+        let before = reload_failures();
+        let r = reload_now(
+            ConfigSource::Body("not toml [".into()),
+            &store,
+            TEST_CONN_LIMIT_MAX,
+            None,
+            None,
+            None,
+        );
+        assert!(r.is_err());
+        assert!(
+            reload_failures() > before,
+            "a rejected reload must be counted"
+        );
+    }
+
+    #[test]
+    fn reload_now_rejects_a_change_of_the_tls_paths() {
+        use arc_swap::ArcSwap;
+        let dir = std::env::temp_dir().join(format!("zion-reload-tlspath-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("c.crt");
+        let key = dir.join("k.key");
+        std::fs::write(&cert, b"-").unwrap();
+        std::fs::write(&key, b"-").unwrap();
+        let body = format!(
+            "[server]\nlisten_http=\"0.0.0.0:8080\"\nlisten_https=\"0.0.0.0:8443\"\n\
+             [tls]\ncert_path='{}'\nkey_path='{}'\n\
+             [upstreams]\napi=\"http://api:8000\"\n\
+             [[route]]\npath=\"/api/{{*rest}}\"\nupstream=\"api\"\n",
+            cert.display(),
+            key.display()
+        );
+        let snap0 =
+            ResolvedAppConfig::try_build(&parse_inline(&body), TEST_CONN_LIMIT_MAX).unwrap();
+        let store = Arc::new(ArcSwap::from_pointee(snap0));
+        let live_before = store.load_full();
+        let before = reload_failures();
+
+        // Same paths as boot: accepted.
+        assert!(reload_now(
+            ConfigSource::Body(body.clone()),
+            &store,
+            TEST_CONN_LIMIT_MAX,
+            None,
+            Some(&cert.to_string_lossy()),
+            Some(&key.to_string_lossy()),
+        )
+        .is_ok());
+        // Boot had a different cert path than the pushed config: rejected.
+        let live_ok = store.load_full();
+        let e = reload_now(
+            ConfigSource::Body(body),
+            &store,
+            TEST_CONN_LIMIT_MAX,
+            None,
+            Some("/etc/ssl/old/c.crt"),
+            Some(&key.to_string_lossy()),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("tls.cert_path changed") && e.contains("restart"),
+            "{e}"
+        );
+        assert!(
+            Arc::ptr_eq(&live_ok, &store.load_full()),
+            "snapshot must not change"
+        );
+        assert!(
+            !Arc::ptr_eq(&live_before, &live_ok),
+            "the accepted reload did swap"
+        );
+        assert!(reload_failures() > before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

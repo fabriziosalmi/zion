@@ -5,6 +5,12 @@
 //!   - "text": human-readable (default, for development)
 //!   - "json": machine-parseable (for production, Loki/ELK/Datadog)
 //!
+//! In text mode when stderr is NOT a terminal (journald, `docker logs`, a file,
+//! a pipe) every line carries a UTC timestamp, a level and the event key
+//! (`2026-09-30T06:26:36.771169Z WARN upstream: ...`), so incident logs can be
+//! ordered and filtered by subsystem without a wrapper adding timestamps. On a
+//! TTY the human-oriented format below is unchanged.
+//!
 //! In text mode on a TTY, warnings and errors get a colored glyph prefix
 //! (`⚠` amber for warn, `✖` red for error) so they don't drown in the rest
 //! of the boot output. ANSI is suppressed when stderr is not a terminal,
@@ -18,6 +24,8 @@ use std::sync::OnceLock;
 
 static JSON_MODE: OnceLock<bool> = OnceLock::new();
 static COLOR_TTY: OnceLock<bool> = OnceLock::new();
+/// True in text mode when stderr is not a terminal: lines get ts + level + event.
+static STAMPED: OnceLock<bool> = OnceLock::new();
 
 /// Initialize the logger. Call once at startup.
 pub fn init(format: &str) {
@@ -26,6 +34,16 @@ pub fn init(format: &str) {
         std::env::var_os("NO_COLOR").is_some() || std::env::var_os("ZION_BOOT_PLAIN").is_some();
     let color = !plain && std::io::stderr().is_terminal();
     COLOR_TTY.set(color).ok();
+    STAMPED.set(!std::io::stderr().is_terminal()).ok();
+}
+
+fn is_stamped() -> bool {
+    *STAMPED.get().unwrap_or(&false)
+}
+
+/// One machine-friendly text line: `<ts> <LEVEL> <event>: <msg>`.
+fn format_stamped(ts: &str, level: &str, event: &str, msg: &str) -> String {
+    format!("{ts} {level:<5} {event}: {msg}")
 }
 
 fn is_json() -> bool {
@@ -45,6 +63,8 @@ pub fn info(event: &str, msg: &str) {
             escape(event),
             escape(msg)
         );
+    } else if is_stamped() {
+        eprintln!("{}", format_stamped(&now(), "INFO", event, msg));
     } else {
         eprintln!("{msg}");
     }
@@ -54,14 +74,22 @@ pub fn info(event: &str, msg: &str) {
 /// a bold amber `⚠ warning:` so operators spot it amid the boot stream.
 #[allow(dead_code)]
 pub fn warn(event: &str, msg: &str) {
-    eprintln!("{}", format_warn(is_json(), want_color(), event, msg));
+    if !is_json() && is_stamped() {
+        eprintln!("{}", format_stamped(&now(), "WARN", event, msg));
+    } else {
+        eprintln!("{}", format_warn(is_json(), want_color(), event, msg));
+    }
 }
 
 /// Log an error-level event. In text+TTY mode prefixed with a bold red
 /// `✖ error:` for maximum salience.
 #[allow(dead_code)]
 pub fn error(event: &str, msg: &str) {
-    eprintln!("{}", format_error(is_json(), want_color(), event, msg));
+    if !is_json() && is_stamped() {
+        eprintln!("{}", format_stamped(&now(), "ERROR", event, msg));
+    } else {
+        eprintln!("{}", format_error(is_json(), want_color(), event, msg));
+    }
 }
 
 /// Build the warning-line string. Extracted from `warn()` so tests can
@@ -132,6 +160,19 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stamped_text_line_has_timestamp_level_and_event() {
+        // ZION-OBS-04: a non-TTY text log must be orderable and filterable.
+        let line = format_stamped(&now(), "WARN", "upstream", "http://b:1 is DOWN");
+        let (ts, rest) = line.split_once(' ').unwrap();
+        assert_eq!(ts.len(), 27, "ISO-8601 UTC with microseconds: {ts}");
+        assert!(ts.ends_with('Z') && ts.as_bytes()[10] == b'T');
+        assert_eq!(rest, "WARN  upstream: http://b:1 is DOWN");
+        // levels align on a fixed column
+        assert!(format_stamped("t", "INFO", "e", "m").starts_with("t INFO  e: m"));
+        assert!(format_stamped("t", "ERROR", "e", "m").starts_with("t ERROR e: m"));
+    }
 
     #[test]
     fn now_returns_iso8601_format() {

@@ -500,7 +500,7 @@ async fn process_request_inner(
             } else {
                 "text/plain; version=0.0.4; charset=utf-8"
             };
-            let body = metrics::METRICS.render(openmetrics);
+            let body = metrics::METRICS.render_with_upstreams(openmetrics, &state.cfg().health_map);
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", content_type)
@@ -1282,7 +1282,7 @@ async fn process_request_inner(
             }
             config::RouteMode::SseStream => {
                 proxy::proxy_pass_stream(
-                    &state.http_client,
+                    &state.client_for(rule.connect_timeout_ms),
                     req,
                     &dyn_scheme,
                     &dyn_authority,
@@ -1294,7 +1294,7 @@ async fn process_request_inner(
             }
             config::RouteMode::Standard => {
                 proxy::proxy_pass_ha(
-                    &state.http_client,
+                    &state.client_for(rule.connect_timeout_ms),
                     req,
                     &rule.upstream_url,
                     &dyn_scheme,
@@ -1308,7 +1308,7 @@ async fn process_request_inner(
             }
             config::RouteMode::Websocket => {
                 proxy::proxy_pass(
-                    &state.http_client,
+                    &state.client_for(rule.connect_timeout_ms),
                     req,
                     &dyn_scheme,
                     &dyn_authority,
@@ -1758,7 +1758,7 @@ async fn handle_static_cache(
     // would later be served to a GET (method-confusion cache poisoning).
     if *req.method() != hyper::Method::GET {
         return proxy::proxy_pass(
-            &state.http_client,
+            &state.client_for(rule.connect_timeout_ms),
             req,
             dyn_scheme,
             dyn_authority,
@@ -1883,7 +1883,7 @@ async fn handle_static_cache(
     // (channel closed without receiving `true`), they re-check the cache,
     // miss, and fall through to fetch themselves.
     let resp = match proxy::proxy_pass(
-        &state.http_client,
+        &state.client_for(rule.connect_timeout_ms),
         req,
         dyn_scheme,
         dyn_authority,

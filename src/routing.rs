@@ -25,6 +25,9 @@ use std::sync::Arc;
 pub struct ResolvedRoute {
     #[allow(dead_code)]
     pub upstream_url: Vec<String>,
+    /// TCP connect deadline for this route's upstream (ms; 0 = none). Selects the
+    /// HTTP client whose connector enforces it — see `AppState::client_for`.
+    pub connect_timeout_ms: u64,
     /// Pre-parsed URI parts — avoids full URI parse on every request.
     pub upstream_scheme: hyper::http::uri::Scheme,
     pub upstream_authority: hyper::http::uri::Authority,
@@ -450,6 +453,11 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
 
     Ok(Arc::new(ResolvedRoute {
         upstream_url,
+        connect_timeout_ms: config
+            .upstream
+            .get(route.upstream.as_str())
+            .map(|u| u.connect_timeout_ms)
+            .unwrap_or(crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS),
         upstream_scheme,
         upstream_authority,
         mode: route.mode.clone(),

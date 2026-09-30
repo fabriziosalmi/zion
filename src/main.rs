@@ -664,7 +664,8 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     let state = Arc::new(AppState {
         config: Arc::new(ArcSwap::from_pointee(resolved)),
         tls_acceptor: tls_acceptor_store,
-        http_client: proxy::build_http_client(),
+        http_client: proxy::build_http_client(proxy::DEFAULT_CONNECT_TIMEOUT_MS),
+        http_clients: dashmap::DashMap::new(),
         static_cache: cache::StaticCache::new(),
         conn_limit: Arc::new(Semaphore::new(platform.conn_limit)),
         acme_challenges: acme::new_challenge_store(),
@@ -1777,7 +1778,7 @@ async fn handle_http(
         };
         if let Some(rule) = rule {
             return proxy::proxy_pass(
-                &state.http_client,
+                &state.client_for(rule.connect_timeout_ms),
                 req,
                 &rule.upstream_scheme,
                 &rule.upstream_authority,
