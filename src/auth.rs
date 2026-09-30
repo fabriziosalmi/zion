@@ -39,6 +39,8 @@ pub struct Claims {
     pub exp: Option<u64>,
     /// Not before (Unix timestamp)
     pub nbf: Option<u64>,
+    /// Token id. Only a token that carries one can be revoked (`POST /admin/revoke`).
+    pub jti: Option<String>,
 }
 
 /// The `aud` claim: one audience or several.
@@ -188,6 +190,8 @@ pub enum AuthError {
     InvalidToken(String),
     /// Token has expired
     Expired,
+    /// Token id was revoked through the admin API
+    Revoked,
 }
 
 /// Extract Bearer token from Authorization header.
@@ -207,6 +211,51 @@ pub fn extract_bearer(auth_header: &str) -> Option<&str> {
         None
     } else {
         Some(token)
+    }
+}
+
+/// In-memory denylist of revoked token ids (`jti`). Per instance and lost on
+/// restart: an entry only has to outlive the token, so each carries the token's own
+/// expiry and is dropped after it. A token without a `jti` cannot be revoked.
+pub mod revocation {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Upper bound on live entries; a full list refuses new ones rather than grow.
+    pub const MAX_ENTRIES: usize = 100_000;
+
+    fn list() -> &'static Mutex<HashMap<String, u64>> {
+        static L: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+        L.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Revoke `jti` until `exp` (Unix seconds). Returns the live entry count.
+    pub fn revoke(jti: &str, exp: u64) -> Result<usize, &'static str> {
+        if jti.is_empty() || jti.len() > 256 {
+            return Err("jti must be 1..=256 bytes");
+        }
+        let mut m = list().lock().unwrap_or_else(|e| e.into_inner());
+        let t = now();
+        m.retain(|_, e| *e > t);
+        if m.len() >= MAX_ENTRIES && !m.contains_key(jti) {
+            return Err("revocation list is full");
+        }
+        m.insert(jti.to_string(), exp);
+        Ok(m.len())
+    }
+
+    /// True when `jti` is on the list and its token could still be valid.
+    #[cfg_attr(not(feature = "auth"), allow(dead_code))] // read only by the auth gate
+    pub fn is_revoked(jti: &str) -> bool {
+        let m = list().lock().unwrap_or_else(|e| e.into_inner());
+        m.get(jti).is_some_and(|e| *e > now())
     }
 }
 
@@ -254,6 +303,12 @@ pub fn validate_token(token: &str, profile: &ResolvedAuthProfile) -> Result<Clai
                 AuthError::InvalidToken(msg)
             }
         })?;
+
+    if let Some(jti) = token_data.claims.jti.as_deref() {
+        if revocation::is_revoked(jti) {
+            return Err(AuthError::Revoked);
+        }
+    }
 
     // Bound how long a token can be valid for. There is no revocation list, so
     // without this a token with a far-future `exp` (or a stolen one) stays valid
@@ -464,6 +519,71 @@ mod tests {
         assert_eq!(extract_bearer("BearerToken"), None);
     }
 
+    #[test]
+    fn revocation_denies_until_expiry_and_is_bounded() {
+        use super::revocation::*;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(!is_revoked("rev-test-a"));
+        revoke("rev-test-a", now + 60).unwrap();
+        assert!(is_revoked("rev-test-a"));
+        assert!(!is_revoked("rev-test-other"), "only the named id");
+        // an entry whose token has already expired no longer counts
+        revoke("rev-test-old", now.saturating_sub(5)).unwrap();
+        assert!(!is_revoked("rev-test-old"));
+        assert!(revoke("", now + 60).is_err());
+        assert!(revoke(&"x".repeat(257), now + 60).is_err());
+    }
+
+    #[cfg(feature = "auth")]
+    #[test]
+    fn a_revoked_token_is_refused_even_though_it_verifies() {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        let secret = "test-secret-key-for-zion";
+        let mk = |jti: Option<&str>| {
+            let claims = Claims {
+                sub: Some("u".into()),
+                email: None,
+                iss: Some("zion-test".into()),
+                aud: Some("api.zion.dev".into()),
+                exp: Some(u64::MAX),
+                nbf: Some(0),
+                jti: jti.map(str::to_string),
+            };
+            encode(
+                &Header::default(),
+                &claims,
+                &EncodingKey::from_secret(secret.as_bytes()),
+            )
+            .unwrap()
+        };
+        let config = AuthProfileConfig {
+            issuer: Some("zion-test".into()),
+            audience: Some("api.zion.dev".into()),
+            secret: Some(secret.into()),
+            secret_env: None,
+            jwks_url: None,
+            algorithm: "HS256".into(),
+            forward_claims: false,
+            leeway_secs: 30,
+            max_token_lifetime_secs: None,
+        };
+        let profile = resolve_auth_profile(&config).unwrap();
+        let (with, without) = (mk(Some("rev-test-token-1")), mk(None));
+        assert!(validate_token(&with, &profile).is_ok());
+        revocation::revoke("rev-test-token-1", u64::MAX).unwrap();
+        assert!(matches!(
+            validate_token(&with, &profile),
+            Err(AuthError::Revoked)
+        ));
+        assert!(
+            validate_token(&without, &profile).is_ok(),
+            "a token with no jti cannot be revoked (documented)"
+        );
+    }
+
     #[cfg(feature = "auth")]
     #[test]
     fn validate_hmac_token_roundtrip() {
@@ -477,6 +597,7 @@ mod tests {
             aud: Some("api.zion.dev".into()),
             exp: Some(u64::MAX), // far future
             nbf: Some(0),
+            jti: None,
         };
 
         let token = encode(
@@ -518,6 +639,7 @@ mod tests {
             aud: None,
             exp: Some(u64::MAX),
             nbf: Some(0),
+            jti: None,
         };
 
         let token = encode(
@@ -556,6 +678,7 @@ mod tests {
             aud: None,
             exp: Some(1000), // long past
             nbf: Some(0),
+            jti: None,
         };
 
         let token = encode(
@@ -598,6 +721,7 @@ mod tests {
             aud: None,
             exp: Some(u64::MAX),
             nbf: Some(0),
+            jti: None,
         };
         // Token signed with the ENV secret; a decoy literal that must be ignored.
         let token = encode(
@@ -670,6 +794,7 @@ mod tests {
             aud,
             exp: Some(exp),
             nbf: Some(0),
+            jti: None,
         };
         encode(
             &Header::default(),

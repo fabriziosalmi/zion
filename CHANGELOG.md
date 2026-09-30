@@ -9,6 +9,11 @@ All notable changes to Zion Edge Gateway are documented here.
 - **`zion audit verify <segment>...`** checks the HMAC chain of audit segments offline (#419). Exit `0` verified, `1` a segment failed, `2` usage/key error.
 - **`[server] rate_limit_max_tracked_ips`** (default `100000`, unchanged) sets how many distinct client IPs the per-IP rate limiter tracks (#424). At the cap stale entries are evicted; if all are live a new IP is denied.
 
+- **`[server] require_route_auth`** and **`[[route]] public`** (#417): with the flag on, every route must state its auth (`auth_profile`, `public = true` or `internal_only = true`) or the config is refused. Default off.
+- **`[admin] write_token_env`** (#417): mutating admin calls need a bearer token; reads do not. If the variable cannot be loaded the admin listener does not start.
+- **`[admin] persist_push`** (#419): a validated `POST /admin/config` is written back to `zion.toml`. Default off.
+- **`POST /admin/revoke`** (#418): deny a JWT by `jti` until its expiry. In-memory and per instance; only tokens with a `jti` can be revoked.
+
 ### Fixed
 
 - A failed cert rename in `write_cert_key_atomic` now puts the previous key back, so a partial write never leaves a new key beside the old cert (#423).

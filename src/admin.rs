@@ -98,6 +98,37 @@ pub(crate) struct AdminReloadCtx {
     pub(crate) boot_tls_cert: Option<String>,
     pub(crate) boot_tls_key: Option<String>,
     pub(crate) rate_limiter: AdminRateLimiter,
+    /// Bearer token every mutating call must present (`[admin] write_token_env`).
+    /// `None`: a peer that passed `auth` may write.
+    pub(crate) write_token: Option<zeroize::Zeroizing<Vec<u8>>>,
+    /// Write an accepted `POST /admin/config` body back to `config_path`.
+    pub(crate) persist_push: bool,
+}
+
+/// True when `header` is `Bearer <token>` and the token equals `expected`. The
+/// comparison does not short-circuit on the first differing byte.
+fn bearer_matches(expected: &[u8], header: Option<&str>) -> bool {
+    let Some(token) = header.and_then(crate::auth::extract_bearer) else {
+        return false;
+    };
+    aws_lc_rs::constant_time::verify_slices_are_equal(expected, token.as_bytes()).is_ok()
+}
+
+/// What `POST /admin/revoke` accepts.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeBody {
+    jti: String,
+    /// Unix seconds until which the id stays denied: the token's own `exp`.
+    /// Omitted: 24 hours from now.
+    exp: Option<u64>,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// How the admin listener authorizes connections.
@@ -134,7 +165,7 @@ pub(crate) fn spawn_admin_listener(
         };
         crate::logging::info(
             "admin",
-            &format!("admin API on {listen} (GET/POST /admin/config, POST /admin/reload; {mode})"),
+            &format!("admin API on {listen} (GET/POST /admin/config, POST /admin/reload, POST /admin/revoke; {mode})"),
         );
         loop {
             match listener.accept().await {
@@ -213,15 +244,91 @@ async fn handle(
     // Write endpoints (async + stateful) are handled here; the auth gate, the
     // read (GET /admin/config) and 404 stay in the pure, unit-tested `respond`.
     if authorized && req.method() == Method::POST {
+        if let Some(expected) = ctx.write_token.as_ref() {
+            let presented = req
+                .headers()
+                .get(hyper::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok());
+            if !bearer_matches(expected, presented) {
+                crate::observability::ADMIN_REJECTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                audit_denied_write(&state, peer, req.uri().path());
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("WWW-Authenticate", "Bearer")
+                    .header("Content-Type", "application/json; charset=utf-8")
+                    .body(Full::new(Bytes::from_static(
+                        b"{\"error\":\"write token required\"}\n",
+                    )))
+                    .unwrap());
+            }
+        }
         match req.uri().path() {
             // Push a full new config body → validate + atomic-swap via reload_now.
             "/admin/config" => {
-                let result = match read_body_string(req).await {
-                    Ok(toml) => reload_via(ConfigSource::Body(toml), &state, &ctx).await,
-                    Err(e) => Err(e),
+                let (result, persisted) = match read_body_string(req).await {
+                    Ok(toml) => {
+                        let r = reload_via(ConfigSource::Body(toml.clone()), &state, &ctx).await;
+                        // Only a config that validated and went live is written back.
+                        let p = match (&r, ctx.persist_push) {
+                            (Ok(_), true) => Some(crate::atomic_file::write_atomic_config(
+                                &ctx.config_path,
+                                toml.as_bytes(),
+                            )),
+                            _ => None,
+                        };
+                        (r, p)
+                    }
+                    Err(e) => (Err(e), None),
                 };
                 audit_write(&state, peer, "/admin/config", "config push", &result);
+                if let Some(Err(e)) = persisted {
+                    crate::logging::error(
+                        "admin",
+                        &format!("config applied but not persisted: {e}"),
+                    );
+                    return Ok(json_owned(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "{{\"error\":{}}}\n",
+                            json_string(&format!(
+                                "config is live but could not be written to disk (a restart will revert it): {e}"
+                            ))
+                        ),
+                    ));
+                }
                 return Ok(reload_response(result));
+            }
+            // Deny a token id until its own expiry (JWT revocation, #418).
+            "/admin/revoke" => {
+                let outcome = match read_body_string(req).await {
+                    Ok(body) => serde_json::from_str::<RevokeBody>(&body)
+                        .map_err(|e| {
+                            format!("body must be {{\"jti\":\"..\",\"exp\":<unix secs>}}: {e}")
+                        })
+                        .and_then(|b| {
+                            let exp = b.exp.unwrap_or_else(|| now_secs() + 86_400);
+                            crate::auth::revocation::revoke(&b.jti, exp)
+                                .map(|n| (b.jti, n))
+                                .map_err(str::to_string)
+                        }),
+                    Err(e) => Err(e),
+                };
+                return Ok(match outcome {
+                    Ok((jti, live)) => {
+                        audit_revoke(&state, peer, &format!("revoked jti of {} bytes", jti.len()));
+                        json_owned(
+                            StatusCode::OK,
+                            format!("{{\"revoked\":true,\"live_entries\":{live}}}\n"),
+                        )
+                    }
+                    Err(e) => {
+                        crate::observability::ADMIN_REJECTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        json_owned(
+                            StatusCode::BAD_REQUEST,
+                            format!("{{\"error\":{}}}\n", json_string(&e)),
+                        )
+                    }
+                });
             }
             // Re-read zion.toml from disk (skip the watcher's 2s debounce).
             "/admin/reload" => {
@@ -261,6 +368,32 @@ fn audit_write(
         method: Some("POST".to_string()),
         path: Some(path.to_string()),
         detail: Some(detail),
+    });
+}
+
+fn audit_denied_write(state: &AppState, peer: SocketAddr, path: &str) {
+    state.audit.emit(AuditEvent {
+        seq: 0,
+        ts: String::new(),
+        kind: audit::kind::ADMIN_ACCESS,
+        trace_id: None,
+        remote_ip: Some(peer.ip().to_string()),
+        method: Some("POST".to_string()),
+        path: Some(path.to_string()),
+        detail: Some("admin write refused: missing or wrong write token".to_string()),
+    });
+}
+
+fn audit_revoke(state: &AppState, peer: SocketAddr, detail: &str) {
+    state.audit.emit(AuditEvent {
+        seq: 0,
+        ts: String::new(),
+        kind: audit::kind::ADMIN_ACCESS,
+        trace_id: None,
+        remote_ip: Some(peer.ip().to_string()),
+        method: Some("POST".to_string()),
+        path: Some("/admin/revoke".to_string()),
+        detail: Some(detail.to_string()),
     });
 }
 
@@ -379,6 +512,14 @@ fn snapshot_body(state: &AppState) -> Bytes {
         .collect();
     rows.sort_by(|a, b| a.url.cmp(b.url));
     crate::metrics::snapshot_json(platform, &rows)
+}
+
+fn json_owned(status: StatusCode, body: String) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json; charset=utf-8")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap()
 }
 
 fn json(status: StatusCode, body: &'static [u8]) -> Response<Full<Bytes>> {

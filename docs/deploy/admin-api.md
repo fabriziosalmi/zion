@@ -11,6 +11,8 @@ It is **off by default**. With no `[admin]` block, no listener is spawned: zero 
 listen = "127.0.0.1:9180"   # default — loopback only
 auth = "internal-ip"        # default — see Authentication
 rate_limit_rps = 10         # default — global req/s ceiling
+# write_token_env = "ZION_ADMIN_WRITE_TOKEN"   # optional — see Write token
+# persist_push = false      # default — see Persisting a push
 ```
 
 Every field has the default shown, so a bare `[admin]` block is enough to turn it on with safe defaults. The block is validated at load: `listen` must be a real socket address, `auth` must be `internal-ip` or `mtls`, `rate_limit_rps` must be `> 0`, and `auth = "internal-ip"` requires a **loopback** `listen` (`127.0.0.1`, `::1`): it trusts every private-range peer, and that peer can replace the running config, so a routable or container-published bind needs `auth = "mtls"`. A typo fails fast at startup, exactly like the rest of `zion.toml`.
@@ -22,6 +24,7 @@ Every field has the default shown, so a bare `[admin]` block is enough to turn i
 | `GET`  | `/admin/config` | Return the live runtime snapshot (the same JSON as [`/_zion/snapshot.json`](/deploy/observability) — config generation, upstream health, metrics). Read-only. |
 | `POST` | `/admin/config` | Push a full new config body (TOML). Validate → atomic-swap → bump generation. |
 | `POST` | `/admin/reload` | Re-read `zion.toml` from disk (skips the watcher's 2 s debounce). |
+| `POST` | `/admin/revoke` | Deny a JWT by its `jti` until its expiry. Body `{"jti":"...","exp":<unix secs>}`; `exp` defaults to 24 h from now. See [token revocation](/config/auth#token-lifetime-and-revocation). |
 
 Any other method/path returns `404`.
 
@@ -63,6 +66,23 @@ $ curl -sX POST localhost:9180/admin/reload
 ```
 
 The `generation` in every success response is the new value of the `config_generation` counter — the same one surfaced on `/_zion/snapshot.json` and in metrics — so a deploy can confirm its change landed.
+
+## Write token
+
+`auth` decides who may talk to the listener at all. With `write_token_env` set, every **mutating** call (`POST /admin/config`, `/admin/reload`, `/admin/revoke`) must also carry `Authorization: Bearer <token>`, where the token is the value of that environment variable (at least 32 bytes). `GET /admin/config` stays under `auth` alone, so a monitoring client can read without being able to change anything.
+
+```console
+$ export ZION_ADMIN_WRITE_TOKEN="$(openssl rand -hex 32)"
+$ curl -X POST -H "Authorization: Bearer $ZION_ADMIN_WRITE_TOKEN" http://127.0.0.1:9180/admin/reload
+```
+
+A write without the token, or with a wrong one, gets `401`, is counted in `zion_admin_rejects_total`, and leaves an `admin_access` audit record. If `write_token_env` names a variable that is unset, empty or shorter than 32 bytes, **the admin listener does not start** (logged as an error): silently accepting writes from every peer that passes `auth` would be the opposite of what was asked.
+
+## Persisting a push
+
+By default `POST /admin/config` changes the running config only; a restart, or the next file reload, goes back to what is in `zion.toml`. With `persist_push = true` a push that **validated and went live** is also written to `zion.toml` (atomically, keeping the file's mode). A rejected push never touches the file. If the write fails the response is `500` and says the config is live but not saved.
+
+Turn it on only when the pushed config is meant to be the source of truth: a `zion.toml` that is generated or kept in git will be overwritten by whatever was last pushed.
 
 ## Authentication
 

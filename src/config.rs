@@ -114,6 +114,19 @@ pub struct AdminConfig {
     /// be > 0. Default 10.
     #[serde(default = "default_admin_rate_limit")]
     pub rate_limit_rps: u32,
+    /// Name of an environment variable holding a bearer token (>= 32 bytes) that
+    /// every MUTATING admin call (`POST /admin/config`, `/admin/reload`,
+    /// `/admin/revoke`) must present as `Authorization: Bearer <token>`, on top of
+    /// the `auth` mode. Reads (`GET /admin/config`) stay under `auth` alone, so a
+    /// monitoring client can hold read access without being able to change the
+    /// config. Unset (default): a peer that passes `auth` may write.
+    #[serde(default)]
+    pub write_token_env: Option<String>,
+    /// Write a config accepted by `POST /admin/config` back to `zion.toml`
+    /// (atomically, keeping the file's mode) so a restart does not revert it.
+    /// Default `false`: a push is live-only until the next reload or restart.
+    #[serde(default)]
+    pub persist_push: bool,
 }
 
 fn default_admin_listen() -> String {
@@ -201,6 +214,12 @@ pub struct ServerConfig {
     /// Max requests per IP per window. 0 = unlimited (default).
     #[serde(default)]
     pub rate_limit_rps: u32,
+    /// Refuse a config in which any route is neither protected nor declared open.
+    /// With `true`, every `[[route]]` must set `auth_profile`, or `public = true`
+    /// (deliberately unauthenticated), or `internal_only = true`. Default `false`
+    /// (routes without `auth_profile` are served unauthenticated, as before).
+    #[serde(default)]
+    pub require_route_auth: bool,
     /// Rate limit window in seconds. Default: 1.
     #[serde(default = "default_rate_window")]
     pub rate_limit_window_secs: u64,
@@ -773,6 +792,8 @@ struct RawRoute {
     csp: Option<String>,
     auth_profile: Option<String>,
     #[serde(default)]
+    public: bool,
+    #[serde(default)]
     waf: bool,
     max_body_mb: Option<u64>,
     #[serde(default)]
@@ -879,6 +900,11 @@ pub struct RouteConfig {
     /// If set, requests must carry a valid Bearer token.
     pub auth_profile: Option<String>,
 
+    /// Declares the route deliberately unauthenticated. Only meaningful with
+    /// `[server] require_route_auth = true`, where it is the explicit opt-out.
+    /// Cannot be combined with `auth_profile`.
+    pub public: bool,
+
     /// Per-route CORS configuration. If unset, no CORS headers are injected.
     pub cors: Option<CorsConfig>,
 }
@@ -962,6 +988,12 @@ impl TryFrom<RawRoute> for RouteConfig {
             }
         };
 
+        if r.public && r.auth_profile.is_some() {
+            return Err(format!(
+                "route '{path}' sets both `public = true` and `auth_profile` — pick one"
+            ));
+        }
+
         // ---- WAF: one policy, not three keys ----
         let waf = match (r.waf_profile, r.waf) {
             (Some(_), true) => {
@@ -996,6 +1028,7 @@ impl TryFrom<RawRoute> for RouteConfig {
             cache_profile: r.cache_profile,
             csp: r.csp,
             auth_profile: r.auth_profile,
+            public: r.public,
             cors: r.cors,
         })
     }
@@ -1439,6 +1472,19 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                     route.path, profile
                 ));
             }
+        }
+
+        if config.server.require_route_auth
+            && route.auth_profile.is_none()
+            && !route.public
+            && !route.internal_only
+        {
+            errors.push(format!(
+                "route '{}' has no auth_profile and [server] require_route_auth = true — \
+                 add `auth_profile`, or `public = true` to serve it unauthenticated on purpose \
+                 (or `internal_only = true`)",
+                route.path
+            ));
         }
 
         // Auth profile reference must exist
@@ -2402,6 +2448,55 @@ enabledd = true
             e.contains("enabledd") || e.contains("unknown field"),
             "error should name the unknown sub-table field, got: {e}"
         );
+    }
+
+    /// A config whose only interesting parts are `[server]` extras and the route table.
+    fn route_auth_cfg(server_extra: &str, routes: &str) -> String {
+        format!(
+            "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n{server_extra}\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [auth_profile.p]\nsecret=\"0123456789abcdef0123456789abcdef\"\nalgorithm=\"HS256\"\n{routes}"
+        )
+    }
+
+    #[test]
+    fn require_route_auth_demands_a_stated_choice_per_route() {
+        let open = "[[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        // off (default): an unprotected route is fine, as before
+        assert!(!validate_str(&route_auth_cfg("", open), "t")
+            .err()
+            .unwrap_or_default()
+            .contains("require_route_auth"));
+        // on: the same route is refused, and the message says how to fix it
+        let e = validate_str(&route_auth_cfg("require_route_auth=true", open), "t")
+            .err()
+            .unwrap_or_default();
+        assert!(
+            e.contains("require_route_auth") && e.contains("public = true"),
+            "{e}"
+        );
+        // each of the three explicit choices satisfies it
+        for ok in [
+            "[[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\nauth_profile=\"p\"\n",
+            "[[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\npublic=true\n",
+            "[[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\ninternal_only=true\n",
+        ] {
+            let e = validate_str(&route_auth_cfg("require_route_auth=true", ok), "t")
+                .err()
+                .unwrap_or_default();
+            assert!(!e.contains("require_route_auth"), "{ok}: {e}");
+        }
+    }
+
+    #[test]
+    fn public_and_auth_profile_together_are_refused() {
+        let both =
+            "[[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\npublic=true\nauth_profile=\"p\"\n";
+        let e = toml::from_str::<ZionConfig>(&route_auth_cfg("", both))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("public") && e.contains("auth_profile"), "{e}");
     }
 
     #[test]
