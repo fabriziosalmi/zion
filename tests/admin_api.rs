@@ -84,6 +84,12 @@ rate_limit_rps = 1000
     )
 }
 
+/// The same config with another `rate_limit_rps`: listen ports must not change, or a
+/// reload is refused on io-uring builds.
+fn with_rps(cfg: &str, rps: u32) -> String {
+    cfg.replace("rate_limit_rps = 0", &format!("rate_limit_rps = {rps}"))
+}
+
 fn boot(persist: bool) -> Option<(Daemon, u16, std::path::PathBuf, std::path::PathBuf)> {
     let dir = std::env::temp_dir().join(format!(
         "zion-admin-e2e-{}-{}",
@@ -195,7 +201,7 @@ fn persist_push_writes_only_what_validated() {
     let Some((_d, port, dir, cfg)) = boot(true) else {
         return;
     };
-    let good = config(&dir, port, 7, true);
+    let good = with_rps(&fs::read_to_string(&cfg).unwrap(), 7);
     let (st, body) = http(port, "POST", "/admin/config", Some(TOKEN), &good);
     assert_eq!(st, 200, "{body}");
     assert_eq!(
@@ -227,7 +233,7 @@ fn a_push_is_live_only_by_default() {
         return;
     };
     let original = fs::read_to_string(&cfg).unwrap();
-    let pushed = config(&dir, port, 9, false);
+    let pushed = with_rps(&original, 9);
     assert_eq!(
         http(port, "POST", "/admin/config", Some(TOKEN), &pushed).0,
         200
