@@ -188,7 +188,7 @@ pub fn validate_token(token: &str, profile: &ResolvedAuthProfile) -> Result<Clai
 ///
 /// Returns `Err` if the algorithm is unrecognised or if the profile
 /// configures neither `secret` (HMAC) nor `jwks_url` (OIDC). The error
-/// is a String so the caller (`config::build_router`) can wrap it with
+/// is a String so the caller (`routing::build_router`) can wrap it with
 /// the route/profile name in its own error format.
 #[cfg(feature = "auth")]
 pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthProfile, String> {

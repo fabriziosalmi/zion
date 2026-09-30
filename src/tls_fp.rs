@@ -1014,7 +1014,7 @@ fn classify(fp: &TlsFpRuntime, bans: &BanSet, parsed: Result<Ja4, TlsFpError>) -
 ///   `on_unfingerprintable = drop`; otherwise `Proceed`.
 pub async fn fingerprint_gate(
     stream: &tokio::net::TcpStream,
-    state: &crate::AppState,
+    state: &crate::state::AppState,
 ) -> GateOutcome {
     // Clone the resolved runtime out (a cheap Arc clone) and DROP the arc-swap
     // Guard before awaiting — never hold a config Guard across an await point.

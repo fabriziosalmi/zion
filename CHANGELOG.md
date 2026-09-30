@@ -4,6 +4,21 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Internal module boundaries (no behaviour change).** The crate root
+  (`main.rs`) no longer doubles as the shared kernel: `AppState`,
+  `ResolvedAppConfig` and the per-source limiters moved to `state.rs`, and the
+  request-ID/response helpers to `http_util.rs`, so `dispatch`, `listener`,
+  `admin`, `quic`, `tls_fp` and `reload` depend on those modules instead of the
+  file that wires them. Route resolution (`ResolvedRoute`, `HostRouter`,
+  `build_router`) moved from `config.rs` to `routing.rs`, leaving `config.rs` as
+  the serde schema plus validation. The 18 unit tests that exercise routing
+  internals moved with the code; the test count is unchanged (913).
+- Fix the `ResolvedAppConfig` doc comment, which still described the config
+  snapshot as a plain `Arc` with no swap; it is `Arc<ArcSwap<..>>` and is
+  reloaded by the `reload.rs` watcher.
+
 ## [0.8.4] - 2026-09-08
 
 **ACME renewal-loop liveness + owner-only cert-key writes.** A confirming

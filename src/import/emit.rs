@@ -195,7 +195,7 @@ fn toml_str(s: &str) -> String {
 pub fn self_validate(toml: &str) -> Result<(), String> {
     let cfg = crate::config::parse_schema(toml, "imported config")?;
     crate::config::validate_semantics(&cfg, "imported config")?;
-    crate::config::build_router_quiet(&cfg).map_err(|e| format!("router build failed: {e}"))?;
+    crate::routing::build_router_quiet(&cfg).map_err(|e| format!("router build failed: {e}"))?;
     Ok(())
 }
 

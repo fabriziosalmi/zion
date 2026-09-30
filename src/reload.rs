@@ -39,7 +39,7 @@
 use crate::config::{self, ZionConfig};
 use crate::health;
 use crate::logging;
-use crate::ResolvedAppConfig;
+use crate::state::ResolvedAppConfig;
 use arc_swap::ArcSwap;
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
@@ -173,7 +173,7 @@ pub(crate) fn reload_now(
     // of unrelated knobs stay silent (#27 commit 5).
     #[cfg(feature = "tls-fingerprint")]
     {
-        let posture_of = |c: &crate::ResolvedAppConfig| {
+        let posture_of = |c: &crate::state::ResolvedAppConfig| {
             c.tls_fingerprint
                 .as_ref()
                 .map(|fp| fp.posture())

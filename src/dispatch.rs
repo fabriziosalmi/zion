@@ -30,17 +30,16 @@
 
 use crate::audit;
 use crate::audit::AuditEvent;
-use crate::proxy::ZionBody;
-use crate::{
-    cache, config, health, logging, metrics, observability, proxy, security, waf, AppState,
-};
-use crate::{
+use crate::http_util::{
     empty_response, generate_request_id, inject_security_headers, method_not_allowed,
-    text_response, REQUEST_COUNTER,
+    text_response, HEX_DIGITS, REQUEST_COUNTER,
 };
+use crate::proxy::ZionBody;
+use crate::state::AppState;
+use crate::{cache, config, health, logging, metrics, observability, proxy, security, waf};
 // `unauthorized` is only referenced from the JWT/OIDC auth gate.
 #[cfg(feature = "auth")]
-use crate::unauthorized;
+use crate::http_util::unauthorized;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
@@ -50,7 +49,7 @@ use std::sync::Arc;
 #[cfg(feature = "auth")]
 use crate::auth;
 
-use crate::config::ResolvedRoute;
+use crate::routing::ResolvedRoute;
 use http_body_util::Limited;
 
 /// Issue #151: turn an enforcement *deny* into a bounded held (tarpit)
@@ -236,8 +235,8 @@ fn route_cache_key(host: Option<&str>, path: &str) -> u64 {
 fn trace_id_to_hex(bytes: &[u8; 16]) -> String {
     let mut s = String::with_capacity(32);
     for &b in bytes {
-        s.push(crate::HEX_DIGITS[(b >> 4) as usize] as char);
-        s.push(crate::HEX_DIGITS[(b & 0xF) as usize] as char);
+        s.push(HEX_DIGITS[(b >> 4) as usize] as char);
+        s.push(HEX_DIGITS[(b & 0xF) as usize] as char);
     }
     s
 }
@@ -1172,16 +1171,16 @@ async fn process_request_inner(
         let mut buf = [0u8; 55]; // "00-" + 32hex + "-" + 16hex + "-01"
         buf[0..3].copy_from_slice(b"00-");
         for (i, &byte) in tid.iter().enumerate() {
-            buf[3 + i * 2] = crate::HEX_DIGITS[(byte >> 4) as usize];
-            buf[3 + i * 2 + 1] = crate::HEX_DIGITS[(byte & 0xF) as usize];
+            buf[3 + i * 2] = HEX_DIGITS[(byte >> 4) as usize];
+            buf[3 + i * 2 + 1] = HEX_DIGITS[(byte & 0xF) as usize];
         }
         buf[35] = b'-';
         // span_id: same 8 trailing bytes — sequence is unique within a process
         // for the lifetime of `REQUEST_COUNTER`. A future change can split
         // span IDs from request IDs; for now they coincide.
         for i in 0..8 {
-            buf[36 + i * 2] = crate::HEX_DIGITS[(tid[8 + i] >> 4) as usize];
-            buf[36 + i * 2 + 1] = crate::HEX_DIGITS[(tid[8 + i] & 0xF) as usize];
+            buf[36 + i * 2] = HEX_DIGITS[(tid[8 + i] >> 4) as usize];
+            buf[36 + i * 2 + 1] = HEX_DIGITS[(tid[8 + i] & 0xF) as usize];
         }
         buf[52..55].copy_from_slice(b"-01");
         // SAFETY: all bytes are ASCII hex, '-', or '0'/'1'

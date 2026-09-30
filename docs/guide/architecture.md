@@ -7,9 +7,12 @@ Zion is a single async Rust binary built on Tokio, Hyper, and rustls. <!-- zion-
 
 ```text
 src/
-├── main.rs        # Entrypoint, HTTPS/HTTP listeners, connection handling, mTLS fingerprint extraction
+├── main.rs        # Composition root: boot, HTTPS/HTTP accept loops, connection handling, mTLS fingerprint extraction
+├── state.rs       # AppState, ResolvedAppConfig (ArcSwap snapshot) and the per-source limiters shared by every handler
+├── http_util.rs   # Request-ID generation and the small response builders (empty/text/405/401, security headers)
 ├── dispatch.rs    # Request pipeline: routing (LRU + radix), WAF gates, cache, CORS, metrics; thread-local route LRU lives here
-├── config.rs      # TOML parsing, validation, radix tree construction
+├── config.rs      # TOML schema (serde types), parsing and validation
+├── routing.rs     # Resolves the parsed routes into ResolvedRoute + the host-aware radix HostRouter
 ├── tls.rs         # TLS config, SNI resolution, session tickets, 0-RTT, hot-reload, predictive prewarming
 ├── waf.rs         # 5-gate WAF pipeline (Aho-Corasick balanced/aggressive, entropy, simd-json)
 ├── proxy.rs       # Upstream forwarding + XffMode policy (append/rewrite/drop), WebSocket TLS-to-upstream
