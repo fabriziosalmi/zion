@@ -59,6 +59,11 @@ pub fn render_counters(out: &mut bytes::BytesMut) {
             PANICS_TOTAL.load(Ordering::Relaxed),
         ),
         (
+            "zion_log_lines_dropped_total",
+            "Log lines dropped because the log sink (stderr) was slower than the log rate. Only with [server] log_queue_lines > 0.",
+            crate::logq::DROPPED.load(Ordering::Relaxed),
+        ),
+        (
             "zion_audit_events_total",
             "Total audit-log events emitted (signed + chained).",
             AUDIT_EVENTS_TOTAL.load(Ordering::Relaxed),
@@ -291,7 +296,8 @@ impl LogFormat {
 /// The OTLP layer is wired separately by `init_otel_layer()` when the
 /// `otel` feature is enabled — kept apart so toggling it doesn't risk
 /// double-installing the global subscriber.
-pub fn init_subscriber(format: LogFormat) {
+pub fn init_subscriber(format: LogFormat, log_queue_lines: usize) {
+    crate::logq::install(log_queue_lines, matches!(format, LogFormat::Json));
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("zion=info,warn"));
 
@@ -308,7 +314,7 @@ pub fn init_subscriber(format: LogFormat) {
                 .with_span_list(false)
                 .flatten_event(true)
                 .with_target(true)
-                .with_writer(std::io::stderr);
+                .with_writer(crate::logq::MakeLogWriter);
 
             #[cfg(feature = "otel")]
             if let Some(otel_layer) = otel::build_layer() {
@@ -332,7 +338,7 @@ pub fn init_subscriber(format: LogFormat) {
                 .with_target(true)
                 .with_thread_ids(false)
                 .with_thread_names(false)
-                .with_writer(std::io::stderr);
+                .with_writer(crate::logq::MakeLogWriter);
 
             #[cfg(feature = "otel")]
             if let Some(otel_layer) = otel::build_layer() {
@@ -384,6 +390,9 @@ pub fn install_panic_hook(last_gasp_path: Option<std::path::PathBuf>) {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             PANICS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            // Lines logged before the panic go out first, so the record below is in order
+            // (bounded: a stalled sink must not hold up the abort).
+            crate::logq::flush(std::time::Duration::from_millis(300));
 
             // Pull what we can without itself panicking.
             let payload = info

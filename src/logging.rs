@@ -54,19 +54,25 @@ fn want_color() -> bool {
     *COLOR_TTY.get().unwrap_or(&false)
 }
 
+/// One output line: through the non-blocking queue once it is installed (so a stalled stderr
+/// cannot stall the request that logged), straight to stderr during boot.
+fn emit(line: &str) {
+    crate::logq::line(line);
+}
+
 /// Log an info-level event.
 pub fn info(event: &str, msg: &str) {
     if is_json() {
-        eprintln!(
+        emit(&format!(
             r#"{{"ts":"{}","level":"info","event":"{}","msg":"{}"}}"#,
             now(),
             escape(event),
             escape(msg)
-        );
+        ));
     } else if is_stamped() {
-        eprintln!("{}", format_stamped(&now(), "INFO", event, msg));
+        emit(&format_stamped(&now(), "INFO", event, msg));
     } else {
-        eprintln!("{msg}");
+        emit(msg);
     }
 }
 
@@ -75,9 +81,9 @@ pub fn info(event: &str, msg: &str) {
 #[allow(dead_code)]
 pub fn warn(event: &str, msg: &str) {
     if !is_json() && is_stamped() {
-        eprintln!("{}", format_stamped(&now(), "WARN", event, msg));
+        emit(&format_stamped(&now(), "WARN", event, msg));
     } else {
-        eprintln!("{}", format_warn(is_json(), want_color(), event, msg));
+        emit(&format_warn(is_json(), want_color(), event, msg));
     }
 }
 
@@ -86,9 +92,9 @@ pub fn warn(event: &str, msg: &str) {
 #[allow(dead_code)]
 pub fn error(event: &str, msg: &str) {
     if !is_json() && is_stamped() {
-        eprintln!("{}", format_stamped(&now(), "ERROR", event, msg));
+        emit(&format_stamped(&now(), "ERROR", event, msg));
     } else {
-        eprintln!("{}", format_error(is_json(), want_color(), event, msg));
+        emit(&format_error(is_json(), want_color(), event, msg));
     }
 }
 
@@ -125,7 +131,7 @@ fn format_error(json: bool, color: bool, event: &str, msg: &str) -> String {
     }
 }
 
-fn now() -> String {
+pub(crate) fn now() -> String {
     // ISO 8601 UTC with microsecond precision — no chrono needed
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

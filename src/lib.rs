@@ -26,6 +26,9 @@
 #![allow(clippy::explicit_auto_deref)]
 #![allow(clippy::needless_borrow)]
 
+/// Bounded, lossy, non-blocking log output (used by `observability`).
+pub mod logq;
+
 /// W3C Trace Context parser, panic hook, OpenMetrics exemplar counters.
 pub mod observability;
 

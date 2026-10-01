@@ -60,6 +60,7 @@ mod import;
 mod init;
 mod listener;
 mod logging;
+mod logq;
 mod metrics;
 mod net;
 mod numa;
@@ -197,7 +198,10 @@ fn main() {
     // default `fn main() -> Result` termination collapses every error to exit
     // 1 — hence this explicit boundary. The `kind=` prefix gives log scrapers
     // a stable field without parsing the message.
-    if let Err(e) = run() {
+    let result = run();
+    // Whatever was logged last must reach stderr before the process ends.
+    logq::flush(std::time::Duration::from_secs(2));
+    if let Err(e) = result {
         eprintln!("zion: fatal [{}] {}", e.kind(), e);
         std::process::exit(e.to_exit_code());
     }
@@ -497,9 +501,10 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     // `logging::*` (those run before the runtime exists, so they cannot
     // depend on tracing's executor-aware machinery); request-path events
     // will go through tracing once the worker pool is up.
-    observability::init_subscriber(observability::LogFormat::parse_or_text(
-        &config.server.log_format,
-    ));
+    observability::init_subscriber(
+        observability::LogFormat::parse_or_text(&config.server.log_format),
+        config.server.log_queue_lines,
+    );
     logging::info("config", &format!("loaded from {config_path}"));
     warn_feature_config_gaps(&config);
 
@@ -1314,7 +1319,7 @@ async fn run_http_accept_loop(
                     Err(e) => {
                         let now = std::time::Instant::now();
                         if now.duration_since(last_err_log).as_secs() >= 1 {
-                            eprintln!("  http accept error: {e}");
+                            logq::line(&format!("  http accept error: {e}"));
                             last_err_log = now;
                         }
                         continue;
@@ -1424,7 +1429,7 @@ async fn run_https_accept_loop(
                     Err(e) => {
                         let now = std::time::Instant::now();
                         if now.duration_since(last_err_log).as_secs() >= 1 {
-                            eprintln!("  https accept error: {e}");
+                            logq::line(&format!("  https accept error: {e}"));
                             last_err_log = now;
                         }
                         continue;
@@ -1461,7 +1466,7 @@ async fn run_https_accept_loop(
                 // `from_std` would panic "no reactor running").
                 match tokio::net::TcpStream::from_std(conn.std_stream) {
                     Ok(stream) => spawn_https_handler(stream, conn.addr, state.clone()),
-                    Err(e) => eprintln!("  io_uring accept: tokio from_std failed: {e}"),
+                    Err(e) => logq::line(&format!("  io_uring accept: tokio from_std failed: {e}")),
                 }
             }
         }
@@ -1589,7 +1594,7 @@ fn spawn_https_handler(
             }
             Ok(Err(e)) => {
                 if tls_handshake_log_allowed() {
-                    eprintln!("  tls handshake failed from {remote_addr}: {e}");
+                    logq::line(&format!("  tls handshake failed from {remote_addr}: {e}"));
                 }
                 metrics::METRICS
                     .tls_handshake_errors
@@ -1598,7 +1603,9 @@ fn spawn_https_handler(
             }
             Err(_) => {
                 if tls_handshake_log_allowed() {
-                    eprintln!("  tls handshake timed out (10s) from {remote_addr}");
+                    logq::line(&format!(
+                        "  tls handshake timed out (10s) from {remote_addr}"
+                    ));
                 }
                 metrics::METRICS
                     .tls_handshake_errors
@@ -1650,7 +1657,7 @@ fn spawn_https_handler(
         let io = match crate::ktls::try_upgrade(tls_stream).await {
             Ok(ktls_stream) => TokioIo::new(ktls_stream),
             Err(e) => {
-                eprintln!("  kTLS upgrade failed, closing connection: {e}");
+                logq::line(&format!("  kTLS upgrade failed, closing connection: {e}"));
                 return;
             }
         };
