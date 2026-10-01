@@ -6,6 +6,8 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Changed
 
+- **Logging no longer blocks requests.** Log lines used to be written to stderr by the thread that logged, so a stalled pipe (journald, a container log driver) stalled the request workers. They now go through a bounded queue (`[server] log_queue_lines`, default 8192) to one writer thread; when it is full the newest lines are dropped, counted in `zion_log_lines_dropped_total` and announced on stderr. `log_queue_lines = 0` keeps the synchronous behaviour. The queue is flushed at shutdown and before a panic record.
+
 - **Pools choose a member by what real traffic shows (power of two choices).** The latency used to pick among several endpoints came from the active prober, refreshed every 30 s, and the rule was "lowest probe latency": everything went to whichever member was fastest half a minute ago, then flipped all at once. The default is now `load_balancing = "p2c"`: two members are drawn at random and the request goes to the one with the lower `(in-flight + 1) × peak-EWMA latency`, measured on real requests (a spike counts at once, recovery is averaged in). `load_balancing = "lowest_latency"` keeps the old behaviour. Single-endpoint upstreams are unaffected.
 
 ### Added

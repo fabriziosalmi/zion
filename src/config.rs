@@ -257,6 +257,12 @@ pub struct ServerConfig {
     /// Log format: "text" (default) or "json".
     #[serde(default = "default_log_format")]
     pub log_format: String,
+    /// Log lines that can wait for stderr (default 8192). Logging never blocks a request: when
+    /// the sink is slower than the log rate the newest lines are dropped and counted in
+    /// `zion_log_lines_dropped_total`. `0` writes synchronously (a stalled stderr then stalls
+    /// the request that logged). Read at start-up; changing it needs a restart.
+    #[serde(default = "default_log_queue_lines")]
+    pub log_queue_lines: usize,
     /// Trusted proxy CIDR ranges. When the TCP peer IP matches one of these,
     /// the real client IP is extracted from X-Forwarded-For (rightmost untrusted hop).
     /// Example: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
@@ -293,6 +299,10 @@ fn default_xff_mode() -> String {
 
 fn default_tcp_keepalive_secs() -> u64 {
     crate::net::DEFAULT_TCP_KEEPALIVE_SECS
+}
+
+fn default_log_queue_lines() -> usize {
+    8192
 }
 
 fn default_log_format() -> String {
@@ -2134,6 +2144,19 @@ mod tests {
             .err()
             .unwrap_or_default();
         assert!(e.contains("max_object_mb must be >= 1"), "{e}");
+    }
+
+    #[test]
+    fn log_queue_lines_defaults_to_a_bounded_queue_and_zero_means_synchronous() {
+        let parse = |extra: &str| -> ZionConfig {
+            toml::from_str(&format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n{extra}\n[tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstream.u]\nurl=\"http://a:1\"\n[[route]]\npath=\"/{{*r}}\"\nupstream=\"u\"\n"
+            ))
+            .unwrap()
+        };
+        assert_eq!(parse("").server.log_queue_lines, 8192);
+        assert_eq!(parse("log_queue_lines = 100").server.log_queue_lines, 100);
+        assert_eq!(parse("log_queue_lines = 0").server.log_queue_lines, 0);
     }
 
     #[test]
