@@ -46,6 +46,9 @@ pub(super) struct PreCtx {
 pub(super) enum Gate {
     /// Drop client-supplied identity headers (a mutation, never answers).
     ScrubIdentityHeaders,
+    /// Drop client-supplied routing / host override headers unless the peer is a trusted
+    /// proxy (a mutation, never answers).
+    ScrubOverrideHeaders,
     /// 414 for an oversized URI.
     UriLength,
     /// Rewrite the path to its normalized form (mutation; 400 if it cannot be rebuilt).
@@ -74,6 +77,7 @@ pub(super) enum Gate {
 /// way around it.
 pub(super) const PRE_ROUTING: &[Gate] = &[
     Gate::ScrubIdentityHeaders,
+    Gate::ScrubOverrideHeaders,
     Gate::UriLength,
     Gate::NormalizePath,
     Gate::Method,
@@ -98,6 +102,12 @@ pub(super) async fn run_pre_routing(
         let answer = match gate {
             Gate::ScrubIdentityHeaders => {
                 super::scrub_reserved_identity_headers(req.headers_mut());
+                None
+            }
+            Gate::ScrubOverrideHeaders => {
+                if !ctx.cfg.trusted_proxies.is_trusted(&ctx.remote_addr.ip()) {
+                    crate::security::scrub_client_override_headers(req.headers_mut());
+                }
                 None
             }
             Gate::UriLength => uri_length(req),
@@ -558,6 +568,7 @@ mod tests {
     fn pre_routing_order() {
         let always = [
             Gate::ScrubIdentityHeaders,
+            Gate::ScrubOverrideHeaders,
             Gate::UriLength,
             Gate::NormalizePath,
             Gate::Method,

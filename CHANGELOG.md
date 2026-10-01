@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Security
+
+- **Routing and host override headers from clients are no longer passed upstream.** `X-Original-URL` and `X-Rewrite-URL` (which IIS, Symfony and others honour over the real request line), `Forwarded`, `X-Forwarded-Server`, `X-Forwarded-Scheme`, `X-Forwarded-Prefix`, `X-Host`, `X-HTTP-Host-Override` and `X-Original-Host` reached the upstream untouched, so a client could steer a framework behind zion's routing, `internal_only`, WAF and auth, or poison a cache. They are dropped before routing unless the peer is a configured `trusted_proxies` entry, on `:443` and on the `:80` ACME fallback. If a legitimate client of yours sets one of these, route it through a trusted proxy or add it there.
+
 ### CI
 
 - **acme-soak: the `nonce-collision` leg** (#134). Pebble now rejects 20% of the anti-replay nonces zion presents (`PEBBLE_WFE_NONCEREJECT`); issue → renew ×5 → revoke must still complete, with up to 3 whole-operation attempts each for the rare request that exhausts instant-acme's own 3 per-request `badNonce` retries. A deterministic probe makes sure the leg cannot pass vacuously: at 100% rejection issuance must fail with `badNonce` after exactly 3 attempts. With `key-rollover` and `ttl-edge`, all three legs of #134 are in.

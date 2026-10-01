@@ -530,6 +530,33 @@ impl InternalNetworks {
     }
 }
 
+/// Request headers that tell an application or a cache where a request "really" goes or
+/// came from: the path (`X-Original-URL` / `X-Rewrite-URL`, honoured by IIS, Symfony and
+/// others over the real request line), the host or scheme (`X-Host`, `X-Forwarded-Server`,
+/// `X-Forwarded-Scheme`, `X-Forwarded-Prefix`, `X-Original-Host`, `X-HTTP-Host-Override`) and
+/// RFC 7239 `Forwarded` (zion generates `X-Forwarded-*`, never `Forwarded`, so an upstream that
+/// prefers it would read the client's own claim). From a client these are route/policy bypass
+/// and cache-poisoning inputs, so they are dropped unless the peer is a configured trusted
+/// proxy. `X-Forwarded-Host` is not listed: zion always overwrites it with the request's Host.
+pub const CLIENT_OVERRIDE_HEADERS: [&str; 9] = [
+    "x-original-url",
+    "x-rewrite-url",
+    "forwarded",
+    "x-forwarded-server",
+    "x-forwarded-scheme",
+    "x-forwarded-prefix",
+    "x-host",
+    "x-http-host-override",
+    "x-original-host",
+];
+
+/// Drop [`CLIENT_OVERRIDE_HEADERS`] (every copy; hyper lower-cases names).
+pub fn scrub_client_override_headers(headers: &mut hyper::HeaderMap) {
+    for name in CLIENT_OVERRIDE_HEADERS {
+        headers.remove(name);
+    }
+}
+
 impl TrustedProxies {
     /// Parse trusted proxy CIDR list from config.
     /// Invalid CIDRs are logged and skipped.
