@@ -69,7 +69,7 @@ relevant criterion, what Zion satisfies, and what the operator owns.
 
 | TSC | Requirement | Where Zion satisfies it | Operator-side residual |
 |-----|-------------|--------------------------|------------------------|
-| C1.1 | Identification of confidential information | `[redact]` config policy ([`audit.rs`](../../src/audit.rs)) — headers + query params marked sensitive are redacted in audit + access-log paths | Operator chooses `[redact]` keys per data-classification policy |
+| C1.1 | Identification of confidential information | `[redact]` config policy ([`audit.rs`](../../src/audit.rs)) — headers + query params marked sensitive are redacted in audit + access-log paths; `[redact] ip` truncates (`/24`, `/48`) or HMAC-pseudonymises the client address in the access log, the audit trail and TLS-handshake failure lines | Operator chooses `[redact]` keys and the `ip` mode per data-classification / retention policy (the `hmac` key is a secret the operator manages and rotates) |
 | C1.2 | Disposal of confidential information | Audit log rotation handled by operator's logrotate (Zion does not retain in-memory state across restart by design) | Retention schedule, deletion procedures |
 
 ### PI — Processing Integrity

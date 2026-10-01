@@ -9,13 +9,15 @@ Zion is a TLS reverse proxy with a built-in WAF, written in Rust. One binary, on
 | TLS termination | rustls (aws-lc-rs crypto backend), TLS 1.2/1.3, ALPN, SNI |
 | Routing | Radix tree via `matchit` crate |
 | WAF | 5-gate pipeline: body size, content-type, Aho-Corasick (balanced or aggressive mode), Shannon entropy, simd-json structural validation |
-| Caching | In-memory two-level cache: thread-local L1 + shared DashMap L2, TTL + max-entry eviction |
+| Caching | In-memory two-level cache: thread-local L1 + shared DashMap L2, TTL + max-entry eviction; RFC 9111 `Vary`, conditional `304`, `stale-while-revalidate` / `stale-if-error`, `Range` `206` / `416`, purge by prefix or `Surrogate-Key` tag |
+| Resilience | Pools pick a member by power of two choices on in-flight × peak-EWMA latency; opt-in outlier ejection, circuit breaker, `max_in_flight` bulkhead; DNS keeps the last good answer; graceful drain; non-blocking logs. → [Resilience](/guide/resilience) |
 | WebSocket | Bidirectional proxy via HTTP Upgrade |
 | SSE streaming | Dedicated proxy mode with buffer-disabling headers |
 | CORS | Pre-flight OPTIONS handling, origin whitelist, configurable max-age |
 | Observability | Prometheus `/metrics`, `/healthz`, `/readyz`, X-Request-ID |
 | Security headers | HSTS, X-Content-Type-Options, X-Frame-Options, Permissions-Policy |
 | Rate limiting | Per-IP via DashMap, configurable window and threshold |
+| Log privacy | `[redact]`: header and query-string values, and the client IP (truncated or HMAC-pseudonymised) |
 | TLS hot-reload | Filesystem watcher (notify) + ArcSwap atomic pointer swap |
 | Platform detection | Reads CPU count, RAM, AES-NI, SO_REUSEPORT, TCP_FASTOPEN at boot |
 | kTLS offload (experimental) | Post-handshake socket flip into in-kernel TLS; wired but not yet exercised end-to-end in CI. `--features ktls` (Linux 5.10+) |

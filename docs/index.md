@@ -20,7 +20,7 @@ description: One auditable Rust binary at the edge — TLS 1.3 termination, a ze
     <aside class="ds-spec">
       <div class="cap">Specification</div>
       <dl>
-        <div class="ds-row"><dt>Version</dt><dd class="tnum">0.6.2</dd></div>
+        <div class="ds-row"><dt>Version</dt><dd class="tnum">0.9.5</dd></div>
         <div class="ds-row"><dt>Language</dt><dd>Rust · MSRV 1.82</dd></div>
         <div class="ds-row"><dt>Binary</dt><dd class="tnum">~4 MB · static</dd></div>
         <div class="ds-row"><dt>TLS proxy</dt><dd class="tnum">108<span class="u">k</span> req/s</dd></div>
@@ -42,6 +42,7 @@ description: One auditable Rust binary at the edge — TLS 1.3 termination, a ze
       <div class="ds-cap"><div class="t">WAF<small>inspection</small></div><div class="d">Aho-Corasick in a single <b>O(N)</b> pass — five gates, Shannon entropy, simd-json structural limits. A shadow mode logs without blocking.</div></div>
       <div class="ds-cap"><div class="t">Cache<small>two-level</small></div><div class="d">L1 thread-local intrusive LRU + L2 sharded <code>DashMap</code>, generation coherence, request coalescing. No stale read after an update.</div></div>
       <div class="ds-cap"><div class="t">Protocol<small>1.1 / 2 / 3</small></div><div class="d">HTTP/2 upstream multiplexing, WebSocket pipe, zero-buffer SSE, HTTP/3 QUIC (feature-gated). ACME auto-HTTPS on by default in the release build.</div></div>
+      <div class="ds-cap"><div class="t">Resilience<small>by default</small></div><div class="d">Pools balance on <b>real traffic</b> (power of two choices), with opt-in outlier ejection, circuit breaker and a <code>max_in_flight</code> bulkhead. DNS keeps its last good answer; deploys drain idle connections at once. → <a href="/zion/guide/resilience">Resilience</a></div></div>
       <div class="ds-cap"><div class="t">Edge<small>sovereign</small></div><div class="d">Per-IP rate limit <b>and</b> concurrent-connection cap, IT/EU origin tagging with no GeoIP database, Ed25519-signed mesh reputation, an L7 tarpit.</div></div>
       <div class="ds-cap"><div class="t">Ops<small>observable</small></div><div class="d">Prometheus <code>/metrics</code>, hot config reload, a live <code>zion top</code> TUI. Cosign-signed container, CycloneDX SBOM, SLSA provenance.</div></div>
     </div>

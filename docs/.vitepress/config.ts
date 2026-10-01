@@ -218,6 +218,7 @@ export default defineConfig({
           { text: 'Deployment', link: '/deploy/' },
           { text: 'Monitoring (Prometheus/Grafana)', link: '/deploy/observability' },
           { text: 'Observability internals', link: '/guide/observability' },
+          { text: 'Resilience', link: '/guide/resilience' },
           { text: 'Hot-reload', link: '/deploy/hot-reload' },
           { text: 'Admin API', link: '/deploy/admin-api' },
         ]

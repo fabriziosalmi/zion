@@ -58,6 +58,9 @@ When `rate_limit_rps = 0` (default), rate limiting is disabled — the code retu
 | HTTP request | 60 seconds | Kill stalled connections |
 | Upstream connect | 3 seconds (configurable) | Fail fast on dead upstreams |
 | Connection pool idle | 30 seconds | Reclaim unused upstream connections |
+| TCP keepalive (clients) | `tcp_keepalive_secs`, 60 s | Free the slot of a peer that vanished while the connection was *idle* |
+| `TCP_USER_TIMEOUT` (clients) | `tcp_user_timeout_secs`, off (opt-in, Linux) | Free the slot of a client that vanished *while a response was in flight*; also drops a client that stops reading for longer than the value |
+| Upstream DNS lookup | `dns_timeout_ms`, 2000 ms | A resolver outage or hang falls back to the last good answer instead of stalling connections |
 
 ## Connection limit
 
@@ -68,6 +71,27 @@ conn_limit = (RAM_MB / 4) * 1024 / 50    # ~50KB per TLS connection estimate
 ```
 
 Clamped to 1,000–100,000. Connections beyond the limit are silently dropped at the TCP level.
+
+## Protecting the upstream
+
+Two opt-in, per-upstream limits keep a struggling backend from taking the proxy down with it (see the
+[resilience guide](/guide/resilience) for how they combine):
+
+- `max_in_flight`: at most N requests inside the upstream; the next gets `503` + `Retry-After`
+  immediately instead of one more connection, buffered body and waiting task. Taken after auth and
+  the WAF, so a hostile request cannot use up slots.
+- `circuit_breaker`: stops sending traffic to a single-endpoint upstream whose real requests are
+  failing, answers `503` at once, and probes it with one request.
+
+## Logs and personal data
+
+The access log, the audit trail and TLS-handshake failure lines carry the client address. `[redact] ip`
+writes it as is (default), as its network (`203.0.113.0/24`, `2001:db8:1::/48`), or as a keyed,
+irreversible, per-client-stable token (`hmac`, with `ip_hmac_key`); header and query-string values are
+redacted with `[redact] headers` / `query_params`. See
+[Client IP privacy](/guide/observability#client-ip-privacy-redact-ip). Log lines go through a bounded
+queue: a stalled log pipe drops the newest lines (counted in `zion_log_lines_dropped_total`) instead of
+stalling requests.
 
 ## HTTP to HTTPS redirect
 

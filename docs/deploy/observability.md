@@ -210,6 +210,20 @@ rate(zion_audit_events_dropped_total[5m])
 # Tarpit mean hold time (ms) — how long a flooding source is stalled.
 rate(zion_tarpit_held_ms_total[5m]) / clamp_min(rate(zion_tarpit_total[5m]), 1)
 
+# An upstream is at max_in_flight: requests are being refused with 503 (and how close it runs).
+rate(zion_bulkhead_shed_total[5m])
+zion_bulkhead_in_flight / zion_bulkhead_limit
+
+# A pool member was ejected by outlier detection / a circuit is open.
+zion_upstream_ejected == 1
+zion_upstream_circuit_open == 1
+
+# The DNS resolver is failing and zion is running on last-good addresses.
+rate(zion_dns_stale_served_total[5m])
+
+# Log lines are being dropped: the log sink is slower than the log rate (not a latency problem).
+rate(zion_log_lines_dropped_total[5m])
+
 # Mesh: inbound envelopes dropped by reason (spike in signature/replay = a
 # probing peer). Requires --features sovereign-aimp; flat 0 otherwise.
 sum by (reason) (rate(zion_mesh_claims_dropped_total[5m]))

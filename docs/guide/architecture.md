@@ -20,6 +20,25 @@ src/
 ├── security.rs    # CORS (FNV O(1)), rate limiter (packed-atomic, lock-free), security headers, trusted-proxy CIDR resolution
 ├── metrics.rs     # Prometheus: sharded counters, differential histogram, ArcSwap render
 ├── health.rs      # Upstream health checker, EWMA latency, gray failure detection
+├── pool.rs        # Pool member choice (power of two choices on in-flight × peak-EWMA latency) and passive outlier ejection
+├── breaker.rs     # Per-upstream circuit breaker (sliding window, half-open probe token, injectable clock)
+├── bulkhead.rs    # Per-upstream `max_in_flight` cap: counter registry + a body wrapper that holds the slot until the response is sent
+├── dns.rs         # Upstream DNS with stale-on-error: last good answer per host, one lookup in flight per host, deadline
+├── drain.rs       # Graceful drain on SIGTERM: idle keep-alive closed, HTTP/2 GOAWAY, requests in flight finished
+├── logq.rs        # Bounded lossy queue in front of stderr, so a stalled log pipe never stalls a request
+├── vary.rs        # `Vary` secondary cache keys (RFC 9111 §4.1), bounded per primary key
+├── http_conditional.rs  # `If-None-Match` / `If-Modified-Since` evaluation (RFC 9110 §13)
+├── static_files.rs # `mode = "static"` file server (ETag, Range, precompressed sidecars) and the shared `Range` parser
+├── uri_norm.rs    # Request-path normalisation before routing (RFC 3986 §6.2.2)
+├── via.rs         # `Via` header and loop detection (RFC 9110 §7.6.3)
+├── reload.rs      # Config hot-reload: rebuild the snapshot, carry health/breaker/pool state across it
+├── audit.rs       # HMAC-chained audit log, PII redaction (`[redact]`: headers, query params, client IP)
+├── observability.rs # W3C Trace Context, panic hook, audit/trace counters
+├── connlimit.rs   # Per-IP concurrent-connection cap (enforced at accept)
+├── tarpit.rs      # Tarpit for flooding sources
+├── numa.rs        # NUMA-aware shard wrapper around DashMap (feature: --features numa-aware)
+├── atomic_file.rs # Crash-safe file replace for certs/keys and persisted config pushes
+├── admin.rs       # Admin API (config push, JWT revocation); internal IPs or mTLS, write token
 ├── auth.rs        # JWT/OIDC validation gate (feature: --features auth)
 ├── acme.rs        # ACME HTTP-01 auto-renewal (feature: --features acme)
 ├── quic.rs        # HTTP/3 QUIC listener (feature: --features http3)
@@ -59,14 +78,19 @@ Client
   └────────────────────────────────────────────────────┘
        │
        ▼
-  ┌─ Pre-routing Security Gates ──────────────────────────┐
-  │  1. URI length check (path+query >8192 bytes → 414)   │
-  │  2. Method whitelist (7 methods, else 405)             │
-  │  3. 0-RTT replay protection (non-idempotent → 425)    │
-  │  4. Client IP resolution (rightmost-untrusted-hop)     │
-  │  5. Per-IP rate limiter (DashMap + atomic, lock-free)  │
-  │  6. Built-in endpoints (/metrics → internal IPs only)  │
-  │  7. CORS pre-flight (OPTIONS → 204 with headers)       │
+  ┌─ Pre-routing Security Gates (order = PRE_ROUTING) ────┐
+  │  1. Scrub client-supplied identity headers             │
+  │  2. Scrub client routing/host override headers         │
+  │  3. URI length check (path+query >8192 bytes → 414)   │
+  │  4. Path normalisation (RFC 3986 §6.2.2)               │
+  │  5. Method whitelist (7 methods, else 405)             │
+  │  6. 0-RTT replay protection (non-idempotent → 425)    │
+  │  7. Loop detection (Via, → 508)                        │
+  │  8. Per-IP rate limiter (packed atomic, lock-free)     │
+  │  9. Feature-gated: sovereign class, TLS fingerprint,   │
+  │     mesh score                                         │
+  │  then: built-in endpoints (/metrics → internal IPs),   │
+  │        CORS pre-flight (OPTIONS → 204)                 │
   └────────────────────────────────────────────────────────┘
        │
        ▼
@@ -97,6 +121,14 @@ Client
   │           per-profile threshold + kill-switch)      │
   │  Gate 5: JSON structural validation (simd-json) +   │
   │           depth + per-string length limits          │
+  └────────────────────────────────────────────────────┘
+       │
+       ▼
+  ┌─ Upstream protection (opt-in, per upstream) ───────┐
+  │  max_in_flight  → bulkhead: full → 503 at once      │
+  │  circuit_breaker → open → 503 + Retry-After         │
+  │  pool pick      → P2C on in-flight × peak-EWMA;     │
+  │                   skips down / gray / ejected       │
   └────────────────────────────────────────────────────┘
        │
        ▼

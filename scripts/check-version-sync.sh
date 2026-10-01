@@ -92,6 +92,8 @@ PATTERN_CHECKS=(
   "hot-reload.md snapshot example|docs/deploy/hot-reload.md|s/.*\"version\":[[:space:]]*\"([0-9]+\.[0-9]+\.[0-9]+)\".*/\1/p"
   "bug_report.md template default|.github/ISSUE_TEMPLATE/bug_report.md|s/.*Zion Version: \[e\.g\. ([0-9]+\.[0-9]+\.[0-9]+)\].*/\1/p"
   "Helm chart Artifact Hub changelog|deploy/helm/zion/Chart.yaml|s/.*description: Bump appVersion to ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p"
+  # the docs home page showed 0.6.2 for several releases: nothing checked it
+  "docs home page Version row|docs/index.md|s/.*<dt>Version<\/dt><dd class=\"tnum\">([0-9]+\.[0-9]+\.[0-9]+)<\/dd>.*/\1/p"
 )
 for entry in "${PATTERN_CHECKS[@]}"; do
   IFS='|' read -r label file extractor <<< "$entry"
