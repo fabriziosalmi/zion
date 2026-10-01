@@ -15,6 +15,7 @@ fuzz_target!(|data: &[u8]| {
             RedactConfig {
                 headers: vec![],
                 query_params: vec![],
+                ..Default::default()
             },
             "",
         )
@@ -25,6 +26,7 @@ fuzz_target!(|data: &[u8]| {
             RedactConfig {
                 headers: vec![],
                 query_params: vec![],
+                ..Default::default()
             },
             s,
         )
@@ -35,6 +37,7 @@ fuzz_target!(|data: &[u8]| {
             RedactConfig {
                 headers: vec![],
                 query_params: vec!["token".into(), "api_key".into()],
+                ..Default::default()
             },
             s,
         )
