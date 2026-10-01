@@ -2820,3 +2820,41 @@ async fn a_range_on_an_uncached_object_goes_to_the_origin() {
     assert!(!body.is_empty());
     assert_eq!(hits(&o), 1);
 }
+
+#[tokio::test]
+async fn several_range_header_lines_are_a_combined_request_and_get_the_whole_object() {
+    let (_o, st, full) = cached_object(None).await;
+    let mut h = with_range("bytes=2-5");
+    h.push(("range", "bytes=10-12"));
+    let (code, _, body) = raw(&st, "/r/obj", &h).await;
+    assert_eq!(code, 200, "two Range lines are not one range");
+    assert_eq!(body, full);
+}
+
+#[tokio::test]
+async fn only_if_cached_hits_get_the_same_304_range_whole_treatment() {
+    let (_o, st, full) = cached_object(Some("\"v1\"")).await;
+    let oic = |extra: &[(&'static str, &'static str)]| {
+        let mut h = with_range("bytes=2-5");
+        h.push(("cache-control", "only-if-cached"));
+        h.extend_from_slice(extra);
+        h
+    };
+    let (code, hdrs, body) = raw(&st, "/r/obj", &oic(&[])).await;
+    assert_eq!(
+        (code, &body[..]),
+        (206, &full[2..=5]),
+        "a Range on an only-if-cached hit"
+    );
+    assert_eq!(
+        hdrs.get("content-range").unwrap().to_str().unwrap(),
+        format!("bytes 2-5/{}", full.len())
+    );
+    let (code, _, body) = raw(&st, "/r/obj", &oic(&[("if-none-match", "\"v1\"")])).await;
+    assert_eq!(code, 304, "a matching precondition still wins");
+    assert!(body.is_empty());
+    let mut plain = X.to_vec();
+    plain.push(("cache-control", "only-if-cached"));
+    let (code, _, body) = raw(&st, "/r/obj", &plain).await;
+    assert_eq!((code, body), (200, full), "no Range: the whole object");
+}

@@ -1900,7 +1900,11 @@ fn ranged_hit_response(
     if *method != hyper::Method::GET || hit.meta.status != StatusCode::OK {
         return None;
     }
-    headers.get(hyper::header::RANGE)?;
+    // exactly one `Range` field: several lines are a combined (multi-range or malformed) request,
+    // and `get` would only look at the first
+    if headers.get_all(hyper::header::RANGE).iter().count() != 1 {
+        return None;
+    }
     if !static_files::if_range_allows_stored(
         headers,
         hit.meta.etag.as_ref(),
@@ -1959,6 +1963,23 @@ fn ranged_hit_response(
 #[inline]
 fn cache_hit_response(hit: cache::CacheHit) -> Response<ZionBody> {
     cache_response(hit, "HIT")
+}
+
+/// Every way a **fresh** hit leaves the cache, in RFC 9110 §13.2.2 order: a matching precondition
+/// (`If-None-Match` / `If-Modified-Since`) is a `304`, else a satisfiable `Range` is a `206` (or a
+/// `416`), else the whole object. One function so no exit (`only-if-cached` included) can skip a step.
+fn fresh_hit_response(
+    hit: cache::CacheHit,
+    method: &hyper::Method,
+    headers: &hyper::HeaderMap,
+) -> Response<ZionBody> {
+    if client_conditional_hit(headers, &hit.meta) {
+        return not_modified_response(&hit);
+    }
+    if let Some(partial) = ranged_hit_response(&hit, method, headers) {
+        return partial;
+    }
+    cache_hit_response(hit)
 }
 
 /// Seed a conditional GET for origin revalidation (RFC 9111 §4.3.1) from a
@@ -2204,7 +2225,7 @@ async fn handle_static_cache(
         return Ok(match state.static_cache.get(&cache_key) {
             // only-if-cached (§5.2.1.7) must not contact the origin, so a stale
             // stored response can't be revalidated → 504, same as a miss.
-            cache::CacheLookup::Fresh(hit) => cache_hit_response(hit),
+            cache::CacheLookup::Fresh(hit) => fresh_hit_response(hit, req.method(), req.headers()),
             _ => cache_only_if_cached_miss(),
         });
     }
@@ -2219,16 +2240,8 @@ async fn handle_static_cache(
     if !rcc_no_cache && !rcc_no_store {
         match state.static_cache.get(&cache_key) {
             cache::CacheLookup::Fresh(hit) => {
-                // Client conditional request (RFC 9110 §13): a matching
-                // If-None-Match / If-Modified-Since → 304 Not Modified, skipping
-                // the body entirely.
-                if client_conditional_hit(req.headers(), &hit.meta) {
-                    return Ok(not_modified_response(&hit));
-                }
-                if let Some(partial) = ranged_hit_response(&hit, req.method(), req.headers()) {
-                    return Ok(partial);
-                }
-                return Ok(cache_hit_response(hit));
+                // 304 on a matching precondition (RFC 9110 §13), else a Range slice, else all
+                return Ok(fresh_hit_response(hit, req.method(), req.headers()));
             }
             cache::CacheLookup::Stale(hit) => {
                 stale_entry = Some(hit.clone());
