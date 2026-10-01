@@ -2050,10 +2050,18 @@ mode = "sse_stream"
         .iter()
         .map(|o| format!("http://127.0.0.1:{}", o.port.load(Ordering::Relaxed)))
         .collect();
-    for _ in 0..30 {
-        crate::pool::report(&cfg.health_map, &pool_urls, &pool_urls[1], true, Some(1), 1);
-    }
+    // one timestamp for everything: the healthy member's successes must be inside the window
     let now = crate::breaker::now_ms();
+    for _ in 0..30 {
+        crate::pool::report(
+            &cfg.health_map,
+            &pool_urls,
+            &pool_urls[1],
+            true,
+            Some(1),
+            now,
+        );
+    }
     for _ in 0..10 {
         crate::pool::report(&cfg.health_map, &pool_urls, &pool_urls[0], false, None, now);
     }
