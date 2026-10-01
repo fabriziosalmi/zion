@@ -23,7 +23,13 @@
 use crate::health::HealthMap;
 use arc_swap::ArcSwapOption;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Serializes the "should this member be ejected?" decision across every pool in the process:
+/// the cap (`max_ejected_pct`) is a property of a whole pool, so checking how many members are
+/// out and ejecting one must be a single step. It is only taken after a member has already
+/// crossed its failure threshold, so it is off the normal request path.
+static EJECT_LOCK: Mutex<()> = Mutex::new(());
 
 const WINDOW_SLOTS: usize = 60;
 
@@ -52,11 +58,13 @@ pub enum Algorithm {
     LowestLatency,
 }
 
-#[derive(Default)]
+/// One second of outcomes. The epoch and both counters live behind one lock, so rolling a slot
+/// over to a new second can never lose or misattribute a concurrent update.
+#[derive(Clone, Copy, Default)]
 struct Slot {
-    epoch_s: AtomicU64,
-    ok: AtomicU32,
-    fail: AtomicU32,
+    epoch_s: u64,
+    ok: u32,
+    fail: u32,
 }
 
 /// Live state of one member, kept next to its health entry.
@@ -65,7 +73,7 @@ pub struct MemberStats {
     inflight: AtomicU32,
     /// Peak-EWMA of the time to response headers, microseconds (0 = no sample yet).
     ewma_us: AtomicU64,
-    slots: [Slot; WINDOW_SLOTS],
+    slots: Mutex<[Slot; WINDOW_SLOTS]>,
     /// 0 = in rotation; otherwise the time (ms) the ejection ends.
     ejected_until_ms: AtomicU64,
     consecutive_ejections: AtomicU32,
@@ -93,7 +101,7 @@ impl MemberStats {
         Self {
             inflight: AtomicU32::new(0),
             ewma_us: AtomicU64::new(0),
-            slots: std::array::from_fn(|_| Slot::default()),
+            slots: Mutex::new([Slot::default(); WINDOW_SLOTS]),
             ejected_until_ms: AtomicU64::new(0),
             consecutive_ejections: AtomicU32::new(0),
             ejections: AtomicU64::new(0),
@@ -117,11 +125,7 @@ impl MemberStats {
         if changed {
             self.ejected_until_ms.store(0, Relaxed);
             self.consecutive_ejections.store(0, Relaxed);
-            for s in &self.slots {
-                s.epoch_s.store(0, Relaxed);
-                s.ok.store(0, Relaxed);
-                s.fail.store(0, Relaxed);
-            }
+            *self.lock_slots() = [Slot::default(); WINDOW_SLOTS];
         }
     }
 
@@ -183,19 +187,26 @@ impl MemberStats {
         (u64::from(self.inflight.load(Relaxed)) + 1).saturating_mul(lat)
     }
 
+    fn lock_slots(&self) -> std::sync::MutexGuard<'_, [Slot; WINDOW_SLOTS]> {
+        // The data is plain counters: a poisoned lock is still usable.
+        self.slots.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Record one request's outcome in the failure window.
-    fn record_outcome(&self, ok: bool, now_ms: u64, window: u64) {
+    fn record_outcome(&self, ok: bool, now_ms: u64) {
         let sec = now_ms / 1000;
-        let s = &self.slots[(sec % WINDOW_SLOTS as u64) as usize];
-        if s.epoch_s.swap(sec, Relaxed) != sec {
-            s.ok.store(0, Relaxed);
-            s.fail.store(0, Relaxed);
+        let mut slots = self.lock_slots();
+        let s = &mut slots[(sec % WINDOW_SLOTS as u64) as usize];
+        if s.epoch_s != sec {
+            *s = Slot {
+                epoch_s: sec,
+                ..Slot::default()
+            };
         }
-        let _ = window;
         if ok {
-            s.ok.fetch_add(1, Relaxed);
+            s.ok = s.ok.saturating_add(1);
         } else {
-            s.fail.fetch_add(1, Relaxed);
+            s.fail = s.fail.saturating_add(1);
         }
     }
 
@@ -203,15 +214,10 @@ impl MemberStats {
     fn window_totals(&self, now_ms: u64, window: u64) -> (u64, u64) {
         let sec = now_ms / 1000;
         let (mut total, mut fail) = (0u64, 0u64);
-        for s in &self.slots {
-            let e = s.epoch_s.load(Relaxed);
-            if e + window > sec && e <= sec {
-                let (o, f) = (
-                    u64::from(s.ok.load(Relaxed)),
-                    u64::from(s.fail.load(Relaxed)),
-                );
-                total += o + f;
-                fail += f;
+        for s in self.lock_slots().iter() {
+            if s.epoch_s + window > sec && s.epoch_s <= sec {
+                total += u64::from(s.ok) + u64::from(s.fail);
+                fail += u64::from(s.fail);
             }
         }
         (total, fail)
@@ -239,6 +245,45 @@ pub fn pick<'a>(
     now_ms: u64,
     rand: &mut dyn FnMut(usize) -> usize,
 ) -> Option<&'a String> {
+    if algorithm == Algorithm::P2c && urls.len() >= 2 {
+        // Constant work and no allocation: draw two distinct members at random and keep them
+        // if they are fully eligible. Only a pool with few eligible members (down, gray or
+        // ejected ones) falls through to the exhaustive scan below.
+        let fully_eligible = |u: &String| match health.get(u.as_str()) {
+            None => true,
+            Some(h) => {
+                h.healthy.load(Relaxed)
+                    && !h.pool.is_ejected(now_ms)
+                    && h.latency_us.load(Relaxed) < GRAY_FAILURE_US
+            }
+        };
+        let n = urls.len();
+        let first = (0..4).map(|_| rand(n)).find(|&i| fully_eligible(&urls[i]));
+        if let Some(i) = first {
+            let second = (0..4)
+                .map(|_| {
+                    let j = rand(n - 1);
+                    if j >= i {
+                        j + 1
+                    } else {
+                        j
+                    }
+                })
+                .find(|&j| fully_eligible(&urls[j]));
+            if let Some(j) = second {
+                let score = |u: &String| {
+                    health
+                        .get(u.as_str())
+                        .map_or(0, |h| h.pool.score(h.latency_us.load(Relaxed)))
+                };
+                return Some(if score(&urls[j]) < score(&urls[i]) {
+                    &urls[j]
+                } else {
+                    &urls[i]
+                });
+            }
+        }
+    }
     // Tiers, best first: (healthy, not gray, not ejected) → (healthy, not ejected) →
     // (healthy). The last tier is a panic mode: ejecting must never be what returns a 503.
     let eligible = |tier: u8| -> Vec<&'a String> {
@@ -313,17 +358,23 @@ pub fn report(
     if me.pool.is_ejected(now_ms) {
         return; // already out: in-flight stragglers say nothing new
     }
-    me.pool.record_outcome(ok, now_ms, window);
+    me.pool.record_outcome(ok, now_ms);
     if ok {
         // a success after an ejection has expired starts the member's streak over
         if me.pool.ejected_until_ms.load(Relaxed) != 0 {
             me.pool.ejected_until_ms.store(0, Relaxed);
+            me.pool.consecutive_ejections.store(0, Relaxed);
         }
         return;
     }
     let (total, fail) = me.pool.window_totals(now_ms, window);
     if total < u64::from(cfg.min_requests) || fail * 100 < u64::from(cfg.error_rate_pct) * total {
         return;
+    }
+    // The decision reads other members' state and ends in an ejection: do it as one step.
+    let _decision = EJECT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if me.pool.is_ejected(now_ms) {
+        return; // another request ejected it while this one waited
     }
     // An outlier, not an outage: some other member must be doing clearly better.
     let mut others = 0u32;
@@ -696,5 +747,84 @@ mod tests {
             !stats(&h, &urls[0]).is_ejected(1_000),
             "new thresholds start clean"
         );
+    }
+
+    #[test]
+    fn a_success_after_an_ejection_starts_the_streak_over() {
+        let (h, urls) = pool_of(2);
+        feed(&h, &urls, 1, true, 100, 1_000);
+        feed(&h, &urls, 0, false, 10, 1_000);
+        assert!(stats(&h, &urls[0]).is_ejected(1_000));
+        // back after the cool-down, and it serves a request correctly
+        feed(&h, &urls, 0, true, 1, 40_000);
+        assert_eq!(
+            stats(&h, &urls[0]).consecutive_ejections.load(Relaxed),
+            0,
+            "a recovered member is not a repeat offender"
+        );
+        // so the next ejection is the base length again, not doubled
+        feed(&h, &urls, 1, true, 100, 100_000);
+        feed(&h, &urls, 0, false, 30, 100_000);
+        let len = stats(&h, &urls[0]).ejected_until_ms.load(Relaxed) - 100_000;
+        assert_eq!(len, 30_000);
+    }
+
+    #[test]
+    fn concurrent_failures_cannot_push_the_pool_past_its_cap() {
+        for round in 0..200 {
+            let (h, urls) = pool_of(4); // max 50% => 2 of 4
+            feed(&h, &urls, 3, true, 50, 1_000);
+            // three members cross the failure threshold at the same moment
+            for who in 0..3 {
+                feed(&h, &urls, who, false, 9, 1_000);
+            }
+            let gate = std::sync::Barrier::new(3);
+            std::thread::scope(|sc| {
+                for who in 0..3 {
+                    let (h, urls, gate) = (&h, &urls, &gate);
+                    sc.spawn(move || {
+                        gate.wait();
+                        report(h, urls, &urls[who], false, Some(1_000), 1_000);
+                    });
+                }
+            });
+            let out = (0..4)
+                .filter(|&i| stats(&h, &urls[i]).is_ejected(1_000))
+                .count();
+            assert!(out <= 2, "round {round}: {out} of 4 ejected, cap is 2");
+        }
+    }
+
+    #[test]
+    fn concurrent_outcomes_across_a_second_boundary_are_all_counted() {
+        let s = MemberStats::new();
+        std::thread::scope(|sc| {
+            for t in 0..8u64 {
+                let s = &s;
+                sc.spawn(move || {
+                    for k in 0..2_000u64 {
+                        // every thread keeps crossing second boundaries
+                        s.record_outcome(k % 3 != 0, 5_000 + (k + t) % 2 * 1_000);
+                    }
+                });
+            }
+        });
+        let (total, fail) = s.window_totals(6_000, 10);
+        assert_eq!(total, 16_000, "no outcome lost to a slot roll-over");
+        assert!(fail > 0 && fail < total);
+    }
+
+    #[test]
+    fn the_constant_work_path_never_picks_an_ejected_member() {
+        let (h, urls) = pool_of(4);
+        feed(&h, &urls, 3, true, 100, 1_000);
+        feed(&h, &urls, 0, false, 10, 1_000);
+        assert!(stats(&h, &urls[0]).is_ejected(1_000));
+        // the "random" source keeps offering the ejected member first
+        let mut r = script(&[0, 0, 0, 0, 1, 2, 0, 3]);
+        for _ in 0..50 {
+            let got = pick(&h, &urls, Algorithm::P2c, 1_000, &mut r).unwrap();
+            assert_ne!(got, &urls[0]);
+        }
     }
 }

@@ -106,7 +106,7 @@ failing database behind all members is not one member's fault), and at most `max
 the pool is out at once. An ejected member is out for `eject_secs`, multiplied by its consecutive
 ejections (up to 10x), then rejoins. A failure is a `502`, `503` or `504` or a transport error.
 Metrics: `zion_upstream_inflight`, `zion_upstream_peak_ewma_seconds`, `zion_upstream_ejected`,
-`zion_upstream_ejections_total` (per member). A URL that belongs to several pools uses the first
+`zion_upstream_ejections_total` (per member). Every proxy mode (standard, `sse_stream`, `static_cache`, `websocket`) chooses a member with the configured algorithm and skips ejected members; in-flight tracking, latency and failure accounting (what drives ejection) come from `standard` routes. A URL that belongs to several pools uses the first
 route's `outlier_detection`.
 
 ### Circuit breaker (`circuit_breaker`, opt-in)

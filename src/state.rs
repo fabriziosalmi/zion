@@ -149,6 +149,7 @@ impl ResolvedAppConfig {
         // Health map: one entry per upstream URL referenced by any route.
         // The same URL can appear in many routes — dedup via FnvHashMap.
         let mut map = fnv::FnvHashMap::default();
+        let mut outlier_claimed: std::collections::HashSet<String> = Default::default();
         for route in &config.route {
             // A static route has no upstream to probe.
             let Some(name) = route.upstream_name() else {
@@ -187,7 +188,10 @@ impl ResolvedAppConfig {
                 }
                 if is_pool {
                     entry.pool.set_pool_member(true);
-                    if outlier_cfg.is_some() && entry.pool.outlier_cfg().is_none() {
+                    // The first pool route to name a URL decides its outlier detection, even
+                    // when that is "off": a later route cannot switch it on for traffic that
+                    // opted out.
+                    if outlier_claimed.insert(url.clone()) {
                         entry.pool.configure_outlier(outlier_cfg.clone());
                     }
                 }

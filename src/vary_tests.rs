@@ -1967,3 +1967,100 @@ async fn a_reload_adds_and_removes_outlier_detection_through_the_real_rebuild() 
     reload(&st, "");
     assert_eq!(cfg_of(&st), None, "removed on reload");
 }
+
+#[tokio::test]
+async fn the_first_route_decides_outlier_detection_even_when_it_opts_out() {
+    let (os, _) = pool_rig(2, "").await;
+    let urls = os
+        .iter()
+        .map(|o| format!("\"http://127.0.0.1:{}\"", o.port.load(Ordering::Relaxed)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let build = |first: &str, second: &str| {
+        let toml = format!(
+            r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstream.plain]
+urls = [{urls}]
+{first}
+[upstream.guarded]
+urls = [{urls}]
+{second}
+[[route]]
+path = "/a/{{*rest}}"
+upstream = "plain"
+[[route]]
+path = "/b/{{*rest}}"
+upstream = "guarded"
+"#
+        );
+        AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).unwrap())
+    };
+    let st = build("", OUTLIER);
+    assert!(
+        st.cfg()
+            .health_map
+            .values()
+            .all(|h| h.pool.outlier_cfg().is_none()),
+        "traffic through the opted-out pool must never be ejected"
+    );
+    let st = build(OUTLIER, "");
+    assert!(st
+        .cfg()
+        .health_map
+        .values()
+        .all(|h| h.pool.outlier_cfg().is_some()));
+}
+
+#[tokio::test]
+async fn sse_routes_over_a_pool_avoid_an_ejected_member() {
+    let (os, st) = pool_rig(2, OUTLIER).await;
+    // an `sse_stream` view of the same pool
+    let urls = os
+        .iter()
+        .map(|o| format!("\"http://127.0.0.1:{}\"", o.port.load(Ordering::Relaxed)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstream.p]
+urls = [{urls}]
+{OUTLIER}
+[[route]]
+path = "/sse/{{*rest}}"
+upstream = "p"
+mode = "sse_stream"
+"#
+    );
+    drop(st);
+    let st = AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).unwrap());
+    let cfg = st.cfg();
+    let pool_urls: Vec<String> = os
+        .iter()
+        .map(|o| format!("http://127.0.0.1:{}", o.port.load(Ordering::Relaxed)))
+        .collect();
+    for _ in 0..30 {
+        crate::pool::report(&cfg.health_map, &pool_urls, &pool_urls[1], true, Some(1), 1);
+    }
+    let now = crate::breaker::now_ms();
+    for _ in 0..10 {
+        crate::pool::report(&cfg.health_map, &pool_urls, &pool_urls[0], false, None, now);
+    }
+    assert!(cfg.health_map[&pool_urls[0]].pool.is_ejected(now));
+    for i in 0..20 {
+        call(&st, &format!("/sse/{i}")).await;
+    }
+    assert_eq!(hits(&os[0]), 0, "the ejected member gets no SSE traffic");
+    assert!(hits(&os[1]) > 0);
+}

@@ -748,7 +748,7 @@ impl Metrics {
 
         let mut extra = String::with_capacity(96 + rows.len() * 64);
         extra.push_str(
-            "# HELP zion_upstream_up 1 if the upstream is in rotation, 0 if it is ejected (503 until it recovers).\n# TYPE zion_upstream_up gauge\n",
+            "# HELP zion_upstream_up 1 if the active health probe considers the upstream up, 0 if it is marked down (503 until it recovers). Passive ejection of a pool member is zion_upstream_ejected.\n# TYPE zion_upstream_up gauge\n",
         );
         for (url, up) in rows {
             extra.push_str("zion_upstream_up{upstream=\"");
