@@ -81,6 +81,32 @@ refused.
 
 Legacy format `[upstreams]` (flat key-value map of name to URL) is also supported.
 
+### Concurrency cap (`max_in_flight`, opt-in)
+
+```toml
+[upstream.api]
+url = "http://10.0.0.5:8000"
+max_in_flight = 200
+```
+
+At most `max_in_flight` requests are inside this upstream at once (the whole pool, not one
+member). The next one is answered **immediately** with `503`, `Retry-After: 1` and
+`X-Zion-Bulkhead: full`, instead of queueing: a slow backend can no longer turn every extra
+request into one more connection, one more buffered body and one more waiting task until zion
+itself is the problem. A request holds its slot until its response body has been sent (or the
+client went away). The limit is read from the live config on every request, so a reload takes
+effect at once and keeps the true count.
+
+- Counted: `standard` and `sse_stream` routes. Not counted: cache hits (`static_cache` routes
+  are not limited), WebSocket upgrades (long-lived) and static files.
+- Taken after auth and the WAF, so a hostile request cannot use up slots, and before the
+  [circuit breaker](#circuit-breaker-circuit-breaker-opt-in), so a shed request is never counted
+  as an upstream failure.
+- Metrics: `zion_bulkhead_in_flight`, `zion_bulkhead_limit`, `zion_bulkhead_shed_total`
+  (per upstream name).
+- Size it from the backend, not from zion: the number of concurrent requests it can serve at
+  an acceptable latency.
+
 ### Pools: load balancing and outlier detection
 
 An upstream with several endpoints (`urls = [...]`) assigns each request to a member with

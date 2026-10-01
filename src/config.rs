@@ -676,6 +676,8 @@ struct RawUpstream {
     load_balancing: LoadBalancing,
     #[serde(default)]
     outlier_detection: Option<OutlierDetectionConfig>,
+    #[serde(default)]
+    max_in_flight: Option<u32>,
 }
 
 /// How a pool of several endpoints assigns a request to a member.
@@ -869,6 +871,12 @@ pub struct UpstreamConfig {
     /// Opt-in passive health for a pool: eject a member that is failing in-band.
     #[serde(default)]
     pub outlier_detection: Option<OutlierDetectionConfig>,
+    /// Opt-in concurrency cap for this upstream (the whole pool): at most this many requests
+    /// are inside it at once, the next gets `503` + `Retry-After` immediately. Counts `standard`
+    /// and `sse_stream` requests until their response has been sent; `static_cache` and
+    /// `websocket` routes are not counted. Omit for no limit.
+    #[serde(default)]
+    pub max_in_flight: Option<u32>,
 }
 
 impl TryFrom<RawUpstream> for UpstreamConfig {
@@ -896,6 +904,7 @@ impl TryFrom<RawUpstream> for UpstreamConfig {
             circuit_breaker: raw.circuit_breaker,
             load_balancing: raw.load_balancing,
             outlier_detection: raw.outlier_detection,
+            max_in_flight: raw.max_in_flight,
         })
     }
 }
@@ -1508,6 +1517,13 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     let mut errors: Vec<String> = Vec::new();
 
     for (name, up) in &config.upstream {
+        if let Some(n) = up.max_in_flight {
+            if !(1..=1_000_000).contains(&n) {
+                errors.push(format!(
+                    "upstream.{name}.max_in_flight must be 1..=1000000 (omit it for no limit), got {n}"
+                ));
+            }
+        }
         if let Some(cb) = &up.circuit_breaker {
             errors.extend(cb.errors(name));
         }
@@ -2161,6 +2177,32 @@ mod tests {
             .err()
             .unwrap_or_default();
         assert!(e.contains("max_object_mb must be >= 1"), "{e}");
+    }
+
+    #[test]
+    fn max_in_flight_is_opt_in_and_bounded() {
+        let cfg = |up: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+                 [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstream.u]\nurl=\"http://a:1\"\n{up}\n\
+                 [[route]]\npath=\"/{{*r}}\"\nupstream=\"u\"\n"
+            )
+        };
+        let d: ZionConfig = toml::from_str(&cfg("")).unwrap();
+        assert_eq!(
+            d.upstream["u"].max_in_flight, None,
+            "no limit unless asked for"
+        );
+        let c: ZionConfig = toml::from_str(&cfg("max_in_flight = 64")).unwrap();
+        assert_eq!(c.upstream["u"].max_in_flight, Some(64));
+        for bad in ["max_in_flight = 0", "max_in_flight = 1000001"] {
+            let e = validate_str(&cfg(bad), "t").err().unwrap_or_default();
+            assert!(
+                e.contains("max_in_flight must be 1..=1000000"),
+                "{bad}: {e}"
+            );
+        }
+        assert!(toml::from_str::<ZionConfig>(&cfg("max_in_flight = -1")).is_err());
     }
 
     #[test]

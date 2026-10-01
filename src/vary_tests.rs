@@ -2234,3 +2234,231 @@ async fn an_empty_tag_parameter_does_not_flush_the_cache() {
     assert_eq!(code, 200);
     assert_eq!(fetch(&st, "/t/keep", &[]).await.0, "MISS");
 }
+
+// ── bulkhead: [upstream.x] max_in_flight ────────────────────────────────────
+
+/// The bulkhead counter is keyed by upstream *name* (one config per process in production), so
+/// each test names its upstream uniquely instead of sharing "o" with the rest of the suite.
+fn cfg_named(name: &str, port: u16, upstream_extra: &str) -> ZionConfig {
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+
+[tls]
+cert_path = "/c"
+key_path = "/k"
+
+[upstream.{name}]
+url = "http://127.0.0.1:{port}"
+{upstream_extra}
+
+[cache_profile.c]
+ttl_seconds = 3600
+max_entries = 100
+
+[[route]]
+path = "/plain/{{*rest}}"
+upstream = "{name}"
+
+[[route]]
+path = "/cached/{{*rest}}"
+upstream = "{name}"
+mode = "static_cache"
+cache_profile = "c"
+"#
+    );
+    toml::from_str::<ZionConfig>(&toml).expect("config parses")
+}
+
+async fn status_and_headers(
+    st: &Arc<AppState>,
+    uri: &str,
+) -> (u16, Option<String>, Option<String>) {
+    let resp = process_request(
+        get(uri, &[]),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    let h = |n: &str| {
+        resp.headers()
+            .get(n)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let out = (
+        resp.status().as_u16(),
+        h("retry-after"),
+        h("x-zion-bulkhead"),
+    );
+    let _ = resp.into_body().collect().await;
+    out
+}
+
+#[tokio::test]
+async fn an_upstream_at_max_in_flight_sheds_the_overflow_at_once_and_recovers() {
+    let (o, _) = rig("").await;
+    let port = o.port.load(Ordering::Relaxed);
+    let st = AppState::for_tests(&cfg_named("bh-shed", port, "max_in_flight = 2"));
+    o.delay_ms.store(300, Ordering::Relaxed);
+
+    let t = std::time::Instant::now();
+    let results = join_all((0..6).map(|i| {
+        let st = st.clone();
+        async move { status_and_headers(&st, &format!("/plain/bh{i}")).await }
+    }))
+    .await;
+    let ok = results.iter().filter(|r| r.0 == 200).count();
+    let shed: Vec<_> = results.iter().filter(|r| r.0 == 503).collect();
+    assert_eq!(ok, 2, "exactly max_in_flight got through: {results:?}");
+    assert_eq!(shed.len(), 4, "{results:?}");
+    assert!(shed
+        .iter()
+        .all(|r| r.1.as_deref() == Some("1") && r.2.as_deref() == Some("full")));
+    assert_eq!(hits(&o), 2, "the shed requests never reached the origin");
+    assert!(t.elapsed() < Duration::from_millis(2000));
+
+    // the slots were freed when the responses finished
+    o.delay_ms.store(0, Ordering::Relaxed);
+    for i in 0..4 {
+        assert_eq!(
+            status_and_headers(&st, &format!("/plain/after{i}")).await.0,
+            200
+        );
+    }
+    let c = crate::bulkhead::counter("bh-shed");
+    assert_eq!(c.in_flight(), 0);
+    assert!(c.shed() >= 4);
+}
+
+#[tokio::test]
+async fn shed_requests_are_not_upstream_failures_to_the_circuit_breaker() {
+    let (o, _) = rig("").await;
+    let port = o.port.load(Ordering::Relaxed);
+    let st = AppState::for_tests(&cfg_named(
+        "bh-breaker",
+        port,
+        &format!("{BREAKER}\nmax_in_flight = 1"),
+    ));
+    o.delay_ms.store(150, Ordering::Relaxed);
+    // many more shed (503) than the breaker's min_requests: if they counted it would open
+    for _ in 0..3 {
+        let results = join_all((0..8).map(|i| {
+            let st = st.clone();
+            async move { status_and_headers(&st, &format!("/plain/br{i}")).await }
+        }))
+        .await;
+        assert!(results.iter().filter(|r| r.0 == 503).count() >= 6);
+    }
+    o.delay_ms.store(0, Ordering::Relaxed);
+    let (code, _, _) = status_and_headers(&st, "/plain/still-closed").await;
+    assert_eq!(code, 200, "the circuit never opened");
+    let entry = st.cfg().health_map.values().next().unwrap().clone();
+    assert!(
+        matches!(
+            entry.breaker.check(crate::breaker::now_ms()),
+            crate::breaker::Check::Allow
+        ),
+        "closed"
+    );
+}
+
+#[tokio::test]
+async fn a_reload_changes_the_limit_at_once_and_keeps_the_count() {
+    let (o, _) = rig("").await;
+    let port = o.port.load(Ordering::Relaxed);
+    let st = AppState::for_tests(&cfg_named("bh-reload", port, "max_in_flight = 1"));
+    o.delay_ms.store(400, Ordering::Relaxed);
+    let st2 = st.clone();
+    let held = tokio::spawn(async move { status_and_headers(&st2, "/plain/held").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        status_and_headers(&st, "/plain/x").await.0,
+        503,
+        "at the limit"
+    );
+    // reload to a higher limit while the first request is still in flight
+    let prev = st.cfg();
+    let next = crate::reload::rebuild(
+        &cfg_with_breaker(port, "max_in_flight = 5", ""),
+        &prev,
+        1024,
+    )
+    .unwrap();
+    st.config.store(Arc::new(next));
+    assert_eq!(
+        status_and_headers(&st, "/plain/y").await.0,
+        200,
+        "the new limit applies at once"
+    );
+    assert_eq!(held.await.unwrap().0, 200);
+    // and the limit can be removed entirely
+    let prev = st.cfg();
+    let next = crate::reload::rebuild(&cfg_named("bh-reload", port, ""), &prev, 1024).unwrap();
+    st.config.store(Arc::new(next));
+    o.delay_ms.store(0, Ordering::Relaxed);
+    assert_eq!(status_and_headers(&st, "/plain/z").await.0, 200);
+}
+
+#[tokio::test]
+async fn cache_hits_do_not_use_a_slot() {
+    let (o, _) = rig("").await;
+    let port = o.port.load(Ordering::Relaxed);
+    let st = AppState::for_tests(&cfg_named("bh-cache", port, "max_in_flight = 1"));
+    assert_eq!(status_and_headers(&st, "/cached/a").await.0, 200);
+    settle().await;
+    // a held slot on the plain route must not stop cached responses
+    o.delay_ms.store(300, Ordering::Relaxed);
+    let st2 = st.clone();
+    let held = tokio::spawn(async move { status_and_headers(&st2, "/plain/slow").await });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    for _ in 0..5 {
+        assert_eq!(fetch(&st, "/cached/a", &[]).await.0, "HIT");
+    }
+    held.await.unwrap();
+}
+
+#[tokio::test]
+async fn the_slot_is_held_until_the_client_has_read_the_response_body() {
+    let (o, _) = rig("").await;
+    let port = o.port.load(Ordering::Relaxed);
+    let st = AppState::for_tests(&cfg_named("bh-body", port, "max_in_flight = 1"));
+    // a body big enough to be streamed in several frames
+    *o.big.lock().unwrap() = Some((400_000, true));
+    let resp = process_request(
+        get("/plain/stream", &[]),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    // headers are out but the body is unread: the upstream is still busy with this response
+    assert_eq!(status_and_headers(&st, "/plain/other").await.0, 503);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.len(), 400_000);
+    assert_eq!(
+        crate::bulkhead::counter("bh-body").in_flight(),
+        0,
+        "freed at the end of the body"
+    );
+    assert_eq!(status_and_headers(&st, "/plain/other").await.0, 200);
+
+    // a client that goes away mid-body frees the slot too
+    let resp = process_request(
+        get("/plain/abandoned", &[]),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(status_and_headers(&st, "/plain/other").await.0, 503);
+    drop(resp);
+    assert_eq!(status_and_headers(&st, "/plain/other").await.0, 200);
+}

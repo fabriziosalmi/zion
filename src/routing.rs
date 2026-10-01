@@ -30,6 +30,9 @@ pub struct ResolvedRoute {
     pub connect_timeout_ms: u64,
     /// How a pool of several endpoints picks a member.
     pub load_balancing: crate::pool::Algorithm,
+    /// `[upstream.x] max_in_flight` (0 = no limit) and the name its counter is kept under.
+    pub max_in_flight: u32,
+    pub upstream_name: Option<Arc<str>>,
     /// Pre-parsed URI parts — avoids full URI parse on every request.
     pub upstream_scheme: hyper::http::uri::Scheme,
     pub upstream_authority: hyper::http::uri::Authority,
@@ -493,6 +496,12 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
             .and_then(|name| config.upstream.get(name))
             .map(|u| u.load_balancing.into())
             .unwrap_or_default(),
+        max_in_flight: route
+            .upstream_name()
+            .and_then(|name| config.upstream.get(name))
+            .and_then(|u| u.max_in_flight)
+            .unwrap_or(0),
+        upstream_name: route.upstream_name().map(Arc::from),
         upstream_scheme,
         upstream_authority,
         mode: route.mode(),

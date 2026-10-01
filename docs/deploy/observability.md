@@ -111,6 +111,9 @@ feature-gated series (absent, not zero, without the feature) is called out.
 | `zion_panics_total` | counter | Worker panics caught by the panic hook (must stay `0`) |
 | `zion_audit_events_total` | counter | Audit-log events emitted (signed + HMAC-chained) |
 | `zion_cache_tag_uncached` | counter | Responses not stored because their `Surrogate-Key` tags could not be tracked (too many, too long, invalid, or the tag index is full) |
+| `zion_bulkhead_in_flight{upstream}` | gauge | Requests currently inside an upstream that has `max_in_flight` |
+| `zion_bulkhead_limit{upstream}` | gauge | The `max_in_flight` last applied to it |
+| `zion_bulkhead_shed_total{upstream}` | counter | Requests refused with `503` because it was at `max_in_flight` |
 | `zion_dns_lookup_failures_total` | counter | Upstream DNS lookups that failed, timed out or returned no address |
 | `zion_dns_stale_served_total` | counter | Upstream connections that used the last good DNS answer because the fresh lookup failed (see `dns_stale_secs`) |
 | `zion_log_lines_dropped_total` | counter | Log lines dropped because stderr was slower than the log rate (`[server] log_queue_lines`). Any increase means log lines are missing, not that requests were slowed |
