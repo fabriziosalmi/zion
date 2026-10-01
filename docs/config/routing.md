@@ -52,7 +52,8 @@ profiles, used as the cache key, and sent upstream:
 
 Without this, `/open/../internal/x` matches `/open/{*rest}` while an upstream that
 resolves `..` serves `/internal/x`, and `//admin` or `/%61dmin` slip past a `/admin` route.
-Every spelling of a path now meets the same route and the same policy.
+Every spelling of a path now meets the same route and the same policy, on :443 and on the
+plaintext :80 listener (whose ACME-challenge fallback routes on its own).
 
 ## Host-based routing (virtual hosting)
 

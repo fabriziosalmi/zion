@@ -916,3 +916,56 @@ async fn the_upstream_is_sent_the_normalized_path_and_the_query_untouched() {
         );
     }
 }
+
+// ── the plaintext :80 handler routes and forwards on its own, so it normalizes too ──
+
+async fn http80(st: &Arc<AppState>, uri: &str) -> (u16, String) {
+    let resp = crate::handle_http(
+        get(uri, &[("host", "example.test")]),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+    )
+    .await
+    .unwrap();
+    let loc = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    (resp.status().as_u16(), loc)
+}
+
+/// The ACME-fallback shortcut forwards `/.well-known/acme-challenge/*` straight to the
+/// route's upstream. A path that only LOOKS like a challenge before normalization must not
+/// take it: `/.well-known/acme-challenge/../../secret` is `/secret`.
+#[tokio::test]
+async fn the_acme_shortcut_on_port_80_cannot_be_used_to_reach_other_paths() {
+    let (o, st) = rig("").await;
+    // control: a real challenge path is forwarded
+    let (status, _) = http80(&st, "/.well-known/acme-challenge/abc").await;
+    assert_ne!(status, 301, "a challenge path is proxied, not redirected");
+    assert_eq!(hits(&o), 1);
+    assert_eq!(
+        o.last_target.lock().unwrap().as_deref(),
+        Some("/.well-known/acme-challenge/abc")
+    );
+    // spellings that normalize to a challenge path ARE a challenge path, forwarded normalized
+    let (status, _) = http80(&st, "//.well-known/./acme-challenge//def").await;
+    assert_ne!(status, 301);
+    assert_eq!(
+        o.last_target.lock().unwrap().as_deref(),
+        Some("/.well-known/acme-challenge/def")
+    );
+    let before = hits(&o);
+    // ...and ones that normalize to something else are not: redirected to https, never forwarded
+    for p in [
+        "/.well-known/acme-challenge/../../secret",
+        "/.well-known/acme-challenge/%2e%2e/%2e%2e/secret",
+    ] {
+        let (status, loc) = http80(&st, p).await;
+        assert_eq!(status, 301, "{p}");
+        assert_eq!(loc, "https://example.test/secret", "{p}");
+    }
+    assert_eq!(hits(&o), before, "nothing reached the upstream");
+}

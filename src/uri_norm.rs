@@ -64,22 +64,75 @@ fn normalize_escapes(path: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// True when normalization would leave `path` exactly as it is: no dot segments, no
+/// repeated slashes, and every escape already canonical (valid, upper-case hex, not an
+/// unreserved character). One byte scan, no allocation, so the common case — including
+/// paths that carry `%2F` or `%20` — costs nothing on the hot path.
+fn is_normal(path: &str) -> bool {
+    let b = path.as_bytes();
+    let mut seg_start = 0; // index of the first byte of the current segment
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'/' => {
+                let seg = &b[seg_start..i];
+                // an empty segment is a repeated slash, except right at the root's start
+                if i > 0 && seg.is_empty() && seg_start > 0 {
+                    return false;
+                }
+                if seg == b"." || seg == b".." {
+                    return false;
+                }
+                seg_start = i + 1;
+                i += 1;
+            }
+            b'%' => {
+                if i + 2 >= b.len() {
+                    // too short to be an escape: left as written by normalization
+                    i += 1;
+                    continue;
+                }
+                match (hex(b[i + 1]), hex(b[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        let v = h * 16 + l;
+                        if is_unreserved(v)
+                            || b[i + 1].is_ascii_lowercase()
+                            || b[i + 2].is_ascii_lowercase()
+                        {
+                            return false;
+                        }
+                        i += 3;
+                    }
+                    _ => i += 1, // malformed: left as written
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    let last = &b[seg_start..];
+    !(last == b"." || last == b"..")
+}
+
 /// The normalized form of `path` (the path component only, no query). Paths that do not
 /// start with `/` (`*` for `OPTIONS *`) are returned unchanged.
 pub fn normalize_path(path: &str) -> Cow<'_, str> {
     if !path.starts_with('/') {
         return Cow::Borrowed(path);
     }
-    // Fast path: nothing that normalization touches.
-    let plain = !path.contains('%')
-        && !path.contains("//")
-        && !path.contains("/./")
-        && !path.contains("/../")
-        && !path.ends_with("/.")
-        && !path.ends_with("/..");
-    if plain {
+    // Fast path: already canonical — no allocation, one pass.
+    if is_normal(path) {
         return Cow::Borrowed(path);
     }
+    let out = normalize_slow(path);
+    if out == path {
+        Cow::Borrowed(path)
+    } else {
+        Cow::Owned(out)
+    }
+}
+
+/// The full normalization, always computed (the reference the fast check is tested against).
+fn normalize_slow(path: &str) -> String {
     let escaped = normalize_escapes(path);
     let trailing_slash = escaped.ends_with('/')
         || escaped.ends_with("/.")
@@ -101,11 +154,26 @@ pub fn normalize_path(path: &str) -> Cow<'_, str> {
     if trailing_slash && !stack.is_empty() {
         out.push('/');
     }
-    if out == path {
-        Cow::Borrowed(path)
-    } else {
-        Cow::Owned(out)
+    out
+}
+
+/// Rewrite `req`'s URI to its normalized path (query untouched). `Ok(())` when the request
+/// was already normal or has been rewritten; `Err(())` when the normalized URI cannot be
+/// rebuilt (the caller answers 400). Shared by the HTTPS pipeline and the plaintext :80
+/// handler, which routes and forwards ACME challenges on its own.
+pub fn rewrite_request<B>(req: &mut hyper::Request<B>) -> Result<(), ()> {
+    let normalized = normalize_path(req.uri().path());
+    if matches!(normalized, Cow::Borrowed(_)) {
+        return Ok(()); // already normal: no allocation, no rewrite
     }
+    let pq = match req.uri().query() {
+        Some(q) => format!("{normalized}?{q}"),
+        None => normalized.into_owned(),
+    };
+    let mut parts = req.uri().clone().into_parts();
+    parts.path_and_query = Some(pq.parse().map_err(|_| ())?);
+    *req.uri_mut() = hyper::Uri::from_parts(parts).map_err(|_| ())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -131,10 +199,31 @@ mod tests {
         ] {
             assert_eq!(n(p), p, "{p}");
         }
-        assert!(
-            matches!(normalize_path("/a/b"), Cow::Borrowed(_)),
-            "no allocation when nothing changes"
-        );
+        // no allocation when nothing changes — including paths that carry canonical escapes
+        for p in [
+            "/a/b",
+            "/a%2Fb",
+            "/a%20b",
+            "/caf%C3%A9/x",
+            "/a%2F..%2Fb",
+            "/a/",
+            "/",
+            "/a%",
+            "/a%2",
+        ] {
+            assert!(
+                matches!(normalize_path(p), Cow::Borrowed(_)),
+                "{p} must not allocate"
+            );
+        }
+        for p in [
+            "/a%2fb", "/a%41", "/a//b", "/a/./b", "/a/..", "//", "/a/b/.",
+        ] {
+            assert!(
+                matches!(normalize_path(p), Cow::Owned(_)),
+                "{p} must be rewritten"
+            );
+        }
     }
 
     #[test]
@@ -214,6 +303,47 @@ mod tests {
             let once = n(p);
             assert_eq!(n(&once), once, "{p} -> {once}");
         }
+    }
+
+    /// The one-pass fast check must agree with the full normalization on every input: if it
+    /// says "normal" the slow path must leave the path alone, and if the slow path changes
+    /// anything the fast check must not have claimed it normal. Exhaustive over a small
+    /// alphabet that covers slashes, dots, escapes (both hex cases) and truncated escapes.
+    #[test]
+    fn the_fast_check_agrees_with_the_full_normalization() {
+        let alphabet = ["/", ".", "%", "2", "e", "E", "F", "a", "4", "1", "z"];
+        let mut checked = 0u32;
+        // every string of length 1..=6 over the alphabet, prefixed with '/'
+        let mut idx = vec![0usize; 6];
+        for len in 1..=6usize {
+            idx.iter_mut().for_each(|x| *x = 0);
+            loop {
+                let mut p = String::from("/");
+                for k in 0..len {
+                    p.push_str(alphabet[idx[k]]);
+                }
+                let changed = normalize_slow(&p) != p;
+                assert_eq!(is_normal(&p), !changed, "{p:?}");
+                checked += 1;
+                // odometer over the first `len` digits
+                let mut k = 0;
+                loop {
+                    if k == len {
+                        break;
+                    }
+                    idx[k] += 1;
+                    if idx[k] < alphabet.len() {
+                        break;
+                    }
+                    idx[k] = 0;
+                    k += 1;
+                }
+                if k == len {
+                    break;
+                }
+            }
+        }
+        assert!(checked > 1_000_000, "covered {checked} inputs");
     }
 
     #[test]

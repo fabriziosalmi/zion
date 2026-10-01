@@ -141,23 +141,9 @@ fn uri_length(req: &Request<ZionBody>) -> Option<Response<ZionBody>> {
 /// upstream must all read the same path, or `/open/../internal/x` matches the open route
 /// and still reaches `/internal/x` (see `uri_norm`). The query string is left as written.
 fn normalize_path(req: &mut Request<ZionBody>) -> Option<Response<ZionBody>> {
-    let normalized = crate::uri_norm::normalize_path(req.uri().path());
-    if matches!(normalized, std::borrow::Cow::Borrowed(_)) {
-        return None; // already normal: no allocation, no rewrite
-    }
-    let pq = match req.uri().query() {
-        Some(q) => format!("{normalized}?{q}"),
-        None => normalized.into_owned(),
-    };
-    let mut parts = req.uri().clone().into_parts();
-    parts.path_and_query = pq.parse().ok();
-    match hyper::Uri::from_parts(parts) {
-        Ok(uri) if req.uri().path_and_query().is_some() => {
-            *req.uri_mut() = uri;
-            None
-        }
-        _ => Some(empty_response(StatusCode::BAD_REQUEST)),
-    }
+    crate::uri_norm::rewrite_request(req)
+        .err()
+        .map(|()| empty_response(StatusCode::BAD_REQUEST))
 }
 
 /// Gate: HTTP method whitelist.
