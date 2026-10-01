@@ -1870,9 +1870,90 @@ fn cache_response(hit: cache::CacheHit, disposition: &'static str) -> Response<Z
     if let Some(ce) = &hit.meta.content_encoding {
         builder = builder.header(hyper::header::CONTENT_ENCODING, ce.clone());
     }
+    // The validators the client echoes back (If-None-Match / If-Range), as the origin sent them.
+    if let Some(etag) = &hit.meta.etag {
+        builder = builder.header(hyper::header::ETAG, etag.clone());
+    }
+    if let Some(lm) = &hit.meta.last_modified {
+        builder = builder.header(hyper::header::LAST_MODIFIED, lm.clone());
+    }
+    // A fresh hit answers `Range` itself (see `ranged_hit_response`): say so.
+    if disposition == "HIT" && hit.meta.status == StatusCode::OK {
+        builder = builder.header(hyper::header::ACCEPT_RANGES, "bytes");
+    }
     builder
         .body(Full::new(hit.body).map_err(|never| match never {}).boxed())
         .unwrap()
+}
+
+/// Answer a `Range` request from a fresh cached `200` (RFC 9110 §14): one satisfiable byte range
+/// becomes a `206` with a zero-copy slice of the stored body, an unsatisfiable one a `416`.
+/// `None` means "serve the whole representation" — no `Range`, a unit or form we do not handle
+/// (multi-range, malformed), an `If-Range` that does not match, a non-`GET`, or a stored status
+/// other than 200. Preconditions (`If-None-Match`/`If-Modified-Since` → 304) run before this.
+fn ranged_hit_response(
+    hit: &cache::CacheHit,
+    method: &hyper::Method,
+    headers: &hyper::HeaderMap,
+) -> Option<Response<ZionBody>> {
+    use crate::static_files::{self, RangeOutcome};
+    if *method != hyper::Method::GET || hit.meta.status != StatusCode::OK {
+        return None;
+    }
+    headers.get(hyper::header::RANGE)?;
+    if !static_files::if_range_allows_stored(
+        headers,
+        hit.meta.etag.as_ref(),
+        hit.meta.last_modified.as_ref(),
+    ) {
+        return None;
+    }
+    let total = hit.body.len() as u64;
+    let mut builder = Response::builder()
+        .header("Cache-Control", profile_cache_control(hit.max_age_secs))
+        .header("X-Zion-Cache", "HIT")
+        .header(hyper::header::AGE, hit.age_secs)
+        .header(hyper::header::ACCEPT_RANGES, "bytes");
+    if let Some(ct) = &hit.meta.content_type {
+        builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
+    }
+    if let Some(ce) = &hit.meta.content_encoding {
+        builder = builder.header(hyper::header::CONTENT_ENCODING, ce.clone());
+    }
+    if let Some(etag) = &hit.meta.etag {
+        builder = builder.header(hyper::header::ETAG, etag.clone());
+    }
+    if let Some(lm) = &hit.meta.last_modified {
+        builder = builder.header(hyper::header::LAST_MODIFIED, lm.clone());
+    }
+    match static_files::parse_range(headers.get(hyper::header::RANGE), total) {
+        RangeOutcome::Full => None,
+        RangeOutcome::Unsatisfiable => Some(
+            builder
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(hyper::header::CONTENT_RANGE, format!("bytes */{total}"))
+                .body(
+                    Full::new(Bytes::new())
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap(),
+        ),
+        RangeOutcome::Satisfiable(start, end) => Some(
+            builder
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(
+                    hyper::header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{total}"),
+                )
+                .body(
+                    Full::new(hit.body.slice(start as usize..=end as usize))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap(),
+        ),
+    }
 }
 
 #[inline]
@@ -2143,6 +2224,9 @@ async fn handle_static_cache(
                 // the body entirely.
                 if client_conditional_hit(req.headers(), &hit.meta) {
                     return Ok(not_modified_response(&hit));
+                }
+                if let Some(partial) = ranged_hit_response(&hit, req.method(), req.headers()) {
+                    return Ok(partial);
                 }
                 return Ok(cache_hit_response(hit));
             }

@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Range requests are answered from the cache** (RFC 9110 §14). A fresh cached `200` now answers a single `Range` (`a-b`, `a-`, `-n`) with a `206` and a zero-copy slice of the stored body, an unsatisfiable one with `416` + `Content-Range: bytes */size`, so seeking in a cached video or resuming a download no longer pulls the whole object from RAM nor reaches the origin. `If-Range` uses strong comparison, preconditions (`304`) are evaluated first, and anything else (multi-range, other units, stale/revalidated copies, non-GET) still gets the whole object. Cache hits also carry the origin's `ETag` / `Last-Modified` now and `Accept-Ranges: bytes` when they can serve ranges.
+
 ### Fixed
 
 - **A pool member that was once slow is no longer avoided for good.** The load estimate that `p2c` uses (peak-EWMA latency) only changed when a sample arrived, so a member that had one slow period, or that came back from an ejection, kept its old estimate; with two members and low load it was never picked again, so it never got the sample that would correct it. The estimate now fades with time (half every 5 s without a sample), a new sample is folded into the faded estimate, an ejected member's estimate is dropped so it is measured afresh when it returns, and a member with no estimate is assumed to be as fast as the member it is compared with (it used to be scored with a fixed 1 ms guess, so it lost to any faster backend and stayed unmeasured: the cool-down test failed 4 runs in 5 on a release build). In a probe with one member 400 ms slow for 4 s and then healthy, the old build kept it at 0% for 40 s; the new one brings it back after about 25 s (a 200× slower period; less for a milder one).
