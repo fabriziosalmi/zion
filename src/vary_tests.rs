@@ -2512,20 +2512,26 @@ async fn access_log_line(redact: &str) -> String {
         .with_max_level(tracing::Level::INFO)
         .finish();
     let _guard = tracing::subscriber::set_default(sub);
-    let resp = process_request(
-        get("/ip/x", &[]),
-        st,
-        "203.0.113.9:4242".parse::<SocketAddr>().unwrap(),
-        false,
-    )
-    .await
-    .unwrap();
-    let _ = resp.into_body().collect().await;
-    let out = String::from_utf8(cap.0.lock().unwrap().clone()).unwrap();
-    out.lines()
-        .find(|l| l.contains("remote_ip"))
-        .unwrap_or("")
-        .to_string()
+    // `tracing` caches, per call site, whether anyone is listening. Tests running in parallel
+    // reach the access-log call site while no subscriber exists and can leave "nobody" cached
+    // for a moment: rebuild it for ours, and ask again rather than flake.
+    for attempt in 0..5 {
+        tracing::callsite::rebuild_interest_cache();
+        let resp = process_request(
+            get(&format!("/ip/x{attempt}"), &[]),
+            st.clone(),
+            "203.0.113.9:4242".parse::<SocketAddr>().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        let _ = resp.into_body().collect().await;
+        let out = String::from_utf8(cap.0.lock().unwrap().clone()).unwrap();
+        if let Some(l) = out.lines().find(|l| l.contains("remote_ip")) {
+            return l.to_string();
+        }
+    }
+    String::new()
 }
 
 #[tokio::test]
