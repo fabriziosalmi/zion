@@ -314,7 +314,7 @@ mod tests {
         let alphabet = ["/", ".", "%", "2", "e", "E", "F", "a", "4", "1", "z"];
         let mut checked = 0u32;
         // every string of length 1..=6 over the alphabet, prefixed with '/'
-        let mut idx = vec![0usize; 6];
+        let mut idx = [0usize; 6];
         for len in 1..=6usize {
             idx.iter_mut().for_each(|x| *x = 0);
             loop {
