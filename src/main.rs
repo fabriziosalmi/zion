@@ -55,6 +55,7 @@ mod config;
 mod connlimit;
 mod dns;
 mod doctor;
+mod drain;
 mod error;
 mod health;
 mod http_conditional;
@@ -1219,6 +1220,9 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     // on the next iteration; spawned per-connection tasks continue and
     // are drained by the semaphore wait below.
     let _ = super_shutdown_tx.send(true);
+    // Open connections wind down now: idle keep-alive ones close, HTTP/2 ones get GOAWAY, and
+    // a request in flight is finished first (see `drain`).
+    drain::begin();
     // Best-effort wait on the supervisor to exit cleanly. Bounded by 2s
     // so a stuck reconcile does not block process shutdown.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), supervisor_handle).await;
@@ -1390,16 +1394,18 @@ async fn handle_http_connection(
     // Connection-level idle timeout — matches the HTTPS path (1h, generous
     // enough for keep-alive; header_read_timeout bounds the slowloris header
     // phase, per-request limits live in handle_http).
+    let conn = builder.serve_connection(
+        io,
+        service_fn(move |req| {
+            use http_body_util::BodyExt;
+            let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
+            handle_http(req_boxed, state.clone(), addr)
+        }),
+    );
+    tokio::pin!(conn);
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(3600),
-        builder.serve_connection(
-            io,
-            service_fn(move |req| {
-                use http_body_util::BodyExt;
-                let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
-                handle_http(req_boxed, state.clone(), addr)
-            }),
-        ),
+        drain::serve(conn.as_mut(), drain::subscribe(), |c| c.graceful_shutdown()),
     )
     .await;
 }
@@ -1668,62 +1674,63 @@ fn spawn_https_handler(
         let io = TokioIo::new(tls_stream);
         // Connection-level idle timeout. 1h to cover long-lived HTTP/2
         // mux / WebSocket / SSE; per-request timeouts are in process_request.
+        let conn = builder.serve_connection_with_upgrades(
+            io,
+            service_fn(move |mut req: Request<Incoming>| {
+                let state = state.clone();
+                let early_flag = early_flag.clone();
+                let client_fp = client_fp.clone();
+                #[cfg(feature = "tls-fingerprint")]
+                let tls_fp_identity = tls_fp_identity.clone();
+                async move {
+                    // Fast-path: health probes bypass the full pipeline (~1us vs ~5us).
+                    let path = req.uri().path();
+                    if path == "/healthz" {
+                        return Ok(text_response(StatusCode::OK, "ok"));
+                    }
+                    if path == "/readyz" {
+                        return Ok(text_response(StatusCode::OK, "ready"));
+                    }
+
+                    // Consume early_data flag on first request.
+                    let was_early = early_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
+                    // X-Client-Cert-Fingerprint is Zion's attestation of a
+                    // verified client certificate; a client must never be
+                    // able to set it. Strip any inbound value (and the
+                    // legacy -DN) unconditionally, THEN re-inject only the
+                    // verified fingerprint when the peer actually presented
+                    // a cert — otherwise a forged header survives to the
+                    // upstream and the access log as a fake mTLS identity.
+                    req.headers_mut().remove("X-Client-Cert-Fingerprint");
+                    req.headers_mut().remove("X-Client-Cert-DN");
+                    if let Some(ref fp) = client_fp {
+                        if let Ok(val) = hyper::header::HeaderValue::from_str(fp) {
+                            req.headers_mut().insert("X-Client-Cert-Fingerprint", val);
+                        }
+                    }
+                    // Same discipline for the JA4 identity headers (#27
+                    // commit 5): strip any inbound forgery, re-inject the
+                    // gate-computed values. Feature-off builds never
+                    // compute an identity, so they strip only.
+                    #[cfg(feature = "tls-fingerprint")]
+                    tls_fp::apply_headers(&mut req, tls_fp_identity.as_deref());
+                    #[cfg(not(feature = "tls-fingerprint"))]
+                    {
+                        // Module compiled out with the feature — strip the
+                        // literals (names asserted equal by a gated test).
+                        req.headers_mut().remove("X-Client-TLS-JA4");
+                        req.headers_mut().remove("X-Client-TLS-Allowlisted");
+                    }
+                    use http_body_util::BodyExt;
+                    let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
+                    process_request(req_boxed, state, remote_addr, was_early).await
+                }
+            }),
+        );
+        tokio::pin!(conn);
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(3600),
-            builder.serve_connection_with_upgrades(
-                io,
-                service_fn(move |mut req: Request<Incoming>| {
-                    let state = state.clone();
-                    let early_flag = early_flag.clone();
-                    let client_fp = client_fp.clone();
-                    #[cfg(feature = "tls-fingerprint")]
-                    let tls_fp_identity = tls_fp_identity.clone();
-                    async move {
-                        // Fast-path: health probes bypass the full pipeline (~1us vs ~5us).
-                        let path = req.uri().path();
-                        if path == "/healthz" {
-                            return Ok(text_response(StatusCode::OK, "ok"));
-                        }
-                        if path == "/readyz" {
-                            return Ok(text_response(StatusCode::OK, "ready"));
-                        }
-
-                        // Consume early_data flag on first request.
-                        let was_early =
-                            early_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
-                        // X-Client-Cert-Fingerprint is Zion's attestation of a
-                        // verified client certificate; a client must never be
-                        // able to set it. Strip any inbound value (and the
-                        // legacy -DN) unconditionally, THEN re-inject only the
-                        // verified fingerprint when the peer actually presented
-                        // a cert — otherwise a forged header survives to the
-                        // upstream and the access log as a fake mTLS identity.
-                        req.headers_mut().remove("X-Client-Cert-Fingerprint");
-                        req.headers_mut().remove("X-Client-Cert-DN");
-                        if let Some(ref fp) = client_fp {
-                            if let Ok(val) = hyper::header::HeaderValue::from_str(fp) {
-                                req.headers_mut().insert("X-Client-Cert-Fingerprint", val);
-                            }
-                        }
-                        // Same discipline for the JA4 identity headers (#27
-                        // commit 5): strip any inbound forgery, re-inject the
-                        // gate-computed values. Feature-off builds never
-                        // compute an identity, so they strip only.
-                        #[cfg(feature = "tls-fingerprint")]
-                        tls_fp::apply_headers(&mut req, tls_fp_identity.as_deref());
-                        #[cfg(not(feature = "tls-fingerprint"))]
-                        {
-                            // Module compiled out with the feature — strip the
-                            // literals (names asserted equal by a gated test).
-                            req.headers_mut().remove("X-Client-TLS-JA4");
-                            req.headers_mut().remove("X-Client-TLS-Allowlisted");
-                        }
-                        use http_body_util::BodyExt;
-                        let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
-                        process_request(req_boxed, state, remote_addr, was_early).await
-                    }
-                }),
-            ),
+            drain::serve(conn.as_mut(), drain::subscribe(), |c| c.graceful_shutdown()),
         )
         .await;
     });
