@@ -1276,7 +1276,6 @@ fn breaker_entry(
         .cloned()
 }
 
-/// What an open circuit answers: 503 at once, with `Retry-After`.
 /// The upstream is at `max_in_flight`: refuse at once rather than queue.
 fn upstream_busy_response() -> Response<ZionBody> {
     let mut resp = text_response(StatusCode::SERVICE_UNAVAILABLE, "upstream busy");
@@ -1291,6 +1290,7 @@ fn upstream_busy_response() -> Response<ZionBody> {
     resp
 }
 
+/// What an open circuit answers: 503 at once, with `Retry-After`.
 fn circuit_open_response(retry_after_ms: u64) -> Response<ZionBody> {
     let mut resp = text_response(StatusCode::SERVICE_UNAVAILABLE, "upstream circuit open");
     let secs = retry_after_ms.div_ceil(1000).max(1);

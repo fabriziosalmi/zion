@@ -2381,10 +2381,25 @@ async fn a_reload_changes_the_limit_at_once_and_keeps_the_count() {
         503,
         "at the limit"
     );
+    // an unrelated reload (same limit) while the first request is still in flight: the count
+    // is the upstream's, not the snapshot's, so it must still be at the limit
+    let prev = st.cfg();
+    let same = crate::reload::rebuild(
+        &cfg_named("bh-reload", port, "max_in_flight = 1"),
+        &prev,
+        1024,
+    )
+    .unwrap();
+    st.config.store(Arc::new(same));
+    assert_eq!(
+        status_and_headers(&st, "/plain/same").await.0,
+        503,
+        "a reload does not reset the in-flight count"
+    );
     // reload to a higher limit while the first request is still in flight
     let prev = st.cfg();
     let next = crate::reload::rebuild(
-        &cfg_with_breaker(port, "max_in_flight = 5", ""),
+        &cfg_named("bh-reload", port, "max_in_flight = 5"),
         &prev,
         1024,
     )
