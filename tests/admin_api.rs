@@ -7,19 +7,14 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const TOKEN: &str = "0123456789abcdef0123456789abcdef-write-token";
+mod common;
+use common::free_port;
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+const TOKEN: &str = "0123456789abcdef0123456789abcdef-write-token";
 
 /// One HTTP/1.1 request over a fresh connection. Returns (status, body).
 fn http(port: u16, method: &str, path: &str, token: Option<&str>, body: &str) -> (u16, String) {
@@ -89,7 +84,29 @@ fn with_rps(cfg: &str, rps: u32) -> String {
     cfg.replace("rate_limit_rps = 0", &format!("rate_limit_rps = {rps}"))
 }
 
+/// Boot the daemon, retrying with fresh ports if one of them was taken by another process in the
+/// meantime (the daemon then logs `Address already in use` and runs without its admin API or a
+/// listener, and waiting for the admin port could be satisfied by somebody else's daemon).
 fn boot(persist: bool) -> Option<(Daemon, u16, std::path::PathBuf, std::path::PathBuf)> {
+    for attempt in 1..=5 {
+        match boot_once(persist) {
+            Boot::NoOpenssl => return None,
+            Boot::Up(d, port, dir, cfg) => return Some((d, port, dir, cfg)),
+            Boot::PortTaken(log) => {
+                eprintln!("boot attempt {attempt}: a port was taken, retrying:\n{log}")
+            }
+        }
+    }
+    panic!("the daemon could not get its ports in 5 attempts");
+}
+
+enum Boot {
+    NoOpenssl,
+    Up(Daemon, u16, std::path::PathBuf, std::path::PathBuf),
+    PortTaken(String),
+}
+
+fn boot_once(persist: bool) -> Boot {
     let dir = std::env::temp_dir().join(format!(
         "zion-admin-e2e-{}-{}",
         std::process::id(),
@@ -110,7 +127,7 @@ fn boot(persist: bool) -> Option<(Daemon, u16, std::path::PathBuf, std::path::Pa
         .unwrap_or(false);
     if !ok {
         eprintln!("SKIP: openssl not available");
-        return None;
+        return Boot::NoOpenssl;
     }
     let admin_port = free_port();
     let cfg = dir.join("zion.toml");
@@ -125,16 +142,29 @@ fn boot(persist: bool) -> Option<(Daemon, u16, std::path::PathBuf, std::path::Pa
         .spawn()
         .expect("spawn zion");
     let d = Daemon(child);
+    let log = || fs::read_to_string(dir.join("daemon.log")).unwrap_or_default();
+    // Up means: it says it is listening (boot finished), and then the admin port answers.
     let deadline = Instant::now() + Duration::from_secs(20);
+    while !log().contains("listening HTTPS on") {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never finished booting; it said:\n{}",
+            log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if log().contains("Address already in use") {
+        return Boot::PortTaken(log());
+    }
     while TcpStream::connect(("127.0.0.1", admin_port)).is_err() {
         assert!(
             Instant::now() < deadline,
             "admin API never came up; daemon said:\n{}",
-            fs::read_to_string(dir.join("daemon.log")).unwrap_or_default()
+            log()
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    Some((d, admin_port, dir, cfg))
+    Boot::Up(d, admin_port, dir, cfg)
 }
 
 #[test]
@@ -233,9 +263,12 @@ fn a_push_is_live_only_by_default() {
     };
     let original = fs::read_to_string(&cfg).unwrap();
     let pushed = with_rps(&original, 9);
+    let (status, body) = http(port, "POST", "/admin/config", Some(TOKEN), &pushed);
     assert_eq!(
-        http(port, "POST", "/admin/config", Some(TOKEN), &pushed).0,
-        200
+        status,
+        200,
+        "push answered {status}: {body}\ndaemon said:\n{}",
+        fs::read_to_string(dir.join("daemon.log")).unwrap_or_default()
     );
     assert_eq!(
         fs::read_to_string(&cfg).unwrap(),
@@ -243,4 +276,21 @@ fn a_push_is_live_only_by_default() {
         "persist_push = false leaves zion.toml as it was"
     );
     let _ = fs::remove_dir_all(dir);
+}
+
+/// The collision these tests used to suffer: `free_port` must never give one port to two callers
+/// of the same process, even from parallel threads (the kernel happily reuses a port it just got
+/// back). With hundreds of draws from the ephemeral range, plain "bind 0 and drop" repeats one.
+#[test]
+fn free_port_never_hands_out_the_same_port_twice() {
+    let ports: Vec<u16> = std::thread::scope(|s| {
+        (0..8)
+            .map(|_| s.spawn(|| (0..400).map(|_| free_port()).collect::<Vec<_>>()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    });
+    let distinct: std::collections::HashSet<_> = ports.iter().collect();
+    assert_eq!(distinct.len(), ports.len(), "a port was handed out twice");
 }
