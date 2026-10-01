@@ -425,6 +425,7 @@ pub struct Metrics {
     /// Responses that were storable but refused because of their `Vary` (too many
     /// variants for the key, the rule index full, or an overlong varied value).
     pub cache_vary_uncached: ShardedCounter,
+    pub cache_tag_uncached: ShardedCounter,
 
     // Global Counters (Cold Path or connection-level)
     pub websocket_upgrades: AtomicU64,
@@ -582,6 +583,7 @@ impl Metrics {
             cache_swr_refresh_failures: ShardedCounter::new(),
             cache_swr_refresh_skipped: ShardedCounter::new(),
             cache_vary_uncached: ShardedCounter::new(),
+            cache_tag_uncached: ShardedCounter::new(),
             websocket_upgrades: AtomicU64::new(0),
             connections_total: AtomicU64::new(0),
             tls_handshake_errors: AtomicU64::new(0),
@@ -1039,6 +1041,11 @@ impl Metrics {
                 "zion_cache_vary_uncached",
                 "Storable responses not stored because of their Vary (variant cap, rule index full, overlong varied value).",
                 &self.cache_vary_uncached,
+            ),
+            (
+                "zion_cache_tag_uncached",
+                "Responses not stored because their Surrogate-Key tags could not be tracked (too many, too long, invalid, or the tag index is full).",
+                &self.cache_tag_uncached,
             ),
         ] {
             out.extend_from_slice(format!("# HELP {name} {help}\n# TYPE {name} counter\n{name} ").as_bytes());

@@ -2072,3 +2072,144 @@ mode = "sse_stream"
     assert_eq!(hits(&os[0]), 0, "the ejected member gets no SSE traffic");
     assert!(hits(&os[1]) > 0);
 }
+
+// ── Surrogate-Key: purge by tag ─────────────────────────────────────────────
+
+fn surrogate(o: &Origin, tags: &str) {
+    *o.extra.lock().unwrap() = Some(("Surrogate-Key".to_string(), tags.to_string()));
+}
+
+async fn purge_request(st: &Arc<AppState>, query: &str, from: &str) -> (u16, String) {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/_zion/cache/purge{query}"))
+        .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+        .unwrap();
+    let resp = process_request(req, st.clone(), from.parse::<SocketAddr>().unwrap(), false)
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    (status, body)
+}
+
+#[tokio::test]
+async fn purging_by_tag_through_the_endpoint_drops_exactly_the_tagged_entries() {
+    let (o, st) = rig("").await;
+    surrogate(&o, "post-1 section-a");
+    fetch(&st, "/t/one", &[]).await;
+    surrogate(&o, "post-2 section-a");
+    fetch(&st, "/t/two", &[]).await;
+    *o.extra.lock().unwrap() = None;
+    fetch(&st, "/t/plain", &[]).await;
+    settle().await;
+    for p in ["/t/one", "/t/two", "/t/plain"] {
+        assert_eq!(fetch(&st, p, &[]).await.0, "HIT", "{p} is cached");
+    }
+    let before = hits(&o);
+
+    let (code, body) = purge_request(&st, "?tag=post-1", "127.0.0.1:1").await;
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("\"purged\":1"), "{body}");
+    assert_eq!(
+        fetch(&st, "/t/one", &[]).await.0,
+        "MISS",
+        "tagged entry is gone"
+    );
+    assert_eq!(
+        fetch(&st, "/t/two", &[]).await.0,
+        "HIT",
+        "other tag untouched"
+    );
+    assert_eq!(
+        fetch(&st, "/t/plain", &[]).await.0,
+        "HIT",
+        "untagged untouched"
+    );
+    assert_eq!(hits(&o), before + 1);
+
+    // a shared tag takes several entries at once, and tags are repeatable / comma-separated
+    let (_, body) = purge_request(
+        &st,
+        "?tag=section-a&tag=nothing,also-nothing",
+        "127.0.0.1:1",
+    )
+    .await;
+    assert!(
+        body.contains("\"tags\":[\"section-a\",\"nothing\",\"also-nothing\"]"),
+        "{body}"
+    );
+    assert_eq!(fetch(&st, "/t/two", &[]).await.0, "MISS");
+}
+
+#[tokio::test]
+async fn the_tag_purge_endpoint_is_internal_only_and_post_only() {
+    let (o, st) = rig("").await;
+    surrogate(&o, "keep-me");
+    fetch(&st, "/t/guard", &[]).await;
+    settle().await;
+    let (code, _) = purge_request(&st, "?tag=keep-me", "203.0.113.9:1").await;
+    assert_eq!(code, 403, "an outside client cannot purge");
+    assert_eq!(fetch(&st, "/t/guard", &[]).await.0, "HIT");
+}
+
+#[tokio::test]
+async fn surrogate_key_is_not_sent_to_clients() {
+    let (o, st) = rig("").await;
+    surrogate(&o, "post-1");
+    for _ in 0..2 {
+        let resp = process_request(
+            get("/t/hdr", &[]),
+            st.clone(),
+            "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(resp.headers().get("surrogate-key").is_none());
+        let _ = resp.into_body().collect().await;
+        settle().await;
+    }
+}
+
+#[tokio::test]
+async fn a_response_whose_tags_cannot_be_tracked_is_not_cached() {
+    let (o, st) = rig("").await;
+    let too_many = (0..40)
+        .map(|i| format!("t{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    surrogate(&o, &too_many);
+    assert_eq!(fetch(&st, "/t/many", &[]).await.0, "BYPASS");
+    settle().await;
+    assert_eq!(fetch(&st, "/t/many", &[]).await.0, "BYPASS", "never stored");
+    assert_eq!(hits(&o), 2);
+}
+
+#[tokio::test]
+async fn a_tag_purge_while_a_fetch_is_in_flight_keeps_that_response_out_of_the_cache() {
+    let (o, st) = rig("").await;
+    surrogate(&o, "post-1");
+    o.delay_ms.store(300, Ordering::Relaxed);
+    let st2 = st.clone();
+    let slow = tokio::spawn(async move { fetch(&st2, "/t/race", &[]).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (code, _) = purge_request(&st, "?tag=post-1", "127.0.0.1:1").await;
+    assert_eq!(code, 200);
+    slow.await.unwrap();
+    settle().await;
+    o.delay_ms.store(0, Ordering::Relaxed);
+    assert_eq!(
+        fetch(&st, "/t/race", &[]).await.0,
+        "MISS",
+        "the response that began before the purge must not outlive it"
+    );
+}

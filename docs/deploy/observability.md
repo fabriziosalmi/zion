@@ -15,7 +15,7 @@ Zion exposes built-in endpoints that bypass routing and upstream forwarding:
 | `GET /readyz` | `200 ready` | public | Readiness probe (is the process ready to serve?) |
 | `GET /metrics` | Prometheus text format | **internal IPs only** (`403` otherwise) | Metrics scraping |
 | `GET /_zion/snapshot.json` | JSON (metrics + quantiles + platform) | **internal IPs only** | `zion top` / dashboards |
-| `POST /_zion/cache/purge` | `{"purged":N,"scope":...}` | **internal IPs only**, POST-only (`405` on GET) | Flush the RAM cache on deploy; `?prefix=/path` for scoped purge |
+| `POST /_zion/cache/purge` | `{"purged":N,"scope":...}` | **internal IPs only**, POST-only (`405` on GET) | Flush the RAM cache on deploy; `?prefix=/path` for scoped purge, `?tag=a,b` to purge by `Surrogate-Key` tag |
 
 On the HTTPS listener (HTTP/1.1 and /2), `/healthz` and `/readyz` are answered
 on a listener fast path before the request pipeline, so they respond even under
@@ -110,6 +110,7 @@ feature-gated series (absent, not zero, without the feature) is called out.
 |---|---|---|
 | `zion_panics_total` | counter | Worker panics caught by the panic hook (must stay `0`) |
 | `zion_audit_events_total` | counter | Audit-log events emitted (signed + HMAC-chained) |
+| `zion_cache_tag_uncached` | counter | Responses not stored because their `Surrogate-Key` tags could not be tracked (too many, too long, invalid, or the tag index is full) |
 | `zion_dns_lookup_failures_total` | counter | Upstream DNS lookups that failed, timed out or returned no address |
 | `zion_dns_stale_served_total` | counter | Upstream connections that used the last good DNS answer because the fresh lookup failed (see `dns_stale_secs`) |
 | `zion_log_lines_dropped_total` | counter | Log lines dropped because stderr was slower than the log rate (`[server] log_queue_lines`). Any increase means log lines are missing, not that requests were slowed |

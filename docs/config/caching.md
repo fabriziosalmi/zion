@@ -199,6 +199,31 @@ $ curl -sX POST 'http://127.0.0.1/_zion/cache/purge?prefix=/static/app.js'
 {"purged":2,"scope":"/static/app.js"}
 ```
 
+### Purge by tag (`Surrogate-Key`)
+
+An origin can label what it renders with a `Surrogate-Key` response header: tags separated
+by spaces or commas (the header may repeat), e.g. `Surrogate-Key: post-42 section:news`.
+Zion indexes the entry under each tag, and one call drops everything that carries a tag,
+however many URLs and variants that is:
+
+```console
+$ curl -sX POST 'http://127.0.0.1/_zion/cache/purge?tag=post-42'
+{"purged":3,"scope":{"tags":["post-42"]}}
+```
+
+`tag=` repeats and takes commas (`?tag=a&tag=b,c`; percent-encode anything unusual). It is
+internal-IP gated and POST-only like the rest of the endpoint.
+
+- `Surrogate-Key` is for the cache: it is **not** sent to clients.
+- Limits: 32 tags per response, 128 bytes per tag, plain visible ASCII; the index holds
+  10,000 distinct tags and 200,000 (tag, key) pairs. A response whose tags cannot be tracked is
+  **not stored** (`X-Zion-Cache: BYPASS`, counted in `zion_cache_tag_uncached`): an entry that
+  a purge could not reach would be worse than a miss.
+- A response whose fetch began before a tag purge is not stored once the purge has run (it may
+  predate it), so a purge cannot be undone by a slow in-flight fetch.
+- A refresh of a stale entry adds the tags of the new response; tags that an entry no longer
+  carries stay recorded until it is replaced or evicted, which can only purge *more*, never less.
+
 ## RFC conformance at a glance
 
 | Behaviour | RFC | Status |

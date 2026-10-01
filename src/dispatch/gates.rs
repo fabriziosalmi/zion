@@ -452,9 +452,33 @@ pub(super) fn builtin_endpoint(
                     .find_map(|kv| kv.strip_prefix("prefix="))
                     .map(|p| p.to_string())
             });
-            let (removed, scope) = match &prefix {
-                Some(p) => (state.static_cache.purge_prefix(p), format!("{p:?}")),
-                None => (state.static_cache.purge_all(), "\"all\"".to_string()),
+            // `?tag=a,b` (repeatable): purge by `Surrogate-Key` tag.
+            let tags: Vec<String> = req
+                .uri()
+                .query()
+                .map(|q| {
+                    q.split('&')
+                        .filter_map(|kv| kv.strip_prefix("tag="))
+                        .flat_map(|v| v.split(','))
+                        .filter(|t| !t.is_empty())
+                        .map(percent_decode)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let (removed, scope) = if !tags.is_empty() {
+                let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+                (
+                    state.static_cache.purge_tags(&refs),
+                    format!(
+                        "{{\"tags\":{}}}",
+                        serde_json::to_string(&tags).unwrap_or_default()
+                    ),
+                )
+            } else {
+                match &prefix {
+                    Some(p) => (state.static_cache.purge_prefix(p), format!("{p:?}")),
+                    None => (state.static_cache.purge_all(), "\"all\"".to_string()),
+                }
             };
             crate::logging::info("cache", &format!("purge scope={scope} removed={removed}"));
             let body = Bytes::from(format!("{{\"purged\":{removed},\"scope\":{scope}}}\n"));
@@ -558,6 +582,29 @@ pub(super) fn internal_only(
     None
 }
 
+/// `%XX` decoding for a query value (`+` is left alone: tags are not form-encoded). Invalid
+/// escapes are kept as written.
+pub(super) fn percent_decode(v: &str) -> String {
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Some(n) = std::str::from_utf8(&b[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                out.push(n);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,5 +635,20 @@ mod tests {
             Gate::MeshScore,
         ];
         assert_eq!(rest, expected);
+    }
+
+    #[test]
+    fn percent_decode_handles_escapes_and_leaves_the_rest_alone() {
+        assert_eq!(percent_decode("post-1"), "post-1");
+        assert_eq!(percent_decode("a%2Fb%3Ac"), "a/b:c");
+        assert_eq!(percent_decode("100%"), "100%", "a trailing % is kept");
+        assert_eq!(percent_decode("%zz%4"), "%zz%4", "invalid escapes are kept");
+        assert_eq!(percent_decode("a+b"), "a+b", "tags are not form-encoded");
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+        assert_eq!(
+            percent_decode("é%"),
+            "é%",
+            "multibyte text is not sliced mid-character"
+        );
     }
 }
