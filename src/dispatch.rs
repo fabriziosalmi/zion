@@ -38,7 +38,8 @@ use crate::proxy::ZionBody;
 use crate::state::AppState;
 use crate::state::ResolvedAppConfig;
 use crate::{
-    cache, config, health, logging, metrics, observability, proxy, security, uri_norm, vary, waf,
+    breaker, cache, config, health, logging, metrics, observability, proxy, security, uri_norm,
+    vary, waf,
 };
 use std::borrow::Cow;
 // `unauthorized` is only referenced from the JWT/OIDC auth gate.
@@ -967,6 +968,25 @@ async fn process_request_inner(
         None
     };
 
+    // --- Circuit breaker (opt-in, `[upstream.x] circuit_breaker`) ---
+    // After auth and the WAF, so an unauthenticated or hostile request can neither learn that
+    // the circuit is open nor use up its probe. Cached routes consult it inside
+    // `handle_static_cache`, where a stale copy can stand in for the upstream.
+    let breaker_proxy = if rule.cache.is_none()
+        && matches!(
+            rule.mode,
+            config::RouteMode::SseStream | config::RouteMode::Standard
+        ) {
+        breaker_entry(&cfg, &rule)
+    } else {
+        None
+    };
+    if let Some(entry) = &breaker_proxy {
+        if let breaker::Check::Reject { retry_after_ms } = entry.breaker.check(breaker::now_ms()) {
+            return Ok(circuit_open_response(retry_after_ms));
+        }
+    }
+
     // --- Dispatch by mode ---
     let mut resp = if rule.cache.is_some() {
         handle_static_cache(
@@ -1054,6 +1074,10 @@ async fn process_request_inner(
             },
         }
     };
+
+    if let Some(entry) = &breaker_proxy {
+        breaker_record(entry, resp.status());
+    }
 
     // Inject security headers on all responses
     inject_security_headers(&mut resp);
@@ -1173,6 +1197,42 @@ async fn process_request_inner(
     Ok(resp)
 }
 
+/// The health entry whose circuit breaker guards this route, if it has one: the route's
+/// upstream has a single endpoint and a `circuit_breaker` is configured on it.
+fn breaker_entry(
+    cfg: &ResolvedAppConfig,
+    rule: &ResolvedRoute,
+) -> Option<Arc<health::UpstreamHealth>> {
+    if rule.upstream_url.len() != 1 || rule.mode == config::RouteMode::Static {
+        return None;
+    }
+    cfg.health_map
+        .get(&rule.upstream_url[0])
+        .filter(|h| h.breaker.is_configured())
+        .cloned()
+}
+
+/// What an open circuit answers: 503 at once, with `Retry-After`.
+fn circuit_open_response(retry_after_ms: u64) -> Response<ZionBody> {
+    let mut resp = text_response(StatusCode::SERVICE_UNAVAILABLE, "upstream circuit open");
+    let secs = retry_after_ms.div_ceil(1000).max(1);
+    if let Ok(v) = hyper::header::HeaderValue::from_str(&secs.to_string()) {
+        resp.headers_mut().insert(hyper::header::RETRY_AFTER, v);
+    }
+    resp.headers_mut().insert(
+        "X-Zion-Circuit",
+        hyper::header::HeaderValue::from_static("open"),
+    );
+    resp
+}
+
+/// Report what a request that reached the upstream got back.
+fn breaker_record(entry: &health::UpstreamHealth, status: StatusCode) {
+    entry
+        .breaker
+        .record(!breaker::is_failure(status.as_u16()), breaker::now_ms());
+}
+
 /// The paths a response names in `Location` / `Content-Location` that are on the same
 /// origin as the request (RFC 9111 §4.4): a relative reference, or an absolute one
 /// whose authority is the request's own host. Anything pointing elsewhere is ignored,
@@ -1223,6 +1283,8 @@ struct SwrRefresh {
     cache_ttl: u64,
     cache_max: usize,
     max_object: usize,
+    /// The upstream's circuit breaker, if it has one.
+    breaker: Option<Arc<health::UpstreamHealth>>,
 }
 
 /// The request a background refresh sends: the same target and content
@@ -1264,6 +1326,18 @@ fn swr_request(req: &Request<ZionBody>) -> Request<ZionBody> {
 /// limit says no, nothing is started and the caller still serves the stale copy.
 fn spawn_swr_refresh(job: SwrRefresh) {
     use std::sync::atomic::Ordering::Relaxed;
+    // An open circuit means the upstream is not to be contacted, background refresh included.
+    if let Some(entry) = &job.breaker {
+        if matches!(
+            entry.breaker.check(breaker::now_ms()),
+            breaker::Check::Reject { .. }
+        ) {
+            metrics::METRICS
+                .cache_swr_refresh_skipped
+                .fetch_add(1, Relaxed);
+            return;
+        }
+    }
     let Some(permit) = SWR_BUDGET.try_acquire() else {
         metrics::METRICS
             .cache_swr_refresh_skipped
@@ -1914,6 +1988,8 @@ async fn handle_static_cache(
     // `Miss` → fall through to a full fetch. Skipped when the client demanded a
     // fresh response (`no-cache` / `no-store`).
     let mut revalidate: Option<cache::CacheHit> = None;
+    // Any stale entry found, validators or not: what an open circuit can fall back on.
+    let mut stale_entry: Option<cache::CacheHit> = None;
     if !rcc_no_cache && !rcc_no_store {
         match state.static_cache.get(&cache_key) {
             cache::CacheLookup::Fresh(hit) => {
@@ -1926,6 +2002,7 @@ async fn handle_static_cache(
                 return Ok(cache_hit_response(hit));
             }
             cache::CacheLookup::Stale(hit) => {
+                stale_entry = Some(hit.clone());
                 // stale-while-revalidate (RFC 5861): inside the window the origin
                 // offered, answer NOW with the stale copy and refresh in the
                 // background, so the client does not wait for the origin.
@@ -1954,6 +2031,7 @@ async fn handle_static_cache(
                         cache_ttl,
                         cache_max,
                         max_object,
+                        breaker: breaker_entry(&state.cfg(), rule),
                     };
                     spawn_swr_refresh(refresh);
                     crate::metrics::METRICS
@@ -2016,6 +2094,23 @@ async fn handle_static_cache(
         // non-cacheable response): loop to fetch ourselves.
     };
 
+    // Opt-in circuit breaker: if the upstream's circuit is open, do not contact it. A stale
+    // copy (when the origin allowed stale responses) stands in for it; otherwise the client
+    // gets the 503. A fresh hit never reaches this point.
+    let breaker_cached = breaker_entry(&state.cfg(), rule);
+    if let Some(entry) = &breaker_cached {
+        if let breaker::Check::Reject { retry_after_ms } = entry.breaker.check(breaker::now_ms()) {
+            state.inflight.remove(&path_owned);
+            if let Some(hit) = stale_entry.as_ref().filter(|h| !h.meta.must_revalidate) {
+                metrics::METRICS
+                    .cache_stale_if_error
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(cache_response(hit.clone(), "STALE"));
+            }
+            return Ok(circuit_open_response(retry_after_ms));
+        }
+    }
+
     // The varied request headers must outlive `req`, which the fetch consumes: the
     // response may reveal (via `Vary`) which of them the entry is keyed on.
     let req_headers = req.headers().clone();
@@ -2037,6 +2132,9 @@ async fn handle_static_cache(
     {
         Ok(r) => r,
         Err(e) => {
+            if let Some(entry) = &breaker_cached {
+                entry.breaker.record(false, breaker::now_ms());
+            }
             state.inflight.remove(&path_owned);
             // stale-if-error (RFC 9111 §4.2.4): if we were revalidating a stale
             // entry and the origin is unreachable, serve the stale body rather
@@ -2051,6 +2149,10 @@ async fn handle_static_cache(
             return Err(e);
         }
     };
+
+    if let Some(entry) = &breaker_cached {
+        breaker_record(entry, resp.status());
+    }
 
     // stale-if-error (RFC 9111 §4.2.4 / RFC 5861 §4): `proxy_pass` turns a transport
     // failure into a 502 response instead of an `Err`, so an origin that is down or

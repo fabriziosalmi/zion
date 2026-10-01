@@ -47,6 +47,7 @@ mod atomic_file;
 mod audit;
 mod auth;
 mod bootstrap;
+mod breaker;
 mod cache;
 mod cli;
 mod config;

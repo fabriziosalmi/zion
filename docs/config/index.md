@@ -78,6 +78,39 @@ refused.
 
 Legacy format `[upstreams]` (flat key-value map of name to URL) is also supported.
 
+### Circuit breaker (`circuit_breaker`, opt-in)
+
+```toml
+[upstream.api]
+url = "http://10.0.0.5:8000"
+circuit_breaker = { error_rate_pct = 50, min_requests = 20, window_secs = 10, open_secs = 30 }
+```
+
+The health prober notices a dead upstream on its own schedule (every 30 s while healthy);
+until it does, every request to a failing route waits for the origin and then fails. With
+`circuit_breaker`, zion watches the outcomes of **real requests** over a sliding window and,
+when at least `error_rate_pct` % of the last `window_secs` seconds' requests failed (and
+there were at least `min_requests` of them), **opens the circuit**: for `open_secs` seconds
+requests are answered `503` at once with `Retry-After` and `X-Zion-Circuit: open`, and the
+upstream is left alone. Then **one** probe request is let through; its success closes the
+circuit, its failure re-opens it. Values shown are the defaults.
+
+- A failure is a `502`, `503` or `504` (what a refused connection, a timeout or an overloaded
+  origin become). A `500` is the application's own error on one endpoint, and 4xx are the
+  client's: neither counts.
+- It applies to a route whose upstream has a **single** endpoint. A pool of several already
+  fails over between its members.
+- It is consulted after auth and the WAF, so an unauthenticated or hostile request can neither
+  learn that the circuit is open nor use up its probe.
+- On a **cached** route, an open circuit serves the stale copy of a requested entry (unless the
+  origin forbade stale responses with `must-revalidate` / `proxy-revalidate` / `s-maxage`)
+  instead of the 503, and background refreshes are not sent while it is open. A fresh hit never
+  contacts the origin, so it is not affected.
+- State survives a config reload; changing the thresholds on a reload starts the counters clean.
+- A URL shared by two `[upstream.*]` tables shares one breaker (the first table's thresholds).
+- Metrics: `zion_upstream_circuit_open{upstream}`, `zion_upstream_circuit_trips_total{upstream}`,
+  `zion_upstream_circuit_rejected_total{upstream}`.
+
 ## `[waf_profile.<name>]`
 
 | Key | Type | Default | Description |
