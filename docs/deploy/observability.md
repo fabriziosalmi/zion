@@ -110,6 +110,8 @@ feature-gated series (absent, not zero, without the feature) is called out.
 |---|---|---|
 | `zion_panics_total` | counter | Worker panics caught by the panic hook (must stay `0`) |
 | `zion_audit_events_total` | counter | Audit-log events emitted (signed + HMAC-chained) |
+| `zion_dns_lookup_failures_total` | counter | Upstream DNS lookups that failed, timed out or returned no address |
+| `zion_dns_stale_served_total` | counter | Upstream connections that used the last good DNS answer because the fresh lookup failed (see `dns_stale_secs`) |
 | `zion_log_lines_dropped_total` | counter | Log lines dropped because stderr was slower than the log rate (`[server] log_queue_lines`). Any increase means log lines are missing, not that requests were slowed |
 | `zion_audit_events_dropped_total` | counter | Audit events dropped because the writer queue was full (alert on any drop) |
 | `zion_traces_emitted_total` | counter | Request spans observed (one per request) |

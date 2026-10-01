@@ -5203,6 +5203,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "toml",
+ "tower-service",
  "tracing",
  "tracing-core",
  "tracing-opentelemetry",

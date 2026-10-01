@@ -63,6 +63,11 @@ pub(crate) struct ResolvedAppConfig {
     pub(crate) max_connections_per_ip: u32,
     /// TCP keepalive idle seconds for accepted client sockets (0 = off).
     pub(crate) tcp_keepalive_secs: u64,
+    /// Upstream DNS policy (`[server] dns_stale_secs`, `dns_timeout_ms`). Carried in the
+    /// snapshot and applied by `crate::dns::configure` only when the snapshot is published,
+    /// so a rejected reload leaves the running policy alone.
+    pub(crate) dns_stale_secs: u64,
+    pub(crate) dns_timeout_ms: u64,
     /// Resolved tag-driven enforcement policy (`[sovereign.enforce]`, #150).
     /// Lives under the geo-gated `[sovereign]` block (class deny needs the
     /// dataset). Disabled by default. Mesh-score deny additionally needs
@@ -114,6 +119,8 @@ impl ResolvedAppConfig {
             rate_limit_max_tracked_ips: crate::security::MAX_RATE_MAP_ENTRIES,
             max_connections_per_ip: 0,
             tcp_keepalive_secs: crate::net::DEFAULT_TCP_KEEPALIVE_SECS,
+            dns_stale_secs: crate::dns::DEFAULT_STALE_SECS,
+            dns_timeout_ms: crate::dns::DEFAULT_TIMEOUT_MS,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             enforce: sovereign::EnforcePolicy::default(),
             listen_http: None,
@@ -344,6 +351,8 @@ impl ResolvedAppConfig {
             rate_limit_max_tracked_ips: config.server.rate_limit_max_tracked_ips,
             max_connections_per_ip,
             tcp_keepalive_secs: config.server.tcp_keepalive_secs,
+            dns_stale_secs: config.server.dns_stale_secs,
+            dns_timeout_ms: config.server.dns_timeout_ms,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             enforce,
             listen_http,

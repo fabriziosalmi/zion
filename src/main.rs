@@ -52,6 +52,7 @@ mod cache;
 mod cli;
 mod config;
 mod connlimit;
+mod dns;
 mod doctor;
 mod error;
 mod health;
@@ -547,6 +548,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     // from `zion.toml`). This is the single entry point that future
     // hot-reload phases will re-invoke and atomic-swap.
     let resolved = ResolvedAppConfig::try_build(&config, platform.conn_limit)?;
+    dns::configure(resolved.dns_stale_secs, resolved.dns_timeout_ms);
 
     // Boot-time visibility: structured logs for the bits operators
     // commonly check at startup. (Validation of `xff_mode` happens

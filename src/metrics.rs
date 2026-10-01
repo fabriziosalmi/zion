@@ -1460,6 +1460,22 @@ impl Metrics {
         // in their own module to avoid coupling the metrics renderer to
         // tracing internals.
         crate::observability::render_counters(&mut out);
+        for (name, help, val) in [
+            (
+                "zion_dns_lookup_failures_total",
+                "Upstream DNS lookups that failed, timed out or returned no address.",
+                crate::dns::LOOKUP_FAILURES.load(Relaxed),
+            ),
+            (
+                "zion_dns_stale_served_total",
+                "Upstream connections that used the last good DNS answer because the fresh lookup failed.",
+                crate::dns::STALE_SERVED.load(Relaxed),
+            ),
+        ] {
+            out.extend_from_slice(
+                format!("# HELP {name} {help}\n# TYPE {name} counter\n{name} {val}\n").as_bytes(),
+            );
+        }
 
         // Sovereign per-class classification counters (Track D — replaces
         // the previous per-request `format!` call site in dispatch.rs).

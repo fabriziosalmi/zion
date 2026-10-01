@@ -68,7 +68,9 @@ pub type ZionBody = BoxBody<Bytes, hyper::Error>;
 /// Shared HTTP client type — supports both HTTP/1.1 and HTTP/2 to upstreams.
 /// Plain HTTP upstreams use HttpConnector; HTTPS upstreams negotiate H2 via ALPN.
 pub type HttpClient = Client<
-    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    hyper_rustls::HttpsConnector<
+        hyper_util::client::legacy::connect::HttpConnector<crate::dns::StaleOnErrorResolver>,
+    >,
     ZionBody,
 >;
 
@@ -86,7 +88,9 @@ pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 3000;
 /// covers the TCP connect only; the TLS handshake and the response stay bounded
 /// by that overall timeout.
 pub fn build_http_client(connect_timeout_ms: u64) -> HttpClient {
-    let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
+    let mut http = hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(
+        crate::dns::StaleOnErrorResolver,
+    );
     // The TLS wrapper needs to see `https://` URIs; it does its own scheme check.
     http.enforce_http(false);
     // Kernel keepalive on pooled upstream sockets too: a pooled connection to a host
@@ -689,7 +693,7 @@ pub async fn proxy_websocket(
     };
 
     // Connect to upstream via raw TCP (not the pooled client — WebSocket is long-lived)
-    let tcp_stream = match tokio::net::TcpStream::connect(&connect_target).await {
+    let tcp_stream = match crate::dns::connect_tcp(&connect_target).await {
         Ok(s) => s,
         Err(e) => {
             crate::logging::warn(
