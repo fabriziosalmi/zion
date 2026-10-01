@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Shutdown no longer waits for idle keep-alive connections.** On SIGTERM zion stopped accepting and then waited for open connections to finish, but an idle keep-alive connection never finishes by itself, so every deploy waited out its idle timeout (14 s in a probe with a single idle HTTP/1.1 connection, up to the 30 s drain limit). Connections are now told to wind down when the drain starts: idle ones close at once, HTTP/1 closes after the response in flight (`Connection: close`), HTTP/2 sends `GOAWAY` and closes once its streams are done. A request being served is finished, never cut.
+
 ## [0.9.4] - 2026-10-01
 
 **Resilience release: pools balance on real traffic, and logging, DNS and a slow backend can no longer take the proxy down with them.** One security fix (client-supplied routing/host override headers are no longer passed upstream) and a set of opt-in or on-by-default protections. Read the upgrade notes first.

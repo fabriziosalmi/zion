@@ -156,7 +156,12 @@ ZION_CONFIG=./zion.toml timeout 2s ./zion; code=$?
 
 Zion handles `SIGINT` (Ctrl+C) and `SIGTERM`:
 
-1. Stop accepting new connections
+1. Stop accepting new connections, and tell every open connection to wind down: an **idle**
+   keep-alive connection is closed at once, an HTTP/1 connection closes after the response in
+   flight (`Connection: close`), and an HTTP/2 connection gets `GOAWAY`, finishes its open
+   streams and closes. A request already being served is never cut. (Before 0.9.5 an idle
+   keep-alive connection held the drain until its own idle timeout, so a deploy could wait up
+   to the full 30 s.)
 2. Wait up to **30 seconds** for in-flight connections to complete
 3. If drain timeout expires, force exit with a warning log
 4. Stop the audit-log writer (when `[audit]` is enabled): it writes everything still queued, flushes and `fsync`s; Zion waits up to **5 seconds** for it (`audit writer did not finish within 5s` if it takes longer)
