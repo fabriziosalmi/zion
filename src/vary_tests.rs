@@ -969,3 +969,62 @@ async fn the_acme_shortcut_on_port_80_cannot_be_used_to_reach_other_paths() {
     }
     assert_eq!(hits(&o), before, "nothing reached the upstream");
 }
+
+// ── opt-in: parameter order does not split the cache ────────────────────────
+
+#[tokio::test]
+async fn query_parameter_order_splits_the_cache_unless_the_profile_opts_in() {
+    // off by default: two orders are two entries
+    let (o, st) = rig("").await;
+    fetch(&st, "/qa?b=2&a=1", &[]).await;
+    settle().await;
+    assert_eq!(fetch(&st, "/qa?a=1&b=2", &[]).await.0, "MISS");
+    assert_eq!(hits(&o), 2);
+
+    // opted in: one entry for both orders, and the upstream still sees what the client wrote
+    let (o, st) = rig_with("", "public, max-age=60", "normalize_query = true").await;
+    fetch(&st, "/qb?b=2&a=1", &[]).await;
+    settle().await;
+    assert_eq!(
+        o.last_target.lock().unwrap().as_deref(),
+        Some("/qb?b=2&a=1")
+    );
+    let (c, _) = fetch(&st, "/qb?a=1&b=2", &[]).await;
+    assert_eq!(
+        c, "HIT",
+        "the same parameters in another order are the same entry"
+    );
+    assert_eq!(hits(&o), 1);
+}
+
+#[tokio::test]
+async fn sorting_never_merges_different_parameters_or_reorders_repeated_ones() {
+    let (o, st) = rig_with("", "public, max-age=60", "normalize_query = true").await;
+    for q in [
+        "/qc?x=1",
+        "/qc?x=2",     // different value
+        "/qc?x=1&y=",  // extra parameter
+        "/qc?x=1&x=2", // repeated name, order significant
+        "/qc?x=2&x=1", // ...so this is not the same
+        "/qc?X=1",     // names are case-sensitive
+    ] {
+        fetch(&st, q, &[]).await;
+        settle().await;
+    }
+    assert_eq!(hits(&o), 6, "six distinct requests, six distinct entries");
+    // and a reordering of an already-seen set IS a hit
+    assert_eq!(fetch(&st, "/qc?y=&x=1", &[]).await.0, "HIT");
+    assert_eq!(hits(&o), 6);
+}
+
+#[tokio::test]
+async fn a_mutation_invalidates_every_ordering_of_its_query() {
+    let (o, st) = rig_with("", "public, max-age=60", "normalize_query = true").await;
+    fetch(&st, "/qd?b=2&a=1", &[]).await;
+    settle().await;
+    assert_eq!(fetch(&st, "/qd?a=1&b=2", &[]).await.0, "HIT");
+    send(&st, Method::POST, "/qd").await;
+    settle().await;
+    assert_eq!(fetch(&st, "/qd?a=1&b=2", &[]).await.0, "MISS");
+    let _ = o;
+}

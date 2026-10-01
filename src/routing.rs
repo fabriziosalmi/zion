@@ -395,6 +395,7 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
             max_entries: default_max_entries(),
             ttl_seconds: default_ttl(),
             max_object_mb: crate::config::default_max_object_mb(),
+            normalize_query: false,
         })
     } else {
         None

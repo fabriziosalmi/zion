@@ -36,7 +36,10 @@ use crate::http_util::{
 };
 use crate::proxy::ZionBody;
 use crate::state::AppState;
-use crate::{cache, config, health, logging, metrics, observability, proxy, security, vary, waf};
+use crate::{
+    cache, config, health, logging, metrics, observability, proxy, security, uri_norm, vary, waf,
+};
+use std::borrow::Cow;
 // `unauthorized` is only referenced from the JWT/OIDC auth gate.
 #[cfg(feature = "auth")]
 use crate::http_util::unauthorized;
@@ -1813,6 +1816,7 @@ async fn handle_static_cache(
         // profile — never the old 1-year freeze. See config::default_ttl.
         None => (3600, 10_000, DEFAULT_MAX_OBJECT_BYTES),
     };
+    let normalize_query = rule.cache.as_ref().is_some_and(|cp| cp.normalize_query);
 
     // RFC 9111 §3.5: capture whether the request is authenticated BEFORE `req`
     // is consumed by the upstream fetch — the storability gate below needs it
@@ -1836,7 +1840,16 @@ async fn handle_static_cache(
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or_else(|| req.uri().path());
-    let primary_key = format!("{pq}\u{1f}{}", accept_encoding_key(req.headers()));
+    // With `normalize_query` the key carries the parameters in a canonical order; the
+    // request itself (and so what the upstream is sent) is untouched.
+    let key_target: Cow<'_, str> = match (normalize_query, req.uri().query()) {
+        (true, Some(q)) => match uri_norm::sorted_query(q) {
+            Cow::Borrowed(_) => Cow::Borrowed(pq),
+            Cow::Owned(sorted) => Cow::Owned(format!("{}?{sorted}", req.uri().path())),
+        },
+        _ => Cow::Borrowed(pq),
+    };
+    let primary_key = format!("{key_target}\u{1f}{}", accept_encoding_key(req.headers()));
     // If this primary key's responses vary (RFC 9111 §4.1), the entry for THIS request
     // lives under a secondary key built from the varied request headers.
     let Some(cache_key) = lookup_key(&state, &primary_key, req.headers()) else {
