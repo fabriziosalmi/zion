@@ -643,6 +643,82 @@ struct RawUpstream {
     client_cert_path: Option<String>,
     #[serde(default)]
     client_key_path: Option<String>,
+    #[serde(default)]
+    circuit_breaker: Option<CircuitBreakerConfig>,
+}
+
+/// `[upstream.<name>] circuit_breaker = { ... }`: stop sending requests to an upstream that
+/// is failing. See `breaker.rs`. Absent = no breaker. Applies to a route whose upstream has a
+/// SINGLE endpoint (a pool with several already fails over between them).
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CircuitBreakerConfig {
+    /// Open when at least this percentage (1..=100) of the requests in the window failed
+    /// (a 502, 503 or 504, which is what a refused connection, a timeout or an overloaded
+    /// origin become). Default 50.
+    #[serde(default = "default_cb_error_rate")]
+    pub error_rate_pct: u32,
+    /// ...and at least this many requests were seen in it, so a quiet upstream is not
+    /// tripped by one error (>= 1). Default 20.
+    #[serde(default = "default_cb_min_requests")]
+    pub min_requests: u32,
+    /// Sliding window in seconds (1..=60). Default 10.
+    #[serde(default = "default_cb_window")]
+    pub window_secs: u32,
+    /// Seconds the circuit stays open before one probe request is let through (1..=3600).
+    /// While open, requests get `503` with `Retry-After`. Default 30.
+    #[serde(default = "default_cb_open")]
+    pub open_secs: u32,
+}
+
+fn default_cb_error_rate() -> u32 {
+    50
+}
+fn default_cb_min_requests() -> u32 {
+    20
+}
+fn default_cb_window() -> u32 {
+    10
+}
+fn default_cb_open() -> u32 {
+    30
+}
+
+impl CircuitBreakerConfig {
+    pub fn to_runtime(&self) -> crate::breaker::BreakerCfg {
+        crate::breaker::BreakerCfg {
+            error_rate_pct: self.error_rate_pct,
+            min_requests: self.min_requests,
+            window_secs: self.window_secs,
+            open_secs: self.open_secs,
+        }
+    }
+
+    fn errors(&self, name: &str) -> Vec<String> {
+        let mut e = Vec::new();
+        if !(1..=100).contains(&self.error_rate_pct) {
+            e.push(format!(
+                "upstream.{name}.circuit_breaker.error_rate_pct must be 1..=100"
+            ));
+        }
+        if self.min_requests == 0 {
+            e.push(format!(
+                "upstream.{name}.circuit_breaker.min_requests must be >= 1"
+            ));
+        }
+        if !(1..=crate::breaker::MAX_WINDOW_SECS).contains(&self.window_secs) {
+            e.push(format!(
+                "upstream.{name}.circuit_breaker.window_secs must be 1..={}",
+                crate::breaker::MAX_WINDOW_SECS
+            ));
+        }
+        if !(1..=3600).contains(&self.open_secs) {
+            e.push(format!(
+                "upstream.{name}.circuit_breaker.open_secs must be 1..=3600"
+            ));
+        }
+        e
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -672,6 +748,9 @@ pub struct UpstreamConfig {
     /// Client key for upstream mTLS.
     #[serde(default)]
     pub client_key_path: Option<String>,
+    /// Opt-in circuit breaker (see [`CircuitBreakerConfig`]).
+    #[serde(default)]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
 }
 
 impl TryFrom<RawUpstream> for UpstreamConfig {
@@ -696,6 +775,7 @@ impl TryFrom<RawUpstream> for UpstreamConfig {
             tls: raw.tls,
             client_cert_path: raw.client_cert_path,
             client_key_path: raw.client_key_path,
+            circuit_breaker: raw.circuit_breaker,
         })
     }
 }
@@ -709,6 +789,11 @@ impl UpstreamConfig {
 
     pub fn get_urls(&self) -> Vec<String> {
         self.urls.clone()
+    }
+
+    /// The endpoints without cloning them.
+    pub(crate) fn urls_ref(&self) -> &[String] {
+        &self.urls
     }
 }
 
@@ -1302,6 +1387,48 @@ fn deploy_errors(config: &ZionConfig) -> Vec<String> {
 fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     let mut errors: Vec<String> = Vec::new();
 
+    for (name, up) in &config.upstream {
+        if let Some(cb) = &up.circuit_breaker {
+            errors.extend(cb.errors(name));
+        }
+    }
+    // One URL, one breaker: the health entry (and its breaker) is shared by every upstream
+    // that names the URL, so two single-endpoint definitions of it must agree on whether it
+    // has a breaker and on its thresholds. Pools and the `[upstreams]` shorthand are listed
+    // too: they carry no breaker, so they conflict with a table that has one.
+    {
+        let mut by_url: std::collections::BTreeMap<
+            &str,
+            Vec<(String, Option<&CircuitBreakerConfig>)>,
+        > = std::collections::BTreeMap::new();
+        for (name, up) in &config.upstream {
+            if let [u] = up.urls_ref() {
+                by_url
+                    .entry(u.as_str())
+                    .or_default()
+                    .push((format!("upstream.{name}"), up.circuit_breaker.as_ref()));
+            }
+        }
+        for (name, url) in &config.upstreams {
+            by_url
+                .entry(url.as_str())
+                .or_default()
+                .push((format!("upstreams.{name}"), None));
+        }
+        for (url, mut defs) in by_url {
+            defs.sort_by(|a, b| a.0.cmp(&b.0));
+            if defs.windows(2).any(|w| w[0].1 != w[1].1) {
+                errors.push(format!(
+                    "{} all point at {url} but disagree about its circuit breaker; they share one \
+                     health entry, so give them the same `circuit_breaker` (or none)",
+                    defs.iter()
+                        .map(|d| d.0.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+    }
     for (name, cp) in &config.cache_profile {
         if cp.max_object_mb == 0 {
             errors.push(format!(
@@ -1752,6 +1879,68 @@ pub(crate) fn compile_path_set(patterns: &[String]) -> Result<matchit::Router<()
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn circuit_breaker_config_defaults_and_ranges() {
+        let cfg = |cb: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+                 [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstream.be]\nurl=\"http://127.0.0.1:8000\"\n{cb}\n\
+                 [[route]]\npath=\"/{{*rest}}\"\nupstream=\"be\"\n"
+            )
+        };
+        let none: ZionConfig = toml::from_str(&cfg("")).unwrap();
+        assert!(
+            none.upstream["be"].circuit_breaker.is_none(),
+            "off unless asked for"
+        );
+        let d: ZionConfig = toml::from_str(&cfg("circuit_breaker = {}")).unwrap();
+        let cb = d.upstream["be"].circuit_breaker.clone().unwrap();
+        assert_eq!(
+            (
+                cb.error_rate_pct,
+                cb.min_requests,
+                cb.window_secs,
+                cb.open_secs
+            ),
+            (50, 20, 10, 30)
+        );
+        for (bad, why) in [
+            (
+                "circuit_breaker = { error_rate_pct = 0 }",
+                "error_rate_pct must be 1..=100",
+            ),
+            (
+                "circuit_breaker = { error_rate_pct = 101 }",
+                "error_rate_pct must be 1..=100",
+            ),
+            (
+                "circuit_breaker = { min_requests = 0 }",
+                "min_requests must be >= 1",
+            ),
+            (
+                "circuit_breaker = { window_secs = 0 }",
+                "window_secs must be 1..=",
+            ),
+            (
+                "circuit_breaker = { window_secs = 61 }",
+                "window_secs must be 1..=",
+            ),
+            (
+                "circuit_breaker = { open_secs = 0 }",
+                "open_secs must be 1..=3600",
+            ),
+            (
+                "circuit_breaker = { open_secs = 3601 }",
+                "open_secs must be 1..=3600",
+            ),
+        ] {
+            let e = validate_str(&cfg(bad), "t").err().unwrap_or_default();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        let typo = toml::from_str::<ZionConfig>(&cfg("circuit_breaker = { error_rate = 5 }")).err();
+        assert!(typo.is_some(), "an unknown key is refused, not ignored");
+    }
+
     #[test]
     fn max_object_mb_defaults_to_50_and_zero_is_refused() {
         let cfg = |extra: &str| {

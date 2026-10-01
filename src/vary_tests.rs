@@ -1079,3 +1079,517 @@ async fn toggling_normalize_query_across_a_reload_never_aliases_entries() {
     );
     assert_eq!(hits(&o), 2);
 }
+
+// ── circuit breaker (opt-in, per upstream) ──────────────────────────────────
+
+/// A catch-all route to the origin through an `[upstream.o]` TABLE (the breaker lives there).
+fn cfg_with_breaker(port: u16, breaker: &str, route_extra: &str) -> ZionConfig {
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+
+[tls]
+cert_path = "/c"
+key_path = "/k"
+
+[upstream.o]
+url = "http://127.0.0.1:{port}"
+{breaker}
+
+[cache_profile.c]
+ttl_seconds = 3600
+max_entries = 100
+
+[[route]]
+path = "/plain/{{*rest}}"
+upstream = "o"
+
+[[route]]
+path = "/cached/{{*rest}}"
+upstream = "o"
+mode = "static_cache"
+cache_profile = "c"
+{route_extra}
+"#
+    );
+    toml::from_str::<ZionConfig>(&toml).expect("config parses")
+}
+
+const BREAKER: &str =
+    "circuit_breaker = { error_rate_pct = 50, min_requests = 4, window_secs = 10, open_secs = 2 }";
+
+async fn breaker_rig(breaker: &str) -> (Arc<Origin>, Arc<AppState>) {
+    let (o, _) = rig("").await;
+    let port = o.port.load(Ordering::Relaxed);
+    (o, AppState::for_tests(&cfg_with_breaker(port, breaker, "")))
+}
+
+/// (status, X-Zion-Circuit, Retry-After)
+async fn call(st: &Arc<AppState>, uri: &str) -> (u16, String, String) {
+    let resp = process_request(
+        get(uri, &[]),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    let h = |n: &str| {
+        resp.headers()
+            .get(n)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
+    (
+        resp.status().as_u16(),
+        h("x-zion-circuit"),
+        h("retry-after"),
+    )
+}
+
+#[tokio::test]
+async fn a_failing_upstream_trips_the_breaker_and_stops_receiving_traffic() {
+    let (o, st) = breaker_rig(BREAKER).await;
+    // healthy traffic is untouched
+    for i in 0..6 {
+        assert_eq!(call(&st, &format!("/plain/ok{i}")).await.0, 200);
+    }
+    let healthy_hits = hits(&o);
+    o.status.store(503, Ordering::Relaxed);
+    // failures reach the origin until the threshold (min 4 requests, 50%) is crossed
+    let mut tripped_at = None;
+    for i in 0..30 {
+        let (s, circuit, _) = call(&st, &format!("/plain/f{i}")).await;
+        if circuit == "open" {
+            tripped_at = Some(i);
+            assert_eq!(s, 503);
+            break;
+        }
+        assert_eq!(
+            s, 503,
+            "the origin's own 503 is passed through while the circuit is closed"
+        );
+    }
+    let tripped_at = tripped_at.expect("the breaker must open");
+    assert!(tripped_at < 12, "opened after {tripped_at} failures");
+    let at_trip = hits(&o);
+    assert!(at_trip > healthy_hits);
+    // while open: instant rejection with Retry-After, and the origin is not contacted
+    for i in 0..10 {
+        let (s, circuit, retry) = call(&st, &format!("/plain/open{i}")).await;
+        assert_eq!((s, circuit.as_str()), (503, "open"));
+        assert!(
+            retry.parse::<u64>().is_ok_and(|r| (1..=2).contains(&r)),
+            "Retry-After {retry:?}"
+        );
+    }
+    assert_eq!(hits(&o), at_trip, "an open circuit sends nothing upstream");
+}
+
+#[tokio::test]
+async fn it_recovers_through_a_single_probe() {
+    let (o, st) = breaker_rig(BREAKER).await;
+    o.status.store(503, Ordering::Relaxed);
+    for i in 0..10 {
+        call(&st, &format!("/plain/a{i}")).await;
+    }
+    assert_eq!(call(&st, "/plain/x").await.1, "open");
+    let at_open = hits(&o);
+    o.status.store(200, Ordering::Relaxed); // the upstream has recovered
+    tokio::time::sleep(Duration::from_millis(2300)).await; // open_secs = 2
+
+    // concurrent requests after the cool-down: exactly one is the probe
+    let results = tokio::join!(
+        call(&st, "/plain/p1"),
+        call(&st, "/plain/p2"),
+        call(&st, "/plain/p3"),
+        call(&st, "/plain/p4"),
+    );
+    let rs = [results.0, results.1, results.2, results.3];
+    let passed = rs.iter().filter(|r| r.0 == 200).count();
+    let rejected = rs.iter().filter(|r| r.1 == "open").count();
+    assert_eq!(passed, 1, "exactly one probe goes through: {rs:?}");
+    assert_eq!(rejected, 3);
+    assert_eq!(hits(&o), at_open + 1);
+    // and its success closes the circuit
+    for i in 0..5 {
+        assert_eq!(call(&st, &format!("/plain/c{i}")).await.0, 200);
+    }
+}
+
+#[tokio::test]
+async fn a_failed_probe_reopens_the_circuit() {
+    let (o, st) = breaker_rig(BREAKER).await;
+    o.status.store(503, Ordering::Relaxed);
+    for i in 0..10 {
+        call(&st, &format!("/plain/b{i}")).await;
+    }
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    let (s, circuit, _) = call(&st, "/plain/probe").await; // the probe: still failing
+    assert_eq!(
+        (s, circuit.as_str()),
+        (503, ""),
+        "the probe reaches the origin and gets its 503"
+    );
+    assert_eq!(
+        call(&st, "/plain/after").await.1,
+        "open",
+        "so the circuit is open again"
+    );
+}
+
+#[tokio::test]
+async fn what_does_not_count_does_not_trip_it() {
+    // below the minimum request count
+    let (o, st) = breaker_rig(BREAKER).await;
+    o.status.store(503, Ordering::Relaxed);
+    for i in 0..3 {
+        call(&st, &format!("/plain/m{i}")).await;
+    }
+    assert_ne!(
+        call(&st, "/plain/m-next").await.1,
+        "open",
+        "3 failures is under min_requests = 4... until the 4th"
+    );
+    // application errors and client errors are not a sick upstream
+    for status in [400u16, 401, 404, 429, 500] {
+        let (o, st) = breaker_rig(BREAKER).await;
+        o.status.store(status, Ordering::Relaxed);
+        for i in 0..20 {
+            assert_eq!(
+                call(&st, &format!("/plain/e{status}x{i}")).await.1,
+                "",
+                "{status}"
+            );
+        }
+        assert_eq!(hits(&o), 20, "{status}: every request reached the origin");
+    }
+    // a low failure rate: 1 in 10
+    let (o, st) = breaker_rig(BREAKER).await;
+    for i in 0..30 {
+        o.status
+            .store(if i % 10 == 0 { 503 } else { 200 }, Ordering::Relaxed);
+        assert_ne!(
+            call(&st, &format!("/plain/r{i}")).await.1,
+            "open",
+            "request {i}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn without_the_option_nothing_ever_trips() {
+    let (o, st) = breaker_rig("").await;
+    o.status.store(503, Ordering::Relaxed);
+    for i in 0..40 {
+        assert_eq!(
+            call(&st, &format!("/plain/n{i}")).await,
+            (503, String::new(), String::new())
+        );
+    }
+    assert_eq!(hits(&o), 40);
+}
+
+#[tokio::test]
+async fn on_a_cached_route_an_open_circuit_serves_the_stale_copy_otherwise_503() {
+    let (o, _) = rig_with("", "public, max-age=1", "").await;
+    let port = o.port.load(Ordering::Relaxed);
+    let st = AppState::for_tests(&cfg_with_breaker(port, BREAKER, ""));
+    // fill one entry while healthy, then let it go stale
+    // `fetch` reads the body to the end, which is what lets the cache keep the entry
+    assert!(!fetch(&st, "/cached/kept", &[]).await.1.is_empty());
+    settle().await;
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    // the origin starts failing; distinct uncached URLs trip the circuit
+    o.status.store(503, Ordering::Relaxed);
+    for i in 0..10 {
+        call(&st, &format!("/cached/new{i}")).await;
+    }
+    assert_eq!(
+        call(&st, "/cached/another").await.1,
+        "open",
+        "no cached copy: the client gets the 503"
+    );
+    let before = hits(&o);
+    // the stale entry is served instead of an error, without touching the origin
+    let resp = process_request(
+        get("/cached/kept", &[]),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.headers().get("x-zion-cache").unwrap(), "STALE");
+    assert_eq!(
+        hits(&o),
+        before,
+        "the open circuit kept the origin out of it"
+    );
+}
+
+/// The real reload path (`reload::rebuild`): the health entry and its history are reused, and
+/// the breaker's thresholds are taken from the NEW config: added, changed and removed.
+#[tokio::test]
+async fn a_reload_adds_changes_and_removes_the_breaker_through_the_real_rebuild() {
+    let (o, st) = breaker_rig("").await;
+    let port = o.port.load(Ordering::Relaxed);
+    let url = format!("http://127.0.0.1:{port}");
+    let rebuild = |st: &Arc<AppState>, breaker: &str| {
+        let previous = st.cfg();
+        let next = crate::reload::rebuild(&cfg_with_breaker(port, breaker, ""), &previous, 1024)
+            .expect("config rebuilds");
+        let (old, new) = (&previous.health_map[&url], &next.health_map[&url]);
+        assert!(
+            Arc::ptr_eq(old, new),
+            "the health entry is reused across the reload"
+        );
+        st.config.store(Arc::new(next));
+    };
+    let breaker_cfg = |st: &Arc<AppState>| st.cfg().health_map[&url].breaker.cfg();
+    assert_eq!(breaker_cfg(&st), None);
+
+    // added
+    rebuild(&st, BREAKER);
+    assert_eq!(
+        breaker_cfg(&st).map(|c| (c.error_rate_pct, c.min_requests, c.window_secs, c.open_secs)),
+        Some((50, 4, 10, 2))
+    );
+    o.status.store(503, Ordering::Relaxed);
+    for i in 0..10 {
+        call(&st, &format!("/plain/add{i}")).await;
+    }
+    assert_eq!(
+        call(&st, "/plain/add-next").await.1,
+        "open",
+        "the added breaker works"
+    );
+
+    // changed: new thresholds start clean (the open circuit is forgotten)
+    rebuild(
+        &st,
+        "circuit_breaker = { error_rate_pct = 90, min_requests = 50, window_secs = 5, open_secs = 7 }",
+    );
+    assert_eq!(
+        breaker_cfg(&st).map(|c| (c.error_rate_pct, c.min_requests, c.window_secs, c.open_secs)),
+        Some((90, 50, 5, 7))
+    );
+    assert_ne!(
+        call(&st, "/plain/chg").await.1,
+        "open",
+        "a changed breaker starts closed"
+    );
+
+    // unchanged thresholds keep the history across a reload
+    rebuild(&st, "circuit_breaker = { error_rate_pct = 90, min_requests = 50, window_secs = 5, open_secs = 7 }");
+
+    // removed: the circuit stops guarding the route
+    rebuild(&st, "");
+    assert_eq!(breaker_cfg(&st), None);
+    for i in 0..30 {
+        assert_ne!(
+            call(&st, &format!("/plain/rm{i}")).await.1,
+            "open",
+            "no breaker, no rejections"
+        );
+    }
+}
+
+/// The breaker lives on a health entry shared by every upstream that names the URL, so two
+/// definitions of one URL must agree about it.
+#[tokio::test]
+async fn two_upstreams_sharing_a_url_must_agree_about_its_breaker() {
+    let cfg = |a: &str, b: &str| {
+        format!(
+            "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [upstream.a]\nurl=\"http://127.0.0.1:8000\"\n{a}\n\
+             [upstream.b]\nurl=\"http://127.0.0.1:8000\"\n{b}\n\
+             [[route]]\npath=\"/a/{{*r}}\"\nupstream=\"a\"\n\
+             [[route]]\npath=\"/b/{{*r}}\"\nupstream=\"b\"\n"
+        )
+    };
+    let cb = "circuit_breaker = { open_secs = 5 }";
+    let err = |a: &str, b: &str| {
+        crate::config::validate_str(&cfg(a, b), "t")
+            .err()
+            .unwrap_or_default()
+    };
+    assert!(
+        err(cb, "").contains("disagree about its circuit breaker"),
+        "one has it, one does not"
+    );
+    assert!(
+        err(cb, "circuit_breaker = { open_secs = 6 }").contains("disagree"),
+        "different thresholds"
+    );
+    assert!(
+        !err(cb, cb).contains("disagree"),
+        "identical definitions are fine"
+    );
+    assert!(!err("", "").contains("disagree"), "neither has one: fine");
+}
+
+fn ws_request(uri: &str) -> Request<ZionBody> {
+    get(
+        uri,
+        &[
+            ("connection", "Upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-key", "AAAAAAAAAAAAAAAAAAAAAA=="),
+        ],
+    )
+}
+
+async fn ws_status(st: &Arc<AppState>, uri: &str) -> (u16, String) {
+    let resp = process_request(
+        ws_request(uri),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    (
+        resp.status().as_u16(),
+        resp.headers()
+            .get("x-zion-circuit")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string(),
+    )
+}
+
+/// A WebSocket handshake is a request to the upstream like any other: it is refused while the
+/// circuit is open, and a failed handshake counts toward opening it.
+#[tokio::test]
+async fn websocket_handshakes_are_guarded_and_counted() {
+    let (o, st) = breaker_rig(BREAKER).await;
+    o.status.store(503, Ordering::Relaxed);
+    // failed handshakes alone open the circuit
+    let mut opened = false;
+    for i in 0..12 {
+        let (s, circuit) = ws_status(&st, &format!("/plain/ws{i}")).await;
+        if circuit == "open" {
+            assert_eq!(s, 503);
+            opened = true;
+            break;
+        }
+    }
+    assert!(
+        opened,
+        "503s answering WebSocket handshakes must trip the breaker"
+    );
+    let before = hits(&o);
+    let (s, circuit) = ws_status(&st, "/plain/ws-after").await;
+    assert_eq!((s, circuit.as_str()), (503, "open"));
+    // an upgrade on a CACHED route skips the cache handler, so the circuit must catch it first
+    let (s, circuit) = ws_status(&st, "/cached/ws-after").await;
+    assert_eq!(
+        (s, circuit.as_str()),
+        (503, "open"),
+        "websocket on a cached route"
+    );
+    // ordinary requests are refused by the same circuit, and the origin is left alone
+    assert_eq!(call(&st, "/plain/after-ws").await.1, "open");
+    assert_eq!(hits(&o), before);
+}
+
+/// The path that bypasses the cache because a varied request header is too long to key on still
+/// contacts the origin, so the circuit applies to it too.
+#[tokio::test]
+async fn the_overlong_header_cache_bypass_respects_the_circuit() {
+    let (o, _) = rig_with("X-Foo", "public, max-age=60", "").await;
+    let port = o.port.load(Ordering::Relaxed);
+    let st = AppState::for_tests(&cfg_with_breaker(port, BREAKER, ""));
+    // learn that /cached/* varies on X-Foo
+    assert_eq!(fetch(&st, "/cached/v", &[("x-foo", "a")]).await.0, "MISS");
+    settle().await;
+    // open the circuit with failing requests on another path
+    o.status.store(503, Ordering::Relaxed);
+    for i in 0..10 {
+        call(&st, &format!("/plain/o{i}")).await;
+    }
+    assert_eq!(call(&st, "/plain/o-next").await.1, "open");
+    let before = hits(&o);
+    let long = "x".repeat(crate::vary::MAX_VALUE_LEN + 100);
+    let resp = process_request(
+        get("/cached/v", &[("x-foo", long.as_str())]),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+    assert_eq!(resp.headers().get("x-zion-circuit").unwrap(), "open");
+    assert_eq!(hits(&o), before, "the bypass path did not reach the origin");
+}
+
+/// A write to a cached route goes straight to the upstream, so it is guarded as well.
+#[tokio::test]
+async fn writes_to_a_cached_route_respect_the_circuit() {
+    let (o, st) = breaker_rig(BREAKER).await;
+    o.status.store(503, Ordering::Relaxed);
+    for i in 0..10 {
+        call(&st, &format!("/plain/w{i}")).await;
+    }
+    assert_eq!(call(&st, "/plain/w-next").await.1, "open");
+    let before = hits(&o);
+    let resp = process_request(
+        {
+            let mut r = get("/cached/item", &[]);
+            *r.method_mut() = Method::POST;
+            r
+        },
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+    assert_eq!(resp.headers().get("x-zion-circuit").unwrap(), "open");
+    assert_eq!(hits(&o), before);
+}
+
+/// A background refresh must not take the half-open probe slot: it cannot report an outcome
+/// for the circuit, so it would strand the slot and delay recovery.
+#[tokio::test]
+async fn a_background_refresh_never_takes_the_half_open_probe() {
+    let (o, _) = rig_with("", "public, max-age=1, stale-while-revalidate=60", "").await;
+    let port = o.port.load(Ordering::Relaxed);
+    let st = AppState::for_tests(&cfg_with_breaker(port, BREAKER, ""));
+    fetch(&st, "/cached/hp", &[]).await;
+    settle().await;
+    o.status.store(503, Ordering::Relaxed);
+    for i in 0..10 {
+        call(&st, &format!("/plain/h{i}")).await;
+    }
+    assert_eq!(call(&st, "/plain/h-open").await.1, "open");
+    o.status.store(200, Ordering::Relaxed); // recovered
+    tokio::time::sleep(Duration::from_millis(2300)).await; // cool-down over: half-open
+    let before = hits(&o);
+    // a stale-but-refreshable entry is requested first: served at once, refresh held back
+    let (c, _) = fetch(&st, "/cached/hp", &[]).await;
+    assert_eq!(c, "STALE-WHILE-REVALIDATE");
+    settle().await;
+    assert_eq!(
+        hits(&o),
+        before,
+        "no refresh while the circuit is not closed"
+    );
+    // and the probe slot is still free for a foreground request, which recovers the circuit
+    assert_eq!(
+        call(&st, "/plain/h-probe").await.0,
+        200,
+        "the foreground request is the probe"
+    );
+    assert_eq!(hits(&o), before + 1);
+    assert_eq!(call(&st, "/plain/h-after").await.0, 200, "closed again");
+}

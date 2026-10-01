@@ -88,7 +88,7 @@ pub(crate) fn current_generation() -> u64 {
 /// "healthy + latency unknown" defaults; removed URLs are simply
 /// dropped (the old `Arc` will be reclaimed when the last reader
 /// exits, including any in-flight prober iteration).
-fn rebuild(
+pub(crate) fn rebuild(
     new_config: &ZionConfig,
     previous: &ResolvedAppConfig,
     conn_limit_max: usize,
@@ -102,6 +102,9 @@ fn rebuild(
             .get(url.as_str())
             .cloned()
             .unwrap_or_else(|| fresh.clone());
+        // The entry (and its history) is reused, but its breaker thresholds come from the
+        // NEW config: a reload may add, change or remove them.
+        entry.breaker.configure(fresh.breaker.cfg());
         merged.insert(url.clone(), entry);
     }
     snap.health_map = Arc::new(merged);
@@ -443,6 +446,7 @@ mod tests {
             // in-progress recovery backoff on every config reload.
             backoff_us: std::sync::atomic::AtomicU64::new(700_000),
             next_probe_at_us: std::sync::atomic::AtomicU64::new(0),
+            breaker: crate::breaker::Breaker::new(),
         });
         let mut old_map = fnv::FnvHashMap::default();
         old_map.insert(url.clone(), old_health.clone());
@@ -500,6 +504,7 @@ mod tests {
                 latency_us: std::sync::atomic::AtomicU64::new(99),
                 backoff_us: std::sync::atomic::AtomicU64::new(123_456),
                 next_probe_at_us: std::sync::atomic::AtomicU64::new(0),
+                breaker: crate::breaker::Breaker::new(),
             }),
         );
         let previous = ResolvedAppConfig::test_with_health(Arc::new(old_map));

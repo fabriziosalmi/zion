@@ -758,6 +758,47 @@ impl Metrics {
             extra.push('\n');
         }
 
+        // Circuit breaker state, for the upstreams that have one.
+        let mut breakers: Vec<(&String, &crate::breaker::Breaker)> = health
+            .iter()
+            .filter(|(_, h)| h.breaker.is_configured())
+            .map(|(u, h)| (u, &h.breaker))
+            .collect();
+        breakers.sort_by(|a, b| a.0.cmp(b.0));
+        if !breakers.is_empty() {
+            type Read = fn(&crate::breaker::Breaker) -> u64;
+            let series: [(&str, &str, &str, Read); 3] = [
+                (
+                    "zion_upstream_circuit_open",
+                    "1 while the upstream's circuit breaker is open or half-open (requests are rejected with 503).",
+                    "gauge",
+                    |b| u64::from(b.is_open()),
+                ),
+                (
+                    "zion_upstream_circuit_trips_total",
+                    "Times the upstream's circuit breaker opened.",
+                    "counter",
+                    crate::breaker::Breaker::trips,
+                ),
+                (
+                    "zion_upstream_circuit_rejected_total",
+                    "Requests rejected because the upstream's circuit was open.",
+                    "counter",
+                    crate::breaker::Breaker::rejected,
+                ),
+            ];
+            for (name, help, kind, read) in series {
+                extra.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+                for (url, b) in &breakers {
+                    extra.push_str(&format!(
+                        "{name}{{upstream=\"{}\"}} {}\n",
+                        escape_label(&redact_userinfo(url)),
+                        read(b)
+                    ));
+                }
+            }
+        }
+
         let text: &[u8] = base.as_ref();
         let (head, tail): (&[u8], &[u8]) = match text.strip_suffix(b"# EOF\n") {
             Some(h) if openmetrics => (h, b"# EOF\n"),
@@ -1568,6 +1609,58 @@ fn redact_userinfo(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn circuit_breaker_series_appear_only_for_upstreams_that_have_one() {
+        use crate::breaker::BreakerCfg;
+        let with = std::sync::Arc::new(crate::health::UpstreamHealth::new_healthy());
+        with.breaker.configure(Some(BreakerCfg {
+            error_rate_pct: 50,
+            min_requests: 2,
+            window_secs: 10,
+            open_secs: 30,
+        }));
+        let without = std::sync::Arc::new(crate::health::UpstreamHealth::new_healthy());
+        let mut map = fnv::FnvHashMap::default();
+        map.insert("http://guarded:1".to_string(), with.clone());
+        map.insert("http://plain:2".to_string(), without);
+        let health: crate::health::HealthMap = std::sync::Arc::new(map);
+        let m = Metrics::new();
+        let text = |b: bytes::Bytes| String::from_utf8(b.to_vec()).unwrap();
+        let out = text(m.render_with_upstreams(false, &health));
+        assert!(
+            out.contains("zion_upstream_circuit_open{upstream=\"http://guarded:1\"} 0"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("circuit_open{upstream=\"http://plain:2\"}"),
+            "no series without a breaker"
+        );
+        // open it and the gauge and counters move
+        with.breaker.record(false, 1_000, None);
+        with.breaker.record(false, 1_000, None);
+        let _ = with.breaker.check(2_000);
+        let out = text(m.render_with_upstreams(false, &health));
+        assert!(
+            out.contains("zion_upstream_circuit_open{upstream=\"http://guarded:1\"} 1"),
+            "{out}"
+        );
+        assert!(out.contains("zion_upstream_circuit_trips_total{upstream=\"http://guarded:1\"} 1"));
+        assert!(
+            out.contains("zion_upstream_circuit_rejected_total{upstream=\"http://guarded:1\"} 1")
+        );
+        // every sample line is well formed (name{labels} value)
+        for l in out
+            .lines()
+            .filter(|l| l.starts_with("zion_upstream_circuit"))
+        {
+            assert!(
+                l.rsplit_once(' ')
+                    .is_some_and(|(_, v)| v.parse::<u64>().is_ok()),
+                "{l}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

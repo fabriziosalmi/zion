@@ -161,9 +161,22 @@ impl ResolvedAppConfig {
             } else {
                 continue;
             };
+            // The breaker applies to a single-endpoint upstream: a pool already fails over
+            // between its members.
+            let breaker_cfg = config
+                .upstream
+                .get(name)
+                .and_then(|u| u.circuit_breaker.as_ref())
+                .filter(|_| urls.len() == 1)
+                .map(|cb| cb.to_runtime());
             for url in urls {
-                map.entry(url.clone())
+                let entry = map
+                    .entry(url.clone())
                     .or_insert_with(|| Arc::new(health::UpstreamHealth::new_healthy()));
+                // First route in config order wins; validation refuses conflicting tables.
+                if breaker_cfg.is_some() && !entry.breaker.is_configured() {
+                    entry.breaker.configure(breaker_cfg.clone());
+                }
             }
         }
         let health_map = Arc::new(map);

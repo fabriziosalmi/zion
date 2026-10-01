@@ -45,6 +45,9 @@ pub struct UpstreamHealth {
     /// Absolute monotonic deadline (µs since the prober's base `Instant`) of the
     /// next probe. `0` == due immediately (fresh boot / freshly added upstream).
     pub next_probe_at_us: std::sync::atomic::AtomicU64,
+    /// Opt-in in-band circuit breaker (see `breaker.rs`). Part of the health entry so it
+    /// survives a reload with it; its thresholds are re-applied on every reload.
+    pub breaker: crate::breaker::Breaker,
 }
 
 impl UpstreamHealth {
@@ -76,6 +79,7 @@ impl UpstreamHealth {
             latency_us: std::sync::atomic::AtomicU64::new(0),
             backoff_us: std::sync::atomic::AtomicU64::new(PROBE_BASE_US),
             next_probe_at_us: std::sync::atomic::AtomicU64::new(0),
+            breaker: crate::breaker::Breaker::new(),
         }
     }
 
