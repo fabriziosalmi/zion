@@ -4,6 +4,32 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-01
+
+**Hardening release: two security fixes, three RFC 9111 correctness fixes, and the remaining
+items of the post-0.9.2 request-pipeline review.** Upgrade soon if you use route-level policy
+(`internal_only`, WAF or auth profiles) or hot reload: the two security fixes below affect every
+earlier release. Read the upgrade notes first.
+
+### ⚠️ Upgrade notes
+
+- **Paths are normalized before routing** (security fix below). Upstreams now receive
+  `/a/b` where a client sent `/a//./b/../b`, and `%2e`-style escapes of unreserved characters are
+  decoded. `%2F` is left alone. If an application depends on a literal `//` or a dot segment
+  reaching it, it will no longer.
+- **A response with `Set-Cookie` is no longer cached**, whatever its `Cache-Control`. Responses that
+  used to be `HIT` after setting a cookie are now `BYPASS`.
+- **A successful `POST`/`PUT`/`PATCH`/`DELETE` evicts the cache entries for its URI** (per instance).
+- **Upstreams see a new `Via: <protocol> zion-XXXXXXXX` request header**, and a request that already
+  names this process in `Via` is refused with `508`.
+- **TCP keepalive is on by default** (60 s idle) for client connections, pooled upstream sockets and
+  WebSocket dials; `[server] tcp_keepalive_secs = 0` turns it off for client connections.
+- `stale-while-revalidate` and `stale-if-error` no longer serve a response whose origin sent
+  `must-revalidate`, `proxy-revalidate` or `s-maxage`; `stale-if-error` now actually fires on a
+  `500`/`502`/`503`/`504`.
+- Everything new that is configurable (`circuit_breaker`, `normalize_query`, `max_object_mb`) is off
+  or at its previous value by default.
+
 ### Security
 
 - **A hot reload did not apply to routes a worker thread had already cached.** Each worker thread keeps a small cache of resolved routes, and nothing dropped it when the configuration was swapped. A reload that made a route `internal_only`, attached an auth or WAF profile, or changed its upstream took effect only for paths not yet in a thread's cache, i.e. not for the hot paths it was most likely meant to protect, until the entry happened to be evicted. The cache is now dropped on a thread's first request under a new configuration (one pointer comparison per request).
