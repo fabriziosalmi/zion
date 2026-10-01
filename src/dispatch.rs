@@ -36,6 +36,7 @@ use crate::http_util::{
 };
 use crate::proxy::ZionBody;
 use crate::state::AppState;
+use crate::state::ResolvedAppConfig;
 use crate::{
     cache, config, health, logging, metrics, observability, proxy, security, uri_norm, vary, waf,
 };
@@ -327,7 +328,23 @@ async fn process_request_inner(
     thread_local! {
         static ROUTE_CACHE: std::cell::RefCell<route_cache::RouteCache<Arc<ResolvedRoute>>> =
             std::cell::RefCell::new(route_cache::RouteCache::new(route_cache::ROUTE_CACHE_CAP));
+        // The configuration the cache above was filled from. Held (not just compared by
+        // address) so that address cannot be reused by a later config while we compare.
+        static ROUTE_CACHE_CONFIG: std::cell::RefCell<Option<Arc<ResolvedAppConfig>>> =
+            const { std::cell::RefCell::new(None) };
     }
+
+    // A cached route carries the policy of the configuration it was resolved under
+    // (`internal_only`, WAF and auth profiles, upstream). After a hot reload the next
+    // request must see the NEW policy, so a cache filled under a previous snapshot is
+    // dropped on first use. Cost on the hot path: one pointer comparison.
+    ROUTE_CACHE_CONFIG.with(|owner| {
+        let mut owner = owner.borrow_mut();
+        if !owner.as_ref().is_some_and(|c| Arc::ptr_eq(c, &cfg)) {
+            ROUTE_CACHE.with(|cache| cache.borrow_mut().clear());
+            *owner = Some(cfg.clone());
+        }
+    });
 
     let rule = {
         let path = req.uri().path();
@@ -1841,15 +1858,26 @@ async fn handle_static_cache(
         .map(|pq| pq.as_str())
         .unwrap_or_else(|| req.uri().path());
     // With `normalize_query` the key carries the parameters in a canonical order; the
-    // request itself (and so what the upstream is sent) is untouched.
-    let key_target: Cow<'_, str> = match (normalize_query, req.uri().query()) {
-        (true, Some(q)) => match uri_norm::sorted_query(q) {
-            Cow::Borrowed(_) => Cow::Borrowed(pq),
-            Cow::Owned(sorted) => Cow::Owned(format!("{}?{sorted}", req.uri().path())),
-        },
-        _ => Cow::Borrowed(pq),
+    // request itself (and so what the upstream is sent) is untouched. Such keys end in a
+    // `\x1d` mode marker, which no request can produce, so they never share a namespace
+    // with raw-query keys: the cache survives a config reload, and switching the option
+    // must not let a raw request be served an entry filed under a sorted key (or the other
+    // way round).
+    let (key_target, mode_marker): (Cow<'_, str>, &str) = match (normalize_query, req.uri().query())
+    {
+        (true, Some(q)) => (
+            match uri_norm::sorted_query(q) {
+                Cow::Borrowed(_) => Cow::Borrowed(pq),
+                Cow::Owned(sorted) => Cow::Owned(format!("{}?{sorted}", req.uri().path())),
+            },
+            "\u{1d}nq",
+        ),
+        _ => (Cow::Borrowed(pq), ""),
     };
-    let primary_key = format!("{key_target}\u{1f}{}", accept_encoding_key(req.headers()));
+    let primary_key = format!(
+        "{key_target}\u{1f}{}{mode_marker}",
+        accept_encoding_key(req.headers())
+    );
     // If this primary key's responses vary (RFC 9111 §4.1), the entry for THIS request
     // lives under a secondary key built from the varied request headers.
     let Some(cache_key) = lookup_key(&state, &primary_key, req.headers()) else {
@@ -2313,6 +2341,15 @@ mod route_cache {
     }
 
     impl<V: Clone> RouteCache<V> {
+        /// Drop every entry (the capacity and allocations are kept).
+        pub(super) fn clear(&mut self) {
+            self.map.clear();
+            self.nodes.clear();
+            self.free.clear();
+            self.head = NIL;
+            self.tail = NIL;
+        }
+
         pub(super) fn new(cap: usize) -> Self {
             Self {
                 map: fnv::FnvHashMap::with_capacity_and_hasher(cap, Default::default()),
@@ -2435,6 +2472,26 @@ mod route_cache {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn route_cache_clear_empties_it_and_it_stays_usable() {
+        let mut c = route_cache::RouteCache::<u32>::new(3);
+        for k in 0..3u64 {
+            c.insert(k, k as u32 + 10);
+        }
+        assert_eq!(c.get(1), Some(11));
+        c.clear();
+        assert!((0..3u64).all(|k| c.get(k).is_none()), "cleared");
+        // refills to capacity and evicts normally afterwards
+        for k in 10..14u64 {
+            c.insert(k, k as u32);
+        }
+        assert!(
+            c.get(10).is_none(),
+            "the LRU entry was evicted past capacity"
+        );
+        assert_eq!(c.get(13), Some(13));
+    }
+
     #[test]
     fn a_set_cookie_response_is_not_storable_even_if_public() {
         let mut h = hdr(

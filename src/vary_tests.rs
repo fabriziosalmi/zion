@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 struct Origin {
+    /// The port this origin listens on (set once it is bound).
+    port: std::sync::atomic::AtomicU16,
     /// The `Vary` value the origin sends (empty = none).
     vary: Mutex<String>,
     /// Requests that reached the origin.
@@ -136,8 +138,9 @@ fn state_for(port: u16) -> Arc<AppState> {
     state_for_with(port, "")
 }
 
+/// The test config: a catch-all `static_cache` route to the origin on `port`;
 /// `profile_extra` is appended to `[cache_profile.c]`.
-fn state_for_with(port: u16, profile_extra: &str) -> Arc<AppState> {
+fn cfg_for(port: u16, profile_extra: &str) -> ZionConfig {
     let toml = format!(
         r#"
 [server]
@@ -163,7 +166,11 @@ mode = "static_cache"
 cache_profile = "c"
 "#
     );
-    AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"))
+    toml::from_str::<ZionConfig>(&toml).expect("config parses")
+}
+
+fn state_for_with(port: u16, profile_extra: &str) -> Arc<AppState> {
+    AppState::for_tests(&cfg_for(port, profile_extra))
 }
 
 async fn rig(vary: &str) -> (Arc<Origin>, Arc<AppState>) {
@@ -186,6 +193,7 @@ async fn rig_cc(vary: &str, cc: &str) -> (Arc<Origin>, Arc<AppState>) {
 
 async fn rig_with(vary: &str, cc: &str, profile_extra: &str) -> (Arc<Origin>, Arc<AppState>) {
     let o = Arc::new(Origin {
+        port: std::sync::atomic::AtomicU16::new(0),
         vary: Mutex::new(vary.into()),
         hits: AtomicUsize::new(0),
         cc: Mutex::new(cc.into()),
@@ -198,6 +206,7 @@ async fn rig_with(vary: &str, cc: &str, profile_extra: &str) -> (Arc<Origin>, Ar
         extra: Mutex::new(None),
     });
     let port = start_origin(o.clone()).await;
+    o.port.store(port, Ordering::Relaxed);
     (o, state_for_with(port, profile_extra))
 }
 
@@ -1027,4 +1036,46 @@ async fn a_mutation_invalidates_every_ordering_of_its_query() {
     settle().await;
     assert_eq!(fetch(&st, "/qd?a=1&b=2", &[]).await.0, "MISS");
     let _ = o;
+}
+
+/// The RAM cache survives a config reload. Entries stored while `normalize_query` was on live
+/// under sorted keys; turning it off (because order matters) must not let a raw request be
+/// served one of them, and turning it on must not mix its entries with the raw ones.
+#[tokio::test]
+async fn toggling_normalize_query_across_a_reload_never_aliases_entries() {
+    use crate::state::ResolvedAppConfig;
+    let reload = |st: &Arc<AppState>, port: u16, extra: &str| {
+        let cfg = ResolvedAppConfig::try_build(&cfg_for(port, extra), 1024).unwrap();
+        st.config.store(Arc::new(cfg));
+    };
+    // on -> off
+    let (o, st) = rig_with("", "public, max-age=60", "normalize_query = true").await;
+    let port = o.port.load(Ordering::Relaxed);
+    fetch(&st, "/qr?b=2&a=1", &[]).await;
+    settle().await;
+    reload(&st, port, "normalize_query = false");
+    let (c, _) = fetch(&st, "/qr?a=1&b=2", &[]).await;
+    assert_eq!(
+        c, "MISS",
+        "raw request must not be served the entry stored under the sorted key"
+    );
+    assert_eq!(hits(&o), 2);
+    // off -> on
+    let (o, st) = rig_with("", "public, max-age=60", "").await;
+    let port = o.port.load(Ordering::Relaxed);
+    fetch(&st, "/qs?a=1&b=2", &[]).await;
+    settle().await;
+    reload(&st, port, "normalize_query = true");
+    let (c, _) = fetch(&st, "/qs?b=2&a=1", &[]).await;
+    assert_eq!(
+        c, "MISS",
+        "an entry stored in raw mode is not the sorted-mode entry"
+    );
+    settle().await;
+    assert_eq!(
+        fetch(&st, "/qs?a=1&b=2", &[]).await.0,
+        "HIT",
+        "and sorted mode works after the reload"
+    );
+    assert_eq!(hits(&o), 2);
 }

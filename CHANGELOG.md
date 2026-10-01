@@ -6,6 +6,7 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Security
 
+- **A hot reload did not apply to routes a worker thread had already cached.** Each worker thread keeps a small cache of resolved routes, and nothing dropped it when the configuration was swapped. A reload that made a route `internal_only`, attached an auth or WAF profile, or changed its upstream took effect only for paths not yet in a thread's cache, i.e. not for the hot paths it was most likely meant to protect, until the entry happened to be evicted. The cache is now dropped on a thread's first request under a new configuration (one pointer comparison per request).
 - **Route policy could be bypassed by how a path was written.** A request was matched to a route from its raw path, and the same raw path was sent upstream. `/open/../internal/x` matched `/open/{*rest}` (not `internal_only`) while an upstream that resolves `..` served `/internal/x`; `//internal/x`, `/./internal/x` and `/%69nternal/x` likewise slipped past a `/internal/{*rest}` route, and with it its `internal_only`, WAF and auth settings. The path is now normalized (RFC 3986 §6.2.2: decode unreserved escapes, remove dot segments, collapse `//`, keep `%2F` as data) before routing, and the normalized path is what is matched, cached and forwarded; the query string is untouched. The plaintext :80 listener, which matches its ACME-challenge paths and forwards them on its own, normalizes first too. This also merges cache entries that differed only in spelling. Upstreams will see normalized paths.
 
 ### Added

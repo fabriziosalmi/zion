@@ -73,7 +73,8 @@ The key is the **full path + query** plus the **canonical `Accept-Encoding` set*
 - The query is part of the key **as written**, so `?b=2&a=1` and `?a=1&b=2` are two entries.
   A profile can opt in to `normalize_query = true` to sort the parameters by name in the
   key (stable, so repeated names keep their order; nothing that differs is merged). The
-  upstream is still sent the original query.
+  upstream is still sent the original query. Keys built this way carry an internal mode marker, so switching the option on a reload
+  never lets a raw-query request be served an entry filed under a sorted key (or the reverse).
 - A `gzip`-accepting client and an `identity`-only client get **separate** entries,
   so a client is never served a coding it can't decode (RFC 9111 §4.1). The
   Accept-Encoding set is lowercased, `q=0` dropped, deduplicated and sorted, so
