@@ -248,6 +248,7 @@ fn reload_now_inner(
     }
 
     // 3. Atomic swap + generation bump + best-effort notify.
+    crate::dns::configure(snapshot.dns_stale_secs, snapshot.dns_timeout_ms);
     state_config.store(Arc::new(snapshot));
     let gen = CONFIG_GENERATION.fetch_add(1, Ordering::Release) + 1;
     if let Some(tx) = change_notifier {
@@ -549,6 +550,43 @@ mod tests {
             health::PROBE_BASE_US
         );
         assert_eq!(billing.next_probe_at_us.load(Ordering::Relaxed), 0);
+    }
+
+    /// Building a snapshot must not change the running DNS policy: a reload that is built but
+    /// then rejected (or a build that is never published) leaves it alone. Only publishing
+    /// applies it.
+    #[test]
+    fn building_a_snapshot_does_not_apply_the_dns_policy() {
+        let cfg = parse_inline(
+            r#"
+            [server]
+            listen_http = "0.0.0.0:8080"
+            listen_https = "0.0.0.0:8443"
+            dns_stale_secs = 17
+            dns_timeout_ms = 29
+            [tls]
+            cert_path = "/tmp/zion-test.crt"
+            key_path  = "/tmp/zion-test.key"
+            [upstreams]
+            api = "http://api:8000"
+            [[route]]
+            path = "/api/{*rest}"
+            upstream = "api"
+        "#,
+        );
+        let before = crate::dns::current();
+        let snap =
+            ResolvedAppConfig::try_build(&cfg, TEST_CONN_LIMIT_MAX).expect("test config builds");
+        assert_eq!(
+            (snap.dns_stale_secs, snap.dns_timeout_ms),
+            (17, 29),
+            "carried in the snapshot"
+        );
+        assert_eq!(
+            crate::dns::current(),
+            before,
+            "but not applied by building it"
+        );
     }
 
     /// Reload-completeness guard. `try_build` is the SINGLE builder used by
