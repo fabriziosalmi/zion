@@ -4,6 +4,18 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-10-01
+
+**Operations and correctness release: deploys stop waiting on idle connections, a recovered pool member gets traffic again, client IPs can be kept out of the logs, and the cache can serve byte ranges.** No breaking changes; one fix to the 0.9.4 load balancer. Read the notes below.
+
+### Upgrade notes
+
+- **Pools (`p2c`): fixes a 0.9.4 starvation bug.** The load estimate only changed when a sample arrived, so a member that had been slow once, or that came back from an ejection, could stay unpicked for good at low load. If you run pools of two or more endpoints, upgrade.
+- **Cached routes now answer `Range`.** A fresh cached `200` answers one byte range with `206` (or `416`) instead of the whole object, and cache hits carry the origin's `ETag` / `Last-Modified` and `Accept-Ranges: bytes`. Clients that sent `Range` to a cached route used to get the whole `200`; they now get what they asked for.
+- **Shutdown is faster.** Idle keep-alive connections are closed at once on SIGTERM (HTTP/2 gets `GOAWAY`); requests in flight are still finished.
+- **Client IP privacy is opt-in** (`[redact] ip`); the default writes the address as before.
+
+
 ### Added
 
 - **Client IP privacy in logs** (`[redact] ip = "full" | "truncate" | "hmac"`). The client address is written to the access log, the audit trail, TLS-handshake failure lines and the sovereign classification log as it is (default), as its network (`203.0.113.0/24`, `2001:db8:1::/48`), or as a keyed irreversible token (`ip:` + 16 hex of HMAC-SHA256 under `ip_hmac_key`, stable per client). For GDPR/NIS2 retention policies. `hmac` needs a key of at least 16 bytes (validated); a missing key never degrades to the raw address; the key never appears in a debug print.
