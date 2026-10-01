@@ -110,8 +110,26 @@ fn default_sync_interval_ms() -> u64 {
     1000
 }
 
+/// How a client IP address is written to the access log and the audit trail
+/// (`[redact] ip`). The default writes it as is.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IpPrivacy {
+    /// The address as is.
+    #[default]
+    Full,
+    /// The network only: `203.0.113.0/24` (IPv4) or `2001:db8:1::/48` (IPv6). Not reversible, and
+    /// not correlatable below the network.
+    Truncate,
+    /// A keyed, irreversible token (`ip:` + 16 hex of HMAC-SHA256 under `ip_hmac_key`). The same
+    /// address always gives the same token, so a client can still be followed across the logs
+    /// without being identifiable from them; without the key the token cannot be tied back to an
+    /// address.
+    Hmac,
+}
+
 /// `[redact]` block. Lists are case-insensitive. Empty = no redaction.
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Deserialize, Clone, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct RedactConfig {
     /// HTTP header names whose value should be replaced with `<redacted:N>`.
@@ -119,12 +137,58 @@ pub struct RedactConfig {
     pub headers: Vec<String>,
     /// Query-parameter names whose value should be redacted.
     pub query_params: Vec<String>,
+    /// How client IPs are written to the access log, the audit trail and connection-error logs
+    /// (default `full`; see [`IpPrivacy`]). Applied at start-up.
+    pub ip: IpPrivacy,
+    /// Secret for `ip = "hmac"` (at least 16 bytes; keep it out of version control).
+    pub ip_hmac_key: Option<String>,
+}
+
+impl std::fmt::Debug for RedactConfig {
+    // by hand: the HMAC key must never reach a debug print
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedactConfig")
+            .field("headers", &self.headers)
+            .field("query_params", &self.query_params)
+            .field("ip", &self.ip)
+            .field("ip_hmac_key", &self.ip_hmac_key.as_ref().map(|_| "<set>"))
+            .finish()
+    }
+}
+
+/// Shortest accepted `ip_hmac_key`.
+pub const MIN_IP_HMAC_KEY_BYTES: usize = 16;
+
+impl RedactConfig {
+    /// Problems that make this block unusable, for config validation.
+    pub fn errors(&self) -> Vec<String> {
+        let mut e = Vec::new();
+        match (self.ip, self.ip_hmac_key.as_deref()) {
+            (IpPrivacy::Hmac, None) => {
+                e.push("redact.ip = \"hmac\" needs redact.ip_hmac_key".to_string())
+            }
+            (IpPrivacy::Hmac, Some(k)) if k.len() < MIN_IP_HMAC_KEY_BYTES => e.push(format!(
+                "redact.ip_hmac_key must be at least {MIN_IP_HMAC_KEY_BYTES} bytes"
+            )),
+            (IpPrivacy::Full | IpPrivacy::Truncate, Some(_)) => {
+                e.push("redact.ip_hmac_key is only used with redact.ip = \"hmac\"".to_string())
+            }
+            _ => {}
+        }
+        e
+    }
 }
 
 impl RedactConfig {
     /// Build a fast-lookup compiled set. Called once at config-load time.
     pub fn compile(&self) -> CompiledRedaction {
         CompiledRedaction {
+            ip: self.ip,
+            ip_key: self
+                .ip_hmac_key
+                .as_deref()
+                .filter(|k| k.len() >= MIN_IP_HMAC_KEY_BYTES)
+                .map(|k| hmac::Key::new(hmac::HMAC_SHA256, k.as_bytes())),
             headers: self
                 .headers
                 .iter()
@@ -144,9 +208,62 @@ impl RedactConfig {
 pub struct CompiledRedaction {
     headers: Vec<String>,
     query_params: Vec<String>,
+    ip: IpPrivacy,
+    ip_key: Option<hmac::Key>,
+}
+
+/// A client address as it is to be logged (see [`CompiledRedaction::ip_label`]).
+pub enum IpLabel {
+    /// Written as is (no allocation).
+    Full(std::net::IpAddr),
+    Text(String),
+}
+
+impl std::fmt::Display for IpLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full(ip) => ip.fmt(f),
+            Self::Text(s) => f.write_str(s),
+        }
+    }
+}
+
+/// `203.0.113.0/24` / `2001:db8:1::/48`. An IPv4-mapped IPv6 address counts as IPv4.
+fn truncate_ip(ip: std::net::IpAddr) -> String {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}::/48", s[0], s[1], s[2])
+        }
+    }
 }
 
 impl CompiledRedaction {
+    /// How `ip` is to be written to a log or an audit record under `[redact] ip`. `hmac` with no
+    /// usable key (validation refuses that) degrades to `truncate`, never to the raw address.
+    pub fn ip_label(&self, ip: std::net::IpAddr) -> IpLabel {
+        match (self.ip, &self.ip_key) {
+            (IpPrivacy::Full, _) => IpLabel::Full(ip),
+            (IpPrivacy::Hmac, Some(key)) => {
+                let tag = match ip.to_canonical() {
+                    std::net::IpAddr::V4(v4) => hmac::sign(key, &v4.octets()),
+                    std::net::IpAddr::V6(v6) => hmac::sign(key, &v6.octets()),
+                };
+                let mut s = String::with_capacity(19);
+                s.push_str("ip:");
+                for b in &tag.as_ref()[..8] {
+                    s.push_str(&format!("{b:02x}"));
+                }
+                IpLabel::Text(s)
+            }
+            _ => IpLabel::Text(truncate_ip(ip)),
+        }
+    }
+
     /// Test whether the given (lowercased) header name should be redacted.
     /// Currently consumed by the unit tests and reserved for the access-log
     /// integration point; kept on the public surface so callers can ship
@@ -370,6 +487,13 @@ impl AuditHandle {
     /// failed to start (the latter logs a warning).
     pub fn noop() -> Self {
         Self { inner: None }
+    }
+
+    /// A handle whose events can be read back, for tests of what the pipeline records.
+    #[cfg(test)]
+    pub fn capture() -> (Self, tokio::sync::mpsc::Receiver<AuditEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        (Self { inner: Some(tx) }, rx)
     }
 
     /// Push one event. Non-blocking — drops the event if the queue is full
@@ -1426,6 +1550,115 @@ pub fn run_cli(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    // ── [redact] ip ────────────────────────────────────────────────────────
+
+    fn redact(ip: IpPrivacy, key: Option<&str>) -> CompiledRedaction {
+        RedactConfig {
+            ip,
+            ip_hmac_key: key.map(str::to_string),
+            ..Default::default()
+        }
+        .compile()
+    }
+    const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn ip_full_is_the_default_and_writes_the_address_as_is() {
+        let r = CompiledRedaction::default();
+        assert_eq!(
+            r.ip_label("203.0.113.9".parse().unwrap()).to_string(),
+            "203.0.113.9"
+        );
+        assert_eq!(
+            r.ip_label("2001:db8::1".parse().unwrap()).to_string(),
+            "2001:db8::1"
+        );
+    }
+
+    #[test]
+    fn ip_truncate_keeps_only_the_network() {
+        let r = redact(IpPrivacy::Truncate, None);
+        let t = |s: &str| r.ip_label(s.parse().unwrap()).to_string();
+        assert_eq!(t("203.0.113.9"), "203.0.113.0/24");
+        assert_eq!(
+            t("203.0.113.200"),
+            "203.0.113.0/24",
+            "same network, same label"
+        );
+        assert_eq!(t("2001:db8:1:2:3:4:5:6"), "2001:db8:1::/48");
+        assert_eq!(
+            t("::ffff:203.0.113.9"),
+            "203.0.113.0/24",
+            "an IPv4-mapped address is IPv4"
+        );
+        assert!(!t("203.0.113.9").contains(".9"));
+    }
+
+    #[test]
+    fn ip_hmac_is_stable_keyed_and_not_the_address() {
+        let r = redact(IpPrivacy::Hmac, Some(KEY));
+        let t = |s: &str| r.ip_label(s.parse().unwrap()).to_string();
+        let a = t("203.0.113.9");
+        assert!(a.starts_with("ip:") && a.len() == 3 + 16, "{a}");
+        assert!(a[3..].bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(a, t("203.0.113.9"), "the same client gives the same token");
+        assert_ne!(a, t("203.0.113.10"), "another client gives another one");
+        assert_eq!(
+            a,
+            t("::ffff:203.0.113.9"),
+            "v4 and its mapped form are one client"
+        );
+        assert!(
+            !a.contains("203"),
+            "the address does not appear in its token"
+        );
+        let other = redact(IpPrivacy::Hmac, Some("fedcba9876543210fedcba9876543210"));
+        assert_ne!(
+            a,
+            other.ip_label("203.0.113.9".parse().unwrap()).to_string(),
+            "key-dependent"
+        );
+    }
+
+    #[test]
+    fn ip_hmac_without_a_usable_key_never_falls_back_to_the_raw_address() {
+        for key in [None, Some("short")] {
+            let r = redact(IpPrivacy::Hmac, key);
+            let t = r.ip_label("203.0.113.9".parse().unwrap()).to_string();
+            assert_eq!(t, "203.0.113.0/24", "degrades to truncate, not to full");
+        }
+    }
+
+    #[test]
+    fn redact_ip_config_is_validated_and_the_key_never_reaches_a_debug_print() {
+        let ok = |ip, key: Option<&str>| {
+            RedactConfig {
+                ip,
+                ip_hmac_key: key.map(str::to_string),
+                ..Default::default()
+            }
+            .errors()
+        };
+        assert!(ok(IpPrivacy::Full, None).is_empty());
+        assert!(ok(IpPrivacy::Truncate, None).is_empty());
+        assert!(ok(IpPrivacy::Hmac, Some(KEY)).is_empty());
+        assert!(ok(IpPrivacy::Hmac, None)[0].contains("needs redact.ip_hmac_key"));
+        assert!(ok(IpPrivacy::Hmac, Some("short"))[0].contains("at least 16 bytes"));
+        assert!(ok(IpPrivacy::Truncate, Some(KEY))[0].contains("only used with"));
+        let dbg = format!(
+            "{:?}",
+            RedactConfig {
+                ip: IpPrivacy::Hmac,
+                ip_hmac_key: Some(KEY.into()),
+                ..Default::default()
+            }
+        );
+        assert!(!dbg.contains(KEY) && dbg.contains("<set>"), "{dbg}");
+        let parsed: RedactConfig = toml::from_str("ip = \"truncate\"").unwrap();
+        assert_eq!(parsed.ip, IpPrivacy::Truncate);
+        assert!(toml::from_str::<RedactConfig>("ip = \"md5\"").is_err());
+    }
+
     // ── zion audit verify ─────────────────────────────────────────────────────
     fn vkey(b: u8) -> hmac::Key {
         hmac::Key::new(hmac::HMAC_SHA256, &[b; 32])
@@ -1591,6 +1824,7 @@ mod tests {
         let r = RedactConfig {
             headers: vec!["authorization".into()],
             query_params: vec![],
+            ..Default::default()
         }
         .compile();
         assert_eq!(
@@ -1604,6 +1838,7 @@ mod tests {
         let r = RedactConfig {
             headers: vec!["authorization".into(), "cookie".into()],
             query_params: vec![],
+            ..Default::default()
         }
         .compile();
         assert_eq!(
@@ -1621,6 +1856,7 @@ mod tests {
         let r = RedactConfig {
             headers: vec!["AUTHORIZATION".into()],
             query_params: vec![],
+            ..Default::default()
         }
         .compile();
         assert_eq!(
@@ -1634,6 +1870,7 @@ mod tests {
         let r = RedactConfig {
             headers: vec![],
             query_params: vec!["token".into(), "api_key".into()],
+            ..Default::default()
         }
         .compile();
         let out = r.redact_query_string("foo=bar&token=secret123&api_key=verylongkey");
@@ -1645,6 +1882,7 @@ mod tests {
         let r = RedactConfig {
             headers: vec![],
             query_params: vec!["b".into()],
+            ..Default::default()
         }
         .compile();
         // "x" pair has no '=' — must be passed through unchanged.
@@ -2329,6 +2567,7 @@ mod proptests {
             let r = RedactConfig {
                 headers: vec![],
                 query_params: redact_set,
+                ..Default::default()
             }
             .compile();
             let original = keys
@@ -2350,6 +2589,7 @@ mod proptests {
             let r = RedactConfig {
                 headers: vec![],
                 query_params: vec!["secret".into()],
+                ..Default::default()
             }
             .compile();
             let _ = r.redact_query_string(&q);
@@ -2364,6 +2604,7 @@ mod proptests {
             let r = RedactConfig {
                 headers: vec![],
                 query_params: vec!["token".into()],
+                ..Default::default()
             }
             .compile();
             let q = format!("foo=bar&token={secret}&baz=qux");
@@ -2389,6 +2630,7 @@ mod proptests {
             let r = RedactConfig {
                 headers: vec!["authorization".into(), "cookie".into()],
                 query_params: vec![],
+                ..Default::default()
             }
             .compile();
             let mut pairs: std::collections::BTreeMap<&str, String> = Default::default();

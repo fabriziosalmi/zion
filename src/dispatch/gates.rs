@@ -117,7 +117,7 @@ pub(super) async fn run_pre_routing(
             Gate::LoopDetection => loop_detection(req),
             Gate::RateLimit => rate_limit(ctx, state),
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
-            Gate::SovereignClass => sovereign_class(ctx, req).await,
+            Gate::SovereignClass => sovereign_class(ctx, state, req).await,
             #[cfg(feature = "tls-fingerprint")]
             Gate::TlsFingerprint => tls_fingerprint(ctx, req),
             #[cfg(feature = "sovereign-aimp")]
@@ -220,7 +220,11 @@ fn rate_limit(ctx: &PreCtx, state: &Arc<AppState>) -> Option<Response<ZionBody>>
 
 /// Gate: sovereign IP classification and enforcement.
 #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
-async fn sovereign_class(ctx: &PreCtx, req: &mut Request<ZionBody>) -> Option<Response<ZionBody>> {
+async fn sovereign_class(
+    ctx: &PreCtx,
+    state: &Arc<AppState>,
+    req: &mut Request<ZionBody>,
+) -> Option<Response<ZionBody>> {
     let (cfg, client_ip) = (&ctx.cfg, ctx.client_ip);
     // ── Sovereign Edge: IP classification (zero cost when feature is off or disabled) ──
     //
@@ -256,7 +260,7 @@ async fn sovereign_class(ctx: &PreCtx, req: &mut Request<ZionBody>) -> Option<Re
             if cfg.sovereign_log_classification && ip_class != sovereign::IpClass::Unknown {
                 tracing::info!(
                     target: "sovereign",
-                    ip = %client_ip,
+                    ip = %state.redact.ip_label(client_ip),
                     class = ip_class.as_str(),
                     "classified",
                 );

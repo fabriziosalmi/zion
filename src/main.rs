@@ -1603,7 +1603,10 @@ fn spawn_https_handler(
             }
             Ok(Err(e)) => {
                 if tls_handshake_log_allowed() {
-                    logq::line(&format!("  tls handshake failed from {remote_addr}: {e}"));
+                    logq::line(&format!(
+                        "  tls handshake failed from {}: {e}",
+                        state.redact.ip_label(remote_addr.ip())
+                    ));
                 }
                 metrics::METRICS
                     .tls_handshake_errors

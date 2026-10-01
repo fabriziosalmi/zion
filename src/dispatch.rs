@@ -153,7 +153,7 @@ fn emit_waf_block(
         ts: String::new(),
         kind: "request_blocked",
         trace_id: None,
-        remote_ip: Some(remote_addr.ip().to_string()),
+        remote_ip: Some(state.redact.ip_label(remote_addr.ip()).to_string()),
         method: Some(method.to_string()),
         path: Some(path_safe),
         detail: Some(format!("waf:{source}:{reason}")),
@@ -1194,7 +1194,7 @@ async fn process_request_inner(
             latency_us = request_elapsed.as_micros() as u64,
             method = %log_method,
             path = %path_safe,
-            remote_ip = %remote_addr.ip(),
+            remote_ip = %state.redact.ip_label(remote_addr.ip()),
             // 32-hex W3C trace id — the join key from this log line to the
             // distributed trace (and to the matching audit record).
             trace_id = %trace_hex,
@@ -1234,7 +1234,7 @@ async fn process_request_inner(
                 ts: String::new(),
                 kind: audit::kind::REQUEST_COMPLETED,
                 trace_id: Some(trace_hex.clone()),
-                remote_ip: Some(remote_addr.ip().to_string()),
+                remote_ip: Some(state.redact.ip_label(remote_addr.ip()).to_string()),
                 method: Some(log_method.to_string()),
                 path: Some(path_safe.to_string()),
                 detail: Some(detail_parts.join(" ")),

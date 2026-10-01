@@ -86,6 +86,10 @@ earlier release. Read the upgrade notes first.
 - **`Via` and loop detection** (RFC 9110 §7.6.3). Forwarded requests now carry `Via: <protocol> zion-XXXXXXXX` (random per process) after any earlier hop's entry, and a request whose `Via` already names this process is refused with `508 Loop Detected` ahead of the rate limiter, routing and the built-in endpoints, instead of bouncing between hops (for example an upstream that points back at zion) until a connection limit stops it. New counter `zion_loops_detected`. Upstreams will see a new `Via` request header.
 - **Cache: a successful `POST`/`PUT`/`PATCH`/`DELETE` invalidates the cache entries for its URI** (RFC 9111 §4.4): the path, its query variants and every encoding/`Vary` variant, but not longer paths that start the same, plus the same-origin URIs named in the response's `Location` / `Content-Location`. Errors (status 400 and above) invalidate nothing. New counter `zion_cache_invalidations`. Per instance: replicas do not tell each other.
 
+### Added
+
+- **Client IP privacy in logs** (`[redact] ip = "full" | "truncate" | "hmac"`). The client address is written to the access log, the audit trail, TLS-handshake failure lines and the sovereign classification log as it is (default), as its network (`203.0.113.0/24`, `2001:db8:1::/48`), or as a keyed irreversible token (`ip:` + 16 hex of HMAC-SHA256 under `ip_hmac_key`, stable per client). For GDPR/NIS2 retention policies. `hmac` needs a key of at least 16 bytes (validated); a missing key never degrades to the raw address; the key never appears in a debug print.
+
 ### Fixed
 
 - **Cache: a response that sets a cookie is no longer stored.** Cached hits never replayed `Set-Cookie`, but they did replay the body, so a personalised page that started a session could be served to other visitors. Any response with a `Set-Cookie` header is now streamed through uncached (`X-Zion-Cache: BYPASS`), whatever its `Cache-Control`. If you relied on caching such responses, have the origin stop sending `Set-Cookie` on them.

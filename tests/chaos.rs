@@ -151,6 +151,7 @@ fn redact_idempotence_under_repeated_calls() {
     let r = zion::audit::RedactConfig {
         headers: vec![],
         query_params: vec!["token".into(), "session".into()],
+        ..Default::default()
     }
     .compile();
     let q = "user=alice&token=abcd1234&page=2&session=xyz";
