@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### CI
+
+- **acme-soak: the `nonce-collision` leg** (#134). Pebble now rejects 20% of the anti-replay nonces zion presents (`PEBBLE_WFE_NONCEREJECT`); issue → renew ×5 → revoke must still complete, with up to 3 whole-operation attempts each for the rare request that exhausts instant-acme's own 3 per-request `badNonce` retries. A deterministic probe makes sure the leg cannot pass vacuously: at 100% rejection issuance must fail with `badNonce` after exactly 3 attempts. With `key-rollover` and `ttl-edge`, all three legs of #134 are in.
+
 ## [0.9.3] - 2026-10-01
 
 **Hardening release: two security fixes, three RFC 9111 correctness fixes, and the remaining

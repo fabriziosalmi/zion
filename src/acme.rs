@@ -585,9 +585,13 @@ pub async fn run_soak() -> i32 {
             soak_key_rollover(&acme_config, &store, &tls_config, &cert_path, &state_dir).await
         }
         "ttl-edge" => soak_ttl_edge(&acme_config, &store, &tls_config, &cert_path).await,
+        "nonce-collision" => {
+            soak_nonce_collision(&acme_config, &store, &tls_config, &cert_path).await
+        }
         other => {
             eprintln!(
-                "acme-soak: FAIL unknown mode '{other}' (expected happy|key-rollover|ttl-edge)"
+                "acme-soak: FAIL unknown mode '{other}' \
+                 (expected happy|key-rollover|ttl-edge|nonce-collision)"
             );
             2
         }
@@ -766,6 +770,108 @@ async fn soak_ttl_edge(
     0
 }
 
+/// Run `op` up to `attempts` times; `Ok(retries_used)` on the first success.
+#[cfg(feature = "acme")]
+async fn with_retries<F, Fut>(label: &str, attempts: u32, mut op: F) -> Result<u32, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut last = String::new();
+    for n in 0..attempts {
+        match op().await {
+            Ok(()) => return Ok(n),
+            Err(e) => {
+                eprintln!(
+                    "acme-soak: {label}: attempt {} of {attempts} failed: {e}",
+                    n + 1
+                );
+                last = e;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// Nonce-collision leg (issue #134). Pebble is started with `PEBBLE_WFE_NONCEREJECT` so a
+/// share of the anti-replay nonces zion presents are rejected with `badNonce`. instant-acme
+/// retries each request on `badNonce` (RFC 8555 §6.5) up to 3 attempts, so a flow almost
+/// always completes in one go; the rare request that exhausts its attempts fails the whole
+/// operation, and the daemon would retry it on its next cycle. This leg therefore allows
+/// each of issue / renew / revoke up to 3 whole-operation attempts and fails only if one
+/// never succeeds. That the rejections really were injected is asserted by the workflow,
+/// from Pebble's own log: without it a quiet Pebble would make this leg pass for nothing.
+#[cfg(feature = "acme")]
+async fn soak_nonce_collision(
+    acme_config: &crate::config::AcmeConfig,
+    store: &ChallengeStore,
+    tls_config: &crate::config::TlsConfig,
+    cert_path: &str,
+) -> i32 {
+    const ATTEMPTS: u32 = 3;
+    const NONCE_ROUNDS: u32 = 5;
+    let mut op_retries = 0;
+    let mut stage = |name: &'static str, r: Result<u32, String>| -> bool {
+        match r {
+            Ok(n) => {
+                op_retries += n;
+                eprintln!("acme-soak: ✓ {name} (whole-operation retries: {n})");
+                true
+            }
+            Err(e) => {
+                eprintln!("acme-soak: FAIL {name}: gave up after {ATTEMPTS} attempts: {e}");
+                false
+            }
+        }
+    };
+    let issue = with_retries("issue", ATTEMPTS, || async {
+        renew_once(acme_config, store, tls_config)
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    if !stage("issue", issue) {
+        return 1;
+    }
+    if !std::path::Path::new(cert_path).exists() {
+        eprintln!("acme-soak: FAIL issue: no certificate written to {cert_path}");
+        return 1;
+    }
+    // Several renewals: enough requests that injected rejections are certain to occur
+    // (the workflow checks the count against a clean run), at a rate where whole-operation
+    // retries still make the leg reliable.
+    for round in 1..=NONCE_ROUNDS {
+        let renew = with_retries("renew", ATTEMPTS, || async {
+            renew_once(acme_config, store, tls_config)
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await;
+        let name: &'static str = match round {
+            1 => "renew 1",
+            2 => "renew 2",
+            _ => "renew 3+",
+        };
+        if !stage(name, renew) {
+            return 1;
+        }
+    }
+    let revoke = with_retries("revoke", ATTEMPTS, || async {
+        revoke_cert(acme_config, cert_path)
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    if !stage("revoke", revoke) {
+        return 1;
+    }
+    eprintln!(
+        "acme-soak: PASS (nonce-collision: issue → renew → revoke under injected badNonce; \
+         whole-operation retries: {op_retries})"
+    );
+    0
+}
+
 /// Minimal HTTP/1.1 responder for ACME HTTP-01 validation. Reads the
 /// request line, serves the key authorization for a known token, 404s
 /// otherwise. Single-purpose — not a general-purpose server.
@@ -809,6 +915,59 @@ async fn serve_challenges(listener: tokio::net::TcpListener, store: ChallengeSto
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── the soak's whole-operation retry helper ────────────────────────────────
+    // The 100% probe never reaches `with_retries` and the 20% run often succeeds without a
+    // second attempt, so its control flow is pinned here rather than left to the soak.
+
+    #[cfg(feature = "acme")]
+    #[tokio::test]
+    async fn with_retries_succeeds_at_once_without_retrying() {
+        let calls = std::cell::Cell::new(0u32);
+        let r = with_retries("t", 3, || {
+            calls.set(calls.get() + 1);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(r, Ok(0), "no retries used");
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[cfg(feature = "acme")]
+    #[tokio::test]
+    async fn with_retries_reports_how_many_failures_came_before_the_success() {
+        for fail_first in [1u32, 2] {
+            let calls = std::cell::Cell::new(0u32);
+            let r = with_retries("t", 3, || {
+                calls.set(calls.get() + 1);
+                let n = calls.get();
+                async move {
+                    if n <= fail_first {
+                        Err(format!("boom {n}"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+            assert_eq!(r, Ok(fail_first), "{fail_first} failure(s) then success");
+            assert_eq!(calls.get(), fail_first + 1, "stops at the first success");
+        }
+    }
+
+    #[cfg(feature = "acme")]
+    #[tokio::test]
+    async fn with_retries_gives_up_after_the_attempts_with_the_last_error() {
+        let calls = std::cell::Cell::new(0u32);
+        let r = with_retries("t", 3, || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move { Err(format!("boom {n}")) }
+        })
+        .await;
+        assert_eq!(r, Err("boom 3".to_string()), "the LAST error is returned");
+        assert_eq!(calls.get(), 3, "exactly the allowed attempts, no more");
+    }
 
     #[test]
     fn challenge_valid_token_returns_key_auth() {
