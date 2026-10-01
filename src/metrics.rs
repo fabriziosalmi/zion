@@ -820,7 +820,7 @@ impl Metrics {
                 ),
                 (
                     "zion_upstream_peak_ewma_seconds",
-                    "Peak-EWMA of this pool member's time to response headers, measured on real requests (0 = no sample yet).",
+                    "Peak-EWMA of this pool member's time to response headers, measured on real requests, faded by the time since its last sample (0 = no current estimate: never sampled, faded away, or reset by an ejection).",
                     "gauge",
                     Box::new(|s| format!("{:.6}", s.ewma_us(crate::breaker::now_ms()) as f64 / 1_000_000.0)),
                 ),

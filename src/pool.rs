@@ -71,11 +71,11 @@ struct Slot {
 pub struct MemberStats {
     /// Requests currently waiting for this member's response headers.
     inflight: AtomicU32,
-    /// Peak-EWMA of the time to response headers, microseconds (0 = no sample yet), as of
-    /// `ewma_at_ms`. It is *aged* when read (see [`decayed`]), not only when a sample arrives.
-    ewma_us: AtomicU64,
-    /// When `ewma_us` was last updated (ms, the pool clock).
-    ewma_at_ms: AtomicU64,
+    /// Peak-EWMA of the time to response headers and when it was last updated, in ONE word so
+    /// the pair can only change together: estimate in the high 32 bits (microseconds, saturating;
+    /// 0 = no estimate), update time in the low 32 bits (ms of the pool clock, wrapping). The
+    /// estimate is *aged* when read (see [`decayed`]), not only when a sample arrives.
+    ewma: AtomicU64,
     slots: Mutex<[Slot; WINDOW_SLOTS]>,
     /// 0 = in rotation; otherwise the time (ms) the ejection ends.
     ejected_until_ms: AtomicU64,
@@ -96,6 +96,16 @@ impl Default for MemberStats {
 /// weight, so one fast response does not erase the memory of a slow period.
 const EWMA_DECAY_NUM: u64 = 7;
 const EWMA_DECAY_DEN: u64 = 8;
+fn pack_ewma(est_us: u64, at_ms: u64) -> u64 {
+    (est_us.min(u64::from(u32::MAX)) << 32) | (at_ms & 0xffff_ffff)
+}
+
+/// The estimate in `word`, aged to `now_ms`.
+fn aged_estimate(word: u64, now_ms: u64) -> u64 {
+    let age = (now_ms as u32).wrapping_sub(word as u32);
+    decayed(word >> 32, u64::from(age))
+}
+
 /// A latency estimate loses half its value every this long without a new sample. Without that, a
 /// member that was once slow (or came back from an ejection) kept its old estimate for good: at
 /// low load it was never picked again, so it never got the sample that would correct it.
@@ -119,8 +129,7 @@ impl MemberStats {
     pub fn new() -> Self {
         Self {
             inflight: AtomicU32::new(0),
-            ewma_us: AtomicU64::new(0),
-            ewma_at_ms: AtomicU64::new(0),
+            ewma: AtomicU64::new(0),
             slots: Mutex::new([Slot::default(); WINDOW_SLOTS]),
             ejected_until_ms: AtomicU64::new(0),
             consecutive_ejections: AtomicU32::new(0),
@@ -163,12 +172,9 @@ impl MemberStats {
         self.inflight.load(Relaxed)
     }
 
-    /// The latency estimate as of `now_ms`, aged by the time since its last sample.
+    /// The latency estimate as of `now_ms`, aged by the time since its last sample (0 = none).
     pub fn ewma_us(&self, now_ms: u64) -> u64 {
-        decayed(
-            self.ewma_us.load(Relaxed),
-            now_ms.saturating_sub(self.ewma_at_ms.load(Relaxed)),
-        )
+        aged_estimate(self.ewma.load(Relaxed), now_ms)
     }
 
     pub fn ejections(&self) -> u64 {
@@ -184,24 +190,21 @@ impl MemberStats {
     /// is folded into is the *aged* one, so a member that has been quiet for a while is judged
     /// on the new sample rather than on stale history.
     pub fn observe_latency(&self, sample_us: u64, now_ms: u64) {
-        let sample = sample_us.max(1);
-        let mut raw = self.ewma_us.load(Relaxed);
+        let sample = sample_us.max(1).min(u64::from(u32::MAX));
+        let mut word = self.ewma.load(Relaxed);
         loop {
-            let base = decayed(raw, now_ms.saturating_sub(self.ewma_at_ms.load(Relaxed)));
+            let base = aged_estimate(word, now_ms);
             let next = if base == 0 || sample >= base {
                 sample // first sample, or a spike: adopt immediately
             } else {
                 (base * EWMA_DECAY_NUM + sample) / EWMA_DECAY_DEN
             };
             match self
-                .ewma_us
-                .compare_exchange_weak(raw, next, Relaxed, Relaxed)
+                .ewma
+                .compare_exchange_weak(word, pack_ewma(next, now_ms), Relaxed, Relaxed)
             {
-                Ok(_) => {
-                    self.ewma_at_ms.store(now_ms, Relaxed);
-                    return;
-                }
-                Err(seen) => raw = seen,
+                Ok(_) => return,
+                Err(seen) => word = seen,
             }
         }
     }
@@ -472,7 +475,7 @@ pub fn report(
     me.pool.ejections.fetch_add(1, Relaxed);
     // It gets no traffic while it is out, so its old estimate would only go stale: forget it, and
     // measure it afresh when it returns.
-    me.pool.ewma_us.store(0, Relaxed);
+    me.pool.ewma.store(0, Relaxed);
     me.pool.ejected_until_ms.store(
         now_ms + u64::from(cfg.eject_secs) * 1000 * u64::from(streak),
         Relaxed,
@@ -788,7 +791,7 @@ mod tests {
         feed(&h, &urls, 0, false, 100, 1_000);
         assert!(!stats(&h, &urls[0]).is_ejected(1_000));
         // but its latency is still tracked for P2C
-        assert!(stats(&h, &urls[0]).ewma_us(0) > 0);
+        assert!(stats(&h, &urls[0]).ewma_us(1_000) > 0);
     }
 
     #[test]
@@ -975,5 +978,42 @@ mod tests {
             0,
             "its old estimate is dropped on ejection"
         );
+    }
+
+    #[test]
+    fn the_estimate_and_its_timestamp_live_in_one_word() {
+        let w = pack_ewma(123_456, 7_890);
+        assert_eq!((w >> 32, w as u32), (123_456, 7_890));
+        assert_eq!(
+            pack_ewma(u64::MAX, 1) >> 32,
+            u64::from(u32::MAX),
+            "saturates, never wraps"
+        );
+        assert_eq!(
+            pack_ewma(1 << 33, 1) >> 32,
+            u64::from(u32::MAX),
+            "a 2^33 us estimate saturates too"
+        );
+        // age is computed across the 32-bit millisecond wrap
+        let near_wrap = pack_ewma(80_000, u64::from(u32::MAX) - 1_000);
+        assert_eq!(
+            aged_estimate(near_wrap, u64::from(u32::MAX) + 1),
+            decayed(80_000, 1_001)
+        );
+        // concurrent observers always leave a coherent pair: constant samples keep the estimate
+        // at that sample whatever the interleaving and the (wrapping) clock
+        let s = MemberStats::new();
+        std::thread::scope(|sc| {
+            for t in 0..8u64 {
+                let s = &s;
+                sc.spawn(move || {
+                    for k in 0..5_000u64 {
+                        s.observe_latency(10_000, (k * 8 + t) * 3);
+                    }
+                });
+            }
+        });
+        let at = u64::from(s.ewma.load(Relaxed) as u32);
+        assert_eq!(s.ewma_us(at), 10_000, "a coherent (estimate, time) pair");
     }
 }
