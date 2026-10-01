@@ -37,6 +37,24 @@ upstream = "frontend"
 
 More specific routes take priority over wildcards. `/api/v1/events/stream` matches before `/api/{*rest}`.
 
+## Path normalization
+
+The request path is normalized **before** anything decides from it (RFC 3986 §6.2.2), and
+the normalized form is what is routed, checked against `internal_only` / WAF / auth
+profiles, used as the cache key, and sent upstream:
+
+- `%2e%2e` and the like: percent-encodings of unreserved characters
+  (`A-Z a-z 0-9 - . _ ~`) are decoded; every other escape keeps its bytes with upper-case
+  hex (`%2f` → `%2F`). An encoded slash stays data, never a separator.
+- Dot segments are removed, never climbing above the root (`/a/b/../c` → `/a/c`).
+- Runs of `/` collapse to one (`//a///b` → `/a/b`). A trailing slash is kept.
+- The query string is left exactly as written.
+
+Without this, `/open/../internal/x` matches `/open/{*rest}` while an upstream that
+resolves `..` serves `/internal/x`, and `//admin` or `/%61dmin` slip past a `/admin` route.
+Every spelling of a path now meets the same route and the same policy, on :443 and on the
+plaintext :80 listener (whose ACME-challenge fallback routes on its own).
+
 ## Host-based routing (virtual hosting)
 
 Bind a route to one or more `hosts` to serve different backends for different domains on the same listener — the `Host` header (HTTP/1) or `:authority` (HTTP/2) selects the route. A route **without** `hosts` is *shared*: it matches every host and acts as a fallback.

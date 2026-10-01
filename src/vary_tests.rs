@@ -32,6 +32,8 @@ struct Origin {
     last_lang: Mutex<Option<String>>,
     /// A `Set-Cookie` value the origin adds to its answers, if any.
     set_cookie: Mutex<Option<String>>,
+    /// Path and query of the last request the origin saw.
+    last_target: Mutex<Option<String>>,
     /// Every `Via` value of the last request the origin saw, joined with ", ".
     last_via: Mutex<Option<String>>,
     /// When set, the body is this many `x` bytes; the bool = send it chunked (no
@@ -58,6 +60,8 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                     let o = o.clone();
                     async move {
                         o.hits.fetch_add(1, Ordering::Relaxed);
+                        *o.last_target.lock().unwrap() =
+                            req.uri().path_and_query().map(|p| p.as_str().to_string());
                         *o.last_via.lock().unwrap() = {
                             let v: Vec<&str> = req
                                 .headers()
@@ -188,6 +192,7 @@ async fn rig_with(vary: &str, cc: &str, profile_extra: &str) -> (Arc<Origin>, Ar
         last_lang: Mutex::new(None),
         set_cookie: Mutex::new(None),
         last_via: Mutex::new(None),
+        last_target: Mutex::new(None),
         big: Mutex::new(None),
         status: std::sync::atomic::AtomicU16::new(200),
         extra: Mutex::new(None),
@@ -884,4 +889,83 @@ async fn a_background_refresh_over_the_limit_leaves_the_old_entry_alone() {
         first.len(),
         "the oversize refresh must not replace the stored body"
     );
+}
+
+// ── what the upstream is sent: the normalized path ──────────────────────────
+
+#[tokio::test]
+async fn the_upstream_is_sent_the_normalized_path_and_the_query_untouched() {
+    for (n, (sent, want)) in [
+        ("/a/./b//c/%41?x=1&y=%2e", "/a/b/c/A?x=1&y=%2e"),
+        ("/n0/p/../q", "/n0/q"),
+        ("/n1/%2e%2e/%2e%2e/r?k=v", "/r?k=v"),
+        ("/n2/a%2Fb", "/n2/a%2Fb"),
+        ("/n3/%7euser/", "/n3/~user/"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (o, st) = rig("").await;
+        // the route cache is per thread and keyed by path: a state per case, a path per case
+        let _ = n;
+        fetch(&st, sent, &[]).await;
+        assert_eq!(
+            o.last_target.lock().unwrap().as_deref(),
+            Some(want),
+            "sent {sent}"
+        );
+    }
+}
+
+// ── the plaintext :80 handler routes and forwards on its own, so it normalizes too ──
+
+async fn http80(st: &Arc<AppState>, uri: &str) -> (u16, String) {
+    let resp = crate::handle_http(
+        get(uri, &[("host", "example.test")]),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+    )
+    .await
+    .unwrap();
+    let loc = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    (resp.status().as_u16(), loc)
+}
+
+/// The ACME-fallback shortcut forwards `/.well-known/acme-challenge/*` straight to the
+/// route's upstream. A path that only LOOKS like a challenge before normalization must not
+/// take it: `/.well-known/acme-challenge/../../secret` is `/secret`.
+#[tokio::test]
+async fn the_acme_shortcut_on_port_80_cannot_be_used_to_reach_other_paths() {
+    let (o, st) = rig("").await;
+    // control: a real challenge path is forwarded
+    let (status, _) = http80(&st, "/.well-known/acme-challenge/abc").await;
+    assert_ne!(status, 301, "a challenge path is proxied, not redirected");
+    assert_eq!(hits(&o), 1);
+    assert_eq!(
+        o.last_target.lock().unwrap().as_deref(),
+        Some("/.well-known/acme-challenge/abc")
+    );
+    // spellings that normalize to a challenge path ARE a challenge path, forwarded normalized
+    let (status, _) = http80(&st, "//.well-known/./acme-challenge//def").await;
+    assert_ne!(status, 301);
+    assert_eq!(
+        o.last_target.lock().unwrap().as_deref(),
+        Some("/.well-known/acme-challenge/def")
+    );
+    let before = hits(&o);
+    // ...and ones that normalize to something else are not: redirected to https, never forwarded
+    for p in [
+        "/.well-known/acme-challenge/../../secret",
+        "/.well-known/acme-challenge/%2e%2e/%2e%2e/secret",
+    ] {
+        let (status, loc) = http80(&st, p).await;
+        assert_eq!(status, 301, "{p}");
+        assert_eq!(loc, "https://example.test/secret", "{p}");
+    }
+    assert_eq!(hits(&o), before, "nothing reached the upstream");
 }

@@ -77,6 +77,7 @@ mod tarpit;
 mod tls;
 #[cfg(feature = "tui")]
 mod tui;
+mod uri_norm;
 mod vary;
 mod via;
 // `uring.rs` compiles on every target — the io_uring-accept inner
@@ -1786,6 +1787,14 @@ async fn handle_http(
         .unwrap_or_else(|| req.uri().path().len());
     if uri_len > MAX_URI_LEN {
         return Ok(empty_response(StatusCode::URI_TOO_LONG));
+    }
+
+    // Normalize the path before ANYTHING below decides from it (RFC 3986 §6.2.2): this
+    // handler matches the snapshot / ACME paths and routes ACME fallbacks on its own,
+    // outside the HTTPS pipeline, so `/.well-known/acme-challenge/../../x` must not be
+    // treated as a challenge path and forwarded raw. Same rewrite as the pipeline's gate.
+    if uri_norm::rewrite_request(&mut req).is_err() {
+        return Ok(empty_response(StatusCode::BAD_REQUEST));
     }
 
     let path = req.uri().path();

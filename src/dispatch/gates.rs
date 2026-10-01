@@ -48,6 +48,8 @@ pub(super) enum Gate {
     ScrubIdentityHeaders,
     /// 414 for an oversized URI.
     UriLength,
+    /// Rewrite the path to its normalized form (mutation; 400 if it cannot be rebuilt).
+    NormalizePath,
     /// 405 for a method outside the whitelist.
     Method,
     /// 425 for a state-changing method in early data.
@@ -73,6 +75,7 @@ pub(super) enum Gate {
 pub(super) const PRE_ROUTING: &[Gate] = &[
     Gate::ScrubIdentityHeaders,
     Gate::UriLength,
+    Gate::NormalizePath,
     Gate::Method,
     Gate::EarlyData,
     Gate::LoopDetection,
@@ -98,6 +101,7 @@ pub(super) async fn run_pre_routing(
                 None
             }
             Gate::UriLength => uri_length(req),
+            Gate::NormalizePath => normalize_path(req),
             Gate::Method => method_whitelist(req),
             Gate::EarlyData => early_data(ctx, req),
             Gate::LoopDetection => loop_detection(req),
@@ -130,6 +134,16 @@ fn uri_length(req: &Request<ZionBody>) -> Option<Response<ZionBody>> {
         return Some(empty_response(StatusCode::URI_TOO_LONG));
     }
     None
+}
+
+/// Gate: normalize the request path (RFC 3986 §6.2.2) before anything decides from it.
+/// Routing, `internal_only`, the WAF and auth profiles, the cache key and the path sent
+/// upstream must all read the same path, or `/open/../internal/x` matches the open route
+/// and still reaches `/internal/x` (see `uri_norm`). The query string is left as written.
+fn normalize_path(req: &mut Request<ZionBody>) -> Option<Response<ZionBody>> {
+    crate::uri_norm::rewrite_request(req)
+        .err()
+        .map(|()| empty_response(StatusCode::BAD_REQUEST))
 }
 
 /// Gate: HTTP method whitelist.
@@ -545,6 +559,7 @@ mod tests {
         let always = [
             Gate::ScrubIdentityHeaders,
             Gate::UriLength,
+            Gate::NormalizePath,
             Gate::Method,
             Gate::EarlyData,
             Gate::LoopDetection,
