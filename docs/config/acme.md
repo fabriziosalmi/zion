@@ -58,13 +58,13 @@ zion acme-soak        # exits 0 on PASS, non-zero on FAIL
 
 `acme-soak` runs zion's *real* `renew_once` / `revoke_cert` paths, so a regression in the production ACME flow fails the soak. It also asserts the lifecycle counters move (`zion_acme_renewals_total` ≥ 2 across issue + renew).
 
-### Failure modes (follow-up)
+### Failure-mode legs
 
-Three adversarial legs are tracked for a follow-up:
+`ZION_ACME_SOAK_MODE` selects the leg (`happy` is the default). CI runs all four, each against its own Pebble:
 
-- **Nonce collision** (`PEBBLE_WFE_NONCEREJECT`) — needs **per-request** `badNonce` retry; instant-acme 0.8.x does not expose it, and an operation-level retry can't recover a high per-request rejection rate.
-- **Key rollover** — fresh-account issuance after discarding `account.json`.
-- **TTL-edge expiry** — short-validity issuance + assert renewal fires.
+- **`key-rollover`**: fresh-account issuance after discarding `account.json`.
+- **`ttl-edge`**: issue a real certificate and assert the renewal trigger fires exactly at the `renew_before_days` edge, then drive that renewal.
+- **`nonce-collision`**: Pebble rejects 20% of the anti-replay nonces (`PEBBLE_WFE_NONCEREJECT`); issue → five renewals → revoke must still complete. instant-acme 0.8.5 retries **each request** on `badNonce` (RFC 8555 §6.5, up to 3 attempts); the soak allows a few whole-operation attempts for the rare request that exhausts them. The workflow also proves the injection is real: at 100% rejection issuance must fail with `badNonce` after exactly 3 attempts.
 
 The happy-path leg already proved its worth: it surfaced a real ordering bug (HTTP-01 tokens were dropped before `poll_ready`, racing validation) that real Let's Encrypt masked with slower validation timing.
 

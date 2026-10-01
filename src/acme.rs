@@ -916,6 +916,59 @@ async fn serve_challenges(listener: tokio::net::TcpListener, store: ChallengeSto
 mod tests {
     use super::*;
 
+    // ── the soak's whole-operation retry helper ────────────────────────────────
+    // The 100% probe never reaches `with_retries` and the 20% run often succeeds without a
+    // second attempt, so its control flow is pinned here rather than left to the soak.
+
+    #[cfg(feature = "acme")]
+    #[tokio::test]
+    async fn with_retries_succeeds_at_once_without_retrying() {
+        let calls = std::cell::Cell::new(0u32);
+        let r = with_retries("t", 3, || {
+            calls.set(calls.get() + 1);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(r, Ok(0), "no retries used");
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[cfg(feature = "acme")]
+    #[tokio::test]
+    async fn with_retries_reports_how_many_failures_came_before_the_success() {
+        for fail_first in [1u32, 2] {
+            let calls = std::cell::Cell::new(0u32);
+            let r = with_retries("t", 3, || {
+                calls.set(calls.get() + 1);
+                let n = calls.get();
+                async move {
+                    if n <= fail_first {
+                        Err(format!("boom {n}"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+            assert_eq!(r, Ok(fail_first), "{fail_first} failure(s) then success");
+            assert_eq!(calls.get(), fail_first + 1, "stops at the first success");
+        }
+    }
+
+    #[cfg(feature = "acme")]
+    #[tokio::test]
+    async fn with_retries_gives_up_after_the_attempts_with_the_last_error() {
+        let calls = std::cell::Cell::new(0u32);
+        let r = with_retries("t", 3, || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move { Err(format!("boom {n}")) }
+        })
+        .await;
+        assert_eq!(r, Err("boom 3".to_string()), "the LAST error is returned");
+        assert_eq!(calls.get(), 3, "exactly the allowed attempts, no more");
+    }
+
     #[test]
     fn challenge_valid_token_returns_key_auth() {
         let store = new_challenge_store();

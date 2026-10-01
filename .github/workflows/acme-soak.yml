@@ -14,7 +14,7 @@
 # path: `key-rollover` (discard the account file, re-issue, assert a fresh
 # account key + successful issuance) and `ttl-edge` (assert the renewal
 # trigger fires exactly at the renew_before_days edge on a real cert).
-# `nonce-collision` restarts Pebble with PEBBLE_WFE_NONCEREJECT=20 (25% of the
+# `nonce-collision` restarts Pebble with PEBBLE_WFE_NONCEREJECT=20 (20% of the
 # nonces zion presents are rejected with badNonce). instant-acme 0.8.5 retries
 # each request on badNonce (RFC 8555 §6.5, 3 attempts), which is what makes this
 # leg possible at a moderate rate; the soak adds a few whole-operation retries
