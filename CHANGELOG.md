@@ -10,6 +10,8 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### CI
 
+- **A flaky admin-API integration test is fixed at its cause** (`a_push_is_live_only_by_default` failed once in CI). The tests picked ports with "bind 0 and drop", and the kernel hands a just-released port to the next caller: two parallel tests could give two daemons the same port, the second daemon logged `Address already in use` and ran without its admin API, and the test talked to the *other* test's daemon (answers like `301`, `0`, `400`). Reproduced on Linux with `--all-features` under load (3 failures in 120 runs); a shared `free_port` now never returns a port twice per process, the daemon-booting helper waits for "listening" and retries with fresh ports when the daemon reports a taken port, and a failed push prints the server's own error. 0 failures in 180 runs afterwards. The drain tests use the same helper.
+
 - **The cron watchdog no longer raises a false alarm for a newly added cron workflow.** `scripts/check-cron-freshness.sh` reported "never succeeded on schedule" for a weekly workflow added on a Wednesday, so every new cron opened (or kept open) the "Scheduled workflows are not running green" issue until its first Monday (#464: `concurrency` and `coverage`, added on 2026-09-30, first scheduled run 2026-10-05; both pass on PR/push). A workflow with no scheduled success is now reported `NEW` for one staleness window after GitHub first saw it, then `STALE` as before (fail-closed if its age cannot be determined). The script has a `--selftest`, run by `cargo test`.
 
 ## [0.9.5] - 2026-10-01
