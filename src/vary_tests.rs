@@ -43,6 +43,8 @@ struct Origin {
     /// When set, the body is this many `x` bytes; the bool = send it chunked (no
     /// Content-Length) instead of with a declared length.
     big: Mutex<Option<(usize, bool)>>,
+    /// Delay before answering, in ms.
+    delay_ms: std::sync::atomic::AtomicU64,
     /// The status the origin answers with (200 unless a test says otherwise).
     status: std::sync::atomic::AtomicU16,
     /// An extra response header (name, value), e.g. `Content-Location`.
@@ -64,6 +66,10 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                     let o = o.clone();
                     async move {
                         o.hits.fetch_add(1, Ordering::Relaxed);
+                        let d = o.delay_ms.load(Ordering::Relaxed);
+                        if d > 0 {
+                            tokio::time::sleep(Duration::from_millis(d)).await;
+                        }
                         *o.last_headers.lock().unwrap() = req
                             .headers()
                             .iter()
@@ -212,6 +218,7 @@ async fn rig_with(vary: &str, cc: &str, profile_extra: &str) -> (Arc<Origin>, Ar
         last_target: Mutex::new(None),
         last_headers: Mutex::new(Vec::new()),
         big: Mutex::new(None),
+        delay_ms: std::sync::atomic::AtomicU64::new(0),
         status: std::sync::atomic::AtomicU16::new(200),
         extra: Mutex::new(None),
     });
@@ -1742,4 +1749,326 @@ async fn x_forwarded_host_cannot_be_smuggled_through_a_request_without_a_host_he
     // neither: the claim is dropped rather than forwarded
     fetch(&st, "/xh2", &[("x-forwarded-host", "evil.example")]).await;
     assert_eq!(seen(&o, "x-forwarded-host"), None);
+}
+
+// ── pools: load-aware selection and passive ejection ────────────────────────
+
+/// A pool of `n` in-process origins behind one `[upstream.p]` table, routed at `/pool/*`.
+async fn pool_rig(n: usize, extra: &str) -> (Vec<Arc<Origin>>, Arc<AppState>) {
+    let mut origins = Vec::new();
+    for _ in 0..n {
+        let (o, _) = rig("").await;
+        origins.push(o);
+    }
+    let st = AppState::for_tests(&cfg_pool(&origins, extra));
+    (origins, st)
+}
+
+fn cfg_pool(origins: &[Arc<Origin>], extra: &str) -> ZionConfig {
+    let urls = origins
+        .iter()
+        .map(|o| format!("\"http://127.0.0.1:{}\"", o.port.load(Ordering::Relaxed)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+
+[tls]
+cert_path = "/c"
+key_path = "/k"
+
+[upstream.p]
+urls = [{urls}]
+{extra}
+
+[[route]]
+path = "/pool/{{*rest}}"
+upstream = "p"
+"#
+    );
+    toml::from_str::<ZionConfig>(&toml).expect("config parses")
+}
+
+const OUTLIER: &str =
+    "outlier_detection = { error_rate_pct = 50, min_requests = 6, window_secs = 10, eject_secs = 30 }";
+
+/// `n` requests, `width` at a time (so some are in flight together, as under real load).
+async fn burst(st: &Arc<AppState>, tag: &str, n: usize, width: usize) -> Vec<u16> {
+    let mut codes = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let batch = (n - i).min(width);
+        let uris: Vec<String> = (0..batch)
+            .map(|k| format!("/pool/{tag}{}", i + k))
+            .collect();
+        let results = join_all(uris.iter().map(|u| call(st, u))).await;
+        codes.extend(results.into_iter().map(|(s, _, _)| s));
+        i += batch;
+    }
+    codes
+}
+
+/// Poll all the futures together so their waits overlap (the test runtime is single-threaded).
+async fn join_all<F: std::future::Future>(futs: impl Iterator<Item = F>) -> Vec<F::Output> {
+    let mut pinned: Vec<std::pin::Pin<Box<F>>> = futs.map(Box::pin).collect();
+    let mut results: Vec<Option<F::Output>> = (0..pinned.len()).map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (f, slot) in pinned.iter_mut().zip(results.iter_mut()) {
+            if slot.is_none() {
+                match f.as_mut().poll(cx) {
+                    std::task::Poll::Ready(v) => *slot = Some(v),
+                    std::task::Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+    results.into_iter().flatten().collect()
+}
+
+#[tokio::test]
+async fn a_slow_member_gets_a_smaller_share_and_nobody_is_starved() {
+    let (os, st) = pool_rig(3, "").await;
+    os[2].delay_ms.store(150, Ordering::Relaxed); // one slow member
+                                                  // warm the latency picture, then measure
+    burst(&st, "w", 30, 6).await;
+    let base: Vec<usize> = os.iter().map(|o| hits(o)).collect();
+    burst(&st, "m", 120, 6).await;
+    let got: Vec<usize> = os.iter().zip(&base).map(|(o, b)| hits(o) - b).collect();
+    let total: usize = got.iter().sum();
+    assert_eq!(total, 120);
+    assert!(
+        got[2] * 100 < total * 20,
+        "the slow member should carry well under its fair third: {got:?}"
+    );
+    assert!(
+        got[0] * 100 > total * 25 && got[1] * 100 > total * 25,
+        "both fast members carry real load: {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_previous_rule_is_still_available_and_herds_as_before() {
+    let (os, st) = pool_rig(3, "load_balancing = \"lowest_latency\"").await;
+    burst(&st, "l", 60, 6).await;
+    let got: Vec<usize> = os.iter().map(|o| hits(o)).collect();
+    assert_eq!(
+        got.iter().filter(|&&h| h > 0).count(),
+        1,
+        "with equal probe latency one member takes all: {got:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_member_that_keeps_failing_is_ejected_and_stops_receiving_traffic() {
+    let (os, st) = pool_rig(3, OUTLIER).await;
+    os[1].status.store(503, Ordering::Relaxed);
+    // until it is ejected, its own 503s reach clients
+    burst(&st, "e", 90, 6).await;
+    let frozen = hits(&os[1]);
+    assert!(frozen > 0, "it did receive traffic before being ejected");
+    assert!(
+        frozen < 40,
+        "and was cut off long before the end: {frozen} of 90"
+    );
+    let codes = burst(&st, "after", 60, 6).await;
+    assert_eq!(hits(&os[1]), frozen, "an ejected member receives nothing");
+    assert!(
+        codes.iter().all(|&c| c == 200),
+        "clients now only see the healthy members: {codes:?}"
+    );
+    let ejections = st
+        .cfg()
+        .health_map
+        .values()
+        .map(|h| h.pool.ejections())
+        .sum::<u64>();
+    assert_eq!(ejections, 1);
+}
+
+#[tokio::test]
+async fn a_pool_that_fails_everywhere_is_not_ejected_away() {
+    let (os, st) = pool_rig(3, OUTLIER).await;
+    for o in &os {
+        o.status.store(503, Ordering::Relaxed);
+    }
+    burst(&st, "o", 90, 6).await;
+    let before: Vec<usize> = os.iter().map(|o| hits(o)).collect();
+    burst(&st, "o2", 30, 6).await;
+    let after: Vec<usize> = os.iter().map(|o| hits(o)).collect();
+    assert!(
+        after.iter().zip(&before).all(|(a, b)| a > b),
+        "every member is still tried: {before:?} -> {after:?}"
+    );
+    assert_eq!(
+        st.cfg()
+            .health_map
+            .values()
+            .map(|h| h.pool.ejections())
+            .sum::<u64>(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn an_ejected_member_returns_after_its_cool_down() {
+    let (os, st) = pool_rig(2, "outlier_detection = { error_rate_pct = 50, min_requests = 4, window_secs = 10, eject_secs = 1 }").await;
+    os[0].status.store(503, Ordering::Relaxed);
+    burst(&st, "r", 40, 4).await;
+    let frozen = hits(&os[0]);
+    burst(&st, "r2", 20, 4).await;
+    assert_eq!(hits(&os[0]), frozen, "ejected: nothing sent");
+    os[0].status.store(200, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(1300)).await; // eject_secs = 1
+    burst(&st, "r3", 40, 4).await;
+    assert!(
+        hits(&os[0]) > frozen,
+        "back in rotation after the cool-down"
+    );
+}
+
+#[tokio::test]
+async fn a_reload_adds_and_removes_outlier_detection_through_the_real_rebuild() {
+    let (os, st) = pool_rig(2, "").await;
+    let urls: Vec<String> = os
+        .iter()
+        .map(|o| format!("http://127.0.0.1:{}", o.port.load(Ordering::Relaxed)))
+        .collect();
+    let cfg_of = |st: &Arc<AppState>| st.cfg().health_map[&urls[0]].pool.outlier_cfg();
+    assert_eq!(cfg_of(&st), None);
+    let reload = |st: &Arc<AppState>, extra: &str| {
+        let prev = st.cfg();
+        let next = crate::reload::rebuild(&cfg_pool(&os, extra), &prev, 1024).unwrap();
+        assert!(
+            Arc::ptr_eq(&prev.health_map[&urls[0]], &next.health_map[&urls[0]]),
+            "entry reused"
+        );
+        st.config.store(Arc::new(next));
+    };
+    reload(&st, OUTLIER);
+    assert_eq!(
+        cfg_of(&st).map(|c| (c.min_requests, c.eject_secs)),
+        Some((6, 30))
+    );
+    reload(&st, "outlier_detection = { eject_secs = 5 }");
+    assert_eq!(
+        cfg_of(&st).map(|c| (c.min_requests, c.eject_secs)),
+        Some((20, 5))
+    );
+    reload(&st, "");
+    assert_eq!(cfg_of(&st), None, "removed on reload");
+}
+
+#[tokio::test]
+async fn the_first_route_decides_outlier_detection_even_when_it_opts_out() {
+    let (os, _) = pool_rig(2, "").await;
+    let urls = os
+        .iter()
+        .map(|o| format!("\"http://127.0.0.1:{}\"", o.port.load(Ordering::Relaxed)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let build = |first: &str, second: &str| {
+        let toml = format!(
+            r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstream.plain]
+urls = [{urls}]
+{first}
+[upstream.guarded]
+urls = [{urls}]
+{second}
+[[route]]
+path = "/a/{{*rest}}"
+upstream = "plain"
+[[route]]
+path = "/b/{{*rest}}"
+upstream = "guarded"
+"#
+        );
+        AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).unwrap())
+    };
+    let st = build("", OUTLIER);
+    assert!(
+        st.cfg()
+            .health_map
+            .values()
+            .all(|h| h.pool.outlier_cfg().is_none()),
+        "traffic through the opted-out pool must never be ejected"
+    );
+    let st = build(OUTLIER, "");
+    assert!(st
+        .cfg()
+        .health_map
+        .values()
+        .all(|h| h.pool.outlier_cfg().is_some()));
+}
+
+#[tokio::test]
+async fn sse_routes_over_a_pool_avoid_an_ejected_member() {
+    let (os, st) = pool_rig(2, OUTLIER).await;
+    // an `sse_stream` view of the same pool
+    let urls = os
+        .iter()
+        .map(|o| format!("\"http://127.0.0.1:{}\"", o.port.load(Ordering::Relaxed)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstream.p]
+urls = [{urls}]
+{OUTLIER}
+[[route]]
+path = "/sse/{{*rest}}"
+upstream = "p"
+mode = "sse_stream"
+"#
+    );
+    drop(st);
+    let st = AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).unwrap());
+    let cfg = st.cfg();
+    let pool_urls: Vec<String> = os
+        .iter()
+        .map(|o| format!("http://127.0.0.1:{}", o.port.load(Ordering::Relaxed)))
+        .collect();
+    // one timestamp for everything: the healthy member's successes must be inside the window
+    let now = crate::breaker::now_ms();
+    for _ in 0..30 {
+        crate::pool::report(
+            &cfg.health_map,
+            &pool_urls,
+            &pool_urls[1],
+            true,
+            Some(1),
+            now,
+        );
+    }
+    for _ in 0..10 {
+        crate::pool::report(&cfg.health_map, &pool_urls, &pool_urls[0], false, None, now);
+    }
+    assert!(cfg.health_map[&pool_urls[0]].pool.is_ejected(now));
+    for i in 0..20 {
+        call(&st, &format!("/sse/{i}")).await;
+    }
+    assert_eq!(hits(&os[0]), 0, "the ejected member gets no SSE traffic");
+    assert!(hits(&os[1]) > 0);
 }

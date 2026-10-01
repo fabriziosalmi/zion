@@ -364,6 +364,7 @@ pub async fn proxy_pass_ha(
     default_scheme: &hyper::http::uri::Scheme,
     default_authority: &hyper::http::uri::Authority,
     health_map: &crate::health::HealthMap,
+    algorithm: crate::pool::Algorithm,
     remote_addr: Option<SocketAddr>,
     proto: &str,
     xff_mode: XffMode,
@@ -431,7 +432,13 @@ pub async fn proxy_pass_ha(
     // At most one attempt per pool member; marking a failed upstream down
     // makes the next `select_best_upstream` rotate to a survivor.
     for _ in 0..pool.len() {
-        let url = match crate::health::select_best_upstream(health_map, pool) {
+        let url = match crate::pool::pick(
+            health_map,
+            pool,
+            algorithm,
+            crate::breaker::now_ms(),
+            &mut |n| fastrand::usize(..n),
+        ) {
             Some(u) => u.clone(),
             None => break,
         };
@@ -463,7 +470,23 @@ pub async fn proxy_pass_ha(
             return Ok(bad_gateway());
         };
 
-        match send_request_try(client, prepared).await {
+        // Live load and latency of this member, for the next pick; the guard keeps the
+        // in-flight count honest on every exit path.
+        let member = health_map.get(&url);
+        let _in_flight = member.map(|h| h.pool.begin());
+        let started = std::time::Instant::now();
+        let outcome = send_request_try(client, prepared).await;
+        let took_us = started.elapsed().as_micros() as u64;
+        let ok = matches!(&outcome, Ok(r) if !crate::breaker::is_failure(r.status().as_u16()));
+        crate::pool::report(
+            health_map,
+            pool,
+            &url,
+            ok,
+            outcome.is_ok().then_some(took_us),
+            crate::breaker::now_ms(),
+        );
+        match outcome {
             Ok(resp) => return Ok(resp),
             Err(e) => {
                 let connect = e.is_connect();
@@ -1128,6 +1151,7 @@ mod tests {
             &scheme(),
             &authority(),
             &health_map,
+            crate::pool::Algorithm::default(),
             None,
             "https",
             XffMode::Append,

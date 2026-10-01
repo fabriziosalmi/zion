@@ -34,6 +34,7 @@ use crate::http_util::{
     empty_response, generate_request_id, inject_security_headers, text_response, HEX_DIGITS,
     REQUEST_COUNTER,
 };
+use crate::pool;
 use crate::proxy::ZionBody;
 use crate::state::AppState;
 use crate::state::ResolvedAppConfig;
@@ -405,17 +406,31 @@ async fn process_request_inner(
     // dyn_scheme/authority, which that arm never reads (WAF/auth/CSP/security
     // headers still apply on the way down).
     static EMPTY_UPSTREAM: String = String::new();
-    let target_upstream_url =
-        match health::select_best_upstream(&cfg.health_map, &rule.upstream_url) {
-            Some(url) => url,
-            None if rule.mode == config::RouteMode::Static => &EMPTY_UPSTREAM,
-            None => {
-                return Ok(text_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "upstream unavailable",
-                ));
-            }
-        };
+    // A pool picks by its configured algorithm in every proxy mode, so ejected and
+    // overloaded members are avoided by SSE, WebSocket and cached routes too (in-flight and
+    // outlier accounting happen on `Standard` routes only). A single endpoint keeps the plain
+    // lookup, whose "everything gray is 503" behaviour is unchanged.
+    let selected = if rule.upstream_url.len() > 1 {
+        pool::pick(
+            &cfg.health_map,
+            &rule.upstream_url,
+            rule.load_balancing,
+            breaker::now_ms(),
+            &mut |n| fastrand::usize(..n),
+        )
+    } else {
+        health::select_best_upstream(&cfg.health_map, &rule.upstream_url)
+    };
+    let target_upstream_url = match selected {
+        Some(url) => url,
+        None if rule.mode == config::RouteMode::Static => &EMPTY_UPSTREAM,
+        None => {
+            return Ok(text_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream unavailable",
+            ));
+        }
+    };
 
     // Resolve scheme + authority for the selected upstream. Fast path: a
     // single-upstream (or static, empty) route always resolves to
@@ -1042,6 +1057,7 @@ async fn process_request_inner(
                     &dyn_scheme,
                     &dyn_authority,
                     &cfg.health_map,
+                    rule.load_balancing,
                     Some(forward_addr),
                     "https",
                     cfg.xff_mode,

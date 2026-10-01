@@ -28,6 +28,8 @@ pub struct ResolvedRoute {
     /// TCP connect deadline for this route's upstream (ms; 0 = none). Selects the
     /// HTTP client whose connector enforces it — see `AppState::client_for`.
     pub connect_timeout_ms: u64,
+    /// How a pool of several endpoints picks a member.
+    pub load_balancing: crate::pool::Algorithm,
     /// Pre-parsed URI parts — avoids full URI parse on every request.
     pub upstream_scheme: hyper::http::uri::Scheme,
     pub upstream_authority: hyper::http::uri::Authority,
@@ -486,6 +488,11 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
             .and_then(|name| config.upstream.get(name))
             .map(|u| u.connect_timeout_ms)
             .unwrap_or(crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS),
+        load_balancing: route
+            .upstream_name()
+            .and_then(|name| config.upstream.get(name))
+            .map(|u| u.load_balancing.into())
+            .unwrap_or_default(),
         upstream_scheme,
         upstream_authority,
         mode: route.mode(),

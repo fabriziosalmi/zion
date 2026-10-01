@@ -149,6 +149,7 @@ impl ResolvedAppConfig {
         // Health map: one entry per upstream URL referenced by any route.
         // The same URL can appear in many routes — dedup via FnvHashMap.
         let mut map = fnv::FnvHashMap::default();
+        let mut outlier_claimed: std::collections::HashSet<String> = Default::default();
         for route in &config.route {
             // A static route has no upstream to probe.
             let Some(name) = route.upstream_name() else {
@@ -169,6 +170,14 @@ impl ResolvedAppConfig {
                 .and_then(|u| u.circuit_breaker.as_ref())
                 .filter(|_| urls.len() == 1)
                 .map(|cb| cb.to_runtime());
+            // Pool members (two or more endpoints) get passive health and load stats.
+            let outlier_cfg = config
+                .upstream
+                .get(name)
+                .and_then(|u| u.outlier_detection.as_ref())
+                .filter(|_| urls.len() > 1)
+                .map(|o| o.to_runtime());
+            let is_pool = urls.len() > 1;
             for url in urls {
                 let entry = map
                     .entry(url.clone())
@@ -176,6 +185,15 @@ impl ResolvedAppConfig {
                 // First route in config order wins; validation refuses conflicting tables.
                 if breaker_cfg.is_some() && !entry.breaker.is_configured() {
                     entry.breaker.configure(breaker_cfg.clone());
+                }
+                if is_pool {
+                    entry.pool.set_pool_member(true);
+                    // The first pool route to name a URL decides its outlier detection, even
+                    // when that is "off": a later route cannot switch it on for traffic that
+                    // opted out.
+                    if outlier_claimed.insert(url.clone()) {
+                        entry.pool.configure_outlier(outlier_cfg.clone());
+                    }
                 }
             }
         }

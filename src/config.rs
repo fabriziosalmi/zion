@@ -645,6 +645,91 @@ struct RawUpstream {
     client_key_path: Option<String>,
     #[serde(default)]
     circuit_breaker: Option<CircuitBreakerConfig>,
+    #[serde(default)]
+    load_balancing: LoadBalancing,
+    #[serde(default)]
+    outlier_detection: Option<OutlierDetectionConfig>,
+}
+
+/// How a pool of several endpoints assigns a request to a member.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalancing {
+    /// Power of two choices on in-flight requests × peak-EWMA latency measured on real traffic.
+    #[default]
+    P2c,
+    /// The member with the lowest active-probe latency (the behaviour before 0.9.4).
+    LowestLatency,
+}
+
+impl From<LoadBalancing> for crate::pool::Algorithm {
+    fn from(l: LoadBalancing) -> Self {
+        match l {
+            LoadBalancing::P2c => crate::pool::Algorithm::P2c,
+            LoadBalancing::LowestLatency => crate::pool::Algorithm::LowestLatency,
+        }
+    }
+}
+
+/// `[upstream.<name>] outlier_detection = { ... }`: eject a pool member whose own failure rate
+/// is high while the rest of the pool is fine. See `pool.rs`. Pools of two or more endpoints only.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OutlierDetectionConfig {
+    /// Eject a member when at least this percentage (1..=100) of its requests in the window
+    /// failed (a 502, 503 or 504, or a transport error). Default 50.
+    #[serde(default = "default_cb_error_rate")]
+    pub error_rate_pct: u32,
+    /// ...and it saw at least this many requests in it (>= 1). Default 20.
+    #[serde(default = "default_cb_min_requests")]
+    pub min_requests: u32,
+    /// Sliding window in seconds (1..=60). Default 10.
+    #[serde(default = "default_cb_window")]
+    pub window_secs: u32,
+    /// Base ejection time in seconds (1..=3600); consecutive ejections of the same member last
+    /// longer (up to 10x). Default 30.
+    #[serde(default = "default_cb_open")]
+    pub eject_secs: u32,
+    /// At most this percentage of the pool (1..=100) is ejected at once. Default 50.
+    #[serde(default = "default_max_ejected")]
+    pub max_ejected_pct: u32,
+}
+
+fn default_max_ejected() -> u32 {
+    50
+}
+
+impl OutlierDetectionConfig {
+    pub fn to_runtime(&self) -> crate::pool::OutlierCfg {
+        crate::pool::OutlierCfg {
+            error_rate_pct: self.error_rate_pct,
+            min_requests: self.min_requests,
+            window_secs: self.window_secs,
+            eject_secs: self.eject_secs,
+            max_ejected_pct: self.max_ejected_pct,
+        }
+    }
+
+    fn errors(&self, name: &str) -> Vec<String> {
+        let mut e = Vec::new();
+        let p = format!("upstream.{name}.outlier_detection");
+        if !(1..=100).contains(&self.error_rate_pct) {
+            e.push(format!("{p}.error_rate_pct must be 1..=100"));
+        }
+        if self.min_requests == 0 {
+            e.push(format!("{p}.min_requests must be >= 1"));
+        }
+        if !(1..=60).contains(&self.window_secs) {
+            e.push(format!("{p}.window_secs must be 1..=60"));
+        }
+        if !(1..=3600).contains(&self.eject_secs) {
+            e.push(format!("{p}.eject_secs must be 1..=3600"));
+        }
+        if !(1..=100).contains(&self.max_ejected_pct) {
+            e.push(format!("{p}.max_ejected_pct must be 1..=100"));
+        }
+        e
+    }
 }
 
 /// `[upstream.<name>] circuit_breaker = { ... }`: stop sending requests to an upstream that
@@ -751,6 +836,12 @@ pub struct UpstreamConfig {
     /// Opt-in circuit breaker (see [`CircuitBreakerConfig`]).
     #[serde(default)]
     pub circuit_breaker: Option<CircuitBreakerConfig>,
+    /// How a pool of several endpoints picks a member (default `p2c`).
+    #[serde(default)]
+    pub load_balancing: LoadBalancing,
+    /// Opt-in passive health for a pool: eject a member that is failing in-band.
+    #[serde(default)]
+    pub outlier_detection: Option<OutlierDetectionConfig>,
 }
 
 impl TryFrom<RawUpstream> for UpstreamConfig {
@@ -776,6 +867,8 @@ impl TryFrom<RawUpstream> for UpstreamConfig {
             client_cert_path: raw.client_cert_path,
             client_key_path: raw.client_key_path,
             circuit_breaker: raw.circuit_breaker,
+            load_balancing: raw.load_balancing,
+            outlier_detection: raw.outlier_detection,
         })
     }
 }
@@ -1391,6 +1484,16 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
         if let Some(cb) = &up.circuit_breaker {
             errors.extend(cb.errors(name));
         }
+        if let Some(od) = &up.outlier_detection {
+            errors.extend(od.errors(name));
+            if up.urls_ref().len() < 2 {
+                errors.push(format!(
+                    "upstream.{name}.outlier_detection needs a pool of at least two endpoints \
+                     (`urls = [...]`); a single endpoint has no peer to be an outlier against \
+                     (use `circuit_breaker` for that)"
+                ));
+            }
+        }
     }
     // One URL, one breaker: the health entry (and its breaker) is shared by every upstream
     // that names the URL, so two single-endpoint definitions of it must agree on whether it
@@ -1879,6 +1982,78 @@ pub(crate) fn compile_path_set(patterns: &[String]) -> Result<matchit::Router<()
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pool_balancing_and_outlier_config() {
+        let cfg = |up: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+                 [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstream.p]\n{up}\n\
+                 [[route]]\npath=\"/{{*r}}\"\nupstream=\"p\"\n"
+            )
+        };
+        let pool = "urls=[\"http://a:1\",\"http://b:2\"]";
+        let d: ZionConfig = toml::from_str(&cfg(pool)).unwrap();
+        assert_eq!(
+            d.upstream["p"].load_balancing,
+            LoadBalancing::P2c,
+            "p2c is the default"
+        );
+        assert!(
+            d.upstream["p"].outlier_detection.is_none(),
+            "outlier detection is opt-in"
+        );
+        let ll: ZionConfig = toml::from_str(&cfg(&format!(
+            "{pool}\nload_balancing = \"lowest_latency\""
+        )))
+        .unwrap();
+        assert_eq!(
+            ll.upstream["p"].load_balancing,
+            LoadBalancing::LowestLatency
+        );
+        assert!(toml::from_str::<ZionConfig>(&cfg(&format!(
+            "{pool}\nload_balancing = \"round_robin\""
+        )))
+        .is_err());
+        let od: ZionConfig =
+            toml::from_str(&cfg(&format!("{pool}\noutlier_detection = {{}}"))).unwrap();
+        let o = od.upstream["p"].outlier_detection.clone().unwrap();
+        assert_eq!(
+            (
+                o.error_rate_pct,
+                o.min_requests,
+                o.window_secs,
+                o.eject_secs,
+                o.max_ejected_pct
+            ),
+            (50, 20, 10, 30, 50)
+        );
+        for (bad, why) in [
+            ("error_rate_pct = 0", "error_rate_pct must be 1..=100"),
+            ("min_requests = 0", "min_requests must be >= 1"),
+            ("window_secs = 61", "window_secs must be 1..=60"),
+            ("eject_secs = 0", "eject_secs must be 1..=3600"),
+            ("max_ejected_pct = 0", "max_ejected_pct must be 1..=100"),
+            ("max_ejected_pct = 101", "max_ejected_pct must be 1..=100"),
+        ] {
+            let e = validate_str(
+                &cfg(&format!("{pool}\noutlier_detection = {{ {bad} }}")),
+                "t",
+            )
+            .err()
+            .unwrap_or_default();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        // a single endpoint has no peer to be an outlier against
+        let e = validate_str(&cfg("url=\"http://a:1\"\noutlier_detection = {}"), "t")
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("needs a pool of at least two endpoints"), "{e}");
+        assert!(toml::from_str::<ZionConfig>(&cfg(&format!(
+            "{pool}\noutlier_detection = {{ error_rate = 5 }}"
+        )))
+        .is_err());
+    }
+
     #[test]
     fn circuit_breaker_config_defaults_and_ranges() {
         let cfg = |cb: &str| {

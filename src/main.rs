@@ -64,6 +64,7 @@ mod metrics;
 mod net;
 mod numa;
 mod observability;
+mod pool;
 mod proxy;
 #[cfg(feature = "http3")]
 mod quic;
