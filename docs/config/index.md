@@ -78,6 +78,37 @@ refused.
 
 Legacy format `[upstreams]` (flat key-value map of name to URL) is also supported.
 
+### Pools: load balancing and outlier detection
+
+An upstream with several endpoints (`urls = [...]`) assigns each request to a member with
+`load_balancing` (default `"p2c"`, or `"lowest_latency"`, the behaviour before 0.9.4):
+
+- **`p2c`** (power of two choices): two members are drawn at random and the request goes to the
+  one with the lower `(in-flight requests + 1) × peak-EWMA latency`. The latency is measured on
+  **real requests** (time to response headers) and rises at once on a slow response but is
+  forgotten slowly. Load spreads in proportion to speed, a busy member is never piled on, and a
+  member that just got slower stops receiving most traffic within a few responses instead of
+  after the next 30 s probe. Members that are down, in gray failure (probe latency over 2 s) or
+  ejected are skipped unless that would leave none (the pool still answers rather than 503).
+- **`lowest_latency`**: every request to the member with the lowest *probe* latency (refreshed
+  every 30 s), as before. It sends everything to one member until the next probe.
+
+```toml
+[upstream.api]
+urls = ["http://10.0.0.5:8000", "http://10.0.0.6:8000", "http://10.0.0.7:8000"]
+outlier_detection = { error_rate_pct = 50, min_requests = 20, window_secs = 10, eject_secs = 30, max_ejected_pct = 50 }
+```
+
+**`outlier_detection`** (opt-in, pools only) ejects a member whose own failure rate over a sliding
+window is at or above `error_rate_pct` (with at least `min_requests` in it) **and** that is an
+outlier: some other member must be clearly healthier. It never acts on a pool-wide outage (a
+failing database behind all members is not one member's fault), and at most `max_ejected_pct` of
+the pool is out at once. An ejected member is out for `eject_secs`, multiplied by its consecutive
+ejections (up to 10x), then rejoins. A failure is a `502`, `503` or `504` or a transport error.
+Metrics: `zion_upstream_inflight`, `zion_upstream_peak_ewma_seconds`, `zion_upstream_ejected`,
+`zion_upstream_ejections_total` (per member). A URL that belongs to several pools uses the first
+route's `outlier_detection`.
+
 ### Circuit breaker (`circuit_breaker`, opt-in)
 
 ```toml

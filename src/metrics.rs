@@ -799,6 +799,54 @@ impl Metrics {
             }
         }
 
+        // Pool members: live load, measured latency, passive ejection.
+        let mut members: Vec<(&String, &crate::pool::MemberStats)> = health
+            .iter()
+            .filter(|(_, h)| h.pool.is_pool_member())
+            .map(|(u, h)| (u, &h.pool))
+            .collect();
+        members.sort_by(|a, b| a.0.cmp(b.0));
+        if !members.is_empty() {
+            let now = crate::breaker::now_ms();
+            type Read = Box<dyn Fn(&crate::pool::MemberStats) -> String>;
+            let series: [(&str, &str, &str, Read); 4] = [
+                (
+                    "zion_upstream_inflight",
+                    "Requests currently waiting for a response from this pool member.",
+                    "gauge",
+                    Box::new(|s| s.inflight().to_string()),
+                ),
+                (
+                    "zion_upstream_peak_ewma_seconds",
+                    "Peak-EWMA of this pool member's time to response headers, measured on real requests (0 = no sample yet).",
+                    "gauge",
+                    Box::new(|s| format!("{:.6}", s.ewma_us() as f64 / 1_000_000.0)),
+                ),
+                (
+                    "zion_upstream_ejected",
+                    "1 while this pool member is ejected by outlier detection.",
+                    "gauge",
+                    Box::new(move |s| u64::from(s.is_ejected(now)).to_string()),
+                ),
+                (
+                    "zion_upstream_ejections_total",
+                    "Times this pool member was ejected by outlier detection.",
+                    "counter",
+                    Box::new(|s| s.ejections().to_string()),
+                ),
+            ];
+            for (name, help, kind, read) in series {
+                extra.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+                for (url, s) in &members {
+                    extra.push_str(&format!(
+                        "{name}{{upstream=\"{}\"}} {}\n",
+                        escape_label(&redact_userinfo(url)),
+                        read(s)
+                    ));
+                }
+            }
+        }
+
         let text: &[u8] = base.as_ref();
         let (head, tail): (&[u8], &[u8]) = match text.strip_suffix(b"# EOF\n") {
             Some(h) if openmetrics => (h, b"# EOF\n"),
@@ -1609,6 +1657,39 @@ fn redact_userinfo(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pool_member_series_appear_only_for_pool_members() {
+        let member = std::sync::Arc::new(crate::health::UpstreamHealth::new_healthy());
+        member.pool.set_pool_member(true);
+        member.pool.observe_latency(25_000);
+        let _in_flight = member.pool.begin();
+        let single = std::sync::Arc::new(crate::health::UpstreamHealth::new_healthy());
+        let mut map = fnv::FnvHashMap::default();
+        map.insert("http://pooled:1".to_string(), member.clone());
+        map.insert("http://single:2".to_string(), single);
+        let health: crate::health::HealthMap = std::sync::Arc::new(map);
+        let out = String::from_utf8(
+            Metrics::new()
+                .render_with_upstreams(false, &health)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            out.contains("zion_upstream_inflight{upstream=\"http://pooled:1\"} 1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("zion_upstream_peak_ewma_seconds{upstream=\"http://pooled:1\"} 0.025000"),
+            "{out}"
+        );
+        assert!(out.contains("zion_upstream_ejected{upstream=\"http://pooled:1\"} 0"));
+        assert!(out.contains("zion_upstream_ejections_total{upstream=\"http://pooled:1\"} 0"));
+        assert!(
+            !out.contains("inflight{upstream=\"http://single:2\"}"),
+            "a single endpoint is not a pool member"
+        );
+    }
+
     #[test]
     fn circuit_breaker_series_appear_only_for_upstreams_that_have_one() {
         use crate::breaker::BreakerCfg;

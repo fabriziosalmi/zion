@@ -4,6 +4,14 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Pools choose a member by what real traffic shows (power of two choices).** The latency used to pick among several endpoints came from the active prober, refreshed every 30 s, and the rule was "lowest probe latency": everything went to whichever member was fastest half a minute ago, then flipped all at once. The default is now `load_balancing = "p2c"`: two members are drawn at random and the request goes to the one with the lower `(in-flight + 1) × peak-EWMA latency`, measured on real requests (a spike counts at once, recovery is averaged in). `load_balancing = "lowest_latency"` keeps the old behaviour. Single-endpoint upstreams are unaffected.
+
+### Added
+
+- **Outlier detection for pools** (opt-in: `[upstream.<name>] outlier_detection = { error_rate_pct, min_requests, window_secs, eject_secs, max_ejected_pct }`). A member whose own failure rate (502/503/504 or a transport error) is high while another member is clearly healthier is ejected for `eject_secs` (longer for repeat offenders, up to 10x). Never applied to a pool-wide outage, capped at `max_ejected_pct` of the pool, and an ejection alone never turns into a 503. New metrics `zion_upstream_inflight`, `zion_upstream_peak_ewma_seconds`, `zion_upstream_ejected`, `zion_upstream_ejections_total`.
+
 ### Security
 
 - **Routing and host override headers from clients are no longer passed upstream.** `X-Original-URL` and `X-Rewrite-URL` (which IIS, Symfony and others honour over the real request line), `Forwarded`, `X-Forwarded-Server`, `X-Forwarded-Scheme`, `X-Forwarded-Prefix`, `X-Host`, `X-HTTP-Host-Override` and `X-Original-Host` reached the upstream untouched, so a client could steer a framework behind zion's routing, `internal_only`, WAF and auth, or poison a cache. On `:443` they are dropped by a gate before routing; the plaintext `:80` ACME fallback, which picks its route first and forwards on its own, drops them just before forwarding. Either way a peer in `trusted_proxies` keeps its values. `X-Forwarded-Host` is now always replaced with the request's own host (the `Host` header, or the URI authority for HTTP/2) and dropped when there is none. If a legitimate client of yours sets one of these, route it through a trusted proxy or add it there.

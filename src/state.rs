@@ -169,6 +169,14 @@ impl ResolvedAppConfig {
                 .and_then(|u| u.circuit_breaker.as_ref())
                 .filter(|_| urls.len() == 1)
                 .map(|cb| cb.to_runtime());
+            // Pool members (two or more endpoints) get passive health and load stats.
+            let outlier_cfg = config
+                .upstream
+                .get(name)
+                .and_then(|u| u.outlier_detection.as_ref())
+                .filter(|_| urls.len() > 1)
+                .map(|o| o.to_runtime());
+            let is_pool = urls.len() > 1;
             for url in urls {
                 let entry = map
                     .entry(url.clone())
@@ -176,6 +184,12 @@ impl ResolvedAppConfig {
                 // First route in config order wins; validation refuses conflicting tables.
                 if breaker_cfg.is_some() && !entry.breaker.is_configured() {
                     entry.breaker.configure(breaker_cfg.clone());
+                }
+                if is_pool {
+                    entry.pool.set_pool_member(true);
+                    if outlier_cfg.is_some() && entry.pool.outlier_cfg().is_none() {
+                        entry.pool.configure_outlier(outlier_cfg.clone());
+                    }
                 }
             }
         }

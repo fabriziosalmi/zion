@@ -48,6 +48,8 @@ pub struct UpstreamHealth {
     /// Opt-in in-band circuit breaker (see `breaker.rs`). Part of the health entry so it
     /// survives a reload with it; its thresholds are re-applied on every reload.
     pub breaker: crate::breaker::Breaker,
+    /// Live load-balancing and passive-health state (see `pool.rs`).
+    pub pool: crate::pool::MemberStats,
 }
 
 impl UpstreamHealth {
@@ -80,6 +82,7 @@ impl UpstreamHealth {
             backoff_us: std::sync::atomic::AtomicU64::new(PROBE_BASE_US),
             next_probe_at_us: std::sync::atomic::AtomicU64::new(0),
             breaker: crate::breaker::Breaker::new(),
+            pool: crate::pool::MemberStats::new(),
         }
     }
 

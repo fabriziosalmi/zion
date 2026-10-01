@@ -105,6 +105,8 @@ pub(crate) fn rebuild(
         // The entry (and its history) is reused, but its breaker thresholds come from the
         // NEW config: a reload may add, change or remove them.
         entry.breaker.configure(fresh.breaker.cfg());
+        entry.pool.set_pool_member(fresh.pool.is_pool_member());
+        entry.pool.configure_outlier(fresh.pool.outlier_cfg());
         merged.insert(url.clone(), entry);
     }
     snap.health_map = Arc::new(merged);
@@ -447,6 +449,7 @@ mod tests {
             backoff_us: std::sync::atomic::AtomicU64::new(700_000),
             next_probe_at_us: std::sync::atomic::AtomicU64::new(0),
             breaker: crate::breaker::Breaker::new(),
+            pool: crate::pool::MemberStats::new(),
         });
         let mut old_map = fnv::FnvHashMap::default();
         old_map.insert(url.clone(), old_health.clone());
@@ -505,6 +508,7 @@ mod tests {
                 backoff_us: std::sync::atomic::AtomicU64::new(123_456),
                 next_probe_at_us: std::sync::atomic::AtomicU64::new(0),
                 breaker: crate::breaker::Breaker::new(),
+                pool: crate::pool::MemberStats::new(),
             }),
         );
         let previous = ResolvedAppConfig::test_with_health(Arc::new(old_map));

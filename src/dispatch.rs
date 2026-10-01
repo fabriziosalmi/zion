@@ -1042,6 +1042,7 @@ async fn process_request_inner(
                     &dyn_scheme,
                     &dyn_authority,
                     &cfg.health_map,
+                    rule.load_balancing,
                     Some(forward_addr),
                     "https",
                     cfg.xff_mode,
