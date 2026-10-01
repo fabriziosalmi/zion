@@ -1112,6 +1112,9 @@ async fn process_request_inner(
         }
     }
 
+    // `Surrogate-Key` is an origin→cache instruction, not for clients.
+    resp.headers_mut().remove("surrogate-key");
+
     // Inject security headers on all responses
     inject_security_headers(&mut resp);
 
@@ -1334,6 +1337,8 @@ struct SwrRefresh {
     cache_ttl: u64,
     cache_max: usize,
     max_object: usize,
+    /// `tag_epoch` when the refresh was scheduled (see `StaticCache::insert_tagged`).
+    tag_epoch: u64,
     /// The upstream's circuit breaker, if it has one.
     breaker: Option<Arc<health::UpstreamHealth>>,
 }
@@ -1461,14 +1466,19 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
             meta.stale_while_revalidate_secs = origin_swr(resp.headers());
             meta.must_revalidate = forbids_stale(resp.headers());
         }
-        job.state.static_cache.refresh(
+        // Not revived if a tag purge ran since this refresh was scheduled (it may have removed
+        // the very entry being revalidated).
+        if !job.state.static_cache.refresh_checked(
             &job.key,
             job.stale.body.clone(),
             meta,
             ttl,
             initial_age,
             job.cache_max,
-        );
+            job.tag_epoch,
+        ) {
+            return false;
+        }
         metrics::METRICS
             .cache_revalidations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1513,15 +1523,26 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
         stale_while_revalidate_secs: origin_swr(&parts.headers),
         must_revalidate: forbids_stale(&parts.headers),
     };
-    job.state.static_cache.insert(
+    // The refreshed response may carry new tags; one that cannot be tracked is not stored.
+    let Ok(tags) = cache::surrogate_keys(&parts.headers) else {
+        return false;
+    };
+    let stored = job.state.static_cache.insert_tagged(
         &job.key,
         collected.to_bytes(),
         meta,
         ttl,
         initial_age,
         job.cache_max,
+        &tags,
+        job.tag_epoch,
     );
-    true
+    if stored == cache::TagStore::IndexFull {
+        metrics::METRICS
+            .cache_tag_uncached
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    stored == cache::TagStore::Stored
 }
 
 /// Serve from RAM cache or fetch from upstream, then cache.
@@ -1916,6 +1937,8 @@ async fn handle_static_cache(
     xff_mode: proxy::XffMode,
     breaker: Option<Arc<health::UpstreamHealth>>,
 ) -> Result<Response<ZionBody>, hyper::Error> {
+    // Read before anything is fetched: a tag purge after this point keeps the response out.
+    let tag_epoch = state.static_cache.tag_epoch();
     // Only GET is cacheable. HEAD/POST/PUT/PATCH/DELETE/OPTIONS must bypass the
     // cache and never populate it: the cache key is the path (no method), so a
     // non-GET 200 stored under it — a HEAD's empty body, or a POST response —
@@ -2110,6 +2133,7 @@ async fn handle_static_cache(
                         xff_mode,
                         cache_ttl,
                         cache_max,
+                        tag_epoch: state.static_cache.tag_epoch(),
                         max_object,
                         breaker: breaker.clone(),
                     };
@@ -2269,13 +2293,16 @@ async fn handle_static_cache(
                 refreshed_meta.stale_while_revalidate_secs = origin_swr(resp.headers());
                 refreshed_meta.must_revalidate = forbids_stale(resp.headers());
             }
-            state.static_cache.refresh(
+            // Skipped when a tag purge ran since this request began: it must not bring back an
+            // entry the purge may have just removed.
+            state.static_cache.refresh_checked(
                 &path_owned,
                 hit.body.clone(),
                 refreshed_meta,
                 effective_ttl,
                 initial_age,
                 cache_max,
+                tag_epoch,
             );
             state.inflight.remove(&path_owned);
             let _ = tx.send(true); // waiters observe the revived (fresh) entry
@@ -2376,6 +2403,21 @@ async fn handle_static_cache(
             return Ok(resp);
         };
 
+        // `Surrogate-Key` tags (purge by tag). Tags that cannot be tracked mean the entry could
+        // never be purged by them, so the response is streamed through without being stored.
+        let Ok(tags) = cache::surrogate_keys(&parts.headers) else {
+            state.inflight.remove(&path_owned);
+            metrics::METRICS
+                .cache_tag_uncached
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut resp = Response::from_parts(parts, body.map_err(hyper::Error::from).boxed());
+            resp.headers_mut().insert(
+                "X-Zion-Cache",
+                hyper::header::HeaderValue::from_static("BYPASS"),
+            );
+            return Ok(resp);
+        };
+
         // Preserve Content-Type and Content-Encoding for cache (S-05 fix).
         // Without Content-Encoding, gzip-compressed bodies are served garbled.
         let content_type = parts.headers.get(hyper::header::CONTENT_TYPE).cloned();
@@ -2454,15 +2496,30 @@ async fn handle_static_cache(
                 }
             }
 
-            if !cache_aborted {
-                state_clone.static_cache.insert(
+            // Not stored when a tag purge ran after the fetch began: the response may predate it.
+            let outcome = if cache_aborted {
+                None
+            } else {
+                Some(state_clone.static_cache.insert_tagged(
                     &store_key_clone,
                     cache_buffer.into(),
                     meta_clone,
                     effective_ttl,
                     initial_age,
                     cache_max,
-                );
+                    &tags,
+                    tag_epoch,
+                ))
+            };
+            if outcome == Some(cache::TagStore::IndexFull) {
+                // The response is already on its way to the client (as a MISS); only the
+                // metric can say it was not kept.
+                metrics::METRICS
+                    .cache_tag_uncached
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let stored = outcome == Some(cache::TagStore::Stored);
+            if stored {
                 // Cache populated: signal `true` so waiters' wait_for resolves
                 // immediately at the next poll, even if they hadn't subscribed
                 // before this point. Send before remove so the value is the

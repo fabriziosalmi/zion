@@ -199,6 +199,37 @@ $ curl -sX POST 'http://127.0.0.1/_zion/cache/purge?prefix=/static/app.js'
 {"purged":2,"scope":"/static/app.js"}
 ```
 
+### Purge by tag (`Surrogate-Key`)
+
+An origin can label what it renders with a `Surrogate-Key` response header: tags separated
+by spaces or commas (the header may repeat), e.g. `Surrogate-Key: post-42 section:news`.
+Zion indexes the entry under each tag, and one call drops everything that carries a tag,
+however many URLs and variants that is:
+
+```console
+$ curl -sX POST 'http://127.0.0.1/_zion/cache/purge?tag=post-42'
+{"purged":3,"scope":{"tags":["post-42"]}}
+```
+
+`tag=` repeats and takes commas (`?tag=a&tag=b,c`; percent-encode anything unusual). An empty
+`?tag=` is rejected with `400` (it never falls back to flushing everything). It is internal-IP
+gated and POST-only like the rest of the endpoint.
+
+- `Surrogate-Key` is for the cache: it is **not** sent to clients.
+- Limits: 32 tags per response, 128 bytes per tag, plain visible ASCII; the index holds
+  10,000 distinct tags and 200,000 (tag, key) pairs. A response whose tags cannot be tracked is
+  **not stored**, because an entry a purge could not reach would be worse than a miss: too many /
+  too long / invalid tags answer `X-Zion-Cache: BYPASS`; a full index is only found out while the
+  body is being stored, after the response has gone out as `MISS`, and is counted in
+  `zion_cache_tag_uncached` (so are the other cases). The previous entry under that URL is dropped
+  too.
+- A response whose fetch began before a tag purge is not stored once the purge has run (it may
+  predate it), so a purge cannot be undone by a slow in-flight fetch.
+- A new response for a URL **replaces** the tags the entry had (an old tag no longer purges
+  it, and a response with no tags leaves the index). A revalidation that ends in `304` keeps the
+  entry's tags, and is skipped if a tag purge ran while it was in flight, so it cannot bring back
+  an entry the purge removed.
+
 ## RFC conformance at a glance
 
 | Behaviour | RFC | Status |
