@@ -1722,3 +1722,24 @@ async fn the_port_80_acme_fallback_strips_them_too() {
         );
     }
 }
+
+/// HTTP/2 carries the host in the URI authority and sends no Host header, and a hostless request
+/// has neither: a client-supplied X-Forwarded-Host must not survive in either case.
+#[tokio::test]
+async fn x_forwarded_host_cannot_be_smuggled_through_a_request_without_a_host_header() {
+    let (o, st) = rig("").await;
+    // authority only (as h2): the upstream is told the authority, not the client's claim
+    fetch(
+        &st,
+        "https://real.example/xh1",
+        &[("x-forwarded-host", "evil.example")],
+    )
+    .await;
+    assert_eq!(
+        seen(&o, "x-forwarded-host").as_deref(),
+        Some("real.example")
+    );
+    // neither: the claim is dropped rather than forwarded
+    fetch(&st, "/xh2", &[("x-forwarded-host", "evil.example")]).await;
+    assert_eq!(seen(&o, "x-forwarded-host"), None);
+}

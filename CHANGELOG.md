@@ -6,7 +6,7 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Security
 
-- **Routing and host override headers from clients are no longer passed upstream.** `X-Original-URL` and `X-Rewrite-URL` (which IIS, Symfony and others honour over the real request line), `Forwarded`, `X-Forwarded-Server`, `X-Forwarded-Scheme`, `X-Forwarded-Prefix`, `X-Host`, `X-HTTP-Host-Override` and `X-Original-Host` reached the upstream untouched, so a client could steer a framework behind zion's routing, `internal_only`, WAF and auth, or poison a cache. They are dropped before routing unless the peer is a configured `trusted_proxies` entry, on `:443` and on the `:80` ACME fallback. If a legitimate client of yours sets one of these, route it through a trusted proxy or add it there.
+- **Routing and host override headers from clients are no longer passed upstream.** `X-Original-URL` and `X-Rewrite-URL` (which IIS, Symfony and others honour over the real request line), `Forwarded`, `X-Forwarded-Server`, `X-Forwarded-Scheme`, `X-Forwarded-Prefix`, `X-Host`, `X-HTTP-Host-Override` and `X-Original-Host` reached the upstream untouched, so a client could steer a framework behind zion's routing, `internal_only`, WAF and auth, or poison a cache. On `:443` they are dropped by a gate before routing; the plaintext `:80` ACME fallback, which picks its route first and forwards on its own, drops them just before forwarding. Either way a peer in `trusted_proxies` keeps its values. `X-Forwarded-Host` is now always replaced with the request's own host (the `Host` header, or the URI authority for HTTP/2) and dropped when there is none. If a legitimate client of yours sets one of these, route it through a trusted proxy or add it there.
 
 ### CI
 

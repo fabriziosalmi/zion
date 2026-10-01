@@ -175,14 +175,14 @@ fn prepare_request<B>(
         .build()
         .ok()?;
 
-    *req.uri_mut() = new_uri;
-
     // Shared forwarding hygiene: strip Host + dangerous hop-by-hop /
     // credential headers, enforce the X-Forwarded-For policy, set the
     // X-Real-IP / X-Forwarded-Proto / X-Forwarded-Host trust headers and add this
     // proxy to `Via`. It reads the INBOUND version (for `Via`), so the upstream
     // version is set only afterwards.
     apply_forwarding_hygiene(&mut req, remote_addr, proto, xff_mode);
+    // (after the hygiene pass, which reads the INBOUND authority and version)
+    *req.uri_mut() = new_uri;
     *req.version_mut() = Version::HTTP_11;
     // Connection is hop-by-hop (RFC 7230 §6.1); unlike the WebSocket path a
     // normal proxy request must NOT forward it to the upstream.
@@ -206,8 +206,15 @@ fn apply_forwarding_hygiene<B>(
     proto: &str,
     xff_mode: XffMode,
 ) {
-    // Capture the inbound Host for X-Forwarded-Host before we strip it.
-    let inbound_host = req.headers().get(hyper::header::HOST).cloned();
+    // Capture the inbound host for X-Forwarded-Host before we strip it: the Host header, or the
+    // URI authority when there is none (HTTP/2 carries it there and sends no Host header).
+    // Whatever X-Forwarded-Host the client sent is discarded either way.
+    let inbound_host = req.headers().get(hyper::header::HOST).cloned().or_else(|| {
+        req.uri()
+            .authority()
+            .and_then(|a| hyper::header::HeaderValue::from_str(a.as_str()).ok())
+    });
+    req.headers_mut().remove("X-Forwarded-Host");
     // RFC 9110 §7.6.3: name this proxy in `Via` (also what loop detection reads).
     let inbound_version = req.version();
     crate::via::append(req.headers_mut(), inbound_version);
