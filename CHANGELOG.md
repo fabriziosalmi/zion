@@ -4,6 +4,12 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Client IP privacy in logs** (`[redact] ip = "full" | "truncate" | "hmac"`). The client address is written to the access log, the audit trail, TLS-handshake failure lines and the sovereign classification log as it is (default), as its network (`203.0.113.0/24`, `2001:db8:1::/48`), or as a keyed irreversible token (`ip:` + 16 hex of HMAC-SHA256 under `ip_hmac_key`, stable per client). For GDPR/NIS2 retention policies. `hmac` needs a key of at least 16 bytes (validated); a missing key never degrades to the raw address; the key never appears in a debug print.
+
+- **Range requests are answered from the cache** (RFC 9110 §14). A fresh cached `200` now answers a single `Range` (`a-b`, `a-`, `-n`) with a `206` and a zero-copy slice of the stored body, an unsatisfiable one with `416` + `Content-Range: bytes */size`, so seeking in a cached video or resuming a download no longer pulls the whole object from RAM nor reaches the origin. `If-Range` uses strong comparison, preconditions (`304`) are evaluated first, and anything else (multi-range, other units, stale/revalidated copies, non-GET) still gets the whole object. Cache hits also carry the origin's `ETag` / `Last-Modified` now and `Accept-Ranges: bytes` when they can serve ranges.
+
 ### Fixed
 
 - **A pool member that was once slow is no longer avoided for good.** The load estimate that `p2c` uses (peak-EWMA latency) only changed when a sample arrived, so a member that had one slow period, or that came back from an ejection, kept its old estimate; with two members and low load it was never picked again, so it never got the sample that would correct it. The estimate now fades with time (half every 5 s without a sample), a new sample is folded into the faded estimate, an ejected member's estimate is dropped so it is measured afresh when it returns, and a member with no estimate is assumed to be as fast as the member it is compared with (it used to be scored with a fixed 1 ms guess, so it lost to any faster backend and stayed unmeasured: the cool-down test failed 4 runs in 5 on a release build). In a probe with one member 400 ms slow for 4 s and then healthy, the old build kept it at 0% for 40 s; the new one brings it back after about 25 s (a 200× slower period; less for a milder one).
@@ -85,10 +91,6 @@ earlier release. Read the upgrade notes first.
 - **`[server] tcp_keepalive_secs`** (default `60`, `0` = off): kernel TCP keepalive on accepted client sockets (probe after the idle time, every 10 s, dead after 3), and always on for pooled upstream sockets and WebSocket dials. A peer that vanished without a FIN (power loss, a NAT that dropped its mapping) now frees its file descriptor and connection slot in about `idle + 30` s instead of waiting for an application timeout.
 - **`Via` and loop detection** (RFC 9110 §7.6.3). Forwarded requests now carry `Via: <protocol> zion-XXXXXXXX` (random per process) after any earlier hop's entry, and a request whose `Via` already names this process is refused with `508 Loop Detected` ahead of the rate limiter, routing and the built-in endpoints, instead of bouncing between hops (for example an upstream that points back at zion) until a connection limit stops it. New counter `zion_loops_detected`. Upstreams will see a new `Via` request header.
 - **Cache: a successful `POST`/`PUT`/`PATCH`/`DELETE` invalidates the cache entries for its URI** (RFC 9111 §4.4): the path, its query variants and every encoding/`Vary` variant, but not longer paths that start the same, plus the same-origin URIs named in the response's `Location` / `Content-Location`. Errors (status 400 and above) invalidate nothing. New counter `zion_cache_invalidations`. Per instance: replicas do not tell each other.
-
-### Added
-
-- **Client IP privacy in logs** (`[redact] ip = "full" | "truncate" | "hmac"`). The client address is written to the access log, the audit trail, TLS-handshake failure lines and the sovereign classification log as it is (default), as its network (`203.0.113.0/24`, `2001:db8:1::/48`), or as a keyed irreversible token (`ip:` + 16 hex of HMAC-SHA256 under `ip_hmac_key`, stable per client). For GDPR/NIS2 retention policies. `hmac` needs a key of at least 16 bytes (validated); a missing key never degrades to the raw address; the key never appears in a debug print.
 
 ### Fixed
 

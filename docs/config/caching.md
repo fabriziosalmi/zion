@@ -155,6 +155,38 @@ A stale entry with **no validator** can't be revalidated, so it is re-fetched in
 full (a normal miss). The stale body is kept in cache until it is revalidated or
 evicted by capacity — it is never served without one of the checks above.
 
+## Range requests (RFC 9110 §14)
+
+A fresh cached `200` answers `Range` from RAM, so a client can seek in a cached video or resume a
+download without a trip to the origin (and without pulling the whole object):
+
+```console
+$ curl -sk -r 100-199 -D- -o /dev/null https://zion/media/clip.mp4
+HTTP/2 206
+content-range: bytes 100-199/3600
+x-zion-cache: HIT
+accept-ranges: bytes
+```
+
+- One byte range per request: `bytes=a-b`, `bytes=a-` and the suffix form `bytes=-n`. The slice
+  is taken from the stored body without copying it. A range starting at or past the end is a
+  `416` with `Content-Range: bytes */<size>`.
+- Anything else is answered with the whole object (RFC 9110 §14.2 allows ignoring a `Range`):
+  several ranges, another unit, a malformed value, a non-`GET`, a stored status other than `200`,
+  and any response that is not a **fresh** hit (a stale-while-revalidate / stale-if-error copy,
+  a revalidation).
+- `If-Range` is honoured with strong comparison: a strong ETag must be identical to the stored
+  one, a date must equal the stored `Last-Modified`; a weak validator never matches, and a
+  non-matching `If-Range` gets the whole object, as the RFC says.
+- Preconditions run first: a matching `If-None-Match` / `If-Modified-Since` answers `304`, not a
+  slice.
+- A hit now carries the origin's `ETag` / `Last-Modified` (it only used to on a `304`), and
+  `Accept-Ranges: bytes` when it can serve ranges. Ranges apply to the stored representation, so
+  a compressed variant is sliced in its compressed form (`Content-Encoding` is kept).
+- A `Range` request for an object that is **not cached yet** goes to the origin as before; the
+  object is stored only when the origin answers with the whole `200`, so seeking does not fill
+  the cache by itself.
+
 ## Request `Cache-Control` (RFC 9111 §5.2.1)
 
 The client can steer the cache per request:

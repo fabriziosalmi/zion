@@ -467,7 +467,7 @@ fn file_response(
 }
 
 /// The outcome of evaluating a `Range` header against a file of `total` bytes.
-enum RangeOutcome {
+pub(crate) enum RangeOutcome {
     /// No range, an unrecognized unit, a multi-range set, or a malformed spec:
     /// serve the full 200 (RFC 9110 §14.2 lets a server ignore a Range it cannot
     /// or chooses not to satisfy).
@@ -481,7 +481,7 @@ enum RangeOutcome {
 /// Parse a single-range `Range: bytes=…` against `total`. Only one range is
 /// supported (multipart/byteranges is a follow-up); a multi-range set is treated
 /// as [`RangeOutcome::Full`]. Suffix (`-N`) and open-ended (`N-`) forms handled.
-fn parse_range(header: Option<&HeaderValue>, total: u64) -> RangeOutcome {
+pub(crate) fn parse_range(header: Option<&HeaderValue>, total: u64) -> RangeOutcome {
     let Some(spec) = header
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().strip_prefix("bytes="))
@@ -549,6 +549,35 @@ fn if_range_allows(req_headers: &HeaderMap, last_modified: Option<&HeaderValue>)
         Some(lm) => v == lm.trim(),
         None => false,
     }
+}
+
+/// [`if_range_allows`] for a stored representation whose validators come from the origin: an
+/// entity-tag `If-Range` is honoured only when we hold a **strong** tag (not `W/`) and the two
+/// are identical (strong comparison, RFC 9110 §13.1.5); a date only on an exact match with
+/// `Last-Modified`; no `If-Range` always allows the range.
+pub(crate) fn if_range_allows_stored(
+    req_headers: &HeaderMap,
+    etag: Option<&HeaderValue>,
+    last_modified: Option<&HeaderValue>,
+) -> bool {
+    let Some(v) = req_headers
+        .get(hyper::header::IF_RANGE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return true;
+    };
+    let v = v.trim();
+    if v.starts_with("W/") {
+        return false; // a weak tag can never satisfy If-Range
+    }
+    if v.starts_with('"') {
+        return etag
+            .and_then(|e| e.to_str().ok())
+            .is_some_and(|e| !e.starts_with("W/") && e.trim() == v);
+    }
+    last_modified
+        .and_then(|lm| lm.to_str().ok())
+        .is_some_and(|lm| lm.trim() == v)
 }
 
 /// Read `[start, end]` from `path` and answer `206 Partial Content`. The slice is
@@ -821,6 +850,53 @@ mod tests {
 
     // ── If-Range gate (pure) ──────────────────────────────────────────────────
 
+    #[test]
+    fn if_range_on_a_stored_representation_uses_strong_comparison() {
+        let h = |v: &str| {
+            let mut m = HeaderMap::new();
+            m.insert(hyper::header::IF_RANGE, hv(v));
+            m
+        };
+        let strong = hv("\"abc\"");
+        let weak = hv("W/\"abc\"");
+        let lm = hv("Wed, 21 Oct 2015 07:28:00 GMT");
+        assert!(
+            if_range_allows_stored(&HeaderMap::new(), None, None),
+            "no If-Range: allowed"
+        );
+        assert!(if_range_allows_stored(&h("\"abc\""), Some(&strong), None));
+        assert!(
+            !if_range_allows_stored(&h("\"abd\""), Some(&strong), None),
+            "different tag"
+        );
+        assert!(
+            !if_range_allows_stored(&h("\"abc\""), Some(&weak), None),
+            "we hold a weak tag"
+        );
+        assert!(
+            !if_range_allows_stored(&h("W/\"abc\""), Some(&weak), None),
+            "a weak request tag"
+        );
+        assert!(
+            !if_range_allows_stored(&h("\"abc\""), None, None),
+            "no stored tag"
+        );
+        assert!(if_range_allows_stored(
+            &h("Wed, 21 Oct 2015 07:28:00 GMT"),
+            None,
+            Some(&lm)
+        ));
+        assert!(!if_range_allows_stored(
+            &h("Thu, 22 Oct 2015 07:28:00 GMT"),
+            None,
+            Some(&lm)
+        ));
+        assert!(!if_range_allows_stored(
+            &h("Wed, 21 Oct 2015 07:28:00 GMT"),
+            None,
+            None
+        ));
+    }
     #[test]
     fn if_range_gate() {
         let lm = hv("Sun, 06 Nov 1994 08:49:37 GMT");

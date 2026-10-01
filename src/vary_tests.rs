@@ -2648,3 +2648,213 @@ waf = true
     }
     assert_eq!(ip.as_deref(), Some("203.0.113.0/24"));
 }
+
+// ── Range requests served from the cache (RFC 9110 §14) ─────────────────────
+
+/// A `GET` through the pipeline with `headers`; returns (status, headers, body).
+async fn raw(
+    st: &Arc<AppState>,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> (u16, hyper::HeaderMap, Vec<u8>) {
+    let resp = process_request(
+        get(uri, headers),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    let (status, h) = (resp.status().as_u16(), resp.headers().clone());
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, h, body)
+}
+
+/// A cached object with a known body: `-|<0123456789abcdefghijklmnopqrstuvwxyz>|-|-`.
+async fn cached_object(etag: Option<&str>) -> (Arc<Origin>, Arc<AppState>, Vec<u8>) {
+    let (o, st) = rig("").await;
+    if let Some(e) = etag {
+        *o.extra.lock().unwrap() = Some(("ETag".to_string(), e.to_string()));
+    }
+    let x = [("x-foo", "0123456789abcdefghijklmnopqrstuvwxyz")];
+    let (_, _, full) = raw(&st, "/r/obj", &x).await;
+    settle().await;
+    assert_eq!(fetch(&st, "/r/obj", &x).await.0, "HIT", "cached");
+    (o, st, full)
+}
+const X: [(&str, &str); 1] = [("x-foo", "0123456789abcdefghijklmnopqrstuvwxyz")];
+
+fn with_range(range: &str) -> Vec<(&str, &str)> {
+    let mut h = X.to_vec();
+    h.push(("range", range));
+    h
+}
+
+#[tokio::test]
+async fn a_range_on_a_cached_object_is_a_partial_content_from_the_cache() {
+    let (o, st, full) = cached_object(None).await;
+    let n = full.len();
+    let hits_before = hits(&o);
+    for (spec, start, end) in [
+        ("bytes=2-5", 2, 5),
+        ("bytes=-4", n - 4, n - 1),
+        ("bytes=10-", 10, n - 1),
+        ("bytes=0-0", 0, 0),
+        ("bytes=5-9999", 5, n - 1), // clamped to the last byte
+    ] {
+        let (code, h, body) = raw(&st, "/r/obj", &with_range(spec)).await;
+        assert_eq!(code, 206, "{spec}");
+        assert_eq!(body, full[start..=end], "{spec}");
+        assert_eq!(
+            h.get("content-range").unwrap().to_str().unwrap(),
+            format!("bytes {start}-{end}/{n}"),
+            "{spec}"
+        );
+        assert_eq!(h.get("x-zion-cache").unwrap(), "HIT");
+        assert_eq!(h.get("accept-ranges").unwrap(), "bytes");
+        assert_eq!(body.len(), end - start + 1, "{spec}");
+    }
+    assert_eq!(
+        hits(&o),
+        hits_before,
+        "every slice came from the cache, never the origin"
+    );
+}
+
+#[tokio::test]
+async fn an_unsatisfiable_range_is_416_with_the_size_and_other_forms_get_the_whole_object() {
+    let (_o, st, full) = cached_object(None).await;
+    let n = full.len();
+    let (code, h, body) = raw(&st, "/r/obj", &with_range(&format!("bytes={n}-"))).await;
+    assert_eq!(code, 416);
+    assert_eq!(
+        h.get("content-range").unwrap().to_str().unwrap(),
+        format!("bytes */{n}")
+    );
+    assert!(body.is_empty());
+    // a form we do not serve as a partial is simply the whole object (RFC 9110 §14.2)
+    for spec in [
+        "bytes=0-1,3-4",
+        "items=0-1",
+        "bytes=a-b",
+        "bytes=",
+        "garbage",
+    ] {
+        let (code, _, body) = raw(&st, "/r/obj", &with_range(spec)).await;
+        assert_eq!(code, 200, "{spec}");
+        assert_eq!(body, full, "{spec}");
+    }
+}
+
+#[tokio::test]
+async fn if_range_decides_between_the_slice_and_the_whole_object() {
+    let (_o, st, full) = cached_object(Some("\"v1\"")).await;
+    let range = |ir: &'static str| {
+        let mut h = with_range("bytes=2-5");
+        h.push(("if-range", ir));
+        h
+    };
+    let (code, _, body) = raw(&st, "/r/obj", &range("\"v1\"")).await;
+    assert_eq!(
+        (code, &body[..]),
+        (206, &full[2..=5]),
+        "the strong ETag matches: the slice"
+    );
+    let (code, _, body) = raw(&st, "/r/obj", &range("\"v2\"")).await;
+    assert_eq!(
+        (code, body),
+        (200, full.clone()),
+        "a different ETag: the whole object"
+    );
+    let (code, _, _) = raw(&st, "/r/obj", &range("W/\"v1\"")).await;
+    assert_eq!(code, 200, "a weak tag never satisfies If-Range");
+    let (code, _, _) = raw(&st, "/r/obj", &range("Wed, 21 Oct 2015 07:28:00 GMT")).await;
+    assert_eq!(code, 200, "a date that is not the stored Last-Modified");
+}
+
+#[tokio::test]
+async fn a_weak_stored_etag_never_satisfies_an_entity_tag_if_range() {
+    let (_o, st, full) = cached_object(Some("W/\"v1\"")).await;
+    let mut h = with_range("bytes=2-5");
+    h.push(("if-range", "W/\"v1\""));
+    assert_eq!(raw(&st, "/r/obj", &h).await.2, full);
+    let mut h = with_range("bytes=2-5");
+    h.push(("if-range", "\"v1\""));
+    assert_eq!(raw(&st, "/r/obj", &h).await.0, 200);
+    // without If-Range the range is served whatever the validator is
+    assert_eq!(raw(&st, "/r/obj", &with_range("bytes=2-5")).await.0, 206);
+}
+
+#[tokio::test]
+async fn a_matching_conditional_wins_over_the_range_and_the_validators_are_echoed() {
+    let (_o, st, _full) = cached_object(Some("\"v1\"")).await;
+    let mut h = with_range("bytes=2-5");
+    h.push(("if-none-match", "\"v1\""));
+    let (code, _, body) = raw(&st, "/r/obj", &h).await;
+    assert_eq!(code, 304, "preconditions are evaluated before Range");
+    assert!(body.is_empty());
+    let (code, hdrs, _) = raw(&st, "/r/obj", &X).await;
+    assert_eq!(code, 200);
+    assert_eq!(
+        hdrs.get("etag").unwrap(),
+        "\"v1\"",
+        "a plain hit carries the origin's ETag"
+    );
+    assert_eq!(hdrs.get("accept-ranges").unwrap(), "bytes");
+    let (_, hdrs, _) = raw(&st, "/r/obj", &with_range("bytes=2-5")).await;
+    assert_eq!(hdrs.get("etag").unwrap(), "\"v1\"", "and so does a 206");
+}
+
+#[tokio::test]
+async fn a_range_on_an_uncached_object_goes_to_the_origin() {
+    // not cached yet: the request goes to the origin (which here ignores Range)
+    let (o, st) = rig("").await;
+    let (code, _, body) = raw(&st, "/r/miss", &with_range("bytes=2-5")).await;
+    assert_eq!(code, 200);
+    assert!(!body.is_empty());
+    assert_eq!(hits(&o), 1);
+}
+
+#[tokio::test]
+async fn several_range_header_lines_are_a_combined_request_and_get_the_whole_object() {
+    let (_o, st, full) = cached_object(None).await;
+    let mut h = with_range("bytes=2-5");
+    h.push(("range", "bytes=10-12"));
+    let (code, _, body) = raw(&st, "/r/obj", &h).await;
+    assert_eq!(code, 200, "two Range lines are not one range");
+    assert_eq!(body, full);
+}
+
+#[tokio::test]
+async fn only_if_cached_hits_get_the_same_304_range_whole_treatment() {
+    let (_o, st, full) = cached_object(Some("\"v1\"")).await;
+    let oic = |extra: &[(&'static str, &'static str)]| {
+        let mut h = with_range("bytes=2-5");
+        h.push(("cache-control", "only-if-cached"));
+        h.extend_from_slice(extra);
+        h
+    };
+    let (code, hdrs, body) = raw(&st, "/r/obj", &oic(&[])).await;
+    assert_eq!(
+        (code, &body[..]),
+        (206, &full[2..=5]),
+        "a Range on an only-if-cached hit"
+    );
+    assert_eq!(
+        hdrs.get("content-range").unwrap().to_str().unwrap(),
+        format!("bytes 2-5/{}", full.len())
+    );
+    let (code, _, body) = raw(&st, "/r/obj", &oic(&[("if-none-match", "\"v1\"")])).await;
+    assert_eq!(code, 304, "a matching precondition still wins");
+    assert!(body.is_empty());
+    let mut plain = X.to_vec();
+    plain.push(("cache-control", "only-if-cached"));
+    let (code, _, body) = raw(&st, "/r/obj", &plain).await;
+    assert_eq!((code, body), (200, full), "no Range: the whole object");
+}
