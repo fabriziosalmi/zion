@@ -95,6 +95,7 @@ done
 # issue templates). Mirrors the PATTERN_CHECKS in check-version-sync.sh.
 [[ -f SECURITY.md ]] && sedi "s/^\| < $OLD \| No \|/| < $NEW | No |/" SECURITY.md
 [[ -f docs/deploy/hot-reload.md ]] && sedi "s/(\"version\":[[:space:]]*\")$OLD(\")/\1$NEW\2/" docs/deploy/hot-reload.md
+[[ -f docs/index.md ]] && sedi "s/(<dt>Version<\/dt><dd class=\"tnum\">)$OLD(<\/dd>)/\1$NEW\2/" docs/index.md
 [[ -f .github/ISSUE_TEMPLATE/bug_report.md ]] && sedi "s/(Zion Version: \[e\.g\.) $OLD(\])/\1 $NEW\2/" .github/ISSUE_TEMPLATE/bug_report.md
 
 # 4. Refresh Cargo.lock so the workspace package entry matches.

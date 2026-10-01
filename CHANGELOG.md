@@ -14,6 +14,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 - **The cron watchdog no longer raises a false alarm for a newly added cron workflow.** `scripts/check-cron-freshness.sh` reported "never succeeded on schedule" for a weekly workflow added on a Wednesday, so every new cron opened (or kept open) the "Scheduled workflows are not running green" issue until its first Monday (#464: `concurrency` and `coverage`, added on 2026-09-30, first scheduled run 2026-10-05; both pass on PR/push). A workflow with no scheduled success is now reported `NEW` for one staleness window after GitHub first saw it, then `STALE` as before (fail-closed if its age cannot be determined). The script has a `--selftest`, run by `cargo test`.
 
+### Docs
+
+- **README and docs catch up with 0.9.4 / 0.9.5.** New [resilience guide](docs/guide/resilience.md) (what protects against what, where each protection sits on the request path, a combined example, what to alert on); the README Features now cover pools, outlier ejection, breaker, bulkhead, DNS last-good, drain, the log queue, `Range` / `Surrogate-Key` purge and client-IP privacy; the architecture page lists the modules added since 0.6 and the real pre-routing gate order; hardening, compliance mapping (`[redact] ip`) and the alert examples cover the new settings. The docs home page showed `Version 0.6.2`: it is now 0.9.5 and `scripts/check-version-sync.sh` / `bump-version.sh` keep it in step.
+
 ## [0.9.5] - 2026-10-01
 
 **Operations and correctness release: deploys stop waiting on idle connections, a recovered pool member gets traffic again, client IPs can be kept out of the logs, and the cache can serve byte ranges.** No breaking changes; one fix to the 0.9.4 load balancer. Read the notes below.
