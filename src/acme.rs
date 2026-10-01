@@ -585,9 +585,13 @@ pub async fn run_soak() -> i32 {
             soak_key_rollover(&acme_config, &store, &tls_config, &cert_path, &state_dir).await
         }
         "ttl-edge" => soak_ttl_edge(&acme_config, &store, &tls_config, &cert_path).await,
+        "nonce-collision" => {
+            soak_nonce_collision(&acme_config, &store, &tls_config, &cert_path).await
+        }
         other => {
             eprintln!(
-                "acme-soak: FAIL unknown mode '{other}' (expected happy|key-rollover|ttl-edge)"
+                "acme-soak: FAIL unknown mode '{other}' \
+                 (expected happy|key-rollover|ttl-edge|nonce-collision)"
             );
             2
         }
@@ -763,6 +767,108 @@ async fn soak_ttl_edge(
         return 1;
     }
     eprintln!("acme-soak: PASS (ttl-edge: issue → edge decision → renew → revoke)");
+    0
+}
+
+/// Run `op` up to `attempts` times; `Ok(retries_used)` on the first success.
+#[cfg(feature = "acme")]
+async fn with_retries<F, Fut>(label: &str, attempts: u32, mut op: F) -> Result<u32, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut last = String::new();
+    for n in 0..attempts {
+        match op().await {
+            Ok(()) => return Ok(n),
+            Err(e) => {
+                eprintln!(
+                    "acme-soak: {label}: attempt {} of {attempts} failed: {e}",
+                    n + 1
+                );
+                last = e;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// Nonce-collision leg (issue #134). Pebble is started with `PEBBLE_WFE_NONCEREJECT` so a
+/// share of the anti-replay nonces zion presents are rejected with `badNonce`. instant-acme
+/// retries each request on `badNonce` (RFC 8555 §6.5) up to 3 attempts, so a flow almost
+/// always completes in one go; the rare request that exhausts its attempts fails the whole
+/// operation, and the daemon would retry it on its next cycle. This leg therefore allows
+/// each of issue / renew / revoke up to 3 whole-operation attempts and fails only if one
+/// never succeeds. That the rejections really were injected is asserted by the workflow,
+/// from Pebble's own log: without it a quiet Pebble would make this leg pass for nothing.
+#[cfg(feature = "acme")]
+async fn soak_nonce_collision(
+    acme_config: &crate::config::AcmeConfig,
+    store: &ChallengeStore,
+    tls_config: &crate::config::TlsConfig,
+    cert_path: &str,
+) -> i32 {
+    const ATTEMPTS: u32 = 3;
+    const NONCE_ROUNDS: u32 = 5;
+    let mut op_retries = 0;
+    let mut stage = |name: &'static str, r: Result<u32, String>| -> bool {
+        match r {
+            Ok(n) => {
+                op_retries += n;
+                eprintln!("acme-soak: ✓ {name} (whole-operation retries: {n})");
+                true
+            }
+            Err(e) => {
+                eprintln!("acme-soak: FAIL {name}: gave up after {ATTEMPTS} attempts: {e}");
+                false
+            }
+        }
+    };
+    let issue = with_retries("issue", ATTEMPTS, || async {
+        renew_once(acme_config, store, tls_config)
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    if !stage("issue", issue) {
+        return 1;
+    }
+    if !std::path::Path::new(cert_path).exists() {
+        eprintln!("acme-soak: FAIL issue: no certificate written to {cert_path}");
+        return 1;
+    }
+    // Several renewals: enough requests that injected rejections are certain to occur
+    // (the workflow checks the count against a clean run), at a rate where whole-operation
+    // retries still make the leg reliable.
+    for round in 1..=NONCE_ROUNDS {
+        let renew = with_retries("renew", ATTEMPTS, || async {
+            renew_once(acme_config, store, tls_config)
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await;
+        let name: &'static str = match round {
+            1 => "renew 1",
+            2 => "renew 2",
+            _ => "renew 3+",
+        };
+        if !stage(name, renew) {
+            return 1;
+        }
+    }
+    let revoke = with_retries("revoke", ATTEMPTS, || async {
+        revoke_cert(acme_config, cert_path)
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    if !stage("revoke", revoke) {
+        return 1;
+    }
+    eprintln!(
+        "acme-soak: PASS (nonce-collision: issue → renew → revoke under injected badNonce; \
+         whole-operation retries: {op_retries})"
+    );
     0
 }
 
