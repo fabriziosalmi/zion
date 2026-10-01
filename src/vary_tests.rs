@@ -2477,3 +2477,168 @@ async fn the_slot_is_held_until_the_client_has_read_the_response_body() {
     drop(resp);
     assert_eq!(status_and_headers(&st, "/plain/other").await.0, 200);
 }
+
+// ── [redact] ip: what the access log really prints ────────────────────────
+
+/// A subscriber that collects every formatted event into a buffer.
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+impl std::io::Write for Capture {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+    type Writer = Capture;
+    fn make_writer(&'a self) -> Capture {
+        self.clone()
+    }
+}
+
+async fn access_log_line(redact: &str) -> String {
+    let (_o, _) = rig("").await;
+    let port = _o.port.load(Ordering::Relaxed);
+    let mut cfg = cfg_for(port, "");
+    cfg.redact = toml::from_str(redact).unwrap();
+    let st = AppState::for_tests(&cfg);
+    let cap = Capture::default();
+    let sub = tracing_subscriber::fmt()
+        .with_writer(cap.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _guard = tracing::subscriber::set_default(sub);
+    let resp = process_request(
+        get("/ip/x", &[]),
+        st,
+        "203.0.113.9:4242".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    let _ = resp.into_body().collect().await;
+    let out = String::from_utf8(cap.0.lock().unwrap().clone()).unwrap();
+    out.lines()
+        .find(|l| l.contains("remote_ip"))
+        .unwrap_or("")
+        .to_string()
+}
+
+#[tokio::test]
+async fn the_access_log_writes_the_client_ip_as_configured() {
+    let full = access_log_line("").await;
+    assert!(
+        full.contains("remote_ip=203.0.113.9"),
+        "default is the address as is: {full}"
+    );
+    let tr = access_log_line("ip = \"truncate\"").await;
+    assert!(tr.contains("remote_ip=203.0.113.0/24"), "{tr}");
+    assert!(
+        !tr.contains("203.0.113.9"),
+        "the full address must not be in the line: {tr}"
+    );
+    let hm =
+        access_log_line("ip = \"hmac\"\nip_hmac_key = \"0123456789abcdef0123456789abcdef\"").await;
+    assert!(hm.contains("remote_ip=ip:"), "{hm}");
+    assert!(!hm.contains("203.0.113"), "{hm}");
+}
+
+#[tokio::test]
+async fn the_audit_trail_records_the_client_ip_as_configured() {
+    for (redact, want, forbid) in [
+        ("", "203.0.113.9", ""),
+        ("ip = \"truncate\"", "203.0.113.0/24", "203.0.113.9"),
+        (
+            "ip = \"hmac\"\nip_hmac_key = \"0123456789abcdef0123456789abcdef\"",
+            "ip:",
+            "203.0.113",
+        ),
+    ] {
+        let (o, _) = rig("").await;
+        let mut cfg = cfg_for(o.port.load(Ordering::Relaxed), "");
+        cfg.redact = toml::from_str(redact).unwrap();
+        let (handle, mut rx) = crate::audit::AuditHandle::capture();
+        let st = AppState::for_tests_with_audit(&cfg, handle);
+        let resp = process_request(
+            get("/aud/x", &[]),
+            st,
+            "203.0.113.9:4242".parse::<SocketAddr>().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        let _ = resp.into_body().collect().await;
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            seen.push(ev);
+        }
+        let ev = seen
+            .iter()
+            .find(|e| e.kind == crate::audit::kind::REQUEST_COMPLETED)
+            .unwrap_or_else(|| panic!("no request_completed event in {} events", seen.len()));
+        let ip = ev.remote_ip.clone().unwrap();
+        assert!(ip.contains(want), "[{redact}] audit remote_ip = {ip}");
+        assert!(
+            forbid.is_empty() || !ip.contains(forbid),
+            "[{redact}] audit remote_ip = {ip}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_waf_block_is_audited_with_the_configured_client_ip_too() {
+    let (o, _) = rig("").await;
+    let port = o.port.load(Ordering::Relaxed);
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstream.w]
+url = "http://127.0.0.1:{port}"
+[redact]
+ip = "truncate"
+[[route]]
+path = "/waf/{{*rest}}"
+upstream = "w"
+waf = true
+"#
+    );
+    let cfg = toml::from_str::<ZionConfig>(&toml).unwrap();
+    let (handle, mut rx) = crate::audit::AuditHandle::capture();
+    let st = AppState::for_tests_with_audit(&cfg, handle);
+    let attack = Request::builder()
+        .method(Method::POST)
+        .uri("/waf/x")
+        .body(
+            Full::new(Bytes::from_static(
+                b"id=1' UNION SELECT username,password FROM users--",
+            ))
+            .map_err(|n| match n {})
+            .boxed(),
+        )
+        .unwrap();
+    let resp = process_request(
+        attack,
+        st,
+        "203.0.113.9:4242".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 400, "the WAF blocked it");
+    let mut ip = None;
+    while let Ok(ev) = rx.try_recv() {
+        if ev.kind == "request_blocked" {
+            ip = ev.remote_ip;
+        }
+    }
+    assert_eq!(ip.as_deref(), Some("203.0.113.0/24"));
+}

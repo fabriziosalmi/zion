@@ -1516,6 +1516,7 @@ fn deploy_errors(config: &ZionConfig) -> Vec<String> {
 fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     let mut errors: Vec<String> = Vec::new();
 
+    errors.extend(config.redact.errors());
     for (name, up) in &config.upstream {
         if let Some(n) = up.max_in_flight {
             if !(1..=1_000_000).contains(&n) {
@@ -2177,6 +2178,30 @@ mod tests {
             .err()
             .unwrap_or_default();
         assert!(e.contains("max_object_mb must be >= 1"), "{e}");
+    }
+
+    #[test]
+    fn redact_ip_settings_are_validated_with_the_rest_of_the_config() {
+        let cfg = |redact: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+                 [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstream.u]\nurl=\"http://a:1\"\n\
+                 [redact]\n{redact}\n[[route]]\npath=\"/{{*r}}\"\nupstream=\"u\"\n"
+            )
+        };
+        // (the placeholder cert/key paths fail the file checks; only the redact checks matter here)
+        for ok in ["ip = \"truncate\"", ""] {
+            let e = validate_str(&cfg(ok), "t").err().unwrap_or_default();
+            assert!(!e.contains("redact"), "{ok}: {e}");
+        }
+        let e = validate_str(&cfg("ip = \"hmac\""), "t")
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("needs redact.ip_hmac_key"), "{e}");
+        let e = validate_str(&cfg("ip = \"hmac\"\nip_hmac_key = \"short\""), "t")
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("at least 16 bytes"), "{e}");
     }
 
     #[test]

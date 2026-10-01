@@ -174,6 +174,31 @@ mtls_fingerprint  = true
 headers       = ["authorization", "cookie", "x-api-key"]
 ```
 
+### Client IP privacy (`[redact] ip`)
+
+The client address is personal data under GDPR. `[redact] ip` controls how it is written to the
+access log (`remote_ip`), the audit trail (`remote_ip`), the TLS-handshake failure lines and the
+sovereign classification log (applied at start-up):
+
+| `ip` | Written as | Use |
+|---|---|---|
+| `"full"` (default) | `203.0.113.9` | forensics and per-client debugging |
+| `"truncate"` | `203.0.113.0/24` (IPv4) / `2001:db8:1::/48` (IPv6) | keeps the network (abuse by ISP, rough geography), drops the host; not reversible |
+| `"hmac"` | `ip:3f9a1c7e5b2d8a40` | the same client always gets the same token, so a session or an attacker can still be followed across the logs, but the address cannot be recovered without `ip_hmac_key` |
+
+```toml
+[redact]
+ip = "hmac"
+ip_hmac_key = "<at least 16 bytes of secret, from your secret store, not from git>"
+```
+
+An IPv4-mapped IPv6 address is treated as IPv4. `hmac` needs `ip_hmac_key` (config validation
+refuses it otherwise, and refuses the key with any other mode); a missing key can never fall
+back to the raw address. Rotating the key breaks correlation with older logs, which is also
+how you "forget" them. Not covered: an `X-Forwarded-For` value you ask to be logged with
+`[access_log] include_headers` (redact it with `[redact] headers`), and addresses an upstream
+writes in its own logs.
+
 ### Storage budget
 
 Each line is a JSON object. With the default fields plus 5 headers

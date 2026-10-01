@@ -488,6 +488,14 @@ impl AppState {
     /// sockets, no certificate on disk (an empty SNI resolver stands in for TLS),
     /// every limiter fresh. Health starts as `new_healthy` for every upstream.
     pub(crate) fn for_tests(config: &config::ZionConfig) -> Arc<Self> {
+        Self::for_tests_with_audit(config, audit::AuditHandle::noop())
+    }
+
+    /// [`Self::for_tests`] with the given audit handle (see `AuditHandle::capture`).
+    pub(crate) fn for_tests_with_audit(
+        config: &config::ZionConfig,
+        audit: audit::AuditHandle,
+    ) -> Arc<Self> {
         // The daemon installs the process-wide provider at boot; tests do it here.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let resolved = ResolvedAppConfig::try_build(config, 1024).expect("test config builds");
@@ -512,8 +520,8 @@ impl AppState {
                 tls_fp_bans: tls_fp::BanSet::new(),
             },
             inflight: numa::NumaAwareMap::new(),
-            audit: audit::AuditHandle::noop(),
-            redact: Arc::new(audit::CompiledRedaction::default()),
+            audit,
+            redact: Arc::new(config.redact.compile()),
             #[cfg(feature = "sovereign-aimp")]
             aimp_cp: None,
         })

@@ -186,7 +186,10 @@ pub(crate) fn spawn_admin_listener(
                                     Ok(tls) => serve_admin(tls, peer, st, cx, true).await,
                                     Err(e) => crate::logging::warn(
                                         "admin",
-                                        &format!("admin mTLS handshake failed from {peer}: {e}"),
+                                        &format!(
+                                            "admin mTLS handshake failed from {}: {e}",
+                                            st.redact.ip_label(peer.ip())
+                                        ),
                                     ),
                                 }
                             });
@@ -364,7 +367,7 @@ fn audit_write(
         ts: String::new(),
         kind: audit::kind::CONFIG_RELOAD,
         trace_id: None,
-        remote_ip: Some(peer.ip().to_string()),
+        remote_ip: Some(state.redact.ip_label(peer.ip()).to_string()),
         method: Some("POST".to_string()),
         path: Some(path.to_string()),
         detail: Some(detail),
@@ -377,7 +380,7 @@ fn audit_denied_write(state: &AppState, peer: SocketAddr, path: &str) {
         ts: String::new(),
         kind: audit::kind::ADMIN_ACCESS,
         trace_id: None,
-        remote_ip: Some(peer.ip().to_string()),
+        remote_ip: Some(state.redact.ip_label(peer.ip()).to_string()),
         method: Some("POST".to_string()),
         path: Some(path.to_string()),
         detail: Some("admin write refused: missing or wrong write token".to_string()),
@@ -390,7 +393,7 @@ fn audit_revoke(state: &AppState, peer: SocketAddr, detail: &str) {
         ts: String::new(),
         kind: audit::kind::ADMIN_ACCESS,
         trace_id: None,
-        remote_ip: Some(peer.ip().to_string()),
+        remote_ip: Some(state.redact.ip_label(peer.ip()).to_string()),
         method: Some("POST".to_string()),
         path: Some("/admin/revoke".to_string()),
         detail: Some(detail.to_string()),
