@@ -145,6 +145,8 @@ impl ResolvedAppConfig {
         conn_limit_max: usize,
     ) -> error::ZionResult<Self> {
         let router = routing::build_router(config).map_err(error::ZionError::Config)?;
+        // Process-wide upstream DNS policy (re-applied on every reload).
+        crate::dns::configure(config.server.dns_stale_secs, config.server.dns_timeout_ms);
 
         // Health map: one entry per upstream URL referenced by any route.
         // The same URL can appear in many routes — dedup via FnvHashMap.

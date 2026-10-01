@@ -52,6 +52,7 @@ mod cache;
 mod cli;
 mod config;
 mod connlimit;
+mod dns;
 mod doctor;
 mod error;
 mod health;

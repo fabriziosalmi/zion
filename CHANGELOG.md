@@ -12,6 +12,8 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **Upstream DNS survives a resolver outage.** Names were resolved with the system resolver on every new upstream connection and nothing else, so a failing or slow resolver (glibc waits 5 s per attempt) failed or stalled requests to upstreams whose addresses had not changed. The last good answer per host is now kept and used when a fresh lookup fails, times out (`[server] dns_timeout_ms`, default 2000) or returns nothing, for up to `dns_stale_secs` (default 3600; `0` = off). A fresh lookup is always tried first, so DNS changes still apply on the next connection. Covers the pooled client and WebSocket dials. New metrics `zion_dns_lookup_failures_total`, `zion_dns_stale_served_total`.
+
 - **Outlier detection for pools** (opt-in: `[upstream.<name>] outlier_detection = { error_rate_pct, min_requests, window_secs, eject_secs, max_ejected_pct }`). A member whose own failure rate (502/503/504 or a transport error) is high while another member is clearly healthier is ejected for `eject_secs` (longer for repeat offenders, up to 10x). Never applied to a pool-wide outage, capped at `max_ejected_pct` of the pool, and an ejection alone never turns into a 503. New metrics `zion_upstream_inflight`, `zion_upstream_peak_ewma_seconds`, `zion_upstream_ejected`, `zion_upstream_ejections_total`.
 
 ### Security

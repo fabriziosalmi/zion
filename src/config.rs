@@ -257,6 +257,15 @@ pub struct ServerConfig {
     /// Log format: "text" (default) or "json".
     #[serde(default = "default_log_format")]
     pub log_format: String,
+    /// How long (seconds) the last good DNS answer for an upstream host may be served when a
+    /// fresh lookup fails, times out or returns nothing (default 3600; `0` = never serve a
+    /// stale answer). A fresh lookup is always tried first. Applied on reload.
+    #[serde(default = "default_dns_stale_secs")]
+    pub dns_stale_secs: u64,
+    /// Deadline (ms) for one upstream DNS lookup before the last good answer is used instead
+    /// (default 2000; `0` = wait as long as the system resolver does). Applied on reload.
+    #[serde(default = "default_dns_timeout_ms")]
+    pub dns_timeout_ms: u64,
     /// Log lines that can wait for stderr (default 8192). Logging never blocks a request: when
     /// the sink is slower than the log rate the newest lines are dropped and counted in
     /// `zion_log_lines_dropped_total`. `0` writes synchronously (a stalled stderr then stalls
@@ -299,6 +308,14 @@ fn default_xff_mode() -> String {
 
 fn default_tcp_keepalive_secs() -> u64 {
     crate::net::DEFAULT_TCP_KEEPALIVE_SECS
+}
+
+fn default_dns_stale_secs() -> u64 {
+    crate::dns::DEFAULT_STALE_SECS
+}
+
+fn default_dns_timeout_ms() -> u64 {
+    crate::dns::DEFAULT_TIMEOUT_MS
 }
 
 fn default_log_queue_lines() -> usize {
@@ -2144,6 +2161,23 @@ mod tests {
             .err()
             .unwrap_or_default();
         assert!(e.contains("max_object_mb must be >= 1"), "{e}");
+    }
+
+    #[test]
+    fn dns_settings_default_to_an_hour_of_stale_answers_and_a_two_second_deadline() {
+        let parse = |extra: &str| -> ZionConfig {
+            toml::from_str(&format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n{extra}\n[tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstream.u]\nurl=\"http://a:1\"\n[[route]]\npath=\"/{{*r}}\"\nupstream=\"u\"\n"
+            ))
+            .unwrap()
+        };
+        let d = parse("");
+        assert_eq!(
+            (d.server.dns_stale_secs, d.server.dns_timeout_ms),
+            (3600, 2000)
+        );
+        let c = parse("dns_stale_secs = 0\ndns_timeout_ms = 500");
+        assert_eq!((c.server.dns_stale_secs, c.server.dns_timeout_ms), (0, 500));
     }
 
     #[test]
