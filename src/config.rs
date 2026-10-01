@@ -756,6 +756,12 @@ pub struct CacheProfile {
     /// over the limit skips buffering altogether.
     #[serde(default = "default_max_object_mb")]
     pub max_object_mb: u64,
+    /// Sort the query parameters in the CACHE KEY, so `?b=2&a=1` and `?a=1&b=2` share an
+    /// entry. Off by default: it is only safe when the origin does not care about the
+    /// order of parameters. Parameters with the same name keep their relative order, and
+    /// the upstream is always sent the query exactly as the client wrote it.
+    #[serde(default)]
+    pub normalize_query: bool,
 }
 
 pub(crate) fn default_max_object_mb() -> u64 {

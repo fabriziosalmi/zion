@@ -190,6 +190,57 @@ async fn rate_limiter_answers_before_the_built_in_endpoints() {
     assert_eq!(get(&st, "198.51.100.7:1", "/healthz").await, 200);
 }
 
+// ── hot reload: a changed route policy applies to the very next request ─────────
+
+/// Each worker thread keeps a small cache of resolved routes. It must not outlive the
+/// configuration it was filled from: after a reload that makes `/open` internal-only, the
+/// next external request to `/open/x` is refused, on the same thread, without waiting for
+/// the cached route to be evicted.
+#[tokio::test]
+async fn a_reload_that_changes_a_routes_policy_applies_to_the_next_request() {
+    use crate::state::ResolvedAppConfig;
+    let st = state(0);
+    // warm the thread's route cache for this path under the original config
+    let before = get(&st, EXTERNAL, "/open/x").await;
+    assert_ne!(
+        before, 403,
+        "control: /open is not internal-only to begin with"
+    );
+
+    let tightened = config_toml(0).replace(
+        "[[route]]\npath = \"/open/{*rest}\"\nupstream = \"live\"\n",
+        "[[route]]\npath = \"/open/{*rest}\"\nupstream = \"live\"\ninternal_only = true\n",
+    );
+    assert_ne!(
+        tightened,
+        config_toml(0),
+        "the replacement must have applied"
+    );
+    let cfg: ZionConfig = toml::from_str(&tightened).unwrap();
+    st.config
+        .store(Arc::new(ResolvedAppConfig::try_build(&cfg, 1024).unwrap()));
+    assert_eq!(
+        get(&st, EXTERNAL, "/open/x").await,
+        403,
+        "the new policy must apply at once"
+    );
+    assert_ne!(
+        get(&st, INTERNAL, "/open/x").await,
+        403,
+        "internal clients are still let in"
+    );
+
+    // and back: loosening it applies at once too
+    let cfg: ZionConfig = toml::from_str(&config_toml(0)).unwrap();
+    st.config
+        .store(Arc::new(ResolvedAppConfig::try_build(&cfg, 1024).unwrap()));
+    assert_ne!(
+        get(&st, EXTERNAL, "/open/x").await,
+        403,
+        "the old policy is gone again"
+    );
+}
+
 // ── path normalization: a route's policy cannot be dodged by how the path is written ──
 
 #[tokio::test]

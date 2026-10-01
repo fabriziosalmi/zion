@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 struct Origin {
+    /// The port this origin listens on (set once it is bound).
+    port: std::sync::atomic::AtomicU16,
     /// The `Vary` value the origin sends (empty = none).
     vary: Mutex<String>,
     /// Requests that reached the origin.
@@ -136,8 +138,9 @@ fn state_for(port: u16) -> Arc<AppState> {
     state_for_with(port, "")
 }
 
+/// The test config: a catch-all `static_cache` route to the origin on `port`;
 /// `profile_extra` is appended to `[cache_profile.c]`.
-fn state_for_with(port: u16, profile_extra: &str) -> Arc<AppState> {
+fn cfg_for(port: u16, profile_extra: &str) -> ZionConfig {
     let toml = format!(
         r#"
 [server]
@@ -163,7 +166,11 @@ mode = "static_cache"
 cache_profile = "c"
 "#
     );
-    AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"))
+    toml::from_str::<ZionConfig>(&toml).expect("config parses")
+}
+
+fn state_for_with(port: u16, profile_extra: &str) -> Arc<AppState> {
+    AppState::for_tests(&cfg_for(port, profile_extra))
 }
 
 async fn rig(vary: &str) -> (Arc<Origin>, Arc<AppState>) {
@@ -186,6 +193,7 @@ async fn rig_cc(vary: &str, cc: &str) -> (Arc<Origin>, Arc<AppState>) {
 
 async fn rig_with(vary: &str, cc: &str, profile_extra: &str) -> (Arc<Origin>, Arc<AppState>) {
     let o = Arc::new(Origin {
+        port: std::sync::atomic::AtomicU16::new(0),
         vary: Mutex::new(vary.into()),
         hits: AtomicUsize::new(0),
         cc: Mutex::new(cc.into()),
@@ -198,6 +206,7 @@ async fn rig_with(vary: &str, cc: &str, profile_extra: &str) -> (Arc<Origin>, Ar
         extra: Mutex::new(None),
     });
     let port = start_origin(o.clone()).await;
+    o.port.store(port, Ordering::Relaxed);
     (o, state_for_with(port, profile_extra))
 }
 
@@ -968,4 +977,105 @@ async fn the_acme_shortcut_on_port_80_cannot_be_used_to_reach_other_paths() {
         assert_eq!(loc, "https://example.test/secret", "{p}");
     }
     assert_eq!(hits(&o), before, "nothing reached the upstream");
+}
+
+// ── opt-in: parameter order does not split the cache ────────────────────────
+
+#[tokio::test]
+async fn query_parameter_order_splits_the_cache_unless_the_profile_opts_in() {
+    // off by default: two orders are two entries
+    let (o, st) = rig("").await;
+    fetch(&st, "/qa?b=2&a=1", &[]).await;
+    settle().await;
+    assert_eq!(fetch(&st, "/qa?a=1&b=2", &[]).await.0, "MISS");
+    assert_eq!(hits(&o), 2);
+
+    // opted in: one entry for both orders, and the upstream still sees what the client wrote
+    let (o, st) = rig_with("", "public, max-age=60", "normalize_query = true").await;
+    fetch(&st, "/qb?b=2&a=1", &[]).await;
+    settle().await;
+    assert_eq!(
+        o.last_target.lock().unwrap().as_deref(),
+        Some("/qb?b=2&a=1")
+    );
+    let (c, _) = fetch(&st, "/qb?a=1&b=2", &[]).await;
+    assert_eq!(
+        c, "HIT",
+        "the same parameters in another order are the same entry"
+    );
+    assert_eq!(hits(&o), 1);
+}
+
+#[tokio::test]
+async fn sorting_never_merges_different_parameters_or_reorders_repeated_ones() {
+    let (o, st) = rig_with("", "public, max-age=60", "normalize_query = true").await;
+    for q in [
+        "/qc?x=1",
+        "/qc?x=2",     // different value
+        "/qc?x=1&y=",  // extra parameter
+        "/qc?x=1&x=2", // repeated name, order significant
+        "/qc?x=2&x=1", // ...so this is not the same
+        "/qc?X=1",     // names are case-sensitive
+    ] {
+        fetch(&st, q, &[]).await;
+        settle().await;
+    }
+    assert_eq!(hits(&o), 6, "six distinct requests, six distinct entries");
+    // and a reordering of an already-seen set IS a hit
+    assert_eq!(fetch(&st, "/qc?y=&x=1", &[]).await.0, "HIT");
+    assert_eq!(hits(&o), 6);
+}
+
+#[tokio::test]
+async fn a_mutation_invalidates_every_ordering_of_its_query() {
+    let (o, st) = rig_with("", "public, max-age=60", "normalize_query = true").await;
+    fetch(&st, "/qd?b=2&a=1", &[]).await;
+    settle().await;
+    assert_eq!(fetch(&st, "/qd?a=1&b=2", &[]).await.0, "HIT");
+    send(&st, Method::POST, "/qd").await;
+    settle().await;
+    assert_eq!(fetch(&st, "/qd?a=1&b=2", &[]).await.0, "MISS");
+    let _ = o;
+}
+
+/// The RAM cache survives a config reload. Entries stored while `normalize_query` was on live
+/// under sorted keys; turning it off (because order matters) must not let a raw request be
+/// served one of them, and turning it on must not mix its entries with the raw ones.
+#[tokio::test]
+async fn toggling_normalize_query_across_a_reload_never_aliases_entries() {
+    use crate::state::ResolvedAppConfig;
+    let reload = |st: &Arc<AppState>, port: u16, extra: &str| {
+        let cfg = ResolvedAppConfig::try_build(&cfg_for(port, extra), 1024).unwrap();
+        st.config.store(Arc::new(cfg));
+    };
+    // on -> off
+    let (o, st) = rig_with("", "public, max-age=60", "normalize_query = true").await;
+    let port = o.port.load(Ordering::Relaxed);
+    fetch(&st, "/qr?b=2&a=1", &[]).await;
+    settle().await;
+    reload(&st, port, "normalize_query = false");
+    let (c, _) = fetch(&st, "/qr?a=1&b=2", &[]).await;
+    assert_eq!(
+        c, "MISS",
+        "raw request must not be served the entry stored under the sorted key"
+    );
+    assert_eq!(hits(&o), 2);
+    // off -> on
+    let (o, st) = rig_with("", "public, max-age=60", "").await;
+    let port = o.port.load(Ordering::Relaxed);
+    fetch(&st, "/qs?a=1&b=2", &[]).await;
+    settle().await;
+    reload(&st, port, "normalize_query = true");
+    let (c, _) = fetch(&st, "/qs?b=2&a=1", &[]).await;
+    assert_eq!(
+        c, "MISS",
+        "an entry stored in raw mode is not the sorted-mode entry"
+    );
+    settle().await;
+    assert_eq!(
+        fetch(&st, "/qs?a=1&b=2", &[]).await.0,
+        "HIT",
+        "and sorted mode works after the reload"
+    );
+    assert_eq!(hits(&o), 2);
 }

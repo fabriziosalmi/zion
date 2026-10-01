@@ -157,6 +157,27 @@ fn normalize_slow(path: &str) -> String {
     out
 }
 
+/// The query string with its parameters in a canonical order, for use in a CACHE KEY only
+/// (the upstream is always sent the query as the client wrote it). Parameters are split on
+/// `&` and stably sorted by name (the text before the first `=`), so `?b=2&a=1` and
+/// `?a=1&b=2` agree; parameters that share a name keep their relative order, because
+/// `?x=1&x=2` and `?x=2&x=1` can mean different things. Names are compared exactly:
+/// case, escapes and empty segments are left alone, so nothing that differs is merged.
+pub fn sorted_query(query: &str) -> Cow<'_, str> {
+    if !query.contains('&') {
+        return Cow::Borrowed(query);
+    }
+    let mut params: Vec<&str> = query.split('&').collect();
+    fn name(p: &str) -> &str {
+        p.split_once('=').map_or(p, |(n, _)| n)
+    }
+    if params.windows(2).all(|w| name(w[0]) <= name(w[1])) {
+        return Cow::Borrowed(query); // already in order
+    }
+    params.sort_by(|a, b| name(a).cmp(name(b))); // stable
+    Cow::Owned(params.join("&"))
+}
+
 /// Rewrite `req`'s URI to its normalized path (query untouched). `Ok(())` when the request
 /// was already normal or has been rewritten; `Err(())` when the normalized URI cannot be
 /// rebuilt (the caller answers 400). Shared by the HTTPS pipeline and the plaintext :80
@@ -344,6 +365,45 @@ mod tests {
             }
         }
         assert!(checked > 1_000_000, "covered {checked} inputs");
+    }
+
+    #[test]
+    fn sorted_query_orders_by_name_and_keeps_repeated_names_in_order() {
+        let q = |s: &str| sorted_query(s).into_owned();
+        assert_eq!(q("b=2&a=1"), "a=1&b=2");
+        assert_eq!(q("c=3&a=1&b=2"), "a=1&b=2&c=3");
+        assert_eq!(q("x=2&x=1"), "x=2&x=1", "repeated names keep their order");
+        assert_eq!(q("y=0&x=2&x=1&a"), "a&x=2&x=1&y=0");
+        assert_eq!(q("b&a="), "a=&b", "a bare name sorts by its name");
+        // different parameters are never merged, case and escapes are compared exactly
+        assert_ne!(q("X=1"), q("x=1"));
+        assert_ne!(q("a=1&b=2"), q("a=1&b=3"));
+        assert_eq!(q("a=%2e&b=1"), "a=%2e&b=1");
+        assert_eq!(q(""), "");
+        assert_eq!(q("a=1"), "a=1");
+        assert!(
+            matches!(sorted_query("a=1&b=2"), Cow::Borrowed(_)),
+            "already ordered: no allocation"
+        );
+        assert!(matches!(sorted_query("a=1"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn sorted_query_is_idempotent_and_a_permutation() {
+        for s in [
+            "z=1&y=2&x=3&x=1&&a",
+            "b&a&c&b=2&b=1",
+            "=1&a=&=",
+            "q=1&Q=2&q=0",
+        ] {
+            let once = sorted_query(s).into_owned();
+            assert_eq!(sorted_query(&once), once, "{s}");
+            let mut a: Vec<&str> = s.split('&').collect();
+            let mut b: Vec<&str> = once.split('&').collect();
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "{s}: same parameters, only reordered");
+        }
     }
 
     #[test]
