@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`[server] tcp_user_timeout_secs`** (opt-in, Linux; default `0` = the kernel's own limit of about 15 minutes of retransmissions). Sets `TCP_USER_TIMEOUT` on client connections: data that stays unacknowledged, or unsent because the client's receive window is zero, for that long drops the connection. Keepalive only probes idle connections, so a client that vanishes while a response is in flight (power loss, a dropped NAT mapping) used to keep its descriptor, connection slot, per-IP slot and buffers for that long. Measured on Linux with the client's ACKs dropped: `tcp_user_timeout_secs = 10` closes the connection after 10.2 s; without it the connection was still established after 70 s. It also drops a client that stops reading for longer than the timeout (a slow reader was cut at ~26 s with a 5 s timeout), so choose a value above the longest pause you accept, for example `300`.
+
 ## [0.9.5] - 2026-10-01
 
 **Operations and correctness release: deploys stop waiting on idle connections, a recovered pool member gets traffic again, client IPs can be kept out of the logs, and the cache can serve byte ranges.** No breaking changes; one fix to the 0.9.4 load balancer. Read the notes below.

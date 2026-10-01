@@ -552,6 +552,31 @@ mod tests {
         assert_eq!(billing.next_probe_at_us.load(Ordering::Relaxed), 0);
     }
 
+    /// `tcp_user_timeout_secs` is a per-accept setting read from the live snapshot, so it must
+    /// survive a build (and therefore a hot reload).
+    #[test]
+    fn the_tcp_user_timeout_is_carried_in_the_snapshot() {
+        let cfg = parse_inline(
+            r#"
+            [server]
+            listen_http = "0.0.0.0:8080"
+            listen_https = "0.0.0.0:8443"
+            tcp_user_timeout_secs = 33
+            [tls]
+            cert_path = "/tmp/zion-test.crt"
+            key_path  = "/tmp/zion-test.key"
+            [upstreams]
+            api = "http://api:8000"
+            [[route]]
+            path = "/api/{*rest}"
+            upstream = "api"
+        "#,
+        );
+        let snap =
+            ResolvedAppConfig::try_build(&cfg, TEST_CONN_LIMIT_MAX).expect("test config builds");
+        assert_eq!(snap.tcp_user_timeout_secs, 33);
+    }
+
     /// Building a snapshot must not change the running DNS policy: a reload that is built but
     /// then rejected (or a build that is never published) leaves it alone. Only publishing
     /// applies it.

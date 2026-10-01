@@ -146,6 +146,30 @@ pub fn tune_accepted(stream: &tokio::net::TcpStream) {
 #[cfg(not(target_os = "linux"))]
 pub fn tune_accepted(_stream: &tokio::net::TcpStream) {}
 
+/// Default `TCP_USER_TIMEOUT`: off (the kernel's own limits). It is opt-in because the option
+/// also bounds a *slow reader*, see [`set_user_timeout`].
+pub const DEFAULT_TCP_USER_TIMEOUT_SECS: u64 = 0;
+
+/// Bound, on an accepted connection, how long data may stay **unacknowledged, or buffered but
+/// untransmitted because the peer's window is zero**, before the kernel drops the connection
+/// (`TCP_USER_TIMEOUT`, Linux; `0` = the kernel's own limits, about 15 minutes of retransmissions).
+///
+/// Keepalive cannot do the first half: it only probes an *idle* connection, and a connection with
+/// data in flight is never idle, so a peer that vanishes mid-response (power loss, a dropped NAT
+/// mapping, a yanked cable) keeps its file descriptor, connection slot, per-IP slot and buffers
+/// until the retransmission limit gives up. The second half is the price: a client that stops
+/// reading for longer than the timeout (a paused player with a full buffer, a very slow reader)
+/// is dropped too, which is why this is opt-in. Other platforms have no such option; no-op there.
+pub fn set_user_timeout(stream: &tokio::net::TcpStream, secs: u64) {
+    #[cfg(target_os = "linux")]
+    if secs > 0 {
+        let _ = socket2::SockRef::from(stream)
+            .set_tcp_user_timeout(Some(std::time::Duration::from_secs(secs)));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (stream, secs);
+}
+
 /// Default idle time before the kernel starts probing a silent connection.
 pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
 /// Seconds between probes, and probes sent before the connection is declared dead.
@@ -213,6 +237,38 @@ mod tests {
             );
             assert_eq!(sock.tcp_keepalive_retries().unwrap(), 3);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_user_timeout_is_set_and_zero_leaves_the_kernel_default() {
+        let s = connected().await;
+        let sock = socket2::SockRef::from(&s);
+        assert_eq!(
+            sock.tcp_user_timeout().unwrap(),
+            None,
+            "control: a fresh socket has none"
+        );
+        set_user_timeout(&s, 0);
+        assert_eq!(
+            sock.tcp_user_timeout().unwrap(),
+            None,
+            "0 = leave the kernel default"
+        );
+        set_user_timeout(&s, 90);
+        assert_eq!(
+            sock.tcp_user_timeout().unwrap(),
+            Some(std::time::Duration::from_secs(90))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_user_timeout_never_breaks_a_connection_on_any_platform() {
+        // a no-op off Linux; on Linux it must not disturb an established connection
+        let s = connected().await;
+        set_user_timeout(&s, 120);
+        set_user_timeout(&s, 0);
+        assert!(s.peer_addr().is_ok());
     }
 
     #[tokio::test]

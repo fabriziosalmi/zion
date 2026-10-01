@@ -254,6 +254,16 @@ pub struct ServerConfig {
     /// dials use the 60 s default.
     #[serde(default = "default_tcp_keepalive_secs")]
     pub tcp_keepalive_secs: u64,
+    /// `TCP_USER_TIMEOUT` on client connections (Linux only; seconds; default `0` = the kernel's
+    /// own limit of about 15 minutes of retransmissions). Data sent to a client that stays
+    /// unacknowledged, **or stays unsent because the client's receive window is zero**, for this
+    /// long drops the connection. It frees the descriptor, connection slot and buffers of a client
+    /// that vanished *while a response was in flight* (keepalive only probes idle connections),
+    /// but it also drops a client that stops reading for longer than this (a paused player with a
+    /// full buffer, a very slow reader), hence opt-in: pick a value comfortably above the longest
+    /// pause you accept (for example `300`). Retuned live on reload for new connections.
+    #[serde(default = "default_tcp_user_timeout_secs")]
+    pub tcp_user_timeout_secs: u64,
     /// Log format: "text" (default) or "json".
     #[serde(default = "default_log_format")]
     pub log_format: String,
@@ -304,6 +314,10 @@ pub struct ServerConfig {
 
 fn default_xff_mode() -> String {
     "append".to_string()
+}
+
+fn default_tcp_user_timeout_secs() -> u64 {
+    crate::net::DEFAULT_TCP_USER_TIMEOUT_SECS
 }
 
 fn default_tcp_keepalive_secs() -> u64 {
@@ -2258,6 +2272,29 @@ mod tests {
         assert_eq!(parse("").server.log_queue_lines, 8192);
         assert_eq!(parse("log_queue_lines = 100").server.log_queue_lines, 100);
         assert_eq!(parse("log_queue_lines = 0").server.log_queue_lines, 0);
+    }
+
+    #[test]
+    fn tcp_user_timeout_secs_is_opt_in_and_can_be_set() {
+        let parse = |extra: &str| -> ZionConfig {
+            toml::from_str(&format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n{extra}\n[tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstream.u]\nurl=\"http://a:1\"\n[[route]]\npath=\"/{{*r}}\"\nupstream=\"u\"\n"
+            ))
+            .unwrap()
+        };
+        assert_eq!(parse("").server.tcp_user_timeout_secs, 0, "opt-in");
+        assert_eq!(
+            parse("tcp_user_timeout_secs = 30")
+                .server
+                .tcp_user_timeout_secs,
+            30
+        );
+        assert_eq!(
+            parse("tcp_user_timeout_secs = 0")
+                .server
+                .tcp_user_timeout_secs,
+            0
+        );
     }
 
     #[test]
