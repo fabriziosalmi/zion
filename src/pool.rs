@@ -71,8 +71,11 @@ struct Slot {
 pub struct MemberStats {
     /// Requests currently waiting for this member's response headers.
     inflight: AtomicU32,
-    /// Peak-EWMA of the time to response headers, microseconds (0 = no sample yet).
+    /// Peak-EWMA of the time to response headers, microseconds (0 = no sample yet), as of
+    /// `ewma_at_ms`. It is *aged* when read (see [`decayed`]), not only when a sample arrives.
     ewma_us: AtomicU64,
+    /// When `ewma_us` was last updated (ms, the pool clock).
+    ewma_at_ms: AtomicU64,
     slots: Mutex<[Slot; WINDOW_SLOTS]>,
     /// 0 = in rotation; otherwise the time (ms) the ejection ends.
     ejected_until_ms: AtomicU64,
@@ -93,6 +96,22 @@ impl Default for MemberStats {
 /// weight, so one fast response does not erase the memory of a slow period.
 const EWMA_DECAY_NUM: u64 = 7;
 const EWMA_DECAY_DEN: u64 = 8;
+/// A latency estimate loses half its value every this long without a new sample. Without that, a
+/// member that was once slow (or came back from an ejection) kept its old estimate for good: at
+/// low load it was never picked again, so it never got the sample that would correct it.
+const EWMA_HALF_LIFE_MS: u64 = 5_000;
+
+/// `v` after `dt_ms` without a sample: halved every [`EWMA_HALF_LIFE_MS`], with a straight line
+/// between the halvings (integer arithmetic, no floats on the request path).
+fn decayed(v: u64, dt_ms: u64) -> u64 {
+    let halvings = dt_ms / EWMA_HALF_LIFE_MS;
+    if halvings >= 40 {
+        return 0;
+    }
+    let v = v >> halvings;
+    v - v * (dt_ms % EWMA_HALF_LIFE_MS) / (2 * EWMA_HALF_LIFE_MS)
+}
+
 /// Latency assumed for a member with no sample yet: small, so a new member gets traffic.
 const UNKNOWN_LATENCY_US: u64 = 1_000;
 
@@ -101,6 +120,7 @@ impl MemberStats {
         Self {
             inflight: AtomicU32::new(0),
             ewma_us: AtomicU64::new(0),
+            ewma_at_ms: AtomicU64::new(0),
             slots: Mutex::new([Slot::default(); WINDOW_SLOTS]),
             ejected_until_ms: AtomicU64::new(0),
             consecutive_ejections: AtomicU32::new(0),
@@ -143,8 +163,12 @@ impl MemberStats {
         self.inflight.load(Relaxed)
     }
 
-    pub fn ewma_us(&self) -> u64 {
-        self.ewma_us.load(Relaxed)
+    /// The latency estimate as of `now_ms`, aged by the time since its last sample.
+    pub fn ewma_us(&self, now_ms: u64) -> u64 {
+        decayed(
+            self.ewma_us.load(Relaxed),
+            now_ms.saturating_sub(self.ewma_at_ms.load(Relaxed)),
+        )
     }
 
     pub fn ejections(&self) -> u64 {
@@ -156,35 +180,30 @@ impl MemberStats {
         until != 0 && now_ms < until
     }
 
-    /// Fold one response-header latency into the peak EWMA.
-    pub fn observe_latency(&self, sample_us: u64) {
+    /// Fold one response-header latency, taken at `now_ms`, into the peak EWMA. The estimate it
+    /// is folded into is the *aged* one, so a member that has been quiet for a while is judged
+    /// on the new sample rather than on stale history.
+    pub fn observe_latency(&self, sample_us: u64, now_ms: u64) {
         let sample = sample_us.max(1);
-        let mut cur = self.ewma_us.load(Relaxed);
+        let mut raw = self.ewma_us.load(Relaxed);
         loop {
-            let next = if cur == 0 || sample >= cur {
+            let base = decayed(raw, now_ms.saturating_sub(self.ewma_at_ms.load(Relaxed)));
+            let next = if base == 0 || sample >= base {
                 sample // first sample, or a spike: adopt immediately
             } else {
-                (cur * EWMA_DECAY_NUM + sample) / EWMA_DECAY_DEN
+                (base * EWMA_DECAY_NUM + sample) / EWMA_DECAY_DEN
             };
             match self
                 .ewma_us
-                .compare_exchange_weak(cur, next, Relaxed, Relaxed)
+                .compare_exchange_weak(raw, next, Relaxed, Relaxed)
             {
-                Ok(_) => return,
-                Err(seen) => cur = seen,
+                Ok(_) => {
+                    self.ewma_at_ms.store(now_ms, Relaxed);
+                    return;
+                }
+                Err(seen) => raw = seen,
             }
         }
-    }
-
-    /// The load score used by [`pick`]: lower is better. Falls back to the probe latency
-    /// (`probe_us`) until real traffic has produced a sample.
-    pub fn score(&self, probe_us: u64) -> u64 {
-        let lat = match self.ewma_us.load(Relaxed) {
-            0 if probe_us > 0 => probe_us,
-            0 => UNKNOWN_LATENCY_US,
-            v => v,
-        };
-        (u64::from(self.inflight.load(Relaxed)) + 1).saturating_mul(lat)
     }
 
     fn lock_slots(&self) -> std::sync::MutexGuard<'_, [Slot; WINDOW_SLOTS]> {
@@ -236,6 +255,44 @@ impl Drop for InFlight<'_> {
 /// Probe latency at or above which a healthy member is treated as a gray failure.
 const GRAY_FAILURE_US: u64 = 2_000_000;
 
+/// True when `b` should get the request rather than `a`. Each side is its load times its latency
+/// estimate, with one refinement: a member with **no estimate** (new, ejected and back, or quiet for
+/// so long that its estimate has faded) is assumed to be as fast as the other candidate until it
+/// has been measured, so the two compete on load alone. Scoring it with a fixed guess instead made
+/// it lose to any peer faster than the guess and stay unmeasured.
+fn b_is_better(
+    a: Option<&crate::health::UpstreamHealth>,
+    b: Option<&crate::health::UpstreamHealth>,
+    now_ms: u64,
+) -> bool {
+    let (a, b) = match (a, b) {
+        (Some(a), Some(b)) => (a, b),
+        (None, _) => return false, // an untracked member is optimistic: it wins
+        (_, None) => return true,
+    };
+    let (ea, eb) = (a.pool.ewma_us(now_ms), b.pool.ewma_us(now_ms));
+    let (la, lb) = match (ea, eb) {
+        (0, 0) => (
+            fallback_latency(a.latency_us.load(Relaxed)),
+            fallback_latency(b.latency_us.load(Relaxed)),
+        ),
+        (0, v) => (v, v),
+        (v, 0) => (v, v),
+        (x, y) => (x, y),
+    };
+    let load = |h: &crate::health::UpstreamHealth| u64::from(h.pool.inflight()) + 1;
+    load(b).saturating_mul(lb) < load(a).saturating_mul(la)
+}
+
+/// Latency to assume for a member with no estimate, when its peer has none either.
+fn fallback_latency(probe_us: u64) -> u64 {
+    if probe_us > 0 {
+        probe_us
+    } else {
+        UNKNOWN_LATENCY_US
+    }
+}
+
 /// Choose a member of `urls` for one request. `rand(n)` returns a uniform index below `n`.
 /// `None` only when there is no member at all or every member is down.
 pub fn pick<'a>(
@@ -271,16 +328,17 @@ pub fn pick<'a>(
                 })
                 .find(|&j| fully_eligible(&urls[j]));
             if let Some(j) = second {
-                let score = |u: &String| {
-                    health
-                        .get(u.as_str())
-                        .map_or(0, |h| h.pool.score(h.latency_us.load(Relaxed)))
-                };
-                return Some(if score(&urls[j]) < score(&urls[i]) {
-                    &urls[j]
-                } else {
-                    &urls[i]
-                });
+                return Some(
+                    if b_is_better(
+                        health.get(urls[i].as_str()).map(|h| &**h),
+                        health.get(urls[j].as_str()).map(|h| &**h),
+                        now_ms,
+                    ) {
+                        &urls[j]
+                    } else {
+                        &urls[i]
+                    },
+                );
             }
         }
     }
@@ -323,12 +381,11 @@ pub fn pick<'a>(
                 if j >= i {
                     j += 1; // distinct
                 }
-                let score = |u: &&String| {
-                    health
-                        .get(u.as_str())
-                        .map_or(0, |h| h.pool.score(h.latency_us.load(Relaxed)))
-                };
-                if score(&c[j]) < score(&c[i]) {
+                if b_is_better(
+                    health.get(c[i].as_str()).map(|h| &**h),
+                    health.get(c[j].as_str()).map(|h| &**h),
+                    now_ms,
+                ) {
                     Some(c[j])
                 } else {
                     Some(c[i])
@@ -350,7 +407,7 @@ pub fn report(
 ) {
     let Some(me) = health.get(url) else { return };
     if let Some(l) = latency_us {
-        me.pool.observe_latency(l);
+        me.pool.observe_latency(l, now_ms);
     }
     let guard = me.pool.outlier.load();
     let Some(cfg) = guard.as_deref() else { return };
@@ -413,6 +470,9 @@ pub fn report(
         .saturating_add(1)
         .min(10);
     me.pool.ejections.fetch_add(1, Relaxed);
+    // It gets no traffic while it is out, so its old estimate would only go stale: forget it, and
+    // measure it afresh when it returns.
+    me.pool.ewma_us.store(0, Relaxed);
     me.pool.ejected_until_ms.store(
         now_ms + u64::from(cfg.eject_secs) * 1000 * u64::from(streak),
         Relaxed,
@@ -465,59 +525,68 @@ mod tests {
     #[test]
     fn a_spike_is_adopted_at_once_and_forgotten_slowly() {
         let s = MemberStats::new();
-        s.observe_latency(10_000);
-        assert_eq!(s.ewma_us(), 10_000, "first sample");
-        s.observe_latency(200_000);
+        s.observe_latency(10_000, 0);
+        assert_eq!(s.ewma_us(0), 10_000, "first sample");
+        s.observe_latency(200_000, 0);
         assert_eq!(
-            s.ewma_us(),
+            s.ewma_us(0),
             200_000,
             "a slower sample replaces it immediately"
         );
-        s.observe_latency(10_000);
+        s.observe_latency(10_000, 0);
         assert_eq!(
-            s.ewma_us(),
+            s.ewma_us(0),
             (200_000 * 7 + 10_000) / 8,
             "a faster one is averaged in"
         );
         for _ in 0..3 {
-            s.observe_latency(10_000);
+            s.observe_latency(10_000, 0);
         }
         assert!(
-            s.ewma_us() > 100_000,
+            s.ewma_us(0) > 100_000,
             "three fast samples do not erase the memory of a slow period"
         );
         for _ in 0..60 {
-            s.observe_latency(10_000);
+            s.observe_latency(10_000, 0);
         }
-        assert!(s.ewma_us() < 12_000, "but it does recover");
+        assert!(s.ewma_us(0) < 12_000, "but it does recover");
     }
 
     #[test]
-    fn score_is_load_times_latency_with_sane_fallbacks() {
-        let s = MemberStats::new();
-        assert_eq!(s.score(0), UNKNOWN_LATENCY_US, "no sample, no probe: small");
-        assert_eq!(s.score(40_000), 40_000, "falls back to the probe latency");
-        s.observe_latency(5_000);
-        let _a = s.begin();
-        let _b = s.begin();
-        assert_eq!(s.inflight(), 2);
-        assert_eq!(
-            s.score(40_000),
-            3 * 5_000,
-            "(in_flight + 1) × measured latency"
+    fn a_member_with_no_estimate_competes_with_its_peers_latency_not_a_fixed_guess() {
+        let mk = || UpstreamHealth::new_healthy();
+        let (a, b) = (mk(), mk());
+        // no estimate on either side: the probe latency decides, then the fixed fallback
+        a.latency_us.store(40_000, Relaxed);
+        b.latency_us.store(1_000, Relaxed);
+        assert!(b_is_better(Some(&a), Some(&b), 0));
+        assert!(!b_is_better(Some(&b), Some(&a), 0));
+        // a is measured (200 us, a very fast backend), b is not: b is assumed as fast, so the two
+        // compete on load alone: equal load keeps a, one request in flight on a hands b the next
+        a.pool.observe_latency(200, 0);
+        assert!(
+            !b_is_better(Some(&a), Some(&b), 0),
+            "tie: keep the first draw"
         );
-        drop(_a);
-        assert_eq!(s.inflight(), 1);
+        let _busy = a.pool.begin();
+        assert!(
+            b_is_better(Some(&a), Some(&b), 0),
+            "a is busier: the unmeasured member gets it"
+        );
+        // both measured: load x latency as before
+        b.pool.observe_latency(5_000, 0);
+        assert!(!b_is_better(Some(&a), Some(&b), 0), "b is 25x slower");
+        // an untracked member is optimistic
+        assert!(b_is_better(Some(&a), None, 0));
+        assert!(!b_is_better(None, Some(&a), 0));
     }
-
-    // ── selection ──────────────────────────────────────────────────────────
 
     #[test]
     fn p2c_takes_the_less_loaded_of_two() {
         let (h, urls) = pool_of(3);
-        stats(&h, &urls[0]).observe_latency(10_000);
-        stats(&h, &urls[1]).observe_latency(10_000);
-        stats(&h, &urls[2]).observe_latency(10_000);
+        stats(&h, &urls[0]).observe_latency(10_000, 0);
+        stats(&h, &urls[1]).observe_latency(10_000, 0);
+        stats(&h, &urls[2]).observe_latency(10_000, 0);
         let _busy: Vec<_> = (0..5).map(|_| stats(&h, &urls[0]).begin()).collect();
         // sampled pair is always (m0, m1): the idle one wins
         let mut r = script(&[0, 0]); // i = 0, then j = 0 → bumped past i to 1
@@ -527,9 +596,9 @@ mod tests {
     #[test]
     fn busy_and_slow_members_get_less_traffic_in_proportion() {
         let (h, urls) = pool_of(3);
-        stats(&h, &urls[0]).observe_latency(10_000); // fast
-        stats(&h, &urls[1]).observe_latency(10_000); // fast
-        stats(&h, &urls[2]).observe_latency(100_000); // 10x slower
+        stats(&h, &urls[0]).observe_latency(10_000, 0); // fast
+        stats(&h, &urls[1]).observe_latency(10_000, 0); // fast
+        stats(&h, &urls[2]).observe_latency(100_000, 0); // 10x slower
         let mut rng = fastrand::Rng::with_seed(7);
         let mut r = |n: usize| rng.usize(..n);
         let mut counts = [0u32; 3];
@@ -719,7 +788,7 @@ mod tests {
         feed(&h, &urls, 0, false, 100, 1_000);
         assert!(!stats(&h, &urls[0]).is_ejected(1_000));
         // but its latency is still tracked for P2C
-        assert!(stats(&h, &urls[0]).ewma_us() > 0);
+        assert!(stats(&h, &urls[0]).ewma_us(0) > 0);
     }
 
     #[test]
@@ -826,5 +895,85 @@ mod tests {
             let got = pick(&h, &urls, Algorithm::P2c, 1_000, &mut r).unwrap();
             assert_ne!(got, &urls[0]);
         }
+    }
+
+    // ── the latency estimate ages ──────────────────────────────────────────
+
+    #[test]
+    fn the_estimate_halves_every_half_life_and_eventually_vanishes() {
+        let hl = EWMA_HALF_LIFE_MS;
+        assert_eq!(decayed(80_000, 0), 80_000);
+        assert_eq!(decayed(80_000, hl), 40_000);
+        assert_eq!(decayed(80_000, 2 * hl), 20_000);
+        let mid = decayed(80_000, hl / 2); // between 1 and 1/2, never above either bound
+        assert!((56_000..=60_000).contains(&mid), "{mid}");
+        assert!(decayed(80_000, 10 * hl) < 100);
+        assert_eq!(decayed(80_000, 40 * hl), 0);
+        assert_eq!(decayed(0, 5 * hl), 0);
+        // monotonic: never increases with time
+        let mut last = u64::MAX;
+        for t in (0..60 * hl).step_by(997) {
+            let v = decayed(1_000_000, t);
+            assert!(v <= last);
+            last = v;
+        }
+    }
+
+    #[test]
+    fn a_member_that_was_once_slow_is_not_starved_for_good_at_low_load() {
+        let (h, urls) = pool_of(2);
+        stats(&h, &urls[0]).observe_latency(500_000, 0); // one slow spike
+        let mut r = script(&[0, 1]);
+        // soon after: the other member is steadily faster, so the slow one is (rightly) avoided
+        stats(&h, &urls[1]).observe_latency(2_000, 1_000);
+        for _ in 0..20 {
+            assert_eq!(
+                pick(&h, &urls, Algorithm::P2c, 1_000, &mut r),
+                Some(&urls[1])
+            );
+        }
+        // a minute later with no traffic to it, the spike is forgotten: it is tried again
+        stats(&h, &urls[1]).observe_latency(2_000, 60_000);
+        let picked_slow = (0..20)
+            .filter(|_| pick(&h, &urls, Algorithm::P2c, 60_000, &mut r) == Some(&urls[0]))
+            .count();
+        assert!(
+            picked_slow > 0,
+            "a member judged on a minute-old spike must get traffic again"
+        );
+        // and one fresh sample puts it back in proper competition
+        stats(&h, &urls[0]).observe_latency(2_500, 60_000);
+        assert!(
+            stats(&h, &urls[0]).ewma_us(60_000) < 3_000,
+            "judged on the new sample, not the old spike"
+        );
+    }
+
+    #[test]
+    fn a_new_sample_is_folded_into_the_aged_estimate_not_the_stale_one() {
+        let s = MemberStats::new();
+        s.observe_latency(500_000, 0);
+        s.observe_latency(2_000, 100_000); // 100 s later
+        assert_eq!(s.ewma_us(100_000), 2_000, "the 500 ms spike is long gone");
+        s.observe_latency(500_000, 100_000);
+        assert_eq!(
+            s.ewma_us(100_000),
+            500_000,
+            "a new spike is still adopted at once"
+        );
+    }
+
+    #[test]
+    fn an_ejected_member_is_measured_afresh_when_it_returns() {
+        let (h, urls) = pool_of(2);
+        stats(&h, &urls[0]).observe_latency(300_000, 1_000);
+        feed(&h, &urls, 1, true, 100, 1_000);
+        feed(&h, &urls, 0, false, 10, 1_000);
+        assert!(stats(&h, &urls[0]).is_ejected(1_000));
+        assert_eq!(
+            stats(&h, &urls[0]).ewma_us(1_000),
+            0,
+            "its old estimate is dropped on ejection"
+        );
     }
 }

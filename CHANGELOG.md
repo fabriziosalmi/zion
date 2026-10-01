@@ -6,6 +6,8 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Fixed
 
+- **A pool member that was once slow is no longer avoided for good.** The load estimate that `p2c` uses (peak-EWMA latency) only changed when a sample arrived, so a member that had one slow period, or that came back from an ejection, kept its old estimate; with two members and low load it was never picked again, so it never got the sample that would correct it. The estimate now fades with time (half every 5 s without a sample), a new sample is folded into the faded estimate, an ejected member's estimate is dropped so it is measured afresh when it returns, and a member with no estimate is assumed to be as fast as the member it is compared with (it used to be scored with a fixed 1 ms guess, so it lost to any faster backend and stayed unmeasured: the cool-down test failed 4 runs in 5 on a release build). In a probe with one member 400 ms slow for 4 s and then healthy, the old build kept it at 0% for 40 s; the new one brings it back after about 25 s (a 200× slower period; less for a milder one).
+
 - **Shutdown no longer waits for idle keep-alive connections.** On SIGTERM zion stopped accepting and then waited for open connections to finish, but an idle keep-alive connection never finishes by itself, so every deploy waited out its idle timeout (14 s in a probe with a single idle HTTP/1.1 connection, up to the 30 s drain limit). Connections are now told to wind down when the drain starts: idle ones close at once, HTTP/1 closes after the response in flight (`Connection: close`), HTTP/2 sends `GOAWAY` and closes once its streams are done. A request being served is finished, never cut.
 
 ## [0.9.4] - 2026-10-01
