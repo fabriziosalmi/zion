@@ -297,7 +297,7 @@ impl LogFormat {
 /// `otel` feature is enabled — kept apart so toggling it doesn't risk
 /// double-installing the global subscriber.
 pub fn init_subscriber(format: LogFormat, log_queue_lines: usize) {
-    crate::logq::install(log_queue_lines);
+    crate::logq::install(log_queue_lines, matches!(format, LogFormat::Json));
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("zion=info,warn"));
 

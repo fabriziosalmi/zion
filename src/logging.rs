@@ -131,7 +131,7 @@ fn format_error(json: bool, color: bool, event: &str, msg: &str) -> String {
     }
 }
 
-fn now() -> String {
+pub(crate) fn now() -> String {
     // ISO 8601 UTC with microsecond precision — no chrono needed
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

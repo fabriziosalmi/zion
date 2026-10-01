@@ -6,20 +6,34 @@
 //! driver, a `| tee` on a slow disk) that `write` blocks, and with it the request worker that
 //! logged: a logging problem becomes a latency, then an availability problem.
 //!
-//! [`LogQueue`] puts a bounded queue between the two. Producers `try_send` a whole formatted
+//! [`LogQueue`](crate::logq::LogQueue) puts a bounded queue between the two. Producers `try_send` a whole formatted
 //! line and never wait; one dedicated thread owns the sink and writes lines in order. When the
-//! queue is full the *new* line is dropped and counted ([`DROPPED`], `zion_log_lines_dropped_total`),
+//! queue is full the *new* line is dropped and counted ([`DROPPED`](crate::logq::DROPPED), `zion_log_lines_dropped_total`),
 //! and the writer thread says so on the sink the next time it can write, so loss is never silent.
-//! [`flush`] waits (bounded) for the queue to drain, for shutdown and for the panic hook.
+//! [`flush`](crate::logq::flush) waits (bounded) for the queue to drain, for shutdown and for the panic hook.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Lines dropped because the queue was full (or the writer thread had died).
 pub static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// True when the process logs JSON: the drop notice then has to be a JSON object too, or it
+/// would poison a JSON log pipeline at the moment it matters most.
+static JSON: AtomicBool = AtomicBool::new(false);
+
+/// The line announcing `n` lost lines, in the process's log format.
+fn drop_notice(json: bool, ts: &str, n: u64) -> String {
+    let msg = format!("{n} log line(s) dropped: the log sink is slower than the log rate");
+    if json {
+        format!(r#"{{"ts":"{ts}","level":"warn","event":"log_dropped","msg":"{msg}"}}"#) + "\n"
+    } else {
+        format!("zion: {msg}\n")
+    }
+}
 
 /// A bounded, lossy, order-preserving line queue in front of a sink.
 pub struct LogQueue {
@@ -42,15 +56,22 @@ impl LogQueue {
                 for line in rx {
                     let lost = d.load(Relaxed);
                     if lost > reported {
-                        let note = format!(
-                            "zion: {} log line(s) dropped: the log sink is slower than the log rate\n",
-                            lost - reported
+                        let note = drop_notice(
+                            JSON.load(Relaxed),
+                            &crate::logging::now(),
+                            lost - reported,
                         );
-                        let _ = sink.write_all(note.as_bytes());
-                        reported = lost;
+                        // announced only once it was actually written
+                        if sink.write_all(note.as_bytes()).is_ok() {
+                            reported = lost;
+                        }
                     }
-                    let _ = sink.write_all(&line);
-                    let _ = sink.flush();
+                    // A record the sink refuses (its reader went away) is a lost line like
+                    // any other: counted, so the metric never under-reports.
+                    if sink.write_all(&line).and_then(|()| sink.flush()).is_err() {
+                        d.fetch_add(1, Relaxed);
+                        DROPPED.fetch_add(1, Relaxed);
+                    }
                     p.fetch_sub(1, Relaxed);
                 }
             });
@@ -102,7 +123,8 @@ static GLOBAL: OnceLock<LogQueue> = OnceLock::new();
 
 /// Install the process-wide queue over stderr. Idempotent; `capacity == 0` leaves output
 /// synchronous (the previous behaviour).
-pub fn install(capacity: usize) {
+pub fn install(capacity: usize, json: bool) {
+    JSON.store(json, Relaxed);
     if capacity > 0 {
         GLOBAL.get_or_init(|| LogQueue::spawn(capacity, Box::new(std::io::stderr())));
     }
@@ -132,17 +154,29 @@ pub fn line(line: &str) {
 #[derive(Clone, Copy)]
 pub struct MakeLogWriter;
 
+/// One event's writer. The fmt layer may emit an event in several `write` calls, so the queue
+/// variant gathers them and enqueues the finished event once, when the writer is dropped: events
+/// never interleave, a drop loses a whole event, and the queue counts events, not fragments.
 pub enum LogWriter {
-    Queue(&'static LogQueue),
+    Queue(&'static LogQueue, Vec<u8>),
     Stderr(std::io::Stderr),
+}
+
+impl Drop for LogWriter {
+    fn drop(&mut self) {
+        if let Self::Queue(q, buf) = self {
+            if !buf.is_empty() {
+                q.push(buf);
+            }
+        }
+    }
 }
 
 impl Write for LogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
-            // one `write` is one formatted event: queue it whole; a drop is counted, not an error
-            Self::Queue(q) => {
-                q.push(buf);
+            Self::Queue(_, event) => {
+                event.extend_from_slice(buf);
                 Ok(buf.len())
             }
             Self::Stderr(s) => s.write(buf),
@@ -150,7 +184,7 @@ impl Write for LogWriter {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
-            Self::Queue(_) => Ok(()),
+            Self::Queue(..) => Ok(()),
             Self::Stderr(s) => s.flush(),
         }
     }
@@ -160,7 +194,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeLogWriter {
     type Writer = LogWriter;
     fn make_writer(&'a self) -> LogWriter {
         match GLOBAL.get() {
-            Some(q) => LogWriter::Queue(q),
+            Some(q) => LogWriter::Queue(q, Vec::with_capacity(256)),
             None => LogWriter::Stderr(std::io::stderr()),
         }
     }
@@ -301,5 +335,127 @@ mod tests {
                 "producer {t} reordered"
             );
         }
+    }
+
+    #[test]
+    fn an_event_written_in_pieces_is_one_queued_line() {
+        // A stalled sink keeps the queue from draining, so the count is deterministic: three
+        // events written in three pieces each must take three slots, not nine.
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let out = Collect::default();
+        let q: &'static LogQueue = Box::leak(Box::new(LogQueue::spawn(
+            4,
+            Box::new(Stalled {
+                gate: gate.clone(),
+                out: out.clone(),
+            }),
+        )));
+        for n in 0..3 {
+            let mut w = LogWriter::Queue(q, Vec::new());
+            w.write_all(b"{\"a\":").unwrap();
+            w.write_all(format!("{n}").as_bytes()).unwrap();
+            w.write_all(b"}\n").unwrap();
+        } // dropped here: the event is complete
+        assert_eq!(
+            q.dropped(),
+            0,
+            "three events, not nine fragments, against a capacity of 4"
+        );
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        assert!(q.flush(Duration::from_secs(5)));
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text, "{\"a\":0}\n{\"a\":1}\n{\"a\":2}\n",
+            "whole events, in order"
+        );
+    }
+
+    #[test]
+    fn the_drop_notice_follows_the_log_format() {
+        let text = drop_notice(false, "T", 3);
+        assert_eq!(
+            text,
+            "zion: 3 log line(s) dropped: the log sink is slower than the log rate\n"
+        );
+        let json = drop_notice(true, "2026-10-01T00:00:00Z", 3);
+        let v: serde_json::Value = serde_json::from_str(json.trim_end()).expect("valid JSON");
+        assert_eq!(v["level"], "warn");
+        assert_eq!(v["event"], "log_dropped");
+        assert!(v["msg"]
+            .as_str()
+            .unwrap()
+            .starts_with("3 log line(s) dropped"));
+        assert!(json.ends_with('\n') && json.matches('\n').count() == 1);
+    }
+
+    /// A sink whose reader has gone away.
+    struct Broken;
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn lines_a_broken_sink_refuses_are_counted_as_lost() {
+        let q = LogQueue::spawn(16, Box::new(Broken));
+        for _ in 0..5 {
+            q.push(b"x\n");
+        }
+        assert!(q.flush(Duration::from_secs(5)));
+        assert_eq!(q.dropped(), 5, "every refused line is a counted loss");
+    }
+
+    /// Refuses the first drop notice it is given, then behaves.
+    struct FailFirstNote {
+        failed: bool,
+        inner: Stalled,
+    }
+    impl Write for FailFirstNote {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if !self.failed && String::from_utf8_lossy(b).contains("log line(s) dropped") {
+                self.failed = true;
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            self.inner.write(b)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_notice_the_sink_refused_is_announced_again_not_forgotten() {
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let out = Collect::default();
+        let q = LogQueue::spawn(
+            4,
+            Box::new(FailFirstNote {
+                failed: false,
+                inner: Stalled {
+                    gate: gate.clone(),
+                    out: out.clone(),
+                },
+            }),
+        );
+        for _ in 0..100 {
+            q.push(b"x\n");
+        }
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        assert!(q.flush(Duration::from_secs(5)));
+        q.push(b"after\n");
+        assert!(q.flush(Duration::from_secs(5)));
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let announced: u64 = text
+            .lines()
+            .filter(|l| l.contains("log line(s) dropped"))
+            .map(|l| l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap())
+            .sum();
+        assert_eq!(announced, q.dropped(), "the lost notice is retried: {text}");
     }
 }

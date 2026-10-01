@@ -65,7 +65,13 @@ lines_rounded=$(( (lines_total + 50) / 100 * 100 ))
 # Cargo is ground truth: a static `grep '#[test]'` undercounts because
 # proptest! macros expand into runtime test cases that share a single
 # attribute in source.
-test_output=$(cargo test --release --lib --bin zion --test chaos --quiet 2>&1 || true)
+# A failing or non-compiling test run must not produce a README number: summing only the
+# binaries that passed would publish a partial count.
+if ! test_output=$(cargo test --release --lib --bin zion --test chaos --quiet 2>&1); then
+    echo "FATAL: cargo test failed; refusing to derive the README test count from a partial run" >&2
+    printf "%s\n" "$test_output" | tail -20 >&2
+    exit 3
+fi
 tests=$(printf "%s" "$test_output" \
     | grep -E '^test result: ok\. [0-9]+ passed' \
     | awk '{s+=$4} END {print s}')
