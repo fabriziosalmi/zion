@@ -820,9 +820,9 @@ impl Metrics {
                 ),
                 (
                     "zion_upstream_peak_ewma_seconds",
-                    "Peak-EWMA of this pool member's time to response headers, measured on real requests (0 = no sample yet).",
+                    "Peak-EWMA of this pool member's time to response headers, measured on real requests, faded by the time since its last sample (0 = no current estimate: never sampled, faded away, or reset by an ejection).",
                     "gauge",
-                    Box::new(|s| format!("{:.6}", s.ewma_us() as f64 / 1_000_000.0)),
+                    Box::new(|s| format!("{:.6}", s.ewma_us(crate::breaker::now_ms()) as f64 / 1_000_000.0)),
                 ),
                 (
                     "zion_upstream_ejected",
@@ -1689,7 +1689,9 @@ mod tests {
     fn pool_member_series_appear_only_for_pool_members() {
         let member = std::sync::Arc::new(crate::health::UpstreamHealth::new_healthy());
         member.pool.set_pool_member(true);
-        member.pool.observe_latency(25_000);
+        member
+            .pool
+            .observe_latency(25_000, crate::breaker::now_ms());
         let _in_flight = member.pool.begin();
         let single = std::sync::Arc::new(crate::health::UpstreamHealth::new_healthy());
         let mut map = fnv::FnvHashMap::default();
@@ -1707,7 +1709,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("zion_upstream_peak_ewma_seconds{upstream=\"http://pooled:1\"} 0.025000"),
+            out.contains("zion_upstream_peak_ewma_seconds{upstream=\"http://pooled:1\"} 0.02"),
             "{out}"
         );
         assert!(out.contains("zion_upstream_ejected{upstream=\"http://pooled:1\"} 0"));

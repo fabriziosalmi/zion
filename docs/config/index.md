@@ -114,8 +114,11 @@ An upstream with several endpoints (`urls = [...]`) assigns each request to a me
 
 - **`p2c`** (power of two choices): two members are drawn at random and the request goes to the
   one with the lower `(in-flight requests + 1) × peak-EWMA latency`. The latency is measured on
-  **real requests** (time to response headers) and rises at once on a slow response but is
-  forgotten slowly. Load spreads in proportion to speed, a busy member is never piled on, and a
+  **real requests** (time to response headers). It rises at once on a slow response and fades
+  with time (it halves every 5 s without a new sample), so a member that was slow once is not
+  avoided for good: it is tried again once its estimate has faded (about 35 s after a 200× slower
+  period, less for a milder one), and a member that was ejected is measured afresh when it
+  returns (a member with no estimate is assumed as fast as the one it is compared with). Load spreads in proportion to speed, a busy member is never piled on, and a
   member that just got slower stops receiving most traffic within a few responses instead of
   after the next 30 s probe. Members that are down, in gray failure (probe latency over 2 s) or
   ejected are skipped unless that would leave none (the pool still answers rather than 503).

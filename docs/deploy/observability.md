@@ -52,7 +52,7 @@ feature-gated series (absent, not zero, without the feature) is called out.
 | `zion_upstream_circuit_trips_total{upstream}` | counter | Times the circuit opened |
 | `zion_upstream_circuit_rejected_total{upstream}` | counter | Requests rejected because the circuit was open |
 | `zion_upstream_inflight{upstream}` | gauge | Requests waiting for a response from this pool member (pools of two or more endpoints only) |
-| `zion_upstream_peak_ewma_seconds{upstream}` | gauge | The member's peak-EWMA time to response headers, measured on real requests (`0` until it has served one) |
+| `zion_upstream_peak_ewma_seconds{upstream}` | gauge | The member's peak-EWMA time to response headers, measured on real requests and faded by the time since its last sample (`0` = no current estimate: never sampled, faded away, or reset by an ejection) |
 | `zion_upstream_ejected{upstream}` | gauge | `1` while [outlier detection](/config/#pools-load-balancing-and-outlier-detection) has ejected this member |
 | `zion_upstream_ejections_total{upstream}` | counter | Times this member was ejected |
 | `zion_upstream_failovers_total` | counter | Requests retried on another upstream after a transport failure. A steady rate with every `zion_upstream_up` at `1` means members are flapping |
