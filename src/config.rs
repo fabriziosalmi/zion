@@ -790,6 +790,11 @@ impl UpstreamConfig {
     pub fn get_urls(&self) -> Vec<String> {
         self.urls.clone()
     }
+
+    /// The endpoints without cloning them.
+    pub(crate) fn urls_ref(&self) -> &[String] {
+        &self.urls
+    }
 }
 
 pub(crate) fn default_connect_timeout() -> u64 {
@@ -1385,6 +1390,43 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     for (name, up) in &config.upstream {
         if let Some(cb) = &up.circuit_breaker {
             errors.extend(cb.errors(name));
+        }
+    }
+    // One URL, one breaker: the health entry (and its breaker) is shared by every upstream
+    // that names the URL, so two single-endpoint definitions of it must agree on whether it
+    // has a breaker and on its thresholds. Pools and the `[upstreams]` shorthand are listed
+    // too: they carry no breaker, so they conflict with a table that has one.
+    {
+        let mut by_url: std::collections::BTreeMap<
+            &str,
+            Vec<(String, Option<&CircuitBreakerConfig>)>,
+        > = std::collections::BTreeMap::new();
+        for (name, up) in &config.upstream {
+            if let [u] = up.urls_ref() {
+                by_url
+                    .entry(u.as_str())
+                    .or_default()
+                    .push((format!("upstream.{name}"), up.circuit_breaker.as_ref()));
+            }
+        }
+        for (name, url) in &config.upstreams {
+            by_url
+                .entry(url.as_str())
+                .or_default()
+                .push((format!("upstreams.{name}"), None));
+        }
+        for (url, mut defs) in by_url {
+            defs.sort_by(|a, b| a.0.cmp(&b.0));
+            if defs.windows(2).any(|w| w[0].1 != w[1].1) {
+                errors.push(format!(
+                    "{} all point at {url} but disagree about its circuit breaker; they share one \
+                     health entry, so give them the same `circuit_breaker` (or none)",
+                    defs.iter()
+                        .map(|d| d.0.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
         }
     }
     for (name, cp) in &config.cache_profile {

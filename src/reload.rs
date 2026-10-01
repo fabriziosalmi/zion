@@ -88,7 +88,7 @@ pub(crate) fn current_generation() -> u64 {
 /// "healthy + latency unknown" defaults; removed URLs are simply
 /// dropped (the old `Arc` will be reclaimed when the last reader
 /// exits, including any in-flight prober iteration).
-fn rebuild(
+pub(crate) fn rebuild(
     new_config: &ZionConfig,
     previous: &ResolvedAppConfig,
     conn_limit_max: usize,

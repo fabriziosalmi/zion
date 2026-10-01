@@ -173,7 +173,8 @@ impl ResolvedAppConfig {
                 let entry = map
                     .entry(url.clone())
                     .or_insert_with(|| Arc::new(health::UpstreamHealth::new_healthy()));
-                if breaker_cfg.is_some() {
+                // First route in config order wins; validation refuses conflicting tables.
+                if breaker_cfg.is_some() && !entry.breaker.is_configured() {
                     entry.breaker.configure(breaker_cfg.clone());
                 }
             }

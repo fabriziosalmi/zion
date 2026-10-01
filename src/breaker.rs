@@ -11,10 +11,13 @@
 //! States:
 //!   * closed     — traffic flows; outcomes are counted per second over `window_secs`;
 //!   * open       — until `open_secs` have passed, every request is rejected;
-//!   * half-open  — after the cool-down ONE request is let through as a probe; its success
-//!     closes the circuit (counters reset), its failure re-opens it. Others are
-//!     rejected while the probe is out; a probe that never reports back is
-//!     abandoned after [`PROBE_TIMEOUT_MS`] so the circuit cannot stick.
+//!   * half-open  — after the cool-down ONE request is let through as a probe and given a
+//!     [`ProbeToken`]; only the outcome reported WITH that token closes the circuit (counters
+//!     reset) or re-opens it. Every other request is rejected while the probe is out, and an
+//!     outcome without the token (a request admitted before the trip that finishes late, or
+//!     an abandoned probe's late answer after a replacement was issued) is ignored. A probe
+//!     that never reports back is abandoned after [`PROBE_TIMEOUT_MS`] so the circuit cannot
+//!     stick.
 //!
 //! A failure is a `502`, `503` or `504` (what a refused connection, a timeout or an overloaded
 //! origin become); a `500` is the application's own bug on one endpoint, not a sick upstream,
@@ -52,13 +55,17 @@ pub struct BreakerCfg {
     pub open_secs: u32,
 }
 
+/// Proof that a request holds the half-open probe slot; hand it back with the outcome.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProbeToken(u64);
+
 /// What `check` decided for a request.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Check {
     /// Closed (or no breaker configured): send it.
     Allow,
-    /// Half-open: this request is the probe; report its outcome.
-    Probe,
+    /// Half-open: this request is the probe; report its outcome with this token.
+    Probe(ProbeToken),
     /// Open: answer 503 now; try again in about this long.
     Reject { retry_after_ms: u64 },
 }
@@ -77,6 +84,9 @@ pub struct Breaker {
     open_until_ms: AtomicU64,
     /// 0 = no probe out; otherwise the time (ms) the outstanding probe is given up on.
     probe_deadline_ms: AtomicU64,
+    /// Id of the probe currently holding the slot (0 = none) and the id counter.
+    probe_owner: AtomicU64,
+    probe_ids: AtomicU64,
     trips: AtomicU64,
     rejected: AtomicU64,
 }
@@ -94,6 +104,8 @@ impl Breaker {
             buckets: std::array::from_fn(|_| Bucket::default()),
             open_until_ms: AtomicU64::new(0),
             probe_deadline_ms: AtomicU64::new(0),
+            probe_owner: AtomicU64::new(0),
+            probe_ids: AtomicU64::new(0),
             trips: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
         }
@@ -121,6 +133,7 @@ impl Breaker {
     fn reset(&self) {
         self.open_until_ms.store(0, Relaxed);
         self.probe_deadline_ms.store(0, Relaxed);
+        self.probe_owner.store(0, Relaxed);
         for b in &self.buckets {
             b.epoch_s.store(0, Relaxed);
             b.ok.store(0, Relaxed);
@@ -151,7 +164,9 @@ impl Breaker {
                 .compare_exchange(deadline, now_ms + PROBE_TIMEOUT_MS, Relaxed, Relaxed)
                 .is_ok()
         {
-            return Check::Probe;
+            let id = self.probe_ids.fetch_add(1, Relaxed) + 1;
+            self.probe_owner.store(id, Relaxed);
+            return Check::Probe(ProbeToken(id));
         }
         self.rejected.fetch_add(1, Relaxed);
         Check::Reject {
@@ -159,16 +174,24 @@ impl Breaker {
         }
     }
 
-    /// Record the outcome of a request that was let through.
-    pub fn record(&self, ok: bool, now_ms: u64) {
+    /// Record the outcome of a request that was let through. `probe` is the token `check`
+    /// handed to this request if it was the half-open probe, `None` otherwise.
+    pub fn record(&self, ok: bool, now_ms: u64, probe: Option<ProbeToken>) {
         let guard = self.cfg.load();
         let Some(cfg) = guard.as_deref() else { return };
-        let until = self.open_until_ms.load(Relaxed);
-        if until != 0 {
-            if now_ms < until {
-                return; // in flight when the circuit opened: says nothing new
+        if self.open_until_ms.load(Relaxed) != 0 {
+            // Open or half-open. Only the probe's own outcome means anything: take its slot
+            // (so it counts once) and resolve the circuit. Everything else — a request
+            // admitted before the trip finishing late, a replaced probe answering late — is
+            // ignored.
+            let Some(ProbeToken(id)) = probe else { return };
+            if self
+                .probe_owner
+                .compare_exchange(id, 0, Relaxed, Relaxed)
+                .is_err()
+            {
+                return;
             }
-            // Half-open: this is the probe's outcome.
             if ok {
                 self.reset(); // closed again, with a clean slate
             } else {
@@ -210,6 +233,7 @@ impl Breaker {
             self.open_until_ms
                 .store(now_ms + u64::from(cfg.open_secs) * 1000, Relaxed);
             self.probe_deadline_ms.store(0, Relaxed);
+            self.probe_owner.store(0, Relaxed);
             self.trips.fetch_add(1, Relaxed);
         }
     }
@@ -255,10 +279,10 @@ mod tests {
     /// `n_ok` successes then `n_fail` failures, all within the same second at `t_ms`.
     fn feed(b: &Breaker, t_ms: u64, n_ok: u32, n_fail: u32) {
         for _ in 0..n_ok {
-            b.record(true, t_ms);
+            b.record(true, t_ms, None);
         }
         for _ in 0..n_fail {
-            b.record(false, t_ms);
+            b.record(false, t_ms, None);
         }
     }
 
@@ -312,31 +336,37 @@ mod tests {
         // but failures spread over the last ten seconds still add up
         let b = breaker();
         for s in 1..=9u64 {
-            b.record(false, s * 1000);
+            b.record(false, s * 1000, None);
         }
-        b.record(false, 9_999);
+        b.record(false, 9_999, None);
         assert!(
             b.is_open(),
             "10 failures over 9 seconds, all inside one 10 s window"
         );
     }
 
+    fn probe(b: &Breaker, now: u64) -> ProbeToken {
+        match b.check(now) {
+            Check::Probe(t) => t,
+            other => panic!("expected a probe at {now}, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn half_open_lets_exactly_one_probe_through_and_success_closes() {
+    fn half_open_lets_exactly_one_probe_through_and_its_success_closes() {
         let b = breaker();
         feed(&b, 1_000, 0, 10);
         assert!(
             matches!(b.check(20_000), Check::Reject { .. }),
             "still cooling down"
         );
-        // cool-down over at 31 000
-        assert_eq!(b.check(31_000), Check::Probe);
+        let t = probe(&b, 31_000); // cool-down over at 31 000
         assert!(
             matches!(b.check(31_001), Check::Reject { .. }),
             "only one probe at a time"
         );
         assert!(matches!(b.check(31_500), Check::Reject { .. }));
-        b.record(true, 31_700);
+        b.record(true, 31_700, Some(t));
         assert!(!b.is_open());
         assert_eq!(b.check(31_800), Check::Allow);
         // a clean slate: the old failures are forgotten
@@ -348,8 +378,8 @@ mod tests {
     fn a_failed_probe_reopens_for_a_full_cool_down() {
         let b = breaker();
         feed(&b, 1_000, 0, 10);
-        assert_eq!(b.check(31_000), Check::Probe);
-        b.record(false, 31_200);
+        let t = probe(&b, 31_000);
+        b.record(false, 31_200, Some(t));
         assert!(b.is_open());
         assert_eq!(
             b.check(31_300),
@@ -359,26 +389,67 @@ mod tests {
         );
         assert_eq!(b.trips(), 2);
         // and the next probe comes after the new cool-down
-        assert_eq!(b.check(61_300), Check::Probe);
+        probe(&b, 61_300);
     }
 
     #[test]
     fn a_probe_that_never_reports_back_does_not_stick_the_circuit() {
         let b = breaker();
         feed(&b, 1_000, 0, 10);
-        assert_eq!(b.check(31_000), Check::Probe);
+        let _lost = probe(&b, 31_000);
         assert!(matches!(b.check(40_000), Check::Reject { .. }));
         // PROBE_TIMEOUT_MS later another request may try
-        assert_eq!(b.check(31_000 + PROBE_TIMEOUT_MS), Check::Probe);
+        probe(&b, 31_000 + PROBE_TIMEOUT_MS);
     }
 
     #[test]
-    fn outcomes_of_requests_already_in_flight_when_it_opened_are_ignored() {
+    fn only_the_probe_that_holds_the_slot_can_resolve_the_circuit() {
+        // a request admitted before the trip that finishes after the cool-down is not the probe
         let b = breaker();
         feed(&b, 1_000, 0, 10);
-        b.record(true, 1_500); // a slow success that started before the trip
-        assert!(b.is_open(), "must not close the circuit");
-        assert!(matches!(b.check(2_000), Check::Reject { .. }));
+        b.record(true, 1_500, None);
+        assert!(
+            b.is_open(),
+            "an in-flight success during the cool-down changes nothing"
+        );
+        b.record(true, 40_000, None);
+        assert!(
+            b.is_open(),
+            "...nor does one that finishes after it: it holds no token"
+        );
+        b.record(false, 40_000, None);
+        assert_eq!(
+            b.trips(),
+            1,
+            "...and a late failure does not re-open or re-count"
+        );
+
+        // an abandoned probe answering late, after a replacement was issued, is ignored
+        let b = breaker();
+        feed(&b, 1_000, 0, 10);
+        let old = probe(&b, 31_000);
+        let new = probe(&b, 31_000 + PROBE_TIMEOUT_MS); // the old one was given up on
+        b.record(true, 61_100, Some(old));
+        assert!(
+            b.is_open(),
+            "the replaced probe's late success must not close the circuit"
+        );
+        b.record(true, 61_200, Some(new));
+        assert!(!b.is_open(), "the current probe's outcome does");
+
+        // a token resolves the circuit once only
+        let b = breaker();
+        feed(&b, 1_000, 0, 10);
+        let t = probe(&b, 31_000);
+        let t2 = ProbeToken(t.0);
+        b.record(false, 31_100, Some(t));
+        assert_eq!(b.trips(), 2);
+        b.record(false, 31_200, Some(t2));
+        assert_eq!(
+            b.trips(),
+            2,
+            "a second report with the same token counts for nothing"
+        );
     }
 
     #[test]

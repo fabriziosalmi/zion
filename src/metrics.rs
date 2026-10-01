@@ -1636,8 +1636,8 @@ mod tests {
             "no series without a breaker"
         );
         // open it and the gauge and counters move
-        with.breaker.record(false, 1_000);
-        with.breaker.record(false, 1_000);
+        with.breaker.record(false, 1_000, None);
+        with.breaker.record(false, 1_000, None);
         let _ = with.breaker.check(2_000);
         let out = text(m.render_with_upstreams(false, &health));
         assert!(

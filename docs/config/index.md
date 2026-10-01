@@ -107,7 +107,15 @@ circuit, its failure re-opens it. Values shown are the defaults.
   instead of the 503, and background refreshes are not sent while it is open. A fresh hit never
   contacts the origin, so it is not affected.
 - State survives a config reload; changing the thresholds on a reload starts the counters clean.
-- A URL shared by two `[upstream.*]` tables shares one breaker (the first table's thresholds).
+- Upstreams that name the same URL share one health entry, and so one breaker: such
+  definitions must agree about it (same `circuit_breaker`, or none), otherwise the config is
+  refused at load. A `[upstreams]` shorthand entry counts as "none".
+- WebSocket handshakes, writes (`POST`/`PUT`/...) to a cached route, and requests that bypass the
+  cache all contact the upstream, so they are gated and counted like any other request.
+- Only one request is let through as the half-open probe, and only its own outcome closes or
+  re-opens the circuit: a request admitted before the circuit opened that finishes late, or an
+  abandoned probe answering after a replacement was issued, is ignored. Background cache
+  refreshes never take the probe; they are simply not sent while the circuit is not closed.
 - Metrics: `zion_upstream_circuit_open{upstream}`, `zion_upstream_circuit_trips_total{upstream}`,
   `zion_upstream_circuit_rejected_total{upstream}`.
 
