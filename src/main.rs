@@ -48,6 +48,7 @@ mod audit;
 mod auth;
 mod bootstrap;
 mod breaker;
+mod bulkhead;
 mod cache;
 mod cli;
 mod config;

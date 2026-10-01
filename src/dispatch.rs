@@ -30,6 +30,7 @@
 
 use crate::audit;
 use crate::audit::AuditEvent;
+use crate::bulkhead;
 use crate::http_util::{
     empty_response, generate_request_id, inject_security_headers, text_response, HEX_DIGITS,
     REQUEST_COUNTER,
@@ -832,6 +833,29 @@ async fn process_request_inner(
     // (`cfg`), so a reload mid-request cannot swap in another generation's breaker. WebSocket
     // handshakes and plain proxied routes are gated here; cached routes consult it inside
     // `handle_static_cache`, where a stale copy can stand in for the upstream.
+    // --- Bulkhead (opt-in, `[upstream.x] max_in_flight`) ---
+    // Taken before the circuit breaker, so a shed request never counts as an upstream failure or
+    // spends a half-open probe, and after auth and the WAF, so a hostile request cannot use up
+    // slots. Held until the response body has been sent. Only requests that go to the upstream
+    // on every call are counted: cache hits, WebSocket upgrades (long-lived) and static routes
+    // are not.
+    let mut bulkhead_permit: Option<bulkhead::Permit> = None;
+    if rule.max_in_flight > 0
+        && !is_websocket
+        && rule.cache.is_none()
+        && matches!(
+            rule.mode,
+            config::RouteMode::SseStream | config::RouteMode::Standard
+        )
+    {
+        if let Some(name) = &rule.upstream_name {
+            match bulkhead::counter(name).try_acquire(rule.max_in_flight) {
+                Some(p) => bulkhead_permit = Some(p),
+                None => return Ok(upstream_busy_response()),
+            }
+        }
+    }
+
     let breaker_up = breaker_entry(&cfg, &rule);
     let mut breaker_probe: Option<breaker::ProbeToken> = None;
     if let Some(entry) = &breaker_up {
@@ -1100,6 +1124,10 @@ async fn process_request_inner(
         }
     };
 
+    if let Some(permit) = bulkhead_permit.take() {
+        resp = bulkhead::attach(resp, permit);
+    }
+
     // Cached routes record inside `handle_static_cache`, where the origin is actually asked.
     if rule.cache.is_none()
         && matches!(
@@ -1246,6 +1274,20 @@ fn breaker_entry(
         .get(&rule.upstream_url[0])
         .filter(|h| h.breaker.is_configured())
         .cloned()
+}
+
+/// The upstream is at `max_in_flight`: refuse at once rather than queue.
+fn upstream_busy_response() -> Response<ZionBody> {
+    let mut resp = text_response(StatusCode::SERVICE_UNAVAILABLE, "upstream busy");
+    resp.headers_mut().insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from_static("1"),
+    );
+    resp.headers_mut().insert(
+        "X-Zion-Bulkhead",
+        hyper::header::HeaderValue::from_static("full"),
+    );
+    resp
 }
 
 /// What an open circuit answers: 503 at once, with `Retry-After`.

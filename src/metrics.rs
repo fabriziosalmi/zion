@@ -1467,6 +1467,11 @@ impl Metrics {
         // in their own module to avoid coupling the metrics renderer to
         // tracing internals.
         crate::observability::render_counters(&mut out);
+        {
+            let mut bulkheads = String::new();
+            crate::bulkhead::render(&mut bulkheads, &escape_label);
+            out.extend_from_slice(bulkheads.as_bytes());
+        }
         for (name, help, val) in [
             (
                 "zion_dns_lookup_failures_total",
