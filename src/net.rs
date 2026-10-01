@@ -239,27 +239,38 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    // Compiled and run everywhere (the README test count comes from runtime output, so a
+    // `#[cfg]`-gated test would make the macOS and Linux counts differ); only the part that needs
+    // the Linux option is gated.
     #[tokio::test]
     async fn the_user_timeout_is_set_and_zero_leaves_the_kernel_default() {
         let s = connected().await;
-        let sock = socket2::SockRef::from(&s);
-        assert_eq!(
-            sock.tcp_user_timeout().unwrap(),
-            None,
-            "control: a fresh socket has none"
-        );
-        set_user_timeout(&s, 0);
-        assert_eq!(
-            sock.tcp_user_timeout().unwrap(),
-            None,
-            "0 = leave the kernel default"
-        );
-        set_user_timeout(&s, 90);
-        assert_eq!(
-            sock.tcp_user_timeout().unwrap(),
-            Some(std::time::Duration::from_secs(90))
-        );
+        #[cfg(target_os = "linux")]
+        {
+            let sock = socket2::SockRef::from(&s);
+            assert_eq!(
+                sock.tcp_user_timeout().unwrap(),
+                None,
+                "control: a fresh socket has none"
+            );
+            set_user_timeout(&s, 0);
+            assert_eq!(
+                sock.tcp_user_timeout().unwrap(),
+                None,
+                "0 = leave the kernel default"
+            );
+            set_user_timeout(&s, 90);
+            assert_eq!(
+                sock.tcp_user_timeout().unwrap(),
+                Some(std::time::Duration::from_secs(90))
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // no such option here: the call must simply leave the connection alone
+            set_user_timeout(&s, 90);
+            assert!(s.peer_addr().is_ok());
+        }
     }
 
     #[tokio::test]
