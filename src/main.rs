@@ -1389,6 +1389,7 @@ async fn handle_http_connection(
     let _ = stream.set_nodelay(true);
     net::tune_accepted(&stream);
     net::set_keepalive(&stream, state.config.load().tcp_keepalive_secs);
+    net::set_user_timeout(&stream, state.config.load().tcp_user_timeout_secs);
 
     let io = TokioIo::new(stream);
     // Connection-level idle timeout — matches the HTTPS path (1h, generous
@@ -1556,6 +1557,7 @@ fn spawn_https_handler(
         let _ = tcp_stream.set_nodelay(true);
         net::tune_accepted(&tcp_stream);
         net::set_keepalive(&tcp_stream, state.config.load().tcp_keepalive_secs);
+        net::set_user_timeout(&tcp_stream, state.config.load().tcp_user_timeout_secs);
         // JA4 fingerprint gate (#27): peek the ClientHello before the handshake,
         // compute JA4, count known/unknown. MSG_PEEK leaves the bytes in the
         // kernel buffer for rustls to re-read. In allowlist mode a rejected
