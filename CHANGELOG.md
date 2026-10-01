@@ -4,6 +4,18 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-10-01
+
+**Resilience release: pools balance on real traffic, and logging, DNS and a slow backend can no longer take the proxy down with them.** One security fix (client-supplied routing/host override headers are no longer passed upstream) and a set of opt-in or on-by-default protections. Read the upgrade notes first.
+
+### ⚠️ Upgrade notes
+
+- **Pools now pick a member with power of two choices (`load_balancing = "p2c"`)** instead of "lowest 30 s probe latency". Traffic spreads in proportion to speed instead of herding onto one member. To keep the old rule: `load_balancing = "lowest_latency"` on the upstream. Single-endpoint upstreams are unaffected.
+- **Log lines now go through a bounded queue.** If stderr is slower than the log rate, the newest lines are dropped (counted in `zion_log_lines_dropped_total`, announced on stderr) instead of stalling requests. `[server] log_queue_lines = 0` restores synchronous writes.
+- **Upstream DNS answers are kept for an hour and used if a fresh lookup fails or takes over 2 s** (`dns_stale_secs`, `dns_timeout_ms`; `0` disables / waits as long as the resolver does). A fresh lookup is always tried first.
+- **Clients can no longer send `X-Original-URL`, `X-Rewrite-URL`, `Forwarded`, `X-Forwarded-Server/-Scheme/-Prefix`, `X-Host`, `X-HTTP-Host-Override` or `X-Original-Host` through zion** (a peer in `trusted_proxies` still can). If a legitimate client of yours set one of these, route it through a trusted proxy.
+- Everything else is opt-in: `outlier_detection`, `max_in_flight`, and tag purge (`Surrogate-Key`) do nothing until configured or until an origin sends the header.
+
 ### Changed
 
 - **Logging no longer blocks requests.** Log lines used to be written to stderr by the thread that logged, so a stalled pipe (journald, a container log driver) stalled the request workers. They now go through a bounded queue (`[server] log_queue_lines`, default 8192) to one writer thread; when it is full the newest lines are dropped, counted in `zion_log_lines_dropped_total` and announced on stderr. `log_queue_lines = 0` keeps the synchronous behaviour. The queue is flushed at shutdown and before a panic record.
