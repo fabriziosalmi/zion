@@ -160,6 +160,9 @@ IP, bypassing rate-limit / `internal_only` gates.
   XFF". Outbound XFF policy is `append` / `rewrite` / `drop` per
   `xff_mode`; the `rewrite` mode is recommended when Zion is the front
   edge — it strips inbound XFF entirely.
+- A peer in `trusted_proxies` also keeps the routing/host override headers (`X-Original-URL`,
+  `X-Rewrite-URL`, `Forwarded`, ...) that zion drops from every other client, so a trusted proxy
+  can steer a framework behind zion's routing. Trust only proxies you operate.
 - **Residual**: misconfiguring `trusted_proxies` to include 0.0.0.0/0
   would un-do the protection. Boot config validation flags an empty list
   but does not block 0.0.0.0/0 — that's a legitimate, if rare, deployment.

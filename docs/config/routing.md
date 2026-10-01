@@ -55,6 +55,25 @@ resolves `..` serves `/internal/x`, and `//admin` or `/%61dmin` slip past a `/ad
 Every spelling of a path now meets the same route and the same policy, on :443 and on the
 plaintext :80 listener (whose ACME-challenge fallback routes on its own).
 
+## Headers that are not passed on from clients
+
+Some request headers tell an application or a cache where a request "really" goes or came
+from. Frameworks that honour them (IIS and Symfony take the path from `X-Original-URL` /
+`X-Rewrite-URL`; others take the host, scheme or prefix from the rest) can be steered behind
+zion's routing, `internal_only`, WAF and auth, and a cache keyed on the real request can be
+poisoned. Zion drops these from any client that is not a configured trusted proxy: by a gate
+before routing on `:443`, and just before forwarding on the plaintext `:80` listener's ACME
+fallback (which picks its route first and forwards on its own):
+
+`X-Original-URL`, `X-Rewrite-URL`, `Forwarded` (zion sends `X-Forwarded-*`, never `Forwarded`),
+`X-Forwarded-Server`, `X-Forwarded-Scheme`, `X-Forwarded-Prefix`, `X-Host`,
+`X-HTTP-Host-Override`, `X-Original-Host`.
+
+A peer listed in `[server] trusted_proxies` (a CDN or load balancer in front of zion) keeps
+its values, as it does for `X-Forwarded-For`. `X-Forwarded-Host` is always overwritten with
+the request's own host (the `Host` header, or the URI authority for HTTP/2), and dropped when there
+is none.
+
 ## Host-based routing (virtual hosting)
 
 Bind a route to one or more `hosts` to serve different backends for different domains on the same listener — the `Host` header (HTTP/1) or `:authority` (HTTP/2) selects the route. A route **without** `hosts` is *shared*: it matches every host and acts as a fallback.

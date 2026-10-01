@@ -36,6 +36,8 @@ struct Origin {
     set_cookie: Mutex<Option<String>>,
     /// Path and query of the last request the origin saw.
     last_target: Mutex<Option<String>>,
+    /// Every header (lower-case name, value) of the last request the origin saw.
+    last_headers: Mutex<Vec<(String, String)>>,
     /// Every `Via` value of the last request the origin saw, joined with ", ".
     last_via: Mutex<Option<String>>,
     /// When set, the body is this many `x` bytes; the bool = send it chunked (no
@@ -62,6 +64,13 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                     let o = o.clone();
                     async move {
                         o.hits.fetch_add(1, Ordering::Relaxed);
+                        *o.last_headers.lock().unwrap() = req
+                            .headers()
+                            .iter()
+                            .map(|(k, v)| {
+                                (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())
+                            })
+                            .collect();
                         *o.last_target.lock().unwrap() =
                             req.uri().path_and_query().map(|p| p.as_str().to_string());
                         *o.last_via.lock().unwrap() = {
@@ -201,6 +210,7 @@ async fn rig_with(vary: &str, cc: &str, profile_extra: &str) -> (Arc<Origin>, Ar
         set_cookie: Mutex::new(None),
         last_via: Mutex::new(None),
         last_target: Mutex::new(None),
+        last_headers: Mutex::new(Vec::new()),
         big: Mutex::new(None),
         status: std::sync::atomic::AtomicU16::new(200),
         extra: Mutex::new(None),
@@ -1592,4 +1602,144 @@ async fn a_background_refresh_never_takes_the_half_open_probe() {
     );
     assert_eq!(hits(&o), before + 1);
     assert_eq!(call(&st, "/plain/h-after").await.0, 200, "closed again");
+}
+
+// ── routing/host override headers from the client ───────────────────────────
+
+const REWRITE_HEADERS: [&str; 9] = [
+    "x-original-url",
+    "x-rewrite-url",
+    "forwarded",
+    "x-forwarded-server",
+    "x-forwarded-scheme",
+    "x-forwarded-prefix",
+    "x-host",
+    "x-http-host-override",
+    "x-original-host",
+];
+
+fn seen(o: &Origin, name: &str) -> Option<String> {
+    o.last_headers
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.clone())
+}
+
+fn hostile_headers() -> Vec<(&'static str, &'static str)> {
+    REWRITE_HEADERS.iter().map(|h| (*h, "/admin")).collect()
+}
+
+/// A client must not be able to steer a framework that honours these headers (IIS and Symfony
+/// take the path from `X-Original-URL` / `X-Rewrite-URL`, others the host or scheme from the
+/// rest) behind Zion's routing and policy, or to poison a cache keyed on the real request.
+#[tokio::test]
+async fn untrusted_clients_cannot_send_routing_or_host_override_headers_upstream() {
+    let (o, st) = rig("").await;
+    let mut headers = hostile_headers();
+    headers.push(("accept-language", "de"));
+    headers.push(("x-custom", "kept"));
+    fetch(&st, "/h1", &headers).await;
+    for h in REWRITE_HEADERS {
+        assert_eq!(seen(&o, h), None, "{h} must not reach the upstream");
+    }
+    // control: ordinary headers are untouched, and Zion's own trust headers are set
+    assert_eq!(seen(&o, "accept-language").as_deref(), Some("de"));
+    assert_eq!(seen(&o, "x-custom").as_deref(), Some("kept"));
+    assert!(seen(&o, "x-forwarded-for").is_some() && seen(&o, "x-forwarded-proto").is_some());
+}
+
+#[tokio::test]
+async fn x_forwarded_host_is_the_requests_own_host_whatever_the_client_claims() {
+    let (o, st) = rig("").await;
+    fetch(
+        &st,
+        "/h2",
+        &[
+            ("host", "real.example"),
+            ("x-forwarded-host", "evil.example"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        seen(&o, "x-forwarded-host").as_deref(),
+        Some("real.example")
+    );
+}
+
+/// A configured trusted proxy (a CDN or load balancer in front of Zion) legitimately sets some
+/// of these; its values are passed through, as with `X-Forwarded-For`.
+#[tokio::test]
+async fn a_trusted_proxy_peer_keeps_its_headers() {
+    let (o, _) = rig("").await;
+    let port = o.port.load(Ordering::Relaxed);
+    let mut cfg = cfg_for(port, "");
+    cfg.server.trusted_proxies = vec!["203.0.113.0/24".to_string()];
+    let st = AppState::for_tests(&cfg);
+    // the peer used by `fetch` is 203.0.113.9: trusted here
+    fetch(&st, "/h3", &hostile_headers()).await;
+    for h in REWRITE_HEADERS {
+        assert_eq!(
+            seen(&o, h).as_deref(),
+            Some("/admin"),
+            "{h} from a trusted proxy is kept"
+        );
+    }
+    // and an untrusted peer on the same instance is still stripped
+    let resp = process_request(
+        get("/h4", &hostile_headers()),
+        st.clone(),
+        "198.51.100.7:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    let _ = resp.into_body().collect().await;
+    for h in REWRITE_HEADERS {
+        assert_eq!(seen(&o, h), None, "{h} from an untrusted peer is stripped");
+    }
+}
+
+/// The plaintext :80 handler forwards ACME-challenge paths on its own, outside the pipeline.
+#[tokio::test]
+async fn the_port_80_acme_fallback_strips_them_too() {
+    let (o, st) = rig("").await;
+    let resp = crate::handle_http(
+        get("/.well-known/acme-challenge/tok", &hostile_headers()),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+    )
+    .await
+    .unwrap();
+    let _ = resp.into_body().collect().await;
+    assert_eq!(hits(&o), 1, "the challenge path was forwarded");
+    for h in REWRITE_HEADERS {
+        assert_eq!(
+            seen(&o, h),
+            None,
+            "{h} must not reach the upstream from :80 either"
+        );
+    }
+}
+
+/// HTTP/2 carries the host in the URI authority and sends no Host header, and a hostless request
+/// has neither: a client-supplied X-Forwarded-Host must not survive in either case.
+#[tokio::test]
+async fn x_forwarded_host_cannot_be_smuggled_through_a_request_without_a_host_header() {
+    let (o, st) = rig("").await;
+    // authority only (as h2): the upstream is told the authority, not the client's claim
+    fetch(
+        &st,
+        "https://real.example/xh1",
+        &[("x-forwarded-host", "evil.example")],
+    )
+    .await;
+    assert_eq!(
+        seen(&o, "x-forwarded-host").as_deref(),
+        Some("real.example")
+    );
+    // neither: the claim is dropped rather than forwarded
+    fetch(&st, "/xh2", &[("x-forwarded-host", "evil.example")]).await;
+    assert_eq!(seen(&o, "x-forwarded-host"), None);
 }

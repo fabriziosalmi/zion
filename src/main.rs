@@ -1859,6 +1859,9 @@ async fn handle_http(
             // This path skips process_request, so drop the identity headers the
             // pipeline would have scrubbed: upstreams trust X-Auth-* as verified.
             dispatch::scrub_reserved_identity_headers(req.headers_mut());
+            if !cfg.trusted_proxies.is_trusted(&remote_addr.ip()) {
+                security::scrub_client_override_headers(req.headers_mut());
+            }
             return proxy::proxy_pass(
                 &state.client_for(rule.connect_timeout_ms),
                 req,
