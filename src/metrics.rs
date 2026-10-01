@@ -1708,9 +1708,19 @@ mod tests {
             out.contains("zion_upstream_inflight{upstream=\"http://pooled:1\"} 1"),
             "{out}"
         );
+        // The estimate fades with wall-clock time (and Miri runs far slower than real time), so
+        // assert the series and a plausible value rather than an exact one.
+        let ewma: f64 = out
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("zion_upstream_peak_ewma_seconds{upstream=\"http://pooled:1\"} ")
+            })
+            .unwrap_or_else(|| panic!("no peak_ewma series: {out}"))
+            .parse()
+            .unwrap();
         assert!(
-            out.contains("zion_upstream_peak_ewma_seconds{upstream=\"http://pooled:1\"} 0.02"),
-            "{out}"
+            ewma > 0.0 && ewma <= 0.025,
+            "25 ms sample, faded by the time the test took: {ewma}"
         );
         assert!(out.contains("zion_upstream_ejected{upstream=\"http://pooled:1\"} 0"));
         assert!(out.contains("zion_upstream_ejections_total{upstream=\"http://pooled:1\"} 0"));

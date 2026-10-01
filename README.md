@@ -288,7 +288,7 @@ MODE=full bash benchmarks/baseline/run-baseline.sh   # → benchmarks/baseline/z
 ## Testing
 
 <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
-**1219 unit tests** run on every change; **23 integration tests** need a running Zion + a backend.
+**1220 unit tests** run on every change; **23 integration tests** need a running Zion + a backend.
 
 ```bash
 cargo test                          # unit tests
