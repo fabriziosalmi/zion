@@ -453,6 +453,10 @@ pub(super) fn builtin_endpoint(
                     .map(|p| p.to_string())
             });
             // `?tag=a,b` (repeatable): purge by `Surrogate-Key` tag.
+            let has_tag_param = req
+                .uri()
+                .query()
+                .is_some_and(|q| q.split('&').any(|kv| kv.starts_with("tag=")));
             let tags: Vec<String> = req
                 .uri()
                 .query()
@@ -465,6 +469,20 @@ pub(super) fn builtin_endpoint(
                         .collect()
                 })
                 .unwrap_or_default();
+            // `?tag=` with nothing in it is a mistake, not a request to flush everything.
+            if has_tag_param && tags.is_empty() {
+                return Some(
+                    Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("Content-Type", "text/plain; charset=utf-8")
+                        .body(
+                            Full::new(Bytes::from_static(b"empty tag\n"))
+                                .map_err(|never| match never {})
+                                .boxed(),
+                        )
+                        .unwrap(),
+                );
+            }
             let (removed, scope) = if !tags.is_empty() {
                 let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
                 (

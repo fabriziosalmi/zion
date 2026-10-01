@@ -344,11 +344,43 @@ pub fn surrogate_keys(headers: &hyper::HeaderMap) -> Result<Vec<String>, ()> {
     Ok(out)
 }
 
-/// tag → the cache keys stored under it.
+/// What [`StaticCache::insert_tagged`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagStore {
+    Stored,
+    /// A tag purge ran after the response's fetch began: it may predate the purge.
+    PurgedMeanwhile,
+    /// The tag index is full; the previous entry under the key (if any) was dropped too, so
+    /// nothing is left that a purge could not reach.
+    IndexFull,
+}
+
+/// tag ↔ cache key, both directions, so replacing a key's tags can drop the old ones.
 #[derive(Default)]
 struct TagIndex {
     by_tag: HashMap<Arc<str>, HashSet<Arc<str>>>,
+    by_key: HashMap<Arc<str>, Vec<Arc<str>>>,
+    /// (tag, key) pairs held.
     pairs: usize,
+}
+
+impl TagIndex {
+    /// Forget everything recorded for `key`.
+    fn detach(&mut self, key: &str) {
+        let Some(tags) = self.by_key.remove(key) else {
+            return;
+        };
+        for t in tags {
+            if let Some(set) = self.by_tag.get_mut(&t) {
+                if set.remove(key) {
+                    self.pairs = self.pairs.saturating_sub(1);
+                }
+                if set.is_empty() {
+                    self.by_tag.remove(&t);
+                }
+            }
+        }
+    }
 }
 
 /// Two-level static cache.
@@ -364,6 +396,8 @@ pub struct StaticCache {
     pub vary: crate::vary::VaryRules,
     /// Surrogate-Key tag index. Its lock also orders tagged inserts against tag purges.
     tags: Mutex<TagIndex>,
+    /// `by_key.len()`, readable without the lock: untagged inserts skip it while nothing is tagged.
+    tagged_keys: std::sync::atomic::AtomicUsize,
     /// Bumped by every tag purge (and `purge_all`): a response fetched before a purge must not
     /// be stored after it (see [`StaticCache::insert_tagged`]).
     tag_epoch: std::sync::atomic::AtomicU64,
@@ -389,6 +423,7 @@ impl StaticCache {
             generation: std::sync::atomic::AtomicU64::new(0),
             vary: crate::vary::VaryRules::default(),
             tags: Mutex::new(TagIndex::default()),
+            tagged_keys: std::sync::atomic::AtomicUsize::new(0),
             tag_epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -409,10 +444,22 @@ impl StaticCache {
         }
     }
 
-    /// Store `body` under `path` and index it under `tags` (`Surrogate-Key`). Returns false,
-    /// storing nothing, when a tag purge happened since `epoch` was read (the response may
-    /// predate it and would outlive the purge) or the index is full. With no tags this is
-    /// [`Self::insert`].
+    fn remove_key(&self, key: &str) -> bool {
+        match &self.l2 {
+            Some(l2) => l2.remove(key).is_some(),
+            None => LOCAL_L2.with(|m| m.borrow_mut().remove(key).is_some()),
+        }
+    }
+
+    fn sync_tagged_keys(&self, idx: &TagIndex) {
+        self.tagged_keys
+            .store(idx.by_key.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Store `body` under `path`, indexed under exactly `tags` (`Surrogate-Key`): whatever tags
+    /// the key had before are replaced, and none at all means it is no longer reachable by tag.
+    /// A response with tags is refused ([`TagStore::PurgedMeanwhile`]) when a tag purge happened
+    /// since `epoch` was read, and ([`TagStore::IndexFull`]) when the index has no room.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_tagged(
         &self,
@@ -424,8 +471,13 @@ impl StaticCache {
         max_entries: usize,
         tags: &[String],
         epoch: u64,
-    ) -> bool {
+    ) -> TagStore {
         if tags.is_empty() {
+            if self.tagged_keys.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                let mut idx = self.lock_tags();
+                idx.detach(path);
+                self.sync_tagged_keys(&idx);
+            }
             self.insert(
                 path,
                 body,
@@ -434,50 +486,79 @@ impl StaticCache {
                 initial_age_secs,
                 max_entries,
             );
-            return true;
+            return TagStore::Stored;
         }
         let mut idx = self.lock_tags();
         if self.tag_epoch() != epoch {
-            return false;
+            return TagStore::PurgedMeanwhile;
         }
-        let new_tags = tags
-            .iter()
-            .filter(|t| !idx.by_tag.contains_key(t.as_str()))
-            .count();
-        let new_pairs = tags
-            .iter()
-            .filter(|t| idx.by_tag.get(t.as_str()).is_none_or(|s| !s.contains(path)))
-            .count();
-        if idx.by_tag.len() + new_tags > MAX_TAGS || idx.pairs + new_pairs > MAX_TAGGED_KEYS {
-            // Make room: drop references to keys that are no longer cached.
-            let mut pairs = 0;
-            idx.by_tag.retain(|_, keys| {
-                keys.retain(|k| self.holds(k));
-                pairs += keys.len();
-                !keys.is_empty()
-            });
-            idx.pairs = pairs;
+        idx.detach(path); // the new response's tags replace the old ones
+        let admit = |idx: &TagIndex| {
             let new_tags = tags
                 .iter()
                 .filter(|t| !idx.by_tag.contains_key(t.as_str()))
                 .count();
-            if idx.by_tag.len() + new_tags > MAX_TAGS || idx.pairs + new_pairs > MAX_TAGGED_KEYS {
-                return false;
+            idx.by_tag.len() + new_tags <= MAX_TAGS && idx.pairs + tags.len() <= MAX_TAGGED_KEYS
+        };
+        if !admit(&idx) {
+            // Make room: forget keys that are no longer cached.
+            let dead: Vec<Arc<str>> = idx
+                .by_key
+                .keys()
+                .filter(|k| !self.holds(k))
+                .cloned()
+                .collect();
+            for k in dead {
+                idx.detach(&k);
             }
+        }
+        if !admit(&idx) {
+            self.remove_key(path);
+            self.sync_tagged_keys(&idx);
+            return TagStore::IndexFull;
         }
         let key: Arc<str> = Arc::from(path);
+        let mut mine = Vec::with_capacity(tags.len());
         for t in tags {
-            if idx
-                .by_tag
-                .entry(Arc::from(t.as_str()))
-                .or_default()
-                .insert(key.clone())
-            {
+            let t: Arc<str> = Arc::from(t.as_str());
+            if idx.by_tag.entry(t.clone()).or_default().insert(key.clone()) {
                 idx.pairs += 1;
             }
+            mine.push(t);
         }
-        // inserted while the index lock is held: a purge that takes the lock afterwards sees it
+        idx.by_key.insert(key, mine);
+        self.sync_tagged_keys(&idx);
+        // stored while the index lock is held: a purge that takes the lock afterwards sees it
         self.insert(
+            path,
+            body,
+            meta,
+            freshness_secs,
+            initial_age_secs,
+            max_entries,
+        );
+        TagStore::Stored
+    }
+
+    /// Revive an entry after a `304` (its tags are unchanged). Refused, storing nothing, when a
+    /// tag purge ran since `epoch` was read: the purge may have removed this very entry, and the
+    /// revalidation must not bring it back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn refresh_checked(
+        &self,
+        path: &str,
+        body: Bytes,
+        meta: CachedMeta,
+        freshness_secs: u64,
+        initial_age_secs: u64,
+        max_entries: usize,
+        epoch: u64,
+    ) -> bool {
+        let _idx = self.lock_tags();
+        if self.tag_epoch() != epoch {
+            return false;
+        }
+        self.refresh(
             path,
             body,
             meta,
@@ -497,21 +578,18 @@ impl StaticCache {
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
             let mut keys = HashSet::new();
             for t in tags {
-                if let Some(set) = idx.by_tag.remove(*t) {
-                    idx.pairs = idx.pairs.saturating_sub(set.len());
-                    keys.extend(set);
+                if let Some(set) = idx.by_tag.get(*t) {
+                    keys.extend(set.iter().cloned());
                 }
             }
+            // each removed key leaves all of its tags, not only the purged ones
+            for k in &keys {
+                idx.detach(k);
+            }
+            self.sync_tagged_keys(&idx);
             keys
         };
-        let mut removed = 0;
-        for k in &keys {
-            let gone = match &self.l2 {
-                Some(l2) => l2.remove(k).is_some(),
-                None => LOCAL_L2.with(|m| m.borrow_mut().remove(k).is_some()),
-            };
-            removed += usize::from(gone);
-        }
+        let removed = keys.iter().filter(|k| self.remove_key(k)).count();
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         removed
@@ -778,6 +856,7 @@ impl StaticCache {
             self.tag_epoch
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
             *idx = TagIndex::default();
+            self.sync_tagged_keys(&idx);
         }
         let n = if let Some(l2) = &self.l2 {
             let n = l2.len();
@@ -1315,7 +1394,7 @@ mod tests {
             100_000,
             &tags,
             epoch,
-        )
+        ) == TagStore::Stored
     }
 
     #[test]
@@ -1388,6 +1467,125 @@ mod tests {
         assert!(
             tag(&cache, "/overflow", &["brand-new"], e),
             "dead references were pruned"
+        );
+    }
+
+    #[test]
+    fn replacing_a_keys_tags_drops_the_old_ones() {
+        let cache = StaticCache::new();
+        let e = cache.tag_epoch();
+        assert!(tag(&cache, "/a", &["old"], e));
+        assert!(tag(&cache, "/a", &["new"], e)); // the origin re-tagged it
+        assert_eq!(
+            cache.purge_tags(&["old"]),
+            0,
+            "an old tag must not purge the current response"
+        );
+        assert!(matches!(cache.get("/a"), CacheLookup::Fresh(_)));
+        assert_eq!(cache.purge_tags(&["new"]), 1);
+        // a hot key that rotates through more tags than the index holds never fills it
+        let e = cache.tag_epoch(); // after the purge above
+        for i in 0..(MAX_TAGS * 2) {
+            assert!(
+                tag(&cache, "/hot", &[&format!("rot{i}")], e),
+                "rotation {i}"
+            );
+        }
+        assert_eq!(cache.purge_tags(&["rot0"]), 0);
+        assert_eq!(cache.purge_tags(&[&format!("rot{}", MAX_TAGS * 2 - 1)]), 1);
+    }
+
+    #[test]
+    fn an_untagged_replacement_is_no_longer_reachable_by_the_old_tag() {
+        let cache = StaticCache::new();
+        let e = cache.tag_epoch();
+        assert!(tag(&cache, "/a", &["t"], e));
+        assert!(tag(&cache, "/a", &[], e)); // the origin stopped tagging it
+        assert_eq!(cache.purge_tags(&["t"]), 0);
+        assert!(matches!(cache.get("/a"), CacheLookup::Fresh(_)));
+    }
+
+    #[test]
+    fn purging_one_tag_removes_the_key_from_its_other_tags_too() {
+        let cache = StaticCache::new();
+        let e = cache.tag_epoch();
+        assert!(tag(&cache, "/a", &["x", "y"], e));
+        assert_eq!(cache.purge_tags(&["x"]), 1);
+        // the key is gone; "y" must not keep a reference that would purge a later entry
+        let e = cache.tag_epoch();
+        cache.insert(
+            "/a",
+            Bytes::from_static(b"fresh"),
+            default_meta(),
+            3600,
+            0,
+            100,
+        );
+        assert_eq!(
+            cache.purge_tags(&["y"]),
+            0,
+            "a new untagged /a is not under y"
+        );
+        assert!(matches!(cache.get("/a"), CacheLookup::Fresh(_)));
+        let _ = e;
+    }
+
+    #[test]
+    fn a_revalidation_cannot_bring_back_an_entry_a_purge_removed() {
+        let cache = StaticCache::new();
+        let e = cache.tag_epoch();
+        assert!(tag(&cache, "/r", &["t"], e));
+        let revalidating = cache.tag_epoch(); // the 304 request starts here
+        cache.purge_tags(&["t"]); // ... and the entry is purged meanwhile
+        let refreshed = cache.refresh_checked(
+            "/r",
+            Bytes::from_static(b"old"),
+            default_meta(),
+            3600,
+            0,
+            100,
+            revalidating,
+        );
+        assert!(!refreshed);
+        assert!(
+            !matches!(cache.get("/r"), CacheLookup::Fresh(_)),
+            "still gone"
+        );
+        // started after the purge: allowed
+        assert!(cache.refresh_checked(
+            "/r",
+            Bytes::from_static(b"v"),
+            default_meta(),
+            3600,
+            0,
+            100,
+            cache.tag_epoch(),
+        ));
+    }
+
+    #[test]
+    fn a_full_index_drops_the_previous_entry_instead_of_leaving_it_unreachable() {
+        let cache = StaticCache::new();
+        let e = cache.tag_epoch();
+        for i in 0..MAX_TAGS {
+            assert!(tag(&cache, &format!("/k{i}"), &[&format!("t{i}")], e));
+        }
+        assert!(tag(&cache, "/old", &["t0"], e));
+        let tags = vec!["brand-new".to_string()];
+        let r = cache.insert_tagged(
+            "/old",
+            Bytes::from_static(b"x"),
+            default_meta(),
+            3600,
+            0,
+            100_000,
+            &tags,
+            e,
+        );
+        assert_eq!(r, TagStore::IndexFull);
+        assert!(
+            !matches!(cache.get("/old"), CacheLookup::Fresh(_)),
+            "no entry a purge cannot reach"
         );
     }
 }

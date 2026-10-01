@@ -2213,3 +2213,24 @@ async fn a_tag_purge_while_a_fetch_is_in_flight_keeps_that_response_out_of_the_c
         "the response that began before the purge must not outlive it"
     );
 }
+
+#[tokio::test]
+async fn an_empty_tag_parameter_does_not_flush_the_cache() {
+    let (o, st) = rig("").await;
+    *o.extra.lock().unwrap() = None;
+    fetch(&st, "/t/keep", &[]).await;
+    settle().await;
+    for q in ["?tag=", "?tag=,,", "?tag=&prefix=/t"] {
+        let (code, _) = purge_request(&st, q, "127.0.0.1:1").await;
+        assert_eq!(code, 400, "{q}");
+    }
+    assert_eq!(
+        fetch(&st, "/t/keep", &[]).await.0,
+        "HIT",
+        "nothing was purged"
+    );
+    // no tag parameter at all is still the legacy "everything"
+    let (code, _) = purge_request(&st, "", "127.0.0.1:1").await;
+    assert_eq!(code, 200);
+    assert_eq!(fetch(&st, "/t/keep", &[]).await.0, "MISS");
+}
