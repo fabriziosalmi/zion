@@ -255,6 +255,7 @@ export default defineConfig({
           { text: '0021 · Static file streaming', link: '/adr/0021-static-file-streaming' },
           { text: '0022 · Static precompressed sidecars', link: '/adr/0022-static-precompressed-sidecars' },
           { text: '0023 · ML-WAF training pipeline', link: '/adr/0023-ml-waf-training-pipeline' },
+          { text: '0024 · preserve_host', link: '/adr/0024-preserve-host' },
         ]
       },
     ],
