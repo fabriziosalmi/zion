@@ -97,7 +97,7 @@ annotation, no emission).
 | `proxy_connect_timeout 75s` | convert | `connect_timeout_ms = 75000` |
 | `proxy_read_timeout` / `send_timeout` / `client_body_timeout` | unsupported | no schema target |
 | `proxy_set_header X-Real-IP / X-Forwarded-For / X-Forwarded-Proto ...` | auto | Zion sets all three unconditionally (`apply_forwarding_hygiene`) |
-| `proxy_set_header Host $host` | unsupported | Zion strips inbound `Host` and re-derives from the upstream authority; original survives only as `X-Forwarded-Host` — behavior delta reported |
+| `proxy_set_header Host $host` | convert (since #485) | the upstream gets `preserve_host = true` ([ADR-0024](0024-preserve-host.md)); before, Zion always re-derived `Host` from the upstream authority and this was reported unsupported |
 | `proxy_set_header <other>` / `add_header <other>` | unsupported | no generic header-manipulation target |
 | `add_header Content-Security-Policy ...` | convert | `route.csp` |
 | `add_header Strict-Transport-Security ...` | auto | Zion injects HSTS (+XCTO, XFO, Referrer-Policy, Permissions-Policy) on every response; differing values cannot be honored → finding |

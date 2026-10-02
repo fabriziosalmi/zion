@@ -6,7 +6,7 @@
 //! finding — never a best-effort guess. The emitted `ZionDoc` is pure data;
 //! rendering and self-validation live in `emit`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use super::model::{LocMod, Location, NginxModel, Pool, Server};
 use super::nginx::Directive;
@@ -53,6 +53,11 @@ pub struct UpstreamOut {
     pub urls: Vec<String>,
     pub connect_timeout_ms: Option<u64>,
     pub keepalive: Option<u64>,
+    /// Forward the client's Host (ADR-0024). Set by [`settle_preserve_host`] from the
+    /// routes that use the upstream.
+    pub preserve_host: bool,
+    /// The Host the health probe sends (with `preserve_host`).
+    pub health_host: Option<String>,
 }
 
 #[derive(Debug)]
@@ -71,6 +76,9 @@ pub struct RouteOut {
     pub spa_fallback: bool,
     /// Only Zion's internal networks may use the route (from nginx `allow`/`deny`, #483).
     pub internal_only: bool,
+    /// The source forwards the client's Host to this route's backend (nginx
+    /// `proxy_set_header Host $host`, Traefik `passHostHeader`, Caddy's default).
+    pub preserve_host: bool,
     /// Rendered as `# UNSUPPORTED: …` comment lines above the route.
     pub annotations: Vec<String>,
 }
@@ -238,6 +246,7 @@ pub fn map_model(model: &NginxModel, findings: &mut Vec<Finding>) -> ZionDoc {
 
     finish_aggregates(&agg, model, &mut doc, findings);
     doc.upstreams = reg.finish(model, findings);
+    settle_preserve_host(&mut doc, findings);
     doc
 }
 
@@ -935,6 +944,8 @@ impl<'a> UpstreamReg<'a> {
                 urls,
                 connect_timeout_ms: timeout,
                 keepalive: pool.keepalive,
+                preserve_host: false,
+                health_host: None,
             });
         }
         for (url, name, timeout) in self.synth {
@@ -943,9 +954,94 @@ impl<'a> UpstreamReg<'a> {
                 urls: vec![url],
                 connect_timeout_ms: timeout,
                 keepalive: None,
+                preserve_host: false,
+                health_host: None,
             });
         }
         out
+    }
+}
+
+/// Turn the routes' `preserve_host` wishes into upstream settings (ADR-0024). The setting
+/// is per upstream in Zion and per location / router / site in the sources, so an upstream
+/// whose routes disagree is split: the routes that forward the client's Host get a copy
+/// named `<name>_host`. Each such upstream gets a `health_host` from the first concrete
+/// host its routes serve (a backend that refuses unknown hosts would fail the probe sent
+/// with its own address); without one, a finding says to set it if needed.
+pub fn settle_preserve_host(doc: &mut ZionDoc, findings: &mut Vec<Finding>) {
+    let mut taken: BTreeSet<String> = doc.upstreams.iter().map(|u| u.name.clone()).collect();
+    let mut added: Vec<UpstreamOut> = Vec::new();
+    for up in &doc.upstreams {
+        let wants: Vec<bool> = doc
+            .routes
+            .iter()
+            .filter(|r| r.upstream == up.name && r.serve_dir.is_none())
+            .map(|r| r.preserve_host)
+            .collect();
+        if wants.iter().all(|w| *w) || !wants.iter().any(|w| *w) {
+            continue;
+        }
+        // Mixed: keep the original for the routes that do not forward the Host.
+        let mut name = format!("{}_host", up.name);
+        while taken.contains(&name) {
+            name.push('_');
+        }
+        taken.insert(name.clone());
+        for r in doc.routes.iter_mut() {
+            if r.upstream == up.name && r.preserve_host && r.serve_dir.is_none() {
+                r.upstream = name.clone();
+            }
+        }
+        findings.push(Finding::new(
+            Status::Convert,
+            0,
+            format!("upstream {}", up.name),
+            format!(
+                "some routes forward the client's Host and some do not: those that do use a \
+                 copy, upstream '{name}', with preserve_host = true"
+            ),
+        ));
+        added.push(UpstreamOut {
+            name,
+            urls: up.urls.clone(),
+            connect_timeout_ms: up.connect_timeout_ms,
+            keepalive: up.keepalive,
+            preserve_host: false,
+            health_host: None,
+        });
+    }
+    doc.upstreams.extend(added);
+    for up in &mut doc.upstreams {
+        let routes: Vec<&RouteOut> = doc
+            .routes
+            .iter()
+            .filter(|r| r.upstream == up.name && r.preserve_host && r.serve_dir.is_none())
+            .collect();
+        if routes.is_empty() {
+            continue;
+        }
+        up.preserve_host = true;
+        up.health_host = routes
+            .iter()
+            .filter_map(|r| r.hosts.as_ref())
+            .flatten()
+            .find(|h| !h.contains('*') && crate::security::normalize_host(h).is_some())
+            .cloned();
+        findings.push(Finding::new(
+            Status::Convert,
+            0,
+            format!("upstream {}", up.name),
+            match &up.health_host {
+                Some(h) => format!(
+                    "the backend receives the client's Host → preserve_host = true, health \
+                     probes send Host {h} (health_host)"
+                ),
+                None => "the backend receives the client's Host → preserve_host = true; no \
+                         concrete host to probe with: set health_host if the backend refuses \
+                         unknown hosts, or its health probes fail"
+                    .to_string(),
+            },
+        ));
     }
 }
 
@@ -983,6 +1079,8 @@ struct ServerCtx {
     csp: Option<String>,
     has_add_header: bool,
     websocket: bool,
+    /// `proxy_set_header Host $host|$http_host` seen (forward the client's Host).
+    preserve_host: bool,
     has_set_header: bool,
     hdr_annotations: Vec<String>,
     waf: bool,
@@ -1252,6 +1350,7 @@ fn map_server(
         csp: None,
         has_add_header: false,
         websocket: false,
+        preserve_host: false,
         has_set_header: false,
         hdr_annotations: Vec::new(),
         waf: false,
@@ -1329,7 +1428,13 @@ fn map_server(
                 // Inherited by locations that declare none of their own —
                 // including the websocket idiom and the Host behavior note.
                 ctx.has_set_header = true;
-                classify_set_header(d, &mut ctx.websocket, &mut ctx.hdr_annotations, findings);
+                classify_set_header(
+                    d,
+                    &mut ctx.websocket,
+                    &mut ctx.preserve_host,
+                    &mut ctx.hdr_annotations,
+                    findings,
+                );
             }
             "proxy_connect_timeout" => {
                 map_connect_timeout(d, &mut ctx.connect_ms, findings);
@@ -1467,6 +1572,7 @@ fn map_location(
                                                                          // Location-scoped header state — inherits from the server ONLY when the
                                                                          // location declares no directive of that family (nginx replace-not-merge).
     let mut loc_ws = false;
+    let mut loc_preserve_host = false;
     let mut loc_has_set_header = false;
     let mut loc_hdr_annotations: Vec<String> = Vec::new();
     let mut loc_csp: Option<String> = None;
@@ -1525,7 +1631,13 @@ fn map_location(
             },
             "proxy_set_header" => {
                 loc_has_set_header = true;
-                classify_set_header(d, &mut loc_ws, &mut loc_hdr_annotations, findings)
+                classify_set_header(
+                    d,
+                    &mut loc_ws,
+                    &mut loc_preserve_host,
+                    &mut loc_hdr_annotations,
+                    findings,
+                )
             }
             "proxy_http_version" => findings.push(Finding::new(
                 Status::Auto,
@@ -1805,6 +1917,7 @@ fn map_location(
             serve_dir: Some(serve_dir),
             spa_fallback,
             internal_only,
+            preserve_host: false,
             annotations: Vec::new(),
         });
         return;
@@ -1836,6 +1949,11 @@ fn map_location(
         loc_ws
     } else {
         ctx.websocket
+    };
+    let preserve_host = if loc_has_set_header {
+        loc_preserve_host
+    } else {
+        ctx.preserve_host
     };
     let mut hdr_annotations = if loc_has_set_header {
         loc_hdr_annotations
@@ -1938,6 +2056,7 @@ fn map_location(
         serve_dir: None,
         spa_fallback: false,
         internal_only,
+        preserve_host,
         annotations,
     });
 }
@@ -2219,6 +2338,7 @@ fn map_add_header(d: &Directive, csp: &mut Option<String>, findings: &mut Vec<Fi
 fn classify_set_header(
     d: &Directive,
     websocket: &mut bool,
+    preserve_host: &mut bool,
     annotations: &mut Vec<String>,
     findings: &mut Vec<Finding>,
 ) {
@@ -2250,22 +2370,49 @@ fn classify_set_header(
                 "Connection — hop-by-hop headers are managed by Zion",
             ));
         }
-        "host" => {
-            findings.push(Finding::new(
-                Status::Unsupported,
+        "host" => match value {
+            "$http_host" => {
+                *preserve_host = true;
+                findings.push(Finding::new(
+                    Status::Convert,
+                    d.line,
+                    "proxy_set_header",
+                    "Host $http_host → the upstream gets preserve_host = true",
+                ));
+            }
+            "$host" => {
+                *preserve_host = true;
+                findings.push(Finding::new(
+                    Status::Convert,
+                    d.line,
+                    "proxy_set_header",
+                    "Host $host → the upstream gets preserve_host = true (Zion forwards the \
+                     Host as the client sent it, port included; nginx $host drops the port)",
+                ));
+            }
+            "$proxy_host" => findings.push(Finding::new(
+                Status::Auto,
                 d.line,
                 "proxy_set_header",
-                format!(
-                    "Host {value} — Zion re-derives Host from the upstream authority; \
-                     the original host reaches the backend as X-Forwarded-Host"
-                ),
-            ));
-            annotations.push(
-                "proxy_set_header Host: backend sees the upstream authority as Host; \
-                 original host arrives in X-Forwarded-Host"
-                    .to_string(),
-            );
-        }
+                "Host $proxy_host — the upstream's own address, Zion's default",
+            )),
+            _ => {
+                findings.push(Finding::new(
+                    Status::Unsupported,
+                    d.line,
+                    "proxy_set_header",
+                    format!(
+                        "Host {value} — Zion sends either the upstream's own address or, with \
+                         preserve_host, the client's Host; a fixed or composed Host is not \
+                         supported"
+                    ),
+                ));
+                annotations.push(format!(
+                    "proxy_set_header Host {value}: backend sees the upstream authority as \
+                     Host; original host arrives in X-Forwarded-Host"
+                ));
+            }
+        },
         _ => findings.push(Finding::new(
             Status::Unsupported,
             d.line,

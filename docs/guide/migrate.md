@@ -38,7 +38,7 @@ $ zion import nginx app.conf -o zion.toml
   zion import nginx: 14 findings — 6 convert, 2 partial, 4 auto, 2 unsupported
    line  status       directive         detail
       8  partial      server            1 plain-HTTP server(s) — Zion always terminates TLS …
-     24  unsupported  proxy_set_header  Host $host — Zion re-derives Host from the upstream authority …
+     31  unsupported  proxy_read_timeout  only the upstream connect timeout is configurable in Zion
 ```
 
 Attach the findings report to your migration PR: it *is* the record of what
@@ -73,6 +73,22 @@ Reads a `server { … }` / `location { … }` / `upstream { … }` config, inclu
 
   Before 0.9.6 these were reported as unsupported **and the route was emitted open**:
   an IP-restricted location became public. Re-run the import of any config that had them.
+- **`proxy_set_header Host`** (in a `location`, or inherited from its `server`,
+  replace-not-merge) → the upstream's
+  [`preserve_host`](/config/#forward-the-client-s-host-preserve-host-opt-in):
+
+  | nginx | Zion | finding |
+  |---|---|---|
+  | `Host $http_host` | `preserve_host = true` | convert |
+  | `Host $host` | `preserve_host = true` | convert (Zion forwards the Host as sent, port included; `$host` drops it) |
+  | `Host $proxy_host`, or no `Host` line | the upstream's own address (default) | auto |
+  | `Host <fixed name>` / composed values | the upstream's own address | unsupported |
+
+  `preserve_host` is per upstream in Zion: when some locations of one upstream
+  forward the Host and others do not, the ones that do get a copy named
+  `<upstream>_host`. Such an upstream also gets `health_host` = the first concrete
+  `server_name`, so its health probe is accepted by a backend that refuses unknown
+  hosts; with only `_` or wildcards, a finding asks you to set it.
 - A location on one of Zion's own endpoints (`/metrics`, `/healthz`, `/readyz`,
   `/_zion/…`) is converted but reported **partial**: Zion answers that path itself,
   so the backend's endpoint is not reachable through Zion.
@@ -92,6 +108,9 @@ rather than guessing.
 - `routers.X.rule=Host(\`a\`) && PathPrefix(\`/api\`)` → `hosts` + `path`.
 - `services.X.loadbalancer.server.port` → an upstream at the **compose service
   name** (`http://<service>:<port>`).
+- Traefik forwards the client's `Host` by default → `preserve_host = true` (and
+  `health_host` from the router's `Host` rule); `services.X.loadbalancer.passhostheader=false`
+  → the upstream's own address.
 - `.tls.certresolver` + the resolver's ACME email → native
   [`[tls.acme]`](#automatic-https-acme).
 - `--providers.docker=true` → the **headline finding**: Zion has no service
@@ -126,6 +145,11 @@ required).
   `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`) and strips
   `Server`. A `Content-Security-Policy` becomes the route's `csp`.
 - `root` + `file_server` → [`mode = "static"`](#static-sites-and-spas).
+- `reverse_proxy` forwards the client's `Host` by default → `preserve_host = true`
+  (and `health_host` from the site address); `header_up Host {upstream_hostport}`
+  inside its block → the upstream's own address. Other sub-directives of a
+  `reverse_proxy { … }` block (`lb_policy`, `health_uri`, `transport`, …) are
+  reported as unsupported; before, they were dropped without a finding.
 
 Not translated: `handle_path` (path rewriting), `respond "…" 403` (static
 responses), `encode` (Zion does not compress), named `@matcher`s.
