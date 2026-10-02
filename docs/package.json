@@ -13,5 +13,8 @@
   "dependencies": {
     "@fontsource-variable/jetbrains-mono": "^5.2.8",
     "@fontsource-variable/source-serif-4": "^5.2.9"
+  },
+  "overrides": {
+    "vite": "^6.4.3"
   }
 }
