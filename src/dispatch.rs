@@ -603,7 +603,11 @@ async fn process_request_inner(
             }
         }
 
-        if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
+        // Read and scan the body of the methods that carry one, and of any other request
+        // that actually has one (Content-Length / chunked on HTTP/1, an open stream on
+        // HTTP/2): a GET body is forwarded to the upstream, so it is scanned like the rest.
+        let has_body = !hyper::body::Body::is_end_stream(req.body());
+        if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") || has_body {
             let (parts, body) = req.into_parts();
 
             // Borrow content-type from parts.headers — no String allocation needed.
