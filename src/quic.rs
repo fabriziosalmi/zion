@@ -217,6 +217,21 @@ where
     Ok(())
 }
 
+/// The HTTP/3 request as the shared pipeline sees it.
+///
+/// It keeps the client's method, URI with its authority, version and every header, minus
+/// the transport attestations no client may set: this listener verifies no client
+/// certificate and computes no JA4. The forwarding headers are the pipeline's job, from
+/// the real peer address, as for HTTP/1 and HTTP/2.
+pub(crate) fn bridge_request(
+    req: hyper::Request<()>,
+    body: crate::ZionBody,
+) -> hyper::Request<crate::ZionBody> {
+    let (mut parts, ()) = req.into_parts();
+    crate::security::strip_transport_attestations(&mut parts.headers);
+    hyper::Request::from_parts(parts, body)
+}
+
 /// Handle a single HTTP/3 request through the Zion security pipeline.
 ///
 /// Gates applied (same as handle_https in main.rs):
@@ -259,13 +274,7 @@ where
         }
     });
 
-    let uni_req: hyper::Request<crate::ZionBody> = hyper::Request::builder()
-        .method(req.method().clone())
-        .uri(req.uri().clone())
-        // Apply connection properties
-        .header("X-Forwarded-For", remote_addr.ip().to_string())
-        .header("X-Forwarded-Proto", "https") // H3 is virtually synonymous with TLS
-        .body(stream_body.boxed())?;
+    let uni_req = bridge_request(req, stream_body.boxed());
 
     // Dispatch the bridged request through the single source of truth HTTP processing engine
     // (This automatically executes all Gates: WAF, CORS, Auth, Rate Limits, and Routes).
@@ -339,6 +348,53 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty() -> crate::ZionBody {
+        use http_body_util::BodyExt;
+        http_body_util::Full::new(Bytes::new())
+            .map_err(|n| match n {})
+            .boxed()
+    }
+
+    #[test]
+    fn the_bridged_request_keeps_every_client_header() {
+        let req = hyper::Request::builder()
+            .method("POST")
+            .uri("https://app.example/api?q=1")
+            .version(hyper::Version::HTTP_3)
+            .header("authorization", "Bearer t")
+            .header("cookie", "sid=1")
+            .header("content-type", "application/json")
+            .header("accept-encoding", "gzip")
+            .header("x-custom", "a")
+            .header("x-custom", "b")
+            .body(())
+            .unwrap();
+        let out = bridge_request(req, empty());
+        assert_eq!(out.method(), "POST");
+        assert_eq!(out.uri(), "https://app.example/api?q=1");
+        assert_eq!(out.version(), hyper::Version::HTTP_3);
+        let h = out.headers();
+        assert_eq!(h["authorization"], "Bearer t");
+        assert_eq!(h["cookie"], "sid=1");
+        assert_eq!(h["content-type"], "application/json");
+        assert_eq!(h["accept-encoding"], "gzip");
+        assert_eq!(h.get_all("x-custom").iter().count(), 2);
+        // forwarding headers are the pipeline's job, from the real peer
+        assert!(!h.contains_key("x-forwarded-for") && !h.contains_key("x-forwarded-proto"));
+    }
+
+    #[test]
+    fn the_bridged_request_drops_forged_transport_attestations() {
+        let mut b = hyper::Request::builder().uri("https://app.example/");
+        for name in crate::security::TRANSPORT_ATTESTATION_HEADERS {
+            b = b.header(name, "forged").header(name, "forged-again");
+        }
+        let out = bridge_request(b.body(()).unwrap(), empty());
+        for name in crate::security::TRANSPORT_ATTESTATION_HEADERS {
+            assert!(!out.headers().contains_key(name), "{name} survived");
+        }
+    }
 
     #[test]
     fn alt_svc_header_value() {

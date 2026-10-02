@@ -550,6 +550,25 @@ pub const CLIENT_OVERRIDE_HEADERS: [&str; 9] = [
     "x-original-host",
 ];
 
+/// Headers by which zion attests what the TLS layer verified: the client certificate
+/// (`X-Client-Cert-Fingerprint` / `-DN`) and the JA4 identity (`X-Client-TLS-JA4` /
+/// `-Allowlisted`). A client must never set them: every listener strips any inbound copy
+/// before the pipeline, and only the HTTPS listener re-injects the values it verified.
+/// Literal names: the JA4 module is compiled out without its feature, the strip is not.
+pub const TRANSPORT_ATTESTATION_HEADERS: [&str; 4] = [
+    "x-client-cert-fingerprint",
+    "x-client-cert-dn",
+    "x-client-tls-ja4",
+    "x-client-tls-allowlisted",
+];
+
+/// Drop [`TRANSPORT_ATTESTATION_HEADERS`] (every copy).
+pub fn strip_transport_attestations(headers: &mut hyper::HeaderMap) {
+    for name in TRANSPORT_ATTESTATION_HEADERS {
+        headers.remove(name);
+    }
+}
+
 /// Drop [`CLIENT_OVERRIDE_HEADERS`] (every copy; hyper lower-cases names).
 pub fn scrub_client_override_headers(headers: &mut hyper::HeaderMap) {
     for name in CLIENT_OVERRIDE_HEADERS {
@@ -619,6 +638,26 @@ impl TrustedProxies {
 #[cfg(test)]
 mod proxy_tests {
     use super::*;
+
+    #[test]
+    fn every_transport_attestation_is_stripped_in_any_case() {
+        let mut h = hyper::HeaderMap::new();
+        for name in [
+            "X-Client-Cert-Fingerprint",
+            "x-client-cert-dn",
+            "X-CLIENT-TLS-JA4",
+            "X-Client-TLS-Allowlisted",
+        ] {
+            h.append(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                "forged".parse().unwrap(),
+            );
+        }
+        h.insert("authorization", "Bearer t".parse().unwrap());
+        strip_transport_attestations(&mut h);
+        assert_eq!(h.len(), 1, "only the forged attestations go: {h:?}");
+        assert!(h.contains_key("authorization"));
+    }
 
     fn proxies(cidrs: &[&str]) -> TrustedProxies {
         TrustedProxies::from_config(&cidrs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
