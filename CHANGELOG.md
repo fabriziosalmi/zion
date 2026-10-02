@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Security
+
+- **A route with `auth_profile` is never served unauthenticated.** The official release binaries and container were built with `--features dist` (acme + init), without `auth`: a config whose routes set `auth_profile` loaded with only a warning, and those routes answered without any token (reproduced on the 0.9.7 release binary: a "protected" route answered 200 to a request with no `Authorization`). Two changes: the release bundle now includes `auth` (`dist = acme + init + auth`), so official artifacts enforce JWT/OIDC (the same route answers 401); and a build without `auth` now **refuses** such a config (exit code 2 at boot, rejected on reload) instead of warning. Found by the 2026-10-02 code audit. If you run an official binary with `auth_profile` routes, upgrade.
+
 ## [0.9.7] - 2026-10-02
 
 **Host release: WebSocket upgrades work against strict backends, and an upstream can receive the client's `Host`.** No breaking changes. Read the notes below.

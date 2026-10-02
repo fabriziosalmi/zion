@@ -416,16 +416,16 @@ fn warn_feature_config_gaps(config: &config::ZionConfig) {
             );
         }
     }
+    // (A route with auth_profile on a build without `--features auth` is a config
+    // error, see config::semantic_errors: it would serve unauthenticated.)
     #[cfg(not(feature = "auth"))]
     {
-        let uses_auth = !config.auth_profile.is_empty()
-            || config.route.iter().any(|r| r.auth_profile.is_some());
-        if uses_auth {
+        if !config.auth_profile.is_empty() {
             logging::warn(
                 "config",
-                "auth_profile is configured but this binary was built WITHOUT \
-                 `--features auth` — authentication is NOT enforced and those \
-                 routes serve UNAUTHENTICATED. Rebuild with `--features auth`.",
+                "[auth_profile] is defined but this binary was built WITHOUT \
+                 `--features auth`; no route uses it, so nothing is served \
+                 unauthenticated, but it would be refused if one did.",
             );
         }
     }

@@ -1,7 +1,9 @@
 # Authentication (JWT/OIDC)
 
 ::: tip Feature-gated
-Build with `--features auth` to enable JWT/OIDC authentication.
+The official release binaries and container include it (since 0.9.8, `--features dist`).
+A source build needs `--features auth`. A build **without** it refuses to start on a
+config whose routes set `auth_profile`, rather than serve them unauthenticated.
 :::
 
 Zion supports per-route JWT validation as an optional authentication gate. Tokens are validated before the request reaches the upstream, preventing unauthorized access at the edge.
