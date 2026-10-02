@@ -79,8 +79,42 @@ refused.
 | `keepalive` | usize | `64` | Max idle keepalive connections |
 | `tls` | bool | `false` | Use HTTPS to connect to upstream |
 | `client_cert_path` / `client_key_path` | string? | none | Client cert + key for mTLS from Zion to the upstream |
+| `preserve_host` | bool | `false` | Send the client's `Host` instead of the upstream's own (see below) |
+| `health_host` | string? | none | `Host` the health probe sends (default: the upstream's own address) |
 
 Legacy format `[upstreams]` (flat key-value map of name to URL) is also supported.
+
+### Forward the client's Host (`preserve_host`, opt-in)
+
+```toml
+[upstream.app]
+url = "http://10.0.0.5:8000"
+preserve_host = true
+health_host = "app.example.com"   # what the health probe sends as Host
+```
+
+By default the upstream receives its own authority as `Host` (`10.0.0.5:8000`) and the
+client's host in `X-Forwarded-Host`. With `preserve_host = true` it receives the client's
+`Host` as sent (port included; for an HTTP/2 client, its `:authority`), like nginx
+`proxy_set_header Host $http_host` and the Traefik and Caddy defaults. Use it for
+applications that check or build URLs from `Host`: Django `ALLOWED_HOSTS`, Rails host
+authorization, CSRF origin checks, absolute redirects, multi-tenant or virtual-host backends.
+
+- Applies to every request zion sends to that upstream: `standard` routes and pool failover
+  attempts, `sse_stream`, `static_cache` origin fetches and background refreshes, WebSocket
+  upgrades, and the `:80` ACME fallback. Health probes keep using the upstream's own name.
+- That upstream is spoken to over **HTTP/1.1 only**: HTTP/2 cannot carry a `Host` that
+  differs from `:authority` (a backend resets the stream). A TLS upstream that offers HTTP/2
+  loses multiplexing; nginx proxies over HTTP/1.1 too.
+- TLS still verifies the **upstream's** certificate name: the setting changes one request
+  header, never which certificate is accepted.
+- **Set `health_host` when the backend refuses unknown hosts.** The health probe sends the
+  upstream's own address as `Host` by default; a backend with an allow-list (Django
+  `ALLOWED_HOSTS`) answers it 4xx, the upstream is marked down and every request gets
+  `503`. Zion warns at startup when `preserve_host` is set without it. A probe with
+  `health_host` also goes over HTTP/1.1.
+- `X-Forwarded-Host` is still set. The response cache is keyed by host, so two hosts never
+  share an entry. See [ADR-0024](/adr/0024-preserve-host).
 
 ### Concurrency cap (`max_in_flight`, opt-in)
 

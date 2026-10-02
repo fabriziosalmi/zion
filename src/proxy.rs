@@ -87,7 +87,11 @@ pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 3000;
 /// attempt against it costs ~30s before the next member is tried. The deadline
 /// covers the TCP connect only; the TLS handshake and the response stay bounded
 /// by that overall timeout.
-pub fn build_http_client(connect_timeout_ms: u64) -> HttpClient {
+///
+/// `http1_only` offers TLS upstreams only `http/1.1` in ALPN: an upstream with
+/// `preserve_host` must not be spoken to over HTTP/2, which cannot carry a `Host` that
+/// differs from `:authority` (the backend resets the stream; ADR-0024).
+pub fn build_http_client(connect_timeout_ms: u64, http1_only: bool) -> HttpClient {
     let mut http = hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(
         crate::dns::StaleOnErrorResolver,
     );
@@ -101,12 +105,15 @@ pub fn build_http_client(connect_timeout_ms: u64) -> HttpClient {
     http.set_connect_timeout(
         (connect_timeout_ms > 0).then(|| std::time::Duration::from_millis(connect_timeout_ms)),
     );
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
+    let builder = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .wrap_connector(http);
+        .enable_http1();
+    let https = if http1_only {
+        builder.wrap_connector(http)
+    } else {
+        builder.enable_http2().wrap_connector(http)
+    };
 
     Client::builder(TokioExecutor::new())
         .pool_idle_timeout(std::time::Duration::from_secs(30))
@@ -153,6 +160,13 @@ fn simple_status(status: StatusCode, msg: &'static str) -> Response<ZionBody> {
         )
         .unwrap()
 }
+
+/// Request extension: forward the client's `Host` to the upstream instead of the
+/// upstream's own authority (`[upstream.x] preserve_host`, ADR-0024). Set once by the
+/// dispatcher on the inbound request, read by the forwarding hygiene shared by every
+/// proxy path; a path that rebuilds the request carries it over.
+#[derive(Clone, Copy, Debug)]
+pub struct PreserveHost;
 
 /// Rewrite URI for upstream forwarding and add proxy headers.
 /// Uses pre-parsed scheme+authority from config — only path is set at runtime.
@@ -219,6 +233,7 @@ fn apply_forwarding_hygiene<B>(
             .and_then(|a| hyper::header::HeaderValue::from_str(a.as_str()).ok())
     });
     req.headers_mut().remove("X-Forwarded-Host");
+    let preserve_host = req.extensions().get::<PreserveHost>().is_some();
     // RFC 9110 §7.6.3: name this proxy in `Via` (also what loop detection reads).
     let inbound_version = req.version();
     crate::via::append(req.headers_mut(), inbound_version);
@@ -272,6 +287,12 @@ fn apply_forwarding_hygiene<B>(
     // upstream still sees it (the module doc claimed this header was set but
     // it never was).
     if let Some(host) = inbound_host {
+        // `preserve_host`: the client's host is also the upstream's `Host`, as received
+        // (for an HTTP/2 client, its `:authority`). The pooled client only adds `Host` when
+        // it is absent, so this survives the URI rewrite.
+        if preserve_host {
+            req.headers_mut().insert(hyper::header::HOST, host.clone());
+        }
         req.headers_mut().insert("X-Forwarded-Host", host);
     }
 }
@@ -423,6 +444,7 @@ pub async fn proxy_pass_ha(
     let uri = parts.uri.clone();
     let version = parts.version;
     let headers = parts.headers.clone();
+    let preserve_host = parts.extensions.get::<PreserveHost>().is_some();
     let idempotent = matches!(
         method,
         hyper::Method::GET
@@ -467,6 +489,9 @@ pub async fn proxy_pass_ha(
         *attempt.uri_mut() = uri.clone();
         *attempt.version_mut() = version;
         *attempt.headers_mut() = headers.clone();
+        if preserve_host {
+            attempt.extensions_mut().insert(PreserveHost);
+        }
 
         let Some(prepared) =
             prepare_request(attempt, &scheme, &authority, remote_addr, proto, xff_mode)
@@ -725,7 +750,10 @@ pub async fn proxy_websocket(
     let Ok(host_value) = HeaderValue::from_str(&host_value) else {
         return Ok(bad_gateway());
     };
-    req.headers_mut().insert(hyper::header::HOST, host_value);
+    // Unless `preserve_host` kept the client's.
+    req.headers_mut()
+        .entry(hyper::header::HOST)
+        .or_insert(host_value);
 
     // HTTP/1.1 upgrade handshake — works on any AsyncRead+AsyncWrite stream.
     // For TLS upstreams, wrap in tokio-rustls connector first.
@@ -925,7 +953,7 @@ mod tests {
     ) -> std::time::Duration {
         use http_body_util::BodyExt;
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let client = build_http_client(connect_timeout_ms);
+        let client = build_http_client(connect_timeout_ms, false);
         let req = Request::builder()
             .uri("http://192.0.2.1:81/")
             .body(
@@ -1158,7 +1186,7 @@ mod tests {
         let health_map: crate::health::HealthMap = std::sync::Arc::new(Default::default());
 
         let resp = proxy_pass_ha(
-            &build_http_client(DEFAULT_CONNECT_TIMEOUT_MS),
+            &build_http_client(DEFAULT_CONNECT_TIMEOUT_MS, false),
             req,
             &pool,
             &scheme(),

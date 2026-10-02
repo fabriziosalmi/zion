@@ -160,6 +160,7 @@ impl ResolvedAppConfig {
         // The same URL can appear in many routes — dedup via FnvHashMap.
         let mut map = fnv::FnvHashMap::default();
         let mut outlier_claimed: std::collections::HashSet<String> = Default::default();
+        let mut warned_probe_host: std::collections::HashSet<String> = Default::default();
         for route in &config.route {
             // A static route has no upstream to probe.
             let Some(name) = route.upstream_name() else {
@@ -188,11 +189,32 @@ impl ResolvedAppConfig {
                 .filter(|_| urls.len() > 1)
                 .map(|o| o.to_runtime());
             let is_pool = urls.len() > 1;
+            let detailed = config.upstream.get(name);
+            let probe_host = detailed
+                .and_then(|u| u.health_host.as_deref())
+                .and_then(|h| hyper::header::HeaderValue::from_str(h).ok());
+            if detailed.is_some_and(|u| u.preserve_host && u.health_host.is_none())
+                && warned_probe_host.insert(name.to_string())
+            {
+                logging::warn(
+                    "config",
+                    &format!(
+                        "upstream.{name}: preserve_host without health_host: health probes send \
+                         the upstream's own address as Host; a backend that refuses unknown \
+                         hosts answers them 4xx and is marked down (set health_host)"
+                    ),
+                );
+            }
             for url in urls {
                 let entry = map
                     .entry(url.clone())
                     .or_insert_with(|| Arc::new(health::UpstreamHealth::new_healthy()));
                 // First route in config order wins; validation refuses conflicting tables.
+                if let Some(h) = &probe_host {
+                    if entry.probe_host.load().is_none() {
+                        entry.probe_host.store(Some(Arc::new(h.clone())));
+                    }
+                }
                 if breaker_cfg.is_some() && !entry.breaker.is_configured() {
                     entry.breaker.configure(breaker_cfg.clone());
                 }
@@ -424,7 +446,7 @@ pub(crate) struct AppState {
     /// A connector has one connect deadline, so upstreams with different values
     /// need different clients; keeping them here (not in the reloadable config
     /// snapshot) means their connection pools survive a hot reload.
-    pub(crate) http_clients: dashmap::DashMap<u64, HttpClient>,
+    pub(crate) http_clients: dashmap::DashMap<(u64, bool), HttpClient>,
     pub(crate) static_cache: cache::StaticCache,
     pub(crate) conn_limit: Arc<Semaphore>,
     pub(crate) http_builder: Arc<AutoBuilder<TokioExecutor>>,
@@ -472,16 +494,17 @@ impl AppState {
     /// The pooled HTTP client whose connector enforces `connect_timeout_ms` (the
     /// route's `[upstream.*] connect_timeout_ms`). Cheap: `HttpClient` is a
     /// reference-counted handle onto the shared pool.
-    pub(crate) fn client_for(&self, connect_timeout_ms: u64) -> HttpClient {
-        if connect_timeout_ms == crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS {
+    pub(crate) fn client_for(&self, connect_timeout_ms: u64, http1_only: bool) -> HttpClient {
+        if connect_timeout_ms == crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS && !http1_only {
             return self.http_client.clone();
         }
-        if let Some(c) = self.http_clients.get(&connect_timeout_ms) {
+        let key = (connect_timeout_ms, http1_only);
+        if let Some(c) = self.http_clients.get(&key) {
             return c.clone();
         }
         self.http_clients
-            .entry(connect_timeout_ms)
-            .or_insert_with(|| crate::proxy::build_http_client(connect_timeout_ms))
+            .entry(key)
+            .or_insert_with(|| crate::proxy::build_http_client(connect_timeout_ms, http1_only))
             .clone()
     }
 }
@@ -511,7 +534,7 @@ impl AppState {
         Arc::new(AppState {
             config: Arc::new(ArcSwap::from_pointee(resolved)),
             tls_acceptor: Arc::new(ArcSwap::from_pointee(tls)),
-            http_client: proxy::build_http_client(proxy::DEFAULT_CONNECT_TIMEOUT_MS),
+            http_client: proxy::build_http_client(proxy::DEFAULT_CONNECT_TIMEOUT_MS, false),
             http_clients: dashmap::DashMap::new(),
             static_cache: cache::StaticCache::new(),
             conn_limit: Arc::new(Semaphore::new(1024)),

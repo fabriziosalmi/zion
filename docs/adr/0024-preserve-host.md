@@ -73,8 +73,19 @@ accepted.
 ### Every path that talks HTTP to an upstream honours it
 
 Standard and pooled proxying (including failover attempts), `sse_stream`, cached-route
-origin fetches **and** their background refreshes (which build their own request), and
-WebSocket upgrades. Health probes keep probing the upstream's own name.
+origin fetches **and** their background refreshes (which build their own request),
+WebSocket upgrades, and the `:80` ACME fallback.
+
+### Health probes send `health_host` (amended while implementing)
+
+The first version of this record said health probes keep the upstream's own name. Measured
+against a backend that refuses unknown hosts (as Django `ALLOWED_HOSTS` does): the probe
+(`Host` = the upstream's address) got 400, the upstream was marked down, and **every**
+request answered 503, with or without `preserve_host`. So `[upstream.x] health_host` sets
+the `Host` the probe sends; such a probe goes over the HTTP/1.1-only client for the same
+reason as above. It is re-applied on every reload. An upstream with `preserve_host` and no
+`health_host` gets a startup warning. Importers set it from the source's server name when
+they turn `preserve_host` on.
 
 ### WebSocket upgrades send a valid request first
 
@@ -102,6 +113,8 @@ origin-form target (`/path?query`).
   multiplexing, and each concurrent request needs its own pooled connection.
 - One more client per distinct (connect timeout, HTTP/1-only) setting; clients are cheap
   and cached.
+- A backend that refuses unknown hosts needs `health_host` too, or its probes fail and it is
+  marked down; the warning at startup says so.
 - Two hosts sharing one upstream with `preserve_host` reach the upstream as themselves;
   the response cache already separates them.
 

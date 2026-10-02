@@ -817,6 +817,12 @@ async fn process_request_inner(
         }
     }
 
+    // `[upstream.x] preserve_host` (ADR-0024): mark the request once here, where the route
+    // is known; the forwarding hygiene every proxy path shares reads the mark.
+    if rule.preserve_host {
+        req.extensions_mut().insert(proxy::PreserveHost);
+    }
+
     // --- Gate: WebSocket upgrade detection ---
     // Check for Upgrade: websocket on ANY route (or explicit websocket mode)
     let is_websocket = rule.mode == config::RouteMode::Websocket
@@ -1063,7 +1069,7 @@ async fn process_request_inner(
             }
             config::RouteMode::SseStream => {
                 proxy::proxy_pass_stream(
-                    &state.client_for(rule.connect_timeout_ms),
+                    &state.client_for(rule.connect_timeout_ms, rule.preserve_host),
                     req,
                     &dyn_scheme,
                     &dyn_authority,
@@ -1075,7 +1081,7 @@ async fn process_request_inner(
             }
             config::RouteMode::Standard => {
                 proxy::proxy_pass_ha(
-                    &state.client_for(rule.connect_timeout_ms),
+                    &state.client_for(rule.connect_timeout_ms, rule.preserve_host),
                     req,
                     &rule.upstream_url,
                     &dyn_scheme,
@@ -1090,7 +1096,7 @@ async fn process_request_inner(
             }
             config::RouteMode::Websocket => {
                 proxy::proxy_pass(
-                    &state.client_for(rule.connect_timeout_ms),
+                    &state.client_for(rule.connect_timeout_ms, rule.preserve_host),
                     req,
                     &dyn_scheme,
                     &dyn_authority,
@@ -1374,6 +1380,8 @@ struct SwrRefresh {
     stale: cache::CacheHit,
     request: Request<ZionBody>,
     connect_timeout_ms: u64,
+    /// The upstream wants the client's Host (and so an HTTP/1.1-only client).
+    preserve_host: bool,
     scheme: hyper::http::uri::Scheme,
     authority: hyper::http::uri::Authority,
     remote_addr: SocketAddr,
@@ -1399,6 +1407,10 @@ fn swr_request(req: &Request<ZionBody>) -> Request<ZionBody> {
         .version(req.version())
         .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
         .expect("a GET with a copied URI builds");
+    // The refresh reaches the upstream with the same Host as the request it refreshes.
+    if req.extensions().get::<proxy::PreserveHost>().is_some() {
+        out.extensions_mut().insert(proxy::PreserveHost);
+    }
     for (name, value) in req.headers() {
         if matches!(
             *name,
@@ -1476,7 +1488,8 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
     let mut req = swr_request(&job.request);
     add_conditional_headers(req.headers_mut(), &job.stale.meta);
     let resp = match proxy::proxy_pass(
-        &job.state.client_for(job.connect_timeout_ms),
+        &job.state
+            .client_for(job.connect_timeout_ms, job.preserve_host),
         req,
         &job.scheme,
         &job.authority,
@@ -2164,7 +2177,7 @@ async fn handle_static_cache(
             None => None,
         };
         let resp = proxy::proxy_pass(
-            &state.client_for(rule.connect_timeout_ms),
+            &state.client_for(rule.connect_timeout_ms, rule.preserve_host),
             req,
             dyn_scheme,
             dyn_authority,
@@ -2277,7 +2290,7 @@ async fn handle_static_cache(
             None => None,
         };
         let mut resp = proxy::proxy_pass(
-            &state.client_for(rule.connect_timeout_ms),
+            &state.client_for(rule.connect_timeout_ms, rule.preserve_host),
             req,
             dyn_scheme,
             dyn_authority,
@@ -2367,6 +2380,7 @@ async fn handle_static_cache(
                         stale: hit.clone(),
                         request: swr_request(&req),
                         connect_timeout_ms: rule.connect_timeout_ms,
+                        preserve_host: rule.preserve_host,
                         scheme: dyn_scheme.clone(),
                         authority: dyn_authority.clone(),
                         remote_addr,
@@ -2482,7 +2496,7 @@ async fn handle_static_cache(
     // (channel closed without receiving `true`), they re-check the cache,
     // miss, and fall through to fetch themselves.
     let resp = match proxy::proxy_pass(
-        &state.client_for(rule.connect_timeout_ms),
+        &state.client_for(rule.connect_timeout_ms, rule.preserve_host),
         req,
         dyn_scheme,
         dyn_authority,
