@@ -120,7 +120,7 @@ The default build is a lean daemon; opt into what you need:
 cargo build --release                            # bare daemon
 cargo build --release --features init            # + zion init wizard / zion auto dev mode
 cargo build --release --features tui             # + zion top live dashboard
-cargo build --release --features dist            # release bundle: acme + init (what the container ships)
+cargo build --release --features dist            # release bundle: acme + init + auth (what the container ships)
 cargo build --release --features acme            # + automatic HTTPS via Let's Encrypt (HTTP-01)
 cargo build --release --features auth            # + JWT/OIDC authentication gate
 cargo build --release --features http3           # + HTTP/3 QUIC listener
@@ -195,7 +195,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 ```
 
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-66 modules, ~63,700 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+66 modules, ~63,800 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Features
 
@@ -290,7 +290,7 @@ MODE=full bash benchmarks/baseline/run-baseline.sh   # → benchmarks/baseline/z
 ## Testing
 
 <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
-**1261 unit tests** run on every change; **23 integration tests** need a running Zion + a backend.
+**1262 unit tests** run on every change; **23 integration tests** need a running Zion + a backend.
 
 ```bash
 cargo test                          # unit tests

@@ -224,9 +224,10 @@ init = ["rcgen", "time"]
 # closure (time, rcgen, deranged) that raises the real build MSRV to 1.88,
 # and the MSRV-1.82 CI job (`--no-default-features`) wouldn't catch it. So the
 # lean default build (and `cargo install zion`) stays 1.82-clean, while the
-# artifacts an operator actually deploys carry auto-HTTPS + the init wizard.
+# artifacts an operator actually deploys carry auto-HTTPS, the init wizard and
+# JWT/OIDC auth (a route with `auth_profile` is refused by a build without it).
 # Supply-chain cost is zero: cargo-deny/vet already audit --all-features.
-dist = ["acme", "init"]
+dist = ["acme", "init", "auth"]
 # Distributed tracing export to an OTLP collector (Tempo, Jaeger, Honeycomb,
 # Datadog Agent, etc). The base `tracing` integration is always-on; this
 # feature only enables the network exporter.

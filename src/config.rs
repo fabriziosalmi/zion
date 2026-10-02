@@ -1549,6 +1549,19 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     let mut errors: Vec<String> = Vec::new();
 
     errors.extend(config.redact.errors());
+    // A route that names an auth_profile is meant to be authenticated. A binary built
+    // without `--features auth` cannot do that and used to serve it unauthenticated
+    // with only a warning: refuse the config instead (fail closed), at boot and on reload.
+    #[cfg(not(feature = "auth"))]
+    if let Some(route) = config.route.iter().find(|r| r.auth_profile.is_some()) {
+        errors.push(format!(
+            "route '{}' sets auth_profile, but this binary was built without `--features auth`: \
+             it cannot authenticate, and would serve those routes unauthenticated. Use a build \
+             with auth (the official release binaries and container include it), or remove \
+             auth_profile from the routes",
+            route.path
+        ));
+    }
     for (name, up) in &config.upstream {
         if let Some(h) = &up.health_host {
             // A Host value: a host name or address, with an optional port.
@@ -3152,6 +3165,28 @@ enabledd = true
                 .unwrap_or_default();
             assert!(!e.contains("require_route_auth"), "{ok}: {e}");
         }
+    }
+
+    #[test]
+    fn a_route_with_auth_profile_needs_the_auth_feature() {
+        let protected = "[[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\nauth_profile=\"p\"\n";
+        let e = validate_str(&route_auth_cfg("", protected), "t")
+            .err()
+            .unwrap_or_default();
+        if cfg!(feature = "auth") {
+            assert!(!e.contains("--features auth"), "{e}");
+        } else {
+            assert!(
+                e.contains("sets auth_profile") && e.contains("--features auth"),
+                "a build without auth must refuse, not serve unauthenticated: {e}"
+            );
+        }
+        // a profile no route uses protects nothing and changes nothing
+        let open = "[[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let e = validate_str(&route_auth_cfg("", open), "t")
+            .err()
+            .unwrap_or_default();
+        assert!(!e.contains("--features auth"), "{e}");
     }
 
     #[test]

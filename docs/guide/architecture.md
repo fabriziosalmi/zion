@@ -208,7 +208,7 @@ Zion uses Tokio's multi-threaded runtime. Worker count is set to available CPU c
 | kTLS offload *(experimental)* | `--features ktls` | In-kernel TLS after handshake; wired, not yet exercised e2e in CI |
 | ML-augmented WAF *(experimental)* | `--features ml-waf` | ONNX scorer on the WAF hot path; ships no bundled model |
 
-The release bundle is `--features dist` (= `acme` + `init`). The full flag list
+The release bundle is `--features dist` (= `acme` + `init` + `auth`). The full flag list
 and lean/`cargo install` defaults live in the README "Build flavors" section.
 
 Build with multiple features:
