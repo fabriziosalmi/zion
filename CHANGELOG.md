@@ -18,6 +18,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 - **README and docs catch up with 0.9.4 / 0.9.5.** New [resilience guide](docs/guide/resilience.md) (what protects against what, where each protection sits on the request path, a combined example, what to alert on); the README Features now cover pools, outlier ejection, breaker, bulkhead, DNS last-good, drain, the log queue, `Range` / `Surrogate-Key` purge and client-IP privacy; the architecture page lists the modules added since 0.6 and the real pre-routing gate order; hardening, compliance mapping (`[redact] ip`) and the alert examples cover the new settings. The docs home page showed `Version 0.6.2`: it is now 0.9.5 and `scripts/check-version-sync.sh` / `bump-version.sh` keep it in step.
 
+### Security
+
+- **Every open dependency advisory is closed.** `protobuf 2.28` (RUSTSEC-2024-0437, recursion DoS; experimental `sovereign-aimp` build) leaves the graph: aimp#22 builds `prometheus` without its unused `protobuf` feature and zion pins that aimp revision. `memmap2` 0.9.10 → 0.9.11 fixes RUSTSEC-2026-0186 (`ml-waf` build). `lru` (RUSTSEC-2026-0002) was already past the fix, so its stale ignore is removed. `anymap2` (RUSTSEC-2026-0319, *unmaintained*, published 2026-10-02, no fixed version; only a build dependency of `tract` under `ml-waf`) is accepted with a written reason in both `deny.toml` and `.cargo/audit.toml`. Docs toolchain: `vite` 5.4.21 → 6.4.3 via an npm override (fixes the four `vite` / `esbuild` / `launch-editor` dev-server advisories; vitepress 1.6.4 still pins vite 5) and `nanoid` 3.3.19; the generated site is text-identical on all 62 pages.
+
 ## [0.9.5] - 2026-10-01
 
 **Operations and correctness release: deploys stop waiting on idle connections, a recovered pool member gets traffic again, client IPs can be kept out of the logs, and the cache can serve byte ranges.** No breaking changes; one fix to the 0.9.4 load balancer. Read the notes below.

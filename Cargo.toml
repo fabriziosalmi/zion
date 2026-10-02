@@ -176,7 +176,9 @@ git = "https://github.com/fabriziosalmi/aimp"
 #               endpoint, file/env config loader) moved behind aimp's `cli`
 #               feature, which is why `default-features = false` below is
 #               load-bearing and not cosmetic.
-rev = "fbd0f9d797b0dde438a1a6fcec91b40d4da7c44b"
+#   * aimp#22 — prometheus without its `protobuf` feature: drops protobuf 2.28
+#               (RUSTSEC-2024-0437 / GHSA-2gh3-rmm4-6rq5) from zion's graph.
+rev = "9168e176dd74bcf30e2b93ffc11cef127924ee46"
 package = "aimp_node"
 optional = true
 # We embed the protocol, not the node application: zion imports exactly
