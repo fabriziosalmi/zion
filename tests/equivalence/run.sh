@@ -26,7 +26,9 @@
 #   ./tests/equivalence/run.sh [scenario]        # default: multi-vhost
 #
 # Environment:
-#   ZION_IMAGE          zion container image (default: the pinned release)
+#   ZION_IMAGE          zion container image (default: the release matching
+#                       the version in Cargo.toml, so the default never goes
+#                       stale — it was pinned to 0.7.5 four minor releases on)
 #   ZION_BIN            path to a locally built linux zion binary; when set it
 #                       is bind-mounted into ZION_RUNTIME_IMAGE instead of
 #                       using ZION_IMAGE (this is how CI tests the tree)
@@ -35,7 +37,8 @@
 set -euo pipefail
 
 SCENARIO="${1:-multi-vhost}"
-ZION_IMAGE="${ZION_IMAGE:-ghcr.io/fabriziosalmi/zion:0.7.5}"
+_ZION_VERSION="$(awk -F'"' '/^\[package\]/{p=1} p && /^version *=/{print $2; exit}' "$(dirname "$0")/../../Cargo.toml")"
+ZION_IMAGE="${ZION_IMAGE:-ghcr.io/fabriziosalmi/zion:${_ZION_VERSION:?could not read the version from Cargo.toml}}"
 ZION_RUNTIME_IMAGE="${ZION_RUNTIME_IMAGE:-ubuntu:24.04}"
 NGINX_IMAGE="nginx:1.27-alpine"
 CADDY_IMAGE="caddy:2-alpine"
