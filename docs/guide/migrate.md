@@ -58,9 +58,27 @@ Reads a `server { … }` / `location { … }` / `upstream { … }` config, inclu
 - **Static serving** (`root` / `try_files` / `index` / `alias`) →
   [`mode = "static"`](#static-sites-and-spas). An SPA build dir served with
   `try_files … /index.html` next to a proxied `/api` converts in one pass.
+- **IP access rules** (`allow` / `deny`, in a `location` or inherited from its
+  `server`, replace-not-merge like nginx) → `internal_only = true`, **fail closed**:
+  an imported route is never more open than the original.
+
+  | nginx | Zion | finding |
+  |---|---|---|
+  | `allow` the private ranges + loopback, then `deny all` | `internal_only = true` | convert |
+  | a narrower internal list (e.g. `allow 10.0.0.0/8; deny all`) | `internal_only = true` | partial: `internal_only` admits *all* internal networks; to narrow, set `[server] internal_networks` to the list (it applies to every internal-only route and `/metrics`) |
+  | an allow-list with **public** addresses | `internal_only = true` | partial: the public addresses are named; add them to `internal_networks` to let them in |
+  | `deny all` alone | `internal_only = true` | partial: nginx refused everyone, Zion still admits internal networks |
+  | `deny <addr>` … `allow all` (a block-list) | route stays open | unsupported: no per-route deny list |
+  | `allow all` | route stays open | convert |
+
+  Before 0.9.6 these were reported as unsupported **and the route was emitted open**:
+  an IP-restricted location became public. Re-run the import of any config that had them.
+- A location on one of Zion's own endpoints (`/metrics`, `/healthz`, `/readyz`,
+  `/_zion/…`) is converted but reported **partial**: Zion answers that path itself,
+  so the backend's endpoint is not reachable through Zion.
 
 Not translated (each a finding): `rewrite`/`handle_path` path rewriting, `if`,
-`map`, per-route `deny`/`allow`, custom `error_page`, `auth_basic` (Zion auth is
+`map`, per-route deny-lists (see above), custom `error_page`, `auth_basic` (Zion auth is
 JWT/OIDC), regex `location` blocks.
 
 ## Traefik

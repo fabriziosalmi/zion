@@ -69,6 +69,8 @@ pub struct RouteOut {
     pub serve_dir: Option<String>,
     /// SPA fallback for a static route (serve `index.html` on a miss).
     pub spa_fallback: bool,
+    /// Only Zion's internal networks may use the route (from nginx `allow`/`deny`, #483).
+    pub internal_only: bool,
     /// Rendered as `# UNSUPPORTED: …` comment lines above the route.
     pub annotations: Vec<String>,
 }
@@ -993,6 +995,219 @@ struct ServerCtx {
     /// Inherited `index`. Zion serves `index.html` for directory requests, so a
     /// non-default index becomes a partial finding when a static route uses it.
     index: Option<String>,
+    /// Inherited `allow`/`deny` rules, in order (replace-not-merge, like nginx).
+    access: Vec<AccessRule>,
+}
+
+/// One nginx `allow X` / `deny X` (`X` an address, a CIDR or `all`).
+#[derive(Clone, Debug)]
+struct AccessRule {
+    allow: bool,
+    target: String,
+    line: u32,
+}
+
+/// Is the whole address range `target` (`a.b.c.d`, `a.b.c.d/n`, IPv6 forms) inside Zion's
+/// built-in internal networks (loopback, RFC 1918, link-local, ULA)? `None` when it is not an
+/// address. Internal blocks are small and aligned, so checking the first and the last address
+/// is enough: no CIDR can span two of them without starting at a public address.
+fn range_is_internal(target: &str) -> Option<bool> {
+    if !valid_cidr(target) {
+        return None;
+    }
+    let (ip, prefix) = match target.split_once('/') {
+        Some((i, p)) => (i.parse::<std::net::IpAddr>().ok()?, p.parse::<u32>().ok()?),
+        None => {
+            let ip = target.parse::<std::net::IpAddr>().ok()?;
+            (ip, if ip.is_ipv4() { 32 } else { 128 })
+        }
+    };
+    let (first, last) = match ip {
+        std::net::IpAddr::V4(v4) => {
+            let host = if prefix >= 32 { 0 } else { u32::MAX >> prefix };
+            let n = u32::from(v4) & !host;
+            (
+                std::net::IpAddr::V4(n.into()),
+                std::net::IpAddr::V4((n | host).into()),
+            )
+        }
+        std::net::IpAddr::V6(v6) => {
+            let host = if prefix >= 128 {
+                0
+            } else {
+                u128::MAX >> prefix
+            };
+            let n = u128::from(v6) & !host;
+            (
+                std::net::IpAddr::V6(n.into()),
+                std::net::IpAddr::V6((n | host).into()),
+            )
+        }
+    };
+    Some(crate::security::is_internal_ip(&first) && crate::security::is_internal_ip(&last))
+}
+
+/// Turn a location's effective `allow`/`deny` list into `internal_only` (#483), with the
+/// findings. Fail closed: whenever the original restricted access in a way Zion cannot
+/// reproduce exactly, the route becomes internal-only rather than open. Only a block-list
+/// (`deny X; … allow all;`) stays open, because closing it would lock out the public a
+/// public route was meant for.
+fn classify_access(rules: &[AccessRule], findings: &mut Vec<Finding>) -> bool {
+    if rules.is_empty() {
+        return false;
+    }
+    // nginx: first match wins; nothing after an `all` rule is ever reached
+    let end = rules
+        .iter()
+        .position(|r| r.target == "all")
+        .map_or(rules.len(), |i| i + 1);
+    let live = &rules[..end];
+    let first = &live[0];
+    let terminal = live.last().filter(|r| r.target == "all");
+    let directive = |r: &AccessRule| if r.allow { "allow" } else { "deny" };
+
+    // `allow all` first: no restriction at all
+    if first.target == "all" && first.allow {
+        findings.push(Finding::new(
+            Status::Convert,
+            first.line,
+            "allow",
+            "`allow all` → no restriction (the route stays open)",
+        ));
+        return false;
+    }
+    // `deny all` first: nobody may reach it in nginx
+    if first.target == "all" {
+        findings.push(Finding::new(
+            Status::Partial,
+            first.line,
+            "deny",
+            "`deny all` → internal_only = true: nginx refused everyone, Zion still lets its internal networks in (loopback, RFC 1918, link-local, ULA or [server] internal_networks)",
+        ));
+        return true;
+    }
+    // a block-list: specific denies, then everyone else allowed
+    if terminal.is_some_and(|t| t.allow) {
+        let denied: Vec<&str> = live
+            .iter()
+            .filter(|r| !r.allow)
+            .map(|r| r.target.as_str())
+            .collect();
+        findings.push(Finding::new(
+            Status::Unsupported,
+            live.iter().find(|r| !r.allow).map_or(first.line, |r| r.line),
+            "deny",
+            format!(
+                "block-list {} then `allow all` — Zion has no per-route deny list; the route stays OPEN to these addresses",
+                denied.join(", ")
+            ),
+        ));
+        return false;
+    }
+    // an allow-list (ending in `deny all`, or implicitly closed): fail closed
+    let allowed: Vec<&AccessRule> = live.iter().filter(|r| r.allow).collect();
+    let public: Vec<&str> = allowed
+        .iter()
+        .filter(|r| range_is_internal(&r.target) != Some(true))
+        .map(|r| r.target.as_str())
+        .collect();
+    let inner_denies = live.iter().any(|r| !r.allow && r.target != "all");
+    if public.is_empty() && !inner_denies && terminal.is_some() {
+        let list = allowed
+            .iter()
+            .map(|r| r.target.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // `internal_only` admits ALL of Zion's internal networks. That is faithful only when
+        // the original allowed the standard private ranges and loopback; a narrower list
+        // (say `allow 10.0.0.0/8` alone) would let 192.168.x.x in as well.
+        let has = |cidr: &str| allowed.iter().any(|r| r.target == cidr);
+        let full = has("10.0.0.0/8")
+            && has("172.16.0.0/12")
+            && has("192.168.0.0/16")
+            && allowed.iter().any(|r| r.target.starts_with("127."));
+        if full {
+            findings.push(Finding::new(
+                Status::Convert,
+                first.line,
+                directive(first),
+                format!("allow {list} then `deny all` → internal_only = true (Zion's internal networks)"),
+            ));
+        } else {
+            findings.push(Finding::new(
+                Status::Partial,
+                first.line,
+                directive(first),
+                format!(
+                    "allow {list} then `deny all` → internal_only = true, which admits ALL of \
+                     Zion's internal networks (loopback, RFC 1918, link-local, ULA), not only \
+                     these; to narrow it set [server] internal_networks = [{}] (applies to \
+                     every internal-only route and to /metrics)",
+                    allowed
+                        .iter()
+                        .map(|r| format!("\"{}\"", r.target))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+        return true;
+    }
+    let mut why = Vec::new();
+    if !public.is_empty() {
+        why.push(format!(
+            "it allowed {} outside Zion's internal networks — add them to [server] internal_networks to let them in (that widens every internal-only route)",
+            public.join(", ")
+        ));
+    }
+    if inner_denies {
+        why.push("its specific `deny` lines inside the allowed ranges are not reproduced".into());
+    }
+    if terminal.is_none() {
+        why.push(
+            "the list does not end in `deny all`, so nginx's exact semantics are unclear".into(),
+        );
+    }
+    findings.push(Finding::new(
+        Status::Partial,
+        first.line,
+        directive(first),
+        format!(
+            "access rules → internal_only = true (fail closed): {}",
+            why.join("; ")
+        ),
+    ));
+    true
+}
+
+/// Zion's own endpoints: a route there never reaches the backend for that exact path.
+const BUILT_IN_PATHS: &[&str] = &[
+    "/healthz",
+    "/readyz",
+    "/metrics",
+    "/_zion/snapshot.json",
+    "/_zion/cache/purge",
+];
+
+/// Report a route whose path is (or starts at) one of Zion's own endpoints (#483).
+fn report_built_in_collision(path: &str, line: u32, findings: &mut Vec<Finding>) {
+    for b in BUILT_IN_PATHS {
+        let covers = path == *b
+            || path
+                .strip_prefix(b)
+                .is_some_and(|rest| rest.starts_with('/'));
+        if covers || (path.starts_with("/_zion/") && b.starts_with("/_zion/")) {
+            findings.push(Finding::new(
+                Status::Partial,
+                line,
+                "location",
+                format!(
+                    "Zion answers {b} itself (internal networks only), so the backend's {b} is not reachable through Zion"
+                ),
+            ));
+            return;
+        }
+    }
 }
 
 /// Classify a static location's `try_files` fallback (its last argument) into
@@ -1044,6 +1259,7 @@ fn map_server(
         root: None,
         root_line: 0,
         index: None,
+        access: Vec::new(),
     };
 
     for d in &server.directives {
@@ -1100,6 +1316,11 @@ fn map_server(
             }
             "limit_req" => map_limit_req(d, agg, model, findings),
             "limit_conn" => map_limit_conn(d, agg, model, findings),
+            "allow" | "deny" => ctx.access.push(AccessRule {
+                allow: d.name == "allow",
+                target: d.args.first().cloned().unwrap_or_default(),
+                line: d.line,
+            }),
             "add_header" => {
                 ctx.has_add_header = true;
                 map_add_header(d, &mut ctx.csp, findings);
@@ -1261,6 +1482,8 @@ fn map_location(
     let mut loc_try_files: Option<(Vec<String>, u32)> = None;
     let mut loc_autoindex: Option<u32> = None;
     let mut static_bad: Option<(u32, &'static str)> = None; // unresolved/empty root|alias
+                                                            // Location-scoped `allow`/`deny` — replace the server's, never merge (#483).
+    let mut loc_access: Vec<AccessRule> = Vec::new();
 
     for d in &loc.directives {
         match d.name.as_str() {
@@ -1395,13 +1618,11 @@ fn map_location(
                 &d.name,
                 "Zion auth profiles are JWT/OIDC, not basic auth",
             )),
-            "deny" | "allow" => findings.push(Finding::new(
-                Status::Unsupported,
-                d.line,
-                &d.name,
-                "no per-route IP allow/deny lists (`internal_only` covers \
-                 RFC1918/loopback-only routes)",
-            )),
+            "deny" | "allow" => loc_access.push(AccessRule {
+                allow: d.name == "allow",
+                target: d.args.first().cloned().unwrap_or_default(),
+                line: d.line,
+            }),
             "if" => findings.push(Finding::new(
                 Status::Unsupported,
                 d.line,
@@ -1567,6 +1788,13 @@ fn map_location(
                 csp = None;
             }
         }
+        let rules = if loc_access.is_empty() {
+            &ctx.access
+        } else {
+            &loc_access
+        };
+        let internal_only = classify_access(rules, findings);
+        report_built_in_collision(&path, loc.line, findings);
         doc.routes.push(RouteOut {
             path,
             hosts: route_hosts,
@@ -1576,6 +1804,7 @@ fn map_location(
             waf: false,
             serve_dir: Some(serve_dir),
             spa_fallback,
+            internal_only,
             annotations: Vec::new(),
         });
         return;
@@ -1692,6 +1921,13 @@ fn map_location(
                 .to_string(),
         );
     }
+    let rules = if loc_access.is_empty() {
+        &ctx.access
+    } else {
+        &loc_access
+    };
+    let internal_only = classify_access(rules, findings);
+    report_built_in_collision(&path, loc.line, findings);
     doc.routes.push(RouteOut {
         path,
         hosts: route_hosts,
@@ -1701,6 +1937,7 @@ fn map_location(
         waf: route_waf,
         serve_dir: None,
         spa_fallback: false,
+        internal_only,
         annotations,
     });
 }
@@ -2219,6 +2456,29 @@ fn parse_time_ms(raw: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internal_ranges_are_judged_on_the_whole_block() {
+        for (t, want) in [
+            ("10.0.0.0/8", Some(true)),
+            ("172.16.0.0/12", Some(true)),
+            ("192.168.1.0/24", Some(true)),
+            ("127.0.0.1", Some(true)),
+            ("169.254.0.0/16", Some(true)),
+            ("fd00::/8", Some(true)),
+            ("::1", Some(true)),
+            ("10.0.0.0/7", Some(false)), // starts internal, ends in 11.255.255.255 (public)
+            ("172.16.0.0/11", Some(false)), // 172.0.0.0-172.31.255.255: starts public
+            ("192.168.0.0/15", Some(false)),
+            ("203.0.113.0/24", Some(false)),
+            ("0.0.0.0/0", Some(false)),
+            ("all", None),
+            ("unix:", None),
+            ("10.0.0.0/99", None),
+        ] {
+            assert_eq!(range_is_internal(t), want, "{t}");
+        }
+    }
 
     #[test]
     fn size_parsing() {
