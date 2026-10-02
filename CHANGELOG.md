@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **WebSocket upgrades work against strict HTTP/1.1 backends.** The upgrade request reached the upstream with **no `Host` header** and the target in absolute form (`GET http://upstream:port/path HTTP/1.1`): the handshake goes over a bare HTTP/1.1 connection, which adds nothing, after `Host` had been removed. RFC 9112 §3.2 requires a 400 for that, and Go `net/http` does: through 0.9.6 a WebSocket to a Go backend got **400**, directly it got 101 (now 101 through Zion too). The upgrade now carries the upstream's `Host` (without a default port, as ordinary proxied requests) and an origin-form target; the client's host is still sent in `X-Forwarded-Host`, also when the client wrote the target in absolute form. Found while designing `preserve_host` (ADR-0024).
+
 ## [0.9.6] - 2026-10-02
 
 **Security release: the response cache no longer serves one host's response to another host ([GHSA-xwm8-fqm7-8m5r](https://github.com/fabriziosalmi/zion/security/advisories/GHSA-xwm8-fqm7-8m5r)).** No breaking changes. Read the notes below.

@@ -663,18 +663,16 @@ pub async fn proxy_websocket(
     proto: &str,
     xff_mode: XffMode,
 ) -> Result<Response<ZionBody>, hyper::Error> {
-    // Build upstream URI
+    // The handshake goes over a bare HTTP/1.1 connection (below), which sends the request
+    // as given: it adds no `Host` and writes an absolute URI as is. So the request target
+    // must be origin-form (`/path?query`) and `Host` set here, or strict servers (RFC 9112
+    // §3.2: Go net/http, among others) answer the upgrade 400.
     let path_and_query = req
         .uri()
         .path_and_query()
         .cloned()
         .unwrap_or_else(|| hyper::http::uri::PathAndQuery::from_static("/"));
-    let upstream_uri = hyper::Uri::builder()
-        .scheme(scheme.clone())
-        .authority(authority.clone())
-        .path_and_query(path_and_query)
-        .build();
-    let Ok(upstream_uri) = upstream_uri else {
+    let Ok(origin_form) = hyper::Uri::builder().path_and_query(path_and_query).build() else {
         return Ok(bad_gateway());
     };
 
@@ -708,8 +706,6 @@ pub async fn proxy_websocket(
     crate::net::set_keepalive(&tcp_stream, crate::net::DEFAULT_TCP_KEEPALIVE_SECS);
 
     // Perform HTTP upgrade handshake with upstream
-    *req.uri_mut() = upstream_uri;
-    *req.version_mut() = Version::HTTP_11;
     // Same forwarding hygiene as the normal proxy (strip Host + dangerous
     // hop-by-hop / credential headers — notably Proxy-Authorization — and set
     // the X-Forwarded-* / X-Real-IP trust headers per the XFF policy), but
@@ -717,6 +713,19 @@ pub async fn proxy_websocket(
     // path stripped only Host, so it leaked Proxy-Authorization and a spoofed
     // X-Forwarded-For straight to the upstream.
     apply_forwarding_hygiene(&mut req, remote_addr, proto, xff_mode);
+    // (after the hygiene pass, which reads the INBOUND authority for X-Forwarded-Host)
+    *req.uri_mut() = origin_form;
+    *req.version_mut() = Version::HTTP_11;
+    // The upstream's own authority, without a default port, as the pooled client sends it.
+    let default_port = if is_tls_upstream { 443 } else { 80 };
+    let host_value = match authority.port_u16() {
+        Some(p) if p != default_port => authority.as_str().to_string(),
+        _ => authority.host().to_string(),
+    };
+    let Ok(host_value) = HeaderValue::from_str(&host_value) else {
+        return Ok(bad_gateway());
+    };
+    req.headers_mut().insert(hyper::header::HOST, host_value);
 
     // HTTP/1.1 upgrade handshake — works on any AsyncRead+AsyncWrite stream.
     // For TLS upstreams, wrap in tokio-rustls connector first.

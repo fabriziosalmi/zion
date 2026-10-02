@@ -3240,3 +3240,120 @@ async fn send_host(st: &Arc<AppState>, method: Method, uri: &str, host: &str) ->
     .status()
     .as_u16()
 }
+
+// ── a WebSocket upgrade is a valid HTTP/1.1 request to the upstream ─────────
+
+/// A raw upstream that records the head of each request it gets and accepts the upgrade.
+async fn recording_ws_origin() -> (u16, Arc<Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut c, _)) = listener.accept().await {
+            let s = s.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match c.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                s.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf).into_owned());
+                let _ = c
+                    .write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                          Connection: Upgrade\r\n\
+                          Sec-WebSocket-Accept: ICX+Yqv66kxgM0FcWaLWlFLwTAI=\r\n\r\n",
+                    )
+                    .await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            });
+        }
+    });
+    (port, seen)
+}
+
+#[tokio::test]
+async fn a_websocket_upgrade_reaches_the_upstream_with_host_and_an_origin_form_target() {
+    let (port, seen) = recording_ws_origin().await;
+    let st = hosts_state(
+        "[[route]]\npath = \"/{*rest}\"\nupstream = \"w\"\n",
+        &format!("w = \"http://127.0.0.1:{port}\""),
+    );
+    let mut req = ws_request("/chat/room?x=1");
+    req.headers_mut()
+        .insert("host", hyper::header::HeaderValue::from_static("app.test"));
+    let resp = process_request(
+        req,
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 101);
+    let head = seen
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("upstream got the upgrade");
+    let mut lines = head.split("\r\n");
+    assert_eq!(
+        lines.next().unwrap(),
+        "GET /chat/room?x=1 HTTP/1.1",
+        "origin-form target, not absolute-form: {head}"
+    );
+    let hosts: Vec<&str> = lines
+        .filter_map(|l| {
+            l.split_once(':')
+                .filter(|(k, _)| k.eq_ignore_ascii_case("host"))
+                .map(|(_, v)| v.trim())
+        })
+        .collect();
+    let upstream = format!("127.0.0.1:{port}");
+    assert_eq!(
+        hosts,
+        [upstream.as_str()],
+        "exactly one Host, the upstream's (RFC 9112 §3.2): {head}"
+    );
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("x-forwarded-host: app.test"),
+        "the client's host is still passed on: {head}"
+    );
+    // A client may send the target in absolute form (RFC 9112 §3.2.2), with the host in
+    // the URI: the upstream still gets origin-form and its own Host, and the client's
+    // host in X-Forwarded-Host.
+    let resp = process_request(
+        ws_request("http://app.test/chat/abs"),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 101);
+    let head = seen
+        .lock()
+        .unwrap()
+        .get(1)
+        .cloned()
+        .expect("second upgrade");
+    assert!(
+        head.starts_with("GET /chat/abs HTTP/1.1\r\n"),
+        "origin-form: {head}"
+    );
+    let lower = head.to_ascii_lowercase();
+    assert!(
+        lower.contains(&format!("\r\nhost: 127.0.0.1:{port}\r\n")),
+        "{head}"
+    );
+    assert!(lower.contains("x-forwarded-host: app.test"), "{head}");
+}
