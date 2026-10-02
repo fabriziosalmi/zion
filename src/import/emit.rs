@@ -140,6 +140,9 @@ fn render_route(out: &mut String, route: &RouteOut) {
             kv(out, "mode", "websocket");
         }
     }
+    if route.internal_only {
+        out.push_str("internal_only = true\n");
+    }
     if let Some(csp) = &route.csp {
         kv(out, "csp", csp);
     }
@@ -234,6 +237,7 @@ mod tests {
                 waf: false,
                 serve_dir: None,
                 spa_fallback: false,
+                internal_only: false,
                 annotations: vec!["evil\ninternal_only = false\n[admin]".into()],
             }],
         };
@@ -284,6 +288,7 @@ mod tests {
                 waf: false,
                 serve_dir: None,
                 spa_fallback: false,
+                internal_only: false,
                 annotations: vec!["demo annotation".into()],
             }],
         };
@@ -325,6 +330,7 @@ mod tests {
                 waf: true,
                 serve_dir: None,
                 spa_fallback: false,
+                internal_only: false,
                 annotations: Vec::new(),
             }],
         };
@@ -369,6 +375,7 @@ mod tests {
                 waf: false,
                 serve_dir: None,
                 spa_fallback: false,
+                internal_only: false,
                 annotations: Vec::new(),
             }],
         };

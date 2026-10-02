@@ -820,6 +820,7 @@ fn map_site(
                 waf: false,
                 serve_dir: Some(dir),
                 spa_fallback: spa,
+                internal_only: false,
                 annotations: Vec::new(),
             });
         }
@@ -1215,6 +1216,7 @@ fn push_route(
         waf: false,
         serve_dir: None,
         spa_fallback: false,
+        internal_only: false,
         annotations: Vec::new(),
     });
 }

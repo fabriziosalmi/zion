@@ -602,6 +602,7 @@ fn build_route(
         waf: false,
         serve_dir: None,
         spa_fallback: false,
+        internal_only: false,
         annotations: Vec::new(),
     });
 }

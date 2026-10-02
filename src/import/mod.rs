@@ -1163,4 +1163,209 @@ mod tests {
             _ => panic!("expected Parse error"),
         }
     }
+
+    // ── IP access rules (allow / deny) — #483 ──────────────────────────────
+
+    fn conv(src: &str) -> Conversion {
+        match convert(src, None) {
+            Ok(c) => c,
+            Err(e) => panic!("convert failed: {e:?}"),
+        }
+    }
+
+    /// The `[[route]]` block whose `path = "<path>"`, as text.
+    fn route_block<'a>(toml: &'a str, path: &str) -> &'a str {
+        let needle = format!("path = \"{path}\"");
+        let at = toml
+            .find(&needle)
+            .unwrap_or_else(|| panic!("no route {path} in:\n{toml}"));
+        let start = toml[..at].rfind("[[route]]").expect("route header");
+        let end = toml[at..].find("\n\n").map_or(toml.len(), |e| at + e);
+        &toml[start..end]
+    }
+
+    fn server(locations: &str, server_rules: &str) -> String {
+        format!(
+            "events {{}}\nhttp {{\n  upstream app {{ server 10.1.2.3:8000; }}\n  server {{\n    \
+             listen 80;\n    server_name api.example.com;\n    {server_rules}\n    \
+             location / {{ proxy_pass http://app; }}\n    {locations}\n  }}\n}}\n"
+        )
+    }
+
+    #[test]
+    fn finding_texts_have_no_runs_of_spaces() {
+        // a `\` line continuation lost in an edit leaves the next line's indentation inside the
+        // string ("…/metrics                      is not reachable"): catch it for every finding
+        let c = conv(&server(
+            "location /metrics { proxy_pass http://app; } \
+             location /a { allow 10.0.0.0/8; deny all; proxy_pass http://app; } \
+             location /b { allow 203.0.113.0/24; deny all; proxy_pass http://app; } \
+             location /c { deny 198.51.100.7; allow all; proxy_pass http://app; } \
+             location /d { deny all; proxy_pass http://app; }",
+            "",
+        ));
+        for f in &c.findings {
+            assert!(!f.detail.contains("  "), "double space in: {:?}", f.detail);
+        }
+    }
+
+    #[test]
+    fn private_only_allow_then_deny_all_becomes_internal_only() {
+        // the certmate-ng shape: RFC 1918 ranges + loopback, then deny all
+        let c = conv(&server(
+            "location /admin { allow 10.0.0.0/8; allow 172.16.0.0/12; allow 192.168.0.0/16; \
+             allow 127.0.0.1; deny all; proxy_pass http://app; }",
+            "",
+        ));
+        let r = route_block(&c.toml, "/admin/{*rest}");
+        assert!(r.contains("internal_only = true"), "{r}");
+        assert!(
+            has_finding(&c, Status::Convert, "allow", "internal_only"),
+            "{}",
+            report_text(&c.findings, true, "nginx")
+        );
+        // the catch-all next to it stays open
+        assert!(!route_block(&c.toml, "/{*rest}").contains("internal_only"));
+    }
+
+    #[test]
+    fn a_narrower_internal_allow_list_is_partial_and_says_how_to_narrow() {
+        let c = conv(&server(
+            "location /ops { allow 10.0.0.0/8; deny all; proxy_pass http://app; }",
+            "",
+        ));
+        assert!(route_block(&c.toml, "/ops/{*rest}").contains("internal_only = true"));
+        assert!(
+            has_finding(
+                &c,
+                Status::Partial,
+                "allow",
+                "admits ALL of Zion's internal networks"
+            ) && has_finding(
+                &c,
+                Status::Partial,
+                "allow",
+                "internal_networks = [\"10.0.0.0/8\"]"
+            ),
+            "{}",
+            report_text(&c.findings, true, "nginx")
+        );
+        assert!(
+            !has_finding(&c, Status::Convert, "allow", "internal_only"),
+            "not claimed as faithful"
+        );
+    }
+
+    #[test]
+    fn an_allow_list_with_public_addresses_fails_closed() {
+        let c = conv(&server(
+            "location /partner { allow 10.0.0.0/8; allow 203.0.113.0/24; deny all; proxy_pass http://app; }",
+            "",
+        ));
+        assert!(
+            route_block(&c.toml, "/partner/{*rest}").contains("internal_only = true"),
+            "never an open route"
+        );
+        assert!(
+            has_finding(&c, Status::Partial, "allow", "203.0.113.0/24")
+                && has_finding(&c, Status::Partial, "allow", "internal_networks"),
+            "{}",
+            report_text(&c.findings, true, "nginx")
+        );
+    }
+
+    #[test]
+    fn a_cidr_that_only_starts_inside_an_internal_network_fails_closed() {
+        // 10.0.0.0/7 = 10.0.0.0-11.255.255.255: half of it is public
+        let c = conv(&server(
+            "location /x { allow 10.0.0.0/7; deny all; proxy_pass http://app; }",
+            "",
+        ));
+        assert!(route_block(&c.toml, "/x/{*rest}").contains("internal_only = true"));
+        assert!(
+            has_finding(&c, Status::Partial, "allow", "10.0.0.0/7"),
+            "{}",
+            report_text(&c.findings, true, "nginx")
+        );
+    }
+
+    #[test]
+    fn a_block_list_stays_open_and_is_reported() {
+        let c = conv(&server(
+            "location /blog { deny 198.51.100.7; allow all; proxy_pass http://app; }",
+            "",
+        ));
+        assert!(!route_block(&c.toml, "/blog/{*rest}").contains("internal_only"));
+        assert!(
+            has_finding(&c, Status::Unsupported, "deny", "198.51.100.7"),
+            "{}",
+            report_text(&c.findings, true, "nginx")
+        );
+    }
+
+    #[test]
+    fn deny_all_alone_is_closed_to_the_outside() {
+        let c = conv(&server(
+            "location /secret { deny all; proxy_pass http://app; }",
+            "",
+        ));
+        assert!(route_block(&c.toml, "/secret/{*rest}").contains("internal_only = true"));
+        assert!(
+            has_finding(&c, Status::Partial, "deny", "internal networks"),
+            "{}",
+            report_text(&c.findings, true, "nginx")
+        );
+    }
+
+    #[test]
+    fn server_rules_are_inherited_unless_the_location_has_its_own() {
+        let c = conv(&server(
+            "location /inherits { proxy_pass http://app; } \
+             location /opens { allow all; proxy_pass http://app; }",
+            "allow 10.0.0.0/8; deny all;",
+        ));
+        assert!(route_block(&c.toml, "/inherits/{*rest}").contains("internal_only = true"));
+        assert!(
+            route_block(&c.toml, "/{*rest}").contains("internal_only = true"),
+            "location / inherits too"
+        );
+        assert!(
+            !route_block(&c.toml, "/opens/{*rest}").contains("internal_only"),
+            "replace, not merge"
+        );
+    }
+
+    #[test]
+    fn a_static_location_keeps_its_restriction() {
+        let c = conv(&server(
+            "location /files/ { allow 192.168.0.0/16; deny all; root /srv/www; }",
+            "",
+        ));
+        let r = route_block(&c.toml, "/files/{*rest}");
+        assert!(
+            r.contains("serve_dir") && r.contains("internal_only = true"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn a_route_on_a_built_in_endpoint_is_reported() {
+        let c = conv(&server("location /metrics { proxy_pass http://app; }", ""));
+        assert!(
+            has_finding(
+                &c,
+                Status::Partial,
+                "location",
+                "Zion answers /metrics itself"
+            ),
+            "{}",
+            report_text(&c.findings, true, "nginx")
+        );
+        // an ordinary path is not flagged
+        let c = conv(&server("location /api { proxy_pass http://app; }", ""));
+        assert!(!c
+            .findings
+            .iter()
+            .any(|f| f.detail.contains("answers") && f.detail.contains("itself")));
+    }
 }
