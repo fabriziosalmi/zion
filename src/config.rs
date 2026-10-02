@@ -405,6 +405,11 @@ fn default_cors_max_age() -> u64 {
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct AccessLogConfig {
+    /// Emit the per-request access-log event (default `true`). It costs throughput (one
+    /// formatted line per request); `false` turns it off without touching `RUST_LOG`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
     /// Header names to include in the access-log event. Lowercased
     /// at deserialise time so case-insensitive matching against
     /// `req.headers().get(name)` is cheap. Default: empty.
@@ -427,6 +432,7 @@ fn default_mtls_fingerprint() -> bool {
 impl Default for AccessLogConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             include_headers: Vec::new(),
             mtls_fingerprint: default_mtls_fingerprint(),
         }

@@ -291,15 +291,22 @@ impl LogFormat {
 ///
 /// Filtering precedence:
 ///   1. `RUST_LOG` env var if present (full `tracing-subscriber` syntax)
-///   2. fall back to `info` level for the `zion` target, `warn` elsewhere
+///   2. fall back to [`DEFAULT_FILTER`]
 ///
 /// The OTLP layer is wired separately by `init_otel_layer()` when the
 /// `otel` feature is enabled — kept apart so toggling it doesn't risk
 /// double-installing the global subscriber.
+/// The filter without `RUST_LOG`: `info` for zion's own events and for the two event
+/// streams zion emits under their own target, the per-request access log (`access`) and
+/// the opt-in sovereign classification log (`sovereign`); `warn` for everything else
+/// (dependencies). Those two targets are not under `zion`, so `zion=info,warn` alone
+/// silently dropped them: the access log needed `RUST_LOG` to appear at all.
+pub const DEFAULT_FILTER: &str = "zion=info,access=info,sovereign=info,warn";
+
 pub fn init_subscriber(format: LogFormat, log_queue_lines: usize) {
     crate::logq::install(log_queue_lines, matches!(format, LogFormat::Json));
     let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("zion=info,warn"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
 
     // The registry composition produces a different concrete type per layer
     // permutation, so we cannot easily store an intermediate as a `Box<dyn>`
@@ -537,6 +544,52 @@ mod otel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_filter_keeps_the_access_and_sovereign_logs() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let w = buf.clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new(DEFAULT_FILTER))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(move || w.clone()),
+            );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "access", "an-access-line");
+            tracing::info!(target: "sovereign", "a-sovereign-line");
+            tracing::info!(target: "zion::x", "a-zion-line");
+            tracing::info!(target: "hyper", "a-dependency-info-line");
+            tracing::warn!(target: "hyper", "a-dependency-warning");
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        for kept in [
+            "an-access-line",
+            "a-sovereign-line",
+            "a-zion-line",
+            "a-dependency-warning",
+        ] {
+            assert!(out.contains(kept), "{kept} missing:\n{out}");
+        }
+        assert!(
+            !out.contains("a-dependency-info-line"),
+            "dependencies stay at warn"
+        );
+    }
 
     const VALID: &[u8] = b"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
 

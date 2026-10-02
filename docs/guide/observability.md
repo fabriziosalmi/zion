@@ -16,7 +16,7 @@ All four are always linked into the binary; they're cheap when idle. OTLP export
 
 ## Distributed tracing
 
-The `tracing` crate is initialized at boot. Filtering follows `RUST_LOG` (full `tracing-subscriber` syntax); the default is `zion=info,warn`. Output format mirrors `[server.log_format]`:
+The `tracing` crate is initialized at boot. Filtering follows `RUST_LOG` (full `tracing-subscriber` syntax); the default is `zion=info,access=info,sovereign=info,warn` (zion's own events, the access log and the sovereign classification log at `info`, dependencies at `warn`). Output format mirrors `[server.log_format]`:
 
 | `log_format` | Output |
 |---|---|
@@ -142,8 +142,11 @@ stream fan-out in mind.
 
 ## Access log
 
-Every successful request emits one structured `tracing::info!`
-event under the `access` target with these fields:
+Every request emits one structured `tracing::info!` event under the `access` target
+(on by default; before 0.9.8 the default log filter dropped it unless `RUST_LOG` named
+`access`). It costs throughput: one formatted line per request, measured at roughly
+15 % of peak req/s on a laptop writing to a file. Turn it off with `[access_log]
+enabled = false`. Fields:
 
 | Field        | Type   | Notes                                                        |
 |--------------|--------|--------------------------------------------------------------|
@@ -159,6 +162,7 @@ event under the `access` target with these fields:
 
 ```toml
 [access_log]
+enabled = true            # default; false = no per-request line
 # Headers to emit on every access-log line. Lowercased on parse;
 # values pass through `[redact.headers]` before serialisation.
 include_headers   = ["user-agent", "authorization", "host", "x-forwarded-for"]
