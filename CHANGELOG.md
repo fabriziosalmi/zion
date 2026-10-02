@@ -8,6 +8,8 @@ All notable changes to Zion Edge Gateway are documented here.
 
 - **HTTP/3 requests reach the pipeline with their headers** (`--features http3`). The QUIC bridge rebuilt each request from its method and URI only, plus an `X-Forwarded-For` it added itself: every client header was dropped (`Authorization`, `Cookie`, `Content-Type`, `Accept-Encoding`, custom headers), so authenticated routes failed, request bodies lost their type, and the upstream got the client address twice in `X-Forwarded-For`. Measured with an HTTP/3 client against an upstream that echoes what it receives: before, `Authorization` and a custom header were missing and `X-Forwarded-For` was `127.0.0.1, 127.0.0.1`; after, both arrive and `X-Forwarded-For` has one entry, as over HTTP/2. Forged `X-Client-Cert-*` / `X-Client-TLS-*` attestations are stripped on HTTP/3 too, through one shared list now used by every listener. Found by the 2026-10-02 code audit.
 
+- **The health checker follows config reloads.** It iterated the upstream map captured at boot: an upstream added by a hot reload or an admin push was never probed (a dead one kept receiving every request, each answered 502 after a failed connect, instead of a fast 503), an upstream removed by the reload kept being probed, and a boot config without any upstream started no checker at all. It now reads the live config's map every round, and wakes at least once a second, so a new upstream is probed within a second of the reload. Measured on the release binary: after a reload to a dead upstream, 0.9.7 never marked it down (502 per request); now it is DOWN within seconds and requests get 503 at once. Found by the 2026-10-02 code audit.
+
 ### Security
 
 - **The gossip mesh accepts claims only from trusted node keys** (`--features sovereign-aimp`, experimental). The receiver verified each envelope against the public key the envelope itself carried, with no list of trusted nodes: anyone who could reach the UDP port could generate a key and inject reputation scores, which can get clients refused when `mesh_score_deny_above` is set. `[sovereign_aimp] trusted_keys` (the node ids, 64 hex characters, which each node now prints in full at boot) is now **required** when the mesh is enabled (config error otherwise; `ZION_AIMP_TRUSTED_KEYS` for the env path), and a claim from any other key is dropped before signature verification. Found by the 2026-10-02 code audit. Upgrade note: add every node's `node_id` to the others' `trusted_keys` before upgrading a mesh.
@@ -83,7 +85,6 @@ All notable changes to Zion Edge Gateway are documented here.
 - **Cached routes now answer `Range`.** A fresh cached `200` answers one byte range with `206` (or `416`) instead of the whole object, and cache hits carry the origin's `ETag` / `Last-Modified` and `Accept-Ranges: bytes`. Clients that sent `Range` to a cached route used to get the whole `200`; they now get what they asked for.
 - **Shutdown is faster.** Idle keep-alive connections are closed at once on SIGTERM (HTTP/2 gets `GOAWAY`); requests in flight are still finished.
 - **Client IP privacy is opt-in** (`[redact] ip`); the default writes the address as before.
-
 
 ### Added
 

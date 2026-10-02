@@ -970,97 +970,19 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         });
     }
 
-    // 8. Spawn upstream health checker background task
-    if !health_map.is_empty() {
-        logging::info(
-            "health",
-            &format!("monitoring {} upstreams", health_map.len()),
-        );
-        // Start the background ping loop using the shared health_map
-        // (already embedded in AppState, so routing sees updates immediately)
-        let hm = health_map.clone();
-        let health_http_client = state.http_client.clone();
-        let health_http1_client = proxy::build_http_client(proxy::DEFAULT_CONNECT_TIMEOUT_MS, true);
-        tokio::spawn(async move {
-            // Reuse the shared HTTP client for health checks. This has two benefits:
-            // 1. HTTPS upstreams get TLS pre-warming (connections stay in pool)
-            // 2. HTTP/2 multiplexing for HTTPS health probes
-            let client = health_http_client;
-            // Monotonic base for every adaptive probe deadline (immune to NTP
-            // jumps — all scheduling is in µs-since-base, never wall-clock).
-            let base = tokio::time::Instant::now();
-            const MIN_TICK_US: u64 = 10_000;
-            loop {
-                let now_us = base.elapsed().as_micros() as u64;
-                // Probe only upstreams whose adaptive deadline is due: a HEALTHY
-                // upstream every STEADY_US (unchanged 30s), a DOWN one on the
-                // decorrelated-jitter backoff schedule — fast self-heal without
-                // a recovery thundering-herd.
-                let mut due: Vec<(String, Arc<health::UpstreamHealth>)> = Vec::new();
-                for (url, up) in hm.iter() {
-                    if up
-                        .next_probe_at_us
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        <= now_us
-                    {
-                        due.push((url.to_string(), Arc::clone(up)));
-                    }
-                }
-
-                let mut join_set = tokio::task::JoinSet::new();
-
-                for (url, up) in due {
-                    let client_clone = client.clone();
-                    let http1_clone = health_http1_client.clone();
-                    join_set.spawn(async move {
-                        let (healthy, lat) =
-                            health::probe(&client_clone, &http1_clone, &url, &up).await;
-                        up.update_latency(lat);
-
-                        let was_healthy = up
-                            .healthy
-                            .swap(healthy, std::sync::atomic::Ordering::Relaxed);
-                        // Advance the adaptive probe schedule: a success resets
-                        // the backoff to base and returns to the STEADY cadence;
-                        // a failure draws the next decorrelated-jitter delay.
-                        up.reschedule(healthy, base.elapsed().as_micros() as u64);
-                        if was_healthy && !healthy {
-                            let next_ms = up
-                                .backoff_us
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                                / 1000;
-                            logging::warn(
-                                "health",
-                                &format!(
-                                    "upstream {url} is DOWN — 503 until it recovers; adaptive re-probe in ~{next_ms}ms"
-                                ),
-                            );
-                        } else if !was_healthy && healthy {
-                            logging::info(
-                                "health",
-                                &format!("upstream {url} is UP ({lat}us)"),
-                            );
-                        }
-                    });
-                }
-                while join_set.join_next().await.is_some() {}
-
-                // Sleep until the earliest upstream is next due, floored so an
-                // all-due-now state cannot busy-spin.
-                let now2 = base.elapsed().as_micros() as u64;
-                let next_due = hm
-                    .values()
-                    .map(|u| {
-                        u.next_probe_at_us
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                    })
-                    .min()
-                    .unwrap_or_else(|| now2 + health::STEADY_US);
-                let sleep_us = next_due.saturating_sub(now2).max(MIN_TICK_US);
-                tokio::time::sleep(std::time::Duration::from_micros(sleep_us)).await;
-            }
-        });
-    }
+    // 8. Spawn the upstream health checker. It reads the health map of the LIVE
+    // config on every round, so upstreams added by a reload or an admin push are
+    // probed too (it used to iterate the map captured at boot), and it runs even
+    // when the boot config has no upstream yet.
+    logging::info(
+        "health",
+        &format!("monitoring {} upstreams", health_map.len()),
+    );
+    tokio::spawn(health::run_prober(
+        state.clone(),
+        state.http_client.clone(),
+        proxy::build_http_client(proxy::DEFAULT_CONNECT_TIMEOUT_MS, true),
+    ));
 
     // 8b. Pre-warm upstream connection pool (first health check warms TLS + DNS)
     // This eliminates cold-start latency on the first real request.

@@ -175,6 +175,75 @@ pub async fn probe(
     (healthy, lat)
 }
 
+/// Smallest pause between probe rounds, so an all-due-now state cannot busy-spin.
+const MIN_TICK_US: u64 = 10_000;
+/// Longest pause between rounds, whatever is due: an upstream added by a reload (due at
+/// once) is probed within this. A round with nothing due is one pass over the map.
+const MAX_TICK_US: u64 = 1_000_000;
+
+/// One probe round over `map`: probe every upstream whose adaptive deadline is due (a
+/// HEALTHY one every `STEADY_US`, a DOWN one on the decorrelated-jitter backoff), update
+/// its state, and return how long to sleep until the next one is due. `now_us` is
+/// measured from `base`.
+pub async fn probe_round(
+    map: &HealthMap,
+    base: tokio::time::Instant,
+    client: &crate::proxy::HttpClient,
+    http1: &crate::proxy::HttpClient,
+) -> u64 {
+    let now_us = base.elapsed().as_micros() as u64;
+    let due: Vec<(String, Arc<UpstreamHealth>)> = map
+        .iter()
+        .filter(|(_, up)| up.next_probe_at_us.load(Relaxed) <= now_us)
+        .map(|(url, up)| (url.to_string(), Arc::clone(up)))
+        .collect();
+    let mut join_set = tokio::task::JoinSet::new();
+    for (url, up) in due {
+        let (client, http1) = (client.clone(), http1.clone());
+        join_set.spawn(async move {
+            let (healthy, lat) = probe(&client, &http1, &url, &up).await;
+            up.update_latency(lat);
+            let was_healthy = up.healthy.swap(healthy, Relaxed);
+            // A success resets the backoff and returns to the STEADY cadence; a
+            // failure draws the next decorrelated-jitter delay.
+            up.reschedule(healthy, base.elapsed().as_micros() as u64);
+            if was_healthy && !healthy {
+                let next_ms = up.backoff_us.load(Relaxed) / 1000;
+                crate::logging::warn(
+                    "health",
+                    &format!(
+                        "upstream {url} is DOWN — 503 until it recovers; adaptive re-probe in ~{next_ms}ms"
+                    ),
+                );
+            } else if !was_healthy && healthy {
+                crate::logging::info("health", &format!("upstream {url} is UP ({lat}us)"));
+            }
+        });
+    }
+    while join_set.join_next().await.is_some() {}
+    let now = base.elapsed().as_micros() as u64;
+    match map.values().map(|u| u.next_probe_at_us.load(Relaxed)).min() {
+        Some(next_due) => next_due.saturating_sub(now).clamp(MIN_TICK_US, MAX_TICK_US),
+        None => MAX_TICK_US,
+    }
+}
+
+/// The health checker: probe rounds forever over the health map of the live config
+/// (re-read every round, so a reload's upstreams are probed too).
+pub async fn run_prober(
+    state: Arc<crate::state::AppState>,
+    client: crate::proxy::HttpClient,
+    http1: crate::proxy::HttpClient,
+) {
+    // Monotonic base for every probe deadline (immune to wall-clock jumps).
+    let base = tokio::time::Instant::now();
+    loop {
+        let map = state.config.load().health_map.clone();
+        let sleep_us = probe_round(&map, base, &client, &http1).await;
+        tokio::time::sleep(std::time::Duration::from_micros(sleep_us)).await;
+    }
+}
+
 pub type HealthMap = Arc<FnvHashMap<String, Arc<UpstreamHealth>>>;
 
 /// Check if a specific upstream URL is healthy.
