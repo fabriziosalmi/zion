@@ -185,6 +185,11 @@ pub struct AimpConfig {
     /// when `inbound_claims_per_sec > 0`. Default 256.
     #[serde(default = "default_aimp_inbound_claim_burst")]
     pub inbound_claim_burst: u32,
+    /// Node ids (Ed25519 public keys, 64 hex characters, as each node prints at boot)
+    /// whose claims are accepted. Required when the mesh is enabled: a valid signature
+    /// alone only proves the sender holds some key.
+    #[serde(default)]
+    pub trusted_keys: Vec<String>,
 }
 
 #[cfg(feature = "sovereign-aimp")]
@@ -1989,6 +1994,27 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     // to `0.0.0.0:9443` at boot, binding the gossip control plane to every
     // interface — a fat-fingered address would quietly expose it to the
     // internet. Fail validation instead of guessing a (world-open) default.
+    // The mesh accepts reputation claims that can get clients refused: only from
+    // nodes the operator named. Without the list, anyone who reaches the UDP port
+    // could mint a key and inject scores.
+    #[cfg(feature = "sovereign-aimp")]
+    if config.sovereign_aimp.enabled {
+        if config.sovereign_aimp.trusted_keys.is_empty() {
+            errors.push(
+                "sovereign_aimp.enabled = true needs sovereign_aimp.trusted_keys: the node ids \
+                 (64 hex characters each node prints at boot as `node_id=`) whose claims are \
+                 accepted"
+                    .to_string(),
+            );
+        }
+        for k in &config.sovereign_aimp.trusted_keys {
+            if crate::aimp_cp::parse_node_key(k).is_none() {
+                errors.push(format!(
+                    "sovereign_aimp.trusted_keys entry {k:?} is not a node id (64 hex characters)"
+                ));
+            }
+        }
+    }
     #[cfg(feature = "sovereign-aimp")]
     if config.sovereign_aimp.enabled && !config.sovereign_aimp.listen.is_empty() {
         if let Err(e) = config.sovereign_aimp.listen.parse::<std::net::SocketAddr>() {
@@ -3459,6 +3485,30 @@ enabledd = true
                 .any(|e| e.contains("defined in both")),
             "distinct upstream names must not collide"
         );
+    }
+
+    #[cfg(feature = "sovereign-aimp")]
+    #[test]
+    fn an_enabled_mesh_needs_valid_trusted_keys() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let errs = |mesh: &str| {
+            let cfg: ZionConfig =
+                toml::from_str(&format!("{base}[sovereign_aimp]\n{mesh}")).unwrap();
+            semantic_errors(&cfg).join("\n")
+        };
+        let key = "ab".repeat(32);
+        assert!(errs("enabled=true\nlisten=\"127.0.0.1:9443\"\n")
+            .contains("needs sovereign_aimp.trusted_keys"));
+        let ok = errs(&format!(
+            "enabled=true\nlisten=\"127.0.0.1:9443\"\ntrusted_keys=[\"{key}\"]\n"
+        ));
+        assert!(!ok.contains("trusted_keys"), "{ok}");
+        let bad = errs("enabled=true\nlisten=\"127.0.0.1:9443\"\ntrusted_keys=[\"abcd\"]\n");
+        assert!(bad.contains("\"abcd\" is not a node id"), "{bad}");
+        // a disabled mesh accepts nothing, so it needs no list
+        assert!(!errs("enabled=false\n").contains("trusted_keys"));
     }
 
     #[cfg(feature = "sovereign-aimp")]

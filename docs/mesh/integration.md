@@ -48,6 +48,13 @@ peers          = ["10.0.1.10:7777", "10.0.2.10:7777"]
 identity_path  = "/var/lib/zion/aimp.identity"
 anti_entropy_secs = 60                     # 0 to disable
 
+# REQUIRED: the node ids whose claims are accepted (64 hex characters each,
+# what every node prints at boot as `node_id=`). A valid signature alone only
+# proves the sender holds *some* key; without this list anyone who reaches the
+# UDP port could mint one and inject scores. An empty list is a config error
+# (env path: ZION_AIMP_TRUSTED_KEYS, comma-separated).
+trusted_keys   = ["<node_id of 10.0.1.10>", "<node_id of 10.0.2.10>"]
+
 # Inbound claim rate-cap (issue #71). Per-source-node token bucket on the
 # merge path: a flooding peer (even a compromised one with a valid key) is
 # capped, while every other source keeps flowing through its own bucket.
@@ -73,7 +80,9 @@ The first time zion boots with `[sovereign_aimp].enabled = true` AND
 
 1. A fresh Ed25519 keypair is generated.
 2. The 32-byte secret is written to `identity_path` with `chmod 600`.
-3. The `node_id` (Ed25519 public key) is logged once, structured.
+3. The `node_id` (Ed25519 public key) is printed at every boot, in full
+   (`AIMP control plane up: node_id=<64 hex>`): add it to the other nodes'
+   `trusted_keys`.
 
 Subsequent boots load the secret from disk, so the `node_id` is
 **stable across restarts** — peers don't have to re-classify the node

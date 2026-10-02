@@ -369,18 +369,18 @@ header; the local WAF / auth / rate-limit gates run unchanged.
 from a trusted peer (a corrupted WAF reputation, a fake
 `UpstreamUnhealthy`, a forged `IdentityRevoked`).
 - **Mitigation**: every `AimpEnvelope` carries an Ed25519 signature
-  over its canonical-encoded body. Receivers verify against
-  `aimp_node::crypto::SecurityFirewall` before any merge. Pubkeys
-  are TOFU-logged on first sight + persisted under
-  `[sovereign_aimp].identity_path` with `chmod 600`. An unknown-pubkey
-  envelope fails signature verification and is dropped with
-  `zion_mesh_claims_dropped_total{reason="signature"}` ticked. Identity rotation is documented in
+  over its canonical-encoded body. Receivers accept only envelopes whose
+  origin key is in `[sovereign_aimp].trusted_keys` (required when the mesh
+  is enabled), then verify the signature against
+  `aimp_node::crypto::SecurityFirewall` before any merge. An envelope from
+  an unknown key, even correctly signed, is dropped with
+  `zion_mesh_claims_dropped_total{reason="signature"}` ticked (before 0.9.8
+  any self-signed envelope was accepted). The node's own key is persisted
+  under `[sovereign_aimp].identity_path` with `chmod 600`. Identity rotation is documented in
   [docs/mesh/integration.md](../mesh/integration.md) §"Identity management".
-- **Residual**: TOFU has the standard "first-contact spoof" caveat —
-  a network attacker on the path between two nodes' first exchange
-  could substitute their own pubkey and the receiver would trust it.
-  Pubkey pinning + out-of-band peer-list distribution keeps this
-  small in practice. A signed `IdentityIntroduced` claim with quorum
+- **Residual**: the trust list is distributed out of band (config
+  management); a node whose key leaks must be removed from every other
+  node's `trusted_keys`. A signed `IdentityIntroduced` claim with quorum
   is tracked at [#68](https://github.com/fabriziosalmi/zion/issues/68).
 
 **T — tampering**: in-flight modification of a claim payload — flip
