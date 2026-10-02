@@ -1183,7 +1183,7 @@ async fn process_request_inner(
     // the JSON subscriber attached, fields are written directly to the
     // subscriber's buffer — no `format!` allocation, redaction is the
     // only owned-`String` produced.
-    {
+    if cfg.access_log.enabled {
         // Redact the query string per the operator's [redact] policy.
         // Path itself is rarely sensitive and the auditor needs it; we
         // only rewrite the part after the first `?`.

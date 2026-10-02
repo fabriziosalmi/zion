@@ -3900,3 +3900,59 @@ async fn a_pool_that_never_answers_gets_504_and_a_post_is_not_replayed() {
         "a POST that may have been processed is not sent again"
     );
 }
+
+// ── the access log is on by default, and can be turned off ──────────────────
+
+/// Requests through a state built from `extra` (top-level TOML), with the subscriber
+/// zion installs by default (`DEFAULT_FILTER`); returns what it printed.
+async fn access_log_output(extra: &str) -> String {
+    use tracing_subscriber::layer::SubscriberExt;
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let (port, _) = named_origin("A").await;
+    let toml = format!(
+        "{extra}\n[server]\nlisten_http=\"127.0.0.1:0\"\nlisten_https=\"127.0.0.1:0\"\n\
+         [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nu=\"http://127.0.0.1:{port}\"\n\
+         [[route]]\npath=\"/{{*r}}\"\nupstream=\"u\"\n"
+    );
+    let st = AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).unwrap());
+    let buf = Buf::default();
+    let w = buf.clone();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(
+            crate::observability::DEFAULT_FILTER,
+        ))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || w.clone()),
+        );
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let _ = fetch(&st, "/logged-path", &[]).await;
+    let out = buf.0.lock().unwrap().clone();
+    String::from_utf8(out).unwrap()
+}
+
+#[tokio::test]
+async fn the_access_log_is_written_by_default() {
+    let out = access_log_output("").await;
+    assert!(
+        out.contains("access") && out.contains("path=/logged-path") && out.contains("status=200"),
+        "{out}"
+    );
+}
+
+#[tokio::test]
+async fn the_access_log_can_be_turned_off() {
+    let out = access_log_output("[access_log]\nenabled = false").await;
+    assert!(!out.contains("/logged-path"), "{out}");
+}
