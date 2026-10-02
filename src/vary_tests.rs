@@ -3755,3 +3755,64 @@ fn health_host_is_applied_and_follows_a_reload() {
     let removed = crate::reload::rebuild(&cfg(""), &changed, 1000).unwrap();
     assert_eq!(host_of(&removed), None, "and can remove it");
 }
+
+// ── the health checker follows reloads ──────────────────────────────────────
+
+#[tokio::test]
+async fn the_health_checker_probes_upstreams_added_by_a_reload() {
+    let (live, _) = named_origin("L").await;
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }; // nothing listens: every probe fails
+    let cfg = |upstreams: &str| {
+        format!(
+            "[server]\nlisten_http=\"127.0.0.1:0\"\nlisten_https=\"127.0.0.1:0\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\n{upstreams}\n\
+             [[route]]\npath=\"/a/{{*r}}\"\nupstream=\"a\"\n"
+        )
+    };
+    let boot = cfg(&format!("a = \"http://127.0.0.1:{live}\""));
+    let st = AppState::for_tests(&toml::from_str::<ZionConfig>(&boot).unwrap());
+    let ms = crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS;
+    let prober = tokio::spawn(crate::health::run_prober(
+        st.clone(),
+        crate::proxy::build_http_client(ms, false),
+        crate::proxy::build_http_client(ms, true),
+    ));
+    // let it finish a round on the boot config first (the live upstream gets a latency)
+    let live_url = format!("http://127.0.0.1:{live}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while st.config.load().health_map[live_url.as_str()]
+        .latency_us
+        .load(Ordering::Relaxed)
+        == 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "boot upstream never probed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // reload: route /a now goes to an upstream that is down
+    let reloaded: ZionConfig =
+        toml::from_str(&cfg(&format!("a = \"http://127.0.0.1:{dead}\""))).unwrap();
+    let next = crate::reload::rebuild(&reloaded, &st.config.load(), 1000).expect("reload builds");
+    st.config.store(Arc::new(next));
+    let url = format!("http://127.0.0.1:{dead}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let down = !st.config.load().health_map[url.as_str()]
+            .healthy
+            .load(Ordering::Relaxed);
+        if down {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an upstream added by a reload was never probed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    prober.abort();
+}
