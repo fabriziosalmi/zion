@@ -3816,3 +3816,87 @@ async fn the_health_checker_probes_upstreams_added_by_a_reload() {
     }
     prober.abort();
 }
+
+// ── a pool member that never answers is bounded and failed over ─────────────
+
+/// Accepts connections and never answers; counts them.
+async fn hanging_origin() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let a = accepted.clone();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = listener.accept().await {
+            a.fetch_add(1, Ordering::Relaxed);
+            held.push(s); // keep it open, say nothing
+        }
+    });
+    (port, accepted)
+}
+
+fn pool_state(ports: &[u16]) -> Arc<AppState> {
+    let urls = ports
+        .iter()
+        .map(|p| format!("\"http://127.0.0.1:{p}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    hosts_state(
+        "[[route]]\npath = \"/{*rest}\"\nupstream = \"p\"\n",
+        &format!("[upstream.p]\nurls = [{urls}]"),
+    )
+}
+
+async fn timed(st: &Arc<AppState>, method: Method, uri: &str) -> (u16, Duration) {
+    let t = std::time::Instant::now();
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+        .unwrap();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(15),
+        process_request(req, st.clone(), "203.0.113.9:1".parse().unwrap(), false),
+    )
+    .await
+    .expect("the request must not hang")
+    .unwrap();
+    (resp.status().as_u16(), t.elapsed())
+}
+
+#[tokio::test]
+async fn a_pool_member_that_never_answers_is_failed_over() {
+    let (hang, accepted) = hanging_origin().await;
+    let (good, _) = named_origin("G").await;
+    let st = pool_state(&[hang, good]);
+    for i in 0..8 {
+        let (code, took) = timed(&st, Method::GET, &format!("/r{i}")).await;
+        assert_eq!(code, 200, "request {i} took {took:?}");
+    }
+    assert!(
+        accepted.load(Ordering::Relaxed) > 0,
+        "the hanging member was tried at least once (else this proves nothing)"
+    );
+}
+
+#[tokio::test]
+async fn a_pool_that_never_answers_gets_504_and_a_post_is_not_replayed() {
+    let (h1, a1) = hanging_origin().await;
+    let (h2, a2) = hanging_origin().await;
+    let st = pool_state(&[h1, h2]);
+    let (code, _) = timed(&st, Method::GET, "/g").await;
+    assert_eq!(code, 504, "every member timed out");
+    let tries = |a: &std::sync::atomic::AtomicUsize| a.load(Ordering::Relaxed);
+    assert_eq!(
+        (tries(&a1), tries(&a2)),
+        (1, 1),
+        "a GET tries each member once"
+    );
+    let (code, _) = timed(&st, Method::POST, "/p").await;
+    assert_eq!(code, 504);
+    assert_eq!(
+        tries(&a1) + tries(&a2),
+        3,
+        "a POST that may have been processed is not sent again"
+    );
+}
