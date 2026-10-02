@@ -676,9 +676,32 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/zion/aimp-identity.bin"))
             };
-            match listen {
-                None => None, // invalid listen already reported above; fail closed
-                Some(listen) => {
+            // Trusted node ids: TOML, else ZION_AIMP_TRUSTED_KEYS (comma-separated).
+            // Validation already refused a malformed TOML entry; the env path is
+            // checked here, and bootstrap refuses an empty list (fail closed).
+            let trusted_raw: Vec<String> = if !toml_cfg.trusted_keys.is_empty() {
+                toml_cfg.trusted_keys.clone()
+            } else {
+                std::env::var("ZION_AIMP_TRUSTED_KEYS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+                    .collect()
+            };
+            let trusted_keys: Option<Vec<[u8; 32]>> = trusted_raw
+                .iter()
+                .map(|k| aimp_cp::parse_node_key(k))
+                .collect();
+            if trusted_keys.is_none() {
+                eprintln!(
+                    "  AIMP control plane disabled: a trusted key is not a node id \
+                     (64 hex characters)"
+                );
+            }
+            match listen.zip(trusted_keys) {
+                None => None, // invalid listen or keys already reported; fail closed
+                Some((listen, trusted_keys)) => {
                     let cfg = aimp_cp::AimpControlPlaneConfig {
                         enabled: true,
                         listen,
@@ -687,14 +710,15 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                         anti_entropy_secs: toml_cfg.anti_entropy_secs,
                         inbound_claims_per_sec: toml_cfg.inbound_claims_per_sec,
                         inbound_claim_burst: toml_cfg.inbound_claim_burst,
+                        trusted_keys,
                     };
                     match aimp_cp::bootstrap(cfg).await {
                         Ok(cp) => {
+                            // The full id: it is what the other nodes put in trusted_keys.
                             eprintln!(
-                                "  AIMP control plane up: node_id[0..4]={:02x?} listen={} peers={}",
-                                &cp.node_id()[..4],
+                                "  AIMP control plane up: node_id={} listen={}",
+                                aimp_cp::node_key_hex(&cp.node_id()),
                                 listen,
-                                cp.reputation().is_empty() as u8 // touch the handle
                             );
                             Some(cp)
                         }

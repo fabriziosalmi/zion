@@ -6,6 +6,8 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Security
 
+- **The gossip mesh accepts claims only from trusted node keys** (`--features sovereign-aimp`, experimental). The receiver verified each envelope against the public key the envelope itself carried, with no list of trusted nodes: anyone who could reach the UDP port could generate a key and inject reputation scores, which can get clients refused when `mesh_score_deny_above` is set. `[sovereign_aimp] trusted_keys` (the node ids, 64 hex characters, which each node now prints in full at boot) is now **required** when the mesh is enabled (config error otherwise; `ZION_AIMP_TRUSTED_KEYS` for the env path), and a claim from any other key is dropped before signature verification. Found by the 2026-10-02 code audit. Upgrade note: add every node's `node_id` to the others' `trusted_keys` before upgrading a mesh.
+
 - **A route with `auth_profile` is never served unauthenticated.** The official release binaries and container were built with `--features dist` (acme + init), without `auth`: a config whose routes set `auth_profile` loaded with only a warning, and those routes answered without any token (reproduced on the 0.9.7 release binary: a "protected" route answered 200 to a request with no `Authorization`). Two changes: the release bundle now includes `auth` (`dist = acme + init + auth`), so official artifacts enforce JWT/OIDC (the same route answers 401); and a build without `auth` now **refuses** such a config (exit code 2 at boot, rejected on reload) instead of warning. Found by the 2026-10-02 code audit. If you run an official binary with `auth_profile` routes, upgrade.
 
 ## [0.9.7] - 2026-10-02

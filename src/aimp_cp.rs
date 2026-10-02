@@ -107,6 +107,31 @@ pub struct AimpControlPlaneConfig {
     /// spike (e.g. a peer reconnecting after a blip) isn't clipped.
     #[serde(default = "default_inbound_claim_burst")]
     pub inbound_claim_burst: u32,
+
+    /// The Ed25519 public keys (node ids) whose claims this node accepts. A valid
+    /// signature only proves the sender holds *some* key: without this list anyone who
+    /// can reach the UDP port could mint a key and inject reputation. Required:
+    /// [`bootstrap`] refuses an empty list (fail closed).
+    #[serde(default)]
+    pub trusted_keys: Vec<[u8; 32]>,
+}
+
+/// A node id written as 64 hex characters (what the boot log prints for this node).
+pub fn parse_node_key(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 || !s.is_ascii() {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// A node id as 64 lowercase hex characters, the form `trusted_keys` takes.
+pub fn node_key_hex(key: &[u8; 32]) -> String {
+    key.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn default_listen() -> SocketAddr {
@@ -132,6 +157,7 @@ impl Default for AimpControlPlaneConfig {
             anti_entropy_secs: default_anti_entropy_secs(),
             inbound_claims_per_sec: 0,
             inbound_claim_burst: default_inbound_claim_burst(),
+            trusted_keys: vec![],
         }
     }
 }
@@ -261,6 +287,13 @@ pub async fn bootstrap(cfg: AimpControlPlaneConfig) -> Result<AimpControlPlane, 
     if !cfg.enabled {
         return Err("aimp-cp: bootstrap called with disabled config".to_string());
     }
+    if cfg.trusted_keys.is_empty() {
+        return Err(
+            "aimp-cp: no trusted_keys: refusing to accept claims from any node that \
+                    can reach the port (set [sovereign_aimp] trusted_keys)"
+                .to_string(),
+        );
+    }
 
     // --- Identity: load from `cfg.identity_path` if it exists, else
     //     generate a fresh keypair and persist the secret seed.
@@ -288,8 +321,9 @@ pub async fn bootstrap(cfg: AimpControlPlaneConfig) -> Result<AimpControlPlane, 
         let update_tx = update_tx.clone();
         let rate = cfg.inbound_claims_per_sec;
         let burst = cfg.inbound_claim_burst;
+        let trusted = cfg.trusted_keys.clone();
         tokio::spawn(async move {
-            run_receiver(socket, reputation, update_tx, rate, burst).await;
+            run_receiver(socket, reputation, update_tx, rate, burst, trusted).await;
         });
     }
 
@@ -471,6 +505,8 @@ pub(crate) struct ReceiverState {
     skew_past_secs: u64,
     /// Per-source inbound claim rate-cap (#71). Disabled by default.
     rate_limiter: InboundRateLimiter,
+    /// Node ids whose claims are accepted (`None` only in unit tests of other gates).
+    trusted: Option<std::collections::HashSet<[u8; 32]>>,
 }
 
 impl ReceiverState {
@@ -483,7 +519,13 @@ impl ReceiverState {
             skew_future_secs: 60,
             skew_past_secs: 86_400,
             rate_limiter: InboundRateLimiter::new(0, 0),
+            trusted: None,
         }
+    }
+
+    fn with_trusted(mut self, keys: &[[u8; 32]]) -> Self {
+        self.trusted = Some(keys.iter().copied().collect());
+        self
     }
 
     /// Builder: enable the per-source inbound rate-cap (#71). `rate == 0`
@@ -518,6 +560,16 @@ impl ReceiverState {
         {
             metrics.mesh_claims_dropped_rate.fetch_add(1, Relaxed);
             return MergeOutcome::Rejected;
+        }
+
+        // 1c. Only claims from a trusted node id. Before the Ed25519 verify: an
+        //     unknown key is rejected cheaply, and a valid signature by a key nobody
+        //     trusts proves nothing.
+        if let Some(trusted) = &self.trusted {
+            if !trusted.contains(&envelope.data.origin_pubkey) {
+                metrics.mesh_claims_dropped_signature.fetch_add(1, Relaxed);
+                return MergeOutcome::Rejected;
+            }
         }
 
         // 2. Signature verification — every ingress envelope must pass.
@@ -684,11 +736,13 @@ async fn run_receiver(
     update_tx: watch::Sender<u64>,
     inbound_claims_per_sec: u32,
     inbound_claim_burst: u32,
+    trusted_keys: Vec<[u8; 32]>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     let mut buf = vec![0u8; 65_507]; // max UDP datagram
     let mut state = ReceiverState::new(reputation, update_tx)
-        .with_inbound_rate(inbound_claims_per_sec, inbound_claim_burst);
+        .with_inbound_rate(inbound_claims_per_sec, inbound_claim_burst)
+        .with_trusted(&trusted_keys);
 
     loop {
         let (len, _peer) = match socket.recv_from(&mut buf).await {
@@ -1110,12 +1164,17 @@ mod tests {
         let listen = probe.local_addr().unwrap();
         drop(probe);
 
+        // The node gossips to itself, so it must trust its own key.
+        let identity_path =
+            std::env::temp_dir().join(format!("zion-aimp-smoke-{}.bin", std::process::id()));
+        let self_key = load_or_generate_identity(&identity_path).unwrap().node_id();
         let cfg = AimpControlPlaneConfig {
             enabled: true,
             listen,
             peers: vec![listen],
-            identity_path: default_key_path(),
+            identity_path,
             anti_entropy_secs: 0, // off in this loopback smoke test
+            trusted_keys: vec![self_key],
             ..Default::default()
         };
         let cp = match bootstrap(cfg).await {
@@ -1180,6 +1239,113 @@ mod tests {
         let map: Arc<DashMap<IpAddr, WafReputation>> = Arc::new(DashMap::new());
         let (tx, _rx) = watch::channel(0u64);
         (ReceiverState::new(map.clone(), tx), map)
+    }
+
+    #[test]
+    fn only_trusted_node_keys_are_merged() {
+        let alice = Identity::new();
+        let mallory = Identity::new(); // a valid key nobody trusts
+        let target = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let now = 1_700_000_000u64;
+        let map: Arc<DashMap<IpAddr, WafReputation>> = Arc::new(DashMap::new());
+        let (tx, _rx) = watch::channel(0u64);
+        let mut state = ReceiverState::new(map.clone(), tx).with_trusted(&[alice.node_id()]);
+        let forged = build_envelope(&mallory, target, 1.0, now, 1);
+        assert_eq!(
+            state.try_merge(&forged, now),
+            MergeOutcome::Rejected,
+            "a correctly signed claim from an untrusted key"
+        );
+        assert!(map.get(&target).is_none());
+        let real = build_envelope(&alice, target, 0.9, now, 1);
+        assert_eq!(state.try_merge(&real, now), MergeOutcome::Inserted);
+    }
+
+    #[test]
+    fn node_keys_round_trip_through_hex() {
+        let k = Identity::new().node_id();
+        assert_eq!(parse_node_key(&node_key_hex(&k)), Some(k));
+        assert_eq!(
+            parse_node_key(&format!("  {}  ", node_key_hex(&k))),
+            Some(k)
+        );
+        for bad in [
+            "",
+            "00",
+            &"g".repeat(64),
+            &"0".repeat(63),
+            &"0".repeat(65),
+            &"é".repeat(32),
+        ] {
+            assert_eq!(parse_node_key(bad), None, "{bad:?}");
+        }
+    }
+
+    /// Over the real socket and receive loop: a correctly signed claim from a key the
+    /// node does not trust is dropped, one from a trusted key is merged.
+    #[tokio::test]
+    async fn the_running_receiver_drops_claims_from_untrusted_keys() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let listen = probe.local_addr().unwrap();
+        drop(probe);
+        let alice = Identity::new();
+        let mallory = Identity::new();
+        let cfg = AimpControlPlaneConfig {
+            enabled: true,
+            listen,
+            peers: Vec::new(),
+            identity_path: std::env::temp_dir()
+                .join(format!("zion-aimp-recv-{}.bin", std::process::id())),
+            anti_entropy_secs: 0,
+            trusted_keys: vec![alice.node_id()],
+            ..Default::default()
+        };
+        let cp = bootstrap(cfg).await.expect("bootstrap on loopback");
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let now = now_secs();
+        let forged_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 66));
+        let real_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77));
+        for env in [
+            build_envelope(&mallory, forged_ip, 1.0, now, 1),
+            build_envelope(&alice, real_ip, 0.9, now, 1),
+        ] {
+            sender
+                .send_to(&rmp_serde::to_vec(&env).unwrap(), listen)
+                .await
+                .unwrap();
+        }
+        // The trusted claim was sent second: once it is merged, the forged one has been
+        // processed too.
+        for _ in 0..50 {
+            if cp.reputation().contains_key(&real_ip) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            cp.reputation().contains_key(&real_ip),
+            "trusted claim merged"
+        );
+        assert!(
+            !cp.reputation().contains_key(&forged_ip),
+            "a claim signed by an untrusted key must not be merged"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_refuses_an_empty_trust_list() {
+        let cfg = AimpControlPlaneConfig {
+            enabled: true,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            peers: Vec::new(),
+            identity_path: std::env::temp_dir().join("zion-aimp-trust-test.bin"),
+            anti_entropy_secs: 0,
+            inbound_claims_per_sec: 0,
+            inbound_claim_burst: 0,
+            trusted_keys: Vec::new(),
+        };
+        let err = bootstrap(cfg).await.err().expect("must refuse");
+        assert!(err.contains("trusted_keys"), "{err}");
     }
 
     /// Hammer F1.1 — peer B cannot revoke an entry inserted by peer A.
