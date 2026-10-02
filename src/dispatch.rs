@@ -2245,16 +2245,26 @@ async fn handle_static_cache(
         ),
         _ => (Cow::Borrowed(pq), ""),
     };
+    // The response cache is shared by every route and host, so the key carries the
+    // request's host, normalised exactly as host routing sees it (case, port, trailing
+    // dot; HTTP/2 `:authority` or HTTP/1 `Host`): two hosts with the same path are two
+    // entries, whether they reach two origins or one multi-tenant origin. It goes last,
+    // after a `\x1b` no request can produce, so path invalidation and prefix purges,
+    // which match on the leading `path\x1f`, still reach every host's entry.
+    let host_marker = match crate::security::request_host(&req) {
+        Some(h) => format!("\u{1b}{h}"),
+        None => String::new(),
+    };
     let primary_key = format!(
-        "{key_target}\u{1f}{}{mode_marker}",
+        "{key_target}\u{1f}{}{mode_marker}{host_marker}",
         accept_encoding_key(req.headers())
     );
     // A response that is the same bytes for every client (no content coding, not chosen by
     // Accept-Encoding) is stored once, under a shared identity key, and found from any
     // `Accept-Encoding` (#484). The `\x1c` in its place cannot come from a request (header
     // values carry no control characters), so it never collides with the own key of a
-    // client that sent no Accept-Encoding.
-    let identity_primary = format!("{key_target}\u{1f}\u{1c}{mode_marker}");
+    // client that sent no Accept-Encoding. It is per host like every other key.
+    let identity_primary = format!("{key_target}\u{1f}\u{1c}{mode_marker}{host_marker}");
     let takes_identity = !refuses_identity(req.headers());
     // If this primary key's responses vary (RFC 9111 §4.1), the entry for THIS request
     // lives under a secondary key built from the varied request headers.

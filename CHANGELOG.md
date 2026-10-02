@@ -4,6 +4,16 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-10-02
+
+**Security release: the response cache no longer serves one host's response to another host ([GHSA-xwm8-fqm7-8m5r](https://github.com/fabriziosalmi/zion/security/advisories/GHSA-xwm8-fqm7-8m5r)).** No breaking changes. Read the notes below.
+
+### Upgrade notes
+
+- **Upgrade if one Zion instance runs cached routes (`static_cache`) for more than one host.** Since 0.5.0 two hosts with the same path shared one cache entry, so one host could be served another host's cached page. The cache is now keyed by host; nothing to configure.
+- **Fewer origin fetches for unencoded objects.** An origin that does not compress is fetched once per object instead of once per `Accept-Encoding` value.
+- **`zion import nginx`** turns `allow` / `deny` into `internal_only` (or reports it), instead of silently dropping the restriction.
+
 ### Added
 
 - **`[server] tcp_user_timeout_secs`** (opt-in, Linux; default `0` = the kernel's own limit of about 15 minutes of retransmissions). Sets `TCP_USER_TIMEOUT` on client connections: data that stays unacknowledged, or unsent because the client's receive window is zero, for that long drops the connection. Keepalive only probes idle connections, so a client that vanishes while a response is in flight (power loss, a dropped NAT mapping) used to keep its descriptor, connection slot, per-IP slot and buffers for that long. Measured on Linux with the client's ACKs dropped: `tcp_user_timeout_secs = 10` closes the connection after 10.2 s; without it the connection was still established after 70 s. It also drops a client that stops reading for longer than the timeout (a slow reader was cut at ~26 s with a 5 s timeout), so choose a value above the longest pause you accept, for example `300`.
@@ -23,6 +33,8 @@ All notable changes to Zion Edge Gateway are documented here.
 - **README and docs catch up with 0.9.4 / 0.9.5.** New [resilience guide](docs/guide/resilience.md) (what protects against what, where each protection sits on the request path, a combined example, what to alert on); the README Features now cover pools, outlier ejection, breaker, bulkhead, DNS last-good, drain, the log queue, `Range` / `Surrogate-Key` purge and client-IP privacy; the architecture page lists the modules added since 0.6 and the real pre-routing gate order; hardening, compliance mapping (`[redact] ip`) and the alert examples cover the new settings. The docs home page showed `Version 0.6.2`: it is now 0.9.5 and `scripts/check-version-sync.sh` / `bump-version.sh` keep it in step.
 
 ### Security
+
+- **The response cache no longer serves one host's response to another host** ([GHSA-xwm8-fqm7-8m5r](https://github.com/fabriziosalmi/zion/security/advisories/GHSA-xwm8-fqm7-8m5r)). The cache key was path + query + `Accept-Encoding`, with no host, and the cache is shared by every route. Since host-based routing (0.5.0), two hosts with the same path on cached routes shared one entry: with `a.test` and `b.test` routed to two different origins, `b.test/page.html` was answered from the cache with **`a.test`'s body** (reproduced on the 0.9.5 release binary). A route without `hosts` serving several tenants from one origin (which answers per `X-Forwarded-Host`) had the same problem. The key now carries the request's host, normalised exactly as host routing sees it (case, port, trailing dot, HTTP/2 `:authority` or HTTP/1 `Host`); path invalidation and prefix purges still reach every host. Deployments that serve one host per Zion instance, or that do not use `static_cache`, were not affected. Upgrade if you run cached routes for more than one host.
 
 - **`zion import nginx` no longer turns an IP-restricted location into a public route** (#483). `allow` / `deny` used to be reported as unsupported while the route was emitted without any restriction and the import exited 0: a `location /metrics { allow 10.0.0.0/8; … deny all; }` became reachable from anywhere (reproduced on a real config: `/metrics/foo` from a public IP got the backend's 200 instead of nginx's 403). The rules are now mapped to `internal_only = true`, fail-closed: a private-only allow-list converts, a narrower or public-containing list, or a bare `deny all`, becomes internal-only with a *partial* finding that says how to widen or narrow it with `[server] internal_networks`; only a block-list (`deny X; allow all;`) stays open, reported unsupported. Rules on a `server` are inherited by its locations (replace-not-merge, like nginx). A route on one of Zion's own endpoints (`/metrics`, `/healthz`, `/readyz`, `/_zion/…`) is now reported, since the backend's endpoint is not reachable there. Re-run the import of configs that used `allow`/`deny`.
 

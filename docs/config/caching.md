@@ -67,9 +67,14 @@ each variant under its own **secondary key** built from the values of those head
 
 ## Cache key
 
-The key is the **full path + query**, plus the **canonical `Accept-Encoding` set** when
+The key is the **host** and the **full path + query**, plus the **canonical `Accept-Encoding` set** when
 the stored response is encoded:
 
+- The **host** is part of the key, normalised as host routing sees it (lowercased,
+  port and trailing dot dropped; the HTTP/2 `:authority` or the HTTP/1 `Host`): two
+  hosts with the same path never share an entry, whether their routes go to two
+  origins or one route serves several hosts from one multi-tenant origin. Path
+  invalidation and prefix purges still reach the path on every host.
 - `/a?user=alice` and `/a?user=bob` never share an entry (query is part of the key).
 - The query is part of the key **as written**, so `?b=2&a=1` and `?a=1&b=2` are two entries.
   A profile can opt in to `normalize_query = true` to sort the parameters by name in the

@@ -3070,3 +3070,173 @@ async fn a_background_refresh_never_turns_the_shared_identity_entry_into_gzip() 
         "a client without gzip must never get the gzip refresh"
     );
 }
+
+// ── the response cache is per host ──────────────────────────────────────────
+
+/// An origin answering `<name>:<X-Forwarded-Host>` to everything; returns its port and
+/// its hit counter.
+async fn named_origin(name: &'static str) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = hits.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let h = h.clone();
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                    h.fetch_add(1, Ordering::Relaxed);
+                    let xfh = req
+                        .headers()
+                        .get("x-forwarded-host")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("-")
+                        .to_string();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .header("cache-control", "public, max-age=60")
+                                .body(Full::new(Bytes::from(format!("{name}:{xfh}"))))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    (port, hits)
+}
+
+fn hosts_state(routes: &str, upstreams: &str) -> Arc<AppState> {
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstreams]
+{upstreams}
+[cache_profile.c]
+ttl_seconds = 3600
+max_entries = 100
+{routes}
+"#
+    );
+    AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"))
+}
+
+#[tokio::test]
+async fn two_hosts_routed_to_two_origins_never_share_an_entry() {
+    let (pa, ha) = named_origin("A").await;
+    let (pb, hb) = named_origin("B").await;
+    let st = hosts_state(
+        r#"
+[[route]]
+path = "/{*rest}"
+hosts = ["a.test"]
+upstream = "a"
+mode = "static_cache"
+cache_profile = "c"
+[[route]]
+path = "/{*rest}"
+hosts = ["b.test"]
+upstream = "b"
+mode = "static_cache"
+cache_profile = "c"
+"#,
+        &format!("a = \"http://127.0.0.1:{pa}\"\nb = \"http://127.0.0.1:{pb}\""),
+    );
+    let (c, body) = fetch(&st, "/page", &[("host", "a.test")]).await;
+    assert_eq!((c.as_str(), body.as_str()), ("MISS", "A:a.test"));
+    settle().await;
+    let (c, body) = fetch(&st, "/page", &[("host", "b.test")]).await;
+    assert_eq!(
+        (c.as_str(), body.as_str()),
+        ("MISS", "B:b.test"),
+        "b.test must get its own origin's body, never a.test's cached one"
+    );
+    settle().await;
+    assert_eq!(
+        fetch(&st, "/page", &[("host", "a.test")]).await.1,
+        "A:a.test"
+    );
+    assert_eq!(
+        fetch(&st, "/page", &[("host", "b.test")]).await.1,
+        "B:b.test"
+    );
+    assert_eq!(
+        (ha.load(Ordering::Relaxed), hb.load(Ordering::Relaxed)),
+        (1, 1)
+    );
+}
+
+#[tokio::test]
+async fn one_route_serving_several_hosts_keeps_one_entry_per_host() {
+    // A route without `hosts`, to an origin that answers per X-Forwarded-Host (a
+    // multi-tenant app behind one upstream).
+    let (p, hits) = named_origin("O").await;
+    let st = hosts_state(
+        r#"
+[[route]]
+path = "/{*rest}"
+upstream = "o"
+mode = "static_cache"
+cache_profile = "c"
+"#,
+        &format!("o = \"http://127.0.0.1:{p}\""),
+    );
+    assert_eq!(
+        fetch(&st, "/t", &[("host", "one.test")]).await.1,
+        "O:one.test"
+    );
+    settle().await;
+    assert_eq!(
+        fetch(&st, "/t", &[("host", "two.test")]).await.1,
+        "O:two.test"
+    );
+    settle().await;
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+    // the same host in another spelling (case, port, trailing dot, HTTP/2 authority)
+    // is the same entry
+    for (uri, h) in [
+        ("/t", &[("host", "ONE.test:443")][..]),
+        ("/t", &[("host", "one.test.")][..]),
+        ("https://one.test/t", &[][..]),
+    ] {
+        let (c, body) = fetch(&st, uri, h).await;
+        assert_eq!(
+            (c.as_str(), body.as_str()),
+            ("HIT", "O:one.test"),
+            "{uri} {h:?}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+    // and an unsafe request on one host still invalidates the path
+    assert!(send_host(&st, Method::POST, "/t", "one.test").await < 400);
+    settle().await;
+    assert_eq!(fetch(&st, "/t", &[("host", "one.test")]).await.0, "MISS");
+}
+
+async fn send_host(st: &Arc<AppState>, method: Method, uri: &str, host: &str) -> u16 {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", host)
+        .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+        .unwrap();
+    process_request(
+        req,
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap()
+    .status()
+    .as_u16()
+}

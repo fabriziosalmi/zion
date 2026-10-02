@@ -20,7 +20,7 @@ description: One auditable Rust binary at the edge — TLS 1.3 termination, a ze
     <aside class="ds-spec">
       <div class="cap">Specification</div>
       <dl>
-        <div class="ds-row"><dt>Version</dt><dd class="tnum">0.9.5</dd></div>
+        <div class="ds-row"><dt>Version</dt><dd class="tnum">0.9.6</dd></div>
         <div class="ds-row"><dt>Language</dt><dd>Rust · MSRV 1.82</dd></div>
         <div class="ds-row"><dt>Binary</dt><dd class="tnum">~4 MB · static</dd></div>
         <div class="ds-row"><dt>TLS proxy</dt><dd class="tnum">108<span class="u">k</span> req/s</dd></div>
