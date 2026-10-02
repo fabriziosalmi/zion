@@ -716,7 +716,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     let state = Arc::new(AppState {
         config: Arc::new(ArcSwap::from_pointee(resolved)),
         tls_acceptor: tls_acceptor_store,
-        http_client: proxy::build_http_client(proxy::DEFAULT_CONNECT_TIMEOUT_MS),
+        http_client: proxy::build_http_client(proxy::DEFAULT_CONNECT_TIMEOUT_MS, false),
         http_clients: dashmap::DashMap::new(),
         static_cache: cache::StaticCache::new(),
         conn_limit: Arc::new(Semaphore::new(platform.conn_limit)),
@@ -956,6 +956,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         // (already embedded in AppState, so routing sees updates immediately)
         let hm = health_map.clone();
         let health_http_client = state.http_client.clone();
+        let health_http1_client = proxy::build_http_client(proxy::DEFAULT_CONNECT_TIMEOUT_MS, true);
         tokio::spawn(async move {
             // Reuse the shared HTTP client for health checks. This has two benefits:
             // 1. HTTPS upstreams get TLS pre-warming (connections stay in pool)
@@ -986,44 +987,10 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
 
                 for (url, up) in due {
                     let client_clone = client.clone();
+                    let http1_clone = health_http1_client.clone();
                     join_set.spawn(async move {
-                        use http_body_util::BodyExt;
-                        let uri: hyper::Uri = match url.parse() {
-                            Ok(u) => u,
-                            Err(_) => return,
-                        };
-                        let req = match hyper::Request::builder()
-                            .uri(&uri)
-                            .header(
-                                "Host",
-                                uri.authority().map(|a| a.as_str()).unwrap_or("localhost"),
-                            )
-                            .body(
-                                http_body_util::Full::new(bytes::Bytes::new())
-                                    .map_err(|never| match never {})
-                                    .boxed(),
-                            )
-                        {
-                            Ok(r) => r,
-                            Err(_) => return,
-                        };
-                        let start = tokio::time::Instant::now();
-                        let healthy = match tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            client_clone.request(req),
-                        )
-                        .await
-                        {
-                            Ok(Ok(resp)) => {
-                                resp.status().is_success() || resp.status().is_redirection()
-                            }
-                            _ => false,
-                        };
-                        let lat = if healthy {
-                            start.elapsed().as_micros() as u64
-                        } else {
-                            0
-                        };
+                        let (healthy, lat) =
+                            health::probe(&client_clone, &http1_clone, &url, &up).await;
                         up.update_latency(lat);
 
                         let was_healthy = up
@@ -1885,8 +1852,11 @@ async fn handle_http(
             if !cfg.trusted_proxies.is_trusted(&remote_addr.ip()) {
                 security::scrub_client_override_headers(req.headers_mut());
             }
+            if rule.preserve_host {
+                req.extensions_mut().insert(proxy::PreserveHost);
+            }
             return proxy::proxy_pass(
-                &state.client_for(rule.connect_timeout_ms),
+                &state.client_for(rule.connect_timeout_ms, rule.preserve_host),
                 req,
                 &rule.upstream_scheme,
                 &rule.upstream_authority,

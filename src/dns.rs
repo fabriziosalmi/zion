@@ -523,7 +523,7 @@ mod tests {
         let host = "origin.stale-dns-test.invalid";
         let uri = format!("http://{host}:{port}/");
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let client = crate::proxy::build_http_client(2000);
+        let client = crate::proxy::build_http_client(2000, false);
         let req = || {
             hyper::Request::get(&uri)
                 .body(

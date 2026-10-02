@@ -3357,3 +3357,401 @@ async fn a_websocket_upgrade_reaches_the_upstream_with_host_and_an_origin_form_t
     );
     assert!(lower.contains("x-forwarded-host: app.test"), "{head}");
 }
+
+// ── [upstream.x] preserve_host (ADR-0024) ───────────────────────────────────
+
+/// An origin answering `host=<Host>` with `cache_control`; counts its requests.
+async fn host_echo_origin(
+    cache_control: &'static str,
+) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = hits.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let h = h.clone();
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                    h.fetch_add(1, Ordering::Relaxed);
+                    let hosts: Vec<String> = req
+                        .headers()
+                        .get_all("host")
+                        .iter()
+                        .map(|v| v.to_str().unwrap_or("?").to_string())
+                        .collect();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .header("cache-control", cache_control)
+                                .body(Full::new(Bytes::from(format!("host={}", hosts.join(",")))))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    (port, hits)
+}
+
+/// A state with one route (`mode`) to upstream `u` = `urls`, with `preserve_host` as given.
+fn preserve_state(mode: &str, urls: &str, preserve: bool, profile: &str) -> Arc<AppState> {
+    // (a route with a cache profile is served by the cache handler whatever its mode)
+    let cache = if mode == "static_cache" {
+        "cache_profile = \"c\""
+    } else {
+        ""
+    };
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstream.u]
+urls = [{urls}]
+preserve_host = {preserve}
+[cache_profile.c]
+ttl_seconds = 3600
+max_entries = 100
+{profile}
+[[route]]
+path = "/{{*rest}}"
+upstream = "u"
+mode = "{mode}"
+{cache}
+"#
+    );
+    AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"))
+}
+
+async fn body_for(st: &Arc<AppState>, uri: &str, headers: &[(&str, &str)]) -> (u16, String) {
+    let resp = process_request(
+        get(uri, headers),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    let status = resp.status().as_u16();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test]
+async fn preserve_host_sends_the_clients_host_in_every_mode() {
+    let (port, _) = host_echo_origin("no-store").await;
+    let url = format!("\"http://127.0.0.1:{port}\"");
+    let upstream = format!("host=127.0.0.1:{port}");
+    for mode in ["standard", "sse_stream", "static_cache"] {
+        let on = preserve_state(mode, &url, true, "");
+        let off = preserve_state(mode, &url, false, "");
+        let h = [("host", "App.Example:8443")];
+        assert_eq!(
+            body_for(&on, "/p", &h).await,
+            (200, "host=App.Example:8443".to_string()),
+            "{mode}: the client's Host, exactly once, as received"
+        );
+        assert_eq!(
+            body_for(&off, "/p", &h).await,
+            (200, upstream.clone()),
+            "{mode}: without it, the upstream's own authority (unchanged)"
+        );
+        // an HTTP/2 client has no Host header, only the :authority (here the URI's)
+        assert_eq!(
+            body_for(&on, "https://h2.example/p", &[]).await.1,
+            "host=h2.example",
+            "{mode}: an HTTP/2 client's :authority"
+        );
+    }
+}
+
+#[tokio::test]
+async fn preserve_host_survives_a_pool_failover() {
+    let (port, _) = host_echo_origin("no-store").await;
+    // the first member refuses connections, so the request is retried on the second
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let urls = format!("\"http://127.0.0.1:{dead}\", \"http://127.0.0.1:{port}\"");
+    let st = preserve_state("standard", &urls, true, "");
+    for _ in 0..4 {
+        assert_eq!(
+            body_for(&st, "/p", &[("host", "app.example")]).await,
+            (200, "host=app.example".to_string())
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_background_refresh_sends_the_clients_host_too() {
+    let (port, hits) = host_echo_origin("public, max-age=1, stale-while-revalidate=30").await;
+    let st = preserve_state(
+        "static_cache",
+        &format!("\"http://127.0.0.1:{port}\""),
+        true,
+        "",
+    );
+    let h = [("host", "app.example")];
+    assert_eq!(body_for(&st, "/r", &h).await.1, "host=app.example");
+    settle().await;
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    // served stale; the refresh runs in the background
+    assert_eq!(body_for(&st, "/r", &h).await.1, "host=app.example");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while hits.load(Ordering::Relaxed) < 2 {
+        assert!(std::time::Instant::now() < deadline, "no refresh");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    settle().await;
+    // what the refresh stored is what the origin answered to the client's Host
+    let (_, body) = body_for(&st, "/r", &h).await;
+    assert_eq!(body, "host=app.example", "the refreshed entry");
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn preserve_host_applies_to_websocket_upgrades() {
+    let (port, seen) = recording_ws_origin().await;
+    let st = preserve_state(
+        "standard",
+        &format!("\"http://127.0.0.1:{port}\""),
+        true,
+        "",
+    );
+    let mut req = ws_request("/chat");
+    req.headers_mut().insert(
+        "host",
+        hyper::header::HeaderValue::from_static("app.example"),
+    );
+    let resp = process_request(
+        req,
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 101);
+    let head = seen
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(head.starts_with("get /chat http/1.1\r\n"), "{head}");
+    assert_eq!(head.matches("\r\nhost:").count(), 1, "{head}");
+    assert!(head.contains("\r\nhost: app.example\r\n"), "{head}");
+}
+
+#[test]
+fn preserve_host_picks_an_http1_only_client_of_its_own() {
+    let st = preserve_state("standard", "\"http://127.0.0.1:1\"", true, "");
+    let _ = st.client_for(crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS, true);
+    let _ = st.client_for(crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS, false);
+    assert!(st
+        .http_clients
+        .contains_key(&(crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS, true)));
+    assert!(
+        !st.http_clients
+            .contains_key(&(crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS, false)),
+        "the default client is the shared one"
+    );
+}
+
+#[tokio::test]
+async fn the_port_80_acme_fallback_honours_preserve_host() {
+    let (port, _) = host_echo_origin("no-store").await;
+    let st = preserve_state(
+        "standard",
+        &format!("\"http://127.0.0.1:{port}\""),
+        true,
+        "",
+    );
+    let resp = crate::handle_http(
+        get(
+            "/.well-known/acme-challenge/tok",
+            &[("host", "app.example")],
+        ),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+    )
+    .await
+    .unwrap();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"host=app.example");
+}
+
+/// The protocols a client offers in its TLS ClientHello (read before any certificate is
+/// involved, so no trusted certificate is needed: the handshake is abandoned there).
+async fn alpn_offered_by(client: crate::proxy::HttpClient) -> Vec<String> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let acceptor =
+            tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
+        let start = acceptor.await.unwrap();
+        start
+            .client_hello()
+            .alpn()
+            .map(|it| {
+                it.map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    let req = Request::builder()
+        .uri(format!("https://localhost:{port}/"))
+        .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), client.request(req)).await;
+    server.await.unwrap()
+}
+
+#[tokio::test]
+async fn an_http1_only_client_does_not_offer_http2() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let ms = crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS;
+    // (no ALPN at all is HTTP/1.1: a server can only pick h2 when it is offered)
+    let offered = alpn_offered_by(crate::proxy::build_http_client(ms, true)).await;
+    assert!(
+        !offered.iter().any(|p| p == "h2"),
+        "preserve_host upstreams must never negotiate HTTP/2: {offered:?}"
+    );
+    assert_eq!(
+        alpn_offered_by(crate::proxy::build_http_client(ms, false)).await,
+        ["h2", "http/1.1"],
+        "the default client still offers HTTP/2"
+    );
+}
+
+/// An origin that, like Django's `ALLOWED_HOSTS`, answers 400 to any Host but `allowed`.
+async fn host_checking_origin(allowed: &'static str) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let ok =
+                        req.headers().get("host").and_then(|v| v.to_str().ok()) == Some(allowed);
+                    async move {
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .status(if ok { 200 } else { 400 })
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn the_health_probe_sends_health_host_when_set() {
+    let port = host_checking_origin("app.example").await;
+    let url = format!("http://127.0.0.1:{port}/");
+    let ms = crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS;
+    let (c, h1) = (
+        crate::proxy::build_http_client(ms, false),
+        crate::proxy::build_http_client(ms, true),
+    );
+    let up = crate::health::UpstreamHealth::new_healthy();
+    assert!(
+        !crate::health::probe(&c, &h1, &url, &up).await.0,
+        "the endpoint's own address as Host: the backend refuses it"
+    );
+    up.probe_host
+        .store(Some(Arc::new(hyper::header::HeaderValue::from_static(
+            "app.example",
+        ))));
+    assert!(
+        crate::health::probe(&c, &h1, &url, &up).await.0,
+        "health_host is accepted"
+    );
+}
+
+#[tokio::test]
+async fn a_probe_with_health_host_never_offers_http2() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let start =
+            tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream)
+                .await
+                .unwrap();
+        start
+            .client_hello()
+            .alpn()
+            .map(|it| {
+                it.map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    let ms = crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS;
+    let up = crate::health::UpstreamHealth::new_healthy();
+    up.probe_host
+        .store(Some(Arc::new(hyper::header::HeaderValue::from_static(
+            "app.example",
+        ))));
+    let _ = crate::health::probe(
+        &crate::proxy::build_http_client(ms, false),
+        &crate::proxy::build_http_client(ms, true),
+        &format!("https://localhost:{port}/"),
+        &up,
+    )
+    .await;
+    let offered = server.await.unwrap();
+    assert!(!offered.iter().any(|p| p == "h2"), "{offered:?}");
+}
+
+#[test]
+fn health_host_is_applied_and_follows_a_reload() {
+    let cfg = |extra: &str| {
+        let toml = format!(
+            "[server]\nlisten_http=\"127.0.0.1:0\"\nlisten_https=\"127.0.0.1:0\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [upstream.u]\nurl=\"http://127.0.0.1:9\"\npreserve_host = true\n{extra}\n\
+             [[route]]\npath=\"/{{*r}}\"\nupstream=\"u\"\n"
+        );
+        toml::from_str::<ZionConfig>(&toml).unwrap()
+    };
+    let host_of = |snap: &crate::state::ResolvedAppConfig| {
+        snap.health_map["http://127.0.0.1:9"]
+            .probe_host
+            .load_full()
+            .map(|h| h.to_str().unwrap().to_string())
+    };
+    let first =
+        crate::state::ResolvedAppConfig::try_build(&cfg("health_host = \"a.example\""), 1000)
+            .unwrap();
+    assert_eq!(host_of(&first).as_deref(), Some("a.example"));
+    let changed =
+        crate::reload::rebuild(&cfg("health_host = \"b.example\""), &first, 1000).unwrap();
+    assert_eq!(
+        host_of(&changed).as_deref(),
+        Some("b.example"),
+        "a reload changes it"
+    );
+    let removed = crate::reload::rebuild(&cfg(""), &changed, 1000).unwrap();
+    assert_eq!(host_of(&removed), None, "and can remove it");
+}

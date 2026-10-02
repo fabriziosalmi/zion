@@ -4,6 +4,11 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`[upstream.x] preserve_host`** (opt-in, #485, [ADR-0024](docs/adr/0024-preserve-host.md)): the upstream receives the client's `Host` as sent (the `:authority` for HTTP/2 clients) instead of its own address, like nginx `proxy_set_header Host $http_host` and the Traefik / Caddy defaults. For applications that check or build URLs from `Host` (Django `ALLOWED_HOSTS`, Rails host authorization, CSRF origin checks, absolute redirects, multi-tenant backends). It applies to every request sent to that upstream: `standard` routes and pool failover attempts, `sse_stream`, `static_cache` fetches and background refreshes, WebSocket upgrades and the `:80` ACME fallback. Such an upstream is spoken to over HTTP/1.1 only, because over HTTP/2 a `Host` that differs from `:authority` makes the backend reset the stream (measured: `PROTOCOL_ERROR`); TLS still verifies the upstream's own certificate name, and `X-Forwarded-Host` is still set.
+- **`[upstream.x] health_host`**: the `Host` the health probe sends. A backend that refuses unknown hosts answered the probe 400, was marked down, and every request got 503; zion warns at startup when `preserve_host` is set without `health_host`. Re-applied on reload. Measured with a backend that checks `Host` like Django: without the settings every request gets 503; with `preserve_host` + `health_host`, HTTP/1.1 200, HTTP/2 client 200, cached route 200, WebSocket 101.
+
 ### Fixed
 
 - **WebSocket upgrades work against strict HTTP/1.1 backends.** The upgrade request reached the upstream with **no `Host` header** and the target in absolute form (`GET http://upstream:port/path HTTP/1.1`): the handshake goes over a bare HTTP/1.1 connection, which adds nothing, after `Host` had been removed. RFC 9112 §3.2 requires a 400 for that, and Go `net/http` does: through 0.9.6 a WebSocket to a Go backend got **400**, directly it got 101 (now 101 through Zion too). The upgrade now carries the upstream's `Host` (without a default port, as ordinary proxied requests) and an origin-form target; the client's host is still sent in `X-Forwarded-Host`, also when the client wrote the target in absolute form. Found while designing `preserve_host` (ADR-0024).

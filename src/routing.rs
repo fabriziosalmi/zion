@@ -32,6 +32,8 @@ pub struct ResolvedRoute {
     pub load_balancing: crate::pool::Algorithm,
     /// `[upstream.x] max_in_flight` (0 = no limit) and the name its counter is kept under.
     pub max_in_flight: u32,
+    /// `[upstream.x] preserve_host`: forward the client's Host, over an HTTP/1.1-only client.
+    pub preserve_host: bool,
     pub upstream_name: Option<Arc<str>>,
     /// Pre-parsed URI parts — avoids full URI parse on every request.
     pub upstream_scheme: hyper::http::uri::Scheme,
@@ -501,6 +503,10 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
             .and_then(|name| config.upstream.get(name))
             .and_then(|u| u.max_in_flight)
             .unwrap_or(0),
+        preserve_host: route
+            .upstream_name()
+            .and_then(|name| config.upstream.get(name))
+            .is_some_and(|u| u.preserve_host),
         upstream_name: route.upstream_name().map(Arc::from),
         upstream_scheme,
         upstream_authority,

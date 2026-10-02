@@ -50,6 +50,10 @@ pub struct UpstreamHealth {
     pub breaker: crate::breaker::Breaker,
     /// Live load-balancing and passive-health state (see `pool.rs`).
     pub pool: crate::pool::MemberStats,
+    /// `[upstream.x] health_host`: the `Host` the active probe sends instead of the
+    /// endpoint's own authority (first route in config order wins). Re-applied on every
+    /// reload, like the breaker thresholds.
+    pub probe_host: arc_swap::ArcSwapOption<hyper::header::HeaderValue>,
 }
 
 impl UpstreamHealth {
@@ -83,6 +87,7 @@ impl UpstreamHealth {
             next_probe_at_us: std::sync::atomic::AtomicU64::new(0),
             breaker: crate::breaker::Breaker::new(),
             pool: crate::pool::MemberStats::new(),
+            probe_host: arc_swap::ArcSwapOption::empty(),
         }
     }
 
@@ -122,6 +127,54 @@ pub fn next_down_delay(prev_us: u64) -> u64 {
 
 /// Shared health state — keyed by upstream URL.
 /// FnvHashMap for O(1) lookup (upstream URLs are short strings).
+/// One active probe of `url`: `GET` it with `Host` = the entry's `health_host`, or the
+/// endpoint's own authority. Healthy on a 2xx or 3xx answer within 5 s. Returns the
+/// verdict and, when healthy, the latency in µs. A probe with a `health_host` goes over
+/// `http1` (an HTTP/1.1-only client): over HTTP/2 a `Host` that differs from `:authority`
+/// makes the backend reset the stream (ADR-0024).
+pub async fn probe(
+    client: &crate::proxy::HttpClient,
+    http1: &crate::proxy::HttpClient,
+    url: &str,
+    up: &UpstreamHealth,
+) -> (bool, u64) {
+    use http_body_util::BodyExt;
+    let Ok(uri) = url.parse::<hyper::Uri>() else {
+        return (false, 0);
+    };
+    let own = uri.authority().map(|a| a.as_str()).unwrap_or("localhost");
+    let (host, client) = match up.probe_host.load_full() {
+        Some(h) => ((*h).clone(), http1),
+        None => match hyper::header::HeaderValue::from_str(own) {
+            Ok(h) => (h, client),
+            Err(_) => return (false, 0),
+        },
+    };
+    let Ok(req) = hyper::Request::builder()
+        .uri(&uri)
+        .header(hyper::header::HOST, host)
+        .body(
+            http_body_util::Full::new(bytes::Bytes::new())
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+    else {
+        return (false, 0);
+    };
+    let start = tokio::time::Instant::now();
+    let healthy =
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.request(req)).await {
+            Ok(Ok(resp)) => resp.status().is_success() || resp.status().is_redirection(),
+            _ => false,
+        };
+    let lat = if healthy {
+        start.elapsed().as_micros() as u64
+    } else {
+        0
+    };
+    (healthy, lat)
+}
+
 pub type HealthMap = Arc<FnvHashMap<String, Arc<UpstreamHealth>>>;
 
 /// Check if a specific upstream URL is healthy.

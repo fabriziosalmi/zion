@@ -72,7 +72,8 @@ fallback (which picks its route first and forwards on its own):
 A peer listed in `[server] trusted_proxies` (a CDN or load balancer in front of zion) keeps
 its values, as it does for `X-Forwarded-For`. `X-Forwarded-Host` is always overwritten with
 the request's own host (the `Host` header, or the URI authority for HTTP/2), and dropped when there
-is none.
+is none. The upstream's `Host` is its own authority, or the client's host when the upstream
+sets [`preserve_host`](/config/#forward-the-client-s-host-preserve-host-opt-in).
 
 ## Host-based routing (virtual hosting)
 

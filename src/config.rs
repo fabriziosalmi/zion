@@ -692,6 +692,10 @@ struct RawUpstream {
     outlier_detection: Option<OutlierDetectionConfig>,
     #[serde(default)]
     max_in_flight: Option<u32>,
+    #[serde(default)]
+    preserve_host: bool,
+    #[serde(default)]
+    health_host: Option<String>,
 }
 
 /// How a pool of several endpoints assigns a request to a member.
@@ -891,6 +895,18 @@ pub struct UpstreamConfig {
     /// `websocket` routes are not counted. Omit for no limit.
     #[serde(default)]
     pub max_in_flight: Option<u32>,
+    /// Send the client's `Host` (as received; the HTTP/2 `:authority` for HTTP/2 clients)
+    /// to this upstream instead of the upstream's own authority, like nginx
+    /// `proxy_set_header Host $http_host`. This upstream is then spoken to over HTTP/1.1
+    /// only (HTTP/2 cannot carry a `Host` that differs from `:authority`); TLS still
+    /// verifies the upstream's own name. Default `false` (ADR-0024).
+    #[serde(default)]
+    pub preserve_host: bool,
+    /// The `Host` the active health probe sends (default: the endpoint's own authority).
+    /// Set it with `preserve_host` when the backend refuses unknown hosts (Django
+    /// `ALLOWED_HOSTS`): it would answer the probe 4xx and be marked down.
+    #[serde(default)]
+    pub health_host: Option<String>,
 }
 
 impl TryFrom<RawUpstream> for UpstreamConfig {
@@ -919,6 +935,8 @@ impl TryFrom<RawUpstream> for UpstreamConfig {
             load_balancing: raw.load_balancing,
             outlier_detection: raw.outlier_detection,
             max_in_flight: raw.max_in_flight,
+            preserve_host: raw.preserve_host,
+            health_host: raw.health_host,
         })
     }
 }
@@ -1532,6 +1550,17 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
 
     errors.extend(config.redact.errors());
     for (name, up) in &config.upstream {
+        if let Some(h) = &up.health_host {
+            // A Host value: a host name or address, with an optional port.
+            let valid = crate::security::normalize_host(h).is_some()
+                && hyper::header::HeaderValue::from_str(h).is_ok()
+                && h.trim() == h;
+            if !valid {
+                errors.push(format!(
+                    "upstream.{name}.health_host must be a host name (optionally with :port), got {h:?}"
+                ));
+            }
+        }
         if let Some(n) = up.max_in_flight {
             if !(1..=1_000_000).contains(&n) {
                 errors.push(format!(
@@ -2216,6 +2245,49 @@ mod tests {
             .err()
             .unwrap_or_default();
         assert!(e.contains("at least 16 bytes"), "{e}");
+    }
+
+    #[test]
+    fn preserve_host_is_opt_in() {
+        let cfg = |up: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+                 [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstream.u]\nurl=\"http://a:1\"\n{up}\n\
+                 [[route]]\npath=\"/{{*r}}\"\nupstream=\"u\"\n"
+            )
+        };
+        let d: ZionConfig = toml::from_str(&cfg("")).unwrap();
+        assert!(!d.upstream["u"].preserve_host, "off unless asked for");
+        let c: ZionConfig = toml::from_str(&cfg("preserve_host = true")).unwrap();
+        assert!(c.upstream["u"].preserve_host);
+        assert!(toml::from_str::<ZionConfig>(&cfg("preserve_host = \"yes\"")).is_err());
+        assert_eq!(d.upstream["u"].health_host, None);
+        for good in ["app.example", "app.example:8443", "10.0.0.5"] {
+            let c = cfg(&format!("health_host = \"{good}\""));
+            assert!(
+                validate_str(&c, "t")
+                    .err()
+                    .unwrap_or_default()
+                    .find("health_host")
+                    .is_none(),
+                "{good}"
+            );
+        }
+        for bad in [
+            "",
+            " app.example",
+            "app example",
+            "app.example/x",
+            "http://app.example",
+        ] {
+            let e = validate_str(&cfg(&format!("health_host = \"{bad}\"")), "t")
+                .err()
+                .unwrap_or_default();
+            assert!(
+                e.contains("health_host must be a host name"),
+                "{bad:?}: {e}"
+            );
+        }
     }
 
     #[test]
