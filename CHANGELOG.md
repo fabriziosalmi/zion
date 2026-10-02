@@ -4,6 +4,16 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-10-02
+
+**Host release: WebSocket upgrades work against strict backends, and an upstream can receive the client's `Host`.** No breaking changes. Read the notes below.
+
+### Upgrade notes
+
+- **WebSocket fix, upgrade if you proxy WebSockets.** The upgrade request reached the upstream with no `Host` header; strict HTTP/1.1 servers (Go `net/http`, among others) answered it 400. Nothing to configure.
+- **`preserve_host` is opt-in.** Without it, upstreams receive their own address as `Host`, as before. If you turn it on for a backend that refuses unknown hosts (Django `ALLOWED_HOSTS`), also set `health_host`, or its health probes fail and every request gets 503; zion warns at startup.
+- **Re-run `zion import`** for nginx configs with `proxy_set_header Host $host`, and for Traefik and Caddy configs: the generated upstreams now forward the client's `Host` as the source did (`preserve_host = true`, with a `health_host`).
+
 ### Added
 
 - **`[upstream.x] preserve_host`** (opt-in, #485, [ADR-0024](docs/adr/0024-preserve-host.md)): the upstream receives the client's `Host` as sent (the `:authority` for HTTP/2 clients) instead of its own address, like nginx `proxy_set_header Host $http_host` and the Traefik / Caddy defaults. For applications that check or build URLs from `Host` (Django `ALLOWED_HOSTS`, Rails host authorization, CSRF origin checks, absolute redirects, multi-tenant backends). It applies to every request sent to that upstream: `standard` routes and pool failover attempts, `sse_stream`, `static_cache` fetches and background refreshes, WebSocket upgrades and the `:80` ACME fallback. Such an upstream is spoken to over HTTP/1.1 only, because over HTTP/2 a `Host` that differs from `:authority` makes the backend reset the stream (measured: `PROTOCOL_ERROR`); TLS still verifies the upstream's own certificate name, and `X-Forwarded-Host` is still set.
