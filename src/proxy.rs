@@ -457,10 +457,14 @@ pub async fn proxy_pass_ha(
 
     // At most one attempt per pool member; marking a failed upstream down
     // makes the next `select_best_upstream` rotate to a survivor.
+    // Members this request already waited out: a timeout does not mark a member down
+    // (slow is not dead), so it is left out of this request's later picks instead.
+    let mut candidates: Vec<String> = pool.to_vec();
+    let mut timed_out = false;
     for _ in 0..pool.len() {
         let url = match crate::pool::pick(
             health_map,
-            pool,
+            &candidates,
             algorithm,
             crate::breaker::now_ms(),
             &mut |n| fastrand::usize(..n),
@@ -504,7 +508,36 @@ pub async fn proxy_pass_ha(
         let member = health_map.get(&url);
         let _in_flight = member.map(|h| h.pool.begin());
         let started = std::time::Instant::now();
-        let outcome = send_request_try(client, prepared).await;
+        // Bounded like the single-upstream path: a member that accepts the connection
+        // and never answers must not hold the request until the connection cap.
+        let Ok(outcome) =
+            tokio::time::timeout(UPSTREAM_REQUEST_TIMEOUT, send_request_try(client, prepared))
+                .await
+        else {
+            // Slow is not dead: no eager ejection; the pool stats count the failure.
+            crate::pool::report(
+                health_map,
+                pool,
+                &url,
+                false,
+                None,
+                crate::breaker::now_ms(),
+            );
+            crate::metrics::METRICS
+                .upstream_failovers_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::logging::warn(
+                "proxy",
+                &format!("upstream {url} timeout after {UPSTREAM_REQUEST_TIMEOUT:?}"),
+            );
+            timed_out = true;
+            candidates.retain(|c| c != &url);
+            // The request may have been processed: replay only an idempotent one.
+            if !idempotent {
+                return Ok(gateway_timeout());
+            }
+            continue;
+        };
         let took_us = started.elapsed().as_micros() as u64;
         let ok = matches!(&outcome, Ok(r) if !crate::breaker::is_failure(r.status().as_u16()));
         crate::pool::report(
@@ -518,6 +551,7 @@ pub async fn proxy_pass_ha(
         match outcome {
             Ok(resp) => return Ok(resp),
             Err(e) => {
+                timed_out = false;
                 let connect = e.is_connect();
                 crate::metrics::METRICS
                     .upstream_failovers_total
@@ -542,7 +576,12 @@ pub async fn proxy_pass_ha(
             }
         }
     }
-    Ok(bad_gateway())
+    // Every member failed: 504 when the last one timed out, 502 otherwise.
+    Ok(if timed_out {
+        gateway_timeout()
+    } else {
+        bad_gateway()
+    })
 }
 
 /// Forward a request whose body has already been collected (post-WAF path).
@@ -626,8 +665,13 @@ pub async fn proxy_pass_stream(
 /// plus per-IP slot it holds) up to the 1h connection cap — a DoS amplifier.
 /// 504 on elapse. The per-upstream `connect_timeout_ms` bounds only the TCP
 /// connect (it is applied to the connector, see `build_http_client`); this
-/// overall bound is what closes a hang *after* connect.
+/// overall bound is what closes a hang *after* connect. It applies to every attempt of a
+/// pool too (see [`proxy_pass_ha`]). Shorter under test so a hanging upstream can be
+/// exercised in seconds.
+#[cfg(not(test))]
 const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Hard ceiling on a request body buffered for HA replay. Failover has to hold
 /// the whole body in memory to resend it, so this bounds per-request RAM on
