@@ -384,6 +384,25 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthPr
         other => return Err(format!("unsupported JWT algorithm: {other}")),
     };
 
+    // RFC 7518 §3.2: an HMAC key must be at least as long as the hash output. A short
+    // secret makes tokens forgeable offline by brute force, so refuse it rather than
+    // accept a signature check that only looks like one.
+    if let Some(ref secret) = effective_secret {
+        let min = match algorithm {
+            Algorithm::HS256 => 32,
+            Algorithm::HS384 => 48,
+            Algorithm::HS512 => 64,
+            _ => 0,
+        };
+        if secret.len() < min {
+            return Err(format!(
+                "auth secret for {alg_str} is {} bytes; it must be at least {min} (RFC 7518 \
+                 §3.2). Generate one with: openssl rand -base64 {min}",
+                secret.len()
+            ));
+        }
+    }
+
     let mut decoding_key = None;
     let jwk_set_arc = Arc::new(arc_swap::ArcSwapOption::empty());
 
@@ -496,6 +515,28 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthPr
 mod tests {
     use super::*;
 
+    #[cfg(feature = "auth")]
+    #[test]
+    fn an_hmac_secret_shorter_than_the_hash_is_refused() {
+        for (alg, min) in [("HS256", 32), ("HS384", 48), ("HS512", 64)] {
+            let profile = |len: usize| -> AuthProfileConfig {
+                toml::from_str(&format!(
+                    "algorithm = \"{alg}\"\nsecret = \"{}\"\naudience = \"a\"\nissuer = \"i\"",
+                    "k".repeat(len)
+                ))
+                .unwrap()
+            };
+            let err = resolve_auth_profile(&profile(min - 1))
+                .err()
+                .unwrap_or_default();
+            assert!(err.contains(&format!("at least {min}")), "{alg}: {err}");
+            assert!(
+                resolve_auth_profile(&profile(min)).is_ok(),
+                "{alg} at {min} bytes"
+            );
+        }
+    }
+
     #[test]
     fn extract_bearer_valid() {
         assert_eq!(
@@ -541,7 +582,7 @@ mod tests {
     #[test]
     fn a_revoked_token_is_refused_even_though_it_verifies() {
         use jsonwebtoken::{encode, EncodingKey, Header};
-        let secret = "test-secret-key-for-zion";
+        let secret = "test-secret-key-for-zion-padding-padding-padding-padding";
         let mk = |jti: Option<&str>| {
             let claims = Claims {
                 sub: Some("u".into()),
@@ -589,7 +630,7 @@ mod tests {
     fn validate_hmac_token_roundtrip() {
         use jsonwebtoken::{encode, EncodingKey, Header};
 
-        let secret = "test-secret-key-for-zion";
+        let secret = "test-secret-key-for-zion-padding-padding-padding-padding";
         let claims = Claims {
             sub: Some("user-123".to_string()),
             email: Some("test@zion.dev".to_string()),
@@ -645,14 +686,14 @@ mod tests {
         let token = encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(b"secret-a"),
+            &EncodingKey::from_secret(b"secret-a-padding-padding-padding-padding"),
         )
         .unwrap();
 
         let config = AuthProfileConfig {
             issuer: None,
             audience: None,
-            secret: Some("secret-b".into()), // wrong secret
+            secret: Some("secret-b-padding-padding-padding-padding".into()), // wrong secret
             secret_env: None,
             jwks_url: None,
             algorithm: "HS256".to_string(),
@@ -684,14 +725,14 @@ mod tests {
         let token = encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(b"secret"),
+            &EncodingKey::from_secret(b"secret-padding-padding-padding-padding"),
         )
         .unwrap();
 
         let config = AuthProfileConfig {
             issuer: None,
             audience: None,
-            secret: Some("secret".into()),
+            secret: Some("secret-padding-padding-padding-padding".into()),
             secret_env: None,
             jwks_url: None,
             algorithm: "HS256".to_string(),
@@ -712,7 +753,7 @@ mod tests {
 
         // Unique var name so parallel tests don't collide.
         let var = format!("ZION_TEST_AUTH_SECRET_{}", std::process::id());
-        std::env::set_var(&var, "env-secret");
+        std::env::set_var(&var, "env-secret-padding-padding-padding-padding");
 
         let claims = Claims {
             sub: Some("u".to_string()),
@@ -727,7 +768,7 @@ mod tests {
         let token = encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(b"env-secret"),
+            &EncodingKey::from_secret(b"env-secret-padding-padding-padding-padding"),
         )
         .unwrap();
 
@@ -774,7 +815,7 @@ mod tests {
         AuthProfileConfig {
             issuer: None,
             audience: audience.map(str::to_string),
-            secret: Some("unit-test-secret".into()),
+            secret: Some("unit-test-secret-padding-padding-padding-padding".into()),
             secret_env: None,
             jwks_url: None,
             algorithm: "HS256".to_string(),
@@ -799,7 +840,7 @@ mod tests {
         encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(b"unit-test-secret"),
+            &EncodingKey::from_secret(b"unit-test-secret-padding-padding-padding-padding"),
         )
         .unwrap()
     }

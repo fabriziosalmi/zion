@@ -1002,7 +1002,7 @@ upstream = "shared"
         // not be reachable on :80 without a token via the ACME fallback.
         let toml = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
              [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
-             [auth_profile.p]\nsecret=\"unit-test-secret\"\n\
+             [auth_profile.p]\nsecret=\"unit-test-secret-padding-padding-padding-padding\"\n\
              [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\nauth_profile=\"p\"\n";
         let c: ZionConfig = toml::from_str(toml).unwrap();
         let router = build_router_quiet(&c).unwrap();

@@ -563,15 +563,6 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
             &format!("trusted proxies: {:?}", config.server.trusted_proxies),
         );
     }
-    if proxy::XffMode::parse(&config.server.xff_mode).is_none() {
-        logging::warn(
-            "config",
-            &format!(
-                "unknown server.xff_mode '{}', falling back to 'append' (valid: append/rewrite/drop)",
-                config.server.xff_mode
-            ),
-        );
-    }
     logging::info("proxy", &format!("xff_mode: {:?}", resolved.xff_mode));
 
     // kTLS post-handshake offload boot probe (issue #52). Surfaced
