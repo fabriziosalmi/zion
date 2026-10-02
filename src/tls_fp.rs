@@ -1836,6 +1836,14 @@ mod tests {
         // main.rs strips these by string literal on builds where this module
         // is compiled out — the consts and the literals must never drift.
         assert_eq!(HDR_JA4, "X-Client-TLS-JA4");
+        // the listeners strip by the shared list: it must name these headers
+        for h in [HDR_JA4, HDR_ALLOWLISTED] {
+            assert!(
+                crate::security::TRANSPORT_ATTESTATION_HEADERS
+                    .contains(&h.to_ascii_lowercase().as_str()),
+                "{h}"
+            );
+        }
         assert_eq!(HDR_ALLOWLISTED, "X-Client-TLS-Allowlisted");
     }
 

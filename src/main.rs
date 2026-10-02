@@ -1697,8 +1697,7 @@ fn spawn_https_handler(
                     // verified fingerprint when the peer actually presented
                     // a cert — otherwise a forged header survives to the
                     // upstream and the access log as a fake mTLS identity.
-                    req.headers_mut().remove("X-Client-Cert-Fingerprint");
-                    req.headers_mut().remove("X-Client-Cert-DN");
+                    security::strip_transport_attestations(req.headers_mut());
                     if let Some(ref fp) = client_fp {
                         if let Ok(val) = hyper::header::HeaderValue::from_str(fp) {
                             req.headers_mut().insert("X-Client-Cert-Fingerprint", val);
@@ -1708,15 +1707,9 @@ fn spawn_https_handler(
                     // commit 5): strip any inbound forgery, re-inject the
                     // gate-computed values. Feature-off builds never
                     // compute an identity, so they strip only.
+                    // (feature off: already stripped above, nothing to inject)
                     #[cfg(feature = "tls-fingerprint")]
                     tls_fp::apply_headers(&mut req, tls_fp_identity.as_deref());
-                    #[cfg(not(feature = "tls-fingerprint"))]
-                    {
-                        // Module compiled out with the feature — strip the
-                        // literals (names asserted equal by a gated test).
-                        req.headers_mut().remove("X-Client-TLS-JA4");
-                        req.headers_mut().remove("X-Client-TLS-Allowlisted");
-                    }
                     use http_body_util::BodyExt;
                     let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
                     process_request(req_boxed, state, remote_addr, was_early).await
@@ -1775,13 +1768,9 @@ async fn handle_http(
     // Plaintext :80 never has a verified client certificate, so any inbound
     // X-Client-Cert-Fingerprint / -DN is forged. Strip both before the request
     // is logged or proxied, so a client cannot smuggle a fake mTLS identity.
-    req.headers_mut().remove("X-Client-Cert-Fingerprint");
-    req.headers_mut().remove("X-Client-Cert-DN");
     // Likewise for the JA4 identity headers — no TLS on :80, so any inbound
-    // copy is forged. Literal names: the tls_fp module (and its consts) is
-    // compiled out without the feature, and the strip must happen regardless.
-    req.headers_mut().remove("X-Client-TLS-JA4");
-    req.headers_mut().remove("X-Client-TLS-Allowlisted");
+    // copy is forged.
+    security::strip_transport_attestations(req.headers_mut());
 
     // Rate limit HTTP/80 to prevent DoS via redirect/ACME flood
     if !check_rate_limit(&state, remote_addr.ip()) {
