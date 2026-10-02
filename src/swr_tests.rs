@@ -27,6 +27,8 @@ struct Origin {
     cache_control: Mutex<String>,
     /// When set, the origin drops the connection without answering (a transport error).
     down: std::sync::atomic::AtomicBool,
+    /// When set, every response carries `Vary: Accept-Encoding`.
+    vary_ae: std::sync::atomic::AtomicBool,
 }
 
 impl Origin {
@@ -65,14 +67,22 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                         }
                         let (body, etag) = o.body.lock().unwrap().clone();
                         let cc = o.cache_control.lock().unwrap().clone();
+                        // (an unrelated header stands in when the flag is off)
+                        let vary = if o.vary_ae.load(Ordering::Relaxed) {
+                            ("vary", "Accept-Encoding")
+                        } else {
+                            ("x-test", "-")
+                        };
                         let resp = if inm.as_deref() == Some(etag.as_str()) {
                             Response::builder()
+                                .header(vary.0, vary.1)
                                 .status(StatusCode::NOT_MODIFIED)
                                 .header("etag", &etag)
                                 .header("cache-control", &cc)
                                 .body(Full::new(Bytes::new()))
                         } else {
                             Response::builder()
+                                .header(vary.0, vary.1)
                                 .status(StatusCode::OK)
                                 .header("etag", &etag)
                                 .header("cache-control", &cc)
@@ -205,7 +215,7 @@ async fn stale_entry_is_served_at_once_and_refreshed_in_the_background() {
         (200, "MISS", "v1")
     );
     until("entry stored", || {
-        st.static_cache.get("/a\u{1f}").fresh().is_some()
+        st.static_cache.get("/a\u{1f}\u{1c}").fresh().is_some()
     })
     .await;
 
@@ -244,7 +254,7 @@ async fn stale_entry_is_served_at_once_and_refreshed_in_the_background() {
     // once it lands, the next request is a fresh hit on the NEW body
     until("refreshed entry", || {
         st.static_cache
-            .get("/a\u{1f}")
+            .get("/a\u{1f}\u{1c}")
             .fresh()
             .is_some_and(|h| h.body == "v2")
     })
@@ -258,7 +268,7 @@ async fn a_304_refresh_revives_the_entry_without_refetching_the_body() {
     let (o, st) = origin_and_state("public, max-age=1, stale-while-revalidate=30").await;
     fetch(&st, "/b", &[]).await;
     until("entry stored", || {
-        st.static_cache.get("/b\u{1f}").fresh().is_some()
+        st.static_cache.get("/b\u{1f}\u{1c}").fresh().is_some()
     })
     .await;
     tokio::time::sleep(Duration::from_millis(1300)).await;
@@ -267,7 +277,7 @@ async fn a_304_refresh_revives_the_entry_without_refetching_the_body() {
     assert_eq!(stale.cache, "STALE-WHILE-REVALIDATE");
     until("304 refresh", || o.count() >= 2).await;
     until("entry fresh again", || {
-        st.static_cache.get("/b\u{1f}").fresh().is_some()
+        st.static_cache.get("/b\u{1f}\u{1c}").fresh().is_some()
     })
     .await;
     let after = fetch(&st, "/b", &[]).await;
@@ -279,7 +289,7 @@ async fn concurrent_requests_on_a_stale_key_cause_one_refresh() {
     let (o, st) = origin_and_state("public, max-age=1, stale-while-revalidate=30").await;
     fetch(&st, "/c", &[]).await;
     until("entry stored", || {
-        st.static_cache.get("/c\u{1f}").fresh().is_some()
+        st.static_cache.get("/c\u{1f}\u{1c}").fresh().is_some()
     })
     .await;
     tokio::time::sleep(Duration::from_millis(1300)).await;
@@ -293,7 +303,7 @@ async fn concurrent_requests_on_a_stale_key_cause_one_refresh() {
         .iter()
         .all(|a| a.cache == "STALE-WHILE-REVALIDATE" && a.body == "v1"));
     until("refresh done", || {
-        st.static_cache.get("/c\u{1f}").fresh().is_some()
+        st.static_cache.get("/c\u{1f}\u{1c}").fresh().is_some()
     })
     .await;
     assert_eq!(
@@ -308,7 +318,7 @@ async fn outside_the_window_the_client_waits_for_the_origin_as_before() {
     let (o, st) = origin_and_state("public, max-age=1, stale-while-revalidate=1").await;
     fetch(&st, "/d", &[]).await;
     until("entry stored", || {
-        st.static_cache.get("/d\u{1f}").fresh().is_some()
+        st.static_cache.get("/d\u{1f}\u{1c}").fresh().is_some()
     })
     .await;
     tokio::time::sleep(Duration::from_millis(2600)).await; // past max-age + swr
@@ -329,7 +339,7 @@ async fn without_the_directive_behaviour_is_unchanged() {
     let (o, st) = origin_and_state("public, max-age=1").await;
     fetch(&st, "/e", &[]).await;
     until("entry stored", || {
-        st.static_cache.get("/e\u{1f}").fresh().is_some()
+        st.static_cache.get("/e\u{1f}\u{1c}").fresh().is_some()
     })
     .await;
     tokio::time::sleep(Duration::from_millis(1300)).await;
@@ -361,7 +371,7 @@ async fn stale_while_revalidate_is_not_used_when_the_origin_forbids_stale() {
         fetch(&st, &uri, &[]).await;
         until("entry stored", || {
             st.static_cache
-                .get(&format!("{uri}\u{1f}"))
+                .get(&format!("{uri}\u{1f}\u{1c}"))
                 .fresh()
                 .is_some()
         })
@@ -391,7 +401,7 @@ async fn stale_if_error_is_not_used_when_the_origin_forbids_stale() {
         fetch(&st, &uri, &[]).await;
         until("entry stored", || {
             st.static_cache
-                .get(&format!("{uri}\u{1f}"))
+                .get(&format!("{uri}\u{1f}\u{1c}"))
                 .fresh()
                 .is_some()
         })
@@ -415,11 +425,31 @@ async fn stale_if_error_still_serves_a_stale_copy_otherwise() {
     let (o, st) = origin_and_state("public, max-age=1").await;
     fetch(&st, "/sie", &[]).await;
     until("entry stored", || {
-        st.static_cache.get("/sie\u{1f}").fresh().is_some()
+        st.static_cache.get("/sie\u{1f}\u{1c}").fresh().is_some()
     })
     .await;
     tokio::time::sleep(Duration::from_millis(1300)).await;
     o.down.store(true, Ordering::Relaxed);
     let a = fetch(&st, "/sie", &[]).await;
     assert_eq!((a.cache.as_str(), a.body.as_str()), ("STALE", "v1"));
+}
+
+/// A 304 renews the entry it revalidated: here one keyed per encoding (`Vary:
+/// Accept-Encoding`), not the shared identity entry the request would also look under.
+#[tokio::test]
+async fn a_304_renews_a_per_encoding_entry_under_its_own_key() {
+    let (o, st) = origin_and_state("public, max-age=1").await;
+    o.vary_ae.store(true, Ordering::Relaxed);
+    let gz = [("accept-encoding", "gzip")];
+    assert_eq!(fetch(&st, "/pe", &gz).await.cache, "MISS");
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let revalidated = fetch(&st, "/pe", &gz).await;
+    assert_eq!((revalidated.status, revalidated.body.as_str()), (200, "v1"));
+    assert_eq!(o.seen.lock().unwrap()[1].0.as_deref(), Some("\"e1\""));
+    let after = fetch(&st, "/pe", &gz).await;
+    assert_eq!(
+        (after.cache.as_str(), o.count()),
+        ("HIT", 2),
+        "the 304 made the entry fresh again"
+    );
 }

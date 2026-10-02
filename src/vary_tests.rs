@@ -49,6 +49,9 @@ struct Origin {
     status: std::sync::atomic::AtomicU16,
     /// An extra response header (name, value), e.g. `Content-Location`.
     extra: Mutex<Option<(String, String)>>,
+    /// Answer `Content-Encoding: gzip` (with no `Vary`) to a request whose `Accept-Encoding`
+    /// mentions gzip, identity otherwise: the misbehaving origin the per-encoding key guards.
+    gzip_if_accepted: std::sync::atomic::AtomicBool,
 }
 
 /// `lang|foo|cookie|ae` of the request, so a body identifies who it was made for.
@@ -112,6 +115,15 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                             .header("cache-control", o.cc.lock().unwrap().clone());
                         if let Some((k, v)) = o.extra.lock().unwrap().clone() {
                             b = b.header(k, v);
+                        }
+                        if o.gzip_if_accepted.load(Ordering::Relaxed)
+                            && req
+                                .headers()
+                                .get("accept-encoding")
+                                .and_then(|v| v.to_str().ok())
+                                .is_some_and(|v| v.contains("gzip"))
+                        {
+                            b = b.header("content-encoding", "gzip");
                         }
                         if let Some(c) = o.set_cookie.lock().unwrap().clone() {
                             b = b.header("set-cookie", c);
@@ -221,6 +233,7 @@ async fn rig_with(vary: &str, cc: &str, profile_extra: &str) -> (Arc<Origin>, Ar
         delay_ms: std::sync::atomic::AtomicU64::new(0),
         status: std::sync::atomic::AtomicU16::new(200),
         extra: Mutex::new(None),
+        gzip_if_accepted: std::sync::atomic::AtomicBool::new(false),
     });
     let port = start_origin(o.clone()).await;
     o.port.store(port, Ordering::Relaxed);
@@ -575,7 +588,7 @@ async fn a_response_that_sets_a_cookie_is_never_stored() {
     }
     assert_eq!(hits(&o), 3, "every request must reach the origin");
     assert!(
-        st.static_cache.get("/sc\u{1f}").fresh().is_none(),
+        st.static_cache.get("/sc\u{1f}\u{1c}").fresh().is_none(),
         "nothing is stored"
     );
 }
@@ -846,7 +859,7 @@ async fn an_object_over_the_limit_is_streamed_whole_and_never_stored() {
         );
         assert!(st
             .static_cache
-            .get(&format!("{uri}\u{1f}"))
+            .get(&format!("{uri}\u{1f}\u{1c}"))
             .fresh()
             .is_none());
     }
@@ -906,7 +919,7 @@ async fn a_background_refresh_over_the_limit_leaves_the_old_entry_alone() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     settle().await;
-    let kept = match st.static_cache.get("/swr-big\u{1f}") {
+    let kept = match st.static_cache.get("/swr-big\u{1f}\u{1c}") {
         crate::cache::CacheLookup::Fresh(h) | crate::cache::CacheLookup::Stale(h) => h.body.len(),
         crate::cache::CacheLookup::Miss => 0,
     };
@@ -2857,4 +2870,203 @@ async fn only_if_cached_hits_get_the_same_304_range_whole_treatment() {
     plain.push(("cache-control", "only-if-cached"));
     let (code, _, body) = raw(&st, "/r/obj", &plain).await;
     assert_eq!((code, body), (200, full), "no Range: the whole object");
+}
+
+// ── #484: one entry for an identity body, whatever the Accept-Encoding ─────
+
+const CHROME: (&str, &str) = ("accept-encoding", "gzip, deflate, br, zstd");
+const SAFARI: (&str, &str) = ("accept-encoding", "gzip, deflate, br");
+
+/// (x-zion-cache, content-encoding, body)
+async fn fetch_ce(
+    st: &Arc<AppState>,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> (String, String, String) {
+    let resp = process_request(
+        get(uri, headers),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    let h = |n: &str| {
+        resp.headers()
+            .get(n)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
+    let (cache, ce) = (h("x-zion-cache"), h("content-encoding"));
+    let body = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    (cache, ce, body)
+}
+
+#[tokio::test]
+async fn an_identity_body_is_fetched_once_for_every_accept_encoding() {
+    let (o, st) = rig("").await;
+    assert_eq!(fetch(&st, "/ae/one", &[SAFARI]).await.0, "MISS");
+    settle().await;
+    for h in [
+        &[SAFARI][..],
+        &[CHROME][..],
+        &[][..],
+        &[("accept-encoding", "br")][..],
+        &[("accept-encoding", "gzip")][..],
+    ] {
+        assert_eq!(fetch(&st, "/ae/one", h).await.0, "HIT", "{h:?}");
+    }
+    assert_eq!(hits(&o), 1, "one origin fetch for one identical object");
+}
+
+#[tokio::test]
+async fn concurrent_cold_requests_with_different_encodings_coalesce() {
+    let (o, st) = rig("").await;
+    o.delay_ms.store(200, Ordering::Relaxed);
+    let profiles: [&[(&str, &str)]; 4] =
+        [&[CHROME], &[SAFARI], &[], &[("accept-encoding", "gzip")]];
+    let results = join_all((0..40).map(|i| {
+        let st = st.clone();
+        let h = profiles[i % 4];
+        async move { fetch(&st, "/ae/herd", h).await.0 }
+    }))
+    .await;
+    assert_eq!(
+        hits(&o),
+        1,
+        "40 cold requests, 4 encodings, 1 origin fetch: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_encoded_body_is_never_served_to_a_client_that_did_not_accept_it() {
+    let (o, st) = rig("").await;
+    o.gzip_if_accepted.store(true, Ordering::Relaxed);
+    let (c, ce, _) = fetch_ce(&st, "/ae/gz", &[CHROME]).await;
+    assert_eq!((c.as_str(), ce.as_str()), ("MISS", "gzip"));
+    settle().await;
+    // an identity-only client must get its own identity response, not the gzip entry
+    let (c, ce, body) = fetch_ce(&st, "/ae/gz", &[]).await;
+    assert_eq!(ce, "", "identity client got Content-Encoding {ce:?} ({c})");
+    assert!(
+        body.ends_with("|-"),
+        "made for a client without Accept-Encoding: {body}"
+    );
+    settle().await;
+    // and each keeps getting its own
+    assert_eq!(fetch_ce(&st, "/ae/gz", &[CHROME]).await.1, "gzip");
+    assert_eq!(fetch_ce(&st, "/ae/gz", &[]).await.1, "");
+    assert_eq!(hits(&o), 2);
+}
+
+#[tokio::test]
+async fn a_client_that_refuses_identity_is_not_served_the_identity_entry() {
+    let (o, st) = rig("").await;
+    fetch(&st, "/ae/noid", &[]).await; // an identity entry
+    settle().await;
+    let before = hits(&o);
+    let (c, _) = fetch(
+        &st,
+        "/ae/noid",
+        &[("accept-encoding", "gzip, identity;q=0")],
+    )
+    .await;
+    assert_eq!(
+        c, "MISS",
+        "identity;q=0 must not be served an identity body from the cache"
+    );
+    assert_eq!(hits(&o), before + 1);
+}
+
+#[tokio::test]
+async fn the_shared_identity_entry_is_invalidated_and_ranged_like_any_other() {
+    let (o, st) = rig("").await;
+    fetch(&st, "/ae/inv", &[]).await;
+    settle().await;
+    // a Range from a client with a different Accept-Encoding is served from the same entry
+    let (code, h, body) = raw(&st, "/ae/inv", &[SAFARI, ("range", "bytes=0-1")]).await;
+    assert_eq!(
+        (code, h.get("x-zion-cache").unwrap().to_str().unwrap()),
+        (206, "HIT")
+    );
+    assert_eq!(body.len(), 2);
+    // an unsafe request on the path invalidates it for everyone
+    assert!(send(&st, Method::POST, "/ae/inv").await < 400);
+    settle().await;
+    let before = hits(&o);
+    assert_eq!(fetch(&st, "/ae/inv", &[CHROME]).await.0, "MISS");
+    assert_eq!(hits(&o), before + 1);
+}
+
+#[tokio::test]
+async fn an_origin_that_varies_on_accept_encoding_keeps_one_entry_per_encoding() {
+    // nginx `gzip on; gzip_vary on;`: identity to a client without gzip, gzip otherwise,
+    // `Vary: Accept-Encoding` on both. A client without gzip coming first must not make
+    // every browser get the uncompressed body.
+    let (o, st) = rig("Accept-Encoding").await;
+    o.gzip_if_accepted.store(true, Ordering::Relaxed);
+    let (c, ce, _) = fetch_ce(&st, "/ae/vary", &[]).await;
+    assert_eq!((c.as_str(), ce.as_str()), ("MISS", ""));
+    settle().await;
+    let (c, ce, _) = fetch_ce(&st, "/ae/vary", &[CHROME]).await;
+    assert_eq!(
+        (c.as_str(), ce.as_str()),
+        ("MISS", "gzip"),
+        "a browser gets the origin's gzip, not the shared identity entry"
+    );
+    settle().await;
+    assert_eq!(fetch_ce(&st, "/ae/vary", &[CHROME]).await.1, "gzip");
+    assert_eq!(fetch_ce(&st, "/ae/vary", &[]).await.1, "");
+    assert_eq!(hits(&o), 2);
+}
+
+#[tokio::test]
+async fn concurrent_cold_requests_to_an_encoding_origin_each_get_their_own() {
+    let (o, st) = rig("").await;
+    o.gzip_if_accepted.store(true, Ordering::Relaxed);
+    o.delay_ms.store(200, Ordering::Relaxed);
+    let profiles: [&[(&str, &str)]; 4] =
+        [&[CHROME], &[SAFARI], &[], &[("accept-encoding", "gzip")]];
+    let results = join_all((0..40).map(|i| {
+        let st = st.clone();
+        let h = profiles[i % 4];
+        async move { (i % 4, fetch_ce(&st, "/ae/gzherd", h).await) }
+    }))
+    .await;
+    for (p, (c, ce, _)) in &results {
+        let want = if *p == 2 { "" } else { "gzip" };
+        assert_eq!(ce, want, "profile {p} ({c}) got {ce:?}");
+    }
+    assert!(
+        hits(&o) <= 4,
+        "at most one fetch per encoding set: {}",
+        hits(&o)
+    );
+}
+
+#[tokio::test]
+async fn a_background_refresh_never_turns_the_shared_identity_entry_into_gzip() {
+    let (o, st) = rig_cc("", "public, max-age=1, stale-while-revalidate=30").await;
+    fetch(&st, "/ae/swr", &[]).await; // the shared identity entry
+    settle().await;
+    o.gzip_if_accepted.store(true, Ordering::Relaxed); // the origin starts compressing
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    // a browser finds the stale identity entry; its refresh comes back gzip
+    let (c, ce, _) = fetch_ce(&st, "/ae/swr", &[CHROME]).await;
+    assert_eq!((c.as_str(), ce.as_str()), ("STALE-WHILE-REVALIDATE", ""));
+    settle().await;
+    let (_, ce, _) = fetch_ce(&st, "/ae/swr", &[]).await;
+    assert_eq!(
+        ce, "",
+        "a client without gzip must never get the gzip refresh"
+    );
 }

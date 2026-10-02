@@ -1367,6 +1367,8 @@ fn lookup_key(state: &AppState, primary: &str, headers: &hyper::HeaderMap) -> Op
 struct SwrRefresh {
     state: Arc<AppState>,
     key: Arc<str>,
+    /// `key` is a shared identity entry (#484): an encoded refresh must not overwrite it.
+    identity_entry: bool,
     /// The primary key `key` was derived from (they are equal unless the key varies).
     primary_key: Arc<str>,
     stale: cache::CacheHit,
@@ -1547,7 +1549,9 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
         (vary::VaryPolicy::Keyed(names), Some(rule)) => names == rule.names,
         _ => false,
     };
-    if !same_shape {
+    // A shared identity entry is found by every Accept-Encoding: an encoded body must
+    // never replace it (it would reach clients that did not accept that encoding).
+    if !same_shape || (job.identity_entry && !shareable_identity(&parts.headers)) {
         return false;
     }
     let Ok(collected) = http_body_util::Limited::new(body, job.max_object)
@@ -1796,6 +1800,61 @@ fn is_shared_cacheable(
     // request headers it names (see `vary`). Only `Vary: *` and varied credential
     // headers (per-user responses) remain unstorable.
     !matches!(vary::policy(resp_headers), vary::VaryPolicy::Uncacheable)
+}
+
+/// The client refuses an unencoded body (RFC 9110 §12.5.3): `identity;q=0`, or `*;q=0`
+/// without an explicit `identity` entry.
+fn refuses_identity(headers: &hyper::HeaderMap) -> bool {
+    let raw = headers
+        .get(hyper::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let q_of = |tok: &str| -> Option<(String, f32)> {
+        let mut it = tok.split(';');
+        let name = it.next()?.trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        let q = it
+            .find_map(|p| p.trim().strip_prefix("q=").map(str::to_string))
+            .and_then(|q| q.trim().parse::<f32>().ok())
+            .unwrap_or(1.0);
+        Some((name, q))
+    };
+    let codings: Vec<(String, f32)> = raw.split(',').filter_map(q_of).collect();
+    match codings.iter().find(|(n, _)| n == "identity") {
+        Some((_, q)) => *q <= 0.0,
+        None => codings.iter().any(|(n, q)| n == "*" && *q <= 0.0),
+    }
+}
+
+/// The response is the same bytes for every `Accept-Encoding`: no content coding, and the
+/// origin did not say it chose the response by `Accept-Encoding` (a `Vary` naming it, or `*`).
+fn shareable_identity(headers: &hyper::HeaderMap) -> bool {
+    let varies_on_ae = headers
+        .get_all(hyper::header::VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|t| {
+            let t = t.trim();
+            t == "*" || t.eq_ignore_ascii_case("accept-encoding")
+        });
+    !varies_on_ae && !is_encoded(headers)
+}
+
+/// The response body is encoded (`Content-Encoding` other than `identity`).
+fn is_encoded(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get_all(hyper::header::CONTENT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|c| {
+            let c = c.trim();
+            !c.is_empty() && !c.eq_ignore_ascii_case("identity")
+        })
 }
 
 /// Canonical `Accept-Encoding` fragment for the cache key (RFC 9111 §4.1, the
@@ -2190,6 +2249,13 @@ async fn handle_static_cache(
         "{key_target}\u{1f}{}{mode_marker}",
         accept_encoding_key(req.headers())
     );
+    // A response that is the same bytes for every client (no content coding, not chosen by
+    // Accept-Encoding) is stored once, under a shared identity key, and found from any
+    // `Accept-Encoding` (#484). The `\x1c` in its place cannot come from a request (header
+    // values carry no control characters), so it never collides with the own key of a
+    // client that sent no Accept-Encoding.
+    let identity_primary = format!("{key_target}\u{1f}\u{1c}{mode_marker}");
+    let takes_identity = !refuses_identity(req.headers());
     // If this primary key's responses vary (RFC 9111 §4.1), the entry for THIS request
     // lives under a secondary key built from the varied request headers.
     let Some(cache_key) = lookup_key(&state, &primary_key, req.headers()) else {
@@ -2220,9 +2286,29 @@ async fn handle_static_cache(
         return Ok(resp);
     };
 
+    // Where the shared identity entry for this request would live.
+    let identity_key: Option<String> = if takes_identity {
+        lookup_key(&state, &identity_primary, req.headers())
+    } else {
+        None
+    };
+    // Look the request up under its own key, then under the identity key. Returns the
+    // outcome and the key (and primary key) it was found under.
+    let find = |state: &AppState| -> (cache::CacheLookup, String, String) {
+        let own = state.static_cache.get(&cache_key);
+        match (&own, &identity_key) {
+            (cache::CacheLookup::Miss, Some(ik)) => (
+                state.static_cache.get(ik),
+                ik.clone(),
+                identity_primary.clone(),
+            ),
+            _ => (own, cache_key.clone(), primary_key.clone()),
+        }
+    };
+
     // only-if-cached (§5.2.1.7): serve from cache or 504 — never fetch.
     if rcc_only_if_cached {
-        return Ok(match state.static_cache.get(&cache_key) {
+        return Ok(match find(&state).0 {
             // only-if-cached (§5.2.1.7) must not contact the origin, so a stale
             // stored response can't be revalidated → 504, same as a miss.
             cache::CacheLookup::Fresh(hit) => fresh_hit_response(hit, req.method(), req.headers()),
@@ -2237,8 +2323,12 @@ async fn handle_static_cache(
     let mut revalidate: Option<cache::CacheHit> = None;
     // Any stale entry found, validators or not: what an open circuit can fall back on.
     let mut stale_entry: Option<cache::CacheHit> = None;
+    // The key the entry being revalidated lives under (its own key or the identity key).
+    let mut found_key: String = cache_key.clone();
     if !rcc_no_cache && !rcc_no_store {
-        match state.static_cache.get(&cache_key) {
+        let (outcome, at_key, at_primary) = find(&state);
+        found_key = at_key.clone();
+        match outcome {
             cache::CacheLookup::Fresh(hit) => {
                 // 304 on a matching precondition (RFC 9110 §13), else a Range slice, else all
                 return Ok(fresh_hit_response(hit, req.method(), req.headers()));
@@ -2261,8 +2351,9 @@ async fn handle_static_cache(
                     }
                     let refresh = SwrRefresh {
                         state: state.clone(),
-                        key: Arc::from(cache_key.as_str()),
-                        primary_key: Arc::from(primary_key.as_str()),
+                        key: Arc::from(at_key.as_str()),
+                        identity_entry: at_primary == identity_primary,
+                        primary_key: Arc::from(at_primary.as_str()),
                         stale: hit.clone(),
                         request: swr_request(&req),
                         connect_timeout_ms: rule.connect_timeout_ms,
@@ -2293,8 +2384,12 @@ async fn handle_static_cache(
         }
     }
 
-    // Own cache key before consuming req — use Arc directly (cache stores Arc<str>)
-    let path_owned: Arc<str> = Arc::from(cache_key);
+    // The in-flight (singleflight) key: the identity key whenever this client can take an
+    // identity body, so cold requests with different Accept-Encoding coalesce on one fetch.
+    // If that fetch turns out to be encoded for another encoding set, waiters that cannot
+    // use it find nothing and fetch for themselves (the existing re-fetch path).
+    let mut path_owned: Arc<str> =
+        Arc::from(identity_key.clone().unwrap_or_else(|| cache_key.clone()));
 
     // Singleflight: coalesce concurrent cache misses for the same key.
     //
@@ -2324,17 +2419,25 @@ async fn handle_static_cache(
         let mut rx = tx.subscribe();
         let _ = rx.wait_for(|v| *v).await;
         // The fetcher may have just learned that this key varies, so the entry for
-        // THIS request can now live under a secondary key: look it up afresh.
-        let key_now = lookup_key(&state, &primary_key, req.headers());
-        if let Some(hit) = key_now
-            .as_deref()
-            .and_then(|k| state.static_cache.get(k).fresh())
+        // THIS request can now live under a secondary key: look it up afresh, under its own
+        // primary key and, when it takes identity, under the identity one.
+        let mut keys_now = vec![lookup_key(&state, &primary_key, req.headers())];
+        if takes_identity {
+            keys_now.push(lookup_key(&state, &identity_primary, req.headers()));
+        }
+        if let Some(hit) = keys_now
+            .iter()
+            .flatten()
+            .find_map(|k| state.static_cache.get(k).fresh())
         {
             // get() already counted this hit — don't double-count it here.
-            return Ok(cache_hit_response(hit));
+            return Ok(fresh_hit_response(hit, req.method(), req.headers()));
         }
         // Cache miss/stale after wait (fetcher aborted, or stored a
-        // non-cacheable response): loop to fetch ourselves.
+        // non-cacheable response, or one for another encoding set): loop to fetch
+        // ourselves, under this request's own key so that clients with different
+        // encodings do not queue behind each other.
+        path_owned = Arc::from(cache_key.as_str());
     };
 
     // Opt-in circuit breaker: if the upstream's circuit is open, do not contact it. A stale
@@ -2435,7 +2538,7 @@ async fn handle_static_cache(
             // Skipped when a tag purge ran since this request began: it must not bring back an
             // entry the purge may have just removed.
             state.static_cache.refresh_checked(
-                &path_owned,
+                &found_key,
                 hit.body.clone(),
                 refreshed_meta,
                 effective_ttl,
@@ -2493,6 +2596,15 @@ async fn handle_static_cache(
             );
         // Where the entry lives: the primary key, or — when the response varies — the
         // secondary key of THIS request's varied headers (bounded; see `vary`).
+        // An identity body the origin did not select by Accept-Encoding goes under the
+        // identity primary key, shared by every Accept-Encoding (#484). An encoded one, or one
+        // with `Vary: Accept-Encoding` (the origin may compress for other clients), stays
+        // under this request's own primary key, found only by the same encoding set.
+        let store_primary: &str = if !takes_identity || !shareable_identity(&parts.headers) {
+            &primary_key
+        } else {
+            &identity_primary
+        };
         let store_key: Option<Arc<str>> = if !cacheable {
             None
         } else {
@@ -2500,14 +2612,14 @@ async fn handle_static_cache(
                 vary::VaryPolicy::Uncacheable => None,
                 vary::VaryPolicy::None => {
                     // Not varying (any more): forget an old rule so lookups use the primary key.
-                    state.static_cache.vary.remove(&primary_key);
-                    Some(Arc::from(primary_key.as_str()))
+                    state.static_cache.vary.remove(store_primary);
+                    Some(Arc::from(store_primary))
                 }
                 vary::VaryPolicy::Keyed(names) => state
                     .static_cache
                     .vary
                     .install(
-                        &primary_key,
+                        store_primary,
                         names,
                         // Outlive the variants' usefulness: a stale variant is kept for
                         // revalidation / stale-while-revalidate, so the rule must still be
@@ -2518,7 +2630,7 @@ async fn handle_static_cache(
                         cache_max,
                     )
                     .and_then(|rule| {
-                        let vk = vary::variant_key(&primary_key, &rule.names, &req_headers)?;
+                        let vk = vary::variant_key(store_primary, &rule.names, &req_headers)?;
                         rule.admit(&vk).then(|| Arc::from(vk.as_str()))
                     }),
             }
@@ -3113,6 +3225,61 @@ mod tests {
             let h = hdr(hyper::header::VARY, v);
             assert!(is_shared_cacheable(false, &h, TTL, 0), "keyed vary: {v}");
         }
+    }
+
+    #[test]
+    fn identity_is_refused_only_when_excluded() {
+        let refuses = |v: &str| {
+            let mut h = hyper::HeaderMap::new();
+            if !v.is_empty() {
+                h.insert(hyper::header::ACCEPT_ENCODING, v.parse().unwrap());
+            }
+            refuses_identity(&h)
+        };
+        for v in [
+            "",
+            "gzip",
+            "gzip, br",
+            "*",
+            "identity",
+            "gzip;q=0",
+            "identity;q=0.5",
+        ] {
+            assert!(!refuses(v), "{v:?} accepts identity");
+        }
+        for v in [
+            "identity;q=0",
+            "gzip, identity;q=0",
+            "IDENTITY; q=0.0",
+            "*;q=0",
+            "gzip, *;q=0",
+        ] {
+            assert!(refuses(v), "{v:?} refuses identity");
+        }
+        // an explicit identity entry wins over `*;q=0`
+        assert!(!refuses("*;q=0, identity"));
+    }
+
+    #[test]
+    fn only_an_unencoded_response_not_chosen_by_encoding_is_shared() {
+        let shared = |hs: &[(&str, &str)]| {
+            let mut h = hyper::HeaderMap::new();
+            for (k, v) in hs {
+                h.append(
+                    hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            shareable_identity(&h)
+        };
+        assert!(shared(&[]));
+        assert!(shared(&[("content-encoding", "identity")]));
+        assert!(shared(&[("vary", "Accept-Language")]));
+        assert!(!shared(&[("content-encoding", "gzip")]));
+        assert!(!shared(&[("content-encoding", "identity, br")]));
+        assert!(!shared(&[("vary", "Origin, accept-encoding")]));
+        assert!(!shared(&[("vary", "Origin"), ("vary", "Accept-Encoding")]));
+        assert!(!shared(&[("vary", "*")]));
     }
 
     #[test]
