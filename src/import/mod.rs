@@ -474,12 +474,20 @@ mod tests {
         assert!(c.toml.contains("hosts = [\"app.example.com\"]"));
         assert!(c.toml.contains("mode = \"websocket\""));
         assert!(c.toml.contains("url = \"http://localhost:3000\""));
+        // `proxy_set_header Host $host` → the upstream forwards the client's Host, and is
+        // probed with the vhost's name (#485)
         assert!(has_finding(
             &c,
-            Status::Unsupported,
+            Status::Convert,
             "proxy_set_header",
-            "Host"
+            "Host $host"
         ));
+        assert!(c.toml.contains("preserve_host = true"), "{}", c.toml);
+        assert!(
+            c.toml.contains("health_host = \"app.example.com\""),
+            "{}",
+            c.toml
+        );
         assert!(has_finding(
             &c,
             Status::Auto,
@@ -1190,6 +1198,104 @@ mod tests {
              listen 80;\n    server_name api.example.com;\n    {server_rules}\n    \
              location / {{ proxy_pass http://app; }}\n    {locations}\n  }}\n}}\n"
         )
+    }
+
+    /// The `[upstream.<name>]` block, as text.
+    fn upstream_block<'a>(toml: &'a str, name: &str) -> &'a str {
+        let needle = format!("[upstream.{name}]\n");
+        let start = toml
+            .find(&needle)
+            .unwrap_or_else(|| panic!("no upstream {name} in:\n{toml}"));
+        let end = toml[start..].find("\n\n").map_or(toml.len(), |e| start + e);
+        &toml[start..end]
+    }
+
+    #[test]
+    fn proxy_set_header_host_maps_to_preserve_host() {
+        for (value, preserve) in [
+            ("$http_host", true),
+            ("$host", true),
+            ("$proxy_host", false),
+        ] {
+            let c = conv(&server("", &format!("proxy_set_header Host {value};")));
+            let up = upstream_block(&c.toml, "app");
+            assert_eq!(
+                up.contains("preserve_host = true"),
+                preserve,
+                "{value}: {up}"
+            );
+            if preserve {
+                assert!(up.contains("health_host = \"api.example.com\""), "{up}");
+                assert!(has_finding(
+                    &c,
+                    Status::Convert,
+                    "proxy_set_header",
+                    "preserve_host"
+                ));
+            } else {
+                assert!(has_finding(
+                    &c,
+                    Status::Auto,
+                    "proxy_set_header",
+                    "$proxy_host"
+                ));
+            }
+        }
+        // a fixed Host is not something Zion can send
+        let c = conv(&server("", "proxy_set_header Host backend.internal;"));
+        assert!(!c.toml.contains("preserve_host"), "{}", c.toml);
+        assert!(has_finding(
+            &c,
+            Status::Unsupported,
+            "proxy_set_header",
+            "backend.internal"
+        ));
+    }
+
+    #[test]
+    fn a_location_with_its_own_headers_does_not_inherit_the_host_and_splits_the_upstream() {
+        // nginx replace-not-merge: /ws sets headers of its own, none of them Host, so it
+        // sends the upstream's address while / forwards the client's Host
+        let c = conv(&server(
+            "location /ws { proxy_set_header Upgrade $http_upgrade; proxy_pass http://app; }",
+            "proxy_set_header Host $host;",
+        ));
+        assert!(
+            route_block(&c.toml, "/{*rest}").contains("upstream = \"app_host\""),
+            "{}",
+            c.toml
+        );
+        assert!(
+            route_block(&c.toml, "/ws/{*rest}").contains("upstream = \"app\""),
+            "{}",
+            c.toml
+        );
+        assert!(upstream_block(&c.toml, "app_host").contains("preserve_host = true"));
+        assert!(!upstream_block(&c.toml, "app").contains("preserve_host"));
+        assert!(
+            upstream_block(&c.toml, "app_host").contains("url = \"http://10.1.2.3:8000\""),
+            "the copy keeps the endpoints"
+        );
+        assert!(has_finding(&c, Status::Convert, "upstream app", "app_host"));
+    }
+
+    #[test]
+    fn health_host_is_a_concrete_name_or_reported_missing() {
+        let wild = "events {}\nhttp {\n  upstream app { server 10.1.2.3:8000; }\n  server {\n    \
+                    listen 80;\n    server_name *.example.com;\n    proxy_set_header Host $host;\n    \
+                    location / { proxy_pass http://app; }\n  }\n}\n";
+        let c = conv(wild);
+        let up = upstream_block(&c.toml, "app");
+        assert!(
+            up.contains("preserve_host = true") && !up.contains("health_host"),
+            "{up}"
+        );
+        assert!(has_finding(
+            &c,
+            Status::Convert,
+            "upstream app",
+            "set health_host"
+        ));
     }
 
     #[test]

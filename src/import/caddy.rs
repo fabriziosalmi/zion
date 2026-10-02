@@ -553,6 +553,7 @@ fn build(
             findings,
         );
     }
+    super::map::settle_preserve_host(&mut doc, findings);
     doc
 }
 
@@ -821,6 +822,7 @@ fn map_site(
                 serve_dir: Some(dir),
                 spa_fallback: spa,
                 internal_only: false,
+                preserve_host: false,
                 annotations: Vec::new(),
             });
         }
@@ -1194,6 +1196,8 @@ fn push_route(
             urls,
             connect_timeout_ms: None,
             keepalive: None,
+            preserve_host: false,
+            health_host: None,
         });
     }
 
@@ -1203,6 +1207,7 @@ fn push_route(
         "reverse_proxy",
         format!("→ route {path} upstream '{up_name}'"),
     ));
+    let preserve_host = reverse_proxy_block(rp, findings);
     doc.routes.push(RouteOut {
         path: path.to_string(),
         hosts: if hosts.is_empty() {
@@ -1217,8 +1222,58 @@ fn push_route(
         serve_dir: None,
         spa_fallback: false,
         internal_only: false,
+        preserve_host,
         annotations: Vec::new(),
     });
+}
+
+/// The sub-directives of a `reverse_proxy { … }` block. Caddy forwards the client's Host
+/// by default (returns `true`); `header_up Host {upstream_hostport}` sends the upstream's
+/// own address instead (`false`). Anything else in the block is reported, not dropped.
+fn reverse_proxy_block(rp: &Node, findings: &mut Vec<Finding>) -> bool {
+    let mut preserve = true;
+    for sub in rp.block.iter().flatten() {
+        let host_value = (sub.name == "header_up")
+            .then(|| sub.args.first())
+            .flatten()
+            .filter(|h| h.eq_ignore_ascii_case("host"))
+            .and(sub.args.get(1));
+        match host_value.map(String::as_str) {
+            Some("{upstream_hostport}" | "{http.reverse_proxy.upstream.hostport}") => {
+                preserve = false;
+                findings.push(Finding::new(
+                    Status::Convert,
+                    sub.line,
+                    "header_up Host",
+                    "the upstream's own address as Host → Zion's default (no preserve_host)",
+                ));
+            }
+            Some("{host}" | "{hostport}" | "{http.request.host}" | "{http.request.hostport}") => {
+                findings.push(Finding::new(
+                    Status::Convert,
+                    sub.line,
+                    "header_up Host",
+                    "the client's Host → preserve_host = true (Caddy's default)",
+                ))
+            }
+            Some(other) => findings.push(Finding::new(
+                Status::Unsupported,
+                sub.line,
+                "header_up Host",
+                format!(
+                    "Host {other} — Zion sends either the upstream's own address or, with \
+                     preserve_host, the client's Host; a fixed Host is not supported"
+                ),
+            )),
+            None => findings.push(Finding::new(
+                Status::Unsupported,
+                sub.line,
+                format!("reverse_proxy {}", sub.name),
+                "reverse_proxy sub-directive not converted",
+            )),
+        }
+    }
+    preserve
 }
 
 // ── Small helpers ─────────────────────────────────────────────────────────
@@ -1294,6 +1349,32 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         convert(src, None, &cli, None)
+    }
+
+    #[test]
+    fn caddy_forwards_the_host_by_default_and_header_up_can_turn_it_off() {
+        let c = convert_str("app.example.com {\n  reverse_proxy api:8000\n}\n", &[]).unwrap();
+        assert!(c.toml.contains("preserve_host = true"), "{}", c.toml);
+        assert!(
+            c.toml.contains("health_host = \"app.example.com\""),
+            "{}",
+            c.toml
+        );
+        let off = "app.example.com {\n  reverse_proxy api:8000 {\n    header_up Host {upstream_hostport}\n  }\n}\n";
+        let c = convert_str(off, &[]).unwrap();
+        assert!(!c.toml.contains("preserve_host"), "{}", c.toml);
+        let fixed = "app.example.com {\n  reverse_proxy api:8000 {\n    header_up Host internal.app\n    lb_policy first\n  }\n}\n";
+        let c = convert_str(fixed, &[]).unwrap();
+        assert!(c
+            .findings
+            .iter()
+            .any(|f| f.status == Status::Unsupported && f.detail.contains("internal.app")));
+        assert!(
+            c.findings.iter().any(
+                |f| f.status == Status::Unsupported && f.directive == "reverse_proxy lb_policy"
+            ),
+            "a sub-directive is reported, not dropped"
+        );
     }
 
     // ── lexer / parser ──

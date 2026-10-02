@@ -297,6 +297,7 @@ fn build(
             }
         }
     }
+    super::map::settle_preserve_host(&mut doc, findings);
     doc
 }
 
@@ -398,6 +399,8 @@ struct Routing {
     routers: BTreeMap<String, Router>,
     /// Traefik-service-name → (port, line).
     ports: BTreeMap<String, (String, u32)>,
+    /// Traefik-service-name → `loadbalancer.passhostheader` (default `true`).
+    pass_host: BTreeMap<String, bool>,
 }
 
 #[derive(Default)]
@@ -451,6 +454,26 @@ fn collect_routing(svc: &compose::Service, findings: &mut Vec<Finding>) -> Routi
                 if prop == "loadbalancer.server.port" {
                     r.ports
                         .insert(name.to_string(), (label.value.clone(), line));
+                } else if prop == "loadbalancer.passhostheader" {
+                    match label.value.as_str() {
+                        v @ ("true" | "false") => {
+                            r.pass_host.insert(name.to_string(), v == "true");
+                            findings.push(Finding::new(
+                                Status::Convert,
+                                line,
+                                format!("services.{name}.{prop}"),
+                                format!("passHostHeader={v} → preserve_host = {v}"),
+                            ));
+                        }
+                        other => findings.push(Finding::new(
+                            Status::Unsupported,
+                            line,
+                            format!("services.{name}.{prop}"),
+                            format!(
+                                "'{other}' is not true or false — Traefik's default (true) used"
+                            ),
+                        )),
+                    }
                 } else {
                     findings.push(Finding::new(
                         Status::Partial,
@@ -548,6 +571,8 @@ fn build_route(
             urls: vec![format!("http://{}:{}", svc.name, port)],
             connect_timeout_ms: None,
             keepalive: None,
+            preserve_host: false,
+            health_host: None,
         });
     }
 
@@ -603,8 +628,27 @@ fn build_route(
         serve_dir: None,
         spa_fallback: false,
         internal_only: false,
+        // Traefik forwards the client's Host unless the service says passHostHeader=false.
+        preserve_host: pass_host_header(routing, rname, router),
         annotations: Vec::new(),
     });
+}
+
+/// The router's service's `passHostHeader`, found like its port; Traefik's default is true.
+fn pass_host_header(routing: &Routing, rname: &str, router: &Router) -> bool {
+    let key = router.service.clone().unwrap_or_else(|| rname.to_string());
+    routing
+        .pass_host
+        .get(&key)
+        .or_else(|| {
+            if routing.pass_host.len() == 1 && routing.ports.len() <= 1 {
+                routing.pass_host.values().next()
+            } else {
+                None
+            }
+        })
+        .copied()
+        .unwrap_or(true)
 }
 
 /// Resolve the upstream port for a router: its `.service` override, else the
@@ -913,6 +957,33 @@ mod tests {
     }
 
     // ── end to end ──
+
+    #[test]
+    fn traefik_forwards_the_host_unless_the_service_says_not_to() {
+        let c = convert_str(HTTP_ONLY, &[]).unwrap();
+        assert!(c.toml.contains("preserve_host = true"), "{}", c.toml);
+        assert!(c.toml.contains("health_host = \"a.io\""), "{}", c.toml);
+        let off = HTTP_ONLY.replace(
+            "      - \"traefik.http.services.api.loadbalancer.server.port=8000\"",
+            "      - \"traefik.http.services.api.loadbalancer.server.port=8000\"\n      - \"traefik.http.services.api.loadbalancer.passhostheader=false\"",
+        );
+        let c = convert_str(&off, &[]).unwrap();
+        assert!(!c.toml.contains("preserve_host"), "{}", c.toml);
+        assert!(c
+            .findings
+            .iter()
+            .any(|f| f.status == Status::Convert && f.detail.contains("passHostHeader=false")));
+        let bad = off.replace("passhostheader=false", "passhostheader=nope");
+        let c = convert_str(&bad, &[]).unwrap();
+        assert!(
+            c.toml.contains("preserve_host = true"),
+            "Traefik's default stands"
+        );
+        assert!(c
+            .findings
+            .iter()
+            .any(|f| f.status == Status::Unsupported && f.detail.contains("'nope'")));
+    }
 
     const HTTP_ONLY: &str = r#"
 services:

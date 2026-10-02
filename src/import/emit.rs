@@ -109,6 +109,12 @@ fn render_upstream(out: &mut String, up: &UpstreamOut) {
     if let Some(k) = up.keepalive {
         out.push_str(&format!("keepalive = {k}\n"));
     }
+    if up.preserve_host {
+        out.push_str("preserve_host = true\n");
+    }
+    if let Some(h) = &up.health_host {
+        kv(out, "health_host", h);
+    }
     out.push('\n');
 }
 
@@ -227,6 +233,8 @@ mod tests {
                 urls: vec!["http://127.0.0.1:1".into()],
                 connect_timeout_ms: None,
                 keepalive: None,
+                preserve_host: false,
+                health_host: None,
             }],
             routes: vec![super::super::map::RouteOut {
                 path: "/{*rest}".into(),
@@ -238,6 +246,7 @@ mod tests {
                 serve_dir: None,
                 spa_fallback: false,
                 internal_only: false,
+                preserve_host: false,
                 annotations: vec!["evil\ninternal_only = false\n[admin]".into()],
             }],
         };
@@ -278,6 +287,8 @@ mod tests {
                 urls: vec!["http://127.0.0.1:8080".into()],
                 connect_timeout_ms: None,
                 keepalive: None,
+                preserve_host: false,
+                health_host: None,
             }],
             routes: vec![super::super::map::RouteOut {
                 path: "/{*rest}".into(),
@@ -289,6 +300,7 @@ mod tests {
                 serve_dir: None,
                 spa_fallback: false,
                 internal_only: false,
+                preserve_host: false,
                 annotations: vec!["demo annotation".into()],
             }],
         };
@@ -320,6 +332,8 @@ mod tests {
                 urls: vec!["http://10.0.0.1:80".into(), "http://10.0.0.2:80".into()],
                 connect_timeout_ms: Some(75_000),
                 keepalive: Some(32),
+                preserve_host: false,
+                health_host: None,
             }],
             routes: vec![super::super::map::RouteOut {
                 path: "/api/{*rest}".into(),
@@ -331,6 +345,7 @@ mod tests {
                 serve_dir: None,
                 spa_fallback: false,
                 internal_only: false,
+                preserve_host: false,
                 annotations: Vec::new(),
             }],
         };
@@ -365,6 +380,8 @@ mod tests {
                 urls: vec!["http://127.0.0.1:8080".into()],
                 connect_timeout_ms: None,
                 keepalive: None,
+                preserve_host: false,
+                health_host: None,
             }],
             routes: vec![super::super::map::RouteOut {
                 path: "/{*rest}".into(),
@@ -376,6 +393,7 @@ mod tests {
                 serve_dir: None,
                 spa_fallback: false,
                 internal_only: false,
+                preserve_host: false,
                 annotations: Vec::new(),
             }],
         };
