@@ -1045,7 +1045,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         let hm = health_map.clone();
         tokio::spawn(async move {
             use http_body_util::BodyExt;
-            for (url, _) in hm.iter() {
+            for url in hm.keys() {
                 let uri: hyper::Uri = match url.parse() {
                     Ok(u) => u,
                     Err(_) => continue,

@@ -2265,11 +2265,10 @@ mod tests {
         for good in ["app.example", "app.example:8443", "10.0.0.5"] {
             let c = cfg(&format!("health_host = \"{good}\""));
             assert!(
-                validate_str(&c, "t")
+                !validate_str(&c, "t")
                     .err()
                     .unwrap_or_default()
-                    .find("health_host")
-                    .is_none(),
+                    .contains("health_host"),
                 "{good}"
             );
         }

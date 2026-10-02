@@ -2032,10 +2032,8 @@ fn is_unix_target(url: &str) -> bool {
 fn split_proxy_pass(url: &str) -> Option<(String, String, Option<String>)> {
     let (scheme, rest) = if let Some(r) = url.strip_prefix("http://") {
         ("http", r)
-    } else if let Some(r) = url.strip_prefix("https://") {
-        ("https", r)
     } else {
-        return None;
+        ("https", url.strip_prefix("https://")?)
     };
     if rest.is_empty() {
         return None;
