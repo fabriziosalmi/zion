@@ -1,0 +1,8 @@
+tls:
+  existingSecret: zion-tls
+config:
+  upstreams:
+    app: "http://app.default.svc:8000"
+  routes:
+    - path: "/{*rest}"
+      upstream: app

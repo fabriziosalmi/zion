@@ -1,4 +1,6 @@
-{{- if .Values.podDisruptionBudget.enabled -}}
+{{- /* With a single replica, minAvailable: 1 can never be satisfied and blocks every
+       node drain: only render the budget when there is a replica to spare. */}}
+{{- if and .Values.podDisruptionBudget.enabled (gt (int (include "zion.minReplicas" .)) 1) -}}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

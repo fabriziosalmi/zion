@@ -11,7 +11,7 @@ spec:
   {{- if and $rwo (gt (int .Values.replicaCount) 1) }}
   {{- fail "persistence.enabled with a ReadWriteOnce volume supports replicaCount: 1 only (a second pod would sit Pending on Multi-Attach). Disable persistence, use ReadWriteMany, or source certificates from a Secret." }}
   {{- end }}
-  {{- if or (not .Values.autoscaling.enabled) $rwo }}
+  {{- if not (include "zion.hpaEnabled" .) }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
   selector:
@@ -35,6 +35,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       serviceAccountName: {{ include "zion.serviceAccountName" . }}
       automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken | default false }}
       {{- with .Values.imagePullSecrets }}
@@ -94,6 +95,9 @@ spec:
             - name: config-volume
               mountPath: /etc/zion
               readOnly: true
+            - name: tls
+              mountPath: /etc/zion/tls
+              readOnly: true
             # /var/lib/zion holds ACME state + the panic last-gasp file.
             # Required as a writable mount because the rest of the FS is
             # read-only (.Values.securityContext.readOnlyRootFilesystem).
@@ -106,6 +110,9 @@ spec:
         - name: config-volume
           configMap:
             name: {{ include "zion.fullname" . }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
         # ACME state (account key + renewed certs). Persistent when enabled so
         # it survives a reschedule; otherwise an ephemeral emptyDir.
         - name: zion-state

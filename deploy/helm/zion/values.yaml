@@ -13,6 +13,16 @@
 
 replicaCount: 2
 
+# The serving certificate: a `kubernetes.io/tls` Secret (keys `tls.crt` / `tls.key`),
+# for example one issued by cert-manager. Mounted at /etc/zion/tls. Required: Zion
+# cannot start without a certificate, so the chart refuses to render without one.
+tls:
+  existingSecret: ""
+
+# Zion's shutdown takes up to ~37 s (graceful drain up to 30 s, plus the log and
+# audit flushes). Kubernetes kills the pod after this many seconds.
+terminationGracePeriodSeconds: 45
+
 image:
   repository: ghcr.io/fabriziosalmi/zion
   pullPolicy: IfNotPresent
@@ -151,18 +161,23 @@ networkPolicy:
 
 # Probe tuning. Conservative defaults — bump initial / failure thresholds
 # if the daemon is slow to start because of ACME bootstrap.
+# The health endpoints are answered on the HTTPS listener; the plain-HTTP port answers
+# every path with a redirect, which a probe would count as success whatever Zion's
+# state. kubelet does not verify the certificate of an HTTPS probe.
 probes:
   startup:
     enabled: true
     httpGet:
       path: /healthz
-      port: http
+      port: https
+      scheme: HTTPS
     failureThreshold: 30
     periodSeconds: 1
   liveness:
     httpGet:
       path: /healthz
-      port: http
+      port: https
+      scheme: HTTPS
     initialDelaySeconds: 2
     periodSeconds: 10
     timeoutSeconds: 2
@@ -170,7 +185,8 @@ probes:
   readiness:
     httpGet:
       path: /readyz
-      port: http
+      port: https
+      scheme: HTTPS
     initialDelaySeconds: 2
     periodSeconds: 5
     timeoutSeconds: 2

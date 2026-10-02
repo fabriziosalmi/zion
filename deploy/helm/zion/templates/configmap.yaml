@@ -1,3 +1,6 @@
+{{- if not .Values.tls.existingSecret }}
+{{- fail "tls.existingSecret is required: the name of a kubernetes.io/tls Secret (tls.crt / tls.key) with the serving certificate, for example one issued by cert-manager. Zion cannot start without a certificate." }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -11,6 +14,11 @@ data:
     # containerPorts, and the Service targetPorts cannot drift apart.
     listen_http = {{ printf "0.0.0.0:%v" .Values.containerPorts.http | quote }}
     listen_https = {{ printf "0.0.0.0:%v" .Values.containerPorts.https | quote }}
+
+    [tls]
+    # From the Secret named by .Values.tls.existingSecret (mounted by the Deployment).
+    cert_path = "/etc/zion/tls/tls.crt"
+    key_path = "/etc/zion/tls/tls.key"
 
     [upstreams]
     {{- range $k, $v := .Values.config.upstreams }}

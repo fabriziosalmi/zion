@@ -2,7 +2,7 @@ apiVersion: v2
 name: zion
 description: Zion Edge Gateway — high-performance Rust TLS reverse proxy with WAF
 type: application
-version: 0.2.2
+version: 0.3.0
 appVersion: "0.9.7"
 home: https://fabriziosalmi.github.io/zion
 sources:
@@ -18,6 +18,16 @@ keywords:
 annotations:
   artifacthub.io/license: Apache-2.0
   artifacthub.io/changes: |
+    - kind: fixed
+      description: Render the required [tls] table from a kubernetes.io/tls Secret (tls.existingSecret, required); the chart used to render a config Zion refused, so every install crash-looped
+    - kind: added
+      description: HorizontalPodAutoscaler template (autoscaling.enabled was set but no HPA was rendered)
+    - kind: fixed
+      description: PodDisruptionBudget only when more than one replica (minAvailable 1 with one replica blocked node drains)
+    - kind: fixed
+      description: Probes over HTTPS (the HTTP port answers a redirect, which always passed)
+    - kind: added
+      description: terminationGracePeriodSeconds (default 45, covering Zion's drain)
     - kind: changed
       description: Bump appVersion to 0.9.7
     - kind: added
