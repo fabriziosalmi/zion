@@ -150,6 +150,16 @@ jobs:
           echo "SOURCE_DATE_EPOCH=${ts}" >> "$GITHUB_ENV"
           echo "epoch=${ts}" >> "$GITHUB_OUTPUT"
 
+      # Record the commit BEFORE touching the tree: build.rs stamps "-dirty" when
+      # `git status` is not clean, and removing rust-toolchain.toml below made every
+      # released binary report e.g. "0.9.5 (61bb90a2c200-dirty)". With these set,
+      # build.rs uses them and never consults git (as the container build already does).
+      - name: Record commit for the version string
+        shell: bash
+        run: |
+          echo "ZION_GIT_SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+          echo "ZION_COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y-%m-%d HEAD)" >> "$GITHUB_ENV"
+
       # Release builds are PINNED to the same toolchain as dev/CI
       # (rust-toolchain.toml, currently 1.88.0) so the shipped binary is
       # REPRODUCIBLE — "latest stable" would silently change the release

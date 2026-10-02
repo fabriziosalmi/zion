@@ -205,8 +205,13 @@ g6() {
 
 step "load + reloads running; sampling RSS/fd every ${INTERVAL}s"
 load_pids=()
-for _ in $(seq 1 "$WORKERS"); do g1 & load_pids+=("$!"); done
-g3 & load_pids+=("$!")
+# The generators run niced: on a 4-vCPU CI runner 32 curl loops push the load to ~30 and
+# starved the runner's own agent ("The hosted runner lost communication with the server",
+# nightly 2026-10-02). Zion (the system under test) and the runner keep normal priority;
+# the generators still saturate any idle CPU. A child curl inherits its parent's niceness.
+nice_gen() { renice -n "${GEN_NICE:-10}" -p "$1" >/dev/null 2>&1 || true; }
+for _ in $(seq 1 "$WORKERS"); do g1 & load_pids+=("$!"); nice_gen "$!"; done
+g3 & load_pids+=("$!"); nice_gen "$!"
 g6 & g6_pid="$!"
 
 # ── Sampler ──
