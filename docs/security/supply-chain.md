@@ -114,26 +114,41 @@ or [Kyverno](https://kyverno.io/policies/?policytypes=cosign) `ClusterImagePolic
 
 ## Reproducing a build
 
-Builds are bit-stable to the extent the toolchain allows: the workflow exports
-`SOURCE_DATE_EPOCH` from the commit timestamp, sorts archive entries
-deterministically, and pins the Rust toolchain via
-[`rust-toolchain.toml`](../../rust-toolchain.toml). To reproduce locally:
+The release workflow builds every Linux target with `cargo zigbuild`, on Rust
+**1.88.0** (set by the workflow; `rust-toolchain.toml` is the development pin and
+is not used for releases), with **`--features dist`** (acme + init + auth), the
+commit stamped into the version string (`ZION_GIT_SHA`, `ZION_COMMIT_DATE`),
+`SOURCE_DATE_EPOCH` set to the commit time, then `strip` and a deterministic
+`tar` (owner 0, `--mtime=@$SOURCE_DATE_EPOCH`, `--sort=name`). To rebuild the
+Linux musl artifact the same way:
 
 ```bash
 git checkout v0.9.7
 export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
-# Linux musl example — matches the release artifact byte-for-byte
-# (modulo strip's stable behavior on your distro).
-cargo install --locked cargo-zigbuild
-rustup target add x86_64-unknown-linux-musl
-cargo zigbuild --release --locked --target x86_64-unknown-linux-musl
+export ZION_GIT_SHA=$(git rev-parse --short=12 HEAD)
+export ZION_COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y-%m-%d HEAD)
+rustup toolchain install 1.88.0 --target x86_64-unknown-linux-musl
+cargo install --locked cargo-zigbuild        # needs zig on PATH
+cargo +1.88.0 zigbuild --release --locked --features dist --target x86_64-unknown-linux-musl
 strip target/x86_64-unknown-linux-musl/release/zion
 sha256sum target/x86_64-unknown-linux-musl/release/zion
 ```
 
-Compare the resulting hash to the release `SHA256SUMS`. Any drift is a
-reproducibility defect — file an issue with your toolchain version and we'll
-chase it.
+`SHA256SUMS` lists the **archives**, not the binaries. Compare the binary with
+the one inside the published archive:
+
+```bash
+tar -xzOf zion-v0.9.7-x86_64-unknown-linux-musl.tar.gz zion | sha256sum
+```
+
+or recreate the archive with the same `tar` flags and compare it against
+`SHA256SUMS`. Two inputs are not pinned by the workflow and can make the bytes
+differ: the `zig` and `cargo-zigbuild` versions. No CI job rebuilds a release
+and compares hashes yet, so treat byte-for-byte reproducibility as a goal, not a
+verified property; a difference you can explain is worth an issue (with your
+toolchain versions). Provenance does not depend on it: every artifact carries a
+SLSA build attestation (`gh attestation verify`) and the commit in its version
+string.
 
 ## Policy: what the supply-chain pipeline blocks
 
