@@ -229,6 +229,28 @@ them:
 The shipped Helm chart defaults to 2 replicas and autoscales to 10 — plan the
 limit values accordingly.
 
+## Kubernetes (Helm)
+
+The chart is in [`deploy/helm/zion`](https://github.com/fabriziosalmi/zion/tree/master/deploy/helm/zion).
+Zion needs a serving certificate, so the chart requires a `kubernetes.io/tls`
+Secret (for example issued by cert-manager) and refuses to render without one:
+
+```bash
+kubectl create secret tls zion-tls --cert=tls.crt --key=tls.key
+helm install zion deploy/helm/zion -f my-values.yaml   # with tls.existingSecret: zion-tls
+```
+
+- Probes go to `/healthz` and `/readyz` over HTTPS (kubelet does not verify the
+  certificate); the plain-HTTP port answers everything with a redirect.
+- `autoscaling.enabled` (default) renders a HorizontalPodAutoscaler; the
+  PodDisruptionBudget is only rendered when more than one replica can run.
+- `terminationGracePeriodSeconds: 45` covers the drain.
+- `preserve_host` upstreams that refuse unknown hosts need `health_host` too, or
+  their probes fail (see the [upstream settings](/config/#forward-the-client-s-host-preserve-host-opt-in)).
+
+Every values file in `deploy/helm/zion/ci/` is rendered in CI and the resulting
+`zion.toml` checked with `zion doctor`.
+
 ## Rollback
 
 Zion's config parser is fail-closed (`deny_unknown_fields`): an older binary
