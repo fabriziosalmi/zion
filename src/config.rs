@@ -865,7 +865,6 @@ impl CircuitBreakerConfig {
 }
 
 #[derive(Deserialize, Clone, Debug)]
-#[allow(dead_code)]
 #[serde(try_from = "RawUpstream")]
 pub struct UpstreamConfig {
     /// Endpoints in failover order, **never empty**. `url` and `urls` are two
@@ -973,7 +972,7 @@ pub(crate) fn default_connect_timeout() -> u64 {
     3000
 }
 fn default_keepalive() -> usize {
-    64
+    crate::proxy::DEFAULT_KEEPALIVE
 }
 pub(crate) fn default_client_auth() -> String {
     "none".to_string()
@@ -1621,6 +1620,33 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
         ));
     }
     for (name, up) in &config.upstream {
+        // Documented, parsed, and used by nothing: a config that sets them believed its
+        // upstream connections were authenticated. Refuse until it exists (#503).
+        if up.client_cert_path.is_some() || up.client_key_path.is_some() {
+            errors.push(format!(
+                "upstream.{name}: client_cert_path / client_key_path (mTLS to the upstream) are \
+                 not supported yet and were never applied: Zion presents no client certificate. \
+                 Remove them (see https://github.com/fabriziosalmi/zion/issues/503)"
+            ));
+        }
+        // `tls = true` with an http:// URL used to connect in plaintext: the URL scheme is
+        // what decides, so say so instead of sending cleartext the operator did not ask for.
+        if up.tls {
+            for url in up.urls_ref() {
+                if !url.starts_with("https://") {
+                    errors.push(format!(
+                        "upstream.{name}: tls = true but {url:?} is not https:// (the URL scheme \
+                         decides; use an https:// URL, and drop `tls`)"
+                    ));
+                }
+            }
+        }
+        if up.keepalive > 10_000 {
+            errors.push(format!(
+                "upstream.{name}.keepalive must be 0..=10000 (idle pooled connections per host), got {}",
+                up.keepalive
+            ));
+        }
         if let Some(h) = &up.health_host {
             // A Host value: a host name or address, with an optional port.
             let valid = crate::security::normalize_host(h).is_some()
@@ -2384,6 +2410,41 @@ mod tests {
         ] {
             assert!(jwks(bad).contains("jwks_url must use https"), "{bad}");
         }
+    }
+
+    #[test]
+    fn upstream_fields_that_did_nothing_are_refused_or_checked() {
+        let cfg = |up: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+                 [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstream.u]\n{up}\n\
+                 [[route]]\npath=\"/{{*r}}\"\nupstream=\"u\"\n"
+            )
+        };
+        let errs = |up: &str| {
+            let c: ZionConfig = toml::from_str(&cfg(up)).unwrap();
+            semantic_errors(&c).join("\n")
+        };
+        for mtls in [
+            "client_cert_path = \"/c.pem\"",
+            "client_key_path = \"/k.pem\"",
+        ] {
+            let e = errs(&format!("url = \"https://a:1\"\n{mtls}"));
+            assert!(
+                e.contains("not supported yet") && e.contains("issues/503"),
+                "{e}"
+            );
+        }
+        assert!(errs("url = \"http://a:1\"\ntls = true").contains("is not https://"));
+        assert!(!errs("url = \"https://a:1\"\ntls = true").contains("tls = true"));
+        assert!(!errs("url = \"http://a:1\"").contains("tls = true"));
+        assert!(errs("url = \"http://a:1\"\nkeepalive = 10001").contains("keepalive must be"));
+        let c: ZionConfig = toml::from_str(&cfg("url = \"http://a:1\"")).unwrap();
+        assert_eq!(
+            c.upstream["u"].keepalive,
+            crate::proxy::DEFAULT_KEEPALIVE,
+            "default unchanged"
+        );
     }
 
     #[test]
@@ -3713,7 +3774,7 @@ upstream = "backend"
         let config: ZionConfig = toml::from_str(profile_toml()).unwrap();
         let fe = config.upstream.get("frontend").unwrap();
         assert_eq!(fe.connect_timeout_ms, 3000); // default
-        assert_eq!(fe.keepalive, 64); // default
+        assert_eq!(fe.keepalive, crate::proxy::DEFAULT_KEEPALIVE); // default
     }
 
     #[test]

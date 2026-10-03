@@ -3556,14 +3556,16 @@ async fn preserve_host_applies_to_websocket_upgrades() {
 #[test]
 fn preserve_host_picks_an_http1_only_client_of_its_own() {
     let st = preserve_state("standard", "\"http://127.0.0.1:1\"", true, "");
-    let _ = st.client_for(crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS, true);
-    let _ = st.client_for(crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS, false);
-    assert!(st
-        .http_clients
-        .contains_key(&(crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS, true)));
+    let h1 = crate::proxy::ClientSpec {
+        http1_only: true,
+        ..crate::proxy::ClientSpec::DEFAULT
+    };
+    let _ = st.client_for(h1);
+    let _ = st.client_for(crate::proxy::ClientSpec::DEFAULT);
+    assert!(st.http_clients.contains_key(&h1));
     assert!(
         !st.http_clients
-            .contains_key(&(crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS, false)),
+            .contains_key(&crate::proxy::ClientSpec::DEFAULT),
         "the default client is the shared one"
     );
 }
@@ -4009,4 +4011,52 @@ async fn an_injection_in_a_get_body_is_blocked_on_a_waf_route() {
         200,
         "a benign GET body is forwarded"
     );
+}
+
+// ── [upstream.x] keepalive sizes the idle pool ──────────────────────────────
+
+/// An HTTP/1.1 origin that counts the TCP connections it accepts.
+async fn conn_counting_origin() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = conns.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            c.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(async move {
+                let svc =
+                    hyper::service::service_fn(|_req: Request<hyper::body::Incoming>| async {
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                            Bytes::from_static(b"ok"),
+                        )))
+                    });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    (port, conns)
+}
+
+#[tokio::test]
+async fn keepalive_sizes_the_idle_upstream_pool() {
+    for (keepalive, expect_reuse) in [("", true), ("keepalive = 0", false)] {
+        let (port, conns) = conn_counting_origin().await;
+        let st = hosts_state(
+            "[[route]]\npath = \"/{*rest}\"\nupstream = \"u\"\n",
+            &format!("[upstream.u]\nurl = \"http://127.0.0.1:{port}\"\n{keepalive}"),
+        );
+        for i in 0..5 {
+            assert_eq!(call(&st, &format!("/k{i}")).await.0, 200);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let n = conns.load(Ordering::Relaxed);
+        if expect_reuse {
+            assert_eq!(n, 1, "default keepalive reuses one pooled connection");
+        } else {
+            assert_eq!(n, 5, "keepalive = 0 keeps no idle connection");
+        }
+    }
 }

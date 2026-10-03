@@ -34,6 +34,8 @@ pub struct ResolvedRoute {
     pub max_in_flight: u32,
     /// `[upstream.x] preserve_host`: forward the client's Host, over an HTTP/1.1-only client.
     pub preserve_host: bool,
+    /// `[upstream.x] keepalive`: idle pooled connections kept per upstream host.
+    pub keepalive: usize,
     pub upstream_name: Option<Arc<str>>,
     /// Pre-parsed URI parts — avoids full URI parse on every request.
     pub upstream_scheme: hyper::http::uri::Scheme,
@@ -63,6 +65,15 @@ pub struct ResolvedRoute {
 }
 
 impl ResolvedRoute {
+    /// The HTTP client this route's upstream needs.
+    pub fn client_spec(&self) -> crate::proxy::ClientSpec {
+        crate::proxy::ClientSpec {
+            connect_timeout_ms: self.connect_timeout_ms,
+            http1_only: self.preserve_host,
+            keepalive: self.keepalive,
+        }
+    }
+
     /// May the plaintext `:80` listener hand an ACME-challenge request that no
     /// in-memory token matched to this route's upstream (for external clients such
     /// as certbot)? That fallback proxies without going through the request
@@ -507,6 +518,11 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
             .upstream_name()
             .and_then(|name| config.upstream.get(name))
             .is_some_and(|u| u.preserve_host),
+        keepalive: route
+            .upstream_name()
+            .and_then(|name| config.upstream.get(name))
+            .map(|u| u.keepalive)
+            .unwrap_or(crate::proxy::DEFAULT_KEEPALIVE),
         upstream_name: route.upstream_name().map(Arc::from),
         upstream_scheme,
         upstream_authority,

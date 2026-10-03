@@ -76,9 +76,9 @@ refused.
 | `url` | string | `url` **or** `urls` required | Single upstream URL (e.g. `"http://127.0.0.1:8000"`). An upstream with neither is a load-time error. If both are written they are merged, `urls` first then `url` |
 | `urls` | string[] | `[]` | Multiple upstream URLs (latency-routed); use instead of `url` |
 | `connect_timeout_ms` | u64 | `3000` | TCP connect deadline in milliseconds, applied to the connector of the client that serves this upstream: a black-holed member (packets dropped, no RST) is abandoned after this long and the next HA member is tried. `0` = none. Covers the TCP connect only; the TLS handshake and the response are bounded by the 30 s request timeout |
-| `keepalive` | usize | `64` | Max idle keepalive connections |
-| `tls` | bool | `false` | Use HTTPS to connect to upstream |
-| `client_cert_path` / `client_key_path` | string? | none | Client cert + key for mTLS from Zion to the upstream |
+| `keepalive` | usize | `128` | Idle pooled connections kept per upstream host (`0` = a new connection per request; max 10000). Before 0.9.8 this was parsed but ignored (always 128) |
+| `tls` | bool | `false` | Redundant: the URL scheme decides (`https://` = TLS to the upstream). `tls = true` with an `http://` URL is a config error (it used to connect in plaintext) |
+| `client_cert_path` / `client_key_path` | string? | none | **Not supported yet** (mTLS to the upstream, [#503](https://github.com/fabriziosalmi/zion/issues/503)): setting them is a config error. Before 0.9.8 they were accepted and ignored, so no client certificate was ever presented |
 | `preserve_host` | bool | `false` | Send the client's `Host` instead of the upstream's own (see below) |
 | `health_host` | string? | none | `Host` the health probe sends (default: the upstream's own address) |
 
