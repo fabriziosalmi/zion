@@ -39,8 +39,21 @@ pub fn handle_challenge(store: &ChallengeStore, path: &str) -> Option<String> {
     store.get(token).map(|v| v.value().clone())
 }
 
+/// Delay before the next renewal check: 12 hours normally; after `failures` consecutive
+/// failed attempts, 5 minutes doubling each time (5, 10, 20, 40 … min), capped at 12 hours.
+/// Short enough to save a short-lived certificate, slow enough for the CA's rate limits.
+pub fn next_check_delay(failures: u32) -> std::time::Duration {
+    const STEADY: u64 = 12 * 3600;
+    let secs = match failures {
+        0 => STEADY,
+        n => (300u64 << (n - 1).min(16)).min(STEADY),
+    };
+    std::time::Duration::from_secs(secs)
+}
+
 /// Spawn the ACME renewal background task.
-/// Checks cert expiry every 12 hours. Renews when < renew_before_days.
+/// Checks cert expiry every 12 hours (sooner after a failure, see [`next_check_delay`]).
+/// Renews when < renew_before_days.
 pub fn spawn_renewal_task(
     acme_config: crate::config::AcmeConfig,
     challenge_store: ChallengeStore,
@@ -51,6 +64,7 @@ pub fn spawn_renewal_task(
         // Initial delay — let the server start up fully
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
+        let mut consecutive_failures: u32 = 0;
         loop {
             // Liveness heartbeat: advance on every wake-up, *before* the
             // work, so a dead loop is distinguishable from the normal
@@ -68,6 +82,9 @@ pub fn spawn_renewal_task(
             crate::metrics::METRICS
                 .acme_loop_last_check_timestamp_seconds
                 .store(now_secs, Relaxed);
+
+            // Did this round leave the certificate unrenewed although it was due?
+            let mut failed = false;
 
             // Check if renewal is needed (uses blocking fs)
             let cert_path = tls_config.cert_path.clone();
@@ -109,6 +126,7 @@ pub fn spawn_renewal_task(
                                 );
                             }
                             Err(e) => {
+                                failed = true;
                                 crate::logging::error(
                                     "acme",
                                     &format!("failed to load renewed certificate: {e}"),
@@ -117,13 +135,24 @@ pub fn spawn_renewal_task(
                         }
                     }
                     Err(e) => {
+                        failed = true;
                         crate::logging::error("acme", &format!("renewal failed: {e}"));
                     }
                 }
             }
 
-            // Check every 12 hours
-            tokio::time::sleep(std::time::Duration::from_secs(12 * 3600)).await;
+            // Every 12 hours when all is well; after a failure retry soon, backing off, so a
+            // short-lived certificate (zion init's 1-day bootstrap one) gets more than one
+            // more attempt before it expires.
+            consecutive_failures = if failed { consecutive_failures + 1 } else { 0 };
+            let delay = next_check_delay(consecutive_failures);
+            if failed {
+                crate::logging::warn(
+                    "acme",
+                    &format!("retrying the renewal in {} min", delay.as_secs() / 60),
+                );
+            }
+            tokio::time::sleep(delay).await;
         }
     });
 }
@@ -915,6 +944,16 @@ async fn serve_challenges(listener: tokio::net::TcpListener, store: ChallengeSto
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_renewal_is_retried_soon_with_backoff() {
+        let m = |n| next_check_delay(n).as_secs() / 60;
+        assert_eq!(m(0), 720, "12 h when all is well");
+        assert_eq!((m(1), m(2), m(3), m(4)), (5, 10, 20, 40));
+        assert_eq!(m(8), 640);
+        assert_eq!(m(9), 720, "capped at 12 h");
+        assert_eq!(m(u32::MAX), 720, "no overflow");
+    }
 
     // ── the soak's whole-operation retry helper ────────────────────────────────
     // The 100% probe never reaches `with_retries` and the 20% run often succeeds without a
