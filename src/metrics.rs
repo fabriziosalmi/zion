@@ -531,6 +531,13 @@ pub struct Metrics {
     /// months-long idle steady state (the cert-silently-expires gap). 0
     /// until the first wake-up.
     pub acme_loop_last_check_timestamp_seconds: AtomicU64,
+    /// Rounds of the active health checker (monotonic counter; at least one per second
+    /// while it runs). `rate() == 0` means it is dead, and then nothing marks a failed
+    /// upstream down or a recovered one up again.
+    pub health_probe_rounds_total: AtomicU64,
+    /// Unix time of the health checker's last round (gauge, a liveness heartbeat; 0 until
+    /// the first). Alert when `time() - this` exceeds a few seconds.
+    pub health_probe_last_round_timestamp_seconds: AtomicU64,
 
     // Gauges
     pub active_connections: AtomicI64,
@@ -616,6 +623,8 @@ impl Metrics {
             acme_renewal_failures_total: AtomicU64::new(0),
             acme_loop_checks_total: AtomicU64::new(0),
             acme_loop_last_check_timestamp_seconds: AtomicU64::new(0),
+            health_probe_rounds_total: AtomicU64::new(0),
+            health_probe_last_round_timestamp_seconds: AtomicU64::new(0),
             active_connections: AtomicI64::new(0),
             process_resident_memory_bytes: AtomicU64::new(0),
             process_open_fds: AtomicU64::new(0),
@@ -1429,6 +1438,26 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.acme_loop_last_check_timestamp_seconds.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(
+            b"\n# HELP zion_health_probe_rounds_total Rounds of the active upstream health checker (at least one per second while it runs; rate()==0 means it is dead).\n\
+                                # TYPE zion_health_probe_rounds_total counter\n\
+                                zion_health_probe_rounds_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.health_probe_rounds_total.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(
+            b"\n# HELP zion_health_probe_last_round_timestamp_seconds Unix time of the health checker's last round (liveness heartbeat; 0 until the first). Alert when time()-this exceeds a few seconds.\n\
+                                # TYPE zion_health_probe_last_round_timestamp_seconds gauge\n\
+                                zion_health_probe_last_round_timestamp_seconds ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.health_probe_last_round_timestamp_seconds.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");
