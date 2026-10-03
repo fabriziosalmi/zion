@@ -76,7 +76,7 @@ with v0.2.0 deployments — encouraged to migrate to TOML for diffability.
 ## Identity management
 
 The first time zion boots with `[sovereign_aimp].enabled = true` AND
-`identity_path` is empty/unreadable:
+there is no file at `identity_path`:
 
 1. A fresh Ed25519 keypair is generated.
 2. The 32-byte secret is written to `identity_path` with `chmod 600`.
@@ -87,6 +87,12 @@ The first time zion boots with `[sovereign_aimp].enabled = true` AND
 Subsequent boots load the secret from disk, so the `node_id` is
 **stable across restarts** — peers don't have to re-classify the node
 on every cycle. This was tracked as part of issue #68.
+
+A file that exists but cannot be used (not 32 bytes, or unreadable) is **not
+replaced**: the mesh does not start, and the log says why. Restore the seed, or
+delete the file to generate a new identity and update the other nodes'
+`trusted_keys`. (Before 0.9.8 such a file was silently overwritten with a new
+identity, while the log said "ephemeral".)
 
 Backup: `identity_path`'s 32 bytes are the only secret material the
 mesh uses for that node. Treat it like a TLS private key — daily

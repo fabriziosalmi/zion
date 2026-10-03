@@ -942,18 +942,24 @@ fn load_or_generate_identity(path: &std::path::Path) -> Result<Identity, String>
                 seed.copy_from_slice(&bytes);
                 return Ok(Identity::from_secret_bytes(*seed));
             }
+            // An existing seed that cannot be used is NOT replaced: that would rotate this
+            // node's identity behind the operator's back (the other nodes' trusted_keys
+            // would then reject it) and destroy a key that may only be misread for now.
             Ok(other) => {
-                eprintln!(
-                    "aimp_cp: warn: identity_path {} has wrong length ({} bytes, expected 32) — generating ephemeral",
+                return Err(format!(
+                    "identity_path {} has {} bytes, expected 32: not replacing it. Restore the \
+                     seed, or delete the file to generate a new identity (and update the other \
+                     nodes' trusted_keys)",
                     path.display(),
                     other.len()
-                );
+                ));
             }
             Err(e) => {
-                eprintln!(
-                    "aimp_cp: warn: identity_path {} unreadable ({e}) — generating ephemeral",
+                return Err(format!(
+                    "identity_path {} cannot be read ({e}): not replacing it. Fix its \
+                     permissions or delete it to generate a new identity",
                     path.display()
-                );
+                ));
             }
         }
     }
@@ -1259,6 +1265,39 @@ mod tests {
         assert!(map.get(&target).is_none());
         let real = build_envelope(&alice, target, 0.9, now, 1);
         assert_eq!(state.try_merge(&real, now), MergeOutcome::Inserted);
+    }
+
+    #[test]
+    fn an_unusable_identity_seed_is_refused_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("zion-aimp-seed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seed.bin");
+        std::fs::write(&path, b"too short").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let err = load_or_generate_identity(&path).err().expect("refused");
+        assert!(
+            err.contains("expected 32") && err.contains("not replacing"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"too short",
+            "the file is untouched"
+        );
+        // a missing seed is still generated and persisted
+        std::fs::remove_file(&path).unwrap();
+        let id = load_or_generate_identity(&path).expect("generated");
+        assert_eq!(std::fs::read(&path).unwrap().len(), 32);
+        assert_eq!(
+            load_or_generate_identity(&path).unwrap().node_id(),
+            id.node_id(),
+            "and reloaded"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
