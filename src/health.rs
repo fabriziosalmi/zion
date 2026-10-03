@@ -191,6 +191,16 @@ pub async fn probe_round(
     client: &crate::proxy::HttpClient,
     http1: &crate::proxy::HttpClient,
 ) -> u64 {
+    // Liveness heartbeat, before the work: a dead checker freezes both.
+    let metrics = &crate::metrics::METRICS;
+    metrics.health_probe_rounds_total.fetch_add(1, Relaxed);
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    metrics
+        .health_probe_last_round_timestamp_seconds
+        .store(wall, Relaxed);
     let now_us = base.elapsed().as_micros() as u64;
     let due: Vec<(String, Arc<UpstreamHealth>)> = map
         .iter()
@@ -313,6 +323,35 @@ pub fn select_best_upstream<'a>(health_map: &HealthMap, urls: &'a [String]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // builds a TLS client (aws-lc FFI) and reads the wall clock
+    async fn every_probe_round_beats_the_heartbeat() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let m = &crate::metrics::METRICS;
+        let before = m.health_probe_rounds_total.load(Relaxed);
+        let map: HealthMap = Arc::new(FnvHashMap::default());
+        let ms = crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS;
+        let client = crate::proxy::build_http_client(ms, false);
+        let _ = probe_round(&map, tokio::time::Instant::now(), &client, &client).await;
+        assert!(
+            m.health_probe_rounds_total.load(Relaxed) > before,
+            "the counter advanced"
+        );
+        assert!(
+            m.health_probe_last_round_timestamp_seconds.load(Relaxed) > 1_700_000_000,
+            "the timestamp is wall-clock seconds"
+        );
+        let text = String::from_utf8(m.render(false).to_vec()).unwrap();
+        assert!(
+            text.contains("\nzion_health_probe_rounds_total "),
+            "exported"
+        );
+        assert!(
+            text.contains("\nzion_health_probe_last_round_timestamp_seconds "),
+            "exported"
+        );
+    }
 
     #[test]
     fn untracked_upstream_is_healthy() {

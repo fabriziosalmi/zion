@@ -150,6 +150,10 @@ rate(zion_log_lines_dropped_total[5m]) > 0
 
 # Saturation before it sheds: in flight close to the limit.
 zion_bulkhead_in_flight / zion_bulkhead_limit > 0.8
+
+# The active health checker stopped: nothing marks a failed upstream down (or a
+# recovered one up) any more. It runs at least once a second.
+time() - zion_health_probe_last_round_timestamp_seconds > 30
 ```
 
 ## Trying it
