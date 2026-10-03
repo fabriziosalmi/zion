@@ -206,7 +206,8 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 - Zero-downtime TLS, QUIC, and full-config hot-reload (ArcSwap + watch channels) — including live listener rebind
 - Session tickets + 0-RTT early data with method gating (425 Too Early, RFC 8470)
 - WebSocket proxy (bidirectional pipe, TLS-to-upstream) and zero-buffer SSE streaming
-- ACME auto-renewal (`--features acme`); JWT/OIDC auth gate (`--features auth`)
+- ACME auto-renewal and a JWT/OIDC auth gate, both in the release binaries (`--features dist`); a custom build without `auth` refuses a config with `auth_profile` routes instead of serving them unauthenticated
+- `preserve_host` per upstream (forward the client's `Host`, as nginx `proxy_set_header Host $http_host`, Traefik and Caddy do) with `health_host` for backends that refuse unknown hosts
 
 **Cache** — two-level RAM cache: L1 thread-local (O(1) intrusive-LRU) + L2 sharded DashMap, generation-based coherence (no stale data after update), request coalescing (singleflight: N concurrent misses → 1 upstream fetch). Honors the origin's `Cache-Control` (RFC 9111: `Vary` secondary keys, conditional requests → `304`, `stale-while-revalidate` / `stale-if-error`, `Range` → `206` / `416` served from RAM), emits `Age` and an `X-Zion-Cache: HIT|MISS|BYPASS` decision header, and exposes `POST /_zion/cache/purge` to flush everything, a path prefix, or every entry carrying a `Surrogate-Key` tag.
 
@@ -214,11 +215,11 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 
 **Resilience** — pools pick a member by *power of two choices* on in-flight requests × peak-EWMA latency measured on real traffic (`load_balancing = "p2c"`), with opt-in passive **outlier ejection**; opt-in per-upstream **circuit breaker** and `max_in_flight` **bulkhead** (an immediate `503` + `Retry-After` instead of piling on a struggling backend); upstream **DNS keeps the last good answer** when a lookup fails or hangs; **graceful drain** (idle keep-alive connections closed at once, HTTP/2 `GOAWAY`, requests in flight finished); a **non-blocking log queue** (a stalled stderr never stalls a request); opt-in `TCP_USER_TIMEOUT` to free the slots of clients that vanish mid-response. See the [resilience guide](https://fabriziosalmi.github.io/zion/guide/resilience).
 
-**Security** — HSTS preload, nosniff, frame-deny, Referrer-Policy, Permissions-Policy, per-route CSP; `Server`/hop-by-hop stripping (RFC 7230); URI-length cap + 7-method whitelist; per-IP rate limit **and** per-IP concurrent-connection cap (enforced at accept); CORS (FNV O(1)); header-bomb limits (64 headers / 16 KB).
+**Security** — HSTS preload, nosniff, frame-deny, Referrer-Policy, Permissions-Policy, per-route CSP; `Server`/hop-by-hop stripping (RFC 7230); URI-length cap + 7-method whitelist; per-IP rate limit **and** per-IP concurrent-connection cap (enforced at accept); CORS (FNV O(1)); header-bomb limits (64 headers / 16 KB). Admin API on its own listener, with its own client CA for mTLS and a bearer token required for every change; the gossip mesh accepts claims only from listed node keys. Settings that would silently weaken security (a short JWT secret, an `http://` JWKS, an unknown `xff_mode`) are config errors.
 
 **Observability** — `/healthz` · `/readyz` fast-path (~1 µs), `/metrics` Prometheus (lock-free sharded counters), `X-Request-ID` + W3C `traceparent` propagation, structured text/JSON logs (client IPs can be truncated or HMAC-pseudonymised with `[redact] ip` for GDPR / NIS2), and the `zion top` live TUI.
 
-**Operations** — fail-fast config validation, graceful 30 s drain that closes idle connections immediately, adaptive upstream recovery (decorrelated-jitter backoff: a recovered origin returns in ~1.4 s vs up to 30 s), boot-time platform auto-detection + performance-tier calibration, `zion doctor` diagnostics, TCP tuning (NODELAY / DEFER_ACCEPT / FASTOPEN / QUICKACK), systemd unit + Docker HEALTHCHECK.
+**Operations** — fail-fast config validation, graceful 30 s drain that closes idle connections immediately, adaptive upstream recovery (decorrelated-jitter backoff: a recovered origin returns in ~1.4 s vs up to 30 s), boot-time platform auto-detection + performance-tier calibration, `zion doctor` diagnostics, TCP tuning (NODELAY / DEFER_ACCEPT / FASTOPEN / QUICKACK), systemd unit, distroless container (health probes live in the orchestrator), Helm chart rendered and checked with `zion doctor` in CI.
 
 **Opt-in tracks (feature-gated, default-off)**
 - **kTLS offload** (`--features ktls`, Linux 5.10+) — *experimental*: flips the socket into in-kernel TLS after handshake toward `sendfile`-class zero-copy. The offload is wired but not yet exercised end-to-end in CI (issue #52).
