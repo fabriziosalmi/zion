@@ -1556,10 +1556,57 @@ fn deploy_errors(config: &ZionConfig) -> Vec<String> {
 }
 
 /// Filesystem-free semantic checks; see [`validate_semantics`].
+/// A JWKS URL Zion may fetch signing keys from: `https://`, or `http://` to a loopback
+/// host only (a sidecar on the same machine). Decided on the parsed host, so
+/// `http://localhost.evil.example` is not mistaken for loopback.
+fn jwks_url_is_safe(url: &str) -> bool {
+    let Ok(uri) = url.parse::<hyper::Uri>() else {
+        return false;
+    };
+    match (uri.scheme_str(), uri.host()) {
+        (Some("https"), Some(_)) => true,
+        (Some("http"), Some(host)) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }
+        _ => false,
+    }
+}
+
 fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     let mut errors: Vec<String> = Vec::new();
 
     errors.extend(config.redact.errors());
+    // Closed sets that used to fall back silently: an unknown xff_mode ran as `append`
+    // (the most permissive), an unknown log_format as `text`.
+    if crate::proxy::XffMode::parse(&config.server.xff_mode).is_none() {
+        errors.push(format!(
+            "server.xff_mode '{}' is not one of append, rewrite, drop",
+            config.server.xff_mode
+        ));
+    }
+    if !matches!(config.server.log_format.as_str(), "text" | "json") {
+        errors.push(format!(
+            "server.log_format '{}' is not one of text, json",
+            config.server.log_format
+        ));
+    }
+    // Signing keys fetched over plain http can be swapped by anyone on the path, who can
+    // then mint tokens the gateway accepts. Only a loopback JWKS may use http.
+    for (name, p) in &config.auth_profile {
+        if let Some(url) = &p.jwks_url {
+            if !jwks_url_is_safe(url) {
+                errors.push(format!(
+                    "auth_profile.{name}.jwks_url must use https:// (http is accepted only for a \
+                     loopback address), got {url:?}"
+                ));
+            }
+        }
+    }
     // A route that names an auth_profile is meant to be authenticated. A binary built
     // without `--features auth` cannot do that and used to serve it unauthenticated
     // with only a warning: refuse the config instead (fail closed), at boot and on reload.
@@ -2290,6 +2337,53 @@ mod tests {
             .err()
             .unwrap_or_default();
         assert!(e.contains("at least 16 bytes"), "{e}");
+    }
+
+    #[test]
+    fn closed_sets_and_jwks_urls_are_validated() {
+        let cfg = |server: &str, profile: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n{server}\n\
+                 [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+                 {profile}\n[[route]]\npath=\"/{{*r}}\"\nupstream=\"be\"\n"
+            )
+        };
+        let errs = |server: &str, profile: &str| {
+            let c: ZionConfig = toml::from_str(&cfg(server, profile)).unwrap();
+            semantic_errors(&c).join("\n")
+        };
+        for ok in ["append", "rewrite", "drop"] {
+            assert!(
+                !errs(&format!("xff_mode=\"{ok}\""), "").contains("xff_mode"),
+                "{ok}"
+            );
+        }
+        assert!(errs("xff_mode=\"rewite\"", "").contains("server.xff_mode 'rewite'"));
+        for ok in ["text", "json"] {
+            assert!(
+                !errs(&format!("log_format=\"{ok}\""), "").contains("log_format"),
+                "{ok}"
+            );
+        }
+        assert!(errs("log_format=\"JSON\"", "").contains("server.log_format 'JSON'"));
+        let jwks = |url: &str| errs("", &format!("[auth_profile.p]\njwks_url=\"{url}\"\n"));
+        for ok in [
+            "https://idp.example/.well-known/jwks.json",
+            "http://localhost:8080/jwks",
+            "http://127.0.0.1/jwks",
+            "http://[::1]:9000/jwks",
+        ] {
+            assert!(!jwks(ok).contains("jwks_url"), "{ok}");
+        }
+        for bad in [
+            "http://idp.example/jwks",
+            "http://localhost.evil.example/jwks",
+            "http://10.0.0.5/jwks",
+            "ftp://idp.example/jwks",
+            "not a url",
+        ] {
+            assert!(jwks(bad).contains("jwks_url must use https"), "{bad}");
+        }
     }
 
     #[test]

@@ -60,8 +60,8 @@ waf = true
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `secret` | string | — | HMAC shared secret literal (HS256/HS384/HS512). **Deprecated: use `secret_env`.** Zion warns at boot when it is set. It is redacted from debug output and wiped from memory when the config is dropped. |
-| `secret_env` | string | — | Name of an env var holding the HMAC secret. Preferred over `secret`; wins when both are set. |
-| `jwks_url` | string | — | JWKS endpoint URL (for RS256/ES256, auto-refreshed hourly) |
+| `secret_env` | string | — | Name of an env var holding the HMAC secret. Preferred over `secret`; wins when both are set. The secret must be at least as long as the hash (RFC 7518 §3.2): 32 bytes for HS256, 48 for HS384, 64 for HS512; a shorter one is refused at boot and on reload (`openssl rand -base64 48`). |
+| `jwks_url` | string | — | JWKS endpoint URL (for RS256/ES256, auto-refreshed hourly). Must be `https://` (plain `http://` only to a loopback address); anything else is refused. |
 | `algorithm` | string | `HS256` | JWT algorithm. Auto-selects RS256 when `jwks_url` is set without `secret` |
 | `issuer` | string | — | Expected `iss` claim (optional) |
 | `audience` | string | — | Expected `aud` claim (optional) |
