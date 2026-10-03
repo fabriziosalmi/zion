@@ -1,0 +1,17 @@
+tls:
+  existingSecret: zion-tls
+replicaCount: 1
+autoscaling:
+  enabled: false
+persistence:
+  enabled: true
+config:
+  upstreams:
+    app: "http://app.default.svc:8000"
+    api: "http://api.default.svc:9000"
+  routes:
+    - path: "/api/{*rest}"
+      upstream: api
+      waf: true
+    - path: "/{*rest}"
+      upstream: app

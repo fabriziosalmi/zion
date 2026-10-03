@@ -5,18 +5,28 @@ This directory contains resources for deploying Zion.
 ## Helm Chart (Kubernetes)
 
 We provide a Helm chart for deploying Zion to Kubernetes clusters. The chart configures:
-- ConfigMap injection for `zion.toml`
-- Liveness and Readiness probes (`/healthz`, `/readyz`)
+- ConfigMap injection for `zion.toml`, with `[tls]` from a TLS Secret you provide
+- Startup, liveness and readiness probes over HTTPS (`/healthz`, `/readyz`)
 - Service configuration (TCP/UDP multiplexing for HTTPS and QUIC)
+- A HorizontalPodAutoscaler (`autoscaling.enabled`, default on), a PodDisruptionBudget
+  when there is more than one replica, and a 45 s termination grace period
 
 ### Installation
 
+Zion needs a serving certificate: a `kubernetes.io/tls` Secret (for example issued by
+cert-manager). The chart refuses to render without one.
+
 ```bash
-cd helm/zion
-helm install zion .
-# Or define configuration in a custom values file:
-# helm install zion . -f my-values.yaml
+kubectl create secret tls zion-tls --cert=tls.crt --key=tls.key
+helm install zion deploy/helm/zion \
+  --set tls.existingSecret=zion-tls \
+  --set-string 'config.upstreams.app=http://app.default.svc:8000' \
+  --set 'config.routes[0].path=/{*rest}' --set 'config.routes[0].upstream=app'
+# or put the same in a values file: helm install zion deploy/helm/zion -f my-values.yaml
 ```
+
+Every values file in `deploy/helm/zion/ci/` is rendered in CI and the resulting
+`zion.toml` is checked with `zion doctor` (`scripts/check-helm-chart.sh`).
 
 ### Exposing the Service
 

@@ -60,3 +60,20 @@ chart auto-creates the SA so you don't need a separate manifest.
 {{- default "default" .Values.serviceAccount.name -}}
 {{- end -}}
 {{- end }}
+
+
+{{/*
+"true" when a HorizontalPodAutoscaler owns the replica count: autoscaling is on and no
+ReadWriteOnce volume pins the Deployment to one replica. Empty string otherwise.
+*/}}
+{{- define "zion.hpaEnabled" -}}
+{{- $rwo := and .Values.persistence.enabled (eq .Values.persistence.accessMode "ReadWriteOnce") -}}
+{{- if and .Values.autoscaling.enabled (not $rwo) -}}true{{- end -}}
+{{- end }}
+
+{{/*
+The fewest replicas the Deployment can run with: the HPA minimum, or replicaCount.
+*/}}
+{{- define "zion.minReplicas" -}}
+{{- if include "zion.hpaEnabled" . -}}{{ .Values.autoscaling.minReplicas }}{{- else -}}{{ .Values.replicaCount }}{{- end -}}
+{{- end }}
