@@ -325,6 +325,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)] // builds a TLS client (aws-lc FFI) and reads the wall clock
     async fn every_probe_round_beats_the_heartbeat() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let m = &crate::metrics::METRICS;
