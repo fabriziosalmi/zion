@@ -4,6 +4,25 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-10-03
+
+**Security release: fixes from the 2026-10-02 code audit.** Routes with `auth_profile` are enforced by the official binaries, the gossip mesh only trusts named nodes, the admin API needs its own CA and a write token, the WAF scans GET bodies, HTTP/3 forwards client headers, and the health checker follows reloads. Several settings that used to be accepted and silently ignored or weakened are now **config errors**: read the upgrade notes before upgrading.
+
+### Upgrade notes
+
+Zion now refuses to start (exit code 2) or to reload when the config contains any of the following; each was accepted before and either did nothing or weakened security:
+
+- **`auth_profile` on a build without `auth`.** The official binaries and container now include `auth` (`--features dist`), so this only affects custom builds: build with `--features auth`.
+- **`[sovereign_aimp] enabled = true` without `trusted_keys`.** List every node's `node_id` (printed in full at boot) in the other nodes' `trusted_keys` *before* upgrading a mesh.
+- **`[admin] auth = "mtls"` without `[admin] client_ca_path`.** The admin CA no longer comes from `tls.client_ca_path`. Admin **writes** also need `write_token_env` now (without it they get 403; reads keep working).
+- **An HMAC JWT secret shorter than its hash** (32 bytes for HS256, 48 for HS384, 64 for HS512), or a **`jwks_url` over plain `http://`** to a non-loopback host.
+- **An unknown `server.xff_mode` or `server.log_format`** (they used to fall back to `append` / `text`).
+- **`[upstream.x] client_cert_path` / `client_key_path`** (upstream mTLS was never applied; see #503), or **`tls = true` with an `http://` URL**.
+- **A route on `/healthz`, `/readyz`, `/metrics`, `/_zion/snapshot.json` or `/_zion/cache/purge`** (zion answers these itself; such a route never received a request).
+- **Helm:** chart 0.3.0 requires `tls.existingSecret` (the chart used to render a config that crash-looped).
+
+Also changed: the access log is now written by default, as documented (`[access_log] enabled = false` turns it off; it costs throughput); `[upstream.x] keepalive` now takes effect (default 128, unchanged behaviour).
+
 ### Changed
 
 - **A route on one of zion's own endpoints is refused** (`/healthz`, `/readyz`, `/metrics`, `/_zion/snapshot.json`, `/_zion/cache/purge`). Zion answers these itself, before routing, on every host, so such a route never received a request, but it loaded without a word (the shipped `zion.example.toml`, `configs/full-stack.toml`, `examples/multi-site.toml` and the routing guide all had a `/metrics` route that looked like it forwarded to a backend). It is now a config error; the examples use `/internal/{*rest}`, and `zion import` drops (and reports) a location that would land exactly on a built-in path. Found by the 2026-10-02 code audit. **Upgrade note:** move such a route to another path.
