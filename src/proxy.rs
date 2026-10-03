@@ -92,6 +92,38 @@ pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 3000;
 /// `preserve_host` must not be spoken to over HTTP/2, which cannot carry a `Host` that
 /// differs from `:authority` (the backend resets the stream; ADR-0024).
 pub fn build_http_client(connect_timeout_ms: u64, http1_only: bool) -> HttpClient {
+    build_client(&ClientSpec {
+        connect_timeout_ms,
+        http1_only,
+        keepalive: DEFAULT_KEEPALIVE,
+    })
+}
+
+/// Idle pooled connections kept per upstream host (`[upstream.x] keepalive`).
+pub const DEFAULT_KEEPALIVE: usize = 128;
+
+/// What an upstream needs from its HTTP client: the connect deadline, whether it must be
+/// spoken to over HTTP/1.1 only (`preserve_host`), and how many idle connections to
+/// keep (`keepalive`). Clients are cached per distinct spec ([`crate::state::AppState::client_for`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ClientSpec {
+    pub connect_timeout_ms: u64,
+    pub http1_only: bool,
+    pub keepalive: usize,
+}
+
+impl ClientSpec {
+    /// The spec of the shared default client.
+    pub const DEFAULT: ClientSpec = ClientSpec {
+        connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
+        http1_only: false,
+        keepalive: DEFAULT_KEEPALIVE,
+    };
+}
+
+/// Build the HTTP client for `spec`.
+pub fn build_client(spec: &ClientSpec) -> HttpClient {
+    let (connect_timeout_ms, http1_only) = (spec.connect_timeout_ms, spec.http1_only);
     let mut http = hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(
         crate::dns::StaleOnErrorResolver,
     );
@@ -117,7 +149,7 @@ pub fn build_http_client(connect_timeout_ms: u64, http1_only: bool) -> HttpClien
 
     Client::builder(TokioExecutor::new())
         .pool_idle_timeout(std::time::Duration::from_secs(30))
-        .pool_max_idle_per_host(128)
+        .pool_max_idle_per_host(spec.keepalive)
         .build(https)
 }
 

@@ -1782,7 +1782,7 @@ async fn handle_http(
                 req.extensions_mut().insert(proxy::PreserveHost);
             }
             return proxy::proxy_pass(
-                &state.client_for(rule.connect_timeout_ms, rule.preserve_host),
+                &state.client_for(rule.client_spec()),
                 req,
                 &rule.upstream_scheme,
                 &rule.upstream_authority,

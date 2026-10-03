@@ -446,7 +446,7 @@ pub(crate) struct AppState {
     /// A connector has one connect deadline, so upstreams with different values
     /// need different clients; keeping them here (not in the reloadable config
     /// snapshot) means their connection pools survive a hot reload.
-    pub(crate) http_clients: dashmap::DashMap<(u64, bool), HttpClient>,
+    pub(crate) http_clients: dashmap::DashMap<crate::proxy::ClientSpec, HttpClient>,
     pub(crate) static_cache: cache::StaticCache,
     pub(crate) conn_limit: Arc<Semaphore>,
     pub(crate) http_builder: Arc<AutoBuilder<TokioExecutor>>,
@@ -494,17 +494,16 @@ impl AppState {
     /// The pooled HTTP client whose connector enforces `connect_timeout_ms` (the
     /// route's `[upstream.*] connect_timeout_ms`). Cheap: `HttpClient` is a
     /// reference-counted handle onto the shared pool.
-    pub(crate) fn client_for(&self, connect_timeout_ms: u64, http1_only: bool) -> HttpClient {
-        if connect_timeout_ms == crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS && !http1_only {
+    pub(crate) fn client_for(&self, spec: crate::proxy::ClientSpec) -> HttpClient {
+        if spec == crate::proxy::ClientSpec::DEFAULT {
             return self.http_client.clone();
         }
-        let key = (connect_timeout_ms, http1_only);
-        if let Some(c) = self.http_clients.get(&key) {
+        if let Some(c) = self.http_clients.get(&spec) {
             return c.clone();
         }
         self.http_clients
-            .entry(key)
-            .or_insert_with(|| crate::proxy::build_http_client(connect_timeout_ms, http1_only))
+            .entry(spec)
+            .or_insert_with(|| crate::proxy::build_client(&spec))
             .clone()
     }
 }

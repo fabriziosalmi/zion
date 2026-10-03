@@ -1073,7 +1073,7 @@ async fn process_request_inner(
             }
             config::RouteMode::SseStream => {
                 proxy::proxy_pass_stream(
-                    &state.client_for(rule.connect_timeout_ms, rule.preserve_host),
+                    &state.client_for(rule.client_spec()),
                     req,
                     &dyn_scheme,
                     &dyn_authority,
@@ -1085,7 +1085,7 @@ async fn process_request_inner(
             }
             config::RouteMode::Standard => {
                 proxy::proxy_pass_ha(
-                    &state.client_for(rule.connect_timeout_ms, rule.preserve_host),
+                    &state.client_for(rule.client_spec()),
                     req,
                     &rule.upstream_url,
                     &dyn_scheme,
@@ -1100,7 +1100,7 @@ async fn process_request_inner(
             }
             config::RouteMode::Websocket => {
                 proxy::proxy_pass(
-                    &state.client_for(rule.connect_timeout_ms, rule.preserve_host),
+                    &state.client_for(rule.client_spec()),
                     req,
                     &dyn_scheme,
                     &dyn_authority,
@@ -1383,9 +1383,8 @@ struct SwrRefresh {
     primary_key: Arc<str>,
     stale: cache::CacheHit,
     request: Request<ZionBody>,
-    connect_timeout_ms: u64,
-    /// The upstream wants the client's Host (and so an HTTP/1.1-only client).
-    preserve_host: bool,
+    /// The upstream's HTTP client (connect deadline, HTTP/1-only, keepalive).
+    client_spec: crate::proxy::ClientSpec,
     scheme: hyper::http::uri::Scheme,
     authority: hyper::http::uri::Authority,
     remote_addr: SocketAddr,
@@ -1492,8 +1491,7 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
     let mut req = swr_request(&job.request);
     add_conditional_headers(req.headers_mut(), &job.stale.meta);
     let resp = match proxy::proxy_pass(
-        &job.state
-            .client_for(job.connect_timeout_ms, job.preserve_host),
+        &job.state.client_for(job.client_spec),
         req,
         &job.scheme,
         &job.authority,
@@ -2181,7 +2179,7 @@ async fn handle_static_cache(
             None => None,
         };
         let resp = proxy::proxy_pass(
-            &state.client_for(rule.connect_timeout_ms, rule.preserve_host),
+            &state.client_for(rule.client_spec()),
             req,
             dyn_scheme,
             dyn_authority,
@@ -2294,7 +2292,7 @@ async fn handle_static_cache(
             None => None,
         };
         let mut resp = proxy::proxy_pass(
-            &state.client_for(rule.connect_timeout_ms, rule.preserve_host),
+            &state.client_for(rule.client_spec()),
             req,
             dyn_scheme,
             dyn_authority,
@@ -2383,8 +2381,7 @@ async fn handle_static_cache(
                         primary_key: Arc::from(at_primary.as_str()),
                         stale: hit.clone(),
                         request: swr_request(&req),
-                        connect_timeout_ms: rule.connect_timeout_ms,
-                        preserve_host: rule.preserve_host,
+                        client_spec: rule.client_spec(),
                         scheme: dyn_scheme.clone(),
                         authority: dyn_authority.clone(),
                         remote_addr,
@@ -2500,7 +2497,7 @@ async fn handle_static_cache(
     // (channel closed without receiving `true`), they re-check the cache,
     // miss, and fall through to fetch themselves.
     let resp = match proxy::proxy_pass(
-        &state.client_for(rule.connect_timeout_ms, rule.preserve_host),
+        &state.client_for(rule.client_spec()),
         req,
         dyn_scheme,
         dyn_authority,
