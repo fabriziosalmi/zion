@@ -121,7 +121,16 @@ pub fn spawn_quic_listener(
     }
 
     tokio::spawn(async move {
-        while let Some(incoming) = endpoint.accept().await {
+        // On shutdown stop accepting new QUIC connections, like the TCP listeners.
+        let mut drain_rx = crate::drain::subscribe();
+        loop {
+            let incoming = tokio::select! {
+                i = endpoint.accept() => match i {
+                    Some(i) => i,
+                    None => break,
+                },
+                _ = async { let _ = drain_rx.wait_for(|draining| *draining).await; } => break,
+            };
             let state = state.clone();
 
             tokio::spawn(async move {
@@ -148,6 +157,9 @@ pub fn spawn_quic_listener(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let _conn_guard = metrics::ConnectionGuard::new();
 
+                // Kept to close the connection ourselves once drained: after a GOAWAY an
+                // idle client never closes it, so h3 would wait for the idle timeout.
+                let quic = conn.clone();
                 let h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn)).await;
 
                 let mut h3_conn = match h3_conn {
@@ -158,11 +170,26 @@ pub fn spawn_quic_listener(
                     }
                 };
 
+                // On shutdown send GOAWAY (accept nothing new), let the requests in
+                // flight finish, then close: the same drain HTTP/1 and HTTP/2 get. The
+                // requests are tracked, so this task (and the connection slot it holds)
+                // also outlives them when the client closes first.
+                let mut drain_rx = crate::drain::subscribe();
+                let mut requests = tokio::task::JoinSet::new();
                 loop {
-                    match h3_conn.accept().await {
+                    let accepted = tokio::select! {
+                        a = h3_conn.accept() => a,
+                        _ = async { let _ = drain_rx.wait_for(|draining| *draining).await; } => {
+                            let _ = h3_conn.shutdown(0).await;
+                            break;
+                        }
+                        // reap finished requests so the set does not grow on a long connection
+                        Some(_) = requests.join_next(), if !requests.is_empty() => continue,
+                    };
+                    match accepted {
                         Ok(Some(resolver)) => {
                             let state = state.clone();
-                            tokio::spawn(async move {
+                            requests.spawn(async move {
                                 match resolver.resolve_request().await {
                                     Ok((req, stream)) => {
                                         if let Err(e) =
@@ -184,6 +211,13 @@ pub fn spawn_quic_listener(
                         }
                     }
                 }
+                while requests.join_next().await.is_some() {}
+                // Responses can still sit in the send buffer: closing now would discard
+                // them. A client that got GOAWAY closes once it has read them; give it a
+                // moment, then close (an idle one never would).
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), quic.closed()).await;
+                quic.close(0u32.into(), b"shutting down");
             });
         }
     });
