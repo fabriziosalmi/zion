@@ -11,7 +11,7 @@ It is **off by default**. With no `[admin]` block, no listener is spawned: zero 
 listen = "127.0.0.1:9180"   # default — loopback only
 auth = "internal-ip"        # default — see Authentication
 rate_limit_rps = 10         # default — global req/s ceiling
-# write_token_env = "ZION_ADMIN_WRITE_TOKEN"   # optional — see Write token
+write_token_env = "ZION_ADMIN_WRITE_TOKEN"     # required for writes — see Write token
 # persist_push = false      # default — see Persisting a push
 ```
 
@@ -69,7 +69,9 @@ The `generation` in every success response is the new value of the `config_gener
 
 ## Write token
 
-`auth` decides who may talk to the listener at all. With `write_token_env` set, every **mutating** call (`POST /admin/config`, `/admin/reload`, `/admin/revoke`) must also carry `Authorization: Bearer <token>`, where the token is the value of that environment variable (at least 32 bytes). `GET /admin/config` stays under `auth` alone, so a monitoring client can read without being able to change anything.
+`auth` decides who may talk to the listener at all. Every **mutating** call (`POST /admin/config`, `/admin/reload`, `/admin/revoke`) must also carry `Authorization: Bearer <token>`, where the token is the value of the environment variable named by `write_token_env` (at least 32 bytes). `GET /admin/config` stays under `auth` alone, so a monitoring client can read without being able to change anything.
+
+**Without `write_token_env`, writes are refused** (`403`, with a message naming the setting; a warning at startup): network position, or a client certificate, authorizes reading the config, never replacing it. Before 0.9.8 a write from any peer that passed `auth` (on the loopback default, any local process) was accepted.
 
 ```console
 $ export ZION_ADMIN_WRITE_TOKEN="$(openssl rand -hex 32)"
@@ -89,7 +91,7 @@ Turn it on only when the pushed config is meant to be the source of truth: a `zi
 | Mode | Behaviour |
 |---|---|
 | `internal-ip` (default) | Plain HTTP. The connection **peer** must be a loopback / private-range IP (the same gate as `/_zion/snapshot.json`). |
-| `mtls` | TLS with a **required** client certificate chaining to `tls.client_ca_path`. A completed handshake **is** the authorization — only CA-signed clients ever reach the HTTP layer, so the peer's IP no longer matters and the listener can safely bind a routable interface. Requires `tls.client_ca_path` (validated at load). |
+| `mtls` | TLS with a **required** client certificate chaining to `admin.client_ca_path`. A completed handshake **is** the authorization — only CA-signed clients ever reach the HTTP layer, so the peer's IP no longer matters and the listener can safely bind a routable interface. Requires `admin.client_ca_path` (validated at load), its own CA: the data-plane `tls.client_ca_path` is not used, so a client certificate issued to call the gateway does not open the admin API (before 0.9.8 it did). |
 
 For `internal-ip`, authorization is checked on the **TCP connection peer**, never on a forwarded header — `X-Forwarded-For` and `X-Client-Cert-*` are deliberately **not trusted** (admin auth is not transitive through a proxy). For `mtls`, the client cert is verified by rustls against the configured CA during the handshake; a missing or untrusted cert drops the connection before any request is served.
 
@@ -99,11 +101,12 @@ For `internal-ip`, authorization is checked on the **TCP connection peer**, neve
 [tls]
 cert_path = "/etc/ssl/zion/server.crt"   # the admin listener reuses the daemon's server cert
 key_path  = "/etc/ssl/zion/server.key"
-client_ca_path = "/etc/ssl/zion/admin-ca.crt"   # CA that signs operator client certs
 
 [admin]
 listen = "0.0.0.0:9180"   # safe to expose: the handshake is the gate
 auth = "mtls"
+client_ca_path = "/etc/ssl/zion/admin-ca.crt"   # CA that signs OPERATOR client certs
+write_token_env = "ZION_ADMIN_WRITE_TOKEN"     # writes still need the token
 ```
 
 ```console

@@ -18,7 +18,12 @@
 //! Two auth modes (`[admin].auth`):
 //! - `internal-ip` (default): plain HTTP; each request is authorized iff the
 //!   connection peer is an internal IP.
-//! - `mtls`: TLS with a **required** client cert chaining to `tls.client_ca_path`.
+//! - `mtls`: TLS with a **required** client cert chaining to `admin.client_ca_path`
+//!   (its own CA: a data-plane client certificate does not open the admin API).
+//!
+//! Writes (`POST`) additionally need the bearer token from `[admin] write_token_env`;
+//! without one configured they are refused (403): network position alone never
+//! authorizes changing the config.
 //!   A completed handshake IS the authorization — only CA-signed clients ever
 //!   reach the HTTP layer, so the peer's IP no longer matters and the listener
 //!   can safely bind a routable interface.
@@ -247,7 +252,17 @@ async fn handle(
     // Write endpoints (async + stateful) are handled here; the auth gate, the
     // read (GET /admin/config) and 404 stay in the pure, unit-tested `respond`.
     if authorized && req.method() == Method::POST {
-        if let Some(expected) = ctx.write_token.as_ref() {
+        // No write token configured: refuse every write. Network position (or a client
+        // certificate) authorizes reading the config, never replacing it.
+        let Some(expected) = ctx.write_token.as_ref() else {
+            crate::observability::ADMIN_REJECTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            audit_denied_write(&state, peer, req.uri().path());
+            return Ok(json(
+                StatusCode::FORBIDDEN,
+                b"{\"error\":\"admin writes are disabled: set [admin] write_token_env\"}\n",
+            ));
+        };
+        {
             let presented = req
                 .headers()
                 .get(hyper::header::AUTHORIZATION)
