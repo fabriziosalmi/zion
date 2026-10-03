@@ -1581,6 +1581,16 @@ fn jwks_url_is_safe(url: &str) -> bool {
     }
 }
 
+/// Paths zion answers itself, before route lookup, on every host (see
+/// `dispatch::gates::builtin_endpoint`): a route on one of them never receives a request.
+pub const BUILT_IN_PATHS: &[&str] = &[
+    "/healthz",
+    "/readyz",
+    "/metrics",
+    "/_zion/snapshot.json",
+    "/_zion/cache/purge",
+];
+
 fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     let mut errors: Vec<String> = Vec::new();
 
@@ -1939,6 +1949,16 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                  add `auth_profile`, or `public = true` to serve it unauthenticated on purpose \
                  (or `internal_only = true`)",
                 route.path
+            ));
+        }
+
+        // A route on a built-in endpoint is dead: zion answers that path itself first.
+        if BUILT_IN_PATHS.contains(&route.path.as_str()) {
+            errors.push(format!(
+                "route '{}' can never receive a request: zion answers {} itself, before \
+                 routing, on every host. Use another path (for example /status), or rely on \
+                 the built-in endpoint",
+                route.path, route.path
             ));
         }
 
@@ -2472,6 +2492,29 @@ mod tests {
         assert!(e.contains("requires admin.client_ca_path"), "{e}");
         let e = errs("", "client_ca_path=\"/admin-ca\"");
         assert!(!e.contains("admin.client_ca_path"), "{e}");
+    }
+
+    #[test]
+    fn a_route_on_a_built_in_endpoint_is_refused() {
+        let cfg = |path: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+                 [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+                 [[route]]\npath=\"{path}\"\nupstream=\"be\"\n"
+            )
+        };
+        for b in BUILT_IN_PATHS {
+            let c: ZionConfig = toml::from_str(&cfg(b)).unwrap();
+            let e = semantic_errors(&c).join("\n");
+            assert!(e.contains("can never receive a request"), "{b}: {e}");
+        }
+        for ok in ["/{*rest}", "/status", "/metrics/{*rest}", "/healthzz"] {
+            let c: ZionConfig = toml::from_str(&cfg(ok)).unwrap();
+            assert!(
+                !semantic_errors(&c).join("\n").contains("never receive"),
+                "{ok}"
+            );
+        }
     }
 
     #[test]

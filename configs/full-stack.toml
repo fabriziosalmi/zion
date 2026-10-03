@@ -95,7 +95,7 @@ upstream = "api"
 waf_profile = "strict"
 
 [[route]]
-path = "/metrics"
+path = "/internal/{*rest}"
 upstream = "internal"
 internal_only = true
 

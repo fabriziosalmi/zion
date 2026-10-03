@@ -528,7 +528,21 @@ mod tests {
     #[test]
     fn corpus_03_api_gateway_routes_and_global_rate() {
         let c = convert_fixture("03-api-gateway.conf");
-        assert!(c.toml.contains("path = \"/healthz\""));
+        // `location = /healthz` would be a dead route (zion answers /healthz itself): it is
+        // dropped and reported, not emitted
+        assert!(!c.toml.contains("path = \"/healthz\""), "{}", c.toml);
+        assert!(has_finding(
+            &c,
+            Status::Partial,
+            "location",
+            "/healthz itself"
+        ));
+        assert!(has_finding(
+            &c,
+            Status::Partial,
+            "location",
+            "route dropped"
+        ));
         assert!(c.toml.contains("path = \"/v1/users/{*rest}\""));
         assert!(c.toml.contains("path = \"/v1/orders/{*rest}\""));
         assert!(c.toml.contains("path = \"/v1/{*rest}\""));
