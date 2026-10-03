@@ -3956,3 +3956,57 @@ async fn the_access_log_can_be_turned_off() {
     let out = access_log_output("[access_log]\nenabled = false").await;
     assert!(!out.contains("/logged-path"), "{out}");
 }
+
+// ── a body on GET is scanned like any other body ────────────────────────────
+
+#[tokio::test]
+async fn an_injection_in_a_get_body_is_blocked_on_a_waf_route() {
+    let (o, _) = rig("").await;
+    let port = o.port.load(Ordering::Relaxed);
+    let st = hosts_state(
+        "[[route]]\npath = \"/waf/{*rest}\"\nupstream = \"w\"\nwaf = true\n",
+        &format!("w = \"http://127.0.0.1:{port}\""),
+    );
+    let send_get = |body: &'static [u8], ct: Option<&'static str>| {
+        let st = st.clone();
+        async move {
+            let mut b = Request::builder().method(Method::GET).uri("/waf/search");
+            if let Some(ct) = ct {
+                b = b.header("content-type", ct);
+            }
+            let req = b
+                .body(
+                    Full::new(Bytes::from_static(body))
+                        .map_err(|n| match n {})
+                        .boxed(),
+                )
+                .unwrap();
+            process_request(req, st, "203.0.113.9:1".parse().unwrap(), false)
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    let before = hits(&o);
+    assert_eq!(
+        send_get(
+            b"q=1' UNION SELECT username,password FROM users--",
+            Some("application/x-www-form-urlencoded")
+        )
+        .await,
+        400,
+        "the body is scanned"
+    );
+    assert_eq!(hits(&o), before, "and never reaches the upstream");
+    assert_eq!(
+        send_get(b"", None).await,
+        200,
+        "a GET without a body is unaffected"
+    );
+    assert_eq!(
+        send_get(b"{\"q\":\"laptop\"}", Some("application/json")).await,
+        200,
+        "a benign GET body is forwarded"
+    );
+}

@@ -1036,7 +1036,7 @@ pub fn validate_request_prescanned(
 
 #[inline]
 fn validate_request_impl(
-    method: &str,
+    _method: &str,
     content_type: Option<&str>,
     body: &[u8],
     profile: &WafProfile,
@@ -1048,12 +1048,9 @@ fn validate_request_impl(
         return WafVerdict::Deny("body exceeds max size");
     }
 
-    // Methods without body semantics: skip body inspection.
-    // DELETE can carry a body (RFC 9110) — some APIs use it.
-    if !matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
-        return WafVerdict::Allow;
-    }
-
+    // Inspect any body that is there, whatever the method: a GET/HEAD/OPTIONS body
+    // has no defined semantics (RFC 9110) but is forwarded, and backends that read it
+    // (search APIs, some RPC) act on it, so it must not be a way around the scanner.
     if body.is_empty() {
         return WafVerdict::Allow;
     }
@@ -2123,6 +2120,39 @@ mod tests {
     }
 
     // ── Method filtering ──
+
+    #[test]
+    fn a_body_on_get_head_or_options_is_inspected_too() {
+        for m in ["GET", "HEAD", "OPTIONS"] {
+            assert!(
+                matches!(
+                    validate_request(
+                        m,
+                        Some("application/x-www-form-urlencoded"),
+                        b"q=' OR 1=1 --",
+                        &strict_profile()
+                    ),
+                    WafVerdict::Deny(_)
+                ),
+                "{m} with an injection body"
+            );
+            assert_eq!(
+                validate_request(m, None, b"anything", &strict_profile()),
+                WafVerdict::Deny("missing content-type header"),
+                "{m} body without a type is treated like any other body"
+            );
+            assert_eq!(
+                validate_request(
+                    m,
+                    Some("application/json"),
+                    b"{\"q\":\"laptop\"}",
+                    &strict_profile()
+                ),
+                WafVerdict::Allow,
+                "{m} with a benign body"
+            );
+        }
+    }
 
     #[test]
     fn allows_get_without_body() {
