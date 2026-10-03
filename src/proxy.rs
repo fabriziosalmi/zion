@@ -719,10 +719,30 @@ const HA_BODY_COLLECT_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 /// Internal: send a prepared request through the shared client.
 #[inline]
+/// `upstream=<scheme://authority> trace_id=<32 hex>` for a log line about this upstream
+/// request: which backend failed, and the join key to the access log, the audit record
+/// and the trace (`-` when the request carries no traceparent).
+fn upstream_context<B>(req: &Request<B>) -> String {
+    let uri = req.uri();
+    let target = match (uri.scheme_str(), uri.authority()) {
+        (Some(s), Some(a)) => format!("{s}://{a}"),
+        _ => "-".to_string(),
+    };
+    let trace = req
+        .headers()
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|tp| tp.split('-').nth(1))
+        .filter(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or("-");
+    format!("upstream={target} trace_id={trace}")
+}
+
 async fn send_request(
     client: &HttpClient,
     req: Request<ZionBody>,
 ) -> Result<Response<ZionBody>, hyper::Error> {
+    let context = upstream_context(&req);
     let upstream_start = std::time::Instant::now();
     match tokio::time::timeout(UPSTREAM_REQUEST_TIMEOUT, client.request(req)).await {
         Ok(Ok(resp)) => {
@@ -737,7 +757,7 @@ async fn send_request(
             crate::metrics::METRICS
                 .upstream_duration
                 .observe(upstream_start.elapsed());
-            crate::logging::warn("proxy", &format!("upstream error: {e}"));
+            crate::logging::warn("proxy", &format!("upstream error: {e} {context}"));
             Ok(bad_gateway())
         }
         Err(_elapsed) => {
@@ -746,7 +766,7 @@ async fn send_request(
                 .observe(upstream_start.elapsed());
             crate::logging::warn(
                 "proxy",
-                &format!("upstream timeout after {UPSTREAM_REQUEST_TIMEOUT:?}"),
+                &format!("upstream timeout after {UPSTREAM_REQUEST_TIMEOUT:?} {context}"),
             );
             Ok(gateway_timeout())
         }
@@ -1065,6 +1085,33 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn upstream_log_lines_name_the_upstream_and_the_trace() {
+        let req = Request::builder()
+            .uri("http://10.0.0.5:8000/api/x?q=1")
+            .header(
+                "traceparent",
+                "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            )
+            .body(())
+            .unwrap();
+        assert_eq!(
+            upstream_context(&req),
+            "upstream=http://10.0.0.5:8000 trace_id=0af7651916cd43dd8448eb211c80319c"
+        );
+        let bare = Request::builder().uri("/relative").body(()).unwrap();
+        assert_eq!(upstream_context(&bare), "upstream=- trace_id=-");
+        let bad = Request::builder()
+            .uri("https://api.internal/")
+            .header("traceparent", "garbage")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            upstream_context(&bad),
+            "upstream=https://api.internal trace_id=-"
+        );
+    }
     use hyper::http::uri::{Authority, Scheme};
 
     fn make_request(method: &str, uri: &str) -> Request<()> {
