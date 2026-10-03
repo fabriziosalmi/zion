@@ -102,6 +102,7 @@ daemon + backend) and the e2e rig — **not** by CI unit tests:
 
 ```bash
 cd benchmarks/backend && go run test-server.go &
+cargo build --release --features auth   # tests/zion-test.toml has auth routes
 ZION_CONFIG=tests/zion-test.toml ./target/release/zion &
 cargo test --test integration -- --ignored --test-threads=1
 ```

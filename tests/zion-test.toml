@@ -61,7 +61,7 @@ serve_dir = "./tests/fixtures/static"
 
 # Internal-only (metrics)
 [[route]]
-path = "/metrics"
+path = "/internal/{*rest}"
 upstream = "backend"
 internal_only = true
 

@@ -94,7 +94,7 @@ upstream = "frontend"
 
 # Shared: no `hosts`, reachable on every domain
 [[route]]
-path = "/healthz"
+path = "/status"
 upstream = "api"
 internal_only = true
 ```
@@ -157,7 +157,7 @@ At startup, all upstream URLs are pre-parsed into `Scheme` + `Authority`. No URI
 
 ```toml
 [[route]]
-path = "/metrics"
+path = "/internal/{*rest}"
 upstream = "internal"
 internal_only = true
 ```

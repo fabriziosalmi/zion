@@ -129,6 +129,6 @@ internal_only = true
 # ── Shared route (no `hosts`) — reachable on every domain ────────
 # Written once, served for api/app/admin alike. Internal-only.
 [[route]]
-path = "/metrics"
+path = "/internal/{*rest}"
 upstream = "api"
 internal_only = true

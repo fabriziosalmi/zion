@@ -1279,33 +1279,42 @@ fn classify_access(rules: &[AccessRule], findings: &mut Vec<Finding>) -> bool {
 }
 
 /// Zion's own endpoints: a route there never reaches the backend for that exact path.
-const BUILT_IN_PATHS: &[&str] = &[
-    "/healthz",
-    "/readyz",
-    "/metrics",
-    "/_zion/snapshot.json",
-    "/_zion/cache/purge",
-];
+use crate::config::BUILT_IN_PATHS;
 
 /// Report a route whose path is (or starts at) one of Zion's own endpoints (#483).
-fn report_built_in_collision(path: &str, line: u32, findings: &mut Vec<Finding>) {
+/// Returns true when the route would be exactly a built-in path: it could never receive
+/// a request (and zion refuses such a route), so the caller drops it.
+fn report_built_in_collision(path: &str, line: u32, findings: &mut Vec<Finding>) -> bool {
     for b in BUILT_IN_PATHS {
-        let covers = path == *b
-            || path
-                .strip_prefix(b)
-                .is_some_and(|rest| rest.starts_with('/'));
+        if path == *b {
+            findings.push(Finding::new(
+                Status::Partial,
+                line,
+                "location",
+                format!(
+                    "Zion answers {b} itself, before routing, so the backend's {b} is not \
+                     reachable through Zion: route dropped"
+                ),
+            ));
+            return true;
+        }
+        let covers = path
+            .strip_prefix(b)
+            .is_some_and(|rest| rest.starts_with('/'));
         if covers || (path.starts_with("/_zion/") && b.starts_with("/_zion/")) {
             findings.push(Finding::new(
                 Status::Partial,
                 line,
                 "location",
                 format!(
-                    "Zion answers {b} itself (internal networks only), so the backend's {b} is not reachable through Zion"
+                    "Zion answers {b} itself, before routing, so the backend's {b} is not \
+                     reachable through Zion"
                 ),
             ));
-            return;
+            return false;
         }
     }
+    false
 }
 
 /// Classify a static location's `try_files` fallback (its last argument) into
@@ -1906,7 +1915,9 @@ fn map_location(
             &loc_access
         };
         let internal_only = classify_access(rules, findings);
-        report_built_in_collision(&path, loc.line, findings);
+        if report_built_in_collision(&path, loc.line, findings) {
+            return;
+        }
         doc.routes.push(RouteOut {
             path,
             hosts: route_hosts,
@@ -2045,7 +2056,9 @@ fn map_location(
         &loc_access
     };
     let internal_only = classify_access(rules, findings);
-    report_built_in_collision(&path, loc.line, findings);
+    if report_built_in_collision(&path, loc.line, findings) {
+        return;
+    }
     doc.routes.push(RouteOut {
         path,
         hosts: route_hosts,

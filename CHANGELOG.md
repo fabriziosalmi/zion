@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **A route on one of zion's own endpoints is refused** (`/healthz`, `/readyz`, `/metrics`, `/_zion/snapshot.json`, `/_zion/cache/purge`). Zion answers these itself, before routing, on every host, so such a route never received a request, but it loaded without a word (the shipped `zion.example.toml`, `configs/full-stack.toml`, `examples/multi-site.toml` and the routing guide all had a `/metrics` route that looked like it forwarded to a backend). It is now a config error; the examples use `/internal/{*rest}`, and `zion import` drops (and reports) a location that would land exactly on a built-in path. Found by the 2026-10-02 code audit. **Upgrade note:** move such a route to another path.
+
 ### Fixed
 
 - **HTTP/3 connections are drained on shutdown** (`--features http3`). The QUIC listener ignored the drain: it kept accepting after SIGTERM, and an idle HTTP/3 connection was never told to close, so shutdown waited for the QUIC idle timeout, close to the 30 s drain limit, on every deploy (measured: 28.1 s with one idle connection). The listener now stops accepting, each connection sends GOAWAY, finishes the requests in flight and closes (measured: exit within about 2 s, the grace a client gets to read the last responses; a request in flight at SIGTERM still gets its 200). A connection also keeps its slot until its requests are done, instead of releasing it while they still run. Found by the 2026-10-02 code audit.
