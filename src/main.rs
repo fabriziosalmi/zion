@@ -815,12 +815,12 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     // 5b. Admin API listener (#26) — loopback by default. listen + auth were
     // validated at config load (auth ∈ {internal-ip, mtls}; mtls ⇒ client_ca_path
     // is set). `internal-ip` gates on the peer IP over plain HTTP; `mtls` requires
-    // a client cert chaining to `tls.client_ca_path` (the handshake is the auth).
+    // a client cert chaining to `admin.client_ca_path` (the handshake is the auth).
     if let Some(ref admin_cfg) = config.admin {
         match admin_cfg.listen.parse::<std::net::SocketAddr>() {
             Ok(addr) => {
                 let auth = match admin_cfg.auth.as_str() {
-                    "mtls" => match config.tls.client_ca_path.as_deref() {
+                    "mtls" => match admin_cfg.client_ca_path.as_deref() {
                         Some(ca) => match tls::admin_mtls_acceptor(
                             &config.tls.cert_path,
                             &config.tls.key_path,
@@ -839,7 +839,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                         None => {
                             logging::error(
                                 "admin",
-                                "admin.auth=mtls requires tls.client_ca_path — admin API NOT spawned",
+                                "admin.auth=mtls requires admin.client_ca_path — admin API NOT spawned",
                             );
                             None
                         }
@@ -869,6 +869,14 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                     }
                     Ok(t) => auth.map(|a| (a, t)),
                 };
+                if matches!(auth_and_token, Some((_, None))) {
+                    logging::warn(
+                        "admin",
+                        "admin.write_token_env is not set: the admin API answers reads, but \
+                         config pushes, reloads and revocations are refused (403) until a \
+                         write token is configured",
+                    );
+                }
                 if let Some((auth, write_token)) = auth_and_token {
                     let ctx = std::sync::Arc::new(admin::AdminReloadCtx {
                         conn_limit_max: platform.conn_limit,

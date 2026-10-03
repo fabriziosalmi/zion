@@ -23,6 +23,9 @@
 #      ZION_BIN / BACKEND_BIN — prebuilt binaries (CI builds them once).
 set -euo pipefail
 
+# Admin writes need a bearer token (an [admin] without write_token_env refuses them).
+export ZION_ADMIN_WRITE_TOKEN="${ZION_ADMIN_WRITE_TOKEN:-reload-under-load-admin-token-padding-padding-padding}"
+
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DURATION="${DURATION:-15}"
 WORKERS="${WORKERS:-24}"
@@ -76,9 +79,10 @@ hot_reload = false
 backend = "http://127.0.0.1:$BACKEND_PORT"
 
 [admin]
-listen         = "127.0.0.1:$ADMIN_PORT"
-auth           = "internal-ip"
-rate_limit_rps = 500
+listen          = "127.0.0.1:$ADMIN_PORT"
+auth            = "internal-ip"
+rate_limit_rps  = 500
+write_token_env = "ZION_ADMIN_WRITE_TOKEN"
 
 [[route]]
 path     = "/api/{*rest}"
@@ -131,7 +135,7 @@ sleep 1  # let traffic ramp
 reload_ok=0
 interval=$(awk "BEGIN{print ($DURATION-2)/$RELOADS}")
 for _ in $(seq 1 "$RELOADS"); do
-    rc="$(curl -s -o /dev/null -w '%{http_code}' -m 3 -X POST "http://127.0.0.1:$ADMIN_PORT/admin/reload" 2>/dev/null || echo 000)"
+    rc="$(curl -s -o /dev/null -w '%{http_code}' -m 3 -H "Authorization: Bearer $ZION_ADMIN_WRITE_TOKEN" -X POST "http://127.0.0.1:$ADMIN_PORT/admin/reload" 2>/dev/null || echo 000)"
     [ "${rc:0:1}" = 2 ] && reload_ok=$((reload_ok+1))
     sleep "$interval"
 done

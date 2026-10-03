@@ -127,6 +127,11 @@ pub struct AdminConfig {
     /// Default `false`: a push is live-only until the next reload or restart.
     #[serde(default)]
     pub persist_push: bool,
+    /// The CA that signs ADMIN client certificates (`auth = "mtls"`). Required in that
+    /// mode and separate from `tls.client_ca_path` on purpose: a certificate issued for
+    /// data-plane client authentication must not also open the admin API.
+    #[serde(default)]
+    pub client_ca_path: Option<String>,
 }
 
 fn default_admin_listen() -> String {
@@ -2034,10 +2039,13 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
         if admin.rate_limit_rps == 0 {
             errors.push("admin.rate_limit_rps must be > 0".to_string());
         }
-        // mTLS needs a client CA to verify presented certs against.
-        if admin.auth == "mtls" && config.tls.client_ca_path.is_none() {
+        // mTLS needs its own CA: with the data-plane one, every client certificate
+        // issued to call the gateway would also authorize config pushes.
+        if admin.auth == "mtls" && admin.client_ca_path.is_none() {
             errors.push(
-                "admin.auth = \"mtls\" requires tls.client_ca_path (the CA that signs admin client certs)"
+                "admin.auth = \"mtls\" requires admin.client_ca_path: the CA that signs ADMIN \
+                 client certificates (not tls.client_ca_path, whose data-plane client \
+                 certificates would otherwise open the admin API too)"
                     .to_string(),
             );
         }
@@ -2445,6 +2453,25 @@ mod tests {
             crate::proxy::DEFAULT_KEEPALIVE,
             "default unchanged"
         );
+    }
+
+    #[test]
+    fn admin_mtls_needs_its_own_ca() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [upstreams]\nbe=\"http://127.0.0.1:8000\"\n[[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let errs = |tls_extra: &str, admin_extra: &str| {
+            let toml = format!(
+                "{base}[tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n{tls_extra}\n\
+                 [admin]\nlisten=\"0.0.0.0:9180\"\nauth=\"mtls\"\n{admin_extra}\n"
+            );
+            let c: ZionConfig = toml::from_str(&toml).unwrap();
+            semantic_errors(&c).join("\n")
+        };
+        // the data-plane CA alone no longer authorizes the admin API
+        let e = errs("client_auth=\"required\"\nclient_ca_path=\"/data-ca\"", "");
+        assert!(e.contains("requires admin.client_ca_path"), "{e}");
+        let e = errs("", "client_ca_path=\"/admin-ca\"");
+        assert!(!e.contains("admin.client_ca_path"), "{e}");
     }
 
     #[test]
