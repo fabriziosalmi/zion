@@ -36,11 +36,15 @@ Before spending time on a large PR, we strongly suggest opening a feature reques
    ```bash
    cargo test
    ```
-5. Ensure no warnings are reported:
+5. Ensure no warnings are reported. These are the commands CI runs (stable Rust; CI also
+   runs clippy once per feature: `acme`, `auth`, `http3`, `tui`, `init`, …):
    ```bash
-   cargo clippy -- -D warnings
+   cargo clippy --locked --all-targets -- -D warnings
+   cargo clippy --locked --all-targets --all-features -- -D warnings
    cargo fmt --all -- --check
    ```
+   `--all-targets` matters: without it the tests, benches and examples are not linted, and
+   CI fails on what a plain `cargo clippy` did not show.
 6. If your PR touches the request processing path (`src/dispatch.rs`, `src/waf.rs`, `src/proxy.rs`), please run the benchmarks:
    ```bash
    MODE=full bash benchmarks/baseline/run-baseline.sh

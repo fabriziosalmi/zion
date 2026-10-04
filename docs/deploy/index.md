@@ -268,7 +268,14 @@ back together.
 
 **Compatibility contract:** within a release the config schema is exact (no
 unknown keys). Across releases, a config authored for version *N* may not load
-on version *N−1* if it uses keys introduced in *N*. There is no schema-version
-handshake yet, so treat a downgrade as "restore the matching config too", and
-read the CHANGELOG for any config or forwarded-header contract changes before
-upgrading or rolling back.
+on version *N−1* if it uses keys introduced in *N*.
+
+There is a schema-version handshake, with one limit to know about. A config may
+declare `schema_version` (omitted = `1`); a file that declares a version newer
+than the binary supports is refused with a message that says to upgrade zion,
+and `0` is refused. But the version has been `1` since the handshake was added:
+keys introduced since then did not bump it, so it does not yet tell an older
+binary that a config is too new. The unknown-key error above is what you get.
+So still treat a downgrade as "restore the matching config too", and read the
+CHANGELOG for any config or forwarded-header contract changes before upgrading
+or rolling back.

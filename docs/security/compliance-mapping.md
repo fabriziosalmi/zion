@@ -99,7 +99,7 @@ where it touches build provenance).
 | AC-4 | Information flow enforcement | Trusted-proxy / xff_mode policy ([`config.rs`](../../src/config.rs)); CORS allowlist | Egress firewall |
 | AC-7 | Unsuccessful logon attempts | Per-IP rate limiter ([`security.rs`](../../src/security.rs)); audit `auth_failure` events | Lockout / step-up auth at IdP |
 | AC-12 | Session termination | TLS session ticket lifetime (rustls default); idle connection timeout per accepted stream | — |
-| AC-17 | Remote access | TLS 1.3 mandatory on `[server.listen_https]`; mTLS optional | VPN / bastion if required |
+| AC-17 | Remote access | TLS 1.3 only **by default** on `[server.listen_https]` (`[tls] min_version = "1.3"`); `min_version = "1.2"` also admits TLS 1.2, so verify the setting per deployment. mTLS optional (`client_auth`) | VPN / bastion if required |
 
 ### AU — Audit and Accountability
 

@@ -55,7 +55,7 @@ description: One auditable Rust binary at the edge — TLS 1.3 termination, a ze
       <p>From zero to a running daemon in about a minute.</p>
     </div>
     <div class="ds-sec-body">
-      <div class="ds-cap"><div class="t">Install<small>quickstart</small></div><div class="d">Build the release binary, run <code>zion auto</code> for an ephemeral cert + config, and you have TLS in front of a backend. → <a href="/zion/guide/quickstart">Quick start</a></div></div>
+      <div class="ds-cap"><div class="t">Install<small>quickstart</small></div><div class="d">Download a release binary (or build with <code>--features init</code>), run <code>zion auto</code> for an ephemeral cert + config, and you have TLS in front of a backend. → <a href="/zion/guide/quickstart">Quick start</a></div></div>
       <div class="ds-cap"><div class="t">Migrate<small>from nginx</small></div><div class="d">Convert an existing config with <code>zion import nginx</code> — a validated <code>zion.toml</code> and an honest findings report. → <a href="/zion/guide/">Guide</a></div></div>
       <div class="ds-cap"><div class="t">Configure<small>reference</small></div><div class="d">One hot-reloaded TOML file: routes, upstreams, WAF profiles, TLS, ACME, CORS. → <a href="/zion/config/">Configuration</a></div></div>
     </div>

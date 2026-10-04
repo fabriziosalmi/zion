@@ -7,7 +7,7 @@
 //! starts the TLS acceptor + listeners (HTTP/HTTPS, optional QUIC),
 //! spawns the cert-watcher, the config-reload watcher, the cache prober
 //! and the audit writer, and finally hands every accepted connection to
-//! `dispatch::handle_request`.
+//! [`dispatch::process_request`].
 //!
 //! `main()` returns `error::ZionResult<()>` so any boot-time failure
 //! propagates with a structured exit code instead of panicking.
