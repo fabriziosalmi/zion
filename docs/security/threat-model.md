@@ -42,9 +42,12 @@ route, or an MITM exploiting a TLS downgrade.
   client's claimed identity. Session tickets are encrypted with rustls'
   rotating server keys.
 - **Residual**: trust anchors are whatever the operator places in
-  `client_ca_path`. We do not enforce CT, OCSP stapling, or CRL distribution
-  for client certs — this is a deliberate scope choice for v0.1.x
-  (re-evaluate at v0.2 along with the [ADR-0001 hot-reload model](../adr/0001-arcswap-config-hot-reload.md)).
+  `client_ca_path`. A client certificate is revoked by listing it in the CRL at
+  `client_crl_path` (data plane) or `admin.client_crl_path` (admin API); the file is
+  re-read when it changes. Zion does not fetch CRLs from distribution points, does not
+  do OCSP, and does not enforce the CRL's `nextUpdate`: publishing the list is the
+  operator's job. Without a CRL a leaked client certificate is valid until it expires
+  or the CA is replaced.
 
 **T — tampering**: in-flight injection of WAF-bypass payloads on a hijacked
 TLS session.

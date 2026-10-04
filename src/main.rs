@@ -839,8 +839,24 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                             &config.tls.cert_path,
                             &config.tls.key_path,
                             ca,
+                            admin_cfg.client_crl_path.as_deref(),
                         ) {
-                            Ok(acc) => Some(admin::AdminAuth::Mtls(std::sync::Arc::new(acc))),
+                            Ok(acc) => {
+                                let store = std::sync::Arc::new(ArcSwap::from_pointee(acc));
+                                // The admin listener re-reads its certificate, CA and CRL
+                                // when they change, like the data plane: revoking an admin
+                                // certificate must not need a restart.
+                                if config.tls.hot_reload {
+                                    tls::spawn_admin_tls_watcher(
+                                        store.clone(),
+                                        config.tls.cert_path.clone(),
+                                        config.tls.key_path.clone(),
+                                        ca.to_string(),
+                                        admin_cfg.client_crl_path.clone(),
+                                    );
+                                }
+                                Some(admin::AdminAuth::Mtls(store))
+                            }
                             Err(e) => {
                                 logging::error(
                                     "admin",

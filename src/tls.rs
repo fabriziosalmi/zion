@@ -172,6 +172,65 @@ fn load_certified_key(cert_path: &str, key_path: &str) -> Result<Arc<CertifiedKe
     Ok(Arc::new(ck))
 }
 
+/// The CA certificates in `ca_path` as a root store. `what` names the file's role in errors.
+fn client_roots(ca_path: &str, what: &str) -> Result<rustls::RootCertStore, String> {
+    let ca_file = std::fs::File::open(ca_path).map_err(|e| format!("{what} {ca_path}: {e}"))?;
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut BufReader::new(ca_file)) {
+        let cert = cert.map_err(|e| format!("{what} PEM: {e}"))?;
+        root_store
+            .add(cert)
+            .map_err(|e| format!("{what} add: {e}"))?;
+    }
+    Ok(root_store)
+}
+
+/// The CRLs in `path`: every `X509 CRL` PEM block, or the whole file as one DER CRL when it
+/// holds no PEM block. An empty or unreadable file is an error: a configured revocation list
+/// that cannot be applied must not turn into "nothing is revoked".
+pub(crate) fn load_crls(
+    path: &str,
+) -> Result<Vec<rustls::pki_types::CertificateRevocationListDer<'static>>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("client CRL {path}: {e}"))?;
+    let pem: Vec<_> = rustls_pemfile::crls(&mut bytes.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("client CRL {path}: {e}"))?;
+    if !pem.is_empty() {
+        return Ok(pem);
+    }
+    if bytes.is_empty() || bytes.starts_with(b"-----BEGIN") {
+        return Err(format!(
+            "client CRL {path}: no certificate revocation list in the file"
+        ));
+    }
+    Ok(vec![rustls::pki_types::CertificateRevocationListDer::from(
+        bytes,
+    )])
+}
+
+/// The client-certificate verifier both listeners use: certificates must chain to `roots`,
+/// and, with `crl_path`, the client's own certificate must not be revoked. A certificate
+/// whose issuer has no CRL in the file is refused (rustls' default: an unknown status is not
+/// "good"). `optional` lets a client connect without a certificate at all.
+fn client_cert_verifier(
+    roots: rustls::RootCertStore,
+    crl_path: Option<&str>,
+    optional: bool,
+) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, String> {
+    let mut builder = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots));
+    if let Some(path) = crl_path {
+        builder = builder
+            .with_crls(load_crls(path)?)
+            .only_check_end_entity_revocation();
+    }
+    if optional {
+        builder = builder.allow_unauthenticated();
+    }
+    builder
+        .build()
+        .map_err(|e| format!("client certificate verifier: {e}"))
+}
+
 /// Build a TLS acceptor for the admin listener's `auth = "mtls"` mode (#26): the
 /// daemon's own server cert/key on the server side, and a **required** client-cert
 /// verifier rooted at `ca_path`. Deliberately minimal — TLS 1.3 only, no SNI, no
@@ -182,6 +241,7 @@ pub(crate) fn admin_mtls_acceptor(
     cert_path: &str,
     key_path: &str,
     ca_path: &str,
+    crl_path: Option<&str>,
 ) -> Result<TlsAcceptor, String> {
     // Server identity (reuses the daemon's cert/key).
     let cert_file =
@@ -195,20 +255,10 @@ pub(crate) fn admin_mtls_acceptor(
         .map_err(|e| format!("admin TLS key PEM: {e}"))?
         .ok_or_else(|| "admin TLS key: no private key in PEM".to_string())?;
 
-    // Client CA → REQUIRED verifier (no `allow_unauthenticated`: a client cert
-    // chaining to this CA is mandatory).
-    let ca_file =
-        std::fs::File::open(ca_path).map_err(|e| format!("admin client CA {ca_path}: {e}"))?;
-    let mut root_store = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut BufReader::new(ca_file)) {
-        let cert = cert.map_err(|e| format!("admin client CA PEM: {e}"))?;
-        root_store
-            .add(cert)
-            .map_err(|e| format!("admin client CA add: {e}"))?;
-    }
-    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
-        .build()
-        .map_err(|e| format!("admin client verifier: {e}"))?;
+    // Client CA → REQUIRED verifier (not optional: a client cert chaining to this CA is
+    // mandatory), minus whatever the CRL revokes.
+    let verifier = client_cert_verifier(client_roots(ca_path, "admin client CA")?, crl_path, false)
+        .map_err(|e| format!("admin {e}"))?;
 
     let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_client_cert_verifier(verifier)
@@ -216,6 +266,82 @@ pub(crate) fn admin_mtls_acceptor(
         .map_err(|e| format!("admin TLS config: {e}"))?;
 
     Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Keep the admin acceptor in step with its files: when the server certificate, the admin CA
+/// or the admin CRL changes on disk, rebuild it and swap it in. A rebuild that fails keeps
+/// the previous acceptor (a half-written file must not close the admin API).
+pub(crate) fn spawn_admin_tls_watcher(
+    store: Arc<ArcSwap<TlsAcceptor>>,
+    cert_path: String,
+    key_path: String,
+    ca_path: String,
+    crl_path: Option<String>,
+) {
+    let signal = Arc::new(Notify::new());
+    let on_event = signal.clone();
+    let mut watcher =
+        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                    on_event.notify_one();
+                }
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                crate::logging::warn("admin", &format!("cannot watch the admin TLS files: {e}"));
+                return;
+            }
+        };
+    let mut dirs = std::collections::HashSet::new();
+    for file in [
+        Some(cert_path.as_str()),
+        Some(ca_path.as_str()),
+        crl_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(dir) = Path::new(file).parent() {
+            if dirs.insert(dir.to_path_buf()) {
+                if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+                    crate::logging::warn("admin", &format!("cannot watch {}: {e}", dir.display()));
+                }
+            }
+        }
+    }
+    tokio::spawn(async move {
+        let _watcher = watcher; // dropped with the task: keeps the watches alive
+        loop {
+            signal.notified().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let (cert, key, ca, crl) = (
+                cert_path.clone(),
+                key_path.clone(),
+                ca_path.clone(),
+                crl_path.clone(),
+            );
+            let rebuilt = tokio::task::spawn_blocking(move || {
+                admin_mtls_acceptor(&cert, &key, &ca, crl.as_deref())
+            })
+            .await;
+            match rebuilt {
+                Ok(Ok(acceptor)) => {
+                    store.store(Arc::new(acceptor));
+                    crate::logging::info("admin", "admin TLS reloaded (certificate, CA, CRL)");
+                }
+                Ok(Err(e)) => crate::logging::warn(
+                    "admin",
+                    &format!("admin TLS reload failed ({e}), keeping the previous one"),
+                ),
+                Err(e) => crate::logging::warn(
+                    "admin",
+                    &format!("admin TLS reload task failed ({e}), keeping the previous one"),
+                ),
+            }
+        }
+    });
 }
 
 /// Map the configured `min_version` to the rustls protocol-version list.
@@ -274,28 +400,19 @@ pub fn load_tls_config(tls: &TlsConfig) -> Result<ServerConfig, String> {
     let client_auth_mode = tls.client_auth.as_str();
     let mut config = if let Some(ref ca_path) = tls.client_ca_path {
         if client_auth_mode != "none" {
-            let ca_file =
-                std::fs::File::open(ca_path).map_err(|e| format!("Client CA {ca_path}: {e}"))?;
-            let mut ca_reader = BufReader::new(ca_file);
-            let mut root_store = rustls::RootCertStore::empty();
-            for cert in rustls_pemfile::certs(&mut ca_reader) {
-                let cert = cert.map_err(|e| format!("Failed to parse client CA PEM: {e}"))?;
-                root_store
-                    .add(cert)
-                    .map_err(|e| format!("Failed to add client CA cert: {e}"))?;
-            }
+            let verifier = client_cert_verifier(
+                client_roots(ca_path, "Client CA")?,
+                tls.client_crl_path.as_deref(),
+                client_auth_mode == "optional",
+            )?;
 
-            let verifier_builder =
-                rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
-
-            let verifier = if client_auth_mode == "optional" {
-                verifier_builder.allow_unauthenticated().build()
-            } else {
-                verifier_builder.build()
-            }
-            .map_err(|e| format!("Failed to build client cert verifier: {e}"))?;
-
-            eprintln!("  mtls: client auth={client_auth_mode}, ca={ca_path}");
+            eprintln!(
+                "  mtls: client auth={client_auth_mode}, ca={ca_path}{}",
+                tls.client_crl_path
+                    .as_deref()
+                    .map(|p| format!(", crl={p}"))
+                    .unwrap_or_default()
+            );
 
             ServerConfig::builder_with_protocol_versions(&versions)
                 .with_client_cert_verifier(verifier)
@@ -458,8 +575,26 @@ pub fn spawn_tls_watcher(
         }
     }
 
+    // The client CA and the CRL are re-read by the same reload: watch where they live, so
+    // revoking a certificate (a new CRL) takes effect without a restart.
+    for extra in [
+        tls.client_ca_path.as_deref(),
+        tls.client_crl_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(dir) = Path::new(extra).parent() {
+            if watched_dirs.insert(dir.to_path_buf()) {
+                if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+                    eprintln!("  warning: cannot watch {}: {}", dir.display(), e);
+                }
+            }
+        }
+    }
+
     eprintln!(
-        "  tls watcher active on {} (+{} SNI dirs)",
+        "  tls watcher active on {} (+{} more dirs)",
         cert_dir.display(),
         watched_dirs.len() - 1
     );
@@ -772,13 +907,48 @@ mod tests {
         assert_ne!(mode, "required");
     }
 
+    /// A configured CRL that cannot be applied is an error, never "nothing is revoked".
+    #[test]
+    #[cfg_attr(miri, ignore)] // the verifier needs the crypto provider (aws-lc, FFI)
+    fn a_crl_file_that_holds_no_crl_is_refused() {
+        let dir = std::env::temp_dir().join(format!("zion-crl-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str, content: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, content).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let missing = dir.join("missing.pem").to_string_lossy().into_owned();
+        assert!(super::load_crls(&missing)
+            .unwrap_err()
+            .contains("client CRL"));
+        let e = super::load_crls(&path("empty.pem", b"")).unwrap_err();
+        assert!(e.contains("no certificate revocation list"), "{e}");
+        // A PEM file with something else in it (a certificate, a key) is not a CRL.
+        let e = super::load_crls(&path(
+            "cert.pem",
+            b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        ))
+        .unwrap_err();
+        assert!(e.contains("no certificate revocation list"), "{e}");
+        // Bytes that are not PEM are taken as one DER list; garbage is then refused when the
+        // verifier parses it, with the role of the file in the message.
+        let garbage = path("garbage.der", &[0x30, 0x03, 0x01, 0x02, 0x03]);
+        assert_eq!(super::load_crls(&garbage).unwrap().len(), 1);
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let e = super::client_cert_verifier(rustls::RootCertStore::empty(), Some(&garbage), false)
+            .expect_err("garbage is not a CRL");
+        assert!(e.contains("client certificate verifier"), "{e}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn admin_mtls_acceptor_errors_on_missing_files() {
         // No real cert fixtures in unit tests (certs are generated, not
         // committed); the mTLS happy path is covered by the reproducible smoke
         // in the PR. Here we assert the builder fails cleanly (Err, not panic)
         // when the cert/key/CA paths don't exist.
-        let r = super::admin_mtls_acceptor("/no/cert.pem", "/no/key.pem", "/no/ca.pem");
+        let r = super::admin_mtls_acceptor("/no/cert.pem", "/no/key.pem", "/no/ca.pem", None);
         assert!(r.is_err(), "missing cert/key/ca must yield Err");
     }
 

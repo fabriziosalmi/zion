@@ -67,6 +67,7 @@ refused.
 | `sni` | SniCert[] | `[]` | Per-domain certificate mappings |
 | `acme` | table | none | Automatic HTTPS via Let's Encrypt — see [ACME](./acme) |
 | `client_ca_path` | string? | none | CA bundle used to verify client certs (mTLS) |
+| `client_crl_path` | string? | none | Certificate revocation list for client certificates: a PEM file with one or more CRLs, or one DER CRL, issued by the CA(s) in `client_ca_path`. A certificate it lists is refused at the handshake, and so is one whose issuer has no CRL in the file. Only the client's own certificate is checked, not intermediates. Re-read when the file changes (with `hot_reload`): publishing a new CRL needs no restart. The list's `nextUpdate` is not enforced: an out-of-date CRL keeps being applied instead of locking every client out. Needs `client_auth = "required"` or `"optional"` |
 | `client_auth` | string | `"none"` | mTLS client-auth mode (`"none"` disables mTLS) |
 
 ## `[upstream.<name>]`

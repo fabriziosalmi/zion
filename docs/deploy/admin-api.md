@@ -106,8 +106,15 @@ key_path  = "/etc/ssl/zion/server.key"
 listen = "0.0.0.0:9180"   # safe to expose: the handshake is the gate
 auth = "mtls"
 client_ca_path = "/etc/ssl/zion/admin-ca.crt"   # CA that signs OPERATOR client certs
+client_crl_path = "/etc/ssl/zion/admin-ca.crl"  # optional: revoked operator certs
 write_token_env = "ZION_ADMIN_WRITE_TOKEN"     # writes still need the token
 ```
+
+**Revoking an operator certificate.** List it in the CRL at `client_crl_path` (PEM, one or
+more CRLs, or one DER CRL, signed by the admin CA) and replace the file: the admin listener
+re-reads its certificate, CA and CRL when they change, so the certificate stops working
+within seconds, without a restart. Without a CRL a leaked operator certificate opens the
+admin API until it expires or the CA is replaced.
 
 ```console
 # A client cert signed by admin-ca is mandatory; without it the handshake fails.
