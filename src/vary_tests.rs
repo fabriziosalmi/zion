@@ -3903,6 +3903,107 @@ async fn a_pool_that_never_answers_gets_504_and_a_post_is_not_replayed() {
     );
 }
 
+// ── `[upstream.x] request_timeout_ms` (#517) ────────────────────────────────
+
+/// Answers every request `delay` after receiving it.
+async fn slow_origin(delay: Duration) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(
+                    move |_req: Request<hyper::body::Incoming>| async move {
+                        tokio::time::sleep(delay).await;
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .header("cache-control", "public, max-age=60")
+                                .body(Full::new(Bytes::from_static(b"slow")))
+                                .unwrap(),
+                        )
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    port
+}
+
+/// The deadline is the upstream's own: shorter than the default cuts a slow origin early,
+/// longer than the default lets one answer that the default would have cut (the default is
+/// 2 s under test, 30 s in a release build).
+#[tokio::test]
+async fn request_timeout_ms_is_per_upstream_in_both_directions() {
+    let slow = slow_origin(Duration::from_millis(1500)).await;
+    let slower = slow_origin(Duration::from_millis(3500)).await;
+    let st = hosts_state(
+        "[[route]]\npath = \"/short/{*r}\"\nupstream = \"short\"\n\
+         [[route]]\npath = \"/long/{*r}\"\nupstream = \"long\"\n\
+         [[route]]\npath = \"/default/{*r}\"\nupstream = \"dflt\"\n",
+        &format!(
+            "[upstream.short]\nurl = \"http://127.0.0.1:{slow}\"\nrequest_timeout_ms = 200\n\
+             [upstream.long]\nurl = \"http://127.0.0.1:{slower}\"\nrequest_timeout_ms = 10000\n\
+             [upstream.dflt]\nurl = \"http://127.0.0.1:{slower}\"\n"
+        ),
+    );
+    let (code, took) = timed(&st, Method::GET, "/short/x").await;
+    assert_eq!(code, 504, "cut at 200 ms, the origin needs 1500");
+    assert!(
+        took >= Duration::from_millis(200) && took < Duration::from_millis(1400),
+        "cut at the configured 200 ms, not at the origin's 1500 or the default: {took:?}"
+    );
+    let (code, took) = timed(&st, Method::GET, "/long/x").await;
+    assert_eq!(code, 200, "10 s allowed, the origin needs 3.5: {took:?}");
+    let (code, took) = timed(&st, Method::GET, "/default/x").await;
+    assert_eq!(
+        code, 504,
+        "the same origin without the setting is cut at the default"
+    );
+    assert!(took < Duration::from_millis(3400), "{took:?}");
+}
+
+/// Every attempt of a pool gets the upstream's deadline, not the default.
+#[tokio::test]
+async fn request_timeout_ms_bounds_each_pool_attempt() {
+    let (h1, a1) = hanging_origin().await;
+    let (h2, a2) = hanging_origin().await;
+    let st = hosts_state(
+        "[[route]]\npath = \"/{*rest}\"\nupstream = \"p\"\n",
+        &format!(
+            "[upstream.p]\nurls = [\"http://127.0.0.1:{h1}\", \"http://127.0.0.1:{h2}\"]\n\
+             request_timeout_ms = 250\n"
+        ),
+    );
+    let (code, took) = timed(&st, Method::GET, "/p").await;
+    assert_eq!(code, 504);
+    assert_eq!(
+        (a1.load(Ordering::Relaxed), a2.load(Ordering::Relaxed)),
+        (1, 1),
+        "each member tried once"
+    );
+    assert!(
+        took >= Duration::from_millis(500) && took < Duration::from_millis(3000),
+        "two attempts of 250 ms, not two of the default: {took:?}"
+    );
+}
+
+/// A cache miss fetches from the origin under the same deadline.
+#[tokio::test]
+async fn request_timeout_ms_bounds_a_cache_fetch() {
+    let slow = slow_origin(Duration::from_millis(1500)).await;
+    let st = hosts_state(
+        "[[route]]\npath = \"/{*rest}\"\nupstream = \"u\"\nmode = \"static_cache\"\n\
+         cache_profile = \"c\"\n",
+        &format!("[upstream.u]\nurl = \"http://127.0.0.1:{slow}\"\nrequest_timeout_ms = 200\n"),
+    );
+    let (code, took) = timed(&st, Method::GET, "/asset.js").await;
+    assert_eq!(code, 504);
+    assert!(took < Duration::from_millis(1400), "{took:?}");
+}
+
 // ── the access log is on by default, and can be turned off ──────────────────
 
 /// Requests through a state built from `extra` (top-level TOML), with the subscriber

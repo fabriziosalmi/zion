@@ -509,11 +509,13 @@ mod tests {
         assert!(c
             .toml
             .contains("hosts = [\"blog.example.com\", \"www.blog.example.com\"]"));
+        // proxy_read_timeout → request_timeout_ms, with the semantic delta stated.
+        assert!(c.toml.contains("request_timeout_ms = 300000"), "{}", c.toml);
         assert!(has_finding(
             &c,
-            Status::Unsupported,
+            Status::Partial,
             "proxy_read_timeout",
-            "connect"
+            "request_timeout_ms = 300000"
         ));
         assert!(has_finding(
             &c,
@@ -972,6 +974,103 @@ mod tests {
              location / { proxy_connect_timeout 5s; proxy_pass http://127.0.0.1:1; } }");
         assert!(c.toml.contains("connect_timeout_ms = 5000"));
         assert!(!c.toml.contains("connect_timeout_ms = 30000"));
+    }
+
+    #[test]
+    fn proxy_read_timeout_becomes_request_timeout_ms() {
+        // Location overrides server, like the connect timeout.
+        let c = ok("server { listen 80; proxy_read_timeout 60s; \
+             location / { proxy_read_timeout 120s; proxy_pass http://127.0.0.1:1; } }");
+        assert!(c.toml.contains("request_timeout_ms = 120000"), "{}", c.toml);
+        assert!(!c.toml.contains("request_timeout_ms = 60000"));
+        // Partial, not convert: the finding states where the two differ.
+        assert!(has_finding(
+            &c,
+            Status::Partial,
+            "proxy_read_timeout",
+            "between two reads"
+        ));
+        // Server level alone is inherited.
+        let c = ok("server { listen 80; proxy_read_timeout 45s; \
+             location / { proxy_pass http://127.0.0.1:1; } }");
+        assert!(c.toml.contains("request_timeout_ms = 45000"), "{}", c.toml);
+        // Without the directive nothing is emitted: the default applies.
+        let c = ok("server { listen 80; location / { proxy_pass http://127.0.0.1:1; } }");
+        assert!(!c.toml.contains("request_timeout_ms"));
+    }
+
+    #[test]
+    fn a_read_timeout_zion_cannot_express_is_not_emitted() {
+        // 0 and anything past the 1 h connection cap are refused by the config: the importer
+        // must say so instead of emitting a config that fails its own validation.
+        for bad in ["0", "2h", "soon"] {
+            let c = ok(&format!(
+                "server {{ listen 80; location / {{ proxy_read_timeout {bad}; \
+                 proxy_pass http://127.0.0.1:1; }} }}"
+            ));
+            assert!(!c.toml.contains("request_timeout_ms"), "{bad}: {}", c.toml);
+            assert!(
+                has_finding(
+                    &c,
+                    Status::Unsupported,
+                    "proxy_read_timeout",
+                    "default 30 s"
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_send_timeout_points_at_request_timeout_ms() {
+        let c = ok("server { listen 80; location / { proxy_send_timeout 90s; \
+             proxy_pass http://127.0.0.1:1; } }");
+        assert!(
+            !c.toml.contains("request_timeout_ms"),
+            "nothing is invented from it"
+        );
+        assert!(has_finding(
+            &c,
+            Status::Unsupported,
+            "proxy_send_timeout",
+            "request_timeout_ms"
+        ));
+    }
+
+    #[test]
+    fn two_locations_on_one_upstream_keep_the_first_read_timeout() {
+        let c = ok("server { listen 80; \
+             location /a/ { proxy_read_timeout 10s; proxy_pass http://127.0.0.1:1; } \
+             location /b/ { proxy_read_timeout 99s; proxy_pass http://127.0.0.1:1; } }");
+        assert!(c.toml.contains("request_timeout_ms = 10000"), "{}", c.toml);
+        assert!(!c.toml.contains("request_timeout_ms = 99000"));
+        // The one that is not applied is named, not dropped in silence.
+        assert!(has_finding(
+            &c,
+            Status::Partial,
+            "proxy_read_timeout",
+            "request_timeout_ms = 10000 kept (the first), 99000 not applied"
+        ));
+        // Same for the connect timeout, which shares the mechanism.
+        let c = ok("server { listen 80; \
+             location /a/ { proxy_connect_timeout 1s; proxy_pass http://127.0.0.1:1; } \
+             location /b/ { proxy_connect_timeout 9s; proxy_pass http://127.0.0.1:1; } }");
+        assert!(has_finding(
+            &c,
+            Status::Partial,
+            "proxy_connect_timeout",
+            "connect_timeout_ms = 1000 kept (the first), 9000 not applied"
+        ));
+        // Equal values are not a conflict.
+        let c = ok("server { listen 80; \
+             location /a/ { proxy_read_timeout 10s; proxy_pass http://127.0.0.1:1; } \
+             location /b/ { proxy_read_timeout 10s; proxy_pass http://127.0.0.1:1; } }");
+        assert!(!has_finding(
+            &c,
+            Status::Partial,
+            "proxy_read_timeout",
+            "not applied"
+        ));
     }
 
     #[test]

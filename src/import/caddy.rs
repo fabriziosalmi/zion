@@ -1195,6 +1195,7 @@ fn push_route(
             name: up_name.clone(),
             urls,
             connect_timeout_ms: None,
+            request_timeout_ms: None,
             keepalive: None,
             preserve_host: false,
             health_host: None,

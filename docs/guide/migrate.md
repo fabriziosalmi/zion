@@ -38,7 +38,7 @@ $ zion import nginx app.conf -o zion.toml
   zion import nginx: 14 findings — 6 convert, 2 partial, 4 auto, 2 unsupported
    line  status       directive         detail
       8  partial      server            1 plain-HTTP server(s) — Zion always terminates TLS …
-     31  unsupported  proxy_read_timeout  only the upstream connect timeout is configurable in Zion
+     31  partial      proxy_read_timeout  request_timeout_ms = 120000: Zion bounds the whole exchange up to the response headers …
 ```
 
 Attach the findings report to your migration PR: it *is* the record of what

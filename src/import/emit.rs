@@ -106,6 +106,9 @@ fn render_upstream(out: &mut String, up: &UpstreamOut) {
     if let Some(ms) = up.connect_timeout_ms {
         out.push_str(&format!("connect_timeout_ms = {ms}\n"));
     }
+    if let Some(ms) = up.request_timeout_ms {
+        out.push_str(&format!("request_timeout_ms = {ms}\n"));
+    }
     if let Some(k) = up.keepalive {
         out.push_str(&format!("keepalive = {k}\n"));
     }
@@ -232,6 +235,7 @@ mod tests {
                 name: "b".into(),
                 urls: vec!["http://127.0.0.1:1".into()],
                 connect_timeout_ms: None,
+                request_timeout_ms: None,
                 keepalive: None,
                 preserve_host: false,
                 health_host: None,
@@ -286,6 +290,7 @@ mod tests {
                 name: "backend".into(),
                 urls: vec!["http://127.0.0.1:8080".into()],
                 connect_timeout_ms: None,
+                request_timeout_ms: None,
                 keepalive: None,
                 preserve_host: false,
                 health_host: None,
@@ -331,6 +336,7 @@ mod tests {
                 name: "pool".into(),
                 urls: vec!["http://10.0.0.1:80".into(), "http://10.0.0.2:80".into()],
                 connect_timeout_ms: Some(75_000),
+                request_timeout_ms: None,
                 keepalive: Some(32),
                 preserve_host: false,
                 health_host: None,
@@ -379,6 +385,7 @@ mod tests {
                 name: "backend".into(),
                 urls: vec!["http://127.0.0.1:8080".into()],
                 connect_timeout_ms: None,
+                request_timeout_ms: None,
                 keepalive: None,
                 preserve_host: false,
                 health_host: None,

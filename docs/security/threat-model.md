@@ -191,8 +191,8 @@ logs / audit.
 admits and processes (large bodies, slow upstream, rate-limit bypass).
 - **Mitigation**: lock-free rate-limiter with packed `(window, count)` u64
   per IP; bounded `MAX_RATE_MAP_ENTRIES=100_000` with fail-closed eviction;
-  `MAX_URI_LEN=8192`; method allowlist (7 methods); upstream timeout via
-  hyper's pool config; 1h connection ceiling for H2/WS/SSE.
+  `MAX_URI_LEN=8192`; method allowlist (7 methods); a deadline on every upstream
+  attempt (`request_timeout_ms`, default 30 s, never "none"); 1h connection ceiling for H2/WS/SSE.
 
 **E — elevation of privilege**: routing a request to a more privileged
 upstream than the route definition allows.
