@@ -8,6 +8,11 @@ All notable changes to Zion Edge Gateway are documented here.
 
 - **The HTTP→HTTPS redirect went back to the HTTP port on non-standard ports.** The `:80` listener built `Location` from the request's `Host` as it came, port included: with `listen_http = :8080` and `listen_https = :8443` (the defaults of `zion auto`), `http://localhost:8080/` redirected to `https://localhost:8080/`, TLS on the plaintext port. A `Host` that names zion's own HTTP port is now sent to the HTTPS listener's port (omitted when it is 443). A `Host` without a port, or with a port that is not zion's (a port mapping in front), is left as it is.
 
+### Added
+
+- **`[admin] revocations_path`**: revoked token ids survive a restart (#522). The list of `POST /admin/revoke` was in memory only, so a restart made every revoked token valid again until it expired. With this path set, each revocation is written and synced before the API answers, and read back at boot (expired entries are dropped, the file is compacted). A list that exists and cannot be read stops the boot. Still per instance: in a fleet, revoke on every node.
+- **`[auth_profile.x] previous_secret_env`**: rotate an HMAC signing key without invalidating every outstanding token. A token whose signature the current key rejects is checked against the previous one; everything else (expiry, issuer, audience) is checked the same. Remove the setting when the old tokens have expired. See "Rotating the signing key" in the auth guide.
+
 ### Security
 
 - **A client could set `X-Zion-Mesh-Score`** (#523). The header carries the mesh's reputation for the client IP to the upstream, which may use it to add friction or to trust. Zion set it when the mesh had a score, and never removed an inbound copy: a client with no score (or any client, on a build without the mesh) could hand the upstream a reputation of its own choosing. It is now dropped from every request before the pipeline sets the real value, like `X-Auth-Subject` and `X-Auth-Email`.
