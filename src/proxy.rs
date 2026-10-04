@@ -587,7 +587,10 @@ pub async fn proxy_pass_ha(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             crate::logging::warn(
                 "proxy",
-                &format!("upstream {url} timeout after {attempt_timeout:?}"),
+                &format!(
+                    "upstream {} timeout after {attempt_timeout:?}",
+                    crate::http_util::redact_userinfo(&url)
+                ),
             );
             timed_out = true;
             candidates.retain(|c| c != &url);
@@ -617,7 +620,10 @@ pub async fn proxy_pass_ha(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::logging::warn(
                     "proxy",
-                    &format!("failover: upstream {url} error (connect={connect}): {e}"),
+                    &format!(
+                        "failover: upstream {} error (connect={connect}): {e}",
+                        crate::http_util::redact_userinfo(&url)
+                    ),
                 );
                 // Eagerly eject: mark unhealthy and bring the next probe
                 // forward (`next_probe_at_us = 0` == due now) so the upstream
@@ -751,7 +757,8 @@ const HA_BODY_COLLECT_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 fn upstream_context<B>(req: &Request<B>) -> String {
     let uri = req.uri();
     let target = match (uri.scheme_str(), uri.authority()) {
-        (Some(s), Some(a)) => format!("{s}://{a}"),
+        // An authority can carry `user:pass@`: never into a log line.
+        (Some(s), Some(a)) => crate::http_util::redact_userinfo(&format!("{s}://{a}")),
         _ => "-".to_string(),
     };
     let trace = req

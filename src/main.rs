@@ -422,6 +422,14 @@ fn warn_feature_config_gaps(config: &config::ZionConfig) {
             );
         }
     }
+    // Same for the IP pseudonymisation key: with it, every logged token can be reversed.
+    if config.redact.ip_hmac_key.is_some() {
+        logging::warn(
+            "config",
+            "[redact] ip_hmac_key is a literal in zion.toml — deprecated; move the key to an \
+             environment variable and set `ip_hmac_key_env` instead.",
+        );
+    }
     // (A route with auth_profile on a build without `--features auth` is a config
     // error, see config::semantic_errors: it would serve unauthenticated.)
     #[cfg(not(feature = "auth"))]

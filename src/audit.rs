@@ -140,8 +140,14 @@ pub struct RedactConfig {
     /// How client IPs are written to the access log, the audit trail and connection-error logs
     /// (default `full`; see [`IpPrivacy`]). Applied at start-up.
     pub ip: IpPrivacy,
-    /// Secret for `ip = "hmac"` (at least 16 bytes; keep it out of version control).
+    /// Secret for `ip = "hmac"` (at least 16 bytes). Deprecated in favour of
+    /// `ip_hmac_key_env`: a literal ends up wherever `zion.toml` goes (version control,
+    /// config management, backups), and with the key every logged token can be reversed by
+    /// enumerating the IPv4 space.
     pub ip_hmac_key: Option<String>,
+    /// Name of the environment variable holding the secret for `ip = "hmac"`. Preferred over
+    /// the literal `ip_hmac_key`; set one or the other.
+    pub ip_hmac_key_env: Option<String>,
 }
 
 impl std::fmt::Debug for RedactConfig {
@@ -152,6 +158,7 @@ impl std::fmt::Debug for RedactConfig {
             .field("query_params", &self.query_params)
             .field("ip", &self.ip)
             .field("ip_hmac_key", &self.ip_hmac_key.as_ref().map(|_| "<set>"))
+            .field("ip_hmac_key_env", &self.ip_hmac_key_env)
             .finish()
     }
 }
@@ -163,19 +170,53 @@ impl RedactConfig {
     /// Problems that make this block unusable, for config validation.
     pub fn errors(&self) -> Vec<String> {
         let mut e = Vec::new();
-        match (self.ip, self.ip_hmac_key.as_deref()) {
-            (IpPrivacy::Hmac, None) => {
-                e.push("redact.ip = \"hmac\" needs redact.ip_hmac_key".to_string())
-            }
-            (IpPrivacy::Hmac, Some(k)) if k.len() < MIN_IP_HMAC_KEY_BYTES => e.push(format!(
-                "redact.ip_hmac_key must be at least {MIN_IP_HMAC_KEY_BYTES} bytes"
-            )),
-            (IpPrivacy::Full | IpPrivacy::Truncate, Some(_)) => {
-                e.push("redact.ip_hmac_key is only used with redact.ip = \"hmac\"".to_string())
+        if self.ip_hmac_key.is_some() && self.ip_hmac_key_env.is_some() {
+            e.push(
+                "redact.ip_hmac_key and redact.ip_hmac_key_env are both set: keep \
+                 ip_hmac_key_env and remove the literal"
+                    .to_string(),
+            );
+            return e;
+        }
+        let configured = self.ip_hmac_key.is_some() || self.ip_hmac_key_env.is_some();
+        match (self.ip, self.resolve_ip_hmac_key()) {
+            (IpPrivacy::Full | IpPrivacy::Truncate, _) if configured => e.push(
+                "redact.ip_hmac_key / ip_hmac_key_env is only used with redact.ip = \"hmac\""
+                    .to_string(),
+            ),
+            (IpPrivacy::Hmac, Err(problem)) => e.push(problem),
+            (IpPrivacy::Hmac, Ok(None)) => e.push(
+                "redact.ip = \"hmac\" needs redact.ip_hmac_key_env (or redact.ip_hmac_key)"
+                    .to_string(),
+            ),
+            (IpPrivacy::Hmac, Ok(Some(k))) if k.len() < MIN_IP_HMAC_KEY_BYTES => {
+                let which = if self.ip_hmac_key_env.is_some() {
+                    "the value of redact.ip_hmac_key_env"
+                } else {
+                    "redact.ip_hmac_key"
+                };
+                e.push(format!(
+                    "{which} must be at least {MIN_IP_HMAC_KEY_BYTES} bytes"
+                ));
             }
             _ => {}
         }
         e
+    }
+
+    /// The key for `ip = "hmac"`: from the environment variable `ip_hmac_key_env` names, else
+    /// the literal. `Err` when the variable is named but unset or empty (the message names
+    /// the variable, never a value).
+    fn resolve_ip_hmac_key(&self) -> Result<Option<String>, String> {
+        match &self.ip_hmac_key_env {
+            Some(var) => match std::env::var(var) {
+                Ok(v) if !v.is_empty() => Ok(Some(v)),
+                _ => Err(format!(
+                    "redact.ip_hmac_key_env names {var}, which is not set (or empty)"
+                )),
+            },
+            None => Ok(self.ip_hmac_key.clone()),
+        }
     }
 }
 
@@ -185,8 +226,9 @@ impl RedactConfig {
         CompiledRedaction {
             ip: self.ip,
             ip_key: self
-                .ip_hmac_key
-                .as_deref()
+                .resolve_ip_hmac_key()
+                .ok()
+                .flatten()
                 .filter(|k| k.len() >= MIN_IP_HMAC_KEY_BYTES)
                 .map(|k| hmac::Key::new(hmac::HMAC_SHA256, k.as_bytes())),
             headers: self
@@ -1561,6 +1603,62 @@ mod tests {
         .compile()
     }
     const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    /// `ip_hmac_key_env` (ZION-SEC-02): the key comes from the environment, so `zion.toml`
+    /// can go to version control without it.
+    #[test]
+    fn the_hmac_key_can_come_from_the_environment() {
+        const VAR: &str = "ZION_TEST_IP_HMAC_KEY_5f21";
+        let from_env = |ip| RedactConfig {
+            ip,
+            ip_hmac_key_env: Some(VAR.to_string()),
+            ..Default::default()
+        };
+        // Named but not set: refused, naming the variable.
+        std::env::remove_var(VAR);
+        let e = from_env(IpPrivacy::Hmac).errors().join("\n");
+        assert!(e.contains(VAR) && e.contains("not set"), "{e}");
+        // Too short: refused without showing the value.
+        std::env::set_var(VAR, "short-key");
+        let e = from_env(IpPrivacy::Hmac).errors().join("\n");
+        assert!(
+            e.contains("at least 16 bytes") && !e.contains("short-key"),
+            "{e}"
+        );
+        // Set: used, and it gives the token the same key gives as a literal.
+        std::env::set_var(VAR, KEY);
+        let cfg = from_env(IpPrivacy::Hmac);
+        assert!(cfg.errors().is_empty(), "{:?}", cfg.errors());
+        let ip = "203.0.113.9".parse().unwrap();
+        let token = cfg.compile().ip_label(ip).to_string();
+        assert!(token.starts_with("ip:"), "{token}");
+        assert_eq!(
+            token,
+            redact(IpPrivacy::Hmac, Some(KEY)).ip_label(ip).to_string()
+        );
+        // Both forms at once: one must go.
+        let both = RedactConfig {
+            ip: IpPrivacy::Hmac,
+            ip_hmac_key: Some(KEY.to_string()),
+            ip_hmac_key_env: Some(VAR.to_string()),
+            ..Default::default()
+        };
+        assert!(both.errors().join("\n").contains("both set"));
+        // A key with nothing to use it.
+        let e = from_env(IpPrivacy::Full).errors().join("\n");
+        assert!(e.contains("only used with redact.ip = \"hmac\""), "{e}");
+        std::env::remove_var(VAR);
+        // The debug print names the variable and never a key.
+        let shown = format!(
+            "{:?}",
+            RedactConfig {
+                ip: IpPrivacy::Hmac,
+                ip_hmac_key: Some(KEY.to_string()),
+                ..Default::default()
+            }
+        );
+        assert!(!shown.contains(KEY), "{shown}");
+    }
 
     #[test]
     fn ip_full_is_the_default_and_writes_the_address_as_is() {

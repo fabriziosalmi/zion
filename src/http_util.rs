@@ -146,3 +146,41 @@ mod response_header_tests {
         );
     }
 }
+
+/// A URL without the `user:pass@` of its authority. Upstream URLs may carry basic-auth
+/// credentials, and they are written to metric labels, the JSON snapshot, the logs and
+/// config error messages: none of those may show them.
+pub(crate) fn redact_userinfo(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let rest = &url[scheme_end + 3..];
+        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        if let Some(at) = rest[..authority_end].rfind('@') {
+            return format!("{}{}", &url[..scheme_end + 3], &rest[at + 1..]);
+        }
+    }
+    url.to_string()
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_userinfo;
+
+    #[test]
+    fn userinfo_is_dropped_and_nothing_else() {
+        for (url, shown) in [
+            ("http://user:pw@host:80/p@th", "http://host:80/p@th"),
+            ("https://token@api.internal", "https://api.internal"),
+            ("http://u:p%40ss@h:1", "http://h:1"),
+            // an `@` after the authority is not userinfo
+            ("http://host/path?to=a@b", "http://host/path?to=a@b"),
+            ("http://host?next=x@y", "http://host?next=x@y"),
+            ("http://host#frag@x", "http://host#frag@x"),
+            ("http://host:80", "http://host:80"),
+            // not a URL: left alone
+            ("host:8080", "host:8080"),
+            ("", ""),
+        ] {
+            assert_eq!(redact_userinfo(url), shown, "{url}");
+        }
+    }
+}
