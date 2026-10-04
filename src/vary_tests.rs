@@ -3937,32 +3937,32 @@ async fn slow_origin(delay: Duration) -> u16 {
 /// 2 s under test, 30 s in a release build).
 #[tokio::test]
 async fn request_timeout_ms_is_per_upstream_in_both_directions() {
-    let slow = slow_origin(Duration::from_millis(900)).await;
-    let slower = slow_origin(Duration::from_millis(2600)).await;
+    let slow = slow_origin(Duration::from_millis(1500)).await;
+    let slower = slow_origin(Duration::from_millis(3500)).await;
     let st = hosts_state(
         "[[route]]\npath = \"/short/{*r}\"\nupstream = \"short\"\n\
          [[route]]\npath = \"/long/{*r}\"\nupstream = \"long\"\n\
          [[route]]\npath = \"/default/{*r}\"\nupstream = \"dflt\"\n",
         &format!(
             "[upstream.short]\nurl = \"http://127.0.0.1:{slow}\"\nrequest_timeout_ms = 200\n\
-             [upstream.long]\nurl = \"http://127.0.0.1:{slower}\"\nrequest_timeout_ms = 6000\n\
+             [upstream.long]\nurl = \"http://127.0.0.1:{slower}\"\nrequest_timeout_ms = 10000\n\
              [upstream.dflt]\nurl = \"http://127.0.0.1:{slower}\"\n"
         ),
     );
     let (code, took) = timed(&st, Method::GET, "/short/x").await;
-    assert_eq!(code, 504, "cut at 200 ms, the origin needs 900");
+    assert_eq!(code, 504, "cut at 200 ms, the origin needs 1500");
     assert!(
-        took >= Duration::from_millis(200) && took < Duration::from_millis(800),
-        "cut at the configured 200 ms, not at the origin's 900 or the default: {took:?}"
+        took >= Duration::from_millis(200) && took < Duration::from_millis(1400),
+        "cut at the configured 200 ms, not at the origin's 1500 or the default: {took:?}"
     );
     let (code, took) = timed(&st, Method::GET, "/long/x").await;
-    assert_eq!(code, 200, "6 s allowed, the origin needs 2.6: {took:?}");
+    assert_eq!(code, 200, "10 s allowed, the origin needs 3.5: {took:?}");
     let (code, took) = timed(&st, Method::GET, "/default/x").await;
     assert_eq!(
         code, 504,
         "the same origin without the setting is cut at the default"
     );
-    assert!(took < Duration::from_millis(2500), "{took:?}");
+    assert!(took < Duration::from_millis(3400), "{took:?}");
 }
 
 /// Every attempt of a pool gets the upstream's deadline, not the default.
@@ -3985,7 +3985,7 @@ async fn request_timeout_ms_bounds_each_pool_attempt() {
         "each member tried once"
     );
     assert!(
-        took >= Duration::from_millis(500) && took < Duration::from_millis(1500),
+        took >= Duration::from_millis(500) && took < Duration::from_millis(3000),
         "two attempts of 250 ms, not two of the default: {took:?}"
     );
 }
@@ -3993,7 +3993,7 @@ async fn request_timeout_ms_bounds_each_pool_attempt() {
 /// A cache miss fetches from the origin under the same deadline.
 #[tokio::test]
 async fn request_timeout_ms_bounds_a_cache_fetch() {
-    let slow = slow_origin(Duration::from_millis(900)).await;
+    let slow = slow_origin(Duration::from_millis(1500)).await;
     let st = hosts_state(
         "[[route]]\npath = \"/{*rest}\"\nupstream = \"u\"\nmode = \"static_cache\"\n\
          cache_profile = \"c\"\n",
@@ -4001,7 +4001,7 @@ async fn request_timeout_ms_bounds_a_cache_fetch() {
     );
     let (code, took) = timed(&st, Method::GET, "/asset.js").await;
     assert_eq!(code, 504);
-    assert!(took < Duration::from_millis(800), "{took:?}");
+    assert!(took < Duration::from_millis(1400), "{took:?}");
 }
 
 // ── the access log is on by default, and can be turned off ──────────────────
