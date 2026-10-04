@@ -4,6 +4,13 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+**Heads-up: the default of `max_token_lifetime_secs` becomes 86400 (24 h) in the next minor release** (#553). Nothing is refused yet. See below how to find out whether it affects you.
+
+### Changed
+
+- **Auth: tokens that the future default would refuse are counted and warned about.** A profile without `max_token_lifetime_secs` accepts a token however far its `exp` is, which is what lets a mis-issued or forged token live for years. From the next minor release the default cap is 24 h. Until then: zion warns at boot for every profile without the setting, and a token with more than 24 h left on such a profile is accepted, counted in `zion_auth_long_lived_tokens_total` and reported in the log (once a minute at most; the remaining lifetime only, never the token). If the counter stays at zero the change will not affect you; otherwise set the value you need.
+- **`max_token_lifetime_secs = 0` now means "no cap"**, the explicit way to keep today's behaviour after the default changes. It used to mean a cap of zero seconds, which refused every token.
+
 ## [0.9.9] - 2026-10-04
 
 **The memory growth is found and fixed, and it was a security bug.** The response cache could exceed `max_entries` without bound under concurrent requests: that is what made the nightly soak climb to 365 MiB, and it let anyone grow the memory of a `static_cache` route until the process was killed. Also in this release: the cache purge no longer trusts every private address, a client can no longer forge `X-Zion-Mesh-Score`, client certificates can be revoked, upstream credentials and config secrets stay out of the snapshot, logs and error messages, and the CLI stops running with defaults when an argument is wrong. **Upgrade if you use `static_cache` or `cache_profile`.**

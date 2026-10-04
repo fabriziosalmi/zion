@@ -507,6 +507,9 @@ pub struct Metrics {
     pub mesh_claims_dropped_rate: AtomicU64,
     /// Dispatcher hits that found a mesh score for the client IP.
     pub mesh_score_lookups: AtomicU64,
+    /// Tokens accepted on a profile without `max_token_lifetime_secs` although they expire
+    /// more than 24 h from now: what the future default cap would refuse (#553).
+    pub auth_long_lived_tokens: AtomicU64,
     /// Total bytes received on the gossip socket (decoded or not).
     pub mesh_gossip_bytes_in: AtomicU64,
     /// Total bytes sent on the gossip socket.
@@ -621,6 +624,7 @@ impl Metrics {
             mesh_claims_dropped_other: AtomicU64::new(0),
             mesh_claims_dropped_rate: AtomicU64::new(0),
             mesh_score_lookups: AtomicU64::new(0),
+            auth_long_lived_tokens: AtomicU64::new(0),
             mesh_gossip_bytes_in: AtomicU64::new(0),
             mesh_gossip_bytes_out: AtomicU64::new(0),
             acme_renewals_total: AtomicU64::new(0),
@@ -1378,7 +1382,17 @@ impl Metrics {
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(
-            b"# HELP zion_mesh_score_lookups_total Dispatcher hits that found a mesh score for the client IP.\n\
+            b"# HELP zion_auth_long_lived_tokens_total Tokens accepted with more than 24 h left on a profile without max_token_lifetime_secs (the future default cap would refuse them).\n\
+                                # TYPE zion_auth_long_lived_tokens_total counter\n\
+                                zion_auth_long_lived_tokens_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.auth_long_lived_tokens.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(
+            b"\n# HELP zion_mesh_score_lookups_total Dispatcher hits that found a mesh score for the client IP.\n\
                                 # TYPE zion_mesh_score_lookups_total counter\n\
                                 zion_mesh_score_lookups_total ",
         );

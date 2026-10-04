@@ -68,7 +68,7 @@ waf = true
 | `audience` | string | — | Expected `aud` claim (optional) |
 | `forward_claims` | bool | `true` | Inject `X-Auth-Subject` and `X-Auth-Email` headers to upstream |
 | `leeway_secs` | integer | `30` | Clock-skew tolerance applied to `exp`/`nbf`. `0` is allowed; above `300` is rejected. |
-| `max_token_lifetime_secs` | integer | — | Reject tokens whose `exp` is further in the future than this (plus `leeway_secs`). Unset = no cap. See [Token lifetime and revocation](#token-lifetime-and-revocation). |
+| `max_token_lifetime_secs` | integer | — | Reject tokens whose `exp` is further in the future than this (plus `leeway_secs`). Unset = no cap. See [Token lifetime and revocation](#token-lifetime-and-revocation). `0` = no cap, on purpose. **Unset becomes `86400` in the next minor release**; until then tokens beyond 24 h are accepted, counted (`zion_auth_long_lived_tokens_total`) and warned about. |
 
 ## Supported algorithms
 
@@ -152,7 +152,14 @@ Consequences for operators:
   Set `max_token_lifetime_secs` to the longest lifetime you actually issue (for
   example `900`) and Zion rejects any token whose `exp` is further out, so a
   mis-issued or forged-by-a-leaked-key token with a far-future `exp` is refused
-  instead of living for years.
+  instead of living for years. `0` means "no cap", said on purpose.
+- **The default is changing.** Today a profile without the setting has no cap.
+  From the next minor release the default is `86400` (24 h) and a token further
+  out is refused. Until then such a token is accepted, counted in
+  `zion_auth_long_lived_tokens_total`, and warned about in the log (once a minute
+  at most), and zion warns at boot for every profile without the setting. If the
+  counter stays at zero, the change will not affect you; otherwise set the value
+  you need, or `0`.
 - `aud` may be a single string or an array (OIDC providers commonly send an
   array); the profile's `audience` must appear in it.
 - A logout / key-compromise event cannot be enforced at the edge mid-lifetime;
