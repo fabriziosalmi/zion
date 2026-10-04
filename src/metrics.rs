@@ -1571,9 +1571,19 @@ pub fn uptime_secs() -> u64 {
 /// One row in the upstream health table — what the TUI shows per upstream.
 #[derive(serde::Serialize)]
 pub struct UpstreamRow<'a> {
+    /// Serialized without its `user:pass@`: the snapshot is read by anything that passes
+    /// the internal-network gate, and by `GET /admin/config`.
+    #[serde(serialize_with = "serialize_url_without_credentials")]
     pub url: &'a str,
     pub healthy: bool,
     pub latency_us: u64,
+}
+
+fn serialize_url_without_credentials<S: serde::Serializer>(
+    url: &&str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&redact_userinfo(url))
 }
 
 /// Build a JSON snapshot of the live state of Zion. Consumed by `zion top`,
@@ -1699,18 +1709,7 @@ fn escape_label(s: &str) -> String {
         .replace('\n', "\\n")
 }
 
-/// Drop a `user:pass@` prefix from a URL's authority so credentials embedded in a
-/// configured upstream URL never end up as a metric label.
-fn redact_userinfo(url: &str) -> String {
-    if let Some(scheme_end) = url.find("://") {
-        let rest = &url[scheme_end + 3..];
-        let authority_end = rest.find('/').unwrap_or(rest.len());
-        if let Some(at) = rest[..authority_end].rfind('@') {
-            return format!("{}{}", &url[..scheme_end + 3], &rest[at + 1..]);
-        }
-    }
-    url.to_string()
-}
+use crate::http_util::redact_userinfo;
 
 #[cfg(test)]
 mod tests {
@@ -2091,6 +2090,35 @@ mod tests {
         let out = String::from_utf8(m.render_with_upstreams(false, &health).to_vec()).unwrap();
         assert!(!out.contains("secret"), "credentials leaked into a label");
         assert!(out.contains("upstream=\"http://h:1\""));
+    }
+
+    /// The JSON snapshot (also what `GET /admin/config` returns) is read by anything that
+    /// passes the internal-network gate: no upstream credentials in it either (ZION-SEC-04).
+    #[test]
+    fn the_snapshot_never_shows_upstream_credentials() {
+        let rows = [
+            UpstreamRow {
+                url: "http://deploy:s3cr3t-pass@backend.internal:8080",
+                healthy: true,
+                latency_us: 120,
+            },
+            UpstreamRow {
+                url: "https://plain.internal:8443",
+                healthy: false,
+                latency_us: 0,
+            },
+        ];
+        let platform = crate::bootstrap::detect();
+        let json = String::from_utf8(snapshot_json(&platform, &rows).to_vec()).unwrap();
+        assert!(
+            !json.contains("s3cr3t-pass") && !json.contains("deploy:"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"http://backend.internal:8080\""),
+            "the upstream is still named"
+        );
+        assert!(json.contains("\"https://plain.internal:8443\""));
     }
 
     #[test]

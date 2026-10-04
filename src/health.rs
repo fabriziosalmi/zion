@@ -219,6 +219,7 @@ pub async fn probe_round(
             up.reschedule(healthy, base.elapsed().as_micros() as u64);
             if was_healthy && !healthy {
                 let next_ms = up.backoff_us.load(Relaxed) / 1000;
+                let url = crate::http_util::redact_userinfo(&url);
                 crate::logging::warn(
                     "health",
                     &format!(
@@ -226,6 +227,7 @@ pub async fn probe_round(
                     ),
                 );
             } else if !was_healthy && healthy {
+                let url = crate::http_util::redact_userinfo(&url);
                 crate::logging::info("health", &format!("upstream {url} is UP ({lat}us)"));
             }
         });

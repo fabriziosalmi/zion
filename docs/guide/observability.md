@@ -188,17 +188,22 @@ sovereign classification log (applied at start-up):
 |---|---|---|
 | `"full"` (default) | `203.0.113.9` | forensics and per-client debugging |
 | `"truncate"` | `203.0.113.0/24` (IPv4) / `2001:db8:1::/48` (IPv6) | keeps the network (abuse by ISP, rough geography), drops the host; not reversible |
-| `"hmac"` | `ip:3f9a1c7e5b2d8a40` | the same client always gets the same token, so a session or an attacker can still be followed across the logs, but the address cannot be recovered without `ip_hmac_key` |
+| `"hmac"` | `ip:3f9a1c7e5b2d8a40` | the same client always gets the same token, so a session or an attacker can still be followed across the logs, but the address cannot be recovered without the key |
 
 ```toml
 [redact]
 ip = "hmac"
-ip_hmac_key = "<at least 16 bytes of secret, from your secret store, not from git>"
+ip_hmac_key_env = "ZION_IP_HMAC_KEY"   # the variable holds at least 16 bytes of secret
 ```
 
-An IPv4-mapped IPv6 address is treated as IPv4. `hmac` needs `ip_hmac_key` (config validation
-refuses it otherwise, and refuses the key with any other mode); a missing key can never fall
-back to the raw address. Rotating the key breaks correlation with older logs, which is also
+The key belongs in the environment, not in `zion.toml`: the file ends up in version control,
+config management and backups, and with the key every logged token can be reversed by
+enumerating the IPv4 space. A literal `ip_hmac_key = "..."` still works and is deprecated
+(zion warns at boot); setting both is an error.
+
+An IPv4-mapped IPv6 address is treated as IPv4. `hmac` needs a key (config validation
+refuses it otherwise, refuses a variable that is not set, and refuses a key with any other
+mode); a missing key can never fall back to the raw address. Rotating the key breaks correlation with older logs, which is also
 how you "forget" them. Not covered: an `X-Forwarded-For` value you ask to be logged with
 `[access_log] include_headers` (redact it with `[redact] headers`), and addresses an upstream
 writes in its own logs.

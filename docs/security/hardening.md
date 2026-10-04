@@ -87,7 +87,7 @@ Two opt-in, per-upstream limits keep a struggling backend from taking the proxy 
 
 The access log, the audit trail and TLS-handshake failure lines carry the client address. `[redact] ip`
 writes it as is (default), as its network (`203.0.113.0/24`, `2001:db8:1::/48`), or as a keyed,
-irreversible, per-client-stable token (`hmac`, with `ip_hmac_key`); header and query-string values are
+irreversible, per-client-stable token (`hmac`, with the key from `ip_hmac_key_env`); header and query-string values are
 redacted with `[redact] headers` / `query_params`. See
 [Client IP privacy](/guide/observability#client-ip-privacy-redact-ip). Log lines go through a bounded
 queue: a stalled log pipe drops the newest lines (counted in `zion_log_lines_dropped_total`) instead of

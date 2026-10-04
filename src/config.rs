@@ -1391,9 +1391,57 @@ pub fn check_schema_version(raw: &str, label: &str) -> Result<(), String> {
 /// migration step.
 fn parse_document(raw: &str, label: &str) -> Result<ZionConfig, String> {
     check_schema_version(raw, label)?;
-    let config: ZionConfig =
-        toml::from_str(raw).map_err(|e| format!("Invalid TOML in {label}: {e}"))?;
+    let config: ZionConfig = toml::from_str(raw)
+        .map_err(|e| format!("Invalid TOML in {label}: {}", describe_toml_error(&e, raw)))?;
     upgrade_schema(config).map_err(|e| format!("{label}: {e}"))
+}
+
+/// A TOML error as `line L, column C: message`, without the excerpt of the source line the
+/// `toml` crate prints, and without the string value serde quotes in a type error.
+///
+/// The excerpt is the offending line verbatim, and that line can be `secret = "..."` or
+/// `ip_hmac_key = "..."`: a typo next to a secret would copy it to the log, to the answer of
+/// a rejected `POST /admin/config` and to the audit trail. The position is enough to find it.
+pub(crate) fn describe_toml_error(e: &toml::de::Error, raw: &str) -> String {
+    let message = mask_quoted_values(e.message());
+    match e.span() {
+        Some(span) => {
+            let upto = &raw[..span.start.min(raw.len())];
+            let line = upto.bytes().filter(|b| *b == b'\n').count() + 1;
+            let column = upto.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+            format!("line {line}, column {column}: {message}")
+        }
+        None => message,
+    }
+}
+
+/// serde reports a value of the wrong type as `invalid type: string "the value", expected ..`:
+/// the value may be a secret pasted into the wrong field. Keep the kind, drop the content.
+fn mask_quoted_values(message: &str) -> String {
+    const MARK: &str = "string \"";
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(at) = rest.find(MARK) {
+        out.push_str(&rest[..at]);
+        out.push_str("a string");
+        let after = &rest[at + MARK.len()..];
+        // The value is printed with `{:?}`: its end is the first quote not preceded by `\`.
+        let mut end = after.len();
+        let mut escaped = false;
+        for (i, c) in after.char_indices() {
+            match c {
+                '\\' if !escaped => escaped = true,
+                '"' if !escaped => {
+                    end = i + 1;
+                    break;
+                }
+                _ => escaped = false,
+            }
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Bring a config that was written for schema `config.schema_version` up to the
@@ -1444,12 +1492,15 @@ pub fn validate_str(raw: &str, label: &str) -> Result<ZionConfig, String> {
 /// first proxied request, so reject it at startup with an actionable message.
 /// Returns `Some(error)` on rejection, `None` when valid.
 fn validate_upstream_url(label: &str, url: &str) -> Option<String> {
+    // The message goes to the log, the admin API's answer and the audit trail: it must not
+    // carry the credentials an upstream URL may hold.
+    let shown = crate::http_util::redact_userinfo(url);
     match url.parse::<hyper::Uri>() {
-        Err(_) => Some(format!("{label} '{url}' is not a valid URL")),
+        Err(_) => Some(format!("{label} '{shown}' is not a valid URL")),
         Ok(uri) => match uri.scheme_str() {
             Some("http") | Some("https") => None,
             other => Some(format!(
-                "{label} '{url}' must use http:// or https:// (got {})",
+                "{label} '{shown}' must use http:// or https:// (got {})",
                 other.unwrap_or("no scheme")
             )),
         },
@@ -1628,7 +1679,8 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             if !jwks_url_is_safe(url) {
                 errors.push(format!(
                     "auth_profile.{name}.jwks_url must use https:// (http is accepted only for a \
-                     loopback address), got {url:?}"
+                     loopback address), got {:?}",
+                    crate::http_util::redact_userinfo(url)
                 ));
             }
         }
@@ -1662,8 +1714,9 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             for url in up.urls_ref() {
                 if !url.starts_with("https://") {
                     errors.push(format!(
-                        "upstream.{name}: tls = true but {url:?} is not https:// (the URL scheme \
-                         decides; use an https:// URL, and drop `tls`)"
+                        "upstream.{name}: tls = true but {:?} is not https:// (the URL scheme \
+                         decides; use an https:// URL, and drop `tls`)",
+                        crate::http_util::redact_userinfo(url)
                     ));
                 }
             }
@@ -1747,12 +1800,13 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             defs.sort_by(|a, b| a.0.cmp(&b.0));
             if defs.windows(2).any(|w| w[0].1 != w[1].1) {
                 errors.push(format!(
-                    "{} all point at {url} but disagree about its circuit breaker; they share one \
+                    "{} all point at {} but disagree about its circuit breaker; they share one \
                      health entry, so give them the same `circuit_breaker` (or none)",
                     defs.iter()
                         .map(|d| d.0.as_str())
                         .collect::<Vec<_>>()
-                        .join(", ")
+                        .join(", "),
+                    crate::http_util::redact_userinfo(url)
                 ));
             }
         }
@@ -2534,6 +2588,80 @@ mod tests {
         let c: ZionConfig =
             toml::from_str(&cfg("url = \"http://a:1\"\nrequest_timeout_ms = 90000")).unwrap();
         assert_eq!(c.upstream["u"].request_timeout_ms, Some(90_000));
+    }
+
+    /// A rejected config must say where the problem is without quoting the source: the
+    /// offending line can hold a secret, and the message goes to the log, to the answer of a
+    /// rejected `POST /admin/config` and to the audit trail (ZION-SEC-05).
+    #[test]
+    fn a_config_error_never_quotes_the_offending_line() {
+        const SECRET: &str = "sup3r-s3cret-hmac-key-do-not-leak";
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+                    [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n";
+        // 1. A syntax error on the secret's own line (unterminated string).
+        let doc = format!("{base}[auth_profile.p]\nsecret = \"{SECRET}\nalgorithm = \"HS256\"\n");
+        let e = parse_schema(&doc, "pushed").err().expect("refused");
+        assert!(!e.contains(SECRET) && !e.contains("s3cret"), "{e}");
+        assert!(e.contains("Invalid TOML in pushed: line 8, column"), "{e}");
+        // 2. A secret pasted into a field of another type: serde quotes the value.
+        let doc = format!(
+            "{base}[upstream.u]\nurl = \"http://a:1\"\nconnect_timeout_ms = \"{SECRET}\"\n"
+        );
+        let e = parse_schema(&doc, "pushed").err().expect("refused");
+        assert!(!e.contains(SECRET), "{e}");
+        assert!(
+            e.contains("line 9, column") && e.contains("a string"),
+            "{e}"
+        );
+        // 3. The useful part of a typo stays: the field that is not known, and the choices.
+        let doc = format!("{base}[redact]\nip_hmac_ky = \"{SECRET}\"\n");
+        let e = parse_schema(&doc, "pushed").err().expect("refused");
+        assert!(!e.contains(SECRET), "{e}");
+        assert!(e.contains("ip_hmac_ky") && e.contains("ip_hmac_key"), "{e}");
+    }
+
+    #[test]
+    fn masking_drops_the_value_and_keeps_the_rest() {
+        assert_eq!(
+            mask_quoted_values("invalid type: string \"s3cret\", expected u64"),
+            "invalid type: a string, expected u64"
+        );
+        // An escaped quote inside the value does not end it early.
+        assert_eq!(
+            mask_quoted_values(r#"invalid value: string "a\"b", expected x"#),
+            "invalid value: a string, expected x"
+        );
+        assert_eq!(
+            mask_quoted_values("unknown field `secrt`, expected `secret`"),
+            "unknown field `secrt`, expected `secret`"
+        );
+        assert_eq!(mask_quoted_values("string \"unterminated"), "a string");
+    }
+
+    /// An upstream URL can carry `user:pass@`; the validation messages that name the URL
+    /// must not (ZION-SEC-05).
+    #[test]
+    fn url_errors_never_show_credentials() {
+        let cfg = |up: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+                 [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstream.u]\n{up}\n\
+                 [[route]]\npath=\"/{{*rest}}\"\nupstream=\"u\"\n"
+            )
+        };
+        let errs = |up: &str| {
+            let c: ZionConfig = toml::from_str(&cfg(up)).unwrap();
+            semantic_errors(&c).join("\n")
+        };
+        for up in [
+            "url = \"ftp://deploy:s3cr3t@files.internal\"",
+            "url = \"http://deploy:s3cr3t@backend.internal\"\ntls = true",
+        ] {
+            let e = errs(up);
+            assert!(!e.is_empty(), "{up} is refused");
+            assert!(!e.contains("s3cr3t") && !e.contains("deploy:"), "{e}");
+            assert!(e.contains("internal"), "the host is still named: {e}");
+        }
     }
 
     #[test]
