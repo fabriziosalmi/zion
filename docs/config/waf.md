@@ -55,6 +55,7 @@ waf_profile = "upload"
 | `allowed_content_types` | string[] | `["application/json", "multipart/form-data"]` | Permitted content types for POST/PUT/PATCH. |
 | `entropy_check` | bool | `true` | Enable Gate 4 (Shannon entropy). Disable on routes that legitimately accept high-entropy bodies (binary uploads, encrypted blobs). |
 | `entropy_threshold` | f64 | `6.5` | Bits/byte. Bodies above this are denied. Default sits above pure base64 (theoretical max 6.0); random/encrypted blobs land at 7.5–8.0. |
+| `scan_headers` | string[] | `[]` | Request headers whose values go through the injection scanner (case-insensitive names, optional trailing `*`). Empty scans none. See [Scanning request headers](#scanning-request-headers). |
 
 ## Detection modes
 
@@ -103,6 +104,49 @@ A route has **one** WAF policy: `waf = true` (inline), a `waf_profile`, or neith
 | POST, PUT, PATCH | Yes | All 5 gates |
 
 Empty bodies on POST/PUT/PATCH are allowed without inspection.
+
+## Scanning request headers
+
+A payload does not only travel in the URI or the body: Log4Shell arrived in `User-Agent`.
+By default zion scans no header. A profile opts in by naming the headers:
+
+```toml
+[waf_profile.api]
+scan_headers = ["user-agent", "referer", "x-*"]   # "x-*" = every header starting with x-
+
+[[route]]
+path = "/api/{*rest}"
+upstream = "api"
+waf_profile = "api"
+waf_shadow = true        # first: count what would be blocked, block nothing
+```
+
+A listed header's value goes through the same scanner as the URI, raw and then decoded
+(URL-encoding, SQL comments, unicode escapes), in the profile's `mode`. A match answers
+`400`; the log names the header, never its value. The cost is bounded by the request's
+header budget (64 headers, 16 KB).
+
+**Why it is opt-in, and how to turn it on.** A signature that is right for a query string
+can be wrong for a header. Measured on the benign header corpus
+(`benchmarks/waf-corpus/headers-benign.json`: 124 values from real browsers, crawlers,
+HTTP libraries, monitoring agents, consent and analytics cookies, search-engine referers):
+
+| Mode | Benign values blocked | Which |
+|---|---|---|
+| `balanced` | 0 of 124 | none |
+| `aggressive` | 2 of 124 | `Origin: http://localhost:3000` (the SSRF signature) and a `Referer` whose URL contains `eval(` |
+
+Detection is the engine's own: the attack corpus sent as a header value is caught as often
+as in a query string (177 of 1,058 in `balanced`, 429 in `aggressive`).
+
+That corpus is not your traffic. Start with `waf_shadow = true`, watch
+`zion_waf_shadow_would_block` and the `waf_shadow` log lines (`source=header header=<name>`)
+for a few days, then remove `waf_shadow`. Suggested lists: `["user-agent", "referer", "x-*"]`
+in `balanced`; in `aggressive` leave out `origin` and `referer`. `cookie` is worth scanning
+if your application reads cookies into queries or templates, and is the header most likely
+to carry something that looks like a payload. A test (`benign_headers_are_not_blocked`)
+keeps the table above true; add a value to the corpus whenever shadow mode shows a false
+positive.
 
 ## Tuning guidelines
 

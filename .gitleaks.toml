@@ -19,6 +19,17 @@
 #     2100 so it never ages out, and it signs nothing real. Allowlisted by its
 #     exact value (not by path) so the scanner keeps watching the rest of that
 #     file for genuine leaks.
+#
+#  3. Two look-alikes in the WAF's benign header corpus
+#     (benchmarks/waf-corpus/headers-benign.json): the sample token every JWT
+#     tutorial shows (jwt.io, "John Doe", signed with `your-256-bit-secret`) inside
+#     a `token=` cookie, and a made-up Laravel `XSRF-TOKEN` whose base64 decodes to
+#     `{"iv":"ABCDEF==","value":"GHIJKL==","mac":"0123456789abcdef"}`. The corpus
+#     has to contain values SHAPED like real credentials, because that is what
+#     the header scan must not mistake for an attack. Allowlisted by exact value,
+#     not by path: the file is where people will paste headers from production
+#     when shadow mode reports a false positive, and the scanner must keep
+#     watching it for real ones.
 title = "Zion"
 
 [extend]
@@ -34,4 +45,11 @@ paths = [
 description = "e2e integration auth fixture (HS256 test JWT; secret published in tests/zion-test.toml)"
 regexes = [
   '''eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9\.eyJzdWIiOiAiZTJlLXVzZXIiLCAiZW1haWwiOiAiZTJlQHppb24udGVzdCIsICJleHAiOiA0MTAyNDQ0ODAwfQ\.i2pofCwQa8-IJSCFrmqGu2kcWwH-fdsSZ_ootnYQblc''',
+]
+
+[[allowlists]]
+description = "WAF benign header corpus: the public jwt.io sample token and a made-up XSRF-TOKEN (shapes, not secrets)"
+regexes = [
+  '''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ\.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c''',
+  '''eyJpdiI6IkFCQ0RFRj09IiwidmFsdWUiOiJHSElKS0w9PSIsIm1hYyI6IjAxMjM0NTY3ODlhYmNkZWYifQ''',
 ]

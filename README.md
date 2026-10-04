@@ -196,7 +196,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 ```
 
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-67 modules, ~67,500 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+67 modules, ~67,900 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Features
 
@@ -212,7 +212,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 
 **Cache** — two-level RAM cache: L1 thread-local (O(1) intrusive-LRU) + L2 sharded DashMap, generation-based coherence (no stale data after update), request coalescing (singleflight: N concurrent misses → 1 upstream fetch). Honors the origin's `Cache-Control` (RFC 9111: `Vary` secondary keys, conditional requests → `304`, `stale-while-revalidate` / `stale-if-error`, `Range` → `206` / `416` served from RAM), emits `Age` and an `X-Zion-Cache: HIT|MISS|BYPASS` decision header, and exposes `POST /_zion/cache/purge` to flush everything, a path prefix, or every entry carrying a `Surrogate-Key` tag.
 
-**WAF (zero-regex, O(N) single-pass)** — Aho-Corasick scanner, two pattern sets (`balanced` ~100 high-precision / `aggressive` ~240 broad-recall), Shannon-entropy analysis (bodies ≥256 B; restricted to JSON string values only for `application/json`, whole-body otherwise), simd-json structural limits, Content-Type enforcement, iterative normalization (URL-decode / SQL-comment / unicode), mTLS `X-Client-Cert-Fingerprint` forwarding, and a shadow mode (log + count, never block).
+**WAF (zero-regex, O(N) single-pass)** — Aho-Corasick scanner, two pattern sets (`balanced` ~100 high-precision / `aggressive` ~240 broad-recall), Shannon-entropy analysis (bodies ≥256 B; restricted to JSON string values only for `application/json`, whole-body otherwise), simd-json structural limits, Content-Type enforcement, iterative normalization (URL-decode / SQL-comment / unicode), mTLS `X-Client-Cert-Fingerprint` forwarding, and a shadow mode (log + count, never block); opt-in scanning of request header values (`scan_headers`: Log4Shell in a `User-Agent`), with its false-positive rate measured on a benign header corpus.
 
 **Resilience** — pools pick a member by *power of two choices* on in-flight requests × peak-EWMA latency measured on real traffic (`load_balancing = "p2c"`), with opt-in passive **outlier ejection**; opt-in per-upstream **circuit breaker** and `max_in_flight` **bulkhead** (an immediate `503` + `Retry-After` instead of piling on a struggling backend); upstream **DNS keeps the last good answer** when a lookup fails or hangs; **graceful drain** (idle keep-alive connections closed at once, HTTP/2 `GOAWAY`, requests in flight finished); a **non-blocking log queue** (a stalled stderr never stalls a request); opt-in `TCP_USER_TIMEOUT` to free the slots of clients that vanish mid-response; a per-upstream **response deadline** (`request_timeout_ms`, default 30 s, never "none"). See the [resilience guide](https://fabriziosalmi.github.io/zion/guide/resilience).
 
@@ -292,7 +292,7 @@ MODE=full bash benchmarks/baseline/run-baseline.sh   # → benchmarks/baseline/z
 ## Testing
 
 <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
-**1317 unit tests** run on every change; **23 integration tests** need a running Zion + a backend.
+**1324 unit tests** run on every change; **23 integration tests** need a running Zion + a backend.
 
 ```bash
 cargo test                          # unit tests

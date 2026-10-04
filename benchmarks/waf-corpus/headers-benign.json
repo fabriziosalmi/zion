@@ -1,0 +1,157 @@
+{
+ "_comment": "Benign request header values the WAF header scan must not block. Shapes taken from real browsers, crawlers, HTTP libraries, monitoring agents, consent managers and analytics cookies. Add a value here whenever shadow mode reports a false positive. NEVER paste a real session id, token or cookie here: replace it with a look-alike of the same shape. gitleaks scans this file; the two sample tokens it would flag are allowlisted by exact value in .gitleaks.toml.",
+ "user-agent": [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
+  "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:127.0) Gecko/20100101 Firefox/127.0",
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+  "Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/126.0.6478.108 Mobile/15E148 Safari/604.1",
+  "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+  "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A.230901.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/125.0.6422.165 Mobile Safari/537.36 [FB_IAB/FB4A;FBAV/468.0.0.50.80;]",
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram 336.0.0.21.90 (iPhone15,2; iOS 17_5; en_US; en; scale=3.00; 1179x2556; 611062514)",
+  "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+  "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Googlebot/2.1; +http://www.google.com/bot.html) Chrome/126.0.6478.126 Safari/537.36",
+  "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+  "Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)",
+  "Mozilla/5.0 (compatible; AhrefsBot/7.0; +http://ahrefs.com/robot/)",
+  "Mozilla/5.0 (compatible; SemrushBot/7~bl; +http://www.semrush.com/bot.html)",
+  "Mozilla/5.0 (compatible; DuckDuckBot-Https/1.1; https://duckduckgo.com/duckduckbot)",
+  "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+  "Twitterbot/1.0",
+  "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)",
+  "LinkedInBot/1.0 (compatible; Mozilla/5.0; Apache-HttpClient +http://www.linkedin.com)",
+  "WhatsApp/2.23.20.0 A",
+  "TelegramBot (like TwitterBot)",
+  "curl/8.7.1",
+  "Wget/1.21.4",
+  "python-requests/2.32.3",
+  "python-httpx/0.27.0",
+  "Go-http-client/2.0",
+  "okhttp/4.12.0",
+  "axios/1.7.2",
+  "node-fetch/1.0 (+https://github.com/bitinn/node-fetch)",
+  "Java/17.0.11",
+  "Apache-HttpClient/5.3.1 (Java/21.0.3)",
+  "PostmanRuntime/7.39.0",
+  "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 8 Build/AP2A.240605.024)",
+  "Prometheus/2.53.0",
+  "kube-probe/1.30",
+  "ELB-HealthChecker/2.0",
+  "GoogleHC/1.0",
+  "Datadog Agent/7.54.0",
+  "UptimeRobot/2.0; http://www.uptimerobot.com/",
+  "Pingdom.com_bot_version_1.4_(http://www.pingdom.com/)",
+  "git/2.45.2",
+  "Docker-Client/26.1.4 (linux)",
+  "aws-sdk-go/1.54.11 (go1.22.4; linux; amd64)",
+  "Microsoft Office/16.0 (Windows NT 10.0; Microsoft Outlook 16.0.17628; Pro)",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 OPR/112.0.0.0",
+  "Mozilla/5.0 (SMART-TV; Linux; Tizen 7.0) AppleWebKit/537.36 (KHTML, like Gecko) 94.0.4606.31/7.0 TV Safari/537.36",
+  "Mozilla/5.0 (PlayStation; PlayStation 5/9.00) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+  "Feedly/1.0 (+http://www.feedly.com/fetcher.html; 12 subscribers; like FeedFetcher-Google)"
+ ],
+ "referer": [
+  "https://www.google.com/",
+  "https://www.google.com/search?q=union+square+hotels+select+rooms&oq=union+square&sourceid=chrome&ie=UTF-8",
+  "https://www.bing.com/search?q=how+to+drop+a+table+in+excel&form=QBLH",
+  "https://duckduckgo.com/?q=insert+image+into+word+document&ia=web",
+  "https://www.google.com/search?q=script+for+school+play+%22romeo+and+juliet%22",
+  "https://example.com/shop/category/men's-shoes?sort=price_asc&page=2",
+  "https://example.com/blog/2026/10/01/or-1-equals-1-explained/",
+  "https://app.example.com/dashboard#/reports/2026-Q3?tab=sales&from=2026-07-01&to=2026-09-30",
+  "https://l.facebook.com/l.php?u=https%3A%2F%2Fexample.com%2Fpost%2F42%3Futm_source%3Dfb&h=AT0abcDEF",
+  "https://t.co/AbCdEfGhIj",
+  "https://www.linkedin.com/feed/update/urn:li:activity:7212345678901234567/",
+  "https://mail.google.com/mail/u/0/",
+  "https://example.com/search?q=%E2%9C%93&category=books&author=O%27Reilly",
+  "https://example.com/docs/sql/select-statement.html",
+  "https://example.com/docs/javascript/eval()-and-alternatives",
+  "https://example.com/path/../other/page.html",
+  "https://example.com/login?next=%2Faccount%2Fsettings%3Ftab%3Dsecurity",
+  "https://news.ycombinator.com/item?id=41012345",
+  "https://github.com/fabriziosalmi/zion/issues?q=is%3Aopen+is%3Aissue+label%3Asecurity",
+  "android-app://com.google.android.googlequicksearchbox/",
+  "https://example.com/products?filter[color]=red&filter[size]=m&price=10..50",
+  "https://example.com/calc?expr=1%2B1%3D2",
+  "https://example.com/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p?x=1&y=2&z=3&utm_source=newsletter&utm_medium=email&utm_campaign=2026_10_launch&utm_content=hero-cta",
+  "https://example.com/help/how-do-i-delete-my-account-and-update-my-email",
+  "https://example.com/wiki/Table_(database)#Dropping_a_table"
+ ],
+ "cookie": [
+  "_ga=GA1.2.1234567890.1727000000; _gid=GA1.2.987654321.1727900000; _gat=1",
+  "_ga_ABCDEFGHIJ=GS1.1.1727900000.5.1.1727901234.60.0.0",
+  "sessionid=3f9a1c7e5b2d8a406f1e2d3c4b5a6978; csrftoken=Zx8Kq2LmN4pR7sT0vW3yB6dF9hJ1cE5g",
+  "PHPSESSID=0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d",
+  "JSESSIONID=5F4DCC3B5AA765D61D8327DEB882CF99.node1",
+  "connect.sid=s%3AabcDEF123456.789xyzQWERTY%2Bslash%2Fequals%3D",
+  "token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+  "OptanonConsent=isGpcEnabled=0&datestamp=Sun+Oct+04+2026+12%3A00%3A00+GMT%2B0200+(Central+European+Summer+Time)&version=202405.1.0&hosts=&landingPath=NotLandingPage&groups=C0001%3A1%2CC0002%3A1%2CC0003%3A0%2CC0004%3A0&AwaitingReconsent=false",
+  "OptanonAlertBoxClosed=2026-10-04T10:00:00.000Z",
+  "CookieConsent={stamp:%27abc123+/==%27%2Cnecessary:true%2Cpreferences:false%2Cstatistics:true%2Cmarketing:false%2Cmethod:%27explicit%27%2Cver:1%2Cutc:1727900000000%2Cregion:%27it%27}",
+  "_fbp=fb.1.1727900000000.1234567890; _fbc=fb.1.1727900000000.IwAR0abcDEFghiJKLmnoPQRstuVWXyz",
+  "__cf_bm=AbCdEf123456_.-1727900000-1.0.1.1-QwErTyUiOp; cf_clearance=Zx.Cv_Bn-Mm1234567890",
+  "__stripe_mid=a1b2c3d4-e5f6-7890-abcd-ef1234567890abcdef; __stripe_sid=0f9e8d7c-6b5a-4321-fedc-ba0987654321fedcba",
+  "ajs_anonymous_id=%2200000000-1111-2222-3333-444444444444%22; ajs_user_id=%22user_42%22",
+  "_hjSessionUser_123456=eyJpZCI6ImFiYzEyMyIsImNyZWF0ZWQiOjE3Mjc5MDAwMDAwMDAsImV4aXN0aW5nIjp0cnVlfQ==",
+  "wordpress_logged_in_0123456789abcdef0123456789abcdef=admin%7C1728000000%7CabcDEF123%7C0123456789abcdef; wp-settings-1=libraryContent%3Dbrowse%26editor%3Dtinymce",
+  "cart=%7B%22items%22%3A%5B%7B%22sku%22%3A%22A-100%22%2C%22qty%22%3A2%7D%5D%2C%22currency%22%3A%22EUR%22%7D",
+  "lang=it-IT; tz=Europe%2FRome; theme=dark; sidebar=collapsed",
+  "remember_me=1; last_search=union+square+select+hotels; recently_viewed=12,45,78,102",
+  "AWSALB=abc123DEF456+ghi789/JKL012=; AWSALBCORS=abc123DEF456+ghi789/JKL012=",
+  "intercom-session-abc123=RmFrZVNlc3Npb25EYXRhLS1ub3RSZWFsPT0tLQ==--0123456789abcdef",
+  "_gcl_au=1.1.1234567890.1727900000; _uetsid=0123456789abcdef0123456789abcdef; _uetvid=fedcba9876543210fedcba9876543210",
+  "XSRF-TOKEN=eyJpdiI6IkFCQ0RFRj09IiwidmFsdWUiOiJHSElKS0w9PSIsIm1hYyI6IjAxMjM0NTY3ODlhYmNkZWYifQ%3D%3D; laravel_session=eyJpdiI6Ik1OT1BRUj09In0%3D",
+  "prefs={\"units\":\"metric\",\"filters\":[\"price<100\",\"rating>=4\"]}",
+  "note=Tom%20%26%20Jerry%20%3C3%20cheese"
+ ],
+ "accept-language": [
+  "en-US,en;q=0.9",
+  "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+  "de-DE,de;q=0.9,en;q=0.5",
+  "*"
+ ],
+ "x-forwarded-host": [
+  "app.example.com",
+  "shop.example.com:8443"
+ ],
+ "x-requested-with": [
+  "XMLHttpRequest",
+  "com.example.app"
+ ],
+ "x-request-id": [
+  "0f9e8d7c-6b5a-4321-fedc-ba0987654321",
+  "req_01HZXABCDEFGHJKMNPQRSTVWXY"
+ ],
+ "x-amzn-trace-id": [
+  "Root=1-66012345-0123456789abcdef01234567;Parent=0123456789abcdef;Sampled=1"
+ ],
+ "x-api-version": [
+  "2026-10-01",
+  "v2"
+ ],
+ "x-client-info": [
+  "supabase-js/2.43.4",
+  "ios/17.5.1 app/4.12.0 (build 3124)"
+ ],
+ "origin": [
+  "https://app.example.com",
+  "http://localhost:3000"
+ ],
+ "authorization": [
+  "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.abc-DEF_123",
+  "Basic dXNlcjpwYXNzd29yZA=="
+ ],
+ "if-none-match": [
+  "\"33a64df551425fcc55e4d42a148795d9f25f89d4\"",
+  "W/\"0815\""
+ ],
+ "accept": [
+  "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "application/json, text/plain, */*"
+ ],
+ "sec-ch-ua": [
+  "\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\""
+ ]
+}
