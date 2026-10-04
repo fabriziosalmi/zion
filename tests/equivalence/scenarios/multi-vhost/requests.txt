@@ -19,3 +19,13 @@ api.example.com      /other                 404      default
 # nginx's prefix location /v1/users string-matches /v1/users999; Zion matches
 # on path segments, so it falls to the /v1/ route.
 api.example.com      /v1/users999           users    legacy
+# ── Forwarded Host (#485): a backend answers /__host with the Host it received ──
+# alpha has `proxy_set_header Host $host`: the client's host reaches the backend
+# on both (the import turns it into `preserve_host = true`).
+alpha.example.com    /__host                alpha.example.com       alpha.example.com
+# beta has no `proxy_set_header Host`: nginx sends the proxy_pass authority, and
+# so does Zion without preserve_host.
+beta.example.com     /__host                zeq-be-beta:5678        zeq-be-beta:5678
+# Documented divergence 3 (import finding on `Host $host`): nginx's $host drops
+# the port, Zion forwards the Host as the client sent it.
+alpha.example.com:8443 /__host              alpha.example.com       alpha.example.com:8443

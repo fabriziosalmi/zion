@@ -30,7 +30,18 @@ For a scenario, `run.sh`:
 5. diffs the backend that answered — request by request.
 
 Each backend is a tiny server that returns its own name, so "which backend
-answered" *is* the routing decision. The exit code is the verdict: `0` only
+answered" *is* the routing decision.
+
+**The forwarded Host is compared too.** A backend answers `/__host` with the
+`Host` header it received, so the same diff proves that both proxies send the
+backend the same Host: the client's when the source forwards it
+(`proxy_set_header Host $host`, Traefik's `passHostHeader`, Caddy's default →
+`preserve_host = true`), the upstream's own authority when it does not. The
+one declared difference is nginx `$host`, which drops the port; Zion forwards
+the Host as the client sent it. The Host findings are `convert`, so the
+harness prints them from the full report next to the partial ones.
+
+The exit code is the verdict: `0` only
 when every request either matched identically or diverged **exactly** as the
 import report declared.
 
@@ -81,6 +92,7 @@ Create `scenarios/<name>/`:
   `http://zeq-be-<id>:5678` (the harness spins up one echo backend per `<id>`
   it finds).
 - `requests.txt` — rows of `HOST PATH EXPECT_NGINX EXPECT_ZION`. Use the
-  backend id for a proxied hit, or an HTTP status (`404`) for a miss. When the
+  backend id for a proxied hit, or an HTTP status (`404`) for a miss; for the
+  path `/__host`, the `Host` the backend must receive. When the
   two expectations differ, the row is a documented divergence and should
   correspond to a partial finding in the import report.

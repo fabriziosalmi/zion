@@ -17,7 +17,7 @@ networks:
 
 services:
   traefik:
-    image: traefik:v3.1
+    image: traefik:v3.6
     command:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
@@ -58,3 +58,17 @@ services:
       - traefik.enable=true
       - traefik.http.routers.legacy.rule=Host(`api.example.com`) && PathPrefix(`/v1`)
       - traefik.http.services.legacy.loadbalancer.server.port=5678
+
+  # Answers with the Host header it received instead of a fixed name, so the
+  # corpus can check what Host each proxy forwards (#485). Traefik forwards the
+  # client's Host by default (passHostHeader).
+  hostecho:
+    image: nginx:1.27-alpine
+    command:
+      - sh
+      - -c
+      - printf 'server { listen 5678; default_type text/plain; location / { return 200 "$$http_host\\n"; } }' > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.hostecho.rule=Host(`echo.example.com`)
+      - traefik.http.services.hostecho.loadbalancer.server.port=5678

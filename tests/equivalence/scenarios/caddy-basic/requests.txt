@@ -19,3 +19,9 @@ api.example.com      /other                 default  default
 # nginx importer flags this class as a partial finding; the caddy importer does
 # not yet — a follow-up (the harness surfaces it here regardless).
 api.example.com      /v1/users999           users    legacy
+# ── Forwarded Host (#485): a backend answers /__host with the Host it received ──
+# Caddy's reverse_proxy forwards the client's Host by default; the import sets
+# `preserve_host = true`, so the backend sees the same Host behind both.
+alpha.example.com    /__host                alpha.example.com       alpha.example.com
+beta.example.com     /__host                beta.example.com        beta.example.com
+alpha.example.com:8443 /__host              alpha.example.com:8443  alpha.example.com:8443

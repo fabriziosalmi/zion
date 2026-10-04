@@ -10,6 +10,10 @@
 #   4. a corpus of (Host, path) requests is replayed against BOTH
 #   5. the answering backend is diffed request by request
 #
+# A backend answers `/__host` with the Host header it received instead of its
+# name, so the same diff also proves that both proxies FORWARD the same Host
+# (`proxy_set_header Host`, Traefik passHostHeader, Caddy's default; #485).
+#
 # The source is auto-detected from the scenario dir:
 #   nginx.conf         → nginx      (real nginx:alpine, echo backends)
 #   Caddyfile          → caddy      (real caddy:alpine, echo backends)
@@ -113,6 +117,8 @@ nginx | caddy)
 server {
     listen $BACKEND_PORT;
     default_type text/plain;
+    # Which Host did the proxy forward? (the Host rows of the corpus, #485)
+    location = /__host { return 200 "\$http_host\n"; }
     location / { return 200 "$name\n"; }
 }
 EOF
@@ -147,10 +153,18 @@ traefik)
 esac
 
 step "zion import $SRC — converting the SAME config (findings below)"
-zion_docker --rm -v "$SCEN_DIR/$SRC_CFG:/in/$SRC_CFG:ro" -- \
-    import "$SRC" "/in/$SRC_CFG" \
+# stderr carries the partial/unsupported findings; --report the full list. The Host
+# findings are `convert` (the Host is forwarded as the source does), so they only
+# appear in the full report: show them too, they are what the Host rows check.
+mkdir -p "$WORK/out" && chmod 777 "$WORK/out"
+zion_docker --rm -v "$SCEN_DIR/$SRC_CFG:/in/$SRC_CFG:ro" -v "$WORK/out:/out" -- \
+    import "$SRC" "/in/$SRC_CFG" --report /out/full-report.txt \
     > "$WORK/zion.toml" 2> "$WORK/report.txt" || { cat "$WORK/report.txt" >&2; exit 1; }
 sed 's/^/  /' "$WORK/report.txt"
+if grep -q "preserve_host" "$WORK/out/full-report.txt" 2>/dev/null; then
+    say "  Host findings in the full report:"
+    grep "preserve_host" "$WORK/out/full-report.txt" | sed 's/^/  /'
+fi
 
 step "self-signed cert at the placeholder paths the importer emitted"
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
@@ -196,7 +210,7 @@ for i in $(seq 1 40); do
 done
 
 step "replaying the request corpus against BOTH instances"
-printf '  %-22s %-22s %-10s %-10s %s\n' "HOST" "PATH" "$SRC" "zion" "VERDICT"
+printf '  %-24s %-22s %-22s %-22s %s\n' "HOST" "PATH" "$SRC" "zion" "VERDICT"
 fails=0; identical=0; documented=0
 while read -r host path want_orig want_zion; do
     case "$host" in ''|'#'*) continue ;; esac
@@ -212,7 +226,7 @@ while read -r host path want_orig want_zion; do
         verdict="${G}identical${N}"
         identical=$((identical + 1))
     fi
-    printf '  %-22s %-22s %-10s %-10s %s\n' "$host" "$path" "$got_orig" "$got_zion" "$verdict"
+    printf '  %-24s %-22s %-22s %-22s %s\n' "$host" "$path" "$got_orig" "$got_zion" "$verdict"
 done < "$SCEN_DIR/requests.txt"
 
 step "result"
