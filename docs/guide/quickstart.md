@@ -24,12 +24,12 @@ Create `zion.toml`:
 
 ```toml
 [server]
-listen_http = "0.0.0.0:80"
-listen_https = "0.0.0.0:443"
+listen_http = "0.0.0.0:8080"
+listen_https = "0.0.0.0:8443"
 
 [tls]
-cert_path = "/etc/ssl/zion/tls.crt"
-key_path = "/etc/ssl/zion/tls.key"
+cert_path = "certs/tls.crt"
+key_path = "certs/tls.key"
 
 [upstreams]
 backend = "http://127.0.0.1:8000"
@@ -47,11 +47,23 @@ upstream = "backend"
 ## Generate a self-signed certificate (dev only)
 
 ```bash
-mkdir -p /etc/ssl/zion
+mkdir -p certs
 openssl req -x509 -newkey rsa:2048 -nodes \
-  -keyout /etc/ssl/zion/tls.key \
-  -out /etc/ssl/zion/tls.crt \
-  -days 365 -subj "/CN=localhost"
+  -keyout certs/tls.key \
+  -out certs/tls.crt \
+  -days 365 -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost"
+```
+
+(The `-addext` matters: without an extension some OpenSSL builds, LibreSSL on macOS among
+them, write an X.509 v1 certificate, which zion refuses with `UnsupportedCertVersion`.)
+
+The ports and paths above need no privileges, so the quick start runs as your own user.
+For the real ports (`80` / `443`) and a system path such as `/etc/ssl/zion`, run zion as
+root or, better, give the binary the one capability it needs and keep it unprivileged:
+
+```bash
+sudo setcap cap_net_bind_service=+ep ./target/release/zion
 ```
 
 ## Run
@@ -83,18 +95,18 @@ ZION ONLINE.
 
 ```bash
 # Health check
-curl -k https://localhost/healthz
+curl -k https://localhost:8443/healthz
 # => ok
 
 # Readiness
-curl -k https://localhost/readyz
+curl -k https://localhost:8443/readyz
 # => ready
 
 # Proxy a request
-curl -k https://localhost/api/v1/users
+curl -k https://localhost:8443/api/v1/users
 
 # HTTP -> HTTPS redirect
-curl -I http://localhost/
+curl -I http://localhost:8080/
 # => 301 Moved Permanently, Location: https://...
 ```
 
