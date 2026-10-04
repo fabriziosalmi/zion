@@ -1942,11 +1942,19 @@ async fn an_ejected_member_returns_after_its_cool_down() {
     assert_eq!(hits(&os[0]), frozen, "ejected: nothing sent");
     os[0].status.store(200, Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(1300)).await; // eject_secs = 1
-    burst(&st, "r3", 40, 4).await;
-    assert!(
-        hits(&os[0]) > frozen,
-        "back in rotation after the cool-down"
-    );
+                                                           // Back in rotation, but not necessarily within the first 40 requests: with two members
+                                                           // the pick always goes to the lower load x latency, and the member that just failed can
+                                                           // carry a latency peak from a loaded test run until it decays. Wait for it, bounded.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut round = 0;
+    while hits(&os[0]) == frozen {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "not back in rotation 20 s after a 1 s cool-down"
+        );
+        burst(&st, &format!("r3-{round}-"), 40, 4).await;
+        round += 1;
+    }
 }
 
 #[tokio::test]
@@ -3871,14 +3879,19 @@ async fn a_pool_member_that_never_answers_is_failed_over() {
     let (hang, accepted) = hanging_origin().await;
     let (good, _) = named_origin("G").await;
     let st = pool_state(&[hang, good]);
-    for i in 0..8 {
-        let (code, took) = timed(&st, Method::GET, &format!("/r{i}")).await;
-        assert_eq!(code, 200, "request {i} took {took:?}");
+    // Which member a request tries first is a random pick, so "8 requests" did not guarantee
+    // that the hanging one was tried at all (seen in CI and locally, about one run in 25):
+    // keep going until it has been, and require every answer on the way to be a 200.
+    let mut sent = 0;
+    while accepted.load(Ordering::Relaxed) == 0 {
+        assert!(
+            sent < 64,
+            "the hanging member was never tried in {sent} requests (else this proves nothing)"
+        );
+        let (code, took) = timed(&st, Method::GET, &format!("/r{sent}")).await;
+        assert_eq!(code, 200, "request {sent} took {took:?}");
+        sent += 1;
     }
-    assert!(
-        accepted.load(Ordering::Relaxed) > 0,
-        "the hanging member was tried at least once (else this proves nothing)"
-    );
 }
 
 #[tokio::test]
