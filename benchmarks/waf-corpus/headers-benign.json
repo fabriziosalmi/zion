@@ -1,5 +1,5 @@
 {
- "_comment": "Benign request header values the WAF header scan must not block. Shapes taken from real browsers, crawlers, HTTP libraries, monitoring agents, consent managers and analytics cookies. Add a value here whenever shadow mode reports a false positive.",
+ "_comment": "Benign request header values the WAF header scan must not block. Shapes taken from real browsers, crawlers, HTTP libraries, monitoring agents, consent managers and analytics cookies. Add a value here whenever shadow mode reports a false positive. NEVER paste a real session id, token or cookie here: replace it with a look-alike of the same shape. gitleaks scans this file; the two sample tokens it would flag are allowlisted by exact value in .gitleaks.toml.",
  "user-agent": [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
