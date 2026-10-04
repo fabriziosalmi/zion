@@ -23,9 +23,14 @@ cargo build --release --quiet
 # Fixed paths — referenced by docs/img/boot.tape.
 DIR=/tmp/zion-boot-shot
 rm -rf "$DIR" && mkdir -p "$DIR"
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+openssl req -x509 -newkey rsa:2048 \
   -keyout "$DIR/key.pem" -out "$DIR/cert.pem" \
-  -days 1 -nodes -subj "/CN=boot-shot.local" >/dev/null 2>&1
+  -days 1 -nodes -subj "/CN=boot-shot.local" \
+  -addext "subjectAltName=DNS:boot-shot.local" >/dev/null 2>&1
+# RSA and -addext, like every other script here: with `-newkey ec -pkeyopt ...` and no
+# extension, LibreSSL (the macOS openssl) wrote a key zion could not pair with the
+# certificate, and an X.509 v1 certificate; the screenshot then showed a fatal error
+# instead of the boot. Check the image after running this.
 cat > "$DIR/zion.toml" <<'EOF'
 [server]
 listen_http  = "127.0.0.1:18080"

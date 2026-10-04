@@ -214,11 +214,11 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 
 **WAF (zero-regex, O(N) single-pass)** — Aho-Corasick scanner, two pattern sets (`balanced` ~100 high-precision / `aggressive` ~240 broad-recall), Shannon-entropy analysis (bodies ≥256 B; restricted to JSON string values only for `application/json`, whole-body otherwise), simd-json structural limits, Content-Type enforcement, iterative normalization (URL-decode / SQL-comment / unicode), mTLS `X-Client-Cert-Fingerprint` forwarding, and a shadow mode (log + count, never block).
 
-**Resilience** — pools pick a member by *power of two choices* on in-flight requests × peak-EWMA latency measured on real traffic (`load_balancing = "p2c"`), with opt-in passive **outlier ejection**; opt-in per-upstream **circuit breaker** and `max_in_flight` **bulkhead** (an immediate `503` + `Retry-After` instead of piling on a struggling backend); upstream **DNS keeps the last good answer** when a lookup fails or hangs; **graceful drain** (idle keep-alive connections closed at once, HTTP/2 `GOAWAY`, requests in flight finished); a **non-blocking log queue** (a stalled stderr never stalls a request); opt-in `TCP_USER_TIMEOUT` to free the slots of clients that vanish mid-response. See the [resilience guide](https://fabriziosalmi.github.io/zion/guide/resilience).
+**Resilience** — pools pick a member by *power of two choices* on in-flight requests × peak-EWMA latency measured on real traffic (`load_balancing = "p2c"`), with opt-in passive **outlier ejection**; opt-in per-upstream **circuit breaker** and `max_in_flight` **bulkhead** (an immediate `503` + `Retry-After` instead of piling on a struggling backend); upstream **DNS keeps the last good answer** when a lookup fails or hangs; **graceful drain** (idle keep-alive connections closed at once, HTTP/2 `GOAWAY`, requests in flight finished); a **non-blocking log queue** (a stalled stderr never stalls a request); opt-in `TCP_USER_TIMEOUT` to free the slots of clients that vanish mid-response; a per-upstream **response deadline** (`request_timeout_ms`, default 30 s, never "none"). See the [resilience guide](https://fabriziosalmi.github.io/zion/guide/resilience).
 
-**Security** — HSTS preload, nosniff, frame-deny, Referrer-Policy, Permissions-Policy, per-route CSP; `Server`/hop-by-hop stripping (RFC 7230); URI-length cap + 7-method whitelist; per-IP rate limit **and** per-IP concurrent-connection cap (enforced at accept); CORS (FNV O(1)); header-bomb limits (64 headers / 16 KB). Admin API on its own listener, with its own client CA for mTLS and a bearer token required for every change; the gossip mesh accepts claims only from listed node keys. Settings that would silently weaken security (a short JWT secret, an `http://` JWKS, an unknown `xff_mode`) are config errors.
+**Security** — HSTS preload, nosniff, frame-deny, Referrer-Policy, Permissions-Policy, per-route CSP; `Server`/hop-by-hop stripping (RFC 7230); URI-length cap + 7-method whitelist; per-IP rate limit **and** per-IP concurrent-connection cap (enforced at accept); CORS (FNV O(1)); header-bomb limits (64 headers / 16 KB). Admin API on its own listener, with its own client CA for mTLS and a bearer token required for every change; **client certificates can be revoked** with a CRL that is re-read when it changes (data plane and admin); JWT revocations survive a restart and HMAC keys rotate without an outage (`previous_secret_env`); the headers an upstream trusts as zion's word (`X-Auth-*`, `X-Client-Cert-*`, `X-Zion-Mesh-Score`) come from one table and are stripped from every client; the cache purge answers loopback only unless you name the networks; the gossip mesh accepts claims only from listed node keys. Settings that would silently weaken security (a short JWT secret, an `http://` JWKS, an unknown `xff_mode`) are config errors.
 
-**Observability** — `/healthz` · `/readyz` fast-path (~1 µs), `/metrics` Prometheus (lock-free sharded counters), `X-Request-ID` + W3C `traceparent` propagation, structured text/JSON logs (client IPs can be truncated or HMAC-pseudonymised with `[redact] ip` for GDPR / NIS2), and the `zion top` live TUI.
+**Observability** — `/healthz` · `/readyz` fast-path (~1 µs), `/metrics` Prometheus (lock-free sharded counters), `X-Request-ID` + W3C `traceparent` propagation, structured text/JSON logs (client IPs can be truncated or HMAC-pseudonymised with `[redact] ip` for GDPR / NIS2; upstream credentials and config secrets never reach the snapshot, the logs or an error message), and the `zion top` live TUI.
 
 **Operations** — fail-fast config validation, graceful 30 s drain that closes idle connections immediately, adaptive upstream recovery (decorrelated-jitter backoff: a recovered origin returns in ~1.4 s vs up to 30 s), boot-time platform auto-detection + performance-tier calibration, `zion doctor` diagnostics, TCP tuning (NODELAY / DEFER_ACCEPT / FASTOPEN / QUICKACK), systemd unit, distroless container (health probes live in the orchestrator), Helm chart rendered and checked with `zion doctor` in CI.
 
@@ -321,12 +321,12 @@ Every release is signed and carries SLSA v1.0 build provenance — see
 
 ```bash
 # Binary release (Sigstore-backed provenance via gh CLI)
-gh release download v0.9.8 -R fabriziosalmi/zion -p '*x86_64-unknown-linux-musl*' -p 'SHA256SUMS'
+gh release download v0.9.9 -R fabriziosalmi/zion -p '*x86_64-unknown-linux-musl*' -p 'SHA256SUMS'
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify zion-v0.9.8-x86_64-unknown-linux-musl.tar.gz --owner fabriziosalmi
+gh attestation verify zion-v0.9.9-x86_64-unknown-linux-musl.tar.gz --owner fabriziosalmi
 
 # Container image (cosign keyless)
-cosign verify ghcr.io/fabriziosalmi/zion:v0.9.8 \
+cosign verify ghcr.io/fabriziosalmi/zion:v0.9.9 \
     --certificate-identity-regexp "^https://github.com/fabriziosalmi/zion/\\.github/workflows/release\\.yml@refs/tags/v" \
     --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 ```
