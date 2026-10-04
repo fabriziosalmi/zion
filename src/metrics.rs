@@ -2095,6 +2095,7 @@ mod tests {
     /// The JSON snapshot (also what `GET /admin/config` returns) is read by anything that
     /// passes the internal-network gate: no upstream credentials in it either (ZION-SEC-04).
     #[test]
+    #[cfg_attr(miri, ignore)] // the snapshot samples process and TLS state through aws-lc (FFI)
     fn the_snapshot_never_shows_upstream_credentials() {
         let rows = [
             UpstreamRow {
