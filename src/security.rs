@@ -503,7 +503,8 @@ pub fn is_valid_cidr(s: &str) -> bool {
 /// a private-range load balancer, Kubernetes SNAT or a Docker bridge every internet
 /// client presents a private address and passes it. `[server] internal_networks`
 /// replaces the default with an explicit allowlist, so only the hosts the operator
-/// names are internal.
+/// names are internal. The cache purge is stricter by default: see
+/// [`InternalNetworks::allows_purge`].
 #[derive(Clone, Debug, Default)]
 pub struct InternalNetworks {
     cidrs: Vec<CidrRange>,
@@ -526,6 +527,22 @@ impl InternalNetworks {
             is_internal_ip(ip)
         } else {
             self.cidrs.iter().any(|c| c.contains(ip))
+        }
+    }
+
+    /// May `ip` use the one destructive internal endpoint, `POST /_zion/cache/purge`?
+    ///
+    /// With no `internal_networks` the default "any private address" test is good enough to
+    /// read `/metrics` and too weak to flush the cache: behind a private-range load balancer
+    /// or a Docker bridge every internet client passes it. So by default only loopback may
+    /// purge. An explicit `internal_networks` is the operator naming who is internal, and
+    /// is honoured as written.
+    #[inline]
+    pub fn allows_purge(&self, ip: &std::net::IpAddr) -> bool {
+        if self.cidrs.is_empty() {
+            ip.to_canonical().is_loopback()
+        } else {
+            self.contains(ip)
         }
     }
 }
@@ -904,6 +921,32 @@ mod normalize_host_tests {
 
 #[cfg(test)]
 mod internal_networks_tests {
+
+    #[test]
+    fn purging_needs_loopback_unless_the_operator_named_the_networks() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let default = InternalNetworks::default();
+        for ok in ["127.0.0.1", "127.8.8.8", "::1", "::ffff:127.0.0.1"] {
+            assert!(default.allows_purge(&ip(ok)), "{ok}");
+        }
+        // Internal enough to read /metrics, not to flush the cache.
+        for no in [
+            "10.0.0.5",
+            "172.16.3.4",
+            "192.168.1.1",
+            "169.254.1.1",
+            "fd00::1",
+            "203.0.113.9",
+        ] {
+            assert!(!default.allows_purge(&ip(no)), "{no}");
+        }
+        assert!(default.contains(&ip("10.0.0.5")), "reads are unchanged");
+        // An explicit list is honoured as written, for purging too.
+        let named = InternalNetworks::from_config(&["10.0.0.0/8".to_string()]);
+        assert!(named.allows_purge(&ip("10.0.0.5")));
+        assert!(!named.allows_purge(&ip("127.0.0.1")));
+        assert!(!named.allows_purge(&ip("192.168.1.1")));
+    }
     use super::*;
 
     // ── ZION-AUTH-03: which peers count as "internal" ─────────────────────

@@ -445,8 +445,17 @@ pub(super) fn builtin_endpoint(
         // immediately instead of waiting out the TTL. Internal-only + POST
         // (mutating). `?prefix=/path` purges matching keys; no prefix = all.
         if path == "/_zion/cache/purge" {
-            if !cfg.internal_networks.contains(&client_ip) {
-                return Some(empty_response(StatusCode::FORBIDDEN));
+            if !cfg.internal_networks.allows_purge(&client_ip) {
+                // Say why to a peer that would have been let in for a read: the operator
+                // running a deploy hook from another host needs to know what to set.
+                return Some(if cfg.internal_networks.contains(&client_ip) {
+                    crate::http_util::text_response(
+                        StatusCode::FORBIDDEN,
+                        "cache purge is loopback-only unless [server] internal_networks lists this host\n",
+                    )
+                } else {
+                    empty_response(StatusCode::FORBIDDEN)
+                });
             }
             if *req.method() != hyper::Method::POST {
                 return Some(method_not_allowed("POST"));

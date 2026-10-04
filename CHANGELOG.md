@@ -12,10 +12,16 @@ All notable changes to Zion Edge Gateway are documented here.
 
 **Upgrade note:** a script that passes a flag Zion never knew, or a value it never parsed, now fails where it used to run with defaults. The error names the argument.
 
+- **Docs: the purge examples used plain HTTP.** `curl -X POST http://127.0.0.1/_zion/cache/purge` gets the `:80` redirect (301), not a purge; the endpoint is on the HTTPS listener. The examples now use `https://`.
+
 ### Added
 
 - **`[upstream.x] request_timeout_ms`** (#517): how long one attempt may take from sending the request to receiving the upstream's response headers. It was a fixed 30 s; that stays the default. Raise it for long-polling, slow report endpoints or uploads slower than 30 s (sending the body counts), lower it for an API that should fail fast. It applies to the single-upstream path, to every attempt of a pool, to cache fetches and to background refreshes. `1`..`3600000` ms: there is no "0 = none", because a request with no deadline holds its connection slot until the 1 h connection cap.
 - **`zion import nginx` converts `proxy_read_timeout`** to `request_timeout_ms` (it was `unsupported`), as `partial`: the finding states that Zion bounds the exchange up to the response headers while nginx bounds each gap between two reads. `proxy_send_timeout` stays `unsupported` and now points at `request_timeout_ms`. Two locations that share an upstream but ask for different connect or read timeouts used to keep the first value in silence; the one that is not applied is now a `partial` finding.
+
+### Security
+
+- **The cache purge is loopback-only unless `internal_networks` is set** (#516). `POST /_zion/cache/purge` shared the rule of the read endpoints: with `[server] internal_networks` empty (the default) any private-range peer was let in. Behind a private-range load balancer, Kubernetes SNAT or a Docker bridge every internet client has a private address, so anyone could flush the cache; Zion only warned about it at boot. The read endpoints (`/metrics`, `/_zion/snapshot.json`, `internal_only` routes) keep their rule and the warning. **Upgrade note:** a deploy hook that purges from another host, or from the Docker host into a container, now gets `403` with a body that says why: list that host in `[server] internal_networks` (the list also applies to the read endpoints, and replaces the default for them).
 
 ## [0.9.8] - 2026-10-03
 

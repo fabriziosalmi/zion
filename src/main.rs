@@ -400,11 +400,12 @@ fn warn_feature_config_gaps(config: &config::ZionConfig) {
     if internal_gates_trust_any_private_peer(&config.server) {
         logging::warn(
             "config",
-            "internal-only endpoints (/metrics, /_zion/snapshot.json, /_zion/cache/purge, \
-             routes with internal_only) accept ANY private-range peer. Behind a private-range \
-             load balancer, Kubernetes SNAT or a Docker bridge, every internet client looks \
-             internal and can purge the cache and read metrics. Set [server] trusted_proxies \
-             (so the real client IP is used) or [server] internal_networks (an explicit allowlist).",
+            "internal-only endpoints (/metrics, /_zion/snapshot.json, routes with internal_only) \
+             accept ANY private-range peer. Behind a private-range load balancer, Kubernetes \
+             SNAT or a Docker bridge, every internet client looks internal and can read metrics \
+             and reach internal_only routes (the cache purge is loopback-only in this \
+             configuration). Set [server] trusted_proxies (so the real client IP is used) or \
+             [server] internal_networks (an explicit allowlist).",
         );
     }
     // A literal JWT HMAC secret in zion.toml is deprecated in favour of
