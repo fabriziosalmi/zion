@@ -43,6 +43,10 @@ log on disk, off by default) are out of scope and tracked in their own issues.
   slope (`tail/overall ≥ 0.5` — i.e. not settling). A decelerating ramp or a
   noise-band trend passes. The raw per-sample table is printed to the log so
   the curve shape is auditable, not just the summary slope.
+- **cache entries:** `zion_cache_entries`, read while the load is still on, must be within
+  `MAX_ENTRIES` plus one in-flight insert per worker. This checks the cause directly instead
+  of waiting for RSS to show it: concurrent inserts used to push the response cache past its
+  cap for good (#481), which the RSS slope only revealed on the 2 h run.
 - **fds:** bounded range and no first-half-to-second-half mean drift — a leaked
   socket shows as a clean upward staircase; the half-means average out the
   per-sample in-flight-connection jitter. The drift limit is

@@ -541,6 +541,10 @@ pub struct Metrics {
 
     // Gauges
     pub active_connections: AtomicI64,
+    /// Entries in the shared response cache, sampled when `/metrics` is rendered. Compare it
+    /// with the profiles' `max_entries`: it is what showed (too late) that the cap was not
+    /// holding under concurrent inserts (#481).
+    pub cache_entries: AtomicU64,
 
     // ── Runtime resource gauges (process self-introspection) ─────────
     // Sampled from `/proc/self` once per `/metrics` scrape (and per JSON
@@ -626,6 +630,7 @@ impl Metrics {
             health_probe_rounds_total: AtomicU64::new(0),
             health_probe_last_round_timestamp_seconds: AtomicU64::new(0),
             active_connections: AtomicI64::new(0),
+            cache_entries: AtomicU64::new(0),
             process_resident_memory_bytes: AtomicU64::new(0),
             process_open_fds: AtomicU64::new(0),
             request_duration: LatencyHistogram::new(),
@@ -1072,6 +1077,14 @@ impl Metrics {
                 .format(self.cache_revalidations.load(Relaxed))
                 .as_bytes(),
         );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_cache_entries Responses held in the shared response cache (all profiles; each is capped by its max_entries).\n\
+                                # TYPE zion_cache_entries gauge\n\
+                                zion_cache_entries ",
+        );
+        out.extend_from_slice(itoa_buf.format(self.cache_entries.load(Relaxed)).as_bytes());
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(

@@ -226,6 +226,8 @@ while [ "$(date +%s)" -lt "$end" ]; do
     printf '%s\t%s\t%s\t%s\n' "$(( now - t0 ))" "${rss:-0}" "${fd:-0}" "${gen:-0}" >> "$WORK/samples.tsv"
     sleep "$INTERVAL"
 done
+# Read while the load is still on: the cap has to hold under concurrent inserts (#481).
+cache_entries="$(val zion_cache_entries)"; cache_entries="${cache_entries:-0}"
 touch "$STOP"; kill "${load_pids[@]}" "$g6_pid" 2>/dev/null || true
 gen1="$(val zion_config_generation)"; gen1="${gen1:-0}"
 
@@ -250,9 +252,20 @@ step "analysis"
 rc=0
 "$ROOT/tests/stability-soak/analyze.sh" "$WORK/samples.tsv" "$gen0" "$gen1" || rc=$?
 
+# ── The response cache holds its cap. RSS growing was the symptom of #481; this is the
+#    cause, checked directly: concurrent inserts used to push the map past max_entries for
+#    good. The slack is one in-flight insert per load worker. ──
+cache_limit=$(( MAX_ENTRIES + WORKERS + 8 ))
+if [ "$cache_entries" -le "$cache_limit" ] 2>/dev/null; then
+    echo "  cache: $cache_entries entries (cap $MAX_ENTRIES, limit $cache_limit under $WORKERS concurrent workers)"
+else
+    echo "  ${R}cache: $cache_entries entries, over the cap of $MAX_ENTRIES (limit $cache_limit)${N}"
+    rc=1
+fi
+
 step "result"
 if [ "$rc" -eq 0 ]; then
-    echo "  ${G}${B}PASS${N} — RSS bounded (tail slope within budget or decelerating to a plateau); open fds bounded; leak surfaces stressed."
+    echo "  ${G}${B}PASS${N} — RSS bounded (tail slope within budget or decelerating to a plateau); open fds bounded; cache within its cap; leak surfaces stressed."
 else
     echo "  ${R}${B}FAIL${N} — see the analysis above; samples at soak-samples.tsv"
 fi

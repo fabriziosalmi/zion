@@ -874,7 +874,6 @@ impl StaticCache {
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         if let Some(l2_concurrent) = &self.l2 {
             l2_concurrent.len()
