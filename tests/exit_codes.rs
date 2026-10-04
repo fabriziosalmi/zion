@@ -139,3 +139,48 @@ upstream = "ghost"
         status.code()
     );
 }
+
+/// A subcommand given a flag it does not know must not run with defaults: `zion init -y
+/// --ouput <path>` used to write `./zion.toml` and exit 0 (ZION-API-02). It is a usage error,
+/// exit 2, that names the flag, and nothing is written.
+#[test]
+fn unknown_cli_flag_exits_2_and_writes_nothing() {
+    let dir = unique_dir("cli-usage");
+    let out = zion()
+        .current_dir(&dir)
+        .args(["init", "-y", "--no-tls", "--ouput", "elsewhere.toml"])
+        .output()
+        .expect("spawn zion");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("unknown flag `--ouput`") && stderr.contains("`--output`"),
+        "stderr must name the flag and the nearest valid one: {stderr}"
+    );
+    assert!(
+        !dir.join("zion.toml").exists() && !dir.join("elsewhere.toml").exists(),
+        "a usage error must not write a config"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `zion import` keeps exit 2 for "converted, `--strict` found partial/unsupported directives"
+/// (ADR-0011): a usage error there is the fatal 1, so a script branching on 2 never takes a
+/// typo for a conversion with findings.
+#[test]
+fn import_usage_error_exits_1_not_the_strict_findings_code() {
+    let out = zion()
+        .args(["import", "nginx", "-", "--strct"])
+        .output()
+        .expect("spawn zion");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("unknown flag `--strct`"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "nothing may be emitted on a usage error"
+    );
+}

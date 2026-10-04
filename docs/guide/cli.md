@@ -16,6 +16,25 @@ $ zion bootstrap                # dump detected platform as JSON (CI / automatio
 $ zion --version | --help
 ```
 
+## Arguments are checked
+
+Every flag takes its value as the next argument or after an equals sign
+(`--upstream :3000` or `--upstream=:3000`). A subcommand given something it
+cannot honour stops instead of running with defaults:
+
+```console
+$ zion init -y --ouput /etc/zion/zion.toml
+zion init: unknown flag `--ouput` (did you mean `--output`?)
+$ zion init --https-port 70000
+zion init: --https-port expects a port (0-65535), got `70000`
+```
+
+An unknown flag, a missing value, a value that does not parse and a stray
+argument are **usage errors: exit `2`**, nothing written (exit `1` for
+`zion import`, where `2` means "converted, `--strict` found findings"). A value
+that starts with a dash needs the equals form (`--var=FLAGS=-O2`). `--help`
+after any subcommand prints the help.
+
 ## The daemon (default)
 
 With no subcommand Zion loads its config and serves. The config path comes from
@@ -138,8 +157,8 @@ $ zion import nginx /etc/nginx/sites-enabled/app.conf -o zion.toml
 Findings statuses: `convert` (faithful), `partial` (converted with a stated
 semantic delta), `auto` (Zion does it built-in — e.g. `X-Forwarded-For`
 headers, the `:80`→HTTPS redirect), `unsupported` (needs a human decision).
-Exit codes: `0` converted, `1` fatal (unparseable input / nothing convertible),
-`2` strict-mode findings.
+Exit codes: `0` converted, `1` fatal (unparseable input / nothing convertible /
+a usage error), `2` strict-mode findings.
 
 ## `zion top` — live dashboard
 

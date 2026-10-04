@@ -246,6 +246,10 @@ fn run() -> error::ZionResult<()> {
             cli::print_help();
             std::process::exit(1);
         }
+        cli::Command::Usage { message, exit } => {
+            eprintln!("{message}\nRun `zion --help` for the flags each subcommand takes.");
+            std::process::exit(exit);
+        }
         cli::Command::Top(opts) => {
             #[cfg(feature = "tui")]
             {

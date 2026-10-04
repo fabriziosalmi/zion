@@ -54,7 +54,18 @@ pub enum Command {
     AcmeSoak,
     /// Unknown subcommand — print help to stderr and exit 1.
     Unknown(String),
+    /// A subcommand was given an argument it cannot honour (unknown flag, missing or
+    /// unparsable value). The caller prints `message` and exits with `exit`: running with
+    /// defaults instead would do something other than what was asked.
+    Usage { message: String, exit: i32 },
 }
+
+/// Exit code of a usage error: the same as a config error, the daemon's other "you asked for
+/// something I cannot do" outcome.
+const USAGE_EXIT: i32 = 2;
+/// `zion import` keeps 2 for "converted, but `--strict` found partial/unsupported directives"
+/// (ADR-0011), so its usage errors are the fatal 1: nothing was emitted.
+const IMPORT_USAGE_EXIT: i32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct TopOpts {
@@ -203,17 +214,26 @@ pub(crate) fn parse_argv(args: &[String]) -> Command {
     let Some(first) = args.first() else {
         return Command::Daemon;
     };
+    let rest = &args[1..];
+    // `zion init --help` asks for help, it does not start the wizard. (`audit` reads its own
+    // arguments.) A flag's value never starts with `-`, so this cannot swallow one.
+    if first != "audit" && rest.iter().any(|a| a == "-h" || a == "--help") {
+        return Command::Help;
+    }
+    let usage = |exit: i32| move |message: String| Command::Usage { message, exit };
     match first.as_str() {
         "-h" | "--help" | "help" => Command::Help,
         "-V" | "--version" | "version" => Command::Version,
-        "top" => Command::Top(parse_top_opts(&args[1..])),
-        "doctor" => Command::Doctor,
-        "init" => Command::Init(parse_init_opts(&args[1..])),
-        "bootstrap" => Command::Bootstrap,
-        "auto" => Command::Auto(parse_auto_opts(&args[1..])),
-        "suggest" => Command::Suggest(parse_suggest_opts(&args[1..])),
-        "import" => Command::Import(parse_import_opts(&args[1..])),
-        "audit" => Command::Audit(args[1..].to_vec()),
+        "top" => parse_top_opts(rest).map_or_else(usage(USAGE_EXIT), Command::Top),
+        "doctor" => no_args("doctor", rest).map_or_else(usage(USAGE_EXIT), |()| Command::Doctor),
+        "init" => parse_init_opts(rest).map_or_else(usage(USAGE_EXIT), Command::Init),
+        "bootstrap" => {
+            no_args("bootstrap", rest).map_or_else(usage(USAGE_EXIT), |()| Command::Bootstrap)
+        }
+        "auto" => parse_auto_opts(rest).map_or_else(usage(USAGE_EXIT), Command::Auto),
+        "suggest" => parse_suggest_opts(rest).map_or_else(usage(USAGE_EXIT), Command::Suggest),
+        "import" => parse_import_opts(rest).map_or_else(usage(IMPORT_USAGE_EXIT), Command::Import),
+        "audit" => Command::Audit(rest.to_vec()),
         "acme-soak" => Command::AcmeSoak,
         other => {
             // Anything else: surface as Unknown — caller prints help and exits 1.
@@ -224,71 +244,179 @@ pub(crate) fn parse_argv(args: &[String]) -> Command {
     }
 }
 
-fn parse_auto_opts(args: &[String]) -> AutoOpts {
-    let mut opts = AutoOpts::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-u" | "--upstream" if i + 1 < args.len() => {
-                opts.upstream = normalize_upstream(&args[i + 1]);
-                i += 2;
-            }
-            "--http-port" if i + 1 < args.len() => {
-                if let Ok(p) = args[i + 1].parse::<u16>() {
-                    opts.http_port = p;
-                }
-                i += 2;
-            }
-            "--https-port" if i + 1 < args.len() => {
-                if let Ok(p) = args[i + 1].parse::<u16>() {
-                    opts.https_port = p;
-                }
-                i += 2;
-            }
-            "--hostname" if i + 1 < args.len() => {
-                opts.hostname = args[i + 1].clone();
-                i += 2;
-            }
-            _ => i += 1,
+/// Walks one subcommand's arguments. Every parser goes through it, so the rules are the same
+/// everywhere: `--flag value` and `--flag=value` both work, and an unknown flag, a missing
+/// value or a value that does not parse is an error, never a silent default.
+struct Flags<'a> {
+    cmd: &'static str,
+    args: &'a [String],
+    i: usize,
+    /// The flag `next` returned last, for the error messages.
+    flag: &'a str,
+    /// The `value` of a `--flag=value` argument, until the flag's arm takes it.
+    inline: Option<&'a str>,
+}
+
+impl<'a> Flags<'a> {
+    fn new(cmd: &'static str, args: &'a [String]) -> Self {
+        Self {
+            cmd,
+            args,
+            i: 0,
+            flag: "",
+            inline: None,
         }
     }
-    opts
+
+    /// The next argument, with the `=value` of a long flag split off. An `=value` the previous
+    /// flag did not take (`--force=yes`) is an error.
+    fn next(&mut self) -> Result<Option<&'a str>, String> {
+        if let Some(v) = self.inline.take() {
+            return Err(format!(
+                "zion {}: {} takes no value (got `{v}`)",
+                self.cmd, self.flag
+            ));
+        }
+        let Some(arg) = self.args.get(self.i) else {
+            return Ok(None);
+        };
+        self.i += 1;
+        self.flag = arg;
+        if arg.starts_with("--") {
+            if let Some((name, value)) = arg.split_once('=') {
+                self.flag = name;
+                self.inline = Some(value);
+            }
+        }
+        Ok(Some(self.flag))
+    }
+
+    /// The value of the flag `next` just returned. The following argument is not taken when it
+    /// looks like a flag itself: `import x.conf -o --strict` must not write a file named
+    /// `--strict`. (`-`, stdin/stdout by convention, is a value.)
+    fn value(&mut self) -> Result<&'a str, String> {
+        if let Some(v) = self.inline.take() {
+            return Ok(v);
+        }
+        let (cmd, flag) = (self.cmd, self.flag);
+        match self.args.get(self.i) {
+            Some(v) if !v.starts_with('-') || v == "-" => {
+                self.i += 1;
+                Ok(v)
+            }
+            Some(v) => Err(format!(
+                "zion {cmd}: {flag} needs a value, but `{v}` follows it (if that is the value, write {flag}={v})"
+            )),
+            None => Err(format!("zion {cmd}: {flag} needs a value")),
+        }
+    }
+
+    /// The flag's value parsed as `T`; `what` names the expected form in the error.
+    fn parsed<T: std::str::FromStr>(&mut self, what: &str) -> Result<T, String> {
+        let (cmd, flag) = (self.cmd, self.flag);
+        let v = self.value()?;
+        v.parse()
+            .map_err(|_| format!("zion {cmd}: {flag} expects {what}, got `{v}`"))
+    }
+
+    /// The flag's value split at its first `=` (`--var KEY=VALUE`); `what` names the form.
+    fn pair(&mut self, what: &str) -> Result<(&'a str, &'a str), String> {
+        let (cmd, flag) = (self.cmd, self.flag);
+        let v = self.value()?;
+        match v.split_once('=') {
+            Some((k, val)) if !k.trim().is_empty() => Ok((k, val)),
+            _ => Err(format!("zion {cmd}: {flag} expects {what}, got `{v}`")),
+        }
+    }
+
+    /// The error for an argument no arm matched, with the nearest known flag when the
+    /// argument looks like a typo of one.
+    fn unknown(&self, arg: &str, known: &[&str]) -> String {
+        let cmd = self.cmd;
+        if !arg.starts_with('-') {
+            return format!("zion {cmd}: unexpected argument `{arg}`");
+        }
+        let nearest = known
+            .iter()
+            .map(|k| (edit_distance(arg, k), *k))
+            .filter(|(d, _)| *d <= 2)
+            .min();
+        match nearest {
+            Some((_, k)) => format!("zion {cmd}: unknown flag `{arg}` (did you mean `{k}`?)"),
+            None => format!("zion {cmd}: unknown flag `{arg}`"),
+        }
+    }
 }
 
-// A value for a value-taking flag must not itself look like a flag — this is
-// what makes `zion import nginx x.conf -o --strict` keep `--strict` as the
-// flag it is instead of writing a file literally named "--strict".
-fn flag_value(args: &[String], i: usize) -> Option<&String> {
-    args.get(i + 1).filter(|v| !v.starts_with('-'))
+/// Levenshtein distance, for the "did you mean" hint. Flags are a few ASCII bytes long.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut diag = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = diag + usize::from(ca != cb);
+            diag = row[j + 1];
+            row[j + 1] = cost.min(row[j] + 1).min(diag + 1);
+        }
+    }
+    row[b.len()]
 }
 
-fn parse_import_opts(args: &[String]) -> ImportOpts {
+/// For the subcommands that take no arguments at all.
+fn no_args(cmd: &'static str, args: &[String]) -> Result<(), String> {
+    match args.first() {
+        None => Ok(()),
+        Some(arg) => Err(format!("zion {cmd}: takes no arguments, got `{arg}`")),
+    }
+}
+
+const AUTO_FLAGS: &[&str] = &[
+    "-u",
+    "--upstream",
+    "--http-port",
+    "--https-port",
+    "--hostname",
+];
+
+fn parse_auto_opts(args: &[String]) -> Result<AutoOpts, String> {
+    let mut opts = AutoOpts::default();
+    let mut f = Flags::new("auto", args);
+    while let Some(arg) = f.next()? {
+        match arg {
+            "-u" | "--upstream" => opts.upstream = normalize_upstream(f.value()?),
+            "--http-port" => opts.http_port = f.parsed("a port (0-65535)")?,
+            "--https-port" => opts.https_port = f.parsed("a port (0-65535)")?,
+            "--hostname" => opts.hostname = f.value()?.to_string(),
+            other => return Err(f.unknown(other, AUTO_FLAGS)),
+        }
+    }
+    Ok(opts)
+}
+
+const IMPORT_FLAGS: &[&str] = &[
+    "-o",
+    "--output",
+    "--report",
+    "--strict",
+    "--var",
+    "--acme-email",
+];
+
+fn parse_import_opts(args: &[String]) -> Result<ImportOpts, String> {
     let mut opts = ImportOpts::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-o" | "--output" if flag_value(args, i).is_some() => {
-                opts.output = flag_value(args, i).cloned();
-                i += 2;
+    let mut f = Flags::new("import", args);
+    while let Some(arg) = f.next()? {
+        match arg {
+            "-o" | "--output" => opts.output = Some(f.value()?.to_string()),
+            "--report" => opts.report = Some(f.value()?.to_string()),
+            "--strict" => opts.strict = true,
+            "--var" => {
+                let (k, v) = f.pair("KEY=VALUE")?;
+                opts.vars.push((k.to_string(), v.to_string()));
             }
-            "--report" if flag_value(args, i).is_some() => {
-                opts.report = flag_value(args, i).cloned();
-                i += 2;
-            }
-            "--strict" => {
-                opts.strict = true;
-                i += 1;
-            }
-            "--var" if flag_value(args, i).is_some() => {
-                if let Some((k, v)) = flag_value(args, i).and_then(|kv| kv.split_once('=')) {
-                    opts.vars.push((k.to_string(), v.to_string()));
-                }
-                i += 2;
-            }
-            "--acme-email" if flag_value(args, i).is_some() => {
-                opts.acme_email = flag_value(args, i).cloned();
-                i += 2;
-            }
+            "--acme-email" => opts.acme_email = Some(f.value()?.to_string()),
             // Positionals: first the source format, then the input path
             // (`-` = stdin, so a leading dash alone is not a flag).
             arg if !arg.starts_with('-') || arg == "-" => {
@@ -296,36 +424,30 @@ fn parse_import_opts(args: &[String]) -> ImportOpts {
                     opts.source = arg.to_string();
                 } else if opts.input.is_none() {
                     opts.input = Some(arg.to_string());
+                } else {
+                    return Err(f.unknown(arg, IMPORT_FLAGS));
                 }
-                i += 1;
             }
-            _ => i += 1,
+            other => return Err(f.unknown(other, IMPORT_FLAGS)),
         }
     }
-    opts
+    Ok(opts)
 }
 
-fn parse_suggest_opts(args: &[String]) -> SuggestOpts {
+const SUGGEST_FLAGS: &[&str] = &["-u", "--upstream", "-d", "--domain", "-w", "--write"];
+
+fn parse_suggest_opts(args: &[String]) -> Result<SuggestOpts, String> {
     let mut opts = SuggestOpts::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-u" | "--upstream" if i + 1 < args.len() => {
-                opts.upstream = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "-d" | "--domain" if i + 1 < args.len() => {
-                opts.domain = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "-w" | "--write" if i + 1 < args.len() => {
-                opts.write = Some(args[i + 1].clone());
-                i += 2;
-            }
-            _ => i += 1,
+    let mut f = Flags::new("suggest", args);
+    while let Some(arg) = f.next()? {
+        match arg {
+            "-u" | "--upstream" => opts.upstream = Some(f.value()?.to_string()),
+            "-d" | "--domain" => opts.domain = Some(f.value()?.to_string()),
+            "-w" | "--write" => opts.write = Some(f.value()?.to_string()),
+            other => return Err(f.unknown(other, SUGGEST_FLAGS)),
         }
     }
-    opts
+    Ok(opts)
 }
 
 /// Allow `--upstream=:3000` as shorthand for `127.0.0.1:3000` so the
@@ -338,96 +460,69 @@ fn normalize_upstream(s: &str) -> String {
     }
 }
 
-fn parse_init_opts(args: &[String]) -> InitOpts {
+const INIT_FLAGS: &[&str] = &[
+    "-o",
+    "--output",
+    "-f",
+    "--force",
+    "-y",
+    "--non-interactive",
+    "--hostname",
+    "--upstream",
+    "--http-port",
+    "--https-port",
+    "--no-tls",
+    "--no-waf",
+    "--acme",
+    "--no-acme",
+    "--email",
+    "--domain",
+];
+
+fn parse_init_opts(args: &[String]) -> Result<InitOpts, String> {
     let mut opts = InitOpts::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-o" | "--output" if i + 1 < args.len() => {
-                opts.output = args[i + 1].clone();
-                i += 2;
+    let mut f = Flags::new("init", args);
+    while let Some(arg) = f.next()? {
+        match arg {
+            "-o" | "--output" => opts.output = f.value()?.to_string(),
+            "-f" | "--force" => opts.force = true,
+            "-y" | "--non-interactive" => opts.non_interactive = true,
+            "--hostname" => opts.hostname = Some(f.value()?.to_string()),
+            // Format: name=host:port  e.g. "backend=127.0.0.1:8000"
+            "--upstream" => {
+                let (name, target) = f.pair("NAME=HOST:PORT")?;
+                opts.upstreams
+                    .push((name.trim().to_string(), target.trim().to_string()));
             }
-            "-f" | "--force" => {
-                opts.force = true;
-                i += 1;
-            }
-            "-y" | "--non-interactive" => {
-                opts.non_interactive = true;
-                i += 1;
-            }
-            "--hostname" if i + 1 < args.len() => {
-                opts.hostname = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--upstream" if i + 1 < args.len() => {
-                // Format: name=host:port  e.g. "backend=127.0.0.1:8000"
-                if let Some((name, target)) = args[i + 1].split_once('=') {
-                    opts.upstreams
-                        .push((name.trim().to_string(), target.trim().to_string()));
-                }
-                i += 2;
-            }
-            "--http-port" if i + 1 < args.len() => {
-                if let Ok(p) = args[i + 1].parse::<u16>() {
-                    opts.http_port = Some(p);
-                }
-                i += 2;
-            }
-            "--https-port" if i + 1 < args.len() => {
-                if let Ok(p) = args[i + 1].parse::<u16>() {
-                    opts.https_port = Some(p);
-                }
-                i += 2;
-            }
-            "--no-tls" => {
-                opts.with_tls = false;
-                i += 1;
-            }
-            "--no-waf" => {
-                opts.with_waf = false;
-                i += 1;
-            }
-            "--acme" => {
-                opts.acme = Some(true);
-                i += 1;
-            }
-            "--no-acme" => {
-                opts.acme = Some(false);
-                i += 1;
-            }
-            "--email" if i + 1 < args.len() => {
-                opts.acme_email = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--domain" if i + 1 < args.len() => {
-                opts.acme_domains.push(args[i + 1].clone());
-                i += 2;
-            }
-            _ => i += 1,
+            "--http-port" => opts.http_port = Some(f.parsed("a port (0-65535)")?),
+            "--https-port" => opts.https_port = Some(f.parsed("a port (0-65535)")?),
+            "--no-tls" => opts.with_tls = false,
+            "--no-waf" => opts.with_waf = false,
+            "--acme" => opts.acme = Some(true),
+            "--no-acme" => opts.acme = Some(false),
+            "--email" => opts.acme_email = Some(f.value()?.to_string()),
+            "--domain" => opts.acme_domains.push(f.value()?.to_string()),
+            other => return Err(f.unknown(other, INIT_FLAGS)),
         }
     }
-    opts
+    Ok(opts)
 }
 
-fn parse_top_opts(args: &[String]) -> TopOpts {
+const TOP_FLAGS: &[&str] = &["-u", "--url", "-i", "--interval"];
+
+fn parse_top_opts(args: &[String]) -> Result<TopOpts, String> {
     let mut opts = TopOpts::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-u" | "--url" if i + 1 < args.len() => {
-                opts.url = args[i + 1].clone();
-                i += 2;
+    let mut f = Flags::new("top", args);
+    while let Some(arg) = f.next()? {
+        match arg {
+            "-u" | "--url" => opts.url = f.value()?.to_string(),
+            "-i" | "--interval" => {
+                opts.interval_ms = f.parsed::<u64>("milliseconds")?.clamp(100, 10_000);
             }
-            "-i" | "--interval" if i + 1 < args.len() => {
-                if let Ok(n) = args[i + 1].parse::<u64>() {
-                    opts.interval_ms = n.clamp(100, 10_000);
-                }
-                i += 2;
-            }
-            _ => i += 1,
+            other => return Err(f.unknown(other, TOP_FLAGS)),
         }
     }
-    opts
+    Ok(opts)
 }
 
 pub fn print_version() {
@@ -494,10 +589,17 @@ pub fn print_help() {
                 --domain <NAME>          domain to obtain a cert for (repeatable; default: the hostname)\n\
         \n\
         IMPORT OPTIONS:\n  \
-            {bin} import nginx <PATH|->  input config (`-` = stdin; `include` resolves relative to it)\n  \
+            {bin} import nginx <PATH|->  nginx config (`-` = stdin; `include` resolves relative to it)\n  \
+            {bin} import traefik <PATH>  docker-compose file with Traefik labels (`.env` next to it is read)\n  \
+            {bin} import caddy <PATH|->  Caddyfile (`.env` next to it is read)\n  \
             -o, --output <PATH>          write the converted config (default stdout)\n  \
                 --report <PATH>          write the full findings report (stderr shows partial/unsupported)\n  \
-                --strict                 exit 2 if any partial/unsupported finding exists\n\
+                --strict                 exit 2 if any partial/unsupported finding exists\n  \
+                --var KEY=VALUE          value for a `${{KEY}}` / `{{$KEY}}` in the source (repeatable; wins over `.env`)\n  \
+                --acme-email <ADDR>      emit `[tls.acme]` with this contact when the source uses automatic HTTPS\n\
+        \n\
+        Every flag also takes the form --flag=value. An unknown flag, a missing value or a value\n\
+        that does not parse is an error (exit 2; exit 1 for import).\n\
         \n\
         ENVIRONMENT:\n  \
             ZION_CONFIG=zion.toml        config path for the daemon\n  \
@@ -578,16 +680,16 @@ mod tests {
             }
             _ => panic!("expected Import"),
         }
-        // A value-taking flag never swallows a following flag: here `-o` is
-        // dangling, so output stays stdout and --strict is still honored.
-        match parse_argv(&argv(&["import", "nginx", "x.conf", "-o", "--strict"])) {
-            Command::Import(o) => {
-                assert_eq!(o.output, None);
-                assert!(o.strict);
-                assert_eq!(o.input.as_deref(), Some("x.conf"));
-            }
-            _ => panic!("expected Import"),
-        }
+        // A value-taking flag never swallows a following flag: `-o --strict` does not write a
+        // file named "--strict". It is an error, not a silent "output stays stdout".
+        let msg = usage(
+            &["import", "nginx", "x.conf", "-o", "--strict"],
+            IMPORT_USAGE_EXIT,
+        );
+        assert!(
+            msg.contains("-o needs a value") && msg.contains("-o=--strict"),
+            "{msg}"
+        );
         // Bare `import` → empty source; run() prints usage and exits 1.
         match parse_argv(&argv(&["import"])) {
             Command::Import(o) => assert!(o.source.is_empty() && o.input.is_none()),
@@ -766,11 +868,250 @@ mod tests {
         }
     }
 
-    #[test]
-    fn init_malformed_upstream_skipped() {
-        match parse_argv(&argv(&["init", "--upstream", "no-equals-sign"])) {
-            Command::Init(o) => assert!(o.upstreams.is_empty()),
-            _ => panic!(),
+    /// The message of the usage error `args` must produce, with the exit code checked.
+    fn usage(args: &[&str], exit: i32) -> String {
+        match parse_argv(&argv(args)) {
+            Command::Usage { message, exit: got } => {
+                assert_eq!(got, exit, "exit code of `zion {}`", args.join(" "));
+                message
+            }
+            other => panic!(
+                "`zion {}` must be a usage error, got {other:?}",
+                args.join(" ")
+            ),
         }
+    }
+
+    /// Every subcommand, every way of getting an argument wrong: each used to run with a
+    /// default instead of what was asked (ZION-API-02).
+    #[test]
+    fn a_wrong_argument_is_an_error_in_every_subcommand() {
+        // (args, exit code, what the message must name)
+        let cases: &[(&[&str], i32, &[&str])] = &[
+            // Unknown flag, with the nearest known one.
+            (
+                &["init", "-y", "--ouput", "x.toml"],
+                2,
+                &["zion init", "`--ouput`", "`--output`"],
+            ),
+            (
+                &["auto", "--upsteam", ":3000"],
+                2,
+                &["zion auto", "`--upsteam`", "`--upstream`"],
+            ),
+            (
+                &["suggest", "--domian", "a.example"],
+                2,
+                &["zion suggest", "`--domian`", "`--domain`"],
+            ),
+            (
+                &["top", "--intervall", "250"],
+                2,
+                &["zion top", "`--intervall`", "`--interval`"],
+            ),
+            (
+                &["import", "nginx", "a.conf", "--strct"],
+                1,
+                &["zion import", "`--strct`", "`--strict`"],
+            ),
+            // Unknown flag with nothing near it: no hint is invented.
+            (
+                &["init", "--frobnicate"],
+                2,
+                &["unknown flag `--frobnicate`"],
+            ),
+            // Missing value.
+            (&["init", "--output"], 2, &["--output needs a value"]),
+            (&["auto", "--upstream"], 2, &["--upstream needs a value"]),
+            (&["suggest", "-w"], 2, &["-w needs a value"]),
+            (&["top", "--url"], 2, &["--url needs a value"]),
+            (
+                &["import", "nginx", "a.conf", "--report"],
+                1,
+                &["--report needs a value"],
+            ),
+            (
+                &["init", "--hostname", "--no-tls"],
+                2,
+                &["--hostname needs a value", "`--no-tls`"],
+            ),
+            // A value that does not parse.
+            (
+                &["init", "--https-port", "70000"],
+                2,
+                &["--https-port expects a port", "`70000`"],
+            ),
+            (
+                &["init", "--http-port", "abc"],
+                2,
+                &["--http-port expects a port", "`abc`"],
+            ),
+            (
+                &["auto", "--https-port", "-1"],
+                2,
+                &["--https-port needs a value"],
+            ),
+            (
+                &["auto", "--http-port=eighty"],
+                2,
+                &["--http-port expects a port", "`eighty`"],
+            ),
+            (
+                &["top", "-i", "fast"],
+                2,
+                &["-i expects milliseconds", "`fast`"],
+            ),
+            (
+                &["init", "--upstream", "no-equals-sign"],
+                2,
+                &["--upstream expects NAME=HOST:PORT"],
+            ),
+            (
+                &["init", "--upstream", "=127.0.0.1:1"],
+                2,
+                &["--upstream expects NAME=HOST:PORT"],
+            ),
+            (
+                &["import", "traefik", "c.yml", "--var", "FOO"],
+                1,
+                &["--var expects KEY=VALUE", "`FOO`"],
+            ),
+            // A value given to a flag that takes none.
+            (
+                &["init", "--force=yes"],
+                2,
+                &["--force takes no value", "`yes`"],
+            ),
+            (
+                &["import", "nginx", "a.conf", "--strict=1"],
+                1,
+                &["--strict takes no value"],
+            ),
+            // A stray positional.
+            (
+                &["init", "zion.toml"],
+                2,
+                &["unexpected argument `zion.toml`"],
+            ),
+            (&["auto", ":3000"], 2, &["unexpected argument `:3000`"]),
+            (
+                &["import", "nginx", "a.conf", "b.conf"],
+                1,
+                &["unexpected argument `b.conf`"],
+            ),
+            (
+                &["doctor", "--json"],
+                2,
+                &["zion doctor: takes no arguments", "`--json`"],
+            ),
+            (
+                &["bootstrap", "x"],
+                2,
+                &["zion bootstrap: takes no arguments"],
+            ),
+        ];
+        for (args, exit, needles) in cases {
+            let msg = usage(args, *exit);
+            for needle in *needles {
+                assert!(
+                    msg.contains(needle),
+                    "`zion {}` → `{msg}` lacks `{needle}`",
+                    args.join(" ")
+                );
+            }
+        }
+    }
+
+    /// `--flag=value` is the form the docs use for the shortest path (`auto --upstream=:3000`).
+    /// It used to be an unrecognised argument, skipped: it only "worked" because the default
+    /// upstream is also :3000.
+    #[test]
+    fn a_long_flag_takes_its_value_after_an_equals_sign() {
+        match parse_argv(&argv(&["auto", "--upstream=:9000", "--https-port=9443"])) {
+            Command::Auto(o) => {
+                assert_eq!(o.upstream, "127.0.0.1:9000");
+                assert_eq!(o.https_port, 9443);
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_argv(&argv(&[
+            "init",
+            "--upstream=api=10.0.0.1:8000",
+            "--output=out.toml",
+        ])) {
+            Command::Init(o) => {
+                assert_eq!(
+                    o.upstreams,
+                    [("api".to_string(), "10.0.0.1:8000".to_string())]
+                );
+                assert_eq!(o.output, "out.toml");
+            }
+            other => panic!("{other:?}"),
+        }
+        // The explicit form is how a value that starts with a dash is given.
+        match parse_argv(&argv(&[
+            "import",
+            "nginx",
+            "a.conf",
+            "--var=FLAGS=-O2",
+            "--output=-",
+        ])) {
+            Command::Import(o) => {
+                assert_eq!(o.vars, [("FLAGS".to_string(), "-O2".to_string())]);
+                assert_eq!(o.output.as_deref(), Some("-"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The `*_FLAGS` lists feed the "did you mean" hint; a flag missing from its list would
+    /// never be suggested. Each listed flag must be one its parser accepts.
+    #[test]
+    fn every_listed_flag_is_accepted_by_its_parser() {
+        let lists: &[(&str, &[&str], &[&str])] = &[
+            ("auto", AUTO_FLAGS, &[]),
+            ("suggest", SUGGEST_FLAGS, &[]),
+            ("top", TOP_FLAGS, &[]),
+            ("init", INIT_FLAGS, &[]),
+            ("import", IMPORT_FLAGS, &["nginx", "a.conf"]),
+        ];
+        for (cmd, flags, prefix) in lists {
+            for flag in *flags {
+                let mut args = vec![*cmd];
+                args.extend_from_slice(prefix);
+                args.push(flag);
+                if let Command::Usage { message, .. } = parse_argv(&argv(&args)) {
+                    assert!(
+                        !message.contains("unknown flag"),
+                        "{cmd}: listed flag {flag} is not accepted: {message}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn help_inside_a_subcommand_is_help() {
+        for args in [
+            &["init", "--help"][..],
+            &["auto", "-h"],
+            &["import", "nginx", "--help"],
+        ] {
+            assert!(matches!(parse_argv(&argv(args)), Command::Help), "{args:?}");
+        }
+        // `audit` reads its own arguments.
+        assert!(matches!(
+            parse_argv(&argv(&["audit", "--help"])),
+            Command::Audit(_)
+        ));
+    }
+
+    #[test]
+    fn edit_distance_counts_single_edits() {
+        assert_eq!(edit_distance("--output", "--output"), 0);
+        assert_eq!(edit_distance("--ouput", "--output"), 1);
+        assert_eq!(edit_distance("--upsteam", "--upstream"), 1);
+        assert_eq!(edit_distance("--strct", "--strict"), 1);
+        assert_eq!(edit_distance("", "-o"), 2);
     }
 }
