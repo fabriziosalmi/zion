@@ -116,6 +116,7 @@ feature-gated series (absent, not zero, without the feature) is called out.
 | `zion_audit_events_total` | counter | Audit-log events emitted (signed + HMAC-chained) |
 | `zion_cache_tag_uncached` | counter | Responses not stored because their `Surrogate-Key` tags could not be tracked (too many, too long, invalid, or the tag index is full) |
 | `zion_cache_entries` | gauge | Responses held in the shared response cache, all profiles together. Each profile is capped by its `max_entries`; a value that keeps rising past the sum of the caps is a bug |
+| `zion_auth_long_lived_tokens_total` | counter | Tokens accepted with more than 24 h left on an auth profile that has no `max_token_lifetime_secs`. The default cap becomes 24 h in the next minor release: this counts what it would refuse |
 | `zion_bulkhead_in_flight{upstream}` | gauge | Requests currently inside an upstream that has `max_in_flight` |
 | `zion_bulkhead_limit{upstream}` | gauge | The `max_in_flight` last applied to it |
 | `zion_bulkhead_shed_total{upstream}` | counter | Requests refused with `503` because it was at `max_in_flight` |

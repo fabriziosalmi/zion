@@ -422,6 +422,22 @@ fn warn_feature_config_gaps(config: &config::ZionConfig) {
             );
         }
     }
+    // A profile with no lifetime cap accepts a token whatever its `exp`. The default becomes
+    // 24 h in the next minor release (#553): say so now, per profile.
+    for (name, profile) in &config.auth_profile {
+        if profile.max_token_lifetime_secs.is_none() {
+            logging::warn(
+                "config",
+                &format!(
+                    "auth_profile '{name}' has no max_token_lifetime_secs: tokens are accepted \
+                     however far their expiry is. From the next minor release the default is \
+                     86400 (24 h) and tokens further out are refused. Set it to the longest \
+                     lifetime you issue (0 = no cap); zion_auth_long_lived_tokens_total counts \
+                     the tokens the new default would refuse."
+                ),
+            );
+        }
+    }
     // Same for the IP pseudonymisation key: with it, every logged token can be reversed.
     if config.redact.ip_hmac_key.is_some() {
         logging::warn(

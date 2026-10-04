@@ -146,7 +146,11 @@ pub struct AuthProfileConfig {
     /// Tokens that outlive it are rejected even though they are otherwise valid.
     /// Zion has no revocation list, so this is the lever that bounds how long a
     /// stolen or de-provisioned user's token keeps working: set it to the longest
-    /// token lifetime you actually issue (e.g. 900). Unset = no cap.
+    /// token lifetime you actually issue (e.g. 900). `0` = no cap, stated on purpose.
+    ///
+    /// Unset = no cap **for now**: a token with more than 24 h left is accepted, counted
+    /// (`zion_auth_long_lived_tokens_total`) and warned about, because from the next minor
+    /// release the default becomes 86400 and such a token will be refused (#553).
     #[serde(default)]
     pub max_token_lifetime_secs: Option<u64>,
 }
@@ -340,6 +344,67 @@ pub mod revocation {
     }
 }
 
+/// The cap that becomes the default of `max_token_lifetime_secs` in the next minor release
+/// (#553). Until then a profile without the setting has no cap, and tokens past this are
+/// counted and warned about so the operator sees what the change will refuse.
+pub const FUTURE_DEFAULT_MAX_TOKEN_LIFETIME_SECS: u64 = 86_400;
+
+/// What a profile's lifetime cap says about a token expiring at `exp`.
+#[cfg_attr(not(feature = "auth"), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum Lifetime {
+    Ok,
+    /// Further out than the configured cap (the value carried).
+    Refused(u64),
+    /// No cap configured and further out than the future default: accepted today.
+    AcceptedForNow,
+}
+
+#[cfg_attr(not(feature = "auth"), allow(dead_code))]
+fn lifetime_verdict(cap: Option<u64>, exp: u64, now: u64, leeway: u64) -> Lifetime {
+    let beyond = |max: u64| exp > now.saturating_add(max).saturating_add(leeway);
+    match cap {
+        Some(0) => Lifetime::Ok, // "no cap", said on purpose
+        Some(max) if beyond(max) => Lifetime::Refused(max),
+        Some(_) => Lifetime::Ok,
+        None if beyond(FUTURE_DEFAULT_MAX_TOKEN_LIFETIME_SECS) => Lifetime::AcceptedForNow,
+        None => Lifetime::Ok,
+    }
+}
+
+/// Count a token the future default would refuse, and say so in the log at most once a
+/// minute (the remaining lifetime only: never the token or its claims).
+#[cfg_attr(not(feature = "auth"), allow(dead_code))]
+fn note_long_lived_token(remaining_secs: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    crate::metrics::METRICS
+        .auth_long_lived_tokens
+        .fetch_add(1, Relaxed);
+    static LAST_WARNED: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_WARNED.load(Relaxed);
+    if now.saturating_sub(last) >= 60
+        && LAST_WARNED
+            .compare_exchange(last, now, Relaxed, Relaxed)
+            .is_ok()
+    {
+        crate::logging::warn(
+            "auth",
+            &format!(
+                "accepted a token that expires in {} h on a profile without \
+                 max_token_lifetime_secs. From the next minor release the default cap is 24 h \
+                 and such a token is refused: set max_token_lifetime_secs to the longest \
+                 lifetime you issue, or to 0 for no cap (zion_auth_long_lived_tokens_total \
+                 counts them)",
+                remaining_secs / 3600
+            ),
+        );
+    }
+}
+
 /// Validate a JWT token against a resolved auth profile.
 /// Returns decoded claims on success.
 #[cfg(feature = "auth")]
@@ -405,17 +470,24 @@ pub fn validate_token(token: &str, profile: &ResolvedAuthProfile) -> Result<Clai
     // Bound how long a token can be valid for. There is no revocation list, so
     // without this a token with a far-future `exp` (or a stolen one) stays valid
     // until it expires.
-    if let Some(max) = profile.max_token_lifetime_secs {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let latest_allowed = now.saturating_add(max).saturating_add(profile.leeway_secs);
-        if token_data.claims.exp.unwrap_or(u64::MAX) > latest_allowed {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let exp = token_data.claims.exp.unwrap_or(u64::MAX);
+    match lifetime_verdict(
+        profile.max_token_lifetime_secs,
+        exp,
+        now,
+        profile.leeway_secs,
+    ) {
+        Lifetime::Ok => {}
+        Lifetime::Refused(max) => {
             return Err(AuthError::InvalidToken(format!(
                 "token lifetime exceeds this profile's max_token_lifetime_secs ({max}s)"
             )));
         }
+        Lifetime::AcceptedForNow => note_long_lived_token(exp.saturating_sub(now)),
     }
 
     Ok(token_data.claims)
@@ -953,6 +1025,102 @@ mod tests {
         assert!(e.contains("at least 32") && !e.contains("short\""), "{e}");
         std::env::remove_var(prev);
         std::env::remove_var(cur);
+    }
+
+    /// Step 1 of the default lifetime cap (#553): nothing new is refused. A profile without
+    /// the setting accepts a far-off token and flags it; `0` is "no cap" said on purpose and
+    /// flags nothing; a configured cap refuses as before.
+    #[test]
+    fn a_missing_lifetime_cap_flags_long_lived_tokens_without_refusing_them() {
+        let now = 1_000_000;
+        let (hour, day) = (3_600, 86_400);
+        let leeway = 30;
+        // No setting: fine up to 24 h (plus leeway), flagged beyond.
+        assert_eq!(
+            lifetime_verdict(None, now + hour, now, leeway),
+            Lifetime::Ok
+        );
+        assert_eq!(
+            lifetime_verdict(None, now + day + leeway, now, leeway),
+            Lifetime::Ok
+        );
+        assert_eq!(
+            lifetime_verdict(None, now + day + leeway + 1, now, leeway),
+            Lifetime::AcceptedForNow
+        );
+        assert_eq!(
+            lifetime_verdict(None, u64::MAX, now, leeway),
+            Lifetime::AcceptedForNow
+        );
+        // 0: no cap, and nothing to flag.
+        assert_eq!(
+            lifetime_verdict(Some(0), now + 400 * day, now, leeway),
+            Lifetime::Ok
+        );
+        // A cap: refused beyond it, as before.
+        assert_eq!(
+            lifetime_verdict(Some(900), now + 900 + leeway, now, leeway),
+            Lifetime::Ok
+        );
+        assert_eq!(
+            lifetime_verdict(Some(900), now + 900 + leeway + 1, now, leeway),
+            Lifetime::Refused(900)
+        );
+        // An already-expired token is not this check's business (exp validation refuses it).
+        assert_eq!(lifetime_verdict(None, now - 10, now, leeway), Lifetime::Ok);
+    }
+
+    /// End to end through `validate_token`: the 25-hour token is accepted and counted.
+    #[cfg(feature = "auth")]
+    #[tokio::test]
+    async fn a_long_lived_token_is_accepted_and_counted() {
+        const KEY: &str = "lifetime-key-padding-padding-padding-padding";
+        let profile = |cap: Option<u64>| {
+            resolve_auth_profile(&AuthProfileConfig {
+                issuer: None,
+                audience: None,
+                secret: Some(KEY.into()),
+                secret_env: None,
+                previous_secret_env: None,
+                jwks_url: None,
+                algorithm: "HS256".into(),
+                forward_claims: true,
+                leeway_secs: 30,
+                max_token_lifetime_secs: cap,
+            })
+            .expect("resolves")
+        };
+        let token = |secs: u64| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            jsonwebtoken::encode(
+                &jsonwebtoken::Header::new(Algorithm::HS256),
+                &serde_json::json!({"sub": "u", "exp": now + secs}),
+                &jsonwebtoken::EncodingKey::from_secret(KEY.as_bytes()),
+            )
+            .unwrap()
+        };
+        let counted = || {
+            crate::metrics::METRICS
+                .auth_long_lived_tokens
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let before = counted();
+        assert!(
+            validate_token(&token(25 * 3600), &profile(None)).is_ok(),
+            "accepted today"
+        );
+        assert!(counted() > before, "and counted");
+        assert!(
+            validate_token(&token(25 * 3600), &profile(Some(0))).is_ok(),
+            "0 = no cap"
+        );
+        assert!(
+            validate_token(&token(25 * 3600), &profile(Some(3600))).is_err(),
+            "a configured cap still refuses"
+        );
     }
 
     /// A revocation recorded on disk is back after a restart (ZION-AUTH-06): `load` is what
