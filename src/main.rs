@@ -1710,6 +1710,36 @@ fn is_valid_host(host: &str) -> bool {
     security::is_valid_host(host)
 }
 
+/// The port the plain-HTTP listener is bound to, if any.
+fn cfg_http_port(state: &AppState) -> Option<u16> {
+    state.cfg().listen_http.map(|a| a.port())
+}
+
+/// The authority the `:80` redirect sends the client to, given the `Host` it used.
+///
+/// A `Host` that names our own HTTP port (`localhost:8080`) reached this listener directly,
+/// so the HTTPS listener's port is what it must go to: keeping `:8080` sent the browser back
+/// to the plaintext port over TLS, a redirect that could never work (`zion auto`, any
+/// non-standard pair of ports). A `Host` without a port, or with a port that is not ours (a
+/// port mapping in front), is left alone: there the public ports are not something zion knows.
+fn https_authority(host: &str, http_port: Option<u16>, https_port: Option<u16>) -> String {
+    // `name:port` or `[v6]:port`; a bare IPv6 literal has colons but no port.
+    let split = match host.rfind(':') {
+        Some(i) if !host[i..].contains(']') => Some((&host[..i], &host[i + 1..])),
+        _ => None,
+    };
+    let (Some((name, port)), Some(http_port)) = (split, http_port) else {
+        return host.to_string();
+    };
+    if port.parse::<u16>().ok() != Some(http_port) {
+        return host.to_string();
+    }
+    match https_port {
+        None | Some(443) => name.to_string(),
+        Some(p) => format!("{name}:{p}"),
+    }
+}
+
 /// HTTP (port 80) handler — ACME challenge proxy or 301 redirect to HTTPS.
 async fn handle_http(
     mut req: Request<ZionBody>,
@@ -1858,7 +1888,12 @@ async fn handle_http(
         path_and_query
     };
 
-    let redirect_uri = format!("https://{host}{safe_path}");
+    let authority = https_authority(
+        host,
+        cfg_http_port(&state),
+        state.cfg().listen_https.map(|a| a.port()),
+    );
+    let redirect_uri = format!("https://{authority}{safe_path}");
     Ok(Response::builder()
         .status(StatusCode::MOVED_PERMANENTLY)
         .header(hyper::header::LOCATION, redirect_uri)
@@ -1880,6 +1915,47 @@ fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
         &state.limiters.rate_map,
         ip,
     )
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::https_authority;
+
+    #[test]
+    fn the_redirect_goes_to_the_https_port_not_back_to_the_http_one() {
+        // (Host, http port, https port) -> authority
+        let cases: &[(&str, Option<u16>, Option<u16>, &str)] = &[
+            // The client reached the HTTP listener on its own port: send it to the HTTPS one.
+            ("localhost:8080", Some(8080), Some(8443), "localhost:8443"),
+            ("app.example:8080", Some(8080), Some(443), "app.example"),
+            ("[::1]:8080", Some(8080), Some(8443), "[::1]:8443"),
+            ("127.0.0.1:8080", Some(8080), Some(8443), "127.0.0.1:8443"),
+            // Standard ports: no port in the Host, none added.
+            ("app.example", Some(80), Some(443), "app.example"),
+            // A port mapping in front (Docker -p 80:8080 -p 443:8443): the Host has no port,
+            // and the public HTTPS port is 443 whatever zion is bound to.
+            ("app.example", Some(8080), Some(8443), "app.example"),
+            // A port that is not ours: the public mapping is not something zion knows.
+            (
+                "app.example:8000",
+                Some(8080),
+                Some(8443),
+                "app.example:8000",
+            ),
+            // A bare IPv6 literal has colons but no port.
+            ("[::1]", Some(8080), Some(8443), "[::1]"),
+            // No listener information: unchanged.
+            ("localhost:8080", None, Some(8443), "localhost:8080"),
+            ("localhost:8080", Some(8080), None, "localhost"),
+        ];
+        for (host, http, https, want) in cases {
+            assert_eq!(
+                https_authority(host, *http, *https),
+                *want,
+                "{host} {http:?} {https:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
