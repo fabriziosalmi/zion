@@ -1626,17 +1626,10 @@ async fn a_background_refresh_never_takes_the_half_open_probe() {
 
 // ── routing/host override headers from the client ───────────────────────────
 
-const REWRITE_HEADERS: [&str; 9] = [
-    "x-original-url",
-    "x-rewrite-url",
-    "forwarded",
-    "x-forwarded-server",
-    "x-forwarded-scheme",
-    "x-forwarded-prefix",
-    "x-host",
-    "x-http-host-override",
-    "x-original-host",
-];
+/// The headers only a trusted proxy may set: the single list in `reserved_headers`.
+fn rewrite_headers() -> Vec<&'static str> {
+    crate::reserved_headers::reserved(crate::reserved_headers::Asserter::TrustedProxy).collect()
+}
 
 fn seen(o: &Origin, name: &str) -> Option<String> {
     o.last_headers
@@ -1648,7 +1641,10 @@ fn seen(o: &Origin, name: &str) -> Option<String> {
 }
 
 fn hostile_headers() -> Vec<(&'static str, &'static str)> {
-    REWRITE_HEADERS.iter().map(|h| (*h, "/admin")).collect()
+    rewrite_headers()
+        .into_iter()
+        .map(|h| (h, "/admin"))
+        .collect()
 }
 
 /// A client must not be able to steer a framework that honours these headers (IIS and Symfony
@@ -1661,13 +1657,49 @@ async fn untrusted_clients_cannot_send_routing_or_host_override_headers_upstream
     headers.push(("accept-language", "de"));
     headers.push(("x-custom", "kept"));
     fetch(&st, "/h1", &headers).await;
-    for h in REWRITE_HEADERS {
+    for h in rewrite_headers() {
         assert_eq!(seen(&o, h), None, "{h} must not reach the upstream");
     }
     // control: ordinary headers are untouched, and Zion's own trust headers are set
     assert_eq!(seen(&o, "accept-language").as_deref(), Some("de"));
     assert_eq!(seen(&o, "x-custom").as_deref(), Some("kept"));
     assert!(seen(&o, "x-forwarded-for").is_some() && seen(&o, "x-forwarded-proto").is_some());
+}
+
+/// What only Zion's pipeline may assert (the authenticated identity, the mesh reputation)
+/// is dropped from every request, a trusted proxy's included: no peer speaks for the auth
+/// gate or the mesh. `X-Zion-Mesh-Score` used to pass straight through, so a client could
+/// hand the upstream a reputation of its own choosing (ZION-AUTH-07).
+#[tokio::test]
+async fn nobody_can_send_what_only_the_pipeline_asserts() {
+    use crate::reserved_headers::{reserved, Asserter};
+    let (o, _) = rig("").await;
+    let port = o.port.load(Ordering::Relaxed);
+    let mut cfg = cfg_for(port, "");
+    cfg.server.trusted_proxies = vec!["203.0.113.0/24".to_string()];
+    let st = AppState::for_tests(&cfg);
+    let forged: Vec<(&str, &str)> = reserved(Asserter::Pipeline)
+        .map(|h| (h, "forged"))
+        .collect();
+    assert!(forged.iter().any(|(h, _)| *h == "x-zion-mesh-score"));
+    for (peer, who) in [
+        ("198.51.100.7:1", "a client"),
+        ("203.0.113.9:1", "a trusted proxy"),
+    ] {
+        let resp = process_request(
+            get(&format!("/p-{}", who.len()), &forged),
+            st.clone(),
+            peer.parse::<SocketAddr>().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let _ = resp.into_body().collect().await;
+        for (h, _) in &forged {
+            assert_eq!(seen(&o, h), None, "{h} from {who} reached the upstream");
+        }
+    }
 }
 
 #[tokio::test]
@@ -1699,7 +1731,7 @@ async fn a_trusted_proxy_peer_keeps_its_headers() {
     let st = AppState::for_tests(&cfg);
     // the peer used by `fetch` is 203.0.113.9: trusted here
     fetch(&st, "/h3", &hostile_headers()).await;
-    for h in REWRITE_HEADERS {
+    for h in rewrite_headers() {
         assert_eq!(
             seen(&o, h).as_deref(),
             Some("/admin"),
@@ -1716,7 +1748,7 @@ async fn a_trusted_proxy_peer_keeps_its_headers() {
     .await
     .unwrap();
     let _ = resp.into_body().collect().await;
-    for h in REWRITE_HEADERS {
+    for h in rewrite_headers() {
         assert_eq!(seen(&o, h), None, "{h} from an untrusted peer is stripped");
     }
 }
@@ -1734,7 +1766,7 @@ async fn the_port_80_acme_fallback_strips_them_too() {
     .unwrap();
     let _ = resp.into_body().collect().await;
     assert_eq!(hits(&o), 1, "the challenge path was forwarded");
-    for h in REWRITE_HEADERS {
+    for h in rewrite_headers() {
         assert_eq!(
             seen(&o, h),
             None,

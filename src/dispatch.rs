@@ -253,19 +253,12 @@ fn trace_id_to_hex(bytes: &[u8; 16]) -> String {
     s
 }
 
-/// Zion-owned identity headers upstreams trust as *verified*. Any inbound copy
-/// is a spoof attempt and is dropped at the trust boundary; the auth gate later
-/// re-injects the authenticated values. Kept as a named list so the reserved
-/// set lives in exactly one place.
-const RESERVED_IDENTITY_HEADERS: [&str; 2] = ["x-auth-subject", "x-auth-email"];
-
-/// Strip every reserved identity header off an inbound request. Idempotent, and
-/// clears repeated copies (hyper lower-cases header names, so one `remove` per
-/// name suffices).
+/// Strip the headers only Zion's own pipeline may set: the authenticated identity
+/// (`X-Auth-*`, re-injected by the auth gate) and the mesh reputation (`X-Zion-Mesh-Score`,
+/// re-injected by the mesh gate). Any inbound copy is a spoof attempt, whoever the peer is.
+/// The list lives in [`crate::reserved_headers`].
 pub(crate) fn scrub_reserved_identity_headers(headers: &mut hyper::HeaderMap) {
-    for name in RESERVED_IDENTITY_HEADERS {
-        headers.remove(name);
-    }
+    crate::reserved_headers::scrub(headers, crate::reserved_headers::Asserter::Pipeline);
 }
 
 async fn process_request_inner(

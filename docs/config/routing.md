@@ -70,7 +70,22 @@ fallback (which picks its route first and forwards on its own):
 `X-HTTP-Host-Override`, `X-Original-Host`.
 
 A peer listed in `[server] trusted_proxies` (a CDN or load balancer in front of zion) keeps
-its values, as it does for `X-Forwarded-For`. `X-Forwarded-Host` is always overwritten with
+its values, as it does for `X-Forwarded-For`.
+
+### Headers only zion may set
+
+An upstream reads some headers as zion's word about the request. A copy sent by anyone
+else, a trusted proxy included, is dropped; zion then sets the real value, or none:
+
+| Header | What it states | Set by |
+|---|---|---|
+| `X-Client-Cert-Fingerprint`, `X-Client-Cert-DN` | the client certificate the TLS handshake verified | the HTTPS listener |
+| `X-Client-TLS-JA4`, `X-Client-TLS-Allowlisted` | the client's TLS fingerprint and whether it is on the allowlist | the HTTPS listener |
+| `X-Auth-Subject`, `X-Auth-Email` | the identity an `auth_profile` verified | the auth gate |
+| `X-Zion-Mesh-Score` | the mesh's reputation for the client IP | the mesh gate |
+
+All of these and the list above come from one table in the code
+(`src/reserved_headers.rs`), and one test walks that table through the real HTTPS listener. `X-Forwarded-Host` is always overwritten with
 the request's own host (the `Host` header, or the URI authority for HTTP/2), and dropped when there
 is none. The upstream's `Host` is its own authority, or the client's host when the upstream
 sets [`preserve_host`](/config/#forward-the-client-s-host-preserve-host-opt-in).

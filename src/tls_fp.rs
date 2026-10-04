@@ -1839,8 +1839,8 @@ mod tests {
         // the listeners strip by the shared list: it must name these headers
         for h in [HDR_JA4, HDR_ALLOWLISTED] {
             assert!(
-                crate::security::TRANSPORT_ATTESTATION_HEADERS
-                    .contains(&h.to_ascii_lowercase().as_str()),
+                crate::reserved_headers::reserved(crate::reserved_headers::Asserter::Transport)
+                    .any(|name| name == h.to_ascii_lowercase()),
                 "{h}"
             );
         }

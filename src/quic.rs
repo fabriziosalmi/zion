@@ -421,11 +421,13 @@ mod tests {
     #[test]
     fn the_bridged_request_drops_forged_transport_attestations() {
         let mut b = hyper::Request::builder().uri("https://app.example/");
-        for name in crate::security::TRANSPORT_ATTESTATION_HEADERS {
+        let transport =
+            || crate::reserved_headers::reserved(crate::reserved_headers::Asserter::Transport);
+        for name in transport() {
             b = b.header(name, "forged").header(name, "forged-again");
         }
         let out = bridge_request(b.body(()).unwrap(), empty());
-        for name in crate::security::TRANSPORT_ATTESTATION_HEADERS {
+        for name in transport() {
             assert!(!out.headers().contains_key(name), "{name} survived");
         }
     }
