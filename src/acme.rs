@@ -578,6 +578,7 @@ pub async fn run_soak() -> i32 {
         sni: vec![],
         acme: None,
         client_ca_path: None,
+        client_crl_path: None,
         client_auth: "none".into(),
         fingerprint: None,
     };

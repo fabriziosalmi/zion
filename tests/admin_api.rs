@@ -410,6 +410,11 @@ fn ca_and_client(dir: &std::path::Path, name: &str) -> bool {
 
 /// GET /admin/config over TLS with a client certificate; the status, 0 when refused.
 fn mtls_get(port: u16, cert: &std::path::Path, key: &std::path::Path) -> u16 {
+    tls_get(port, "/admin/config", cert, key)
+}
+
+/// GET `path` over TLS with a client certificate; the status, 0 when the handshake is refused.
+fn tls_get(port: u16, path: &str, cert: &std::path::Path, key: &std::path::Path) -> u16 {
     let mut child = Command::new("openssl")
         .args([
             "s_client",
@@ -430,8 +435,10 @@ fn mtls_get(port: u16, cert: &std::path::Path, key: &std::path::Path) -> u16 {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"GET /admin/config HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-        .unwrap();
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .ok(); // a refused handshake closes the pipe before the request is written
     let out = child.wait_with_output().unwrap();
     String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -521,6 +528,204 @@ fn admin_mtls_trusts_only_the_admin_ca() {
         ),
         0,
         "a data-plane client certificate must not"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// A CA that can sign CRLs, two client certificates (`good`, `bad`), a CRL that revokes
+/// nothing (`crl-empty.pem`) and one that revokes `bad` (`crl.pem`), all in `dir`.
+fn pki_with_crl(dir: &std::path::Path) -> bool {
+    let d = dir.to_string_lossy();
+    let p = |f: &str| dir.join(f).to_string_lossy().into_owned();
+    fs::write(
+        dir.join("ca.cnf"),
+        format!(
+            "[ca]\ndefault_ca = CA_default\n[CA_default]\ndatabase = {d}/index.txt\n\
+             crlnumber = {d}/crlnumber\nserial = {d}/serial\nnew_certs_dir = {d}\n\
+             default_md = sha256\ndefault_crl_days = 1\ndefault_days = 1\npolicy = policy_any\n\
+             unique_subject = no\ncopy_extensions = none\n[policy_any]\ncommonName = supplied\n\
+             [client_ext]\nbasicConstraints = CA:FALSE\nkeyUsage = digitalSignature\n\
+             extendedKeyUsage = clientAuth\n"
+        ),
+    )
+    .unwrap();
+    fs::write(dir.join("index.txt"), "").unwrap();
+    fs::write(dir.join("crlnumber"), "1000\n").unwrap();
+    fs::write(dir.join("serial"), "01\n").unwrap();
+    let ca = |args: &[&str]| {
+        let mut all = vec![
+            "ca".to_string(),
+            "-batch".into(),
+            "-config".into(),
+            p("ca.cnf"),
+            "-cert".into(),
+            p("ca.pem"),
+            "-keyfile".into(),
+            p("ca.key"),
+        ];
+        all.extend(args.iter().map(|a| a.to_string()));
+        openssl(&all.iter().map(String::as_str).collect::<Vec<_>>())
+    };
+    // The CA must be allowed to sign CRLs, or the verifier refuses the list.
+    let ca_ok = openssl(&[
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-days",
+        "1",
+        "-subj",
+        "/CN=crl-test-ca",
+        "-addext",
+        "basicConstraints=critical,CA:TRUE",
+        "-addext",
+        "keyUsage=critical,keyCertSign,cRLSign",
+        "-keyout",
+        &p("ca.key"),
+        "-out",
+        &p("ca.pem"),
+    ]);
+    let client = |name: &str| {
+        openssl(&[
+            "req",
+            "-new",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-subj",
+            &format!("/CN={name}"),
+            "-keyout",
+            &p(&format!("{name}.key")),
+            "-out",
+            &p(&format!("{name}.csr")),
+        ]) && ca(&[
+            "-in",
+            &p(&format!("{name}.csr")),
+            "-out",
+            &p(&format!("{name}.pem")),
+            "-extensions",
+            "client_ext",
+            "-notext",
+        ])
+    };
+    ca_ok
+        && client("good")
+        && client("bad")
+        && ca(&["-gencrl", "-out", &p("crl-empty.pem")])
+        && ca(&["-revoke", &p("bad.pem")])
+        && ca(&["-gencrl", "-out", &p("crl.pem")])
+}
+
+/// A certificate on the CRL is refused at the handshake, on the data plane and on the admin
+/// API, and publishing a new CRL takes effect without a restart: before this, a leaked client
+/// certificate (an admin one included) stayed valid until it expired or the CA was replaced
+/// (ZION-AUTH-02).
+#[test]
+fn a_revoked_client_certificate_is_refused_and_a_new_crl_needs_no_restart() {
+    let dir = std::env::temp_dir().join(format!("zion-crl-{}-{}", std::process::id(), free_port()));
+    // The server certificate lives in a directory of its own: the certificate watcher
+    // covers that one, and must also cover wherever the CA and the CRL are.
+    fs::create_dir_all(dir.join("server")).unwrap();
+    let server_ok = openssl(&[
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-days",
+        "1",
+        "-subj",
+        "/CN=localhost",
+        "-addext",
+        "subjectAltName=DNS:localhost",
+        "-keyout",
+        &dir.join("server/k.pem").to_string_lossy(),
+        "-out",
+        &dir.join("server/c.pem").to_string_lossy(),
+    ]);
+    if !(server_ok && pki_with_crl(&dir)) {
+        eprintln!("SKIP: openssl could not make the test certificates");
+        return;
+    }
+    // The CRL the daemon reads: it starts with nothing revoked. It lives in a directory of
+    // its own, so the reload below proves that directory is watched, not just the
+    // certificate's.
+    let live = dir.join("published");
+    fs::create_dir_all(&live).unwrap();
+    fs::copy(dir.join("crl-empty.pem"), live.join("crl.pem")).unwrap();
+    let d = dir.to_string_lossy();
+    let (https_port, admin_port) = (free_port(), free_port());
+    let cfg = format!(
+        "[server]\nlisten_http = \"127.0.0.1:{}\"\nlisten_https = \"127.0.0.1:{https_port}\"\n\n\
+         [tls]\ncert_path = \"{d}/server/c.pem\"\nkey_path = \"{d}/server/k.pem\"\n\
+         client_auth = \"required\"\nclient_ca_path = \"{d}/ca.pem\"\n\
+         client_crl_path = \"{d}/published/crl.pem\"\n\n\
+         [upstreams]\nbackend = \"http://127.0.0.1:9\"\n\n\
+         [[route]]\npath = \"/{{*rest}}\"\nupstream = \"backend\"\n\n\
+         [admin]\nlisten = \"127.0.0.1:{admin_port}\"\nauth = \"mtls\"\n\
+         client_ca_path = \"{d}/ca.pem\"\nclient_crl_path = \"{d}/published/crl.pem\"\n\
+         rate_limit_rps = 1000\n",
+        free_port()
+    );
+    fs::write(dir.join("zion.toml"), cfg).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_zion"))
+        .env("ZION_CONFIG", dir.join("zion.toml"))
+        .env("ZION_BOOT_FAST", "1")
+        .env("ZION_LAST_GASP_PATH", dir.join("gasp.jsonl"))
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(dir.join("daemon.log")).unwrap())
+        .spawn()
+        .expect("spawn zion");
+    let _d = Daemon(child);
+    let log = || fs::read_to_string(dir.join("daemon.log")).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while TcpStream::connect(("127.0.0.1", admin_port)).is_err()
+        || TcpStream::connect(("127.0.0.1", https_port)).is_err()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never came up: {}",
+            log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let data = |who: &str| {
+        tls_get(
+            https_port,
+            "/healthz",
+            &dir.join(format!("{who}.pem")),
+            &dir.join(format!("{who}.key")),
+        )
+    };
+    let admin = |who: &str| {
+        mtls_get(
+            admin_port,
+            &dir.join(format!("{who}.pem")),
+            &dir.join(format!("{who}.key")),
+        )
+    };
+    // Nothing revoked yet: both certificates open both listeners.
+    assert_eq!((data("good"), admin("good")), (200, 200), "{}", log());
+    assert_eq!((data("bad"), admin("bad")), (200, 200), "not revoked yet");
+    // Publish the CRL that revokes `bad` (write + rename, as a deploy would).
+    fs::copy(dir.join("crl.pem"), live.join("crl.tmp")).unwrap();
+    fs::rename(live.join("crl.tmp"), live.join("crl.pem")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while (data("bad"), admin("bad")) != (0, 0) {
+        assert!(
+            Instant::now() < deadline,
+            "the revoked certificate still opens a listener (data {}, admin {}): {}",
+            data("bad"),
+            admin("bad"),
+            log()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert_eq!(
+        (data("good"), admin("good")),
+        (200, 200),
+        "a certificate that is not on the CRL keeps working"
     );
     let _ = fs::remove_dir_all(dir);
 }

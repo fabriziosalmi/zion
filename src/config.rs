@@ -132,6 +132,11 @@ pub struct AdminConfig {
     /// data-plane client authentication must not also open the admin API.
     #[serde(default)]
     pub client_ca_path: Option<String>,
+    /// Certificate revocation list(s) for ADMIN client certificates (`auth = "mtls"`): a
+    /// PEM file with one or more CRLs, or one DER CRL. A certificate it lists is refused at
+    /// the handshake. Re-read when the file changes. See `[tls] client_crl_path`.
+    #[serde(default)]
+    pub client_crl_path: Option<String>,
 }
 
 fn default_admin_listen() -> String {
@@ -479,6 +484,16 @@ pub struct TlsConfig {
     /// Path to CA bundle for verifying client certificates (mTLS downstream).
     #[serde(default)]
     pub client_ca_path: Option<String>,
+    /// Certificate revocation list(s) for client certificates: a PEM file with one or more
+    /// CRLs, or one DER CRL, issued by the CA(s) in `client_ca_path`. A client certificate it
+    /// lists is refused at the handshake; so is one whose issuer has no CRL in the file (an
+    /// unknown revocation status is not accepted). Only the client's own certificate is
+    /// checked, not the intermediates. The file is re-read when it changes (with
+    /// `hot_reload`), so revoking a certificate needs no restart. The CRL's `nextUpdate` is
+    /// not enforced: an out-of-date list keeps being applied rather than locking every client
+    /// out.
+    #[serde(default)]
+    pub client_crl_path: Option<String>,
     /// Client auth mode: "none" (default), "optional", "required".
     #[serde(default = "default_client_auth")]
     pub client_auth: String,
@@ -2166,6 +2181,25 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     // presented client certs against. Without `tls.client_ca_path` the listener
     // silently builds with NO client auth (fail-open) — the enforcement the
     // operator asked for would be off with no signal. Reject it at boot.
+    // A CRL nobody consults is a revocation the operator believes in and Zion ignores.
+    if config.tls.client_crl_path.is_some()
+        && !matches!(config.tls.client_auth.as_str(), "required" | "optional")
+    {
+        errors.push(
+            "tls.client_crl_path is set but tls.client_auth is \"none\": no client certificate \
+             is verified, so nothing would be checked against the CRL"
+                .to_string(),
+        );
+    }
+    if let Some(admin) = &config.admin {
+        if admin.client_crl_path.is_some() && admin.auth != "mtls" {
+            errors.push(
+                "admin.client_crl_path is set but admin.auth is not \"mtls\": no client \
+                 certificate is verified, so nothing would be checked against the CRL"
+                    .to_string(),
+            );
+        }
+    }
     if matches!(config.tls.client_auth.as_str(), "required" | "optional")
         && config.tls.client_ca_path.is_none()
     {
@@ -2662,6 +2696,36 @@ mod tests {
             assert!(!e.contains("s3cr3t") && !e.contains("deploy:"), "{e}");
             assert!(e.contains("internal"), "the host is still named: {e}");
         }
+    }
+
+    /// A CRL that no verifier consults is a revocation the operator believes in and Zion
+    /// ignores: refuse the config.
+    #[test]
+    fn a_crl_needs_a_listener_that_verifies_client_certificates() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [upstreams]\nbe=\"http://127.0.0.1:8000\"\n[[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let errs = |tls: &str, admin: &str| {
+            let c: ZionConfig = toml::from_str(&format!(
+                "{base}[tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n{tls}\n[admin]\n{admin}\n"
+            ))
+            .unwrap();
+            semantic_errors(&c).join("\n")
+        };
+        let e = errs("client_crl_path=\"/crl\"", "");
+        assert!(
+            e.contains("tls.client_crl_path is set but tls.client_auth is \"none\""),
+            "{e}"
+        );
+        let e = errs("", "client_crl_path=\"/crl\"");
+        assert!(
+            e.contains("admin.client_crl_path is set but admin.auth is not \"mtls\""),
+            "{e}"
+        );
+        let e = errs(
+            "client_auth=\"required\"\nclient_ca_path=\"/ca\"\nclient_crl_path=\"/crl\"",
+            "auth=\"mtls\"\nclient_ca_path=\"/admin-ca\"\nclient_crl_path=\"/admin-crl\"",
+        );
+        assert!(!e.contains("client_crl_path"), "{e}");
     }
 
     #[test]

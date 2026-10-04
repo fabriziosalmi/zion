@@ -140,8 +140,9 @@ fn now_secs() -> u64 {
 pub(crate) enum AdminAuth {
     /// Plain HTTP; authorize per-request on the peer being an internal IP.
     InternalIp,
-    /// TLS with a required client cert — a completed handshake is authorization.
-    Mtls(Arc<TlsAcceptor>),
+    /// TLS with a required client cert — a completed handshake is authorization. Swapped
+    /// when the certificate, the CA or the CRL changes on disk.
+    Mtls(Arc<arc_swap::ArcSwap<TlsAcceptor>>),
 }
 
 /// Spawn the admin listener. Returns immediately; the accept loop runs on a
@@ -182,7 +183,7 @@ pub(crate) fn spawn_admin_listener(
                             tokio::spawn(serve_admin(stream, peer, st, cx, false));
                         }
                         AdminAuth::Mtls(acceptor) => {
-                            let acc = acceptor.clone();
+                            let acc = acceptor.load_full();
                             tokio::spawn(async move {
                                 // The handshake performs client-cert verification;
                                 // failure (missing / untrusted cert) drops the
