@@ -6,6 +6,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 **Heads-up: the default of `max_token_lifetime_secs` becomes 86400 (24 h) in the next minor release** (#553). Nothing is refused yet. See below how to find out whether it affects you.
 
+### Added
+
+- **The WAF can scan request header values: `[waf_profile.x] scan_headers`** (#519). The signature WAF looked at the URI and the body, never at a header, so Log4Shell in a `User-Agent` or an injection in a custom header reached the upstream. A profile can now list the headers to scan (`["user-agent", "referer", "x-*"]`; a trailing `*` is a prefix, `"*"` is every header): their values go through the same scanner as the URI, raw and decoded, and a match answers `400`. **Off by default**: measured on a corpus of 124 benign header values, `balanced` blocks none, `aggressive` blocks two (`Origin: http://localhost:3000` and a `Referer` containing `eval(`), and that corpus is not your traffic. Turn it on with `waf_shadow = true` first. The WAF guide has the numbers and suggested lists.
+
 ### Changed
 
 - **Auth: tokens that the future default would refuse are counted and warned about.** A profile without `max_token_lifetime_secs` accepts a token however far its `exp` is, which is what lets a mis-issued or forged token live for years. From the next minor release the default cap is 24 h. Until then: zion warns at boot for every profile without the setting, and a token with more than 24 h left on such a profile is accepted, counted in `zion_auth_long_lived_tokens_total` and reported in the log (once a minute at most; the remaining lifetime only, never the token). If the counter stays at zero the change will not affect you; otherwise set the value you need.

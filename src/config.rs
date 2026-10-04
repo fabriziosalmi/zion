@@ -1833,6 +1833,11 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             }
         }
     }
+    for (name, wp) in &config.waf_profile {
+        for problem in wp.scan_headers_errors() {
+            errors.push(format!("waf_profile.{name}: {problem}"));
+        }
+    }
     for (name, cp) in &config.cache_profile {
         if cp.max_object_mb == 0 {
             errors.push(format!(

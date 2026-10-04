@@ -551,6 +551,31 @@ async fn process_request_inner(
             }
         }
 
+        // Gate: WAF header scan (opt-in per profile: `scan_headers`). The URI and the body
+        // are not the only places a payload travels: Log4Shell arrived in `User-Agent`.
+        if let Some((header, reason)) = waf::validate_headers(req.headers(), waf_profile) {
+            if rule.waf_shadow {
+                metrics::METRICS
+                    .waf_shadow_would_block
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                logging::warn(
+                    "waf_shadow",
+                    &format!(
+                        "would_block=true source=header reason={reason} header={header} path={uri_str}"
+                    ),
+                );
+                // Fall through — shadow mode never denies the request.
+            } else {
+                metrics::METRICS
+                    .waf_denied
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The header's name, never its value: it may be a cookie or a token.
+                logging::info("waf", &format!("header denied: {reason} ({header})"));
+                emit_waf_block(&state, &remote_addr, method, uri_str, "header", reason);
+                return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
+            }
+        }
+
         // ── Gate: ML scorer (Track C, --features ml-waf) ─────────────
         // Anomaly score over URI + headers. Cheap (~50µs p50, 200µs p99
         // budget enforced via metrics, not active cancel). Returns None
