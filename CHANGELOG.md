@@ -4,6 +4,14 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **CLI: a wrong argument is an error, not a silent default** (#518). `init`, `auto`, `suggest`, `import` and `top` used to skip any argument they did not recognise and drop any value that did not parse: `zion init -y --ouput /etc/zion/zion.toml` wrote `./zion.toml`, `zion init --https-port 70000` kept 443, `zion import traefik c.yml --var FOO` dropped the variable, all with exit 0. An unknown flag (with the nearest valid one suggested), a missing value, a value that does not parse, a value given to a flag that takes none and a stray argument now stop with exit 2 and write nothing (exit 1 for `zion import`, whose 2 stays "converted, `--strict` found findings"). `doctor` and `bootstrap` refuse arguments.
+- **CLI: `--flag=value` works.** The form the docs use (`zion auto --upstream=:3000`) was an unrecognised argument, skipped; it only appeared to work because the default upstream is also `:3000`.
+- **CLI: `--help` after a subcommand prints the help** (`zion init --help` used to start the wizard), and the help lists the Traefik and Caddy forms of `import` with `--var` and `--acme-email`.
+
+**Upgrade note:** a script that passes a flag Zion never knew, or a value it never parsed, now fails where it used to run with defaults. The error names the argument.
+
 ## [0.9.8] - 2026-10-03
 
 **Security release: fixes from the 2026-10-02 code audit.** Routes with `auth_profile` are enforced by the official binaries, the gossip mesh only trusts named nodes, the admin API needs its own CA and a write token, the WAF scans GET bodies, HTTP/3 forwards client headers, and the health checker follows reloads. Several settings that used to be accepted and silently ignored or weakened are now **config errors**: read the upgrade notes before upgrading.
