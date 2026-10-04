@@ -186,6 +186,19 @@ async fn handle(req: Request<Incoming>) -> Result<Resp, std::convert::Infallible
             ok("application/json", Bytes::from(body))
         }
 
+        // Every request header as received, one `name: value` per line: lets the
+        // integration tests assert what Zion forwards and, above all, what it does not.
+        "/api/v1/headers" => {
+            let mut body = String::new();
+            for (name, value) in req.headers() {
+                body.push_str(name.as_str());
+                body.push_str(": ");
+                body.push_str(&String::from_utf8_lossy(value.as_bytes()));
+                body.push('\n');
+            }
+            ok("text/plain", Bytes::from(body))
+        }
+
         // Server-Sent Events. Integration tests inspect body content
         // (`event: tick`, `"seq":...`), not real-time delivery, so we ship
         // the full event sequence in one Full<Bytes> rather than pull in a

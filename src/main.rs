@@ -73,6 +73,7 @@ mod proxy;
 #[cfg(feature = "http3")]
 mod quic;
 mod reload;
+mod reserved_headers;
 mod routing;
 mod security;
 #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]

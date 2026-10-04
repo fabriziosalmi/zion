@@ -4,6 +4,11 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Security
+
+- **A client could set `X-Zion-Mesh-Score`** (#523). The header carries the mesh's reputation for the client IP to the upstream, which may use it to add friction or to trust. Zion set it when the mesh had a score, and never removed an inbound copy: a client with no score (or any client, on a build without the mesh) could hand the upstream a reputation of its own choosing. It is now dropped from every request before the pipeline sets the real value, like `X-Auth-Subject` and `X-Auth-Email`.
+- **One list of reserved request headers.** The headers an upstream reads as a statement about the request were named in three places (the TLS attestations, the authenticated identity, the routing/host overrides), which is how the mesh score was missed. They are now one table (`src/reserved_headers.rs`) that says who may set each one, used by every listener, and one test walks the whole table through the real HTTPS listener.
+
 ### Fixed
 
 - **CLI: a wrong argument is an error, not a silent default** (#518). `init`, `auto`, `suggest`, `import` and `top` used to skip any argument they did not recognise and drop any value that did not parse: `zion init -y --ouput /etc/zion/zion.toml` wrote `./zion.toml`, `zion init --https-port 70000` kept 443, `zion import traefik c.yml --var FOO` dropped the variable, all with exit 0. An unknown flag (with the nearest valid one suggested), a missing value, a value that does not parse, a value given to a flag that takes none and a stray argument now stop with exit 2 and write nothing (exit 1 for `zion import`, whose 2 stays "converted, `--strict` found findings"). `doctor` and `bootstrap` refuse arguments.

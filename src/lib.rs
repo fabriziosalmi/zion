@@ -70,6 +70,10 @@ pub mod sovereign;
 #[doc(hidden)]
 pub mod numa;
 
+// The reserved-header table: the real-socket tests walk it.
+#[doc(hidden)]
+pub mod reserved_headers;
+
 /// io_uring accept thread (issue #51, `--features io-uring-accept`).
 /// Exposed for the chaos test (`tests/chaos.rs`) and external diagnostics.
 #[doc(hidden)]

@@ -25,7 +25,9 @@ v0.4 mesh slice. The bus already carries the envelope shape.
 
 **Local decisions remain authoritative.** The mesh score is forwarded
 to upstreams as a *signal* (`X-Zion-Mesh-Score: 0.NN`) so backends can
-apply additional friction (CAPTCHA, longer rate windows). Zion's own
+apply additional friction (CAPTCHA, longer rate windows). The header is
+zion's alone: an inbound `X-Zion-Mesh-Score` is dropped from every
+request, so a backend never reads a score the client chose. Zion's own
 WAF / auth / rate-limit gates are unchanged by mesh state — the mesh
 does NOT short-circuit those gates.
 

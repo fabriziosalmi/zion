@@ -547,50 +547,16 @@ impl InternalNetworks {
     }
 }
 
-/// Request headers that tell an application or a cache where a request "really" goes or
-/// came from: the path (`X-Original-URL` / `X-Rewrite-URL`, honoured by IIS, Symfony and
-/// others over the real request line), the host or scheme (`X-Host`, `X-Forwarded-Server`,
-/// `X-Forwarded-Scheme`, `X-Forwarded-Prefix`, `X-Original-Host`, `X-HTTP-Host-Override`) and
-/// RFC 7239 `Forwarded` (zion generates `X-Forwarded-*`, never `Forwarded`, so an upstream that
-/// prefers it would read the client's own claim). From a client these are route/policy bypass
-/// and cache-poisoning inputs, so they are dropped unless the peer is a configured trusted
-/// proxy. `X-Forwarded-Host` is not listed: zion always overwrites it with the request's Host.
-pub const CLIENT_OVERRIDE_HEADERS: [&str; 9] = [
-    "x-original-url",
-    "x-rewrite-url",
-    "forwarded",
-    "x-forwarded-server",
-    "x-forwarded-scheme",
-    "x-forwarded-prefix",
-    "x-host",
-    "x-http-host-override",
-    "x-original-host",
-];
-
-/// Headers by which zion attests what the TLS layer verified: the client certificate
-/// (`X-Client-Cert-Fingerprint` / `-DN`) and the JA4 identity (`X-Client-TLS-JA4` /
-/// `-Allowlisted`). A client must never set them: every listener strips any inbound copy
-/// before the pipeline, and only the HTTPS listener re-injects the values it verified.
-/// Literal names: the JA4 module is compiled out without its feature, the strip is not.
-pub const TRANSPORT_ATTESTATION_HEADERS: [&str; 4] = [
-    "x-client-cert-fingerprint",
-    "x-client-cert-dn",
-    "x-client-tls-ja4",
-    "x-client-tls-allowlisted",
-];
-
-/// Drop [`TRANSPORT_ATTESTATION_HEADERS`] (every copy).
+/// Drop the headers by which Zion attests what the TLS layer verified (every copy). See
+/// [`crate::reserved_headers`]: every listener calls this before the pipeline, and only the
+/// HTTPS listener re-injects the values it verified.
 pub fn strip_transport_attestations(headers: &mut hyper::HeaderMap) {
-    for name in TRANSPORT_ATTESTATION_HEADERS {
-        headers.remove(name);
-    }
+    crate::reserved_headers::scrub(headers, crate::reserved_headers::Asserter::Transport);
 }
 
-/// Drop [`CLIENT_OVERRIDE_HEADERS`] (every copy; hyper lower-cases names).
+/// Drop the headers only a trusted proxy may set (every copy): the caller checks the peer.
 pub fn scrub_client_override_headers(headers: &mut hyper::HeaderMap) {
-    for name in CLIENT_OVERRIDE_HEADERS {
-        headers.remove(name);
-    }
+    crate::reserved_headers::scrub(headers, crate::reserved_headers::Asserter::TrustedProxy);
 }
 
 impl TrustedProxies {

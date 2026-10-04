@@ -613,3 +613,50 @@ integration_test!(t48_combo_authed_malformed_body_still_waf_blocked, {
         "WAF must block a malformed body even on an authed request, got {status}"
     );
 });
+
+// ── reserved request headers: nothing a client forges reaches the backend ────────────────
+//
+// The table in `reserved_headers` names every header an upstream reads as a statement about
+// the request (the verified client certificate, the JA4 identity, the authenticated subject,
+// the mesh reputation, where the request "really" goes). This walks the whole table through
+// the real HTTPS listener: the backend echoes what it received.
+
+/// The value the backend saw for `name`, if any.
+fn echoed<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    body.lines().find_map(|l| {
+        l.strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix(": "))
+    })
+}
+
+integration_test!(t60_no_reserved_header_from_a_client_reaches_the_backend, {
+    let forged: Vec<String> = zion::reserved_headers::RESERVED_HEADERS
+        .iter()
+        .map(|(name, _)| format!("{name}: forged-by-client"))
+        .collect();
+    let mut extra: Vec<&str> = Vec::new();
+    for h in &forged {
+        extra.push("-H");
+        extra.push(h);
+    }
+    // A control header, so an empty echo cannot pass for "all stripped".
+    extra.extend_from_slice(&["-H", "x-control: kept"]);
+    let (status, body, _) = get_with("/api/v1/headers", &extra);
+    assert_eq!(status, 200, "the header echo answers: {body}");
+    assert_eq!(
+        echoed(&body, "x-control"),
+        Some("kept"),
+        "control header: {body}"
+    );
+    for (name, asserter) in zion::reserved_headers::RESERVED_HEADERS {
+        assert_ne!(
+            echoed(&body, name),
+            Some("forged-by-client"),
+            "{name} ({asserter:?}) forged by a client reached the backend"
+        );
+    }
+    assert!(
+        !body.contains("forged-by-client"),
+        "a forged value reached the backend:\n{body}"
+    );
+});
