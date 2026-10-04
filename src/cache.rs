@@ -43,6 +43,34 @@ pub struct CachedMeta {
     pub must_revalidate: bool,
 }
 
+impl CachedMeta {
+    /// The same metadata, with header values that own their bytes.
+    ///
+    /// hyper parses response headers without copying: each `HeaderValue` is a slice of the
+    /// connection's read buffer. Storing one keeps that whole buffer alive (8 KiB or more,
+    /// the body's bytes included) for as long as the entry is cached, on top of the body the
+    /// cache copies itself. A copy of a few dozen bytes lets the buffer go.
+    fn detached(mut self) -> Self {
+        for value in [
+            &mut self.content_type,
+            &mut self.content_encoding,
+            &mut self.etag,
+            &mut self.last_modified,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            // `from_bytes` accepts every value hyper's parser does; if it ever refused one,
+            // the original (shared) value is kept rather than lost.
+            if let Ok(mut owned) = HeaderValue::from_bytes(value.as_bytes()) {
+                owned.set_sensitive(value.is_sensitive());
+                *value = owned;
+            }
+        }
+        self
+    }
+}
+
 /// Result of a cache hit — body + preserved metadata.
 #[derive(Clone)]
 pub struct CacheHit {
@@ -769,6 +797,8 @@ impl StaticCache {
         initial_age_secs: u64,
         max_entries: usize,
     ) {
+        // Every store goes through here: nothing kept may reference the upstream's buffer.
+        let meta = meta.detached();
         // `let-else`: bind l2 for the concurrent path, diverge (return) on the
         // single-core path — mirrors get(), removes the `unreachable!()` abort.
         let Some(l2_concurrent) = &self.l2 else {
@@ -1673,5 +1703,47 @@ mod tests {
             "{} entries with a cap of 50",
             cache.len()
         );
+    }
+    /// hyper parses response headers without copying: each value is a slice of the
+    /// connection's read buffer. A cached entry that kept such a value kept the whole buffer
+    /// alive (8 KiB or more per entry, found by the #481 heap profile). What the cache stores
+    /// must own its bytes.
+    #[test]
+    fn a_stored_entry_does_not_keep_the_upstream_read_buffer_alive() {
+        // The read buffer one upstream response was parsed from: head and body together.
+        let read_buffer = Bytes::from(vec![b'a'; 8192]);
+        let slice_of = |range: std::ops::Range<usize>| {
+            HeaderValue::from_maybe_shared(read_buffer.slice(range)).unwrap()
+        };
+        let meta = CachedMeta {
+            content_type: Some(slice_of(0..9)),
+            content_encoding: Some(slice_of(10..14)),
+            status: StatusCode::OK,
+            etag: Some(slice_of(20..30)),
+            last_modified: Some(slice_of(40..69)),
+            stale_while_revalidate_secs: 0,
+            must_revalidate: false,
+        };
+        assert!(
+            !read_buffer.is_unique(),
+            "the header values share the buffer"
+        );
+        let cache = StaticCache::new();
+        cache.insert("/pinned", Bytes::from_static(b"body"), meta, 3600, 0, 10);
+        assert!(
+            read_buffer.is_unique(),
+            "a cached entry still references the upstream read buffer"
+        );
+        // ... and the values themselves are unchanged.
+        let CacheLookup::Fresh(hit) = cache.get("/pinned") else {
+            panic!("stored entry is fresh");
+        };
+        assert_eq!(hit.meta.content_type.unwrap().as_bytes(), &[b'a'; 9][..]);
+        assert_eq!(
+            hit.meta.content_encoding.unwrap().as_bytes(),
+            &[b'a'; 4][..]
+        );
+        assert_eq!(hit.meta.etag.unwrap().as_bytes(), &[b'a'; 10][..]);
+        assert_eq!(hit.meta.last_modified.unwrap().as_bytes(), &[b'a'; 29][..]);
     }
 }
