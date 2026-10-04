@@ -16,3 +16,8 @@ unknown.example.com  /                      404      404
 # Zion imports it as `/v1/users/{*rest}` (segment-matched) so `/v1/users999`
 # falls to `/v1` -> legacy.
 api.example.com      /v1/users999           users    legacy
+# ── Forwarded Host (#485): the `hostecho` backend answers with the Host it received ──
+# Traefik forwards the client's Host by default (passHostHeader); the import sets
+# `preserve_host = true`, so the backend sees the same Host behind both.
+echo.example.com     /                      echo.example.com        echo.example.com
+echo.example.com:8443 /any/path             echo.example.com:8443   echo.example.com:8443

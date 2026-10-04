@@ -88,7 +88,8 @@ cannot express faithfully is flagged loudly, never silently mistranslated
 The claim is not taken on faith. The **equivalence harness** starts real nginx
 and real Zion side by side on the original and converted configs, replays a
 request corpus against both, and diffs the routing decision request by request
-— the intentional differences are exactly the ones the report declared:
+— and the `Host` each one forwards to the backend — the intentional differences
+are exactly the ones the report declared:
 
 ![zion import equivalence harness](docs/assets/zion-import-equivalence.svg)
 

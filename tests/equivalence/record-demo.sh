@@ -33,7 +33,7 @@ asciinema rec "$CAST" \
     --overwrite \
     --output-format asciicast-v2 \
     --idle-time-limit 2 \
-    --window-size 100x40 \
+    --window-size 150x46 \
     --title "zion import nginx — equivalence harness" \
     --command "bash '$HERE/run.sh' multi-vhost"
 
@@ -41,7 +41,7 @@ echo "converting to SVG…"
 if npx --yes svg-term-cli --version >/dev/null 2>&1; then
     npx --yes svg-term-cli \
         --in "$CAST" --out "$SVG" \
-        --window --width 100 --height 40
+        --window --width 150 --height 46
     echo "wrote $SVG"
 elif command -v agg >/dev/null; then
     agg "$CAST" "${SVG%.svg}.gif"
