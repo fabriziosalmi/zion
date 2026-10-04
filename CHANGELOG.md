@@ -26,6 +26,8 @@ All notable changes to Zion Edge Gateway are documented here.
 
 - **Docs: the purge examples used plain HTTP.** `curl -X POST http://127.0.0.1/_zion/cache/purge` gets the `:80` redirect (301), not a purge; the endpoint is on the HTTPS listener. The examples now use `https://`.
 
+- **A cached entry kept the upstream's read buffer alive.** hyper parses response headers without copying, so the `Content-Type`, `Content-Encoding`, `ETag` and `Last-Modified` the cache stored were slices of the connection's read buffer: every entry pinned 8 KiB or more on top of its body. With 4 KB objects the cache used about three times the memory of what it stored. The stored values are now copies.
+
 ### Added
 
 - **`[upstream.x] request_timeout_ms`** (#517): how long one attempt may take from sending the request to receiving the upstream's response headers. It was a fixed 30 s; that stays the default. Raise it for long-polling, slow report endpoints or uploads slower than 30 s (sending the body counts), lower it for an API that should fail fast. It applies to the single-upstream path, to every attempt of a pool, to cache fetches and to background refreshes. `1`..`3600000` ms: there is no "0 = none", because a request with no deadline holds its connection slot until the 1 h connection cap.
@@ -34,6 +36,10 @@ All notable changes to Zion Edge Gateway are documented here.
 ### Security
 
 - **The cache purge is loopback-only unless `internal_networks` is set** (#516). `POST /_zion/cache/purge` shared the rule of the read endpoints: with `[server] internal_networks` empty (the default) any private-range peer was let in. Behind a private-range load balancer, Kubernetes SNAT or a Docker bridge every internet client has a private address, so anyone could flush the cache; Zion only warned about it at boot. The read endpoints (`/metrics`, `/_zion/snapshot.json`, `internal_only` routes) keep their rule and the warning. **Upgrade note:** a deploy hook that purges from another host, or from the Docker host into a container, now gets `403` with a body that says why: list that host in `[server] internal_networks` (the list also applies to the read endpoints, and replaces the default for them).
+
+- **The response cache could grow past `max_entries` without bound** (#481). Once full, the cache evicted exactly one entry per insert. Threads evicting at the same moment sample the same entries and pick the same victim: all but one removal found it already gone, each thread inserted anyway, and the map grew by one entry per collision and never came back under the cap. Requests for distinct cacheable URLs sent concurrently to a `static_cache` route therefore grew memory until the process was killed; no authentication is needed, only a cached route whose key the client can vary (path or query). In a test, 8 threads and 32,000 inserts left 18,345 entries under a cap of 64; on the 2 h soak RSS climbed linearly to 365 MiB with a 2,000-entry cap. The cache now evicts until there is room (bounded work per insert), and a cache that is over its cap because a reload lowered it shrinks back, which it never did. **Upgrade if you use `static_cache` or `cache_profile`.**
+
+- **`zion_cache_entries`** gauge: responses held in the shared response cache. The nightly soak asserts it stays within the cap under concurrent load, so the cause above is checked directly and not only through RSS.
 
 ## [0.9.8] - 2026-10-03
 

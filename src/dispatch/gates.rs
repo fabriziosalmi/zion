@@ -403,6 +403,10 @@ pub(super) fn builtin_endpoint(
             } else {
                 "text/plain; version=0.0.4; charset=utf-8"
             };
+            metrics::METRICS.cache_entries.store(
+                state.static_cache.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let body = metrics::METRICS.render_with_upstreams(openmetrics, &state.cfg().health_map);
             return Some(
                 Response::builder()

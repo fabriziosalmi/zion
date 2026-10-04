@@ -43,6 +43,34 @@ pub struct CachedMeta {
     pub must_revalidate: bool,
 }
 
+impl CachedMeta {
+    /// The same metadata, with header values that own their bytes.
+    ///
+    /// hyper parses response headers without copying: each `HeaderValue` is a slice of the
+    /// connection's read buffer. Storing one keeps that whole buffer alive (8 KiB or more,
+    /// the body's bytes included) for as long as the entry is cached, on top of the body the
+    /// cache copies itself. A copy of a few dozen bytes lets the buffer go.
+    fn detached(mut self) -> Self {
+        for value in [
+            &mut self.content_type,
+            &mut self.content_encoding,
+            &mut self.etag,
+            &mut self.last_modified,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            // `from_bytes` accepts every value hyper's parser does; if it ever refused one,
+            // the original (shared) value is kept rather than lost.
+            if let Ok(mut owned) = HeaderValue::from_bytes(value.as_bytes()) {
+                owned.set_sensitive(value.is_sensitive());
+                *value = owned;
+            }
+        }
+        self
+    }
+}
+
 /// Result of a cache hit — body + preserved metadata.
 #[derive(Clone)]
 pub struct CacheHit {
@@ -403,7 +431,37 @@ pub struct StaticCache {
     tag_epoch: std::sync::atomic::AtomicU64,
 }
 
+/// Entries one eviction round looks at: a bounded sample, never the whole map.
+const EVICT_SAMPLE: usize = 64;
+/// Most eviction rounds one insert runs before it stores its entry regardless. A round that
+/// removes nothing means another thread took the victim, so the map shrank anyway; the limit
+/// only bounds the work of a single insert.
+const EVICT_ROUNDS: usize = 8;
+
 impl StaticCache {
+    /// One eviction round over a sample of the shared map: drop what has expired, or else the
+    /// entry closest to expiring.
+    fn evict_round(l2: &DashMap<Arc<str>, L2Entry>) {
+        let now = Instant::now();
+        let mut expired_keys: Vec<Arc<str>> = Vec::new();
+        let mut oldest: Option<(Arc<str>, Instant)> = None;
+        for entry in l2.iter().take(EVICT_SAMPLE) {
+            if now >= entry.expires_at {
+                expired_keys.push(entry.key().clone());
+            } else if oldest.as_ref().is_none_or(|(_, at)| entry.expires_at < *at) {
+                oldest = Some((entry.key().clone(), entry.expires_at));
+            }
+        }
+        for key in &expired_keys {
+            l2.remove(key);
+        }
+        if expired_keys.is_empty() {
+            if let Some((key, _)) = oldest {
+                l2.remove(&key);
+            }
+        }
+    }
+
     pub fn new() -> Self {
         let platform = crate::bootstrap::detect();
         let l1_max = platform.l1_hot_entries;
@@ -739,30 +797,32 @@ impl StaticCache {
         initial_age_secs: u64,
         max_entries: usize,
     ) {
+        // Every store goes through here: nothing kept may reference the upstream's buffer.
+        let meta = meta.detached();
         // `let-else`: bind l2 for the concurrent path, diverge (return) on the
         // single-core path — mirrors get(), removes the `unreachable!()` abort.
         let Some(l2_concurrent) = &self.l2 else {
             // Lock-free single-core backend insertion
             LOCAL_L2.with(|map| {
                 let mut m = map.borrow_mut();
-                if max_entries > 0 && m.len() >= max_entries {
+                let mut rounds = 0;
+                while max_entries > 0 && m.len() >= max_entries && rounds < EVICT_ROUNDS {
+                    rounds += 1;
                     let now = Instant::now();
                     let mut expired_keys = Vec::new();
-                    let mut oldest_key = None;
-                    let mut oldest_expiry = now + Duration::from_secs(86400 * 365);
-                    for (k, v) in m.iter().take(64) {
+                    let mut oldest: Option<(Arc<str>, Instant)> = None;
+                    for (k, v) in m.iter().take(EVICT_SAMPLE) {
                         if now >= v.expires_at {
                             expired_keys.push(k.clone());
-                        } else if v.expires_at < oldest_expiry {
-                            oldest_expiry = v.expires_at;
-                            oldest_key = Some(k.clone());
+                        } else if oldest.as_ref().is_none_or(|(_, at)| v.expires_at < *at) {
+                            oldest = Some((k.clone(), v.expires_at));
                         }
                     }
                     for k in &expired_keys {
                         m.remove(k);
                     }
                     if expired_keys.is_empty() {
-                        if let Some(k) = oldest_key {
+                        if let Some((k, _)) = oldest {
                             m.remove(&k);
                         }
                     }
@@ -783,38 +843,17 @@ impl StaticCache {
             return;
         };
 
-        if max_entries > 0 && l2_concurrent.len() >= max_entries {
-            let now = Instant::now();
-
-            // Sampled eviction: scan at most 64 entries to avoid O(N) full scan.
-            // Phase 1: collect expired entries from sample.
-            let sample_size = 64.min(l2_concurrent.len());
-            let mut expired_keys: Vec<Arc<str>> = Vec::new();
-            let mut oldest_key: Option<Arc<str>> = None;
-            let mut oldest_expiry = Instant::now() + Duration::from_secs(86400 * 365);
-
-            for (i, entry) in l2_concurrent.iter().enumerate() {
-                if i >= sample_size {
-                    break;
-                }
-                if now >= entry.expires_at {
-                    expired_keys.push(entry.key().clone());
-                } else if entry.expires_at < oldest_expiry {
-                    oldest_expiry = entry.expires_at;
-                    oldest_key = Some(entry.key().clone());
-                }
-            }
-
-            // Remove expired entries
-            for key in &expired_keys {
-                l2_concurrent.remove(key);
-            }
-
-            // Phase 2: if still full after removing expired, evict closest-to-expiry from sample
-            if expired_keys.is_empty() {
-                if let Some(key) = oldest_key {
-                    l2_concurrent.remove(&key);
-                }
+        // Make room. One round is not enough under concurrency: every thread that evicts at
+        // the same moment samples the same entries and picks the same victim, and all but one
+        // of those removals find it gone. Inserting anyway grew the map by one entry per
+        // collision, for good: it was never brought back under the cap (#481). So evict until
+        // there is room, counting only what this thread really removed; the same loop shrinks
+        // a map that is over its cap because a reload lowered it.
+        if max_entries > 0 {
+            let mut rounds = 0;
+            while l2_concurrent.len() >= max_entries && rounds < EVICT_ROUNDS {
+                Self::evict_round(l2_concurrent);
+                rounds += 1;
             }
         }
 
@@ -835,7 +874,6 @@ impl StaticCache {
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         if let Some(l2_concurrent) = &self.l2 {
             l2_concurrent.len()
@@ -1587,5 +1625,124 @@ mod tests {
             !matches!(cache.get("/old"), CacheLookup::Fresh(_)),
             "no entry a purge cannot reach"
         );
+    }
+    /// The cap must hold when several threads insert at once. Every evicting thread samples
+    /// the same entries and picks the same victim; all but one of those removals find it
+    /// already gone, and each thread then inserts anyway. The map used to grow by one entry
+    /// per collision and never came back under the cap (#481: the soak's linear RSS growth).
+    #[test]
+    fn the_entry_cap_holds_under_concurrent_inserts() {
+        const MAX: usize = 64;
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 4_000;
+        let cache = std::sync::Arc::new(StaticCache::new());
+        if cache.l2.is_none() {
+            return; // single-core backend: thread-local map, nothing to race on
+        }
+        let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let (cache, start) = (cache.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    for i in 0..PER_THREAD {
+                        cache.insert(
+                            &format!("/t{t}/k{i}"),
+                            Bytes::from_static(b"x"),
+                            default_meta(),
+                            3600,
+                            0,
+                            MAX,
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // A thread may be between its check and its insert, so the bound is the cap plus one
+        // in-flight insert per thread, not the cap itself.
+        assert!(
+            cache.len() <= MAX + THREADS,
+            "{} entries after {} inserts with a cap of {MAX}",
+            cache.len(),
+            THREADS * PER_THREAD
+        );
+    }
+
+    /// A map that is over its cap (the cap was lowered by a reload) comes back under it,
+    /// instead of staying over by evicting exactly one entry per insert.
+    #[test]
+    fn a_map_over_its_cap_shrinks_back() {
+        let cache = StaticCache::new();
+        for i in 0..200 {
+            cache.insert(
+                &format!("/a{i}"),
+                Bytes::from_static(b"x"),
+                default_meta(),
+                3600,
+                0,
+                1000,
+            );
+        }
+        assert_eq!(cache.len(), 200);
+        for i in 0..200 {
+            cache.insert(
+                &format!("/b{i}"),
+                Bytes::from_static(b"x"),
+                default_meta(),
+                3600,
+                0,
+                50,
+            );
+        }
+        assert!(
+            cache.len() <= 50,
+            "{} entries with a cap of 50",
+            cache.len()
+        );
+    }
+    /// hyper parses response headers without copying: each value is a slice of the
+    /// connection's read buffer. A cached entry that kept such a value kept the whole buffer
+    /// alive (8 KiB or more per entry, found by the #481 heap profile). What the cache stores
+    /// must own its bytes.
+    #[test]
+    fn a_stored_entry_does_not_keep_the_upstream_read_buffer_alive() {
+        // The read buffer one upstream response was parsed from: head and body together.
+        let read_buffer = Bytes::from(vec![b'a'; 8192]);
+        let slice_of = |range: std::ops::Range<usize>| {
+            HeaderValue::from_maybe_shared(read_buffer.slice(range)).unwrap()
+        };
+        let meta = CachedMeta {
+            content_type: Some(slice_of(0..9)),
+            content_encoding: Some(slice_of(10..14)),
+            status: StatusCode::OK,
+            etag: Some(slice_of(20..30)),
+            last_modified: Some(slice_of(40..69)),
+            stale_while_revalidate_secs: 0,
+            must_revalidate: false,
+        };
+        assert!(
+            !read_buffer.is_unique(),
+            "the header values share the buffer"
+        );
+        let cache = StaticCache::new();
+        cache.insert("/pinned", Bytes::from_static(b"body"), meta, 3600, 0, 10);
+        assert!(
+            read_buffer.is_unique(),
+            "a cached entry still references the upstream read buffer"
+        );
+        // ... and the values themselves are unchanged.
+        let CacheLookup::Fresh(hit) = cache.get("/pinned") else {
+            panic!("stored entry is fresh");
+        };
+        assert_eq!(hit.meta.content_type.unwrap().as_bytes(), &[b'a'; 9][..]);
+        assert_eq!(
+            hit.meta.content_encoding.unwrap().as_bytes(),
+            &[b'a'; 4][..]
+        );
+        assert_eq!(hit.meta.etag.unwrap().as_bytes(), &[b'a'; 10][..]);
+        assert_eq!(hit.meta.last_modified.unwrap().as_bytes(), &[b'a'; 29][..]);
     }
 }

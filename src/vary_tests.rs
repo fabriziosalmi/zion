@@ -4206,3 +4206,59 @@ async fn keepalive_sizes_the_idle_upstream_pool() {
         }
     }
 }
+
+// ── zion_cache_entries: the cap is observable (#481) ────────────────────────
+
+#[tokio::test]
+async fn the_number_of_cached_entries_is_on_metrics() {
+    let (port, _) = named_origin("A").await;
+    let st = hosts_state(
+        "[[route]]\npath = \"/{*rest}\"\nupstream = \"a\"\nmode = \"static_cache\"\ncache_profile = \"c\"\n",
+        &format!("a = \"http://127.0.0.1:{port}\""),
+    );
+    let get = |uri: String, peer: &'static str| {
+        let st = st.clone();
+        async move {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+                .unwrap();
+            let resp = process_request(req, st, peer.parse().unwrap(), false)
+                .await
+                .unwrap();
+            let status = resp.status().as_u16();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+    let entries = |metrics: &str| -> u64 {
+        metrics
+            .lines()
+            .find_map(|l| l.strip_prefix("zion_cache_entries "))
+            .expect("zion_cache_entries is rendered")
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let (status, body) = get("/metrics".into(), "127.0.0.1:1").await;
+    assert_eq!(status, 200);
+    assert_eq!(entries(&body), 0);
+    // The profile caps at 100: 250 distinct objects leave exactly the cap.
+    for i in 0..250 {
+        assert_eq!(get(format!("/o{i}"), "203.0.113.9:1").await.0, 200);
+    }
+    // The store happens on the task that tees the body: give the last ones a moment.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let n = entries(&get("/metrics".into(), "127.0.0.1:1").await.1);
+        if n == 100 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "zion_cache_entries = {n}, expected the cap (100)"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
