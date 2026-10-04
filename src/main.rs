@@ -1793,6 +1793,9 @@ async fn handle_http(
             if rule.preserve_host {
                 req.extensions_mut().insert(proxy::PreserveHost);
             }
+            if let Some(t) = rule.request_timeout() {
+                req.extensions_mut().insert(t);
+            }
             return proxy::proxy_pass(
                 &state.client_for(rule.client_spec()),
                 req,

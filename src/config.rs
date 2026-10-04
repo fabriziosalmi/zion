@@ -692,6 +692,8 @@ struct RawUpstream {
     urls: Vec<String>,
     #[serde(default = "default_connect_timeout")]
     connect_timeout_ms: u64,
+    #[serde(default)]
+    request_timeout_ms: Option<u64>,
     #[serde(default = "default_keepalive")]
     keepalive: usize,
     #[serde(default)]
@@ -881,10 +883,19 @@ pub struct UpstreamConfig {
     /// = none). It is applied to the connector of the HTTP client used for routes
     /// that point here, so a black-holed member (packets dropped, no RST) is
     /// abandoned after this long and the next HA member is tried, instead of
-    /// costing the full 30s request timeout per attempt. It covers the TCP connect
-    /// only; the TLS handshake and the response are bounded by that 30s timeout.
+    /// costing the full request timeout per attempt. It covers the TCP connect
+    /// only; the TLS handshake and the response are bounded by `request_timeout_ms`.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_ms: u64,
+    /// How long one attempt may take from sending the request to receiving the upstream's
+    /// response headers, in milliseconds (default 30000). On expiry the client gets `504`
+    /// (or, in a pool, the next member is tried for an idempotent request). It does not
+    /// bound the response body once it is streaming, nor `sse_stream` and `websocket`
+    /// routes. Raise it for long-polling or slow report endpoints, lower it for an API
+    /// that should fail fast; like nginx `proxy_read_timeout` up to the first byte.
+    /// `None` (omitted) is the default, [`crate::proxy::DEFAULT_REQUEST_TIMEOUT_MS`].
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
     #[serde(default = "default_keepalive")]
     pub keepalive: usize,
     #[serde(default)]
@@ -942,6 +953,7 @@ impl TryFrom<RawUpstream> for UpstreamConfig {
         Ok(Self {
             urls,
             connect_timeout_ms: raw.connect_timeout_ms,
+            request_timeout_ms: raw.request_timeout_ms,
             keepalive: raw.keepalive,
             tls: raw.tls,
             client_cert_path: raw.client_cert_path,
@@ -1654,6 +1666,20 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                          decides; use an https:// URL, and drop `tls`)"
                     ));
                 }
+            }
+        }
+        // No "0 = none" here: a request with no deadline holds its connection slot until
+        // the 1 h connection cap, which is what the timeout exists to prevent.
+        if let Some(ms) = up.request_timeout_ms {
+            if !(crate::proxy::MIN_REQUEST_TIMEOUT_MS..=crate::proxy::MAX_REQUEST_TIMEOUT_MS)
+                .contains(&ms)
+            {
+                errors.push(format!(
+                    "upstream.{name}.request_timeout_ms must be {}..={} (milliseconds until the \
+                     upstream's response headers; there is no \"0 = none\"), got {ms}",
+                    crate::proxy::MIN_REQUEST_TIMEOUT_MS,
+                    crate::proxy::MAX_REQUEST_TIMEOUT_MS,
+                ));
             }
         }
         if up.keepalive > 10_000 {
@@ -2473,6 +2499,41 @@ mod tests {
             crate::proxy::DEFAULT_KEEPALIVE,
             "default unchanged"
         );
+    }
+
+    #[test]
+    fn upstream_request_timeout_ms_is_bounded_and_optional() {
+        let cfg = |up: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+                 [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstream.u]\n{up}\n\
+                 [[route]]\npath=\"/{{*rest}}\"\nupstream=\"u\"\n"
+            )
+        };
+        let errs = |up: &str| {
+            let c: ZionConfig = toml::from_str(&cfg(up)).unwrap();
+            semantic_errors(&c).join("\n")
+        };
+        // No "0 = none": a request with no deadline is what the timeout exists to prevent.
+        for bad in ["0", "3600001"] {
+            let e = errs(&format!("url = \"http://a:1\"\nrequest_timeout_ms = {bad}"));
+            assert!(
+                e.contains("upstream.u.request_timeout_ms must be 1..=3600000") && e.contains(bad),
+                "{bad}: {e}"
+            );
+        }
+        for good in ["1", "120000", "3600000"] {
+            let e = errs(&format!(
+                "url = \"http://a:1\"\nrequest_timeout_ms = {good}"
+            ));
+            assert!(!e.contains("request_timeout_ms"), "{good}: {e}");
+        }
+        // Omitted = the default, carried as "not set" so nothing marks the request.
+        let c: ZionConfig = toml::from_str(&cfg("url = \"http://a:1\"")).unwrap();
+        assert_eq!(c.upstream["u"].request_timeout_ms, None);
+        let c: ZionConfig =
+            toml::from_str(&cfg("url = \"http://a:1\"\nrequest_timeout_ms = 90000")).unwrap();
+        assert_eq!(c.upstream["u"].request_timeout_ms, Some(90_000));
     }
 
     #[test]

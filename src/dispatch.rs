@@ -826,6 +826,10 @@ async fn process_request_inner(
     if rule.preserve_host {
         req.extensions_mut().insert(proxy::PreserveHost);
     }
+    // `[upstream.x] request_timeout_ms`, carried the same way.
+    if let Some(t) = rule.request_timeout() {
+        req.extensions_mut().insert(t);
+    }
 
     // --- Gate: WebSocket upgrade detection ---
     // Check for Upgrade: websocket on ANY route (or explicit websocket mode)
@@ -1414,6 +1418,10 @@ fn swr_request(req: &Request<ZionBody>) -> Request<ZionBody> {
     if req.extensions().get::<proxy::PreserveHost>().is_some() {
         out.extensions_mut().insert(proxy::PreserveHost);
     }
+    // ... and waits for the origin as long as that request would have.
+    if let Some(t) = req.extensions().get::<proxy::RequestTimeout>() {
+        out.extensions_mut().insert(*t);
+    }
     for (name, value) in req.headers() {
         if matches!(
             *name,
@@ -1467,7 +1475,14 @@ fn spawn_swr_refresh(job: SwrRefresh) {
     }
     tokio::spawn(async move {
         let _permit = permit;
-        let ok = tokio::time::timeout(SWR_REFRESH_TIMEOUT, run_swr_refresh(&job))
+        // The whole refresh (headers and body) gets at least the default; an upstream given
+        // a longer `request_timeout_ms` is not cut short here before it could answer.
+        let budget = job
+            .request
+            .extensions()
+            .get::<proxy::RequestTimeout>()
+            .map_or(SWR_REFRESH_TIMEOUT, |t| t.0.max(SWR_REFRESH_TIMEOUT));
+        let ok = tokio::time::timeout(budget, run_swr_refresh(&job))
             .await
             .unwrap_or(false);
         if ok {
@@ -1660,7 +1675,8 @@ const MAX_SWR_SECS: u64 = 86_400;
 /// total so a burst of distinct expiring keys cannot spawn unbounded origin traffic.
 const MAX_SWR_REFRESHES: usize = 64;
 
-/// How long a background refresh may run before it is abandoned.
+/// How long a background refresh may run before it is abandoned (longer when the upstream's
+/// `request_timeout_ms` is).
 const SWR_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A bounded budget of concurrent refreshes.
@@ -2993,6 +3009,36 @@ mod route_cache {
 
 #[cfg(test)]
 mod tests {
+    /// A background refresh waits for the origin as long as the request it refreshes would
+    /// have (`[upstream.x] request_timeout_ms`), and marks nothing when the default applies.
+    #[test]
+    fn a_background_refresh_keeps_the_upstream_request_timeout() {
+        use http_body_util::{BodyExt, Full};
+        let request = || {
+            hyper::Request::builder()
+                .uri("/a")
+                .body(
+                    Full::new(bytes::Bytes::new())
+                        .map_err(|n| match n {})
+                        .boxed(),
+                )
+                .unwrap()
+        };
+        let mark = crate::proxy::RequestTimeout(std::time::Duration::from_millis(250));
+        let mut marked = request();
+        marked.extensions_mut().insert(mark);
+        assert_eq!(
+            super::swr_request(&marked)
+                .extensions()
+                .get::<crate::proxy::RequestTimeout>(),
+            Some(&mark)
+        );
+        assert!(super::swr_request(&request())
+            .extensions()
+            .get::<crate::proxy::RequestTimeout>()
+            .is_none());
+    }
+
     #[test]
     fn route_cache_clear_empties_it_and_it_stays_usable() {
         let mut c = route_cache::RouteCache::<u32>::new(3);

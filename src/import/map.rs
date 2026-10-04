@@ -52,6 +52,8 @@ pub struct UpstreamOut {
     pub name: String,
     pub urls: Vec<String>,
     pub connect_timeout_ms: Option<u64>,
+    /// `request_timeout_ms`: the deadline for the upstream's response headers.
+    pub request_timeout_ms: Option<u64>,
     pub keepalive: Option<u64>,
     /// Forward the client's Host (ADR-0024). Set by [`settle_preserve_host`] from the
     /// routes that use the upstream.
@@ -767,12 +769,57 @@ fn map_tls(
 
 // ── Upstream registry ───────────────────────────────────────────────────
 
+/// The deadlines a location asks of its upstream. They are per location in nginx and per
+/// upstream in Zion: the first location that sets one decides it for the upstream.
+#[derive(Clone, Copy, Default)]
+struct Timeouts {
+    connect_ms: Option<u64>,
+    request_ms: Option<u64>,
+}
+
+impl Timeouts {
+    /// Fill what is still unset from `other`, the timeouts of a later location (at `line`)
+    /// that uses the same upstream `name`. A value that is already set stays, and a
+    /// different one asked for later is reported: it is not applied.
+    fn fill_from(&mut self, other: Timeouts, name: &str, line: u32, findings: &mut Vec<Finding>) {
+        for (kept, asked, directive, key) in [
+            (
+                &mut self.connect_ms,
+                other.connect_ms,
+                "proxy_connect_timeout",
+                "connect_timeout_ms",
+            ),
+            (
+                &mut self.request_ms,
+                other.request_ms,
+                "proxy_read_timeout",
+                "request_timeout_ms",
+            ),
+        ] {
+            match (*kept, asked) {
+                (None, _) => *kept = asked,
+                (Some(k), Some(a)) if k != a => findings.push(Finding::new(
+                    Status::Partial,
+                    line,
+                    directive,
+                    format!(
+                        "upstream '{name}' is shared by locations with different values: \
+                         {key} = {k} kept (the first), {a} not applied — the setting is per \
+                         upstream in Zion"
+                    ),
+                )),
+                _ => {}
+            }
+        }
+    }
+}
+
 struct UpstreamReg<'a> {
     pools: &'a [Pool],
-    /// pool name → (scheme, connect_timeout_ms, used)
-    pool_state: HashMap<String, (String, Option<u64>, bool)>,
+    /// pool name → (scheme, timeouts, used)
+    pool_state: HashMap<String, (String, Timeouts, bool)>,
     /// url → sanitized name (direct proxy_pass targets)
-    synth: Vec<(String, String, Option<u64>)>,
+    synth: Vec<(String, String, Timeouts)>,
 }
 
 impl<'a> UpstreamReg<'a> {
@@ -790,7 +837,7 @@ impl<'a> UpstreamReg<'a> {
         &mut self,
         scheme: &str,
         target: &str,
-        timeout_ms: Option<u64>,
+        timeouts: Timeouts,
         line: u32,
         findings: &mut Vec<Finding>,
     ) -> String {
@@ -798,7 +845,7 @@ impl<'a> UpstreamReg<'a> {
             let entry = self
                 .pool_state
                 .entry(target.to_string())
-                .or_insert_with(|| (scheme.to_string(), timeout_ms, true));
+                .or_insert_with(|| (scheme.to_string(), timeouts, true));
             if entry.0 != scheme {
                 findings.push(Finding::new(
                     Status::Partial,
@@ -810,24 +857,19 @@ impl<'a> UpstreamReg<'a> {
                     ),
                 ));
             }
-            if entry.1.is_none() {
-                entry.1 = timeout_ms;
-            }
+            entry.1.fill_from(timeouts, target, line, findings);
             return sanitize_name(target);
         }
         let url = format!("{scheme}://{target}");
-        if let Some((_, name, existing_timeout)) = self.synth.iter_mut().find(|(u, _, _)| *u == url)
-        {
-            if existing_timeout.is_none() {
-                *existing_timeout = timeout_ms;
-            }
+        if let Some((_, name, existing)) = self.synth.iter_mut().find(|(u, _, _)| *u == url) {
+            existing.fill_from(timeouts, name, line, findings);
             return name.clone();
         }
         let mut name = sanitize_name(target);
         while self.name_taken(&name) {
             name.push('_');
         }
-        self.synth.push((url, name.clone(), timeout_ms));
+        self.synth.push((url, name.clone(), timeouts));
         name
     }
 
@@ -840,11 +882,11 @@ impl<'a> UpstreamReg<'a> {
     fn finish(self, _model: &NginxModel, findings: &mut Vec<Finding>) -> Vec<UpstreamOut> {
         let mut out = Vec::new();
         for pool in self.pools {
-            let (scheme, timeout, used) = self
+            let (scheme, timeouts, used) = self
                 .pool_state
                 .get(&pool.name)
                 .cloned()
-                .unwrap_or_else(|| ("http".to_string(), None, false));
+                .unwrap_or_else(|| ("http".to_string(), Timeouts::default(), false));
             if !used {
                 findings.push(Finding::new(
                     Status::Auto,
@@ -942,17 +984,19 @@ impl<'a> UpstreamReg<'a> {
             out.push(UpstreamOut {
                 name: sanitize_name(&pool.name),
                 urls,
-                connect_timeout_ms: timeout,
+                connect_timeout_ms: timeouts.connect_ms,
+                request_timeout_ms: timeouts.request_ms,
                 keepalive: pool.keepalive,
                 preserve_host: false,
                 health_host: None,
             });
         }
-        for (url, name, timeout) in self.synth {
+        for (url, name, timeouts) in self.synth {
             out.push(UpstreamOut {
                 name,
                 urls: vec![url],
-                connect_timeout_ms: timeout,
+                connect_timeout_ms: timeouts.connect_ms,
+                request_timeout_ms: timeouts.request_ms,
                 keepalive: None,
                 preserve_host: false,
                 health_host: None,
@@ -1005,6 +1049,7 @@ pub fn settle_preserve_host(doc: &mut ZionDoc, findings: &mut Vec<Finding>) {
             name,
             urls: up.urls.clone(),
             connect_timeout_ms: up.connect_timeout_ms,
+            request_timeout_ms: up.request_timeout_ms,
             keepalive: up.keepalive,
             preserve_host: false,
             health_host: None,
@@ -1085,6 +1130,8 @@ struct ServerCtx {
     hdr_annotations: Vec<String>,
     waf: bool,
     connect_ms: Option<u64>,
+    /// `proxy_read_timeout` at server level, inherited by its locations.
+    read_ms: Option<u64>,
     /// Inherited docroot (`root <dir>`) that static locations serve from
     /// (ADR-0015). nginx inheritance is replace-not-merge, but a location's own
     /// `root`/`alias` simply overrides this at the location level.
@@ -1364,6 +1411,7 @@ fn map_server(
         hdr_annotations: Vec::new(),
         waf: false,
         connect_ms: None,
+        read_ms: None,
         root: None,
         root_line: 0,
         index: None,
@@ -1448,6 +1496,8 @@ fn map_server(
             "proxy_connect_timeout" => {
                 map_connect_timeout(d, &mut ctx.connect_ms, findings);
             }
+            "proxy_read_timeout" => map_read_timeout(d, &mut ctx.read_ms, findings),
+            "proxy_send_timeout" => findings.push(send_timeout_finding(d)),
             "ssl" => {
                 if d.args.first().map(String::as_str) == Some("on") {
                     findings.push(Finding::new(
@@ -1587,6 +1637,7 @@ fn map_location(
     let mut loc_csp: Option<String> = None;
     let mut loc_has_add_header = false;
     let mut loc_connect: Option<u64> = None;
+    let mut loc_read: Option<u64> = None;
     let mut route_waf = ctx.waf;
     let mut static_only = Vec::new();
     // Static-serving state (ADR-0015): a location with one of these and no
@@ -1655,16 +1706,15 @@ fn map_location(
                 "backend protocol is managed by Zion",
             )),
             "proxy_connect_timeout" => map_connect_timeout(d, &mut loc_connect, findings),
-            "proxy_read_timeout"
-            | "proxy_send_timeout"
-            | "send_timeout"
-            | "client_body_timeout"
-            | "keepalive_timeout" => {
+            "proxy_read_timeout" => map_read_timeout(d, &mut loc_read, findings),
+            "proxy_send_timeout" => findings.push(send_timeout_finding(d)),
+            "send_timeout" | "client_body_timeout" | "keepalive_timeout" => {
                 findings.push(Finding::new(
                     Status::Unsupported,
                     d.line,
                     &d.name,
-                    "only the upstream connect timeout is configurable in Zion",
+                    "client-side timeouts are not configurable in Zion (only the upstream \
+                     connect and request timeouts are)",
                 ));
             }
             "proxy_buffering" => findings.push(Finding::new(
@@ -1978,7 +2028,10 @@ fn map_location(
         ctx.csp.clone()
     };
     // Timeouts: the location-level value overrides the server-level one.
-    let connect_ms = loc_connect.or(ctx.connect_ms);
+    let timeouts = Timeouts {
+        connect_ms: loc_connect.or(ctx.connect_ms),
+        request_ms: loc_read.or(ctx.read_ms),
+    };
 
     if let Some(uri) = uri {
         // Replacing `/` with `/` under `location /` is the identity — fine.
@@ -2036,7 +2089,7 @@ fn map_location(
         }
     }
 
-    let upstream = reg.resolve(&scheme, &target, connect_ms, pline, findings);
+    let upstream = reg.resolve(&scheme, &target, timeouts, pline, findings);
     findings.push(Finding::new(
         Status::Convert,
         pline,
@@ -2456,6 +2509,55 @@ fn map_connect_timeout(d: &Directive, slot: &mut Option<u64>, findings: &mut Vec
             format!("cannot parse time '{raw}'"),
         )),
     }
+}
+
+/// `proxy_read_timeout` → `request_timeout_ms`. The two agree on the wait for the first byte
+/// of the response; they differ after it, and the finding says how.
+fn map_read_timeout(d: &Directive, slot: &mut Option<u64>, findings: &mut Vec<Finding>) {
+    let raw = d.args.first().map(String::as_str).unwrap_or("");
+    let ms = parse_time_ms(raw).filter(|ms| {
+        (crate::proxy::MIN_REQUEST_TIMEOUT_MS..=crate::proxy::MAX_REQUEST_TIMEOUT_MS).contains(ms)
+    });
+    match ms {
+        Some(ms) => {
+            if slot.is_none() {
+                *slot = Some(ms);
+            }
+            findings.push(Finding::new(
+                Status::Partial,
+                d.line,
+                "proxy_read_timeout",
+                format!(
+                    "request_timeout_ms = {ms}: Zion bounds the whole exchange up to the \
+                     response headers (sending the request included) and nothing once the \
+                     body is streaming; nginx bounds each gap between two reads"
+                ),
+            ));
+        }
+        None => findings.push(Finding::new(
+            Status::Unsupported,
+            d.line,
+            "proxy_read_timeout",
+            format!(
+                "'{raw}' is not a time Zion's request_timeout_ms accepts ({}..={} ms) — the \
+                 default 30 s applies",
+                crate::proxy::MIN_REQUEST_TIMEOUT_MS,
+                crate::proxy::MAX_REQUEST_TIMEOUT_MS
+            ),
+        )),
+    }
+}
+
+/// `proxy_send_timeout` has no counterpart: Zion has no deadline between two writes.
+fn send_timeout_finding(d: &Directive) -> Finding {
+    Finding::new(
+        Status::Unsupported,
+        d.line,
+        "proxy_send_timeout",
+        "no deadline between two writes to the upstream: request_timeout_ms (set from \
+         proxy_read_timeout, default 30 s) bounds sending the request and waiting for the \
+         response headers together — raise it if uploads take longer",
+    )
 }
 
 // ── Aggregation ─────────────────────────────────────────────────────────

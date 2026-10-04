@@ -95,7 +95,9 @@ annotation, no emission).
 | `least_conn` / `ip_hash` / `weight=` / `backup` / `max_fails` | unsupported | Zion's LB is fixed: health-gated lowest-EWMA-latency; health checks automatic |
 | `keepalive 32` (upstream) | convert | `upstream.<n>.keepalive = 32` |
 | `proxy_connect_timeout 75s` | convert | `connect_timeout_ms = 75000` |
-| `proxy_read_timeout` / `send_timeout` / `client_body_timeout` | unsupported | no schema target |
+| `proxy_read_timeout` | partial (since #517) | `request_timeout_ms`: Zion bounds the exchange up to the response headers (sending the request included), nginx each gap between two reads. Two locations sharing an upstream with different values: the first is kept, the other reported |
+| `proxy_send_timeout` | unsupported | no deadline between two writes; the finding points at `request_timeout_ms` |
+| `send_timeout` / `client_body_timeout` | unsupported | no schema target |
 | `proxy_set_header X-Real-IP / X-Forwarded-For / X-Forwarded-Proto ...` | auto | Zion sets all three unconditionally (`apply_forwarding_hygiene`) |
 | `proxy_set_header Host $host` | convert (since #485) | the upstream gets `preserve_host = true` ([ADR-0024](0024-preserve-host.md)); before, Zion always re-derived `Host` from the upstream authority and this was reported unsupported |
 | `proxy_set_header <other>` / `add_header <other>` | unsupported | no generic header-manipulation target |

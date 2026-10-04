@@ -12,6 +12,11 @@ All notable changes to Zion Edge Gateway are documented here.
 
 **Upgrade note:** a script that passes a flag Zion never knew, or a value it never parsed, now fails where it used to run with defaults. The error names the argument.
 
+### Added
+
+- **`[upstream.x] request_timeout_ms`** (#517): how long one attempt may take from sending the request to receiving the upstream's response headers. It was a fixed 30 s; that stays the default. Raise it for long-polling, slow report endpoints or uploads slower than 30 s (sending the body counts), lower it for an API that should fail fast. It applies to the single-upstream path, to every attempt of a pool, to cache fetches and to background refreshes. `1`..`3600000` ms: there is no "0 = none", because a request with no deadline holds its connection slot until the 1 h connection cap.
+- **`zion import nginx` converts `proxy_read_timeout`** to `request_timeout_ms` (it was `unsupported`), as `partial`: the finding states that Zion bounds the exchange up to the response headers while nginx bounds each gap between two reads. `proxy_send_timeout` stays `unsupported` and now points at `request_timeout_ms`. Two locations that share an upstream but ask for different connect or read timeouts used to keep the first value in silence; the one that is not applied is now a `partial` finding.
+
 ## [0.9.8] - 2026-10-03
 
 **Security release: fixes from the 2026-10-02 code audit.** Routes with `auth_profile` are enforced by the official binaries, the gossip mesh only trusts named nodes, the admin API needs its own CA and a write token, the WAF scans GET bodies, HTTP/3 forwards client headers, and the health checker follows reloads. Several settings that used to be accepted and silently ignored or weakened are now **config errors**: read the upgrade notes before upgrading.

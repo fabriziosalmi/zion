@@ -99,6 +99,30 @@ pub fn build_http_client(connect_timeout_ms: u64, http1_only: bool) -> HttpClien
     })
 }
 
+/// Default per-upstream deadline for the response headers (`request_timeout_ms`). Shorter
+/// under test so a hanging upstream can be exercised in seconds.
+#[cfg(not(test))]
+pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+#[cfg(test)]
+pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 2_000;
+/// Bounds of `request_timeout_ms`: no "0 = none" (a request with no deadline would hold its
+/// connection slot until the connection cap), and no longer than that 1 h cap.
+pub const MIN_REQUEST_TIMEOUT_MS: u64 = 1;
+pub const MAX_REQUEST_TIMEOUT_MS: u64 = 3_600_000;
+
+/// A request extension: how long one upstream attempt may wait for the response headers
+/// (`[upstream.x] request_timeout_ms`). Set where the route is known, like [`PreserveHost`];
+/// a request without it gets [`UPSTREAM_REQUEST_TIMEOUT`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestTimeout(pub std::time::Duration);
+
+/// The deadline for `req`'s upstream attempt.
+fn request_timeout<B>(req: &Request<B>) -> std::time::Duration {
+    req.extensions()
+        .get::<RequestTimeout>()
+        .map_or(UPSTREAM_REQUEST_TIMEOUT, |t| t.0)
+}
+
 /// Idle pooled connections kept per upstream host (`[upstream.x] keepalive`).
 pub const DEFAULT_KEEPALIVE: usize = 128;
 
@@ -166,7 +190,7 @@ pub fn bad_gateway() -> Response<ZionBody> {
 }
 
 /// 504 Gateway Timeout — the upstream was reachable but produced no response
-/// within `UPSTREAM_REQUEST_TIMEOUT`. Kept distinct from `bad_gateway` (502 =
+/// within the request timeout (`[upstream.x] request_timeout_ms`). Kept distinct from `bad_gateway` (502 =
 /// connect refused/reset) so an operator can tell a *slow* backend from an
 /// *unreachable* one.
 #[inline]
@@ -477,6 +501,10 @@ pub async fn proxy_pass_ha(
     let version = parts.version;
     let headers = parts.headers.clone();
     let preserve_host = parts.extensions.get::<PreserveHost>().is_some();
+    let attempt_timeout = parts
+        .extensions
+        .get::<RequestTimeout>()
+        .map_or(UPSTREAM_REQUEST_TIMEOUT, |t| t.0);
     let idempotent = matches!(
         method,
         hyper::Method::GET
@@ -543,8 +571,7 @@ pub async fn proxy_pass_ha(
         // Bounded like the single-upstream path: a member that accepts the connection
         // and never answers must not hold the request until the connection cap.
         let Ok(outcome) =
-            tokio::time::timeout(UPSTREAM_REQUEST_TIMEOUT, send_request_try(client, prepared))
-                .await
+            tokio::time::timeout(attempt_timeout, send_request_try(client, prepared)).await
         else {
             // Slow is not dead: no eager ejection; the pool stats count the failure.
             crate::pool::report(
@@ -560,7 +587,7 @@ pub async fn proxy_pass_ha(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             crate::logging::warn(
                 "proxy",
-                &format!("upstream {url} timeout after {UPSTREAM_REQUEST_TIMEOUT:?}"),
+                &format!("upstream {url} timeout after {attempt_timeout:?}"),
             );
             timed_out = true;
             candidates.retain(|c| c != &url);
@@ -691,19 +718,18 @@ pub async fn proxy_pass_stream(
     }
 }
 
-/// Upper bound on a single upstream request/response. A hung or black-holed
+/// Default upper bound on a single upstream request/response
+/// ([`DEFAULT_REQUEST_TIMEOUT_MS`]; `[upstream.x] request_timeout_ms` overrides it per
+/// upstream through [`RequestTimeout`]). A hung or black-holed
 /// backend (TCP/TLS completes but the HTTP response never arrives, or arrives
 /// at a trickle) would otherwise pin the request (and the conn-limit permit
 /// plus per-IP slot it holds) up to the 1h connection cap — a DoS amplifier.
 /// 504 on elapse. The per-upstream `connect_timeout_ms` bounds only the TCP
 /// connect (it is applied to the connector, see `build_http_client`); this
 /// overall bound is what closes a hang *after* connect. It applies to every attempt of a
-/// pool too (see [`proxy_pass_ha`]). Shorter under test so a hanging upstream can be
-/// exercised in seconds.
-#[cfg(not(test))]
-const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-#[cfg(test)]
-const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// pool too (see [`proxy_pass_ha`]).
+const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS);
 
 /// Hard ceiling on a request body buffered for HA replay. Failover has to hold
 /// the whole body in memory to resend it, so this bounds per-request RAM on
@@ -743,8 +769,9 @@ async fn send_request(
     req: Request<ZionBody>,
 ) -> Result<Response<ZionBody>, hyper::Error> {
     let context = upstream_context(&req);
+    let deadline = request_timeout(&req);
     let upstream_start = std::time::Instant::now();
-    match tokio::time::timeout(UPSTREAM_REQUEST_TIMEOUT, client.request(req)).await {
+    match tokio::time::timeout(deadline, client.request(req)).await {
         Ok(Ok(resp)) => {
             crate::metrics::METRICS
                 .upstream_duration
@@ -766,7 +793,7 @@ async fn send_request(
                 .observe(upstream_start.elapsed());
             crate::logging::warn(
                 "proxy",
-                &format!("upstream timeout after {UPSTREAM_REQUEST_TIMEOUT:?} {context}"),
+                &format!("upstream timeout after {deadline:?} {context}"),
             );
             Ok(gateway_timeout())
         }

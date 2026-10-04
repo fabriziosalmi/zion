@@ -28,6 +28,9 @@ pub struct ResolvedRoute {
     /// TCP connect deadline for this route's upstream (ms; 0 = none). Selects the
     /// HTTP client whose connector enforces it — see `AppState::client_for`.
     pub connect_timeout_ms: u64,
+    /// `[upstream.x] request_timeout_ms`: how long one attempt may wait for the upstream's
+    /// response headers. `None` = the default.
+    pub request_timeout_ms: Option<u64>,
     /// How a pool of several endpoints picks a member.
     pub load_balancing: crate::pool::Algorithm,
     /// `[upstream.x] max_in_flight` (0 = no limit) and the name its counter is kept under.
@@ -72,6 +75,13 @@ impl ResolvedRoute {
             http1_only: self.preserve_host,
             keepalive: self.keepalive,
         }
+    }
+
+    /// The mark that carries this route's `request_timeout_ms` to the proxy layer; `None`
+    /// when the upstream keeps the default, so the common case marks nothing.
+    pub fn request_timeout(&self) -> Option<crate::proxy::RequestTimeout> {
+        self.request_timeout_ms
+            .map(|ms| crate::proxy::RequestTimeout(std::time::Duration::from_millis(ms)))
     }
 
     /// May the plaintext `:80` listener hand an ACME-challenge request that no
@@ -504,6 +514,10 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
             .and_then(|name| config.upstream.get(name))
             .map(|u| u.connect_timeout_ms)
             .unwrap_or(crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS),
+        request_timeout_ms: route
+            .upstream_name()
+            .and_then(|name| config.upstream.get(name))
+            .and_then(|u| u.request_timeout_ms),
         load_balancing: route
             .upstream_name()
             .and_then(|name| config.upstream.get(name))
