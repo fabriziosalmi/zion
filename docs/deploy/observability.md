@@ -15,7 +15,7 @@ Zion exposes built-in endpoints that bypass routing and upstream forwarding:
 | `GET /readyz` | `200 ready` | public | Readiness probe (is the process ready to serve?) |
 | `GET /metrics` | Prometheus text format | **internal IPs only** (`403` otherwise) | Metrics scraping |
 | `GET /_zion/snapshot.json` | JSON (metrics + quantiles + platform) | **internal IPs only** | `zion top` / dashboards |
-| `POST /_zion/cache/purge` | `{"purged":N,"scope":...}` | **internal IPs only**, POST-only (`405` on GET) | Flush the RAM cache on deploy; `?prefix=/path` for scoped purge, `?tag=a,b` to purge by `Surrogate-Key` tag |
+| `POST /_zion/cache/purge` | `{"purged":N,"scope":...}` | **loopback only**, or the hosts in `[server] internal_networks` when it is set; POST-only (`405` on GET) | Flush the RAM cache on deploy; `?prefix=/path` for scoped purge, `?tag=a,b` to purge by `Surrogate-Key` tag |
 
 On the HTTPS listener (HTTP/1.1 and /2), `/healthz` and `/readyz` are answered
 on a listener fast path before the request pipeline, so they respond even under
@@ -24,7 +24,11 @@ hit the per-IP rate limiter **before** the health endpoints — a deliberate
 choice, so `/healthz` cannot be used to bypass rate limiting in a flood.
 `/metrics`, `/_zion/snapshot.json`, and `/_zion/cache/purge` always go through
 the pipeline and are restricted to internal source IPs (external clients get
-`403`).
+`403`). "Internal" is any loopback or private-range peer unless
+`[server] internal_networks` names the hosts. The purge, the only one of the
+three that changes anything, does not accept that default: without
+`internal_networks` it answers loopback only, and tells a private peer so in
+the `403` body.
 
 ## Prometheus metrics
 

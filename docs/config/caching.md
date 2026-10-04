@@ -239,13 +239,14 @@ x-zion-cache: HIT
 - **`X-Zion-Cache`** response header on every cacheable route: `HIT` (served from
   cache), `MISS` (fetched + stored), `BYPASS` (not cacheable / `no-store`).
 - **Metrics** (`/metrics`): `zion_cache_hits` / `zion_cache_misses`.
-- **Purge** (internal-IP gated): `POST /_zion/cache/purge` clears everything;
+- **Purge** (loopback only, or the hosts in `[server] internal_networks` when it is
+  set): `POST /_zion/cache/purge` clears everything;
   `POST /_zion/cache/purge?prefix=/static/` clears one path prefix (variants
   share the prefix, so this clears all encodings of a path). Returns
   `{"purged":N,"scope":...}`.
 
 ```console
-$ curl -sX POST 'http://127.0.0.1/_zion/cache/purge?prefix=/static/app.js'
+$ curl -skX POST 'https://127.0.0.1/_zion/cache/purge?prefix=/static/app.js'
 {"purged":2,"scope":"/static/app.js"}
 ```
 
@@ -257,7 +258,7 @@ Zion indexes the entry under each tag, and one call drops everything that carrie
 however many URLs and variants that is:
 
 ```console
-$ curl -sX POST 'http://127.0.0.1/_zion/cache/purge?tag=post-42'
+$ curl -skX POST 'https://127.0.0.1/_zion/cache/purge?tag=post-42'
 {"purged":3,"scope":{"tags":["post-42"]}}
 ```
 

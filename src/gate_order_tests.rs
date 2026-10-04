@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 const EXTERNAL: &str = "203.0.113.9:40000"; // TEST-NET-3: not an internal address
 const INTERNAL: &str = "10.0.0.5:40000";
+const LOOPBACK: &str = "127.0.0.1:40000";
 const DEAD: &str = "http://127.0.0.1:10";
 
 fn config_toml(rate_limit_rps: u32) -> String {
@@ -405,14 +406,39 @@ async fn built_in_endpoints_answer_before_route_lookup() {
     assert_eq!(get(&st, INTERNAL, "/metrics").await, 200);
     assert_eq!(get(&st, EXTERNAL, "/_zion/snapshot.json").await, 403);
     assert_eq!(get(&st, INTERNAL, "/_zion/snapshot.json").await, 200);
-    // purge: internal check, then method
+    // purge: who may, then method. With no `internal_networks` only loopback may purge: a
+    // private address is enough to read /metrics, not to flush the cache (#516).
     assert_eq!(get(&st, EXTERNAL, "/_zion/cache/purge").await, 403);
     assert_eq!(
         get(&st, INTERNAL, "/_zion/cache/purge").await,
+        403,
+        "a private, non-loopback peer may not purge by default"
+    );
+    assert_eq!(
+        get(&st, LOOPBACK, "/_zion/cache/purge").await,
         405,
-        "GET is not POST"
+        "loopback may; GET is not POST"
     );
     assert_eq!(get(&st, INTERNAL, "/no-such-route").await, 404);
+}
+
+/// `[server] internal_networks` is the operator naming who is internal: the hosts it lists
+/// may purge, and nothing else may, loopback included (the list replaces the default, as it
+/// does for the read endpoints).
+#[tokio::test]
+async fn internal_networks_decides_who_may_purge() {
+    let toml = config_toml(0).replacen(
+        "[server]",
+        "[server]\ninternal_networks = [\"10.0.0.0/8\"]",
+        1,
+    );
+    let st = AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"));
+    assert_eq!(get(&st, INTERNAL, "/_zion/cache/purge").await, 405);
+    assert_eq!(get(&st, LOOPBACK, "/_zion/cache/purge").await, 403);
+    assert_eq!(get(&st, EXTERNAL, "/_zion/cache/purge").await, 403);
+    // The read endpoints follow the same list, as before.
+    assert_eq!(get(&st, INTERNAL, "/metrics").await, 200);
+    assert_eq!(get(&st, LOOPBACK, "/metrics").await, 403);
 }
 
 // ── route-level gates, in order ─────────────────────────────────────────────
