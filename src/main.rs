@@ -831,6 +831,30 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     // is set). `internal-ip` gates on the peer IP over plain HTTP; `mtls` requires
     // a client cert chaining to `admin.client_ca_path` (the handshake is the auth).
     if let Some(ref admin_cfg) = config.admin {
+        // Revocations recorded by earlier runs come back before any request is served. A
+        // file that cannot be read stops the boot: starting without it would make every
+        // revoked token valid again.
+        if let Some(path) = admin_cfg.revocations_path.as_deref() {
+            match auth::revocation::load(std::path::Path::new(path)) {
+                Ok((live, skipped)) => {
+                    logging::info(
+                        "auth",
+                        &format!("{live} revoked token id(s) loaded from {path}"),
+                    );
+                    if skipped > 0 {
+                        logging::warn(
+                            "auth",
+                            &format!("{skipped} unreadable line(s) in {path} were skipped"),
+                        );
+                    }
+                }
+                Err(e) => {
+                    return Err(error::ZionError::Config(format!(
+                        "admin.revocations_path: cannot load the revocation list: {e}"
+                    )));
+                }
+            }
+        }
         match admin_cfg.listen.parse::<std::net::SocketAddr>() {
             Ok(addr) => {
                 let auth = match admin_cfg.auth.as_str() {
@@ -917,6 +941,10 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                         rate_limiter: admin::AdminRateLimiter::new(admin_cfg.rate_limit_rps),
                         write_token,
                         persist_push: admin_cfg.persist_push,
+                        revocations_path: admin_cfg
+                            .revocations_path
+                            .as_deref()
+                            .map(std::path::PathBuf::from),
                     });
                     admin::spawn_admin_listener(state.clone(), addr, ctx, auth);
                 }

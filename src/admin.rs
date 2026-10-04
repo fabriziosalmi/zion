@@ -108,6 +108,8 @@ pub(crate) struct AdminReloadCtx {
     pub(crate) write_token: Option<zeroize::Zeroizing<Vec<u8>>>,
     /// Write an accepted `POST /admin/config` body back to `config_path`.
     pub(crate) persist_push: bool,
+    /// Where revocations are recorded (`[admin] revocations_path`); `None`: memory only.
+    pub(crate) revocations_path: Option<PathBuf>,
 }
 
 /// True when `header` is `Bearer <token>` and the token equals `expected`. The
@@ -319,18 +321,38 @@ async fn handle(
             }
             // Deny a token id until its own expiry (JWT revocation, #418).
             "/admin/revoke" => {
+                // 400: the request is wrong. 500: the request is fine and the revocation is
+                // in force, but it could not be made durable.
+                let bad = |e: String| (StatusCode::BAD_REQUEST, e);
                 let outcome = match read_body_string(req).await {
                     Ok(body) => serde_json::from_str::<RevokeBody>(&body)
                         .map_err(|e| {
-                            format!("body must be {{\"jti\":\"..\",\"exp\":<unix secs>}}: {e}")
+                            bad(format!(
+                                "body must be {{\"jti\":\"..\",\"exp\":<unix secs>}}: {e}"
+                            ))
                         })
                         .and_then(|b| {
                             let exp = b.exp.unwrap_or_else(|| now_secs() + 86_400);
-                            crate::auth::revocation::revoke(&b.jti, exp)
-                                .map(|n| (b.jti, n))
-                                .map_err(str::to_string)
+                            let live = crate::auth::revocation::revoke(&b.jti, exp)
+                                .map_err(|e| bad(e.to_string()))?;
+                            // Durable before the operator is told "revoked": a revocation
+                            // that a restart would undo must not look like one that holds.
+                            if let Some(path) = &ctx.revocations_path {
+                                crate::auth::revocation::append(path, &b.jti, exp).map_err(
+                                    |e| {
+                                        (
+                                            StatusCode::INTERNAL_SERVER_ERROR,
+                                            format!(
+                                                "revoked in memory, but not recorded on disk \
+                                                 (a restart would undo it): {e}"
+                                            ),
+                                        )
+                                    },
+                                )?;
+                            }
+                            Ok((b.jti, live))
                         }),
-                    Err(e) => Err(e),
+                    Err(e) => Err(bad(e)),
                 };
                 return Ok(match outcome {
                     Ok((jti, live)) => {
@@ -340,12 +362,9 @@ async fn handle(
                             format!("{{\"revoked\":true,\"live_entries\":{live}}}\n"),
                         )
                     }
-                    Err(e) => {
+                    Err((status, e)) => {
                         crate::observability::ADMIN_REJECTS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        json_owned(
-                            StatusCode::BAD_REQUEST,
-                            format!("{{\"error\":{}}}\n", json_string(&e)),
-                        )
+                        json_owned(status, format!("{{\"error\":{}}}\n", json_string(&e)))
                     }
                 });
             }

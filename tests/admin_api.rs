@@ -334,6 +334,116 @@ fn without_a_write_token_writes_are_refused() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// Start the daemon on an existing config and wait for its admin API.
+fn start(cfg: &std::path::Path, dir: &std::path::Path, admin_port: u16, log_name: &str) -> Daemon {
+    let child = Command::new(env!("CARGO_BIN_EXE_zion"))
+        .env("ZION_CONFIG", cfg)
+        .env("ZION_BOOT_FAST", "1")
+        .env("ZION_TEST_ADMIN_WRITE_TOKEN", TOKEN)
+        .env("ZION_LAST_GASP_PATH", dir.join("gasp.jsonl"))
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(dir.join(log_name)).unwrap())
+        .spawn()
+        .expect("spawn zion");
+    let d = Daemon(child);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while TcpStream::connect(("127.0.0.1", admin_port)).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "admin API never came up; daemon said:\n{}",
+            fs::read_to_string(dir.join(log_name)).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    d
+}
+
+/// A revoked token id is still revoked after a restart when `[admin] revocations_path` is
+/// set (ZION-AUTH-06). Without it the list was in memory only: a restart made every revoked
+/// token valid again until it expired.
+#[test]
+fn a_revocation_survives_a_restart() {
+    let Some((first, port, dir, cfg)) = boot(false) else {
+        return;
+    };
+    drop(first); // only wanted its certificates and config
+    let recorded = dir.join("revoked.jsonl");
+    let mut text = fs::read_to_string(&cfg).unwrap();
+    text.push_str(&format!("revocations_path = \"{}\"\n", recorded.display()));
+    fs::write(&cfg, text).unwrap();
+    let far = 4_102_444_800u64; // 2100-01-01
+
+    let run1 = start(&cfg, &dir, port, "run1.log");
+    let (st, body) = http(
+        port,
+        "POST",
+        "/admin/revoke",
+        Some(TOKEN),
+        &format!(r#"{{"jti":"stolen-token-id","exp":{far}}}"#),
+    );
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("\"live_entries\":1"), "{body}");
+    assert!(
+        fs::read_to_string(&recorded)
+            .unwrap()
+            .contains("stolen-token-id"),
+        "recorded before the operator is told it is revoked"
+    );
+    drop(run1);
+
+    // Restart: the list comes back from the file before anything is served.
+    let run2 = start(&cfg, &dir, port, "run2.log");
+    let log = fs::read_to_string(dir.join("run2.log")).unwrap();
+    assert!(log.contains("1 revoked token id(s) loaded"), "{log}");
+    // The in-memory list already holds the first id: a second one makes two.
+    let (st, body) = http(
+        port,
+        "POST",
+        "/admin/revoke",
+        Some(TOKEN),
+        &format!(r#"{{"jti":"another-id","exp":{far}}}"#),
+    );
+    assert_eq!(st, 200, "{body}");
+    assert!(
+        body.contains("\"live_entries\":2"),
+        "the first id was loaded: {body}"
+    );
+
+    // The file can no longer be written (a directory took its place): the revocation is in
+    // force, and the operator is told it would not survive a restart.
+    fs::remove_file(&recorded).unwrap();
+    fs::create_dir(&recorded).unwrap();
+    let (st, body) = http(
+        port,
+        "POST",
+        "/admin/revoke",
+        Some(TOKEN),
+        &format!(r#"{{"jti":"not-durable","exp":{far}}}"#),
+    );
+    assert_eq!(st, 500, "{body}");
+    assert!(body.contains("not recorded on disk"), "{body}");
+    drop(run2);
+
+    // A list that cannot be read stops the boot instead of starting with nothing revoked.
+    let status = Command::new(env!("CARGO_BIN_EXE_zion"))
+        .env("ZION_CONFIG", &cfg)
+        .env("ZION_BOOT_FAST", "1")
+        .env("ZION_TEST_ADMIN_WRITE_TOKEN", TOKEN)
+        .env("ZION_LAST_GASP_PATH", dir.join("gasp.jsonl"))
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(dir.join("run3.log")).unwrap())
+        .status()
+        .expect("spawn zion");
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "an unreadable revocation list is a config error"
+    );
+    let log = fs::read_to_string(dir.join("run3.log")).unwrap();
+    assert!(log.contains("cannot load the revocation list"), "{log}");
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// Run openssl with `args`; true on success.
 fn openssl(args: &[&str]) -> bool {
     Command::new("openssl")

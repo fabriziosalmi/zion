@@ -122,6 +122,12 @@ pub struct AuthProfileConfig {
     /// mirroring `[audit] key_env`. When both are set, `secret_env` wins.
     #[serde(default)]
     pub secret_env: Option<String>,
+    /// Name of an environment variable holding the PREVIOUS HMAC secret, for rotation
+    /// without an outage: a token whose signature the current secret rejects is checked
+    /// against this one. Set it to the old key when you change `secret_env`, and remove it
+    /// once every token signed with the old key has expired. Only with an HMAC secret.
+    #[serde(default)]
+    pub previous_secret_env: Option<String>,
     /// JWKS URL for asymmetric validation (fetched at startup).
     #[serde(default)]
     pub jwks_url: Option<String>,
@@ -164,6 +170,8 @@ fn default_true() -> bool {
 pub struct ResolvedAuthProfile {
     pub jwks_url: Option<String>,
     pub decoding_key: Option<Arc<DecodingKey>>,
+    /// The key of `previous_secret_env`: tried when the current one rejects the signature.
+    pub previous_decoding_key: Option<Arc<DecodingKey>>,
     pub jwk_set: Arc<arc_swap::ArcSwapOption<jsonwebtoken::jwk::JwkSet>>,
     pub validation: Arc<Validation>,
     pub forward_claims: bool,
@@ -214,9 +222,10 @@ pub fn extract_bearer(auth_header: &str) -> Option<&str> {
     }
 }
 
-/// In-memory denylist of revoked token ids (`jti`). Per instance and lost on
-/// restart: an entry only has to outlive the token, so each carries the token's own
-/// expiry and is dropped after it. A token without a `jti` cannot be revoked.
+/// Denylist of revoked token ids (`jti`). Per instance; kept across restarts when
+/// `[admin] revocations_path` is set ([`revocation::append`] / [`revocation::load`]),
+/// in memory only otherwise. An entry only has to outlive the token, so each carries the
+/// token's own expiry and is dropped after it. A token without a `jti` cannot be revoked.
 pub mod revocation {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -249,6 +258,78 @@ pub mod revocation {
         }
         m.insert(jti.to_string(), exp);
         Ok(m.len())
+    }
+
+    /// One persisted revocation: a line of the file at `[admin] revocations_path`.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Record {
+        jti: String,
+        exp: u64,
+    }
+
+    /// Record a revocation at `path` so it survives a restart: one JSON line, appended and
+    /// synced before the caller answers the operator.
+    pub fn append(path: &std::path::Path, jti: &str, exp: u64) -> Result<(), String> {
+        use std::io::Write;
+        let mut line = serde_json::to_string(&Record {
+            jti: jti.to_string(),
+            exp,
+        })
+        .map_err(|e| e.to_string())?;
+        line.push('\n');
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600); // token ids are not secrets, but they are nobody else's business
+        }
+        let mut file = options
+            .open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        file.write_all(line.as_bytes())
+            .and_then(|()| file.sync_data())
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Load the revocations recorded at `path` (boot), dropping the expired ones, and rewrite
+    /// the file with what is still live. Returns the live count. A missing file is an empty
+    /// list; an unreadable one is an error, because starting without it would make every
+    /// revoked token valid again. A line that does not parse (a write cut short by a crash)
+    /// is skipped and counted in the second value.
+    pub fn load(path: &std::path::Path) -> Result<(usize, usize), String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let t = now();
+        let mut skipped = 0;
+        let mut live: Vec<Record> = Vec::new();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            match serde_json::from_str::<Record>(line) {
+                Ok(r) if r.exp > t => live.push(r),
+                Ok(_) => {} // expired: the token is dead anyway
+                Err(_) => skipped += 1,
+            }
+        }
+        {
+            let mut m = list().lock().unwrap_or_else(|e| e.into_inner());
+            for r in &live {
+                if m.len() >= MAX_ENTRIES && !m.contains_key(&r.jti) {
+                    break;
+                }
+                m.insert(r.jti.clone(), r.exp);
+            }
+        }
+        // Compact: without this the file would keep every revocation ever made.
+        let mut compact = String::new();
+        for r in &live {
+            compact.push_str(&serde_json::to_string(r).map_err(|e| e.to_string())?);
+            compact.push('\n');
+        }
+        crate::atomic_file::write_atomic_0600(path, compact.as_bytes())?;
+        Ok((live.len(), skipped))
     }
 
     /// True when `jti` is on the list and its token could still be valid.
@@ -294,15 +375,26 @@ pub fn validate_token(token: &str, profile: &ResolvedAuthProfile) -> Result<Clai
         ));
     };
 
-    let token_data: TokenData<Claims> = decode(token, decoding_key_ref, &profile.validation)
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("ExpiredSignature") {
-                AuthError::Expired
-            } else {
-                AuthError::InvalidToken(msg)
+    let attempt = |key: &DecodingKey| decode::<Claims>(token, key, &profile.validation);
+    let decoded = match attempt(decoding_key_ref) {
+        // Rotation window: the current secret does not verify the signature, the previous
+        // one may. Every other check (expiry, issuer, audience) is the same for both.
+        Err(e) if matches!(e.kind(), jsonwebtoken::errors::ErrorKind::InvalidSignature) => {
+            match profile.previous_decoding_key.as_deref() {
+                Some(previous) => attempt(previous),
+                None => Err(e),
             }
-        })?;
+        }
+        other => other,
+    };
+    let token_data: TokenData<Claims> = decoded.map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("ExpiredSignature") {
+            AuthError::Expired
+        } else {
+            AuthError::InvalidToken(msg)
+        }
+    })?;
 
     if let Some(jti) = token_data.claims.jti.as_deref() {
         if revocation::is_revoked(jti) {
@@ -401,6 +493,40 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthPr
                 secret.len()
             ));
         }
+    }
+
+    // The previous secret of a rotation: same rules as the current one (set, long enough),
+    // and only meaningful next to a current HMAC secret.
+    let mut previous_decoding_key = None;
+    if let Some(ref env_name) = config.previous_secret_env {
+        if effective_secret.is_none() {
+            return Err(format!(
+                "auth previous_secret_env '{env_name}' is set, but the profile has no HMAC \
+                 secret (secret_env / secret): there is nothing to rotate"
+            ));
+        }
+        let previous = match std::env::var(env_name) {
+            Ok(v) if !v.is_empty() => zeroize::Zeroizing::new(v),
+            _ => {
+                return Err(format!(
+                    "auth previous_secret_env '{env_name}' is not set in the environment (or \
+                     empty): remove the setting once the rotation is over"
+                ))
+            }
+        };
+        let min = match algorithm {
+            Algorithm::HS256 => 32,
+            Algorithm::HS384 => 48,
+            Algorithm::HS512 => 64,
+            _ => 0,
+        };
+        if previous.len() < min {
+            return Err(format!(
+                "auth previous secret for {alg_str} is {} bytes; it must be at least {min}",
+                previous.len()
+            ));
+        }
+        previous_decoding_key = Some(Arc::new(DecodingKey::from_secret(previous.as_bytes())));
     }
 
     let mut decoding_key = None;
@@ -503,6 +629,7 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthPr
     Ok(ResolvedAuthProfile {
         jwks_url: config.jwks_url.clone(),
         decoding_key,
+        previous_decoding_key,
         jwk_set: jwk_set_arc,
         validation: Arc::new(validation),
         forward_claims: config.forward_claims,
@@ -605,6 +732,7 @@ mod tests {
             audience: Some("api.zion.dev".into()),
             secret: Some(secret.into()),
             secret_env: None,
+            previous_secret_env: None,
             jwks_url: None,
             algorithm: "HS256".into(),
             forward_claims: false,
@@ -653,6 +781,7 @@ mod tests {
             audience: Some("api.zion.dev".to_string()),
             secret: Some(secret.into()),
             secret_env: None,
+            previous_secret_env: None,
             jwks_url: None,
             algorithm: "HS256".to_string(),
             forward_claims: true,
@@ -695,6 +824,7 @@ mod tests {
             audience: None,
             secret: Some("secret-b-padding-padding-padding-padding".into()), // wrong secret
             secret_env: None,
+            previous_secret_env: None,
             jwks_url: None,
             algorithm: "HS256".to_string(),
             forward_claims: true,
@@ -734,6 +864,7 @@ mod tests {
             audience: None,
             secret: Some("secret-padding-padding-padding-padding".into()),
             secret_env: None,
+            previous_secret_env: None,
             jwks_url: None,
             algorithm: "HS256".to_string(),
             forward_claims: true,
@@ -744,6 +875,140 @@ mod tests {
         let profile = resolve_auth_profile(&config).expect("valid test profile");
         let result = validate_token(&token, &profile);
         assert!(matches!(result, Err(AuthError::Expired)));
+    }
+
+    #[cfg(feature = "auth")]
+    /// Rotation without an outage (ZION-SEC-03): while `previous_secret_env` names the old
+    /// key, tokens signed with it still verify; once it is removed they do not. A token
+    /// signed with neither key is refused in both states.
+    #[tokio::test]
+    async fn tokens_signed_with_the_previous_secret_verify_during_a_rotation() {
+        const OLD: &str = "old-key-padding-padding-padding-padding-0001";
+        const NEW: &str = "new-key-padding-padding-padding-padding-0002";
+        let (cur, prev) = ("ZION_TEST_AUTH_CUR_5f22", "ZION_TEST_AUTH_PREV_5f22");
+        std::env::set_var(cur, NEW);
+        std::env::set_var(prev, OLD);
+        let profile = |previous: Option<&str>| AuthProfileConfig {
+            issuer: None,
+            audience: None,
+            secret: None,
+            secret_env: Some(cur.to_string()),
+            previous_secret_env: previous.map(str::to_string),
+            jwks_url: None,
+            algorithm: "HS256".into(),
+            forward_claims: true,
+            leeway_secs: 30,
+            max_token_lifetime_secs: None,
+        };
+        let token = |key: &str, exp_in: i64| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            jsonwebtoken::encode(
+                &jsonwebtoken::Header::new(Algorithm::HS256),
+                &serde_json::json!({"sub": "u", "exp": now + exp_in}),
+                &jsonwebtoken::EncodingKey::from_secret(key.as_bytes()),
+            )
+            .unwrap()
+        };
+        let rotating = resolve_auth_profile(&profile(Some(prev))).expect("resolves");
+        assert!(
+            validate_token(&token(NEW, 600), &rotating).is_ok(),
+            "current key"
+        );
+        assert!(
+            validate_token(&token(OLD, 600), &rotating).is_ok(),
+            "previous key, in the window"
+        );
+        assert!(
+            validate_token(
+                &token("some-other-key-padding-padding-padding-0003", 600),
+                &rotating
+            )
+            .is_err(),
+            "a key that is neither"
+        );
+        // The previous key does not excuse anything but the signature.
+        assert!(
+            matches!(
+                validate_token(&token(OLD, -600), &rotating),
+                Err(AuthError::Expired)
+            ),
+            "an expired token signed with the previous key is still expired"
+        );
+        // Rotation over: the setting is removed, the old key stops working.
+        let rotated = resolve_auth_profile(&profile(None)).expect("resolves");
+        assert!(validate_token(&token(NEW, 600), &rotated).is_ok());
+        assert!(
+            validate_token(&token(OLD, 600), &rotated).is_err(),
+            "old key after the window"
+        );
+        // A previous secret that is not there, or too short, is a config error.
+        std::env::remove_var(prev);
+        let e = resolve_auth_profile(&profile(Some(prev))).unwrap_err();
+        assert!(e.contains(prev) && e.contains("not set"), "{e}");
+        std::env::set_var(prev, "short");
+        let e = resolve_auth_profile(&profile(Some(prev))).unwrap_err();
+        assert!(e.contains("at least 32") && !e.contains("short\""), "{e}");
+        std::env::remove_var(prev);
+        std::env::remove_var(cur);
+    }
+
+    /// A revocation recorded on disk is back after a restart (ZION-AUTH-06): `load` is what
+    /// the boot runs. Expired entries are dropped and the file is compacted; a line cut
+    /// short by a crash is skipped, not fatal; a missing file is an empty list.
+    #[test]
+    fn a_recorded_revocation_survives_a_restart() {
+        use revocation::{append, is_revoked, load};
+        let dir = std::env::temp_dir().join(format!("zion-revocations-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("revoked.jsonl");
+        assert_eq!(load(&path).unwrap(), (0, 0), "no file yet: nothing revoked");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        append(&path, "persist-live-1", now + 3600).unwrap();
+        append(&path, "persist-live \"quoted\" \n 2", now + 3600).unwrap();
+        append(&path, "persist-expired", now - 10).unwrap();
+        // a write cut short by a crash
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"{\"jti\":\"persist-torn"))
+            .unwrap();
+        // "Restart": none of these is in memory (append does not touch the list).
+        assert!(!is_revoked("persist-live-1"));
+        assert_eq!(
+            load(&path).unwrap(),
+            (2, 1),
+            "two live, one unreadable line"
+        );
+        assert!(is_revoked("persist-live-1"));
+        assert!(
+            is_revoked("persist-live \"quoted\" \n 2"),
+            "any jti round-trips"
+        );
+        assert!(!is_revoked("persist-expired") && !is_revoked("persist-torn"));
+        // Compacted: the expired entry and the torn line are gone from the file.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(!text.contains("persist-expired") && !text.contains("persist-torn"));
+        // And it loads again to the same thing.
+        assert_eq!(load(&path).unwrap(), (2, 0));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "the list is readable by the daemon's user only"
+            );
+        }
+        // Unreadable (a directory in its place): an error, not an empty list.
+        assert!(load(&dir).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(feature = "auth")]
@@ -777,6 +1042,7 @@ mod tests {
             audience: None,
             secret: Some("decoy-literal-that-must-be-ignored".into()),
             secret_env: Some(var.clone()),
+            previous_secret_env: None,
             jwks_url: None,
             algorithm: "HS256".to_string(),
             forward_claims: true,
@@ -796,6 +1062,7 @@ mod tests {
             audience: None,
             secret: None,
             secret_env: Some(var),
+            previous_secret_env: None,
             jwks_url: None,
             algorithm: "HS256".to_string(),
             forward_claims: true,
@@ -817,6 +1084,7 @@ mod tests {
             audience: audience.map(str::to_string),
             secret: Some("unit-test-secret-padding-padding-padding-padding".into()),
             secret_env: None,
+            previous_secret_env: None,
             jwks_url: None,
             algorithm: "HS256".to_string(),
             forward_claims: true,

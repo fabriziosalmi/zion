@@ -13,6 +13,7 @@ auth = "internal-ip"        # default — see Authentication
 rate_limit_rps = 10         # default — global req/s ceiling
 write_token_env = "ZION_ADMIN_WRITE_TOKEN"     # required for writes — see Write token
 # persist_push = false      # default — see Persisting a push
+# revocations_path = "/var/lib/zion/revoked.jsonl"   # keep revoked token ids across restarts
 ```
 
 Every field has the default shown, so a bare `[admin]` block is enough to turn it on with safe defaults. The block is validated at load: `listen` must be a real socket address, `auth` must be `internal-ip` or `mtls`, `rate_limit_rps` must be `> 0`, and `auth = "internal-ip"` requires a **loopback** `listen` (`127.0.0.1`, `::1`): it trusts every private-range peer, and that peer can replace the running config, so a routable or container-published bind needs `auth = "mtls"`. A typo fails fast at startup, exactly like the rest of `zion.toml`.
@@ -24,7 +25,7 @@ Every field has the default shown, so a bare `[admin]` block is enough to turn i
 | `GET`  | `/admin/config` | Return the live runtime snapshot (the same JSON as [`/_zion/snapshot.json`](/deploy/observability) — config generation, upstream health, metrics). Read-only. |
 | `POST` | `/admin/config` | Push a full new config body (TOML). Validate → atomic-swap → bump generation. |
 | `POST` | `/admin/reload` | Re-read `zion.toml` from disk (skips the watcher's 2 s debounce). |
-| `POST` | `/admin/revoke` | Deny a JWT by its `jti` until its expiry. Body `{"jti":"...","exp":<unix secs>}`; `exp` defaults to 24 h from now. See [token revocation](/config/auth#token-lifetime-and-revocation). |
+| `POST` | `/admin/revoke` | Deny a JWT by its `jti` until its expiry. Body `{"jti":"...","exp":<unix secs>}`; `exp` defaults to 24 h from now. With `revocations_path` set, the revocation is written to that file before the call answers (a `500` saying it was not recorded means it is in force in memory only), and it is still in force after a restart. See [token revocation](/config/auth#token-lifetime-and-revocation). |
 
 Any other method/path returns `404`.
 

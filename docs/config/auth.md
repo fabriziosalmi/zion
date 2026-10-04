@@ -61,6 +61,7 @@ waf = true
 |-----------|------|---------|-------------|
 | `secret` | string | — | HMAC shared secret literal (HS256/HS384/HS512). **Deprecated: use `secret_env`.** Zion warns at boot when it is set. It is redacted from debug output and wiped from memory when the config is dropped. |
 | `secret_env` | string | — | Name of an env var holding the HMAC secret. Preferred over `secret`; wins when both are set. The secret must be at least as long as the hash (RFC 7518 §3.2): 32 bytes for HS256, 48 for HS384, 64 for HS512; a shorter one is refused at boot and on reload (`openssl rand -base64 48`). |
+| `previous_secret_env` | string | — | Name of an env var holding the previous HMAC secret, accepted next to the current one during a [key rotation](#rotating-the-signing-key). Remove it when the old tokens have expired. |
 | `jwks_url` | string | — | JWKS endpoint URL (for RS256/ES256, auto-refreshed hourly). Must be `https://` (plain `http://` only to a loopback address); anything else is refused. |
 | `algorithm` | string | `HS256` | JWT algorithm. Auto-selects RS256 when `jwks_url` is set without `secret` |
 | `issuer` | string | — | Expected `iss` claim (optional) |
@@ -113,10 +114,36 @@ small per-instance **revocation list** keyed on the `jti` claim, described below
 until `exp`; a request carrying it gets `403`. Limits you should know about:
 
 - Only a token that **carries a `jti`** can be revoked. Issue one on every token.
-- The list is **in memory and per instance**: it is lost on restart, and with
-  several Zion instances you revoke on each. It is capped at 100 000 live entries.
+- The list is **per instance**: with several Zion instances you revoke on each. It
+  is capped at 100 000 live entries.
+- It is **in memory unless `[admin] revocations_path` is set**. Without it a restart
+  makes every revoked token valid again until it expires. With it each revocation is
+  written to that file before the API answers, and read back at boot (expired
+  entries are dropped). If the file exists and cannot be read, zion refuses to start
+  rather than start with nothing revoked.
 - It is a stop-gap for a leaked token, not a session system. For revocation that
-  must survive restarts or span a fleet, keep tokens short-lived and rotate the key.
+  must span a fleet, keep tokens short-lived and rotate the key.
+
+### Rotating the signing key
+
+Changing `secret_env` to a new key makes every outstanding token invalid at the
+reload. To rotate without that outage, keep the old key readable for a while:
+
+```toml
+[auth_profile.internal]
+secret_env = "ZION_AUTH_SECRET"            # the new key: what you sign with from now on
+previous_secret_env = "ZION_AUTH_SECRET_OLD"  # the old key: still accepted
+```
+
+1. Put the new key in `ZION_AUTH_SECRET` and the old one in `ZION_AUTH_SECRET_OLD`,
+   set `previous_secret_env`, restart or reload. Tokens signed with either verify.
+2. Start signing with the new key.
+3. When the longest-lived old token has expired, remove `previous_secret_env`.
+
+A token is checked against the previous key only when the current one rejects its
+signature; expiry, issuer and audience are checked the same either way. The
+previous key must be set and as long as the current one (config validation), and
+the setting only makes sense with an HMAC secret.
 
 Consequences for operators:
 

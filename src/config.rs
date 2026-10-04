@@ -127,6 +127,13 @@ pub struct AdminConfig {
     /// Default `false`: a push is live-only until the next reload or restart.
     #[serde(default)]
     pub persist_push: bool,
+    /// File in which `POST /admin/revoke` records revoked token ids, so they stay revoked
+    /// after a restart (without it the list is in memory only, and a restart makes every
+    /// revoked token valid again until it expires). One JSON line per revocation; expired
+    /// ones are dropped at boot. Per instance: in a fleet, revoke on every node or share
+    /// nothing and keep tokens short-lived.
+    #[serde(default)]
+    pub revocations_path: Option<String>,
     /// The CA that signs ADMIN client certificates (`auth = "mtls"`). Required in that
     /// mode and separate from `tls.client_ca_path` on purpose: a certificate issued for
     /// data-plane client authentication must not also open the admin API.
