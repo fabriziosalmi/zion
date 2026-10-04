@@ -408,11 +408,23 @@ fn a_revocation_survives_a_restart() {
         body.contains("\"live_entries\":2"),
         "the first id was loaded: {body}"
     );
+
+    // The file can no longer be written (a directory took its place): the revocation is in
+    // force, and the operator is told it would not survive a restart.
+    fs::remove_file(&recorded).unwrap();
+    fs::create_dir(&recorded).unwrap();
+    let (st, body) = http(
+        port,
+        "POST",
+        "/admin/revoke",
+        Some(TOKEN),
+        &format!(r#"{{"jti":"not-durable","exp":{far}}}"#),
+    );
+    assert_eq!(st, 500, "{body}");
+    assert!(body.contains("not recorded on disk"), "{body}");
     drop(run2);
 
     // A list that cannot be read stops the boot instead of starting with nothing revoked.
-    fs::remove_file(&recorded).unwrap();
-    fs::create_dir(&recorded).unwrap();
     let status = Command::new(env!("CARGO_BIN_EXE_zion"))
         .env("ZION_CONFIG", &cfg)
         .env("ZION_BOOT_FAST", "1")
