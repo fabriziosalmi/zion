@@ -3600,7 +3600,7 @@ fn preserve_host_picks_an_http1_only_client_of_its_own() {
         http1_only: true,
         ..crate::proxy::ClientSpec::DEFAULT
     };
-    let _ = st.client_for(h1);
+    let _ = st.client_for(h1.clone());
     let _ = st.client_for(crate::proxy::ClientSpec::DEFAULT);
     assert!(st.http_clients.contains_key(&h1));
     assert!(

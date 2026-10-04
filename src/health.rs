@@ -54,6 +54,10 @@ pub struct UpstreamHealth {
     /// endpoint's own authority (first route in config order wins). Re-applied on every
     /// reload, like the breaker thresholds.
     pub probe_host: arc_swap::ArcSwapOption<hyper::header::HeaderValue>,
+    /// The client the probe uses when the upstream has TLS settings of its own (a private
+    /// CA, a client certificate): a probe sent without them fails the handshake of an
+    /// mTLS-only upstream and marks it down. Set from the config, re-applied on reload.
+    pub probe_client: arc_swap::ArcSwapOption<crate::proxy::HttpClient>,
 }
 
 impl UpstreamHealth {
@@ -88,6 +92,7 @@ impl UpstreamHealth {
             breaker: crate::breaker::Breaker::new(),
             pool: crate::pool::MemberStats::new(),
             probe_host: arc_swap::ArcSwapOption::empty(),
+            probe_client: arc_swap::ArcSwapOption::empty(),
         }
     }
 
@@ -150,6 +155,9 @@ pub async fn probe(
             Err(_) => return (false, 0),
         },
     };
+    // The upstream's own client (its CA, its client certificate) takes the place of either.
+    let own_client = up.probe_client.load_full();
+    let client = own_client.as_deref().unwrap_or(client);
     let Ok(req) = hyper::Request::builder()
         .uri(&uri)
         .header(hyper::header::HOST, host)

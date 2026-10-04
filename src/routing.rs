@@ -39,6 +39,8 @@ pub struct ResolvedRoute {
     pub preserve_host: bool,
     /// `[upstream.x] keepalive`: idle pooled connections kept per upstream host.
     pub keepalive: usize,
+    /// `[upstream.x] ca_path` / `client_cert_path` / `client_key_path`, loaded and checked.
+    pub upstream_tls: Option<Arc<crate::proxy::UpstreamTls>>,
     pub upstream_name: Option<Arc<str>>,
     /// Pre-parsed URI parts — avoids full URI parse on every request.
     pub upstream_scheme: hyper::http::uri::Scheme,
@@ -74,6 +76,7 @@ impl ResolvedRoute {
             connect_timeout_ms: self.connect_timeout_ms,
             http1_only: self.preserve_host,
             keepalive: self.keepalive,
+            tls: self.upstream_tls.clone(),
         }
     }
 
@@ -355,6 +358,29 @@ pub fn build_router_quiet(config: &ZionConfig) -> Result<HostRouter, String> {
 /// path needs, computed once at build. Pure: no router insertion, so
 /// `build_router` can place the result into one or more host-scoped trees.
 fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<ResolvedRoute>, String> {
+    // The upstream's own TLS material is read here, so a missing file or a key that does
+    // not match its certificate is a config error (boot, reload, push), never a request
+    // sent without the certificate.
+    let upstream_tls = match route
+        .upstream_name()
+        .and_then(|name| config.upstream.get(name).map(|u| (name, u)))
+    {
+        Some((name, u))
+            if u.ca_path.is_some()
+                || u.client_cert_path.is_some()
+                || u.client_key_path.is_some() =>
+        {
+            Some(
+                crate::proxy::UpstreamTls::load(
+                    u.ca_path.as_deref(),
+                    u.client_cert_path.as_deref(),
+                    u.client_key_path.as_deref(),
+                )
+                .map_err(|e| format!("upstream.{name}: {e}"))?,
+            )
+        }
+        _ => None,
+    };
     // A static route (ADR-0015) serves from disk and needs no upstream — ignore
     // any stray `upstream` field so `validate_semantics` and `build_router`
     // agree (both skip the upstream for a static route).
@@ -537,6 +563,7 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
             .and_then(|name| config.upstream.get(name))
             .map(|u| u.keepalive)
             .unwrap_or(crate::proxy::DEFAULT_KEEPALIVE),
+        upstream_tls,
         upstream_name: route.upstream_name().map(Arc::from),
         upstream_scheme,
         upstream_authority,
