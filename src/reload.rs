@@ -108,6 +108,7 @@ pub(crate) fn rebuild(
         entry.pool.set_pool_member(fresh.pool.is_pool_member());
         entry.pool.configure_outlier(fresh.pool.outlier_cfg());
         entry.probe_host.store(fresh.probe_host.load_full());
+        entry.probe_client.store(fresh.probe_client.load_full());
         merged.insert(url.clone(), entry);
     }
     snap.health_map = Arc::new(merged);
@@ -453,6 +454,7 @@ mod tests {
             breaker: crate::breaker::Breaker::new(),
             pool: crate::pool::MemberStats::new(),
             probe_host: arc_swap::ArcSwapOption::empty(),
+            probe_client: arc_swap::ArcSwapOption::empty(),
         });
         let mut old_map = fnv::FnvHashMap::default();
         old_map.insert(url.clone(), old_health.clone());
@@ -513,6 +515,7 @@ mod tests {
                 breaker: crate::breaker::Breaker::new(),
                 pool: crate::pool::MemberStats::new(),
                 probe_host: arc_swap::ArcSwapOption::empty(),
+                probe_client: arc_swap::ArcSwapOption::empty(),
             }),
         );
         let previous = ResolvedAppConfig::test_with_health(Arc::new(old_map));

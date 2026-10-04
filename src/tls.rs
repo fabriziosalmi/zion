@@ -142,7 +142,10 @@ impl ResolvesServerCert for SniResolver {
 /// Load a certificate chain + private key from PEM files.
 /// Returns an error instead of panicking so callers (hot-reload, pre-warm)
 /// can handle failures gracefully by keeping the previous config.
-fn load_certified_key(cert_path: &str, key_path: &str) -> Result<Arc<CertifiedKey>, String> {
+pub(crate) fn load_certified_key(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<Arc<CertifiedKey>, String> {
     let cert_file =
         std::fs::File::open(cert_path).map_err(|e| format!("TLS cert {cert_path}: {e}"))?;
     let key_file = std::fs::File::open(key_path).map_err(|e| format!("TLS key {key_path}: {e}"))?;

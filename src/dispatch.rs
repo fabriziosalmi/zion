@@ -844,6 +844,12 @@ async fn process_request_inner(
     if rule.preserve_host {
         req.extensions_mut().insert(proxy::PreserveHost);
     }
+    // The upstream's own TLS settings, for the path that opens its own connection (the
+    // WebSocket upgrade); the pooled clients get them through `client_spec`.
+    if let Some(tls) = &rule.upstream_tls {
+        req.extensions_mut()
+            .insert(proxy::UpstreamTlsMark(tls.clone()));
+    }
     // `[upstream.x] request_timeout_ms`, carried the same way.
     if let Some(t) = rule.request_timeout() {
         req.extensions_mut().insert(t);
@@ -1524,7 +1530,7 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
     let mut req = swr_request(&job.request);
     add_conditional_headers(req.headers_mut(), &job.stale.meta);
     let resp = match proxy::proxy_pass(
-        &job.state.client_for(job.client_spec),
+        &job.state.client_for(job.client_spec.clone()),
         req,
         &job.scheme,
         &job.authority,

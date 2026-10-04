@@ -19,6 +19,7 @@ use hyper_util::rt::TokioExecutor;
 #[allow(unused_imports)]
 use std::fmt::Write;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 /// How Zion treats the inbound `X-Forwarded-For` header before forwarding.
 ///
@@ -96,6 +97,7 @@ pub fn build_http_client(connect_timeout_ms: u64, http1_only: bool) -> HttpClien
         connect_timeout_ms,
         http1_only,
         keepalive: DEFAULT_KEEPALIVE,
+        tls: None,
     })
 }
 
@@ -129,11 +131,14 @@ pub const DEFAULT_KEEPALIVE: usize = 128;
 /// What an upstream needs from its HTTP client: the connect deadline, whether it must be
 /// spoken to over HTTP/1.1 only (`preserve_host`), and how many idle connections to
 /// keep (`keepalive`). Clients are cached per distinct spec ([`crate::state::AppState::client_for`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ClientSpec {
     pub connect_timeout_ms: u64,
     pub http1_only: bool,
     pub keepalive: usize,
+    /// The upstream's own TLS settings (a private CA, a client certificate); `None`: the
+    /// public roots and no client certificate.
+    pub tls: Option<Arc<UpstreamTls>>,
 }
 
 impl ClientSpec {
@@ -142,8 +147,128 @@ impl ClientSpec {
         connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
         http1_only: false,
         keepalive: DEFAULT_KEEPALIVE,
+        tls: None,
     };
 }
+
+/// How zion's TLS towards one upstream differs from the default (`[upstream.x] ca_path`,
+/// `client_cert_path` / `client_key_path`): which CA signs the upstream's certificate, and
+/// which certificate zion presents (mTLS). Loaded and checked when the config is built, so
+/// a bad file is a config error and never a request that goes out without the certificate.
+pub struct UpstreamTls {
+    /// SHA-256 of the files' contents: two upstreams with the same material share a client,
+    /// and a renewed certificate is a new one (the client cache is keyed by this).
+    id: [u8; 32],
+    config: Arc<rustls::ClientConfig>,
+    presents_certificate: bool,
+}
+
+impl UpstreamTls {
+    /// Load the settings. `ca_path` REPLACES the public roots (an upstream behind a private
+    /// CA is not also trusted through every public one); the client certificate and key
+    /// must be given together and must match.
+    pub fn load(
+        ca_path: Option<&str>,
+        cert_path: Option<&str>,
+        key_path: Option<&str>,
+    ) -> Result<Arc<Self>, String> {
+        use std::io::BufReader;
+        let mut digest = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+        let mut read = |role: &str, path: &str| -> Result<Vec<u8>, String> {
+            let bytes = std::fs::read(path).map_err(|e| format!("{role} {path}: {e}"))?;
+            digest.update(role.as_bytes());
+            digest.update(&(bytes.len() as u64).to_le_bytes());
+            digest.update(&bytes);
+            Ok(bytes)
+        };
+        let mut roots = rustls::RootCertStore::empty();
+        match ca_path {
+            Some(path) => {
+                let pem = read("ca_path", path)?;
+                for cert in rustls_pemfile::certs(&mut BufReader::new(pem.as_slice())) {
+                    let cert = cert.map_err(|e| format!("ca_path {path}: {e}"))?;
+                    roots
+                        .add(cert)
+                        .map_err(|e| format!("ca_path {path}: {e}"))?;
+                }
+                if roots.is_empty() {
+                    return Err(format!("ca_path {path}: no certificate in the file"));
+                }
+            }
+            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+        }
+        let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+        let (config, presents_certificate) = match (cert_path, key_path) {
+            (Some(cert), Some(key)) => {
+                // Same check as the server side: a key that is not the certificate's is
+                // refused here, not at the first handshake.
+                crate::tls::load_certified_key(cert, key)
+                    .map_err(|e| format!("client certificate: {e}"))?;
+                let cert_pem = read("client_cert_path", cert)?;
+                let key_pem = read("client_key_path", key)?;
+                let chain = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_slice()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("client_cert_path {cert}: {e}"))?;
+                let key_der = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_slice()))
+                    .map_err(|e| format!("client_key_path {key}: {e}"))?
+                    .ok_or_else(|| format!("client_key_path {key}: no private key in the file"))?;
+                (
+                    builder
+                        .with_client_auth_cert(chain, key_der)
+                        .map_err(|e| format!("client certificate: {e}"))?,
+                    true,
+                )
+            }
+            (None, None) => (builder.with_no_client_auth(), false),
+            _ => {
+                return Err("client_cert_path and client_key_path must be set together".to_string())
+            }
+        };
+        let mut id = [0u8; 32];
+        id.copy_from_slice(digest.finish().as_ref());
+        Ok(Arc::new(Self {
+            id,
+            config: Arc::new(config),
+            presents_certificate,
+        }))
+    }
+
+    /// The rustls configuration (no ALPN set: each user adds its own).
+    pub fn client_config(&self) -> Arc<rustls::ClientConfig> {
+        self.config.clone()
+    }
+
+    /// Does zion present a client certificate to this upstream?
+    pub fn presents_certificate(&self) -> bool {
+        self.presents_certificate
+    }
+}
+
+impl PartialEq for UpstreamTls {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for UpstreamTls {}
+impl std::hash::Hash for UpstreamTls {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+impl std::fmt::Debug for UpstreamTls {
+    // Never the key material: only whether a certificate is presented.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamTls")
+            .field("presents_certificate", &self.presents_certificate)
+            .finish()
+    }
+}
+
+/// A request extension: the TLS settings of the upstream this request goes to, for the
+/// paths that build their own connection (the WebSocket upgrade). Set where the route is
+/// known, like [`PreserveHost`].
+#[derive(Clone)]
+pub struct UpstreamTlsMark(pub Arc<UpstreamTls>);
 
 /// Build the HTTP client for `spec`.
 pub fn build_client(spec: &ClientSpec) -> HttpClient {
@@ -161,10 +286,14 @@ pub fn build_client(spec: &ClientSpec) -> HttpClient {
     http.set_connect_timeout(
         (connect_timeout_ms > 0).then(|| std::time::Duration::from_millis(connect_timeout_ms)),
     );
-    let builder = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_webpki_roots()
-        .https_or_http()
-        .enable_http1();
+    let builder = match &spec.tls {
+        // The upstream's own CA and/or client certificate.
+        Some(tls) => hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(rustls::ClientConfig::clone(&tls.client_config())),
+        None => hyper_rustls::HttpsConnectorBuilder::new().with_webpki_roots(),
+    }
+    .https_or_http()
+    .enable_http1();
     let https = if http1_only {
         builder.wrap_connector(http)
     } else {
@@ -888,19 +1017,25 @@ pub async fn proxy_websocket(
     // HTTP/1.1 upgrade handshake — works on any AsyncRead+AsyncWrite stream.
     // For TLS upstreams, wrap in tokio-rustls connector first.
     if is_tls_upstream {
-        // Cached TLS client config — build once, reuse for all WS upgrades.
-        // Avoids re-parsing ~150 Mozilla CA roots on every WebSocket TLS connection.
+        // The upstream's own TLS settings when it has any (private CA, client
+        // certificate); otherwise one cached config with the public roots, built once
+        // (re-parsing ~150 CA roots on every WebSocket connection would be wasteful).
         static WS_TLS_CONFIG: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> =
             std::sync::OnceLock::new();
-        let tls_config = WS_TLS_CONFIG.get_or_init(|| {
-            let mut root_store = rustls::RootCertStore::empty();
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            std::sync::Arc::new(
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth(),
-            )
-        });
+        let tls_config = match req.extensions().get::<UpstreamTlsMark>() {
+            Some(mark) => mark.0.client_config(),
+            None => WS_TLS_CONFIG
+                .get_or_init(|| {
+                    let mut root_store = rustls::RootCertStore::empty();
+                    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                    std::sync::Arc::new(
+                        rustls::ClientConfig::builder()
+                            .with_root_certificates(root_store)
+                            .with_no_client_auth(),
+                    )
+                })
+                .clone(),
+        };
         let connector = tokio_rustls::TlsConnector::from(tls_config.clone());
 
         // SNI: use the hostname from the authority (without port).
@@ -1585,5 +1720,24 @@ mod tests {
         // Should use default_port(scheme) when port is None
         let connect = format!("{}:{}", auth.as_str(), default_port("https"));
         assert_eq!(connect, "api.internal:443");
+    }
+    /// What `UpstreamTls::load` refuses without opening a valid certificate: the real
+    /// handshakes are in tests/upstream_mtls.rs.
+    #[test]
+    fn upstream_tls_load_refuses_incomplete_or_missing_material() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let e = UpstreamTls::load(None, Some("/c.pem"), None).unwrap_err();
+        assert!(e.contains("must be set together"), "{e}");
+        let e = UpstreamTls::load(Some("/no/such/ca.pem"), None, None).unwrap_err();
+        assert!(e.contains("ca_path /no/such/ca.pem"), "{e}");
+        let dir = std::env::temp_dir().join(format!("zion-upstream-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, b"").unwrap();
+        let e = UpstreamTls::load(Some(&empty.to_string_lossy()), None, None).unwrap_err();
+        assert!(e.contains("no certificate in the file"), "{e}");
+        let e = UpstreamTls::load(None, Some("/no/c.pem"), Some("/no/k.pem")).unwrap_err();
+        assert!(e.contains("client certificate"), "{e}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

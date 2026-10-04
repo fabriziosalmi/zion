@@ -196,7 +196,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 ```
 
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-67 modules, ~67,900 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+67 modules, ~68,200 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Features
 
@@ -216,7 +216,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 
 **Resilience** — pools pick a member by *power of two choices* on in-flight requests × peak-EWMA latency measured on real traffic (`load_balancing = "p2c"`), with opt-in passive **outlier ejection**; opt-in per-upstream **circuit breaker** and `max_in_flight` **bulkhead** (an immediate `503` + `Retry-After` instead of piling on a struggling backend); upstream **DNS keeps the last good answer** when a lookup fails or hangs; **graceful drain** (idle keep-alive connections closed at once, HTTP/2 `GOAWAY`, requests in flight finished); a **non-blocking log queue** (a stalled stderr never stalls a request); opt-in `TCP_USER_TIMEOUT` to free the slots of clients that vanish mid-response; a per-upstream **response deadline** (`request_timeout_ms`, default 30 s, never "none"). See the [resilience guide](https://fabriziosalmi.github.io/zion/guide/resilience).
 
-**Security** — HSTS preload, nosniff, frame-deny, Referrer-Policy, Permissions-Policy, per-route CSP; `Server`/hop-by-hop stripping (RFC 7230); URI-length cap + 7-method whitelist; per-IP rate limit **and** per-IP concurrent-connection cap (enforced at accept); CORS (FNV O(1)); header-bomb limits (64 headers / 16 KB). Admin API on its own listener, with its own client CA for mTLS and a bearer token required for every change; **client certificates can be revoked** with a CRL that is re-read when it changes (data plane and admin); JWT revocations survive a restart and HMAC keys rotate without an outage (`previous_secret_env`); the headers an upstream trusts as zion's word (`X-Auth-*`, `X-Client-Cert-*`, `X-Zion-Mesh-Score`) come from one table and are stripped from every client; the cache purge answers loopback only unless you name the networks; the gossip mesh accepts claims only from listed node keys. Settings that would silently weaken security (a short JWT secret, an `http://` JWKS, an unknown `xff_mode`) are config errors.
+**Security** — HSTS preload, nosniff, frame-deny, Referrer-Policy, Permissions-Policy, per-route CSP; `Server`/hop-by-hop stripping (RFC 7230); URI-length cap + 7-method whitelist; per-IP rate limit **and** per-IP concurrent-connection cap (enforced at accept); CORS (FNV O(1)); header-bomb limits (64 headers / 16 KB). Admin API on its own listener, with its own client CA for mTLS and a bearer token required for every change; **client certificates can be revoked** with a CRL that is re-read when it changes (data plane and admin); zion can present its own client certificate to an upstream and trust a private CA for it (`client_cert_path`, `ca_path`); JWT revocations survive a restart and HMAC keys rotate without an outage (`previous_secret_env`); the headers an upstream trusts as zion's word (`X-Auth-*`, `X-Client-Cert-*`, `X-Zion-Mesh-Score`) come from one table and are stripped from every client; the cache purge answers loopback only unless you name the networks; the gossip mesh accepts claims only from listed node keys. Settings that would silently weaken security (a short JWT secret, an `http://` JWKS, an unknown `xff_mode`) are config errors.
 
 **Observability** — `/healthz` · `/readyz` fast-path (~1 µs), `/metrics` Prometheus (lock-free sharded counters), `X-Request-ID` + W3C `traceparent` propagation, structured text/JSON logs (client IPs can be truncated or HMAC-pseudonymised with `[redact] ip` for GDPR / NIS2; upstream credentials and config secrets never reach the snapshot, the logs or an error message), and the `zion top` live TUI.
 
@@ -292,7 +292,7 @@ MODE=full bash benchmarks/baseline/run-baseline.sh   # → benchmarks/baseline/z
 ## Testing
 
 <!-- zion-stats:test-count (kept in sync by scripts/update-readme-stats.sh) -->
-**1324 unit tests** run on every change; **23 integration tests** need a running Zion + a backend.
+**1325 unit tests** run on every change; **23 integration tests** need a running Zion + a backend.
 
 ```bash
 cargo test                          # unit tests

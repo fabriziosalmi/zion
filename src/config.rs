@@ -721,6 +721,8 @@ struct RawUpstream {
     #[serde(default)]
     tls: bool,
     #[serde(default)]
+    ca_path: Option<String>,
+    #[serde(default)]
     client_cert_path: Option<String>,
     #[serde(default)]
     client_key_path: Option<String>,
@@ -922,10 +924,17 @@ pub struct UpstreamConfig {
     pub keepalive: usize,
     #[serde(default)]
     pub tls: bool, // backend is HTTPS
-    /// Client certificate for upstream mTLS (Zion → backend).
+    /// The CA (PEM, one or more certificates) that signs this upstream's TLS certificate. It
+    /// REPLACES the public roots for this upstream: a backend behind a private CA is then
+    /// not also trusted through every public one. Omit it for a publicly trusted upstream.
+    #[serde(default)]
+    pub ca_path: Option<String>,
+    /// Client certificate zion presents to this upstream (mTLS, PEM chain). Needs
+    /// `client_key_path`; the pair is read and checked when the config is built, and read
+    /// again on every reload, so a renewed certificate takes effect with a reload.
     #[serde(default)]
     pub client_cert_path: Option<String>,
-    /// Client key for upstream mTLS.
+    /// The private key of `client_cert_path` (PEM).
     #[serde(default)]
     pub client_key_path: Option<String>,
     /// Opt-in circuit breaker (see [`CircuitBreakerConfig`]).
@@ -978,6 +987,7 @@ impl TryFrom<RawUpstream> for UpstreamConfig {
             request_timeout_ms: raw.request_timeout_ms,
             keepalive: raw.keepalive,
             tls: raw.tls,
+            ca_path: raw.ca_path,
             client_cert_path: raw.client_cert_path,
             client_key_path: raw.client_key_path,
             circuit_breaker: raw.circuit_breaker,
@@ -1723,12 +1733,24 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     for (name, up) in &config.upstream {
         // Documented, parsed, and used by nothing: a config that sets them believed its
         // upstream connections were authenticated. Refuse until it exists (#503).
-        if up.client_cert_path.is_some() || up.client_key_path.is_some() {
+        // mTLS to the upstream (#503). The files themselves are read and checked when the
+        // routes are built; here, what can be wrong without opening them.
+        if up.client_cert_path.is_some() != up.client_key_path.is_some() {
             errors.push(format!(
-                "upstream.{name}: client_cert_path / client_key_path (mTLS to the upstream) are \
-                 not supported yet and were never applied: Zion presents no client certificate. \
-                 Remove them (see https://github.com/fabriziosalmi/zion/issues/503)"
+                "upstream.{name}: client_cert_path and client_key_path must be set together"
             ));
+        }
+        if up.ca_path.is_some() || up.client_cert_path.is_some() || up.client_key_path.is_some() {
+            for url in up.urls_ref() {
+                if !url.starts_with("https://") {
+                    errors.push(format!(
+                        "upstream.{name}: ca_path / client_cert_path / client_key_path only \
+                         apply to an https:// endpoint, and {:?} is not one: nothing would \
+                         be verified or presented",
+                        crate::http_util::redact_userinfo(url)
+                    ));
+                }
+            }
         }
         // `tls = true` with an http:// URL used to connect in plaintext: the URL scheme is
         // what decides, so say so instead of sending cleartext the operator did not ask for.
@@ -1824,6 +1846,47 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                 errors.push(format!(
                     "{} all point at {} but disagree about its circuit breaker; they share one \
                      health entry, so give them the same `circuit_breaker` (or none)",
+                    defs.iter()
+                        .map(|d| d.0.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    crate::http_util::redact_userinfo(url)
+                ));
+            }
+        }
+    }
+    // One endpoint has one health entry and one probe: tables that name it must agree on how
+    // zion speaks TLS to it, or the probe would use one table's certificate for the other's
+    // traffic.
+    {
+        type TlsSettings<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>);
+        let mut by_url: std::collections::BTreeMap<&str, Vec<(String, TlsSettings)>> =
+            std::collections::BTreeMap::new();
+        for (name, up) in &config.upstream {
+            for u in up.urls_ref() {
+                by_url.entry(u.as_str()).or_default().push((
+                    format!("upstream.{name}"),
+                    (
+                        up.ca_path.as_deref(),
+                        up.client_cert_path.as_deref(),
+                        up.client_key_path.as_deref(),
+                    ),
+                ));
+            }
+        }
+        for (name, url) in &config.upstreams {
+            by_url
+                .entry(url.as_str())
+                .or_default()
+                .push((format!("upstreams.{name}"), (None, None, None)));
+        }
+        for (url, mut defs) in by_url {
+            defs.sort_by(|a, b| a.0.cmp(&b.0));
+            if defs.windows(2).any(|w| w[0].1 != w[1].1) {
+                errors.push(format!(
+                    "{} all point at {} but disagree about ca_path / client_cert_path / \
+                     client_key_path; they share one health entry, so give them the same TLS \
+                     settings",
                     defs.iter()
                         .map(|d| d.0.as_str())
                         .collect::<Vec<_>>()
@@ -2579,16 +2642,38 @@ mod tests {
             let c: ZionConfig = toml::from_str(&cfg(up)).unwrap();
             semantic_errors(&c).join("\n")
         };
-        for mtls in [
+        // mTLS to the upstream (#503): the pair goes together, and only to an https endpoint.
+        for half in [
             "client_cert_path = \"/c.pem\"",
             "client_key_path = \"/k.pem\"",
         ] {
-            let e = errs(&format!("url = \"https://a:1\"\n{mtls}"));
-            assert!(
-                e.contains("not supported yet") && e.contains("issues/503"),
-                "{e}"
-            );
+            let e = errs(&format!("url = \"https://a:1\"\n{half}"));
+            assert!(e.contains("must be set together"), "{e}");
         }
+        let pair = "client_cert_path = \"/c.pem\"\nclient_key_path = \"/k.pem\"";
+        assert!(
+            !errs(&format!("url = \"https://a:1\"\n{pair}\nca_path = \"/ca.pem\""))
+                .contains("upstream.u"),
+            "a complete https upstream passes validation (the files are read when routes are built)"
+        );
+        for on_http in [pair, "ca_path = \"/ca.pem\""] {
+            let e = errs(&format!("url = \"http://a:1\"\n{on_http}"));
+            assert!(e.contains("only apply to an https:// endpoint"), "{e}");
+        }
+        // Two tables for one endpoint must agree on the TLS settings (one health entry).
+        let c: ZionConfig = toml::from_str(
+            "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [upstream.a]\nurl = \"https://same:1\"\nca_path = \"/ca.pem\"\n\
+             [upstream.b]\nurl = \"https://same:1\"\n\
+             [[route]]\npath=\"/a/{*r}\"\nupstream=\"a\"\n[[route]]\npath=\"/b/{*r}\"\nupstream=\"b\"\n",
+        )
+        .unwrap();
+        let e = semantic_errors(&c).join("\n");
+        assert!(
+            e.contains("disagree about ca_path / client_cert_path"),
+            "{e}"
+        );
         assert!(errs("url = \"http://a:1\"\ntls = true").contains("is not https://"));
         assert!(!errs("url = \"https://a:1\"\ntls = true").contains("tls = true"));
         assert!(!errs("url = \"http://a:1\"").contains("tls = true"));

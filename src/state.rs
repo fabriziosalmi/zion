@@ -205,6 +205,34 @@ impl ResolvedAppConfig {
                     ),
                 );
             }
+            // An upstream with TLS settings of its own is probed with them: without its
+            // client certificate an mTLS-only backend refuses the probe and is marked down.
+            let probe_client = match detailed.filter(|u| {
+                u.ca_path.is_some() || u.client_cert_path.is_some() || u.client_key_path.is_some()
+            }) {
+                Some(u) => {
+                    let tls = proxy::UpstreamTls::load(
+                        u.ca_path.as_deref(),
+                        u.client_cert_path.as_deref(),
+                        u.client_key_path.as_deref(),
+                    )
+                    .map_err(|e| error::ZionError::Config(format!("upstream.{name}: {e}")))?;
+                    if tls.presents_certificate()
+                        && warned_probe_host.insert(format!("mtls:{name}"))
+                    {
+                        logging::info(
+                            "config",
+                            &format!("upstream.{name}: zion presents a client certificate (mTLS)"),
+                        );
+                    }
+                    Some(Arc::new(proxy::build_client(&proxy::ClientSpec {
+                        http1_only: probe_host.is_some(),
+                        tls: Some(tls),
+                        ..proxy::ClientSpec::DEFAULT
+                    })))
+                }
+                None => None,
+            };
             for url in urls {
                 let entry = map
                     .entry(url.clone())
@@ -213,6 +241,11 @@ impl ResolvedAppConfig {
                 if let Some(h) = &probe_host {
                     if entry.probe_host.load().is_none() {
                         entry.probe_host.store(Some(Arc::new(h.clone())));
+                    }
+                }
+                if let Some(c) = &probe_client {
+                    if entry.probe_client.load().is_none() {
+                        entry.probe_client.store(Some(c.clone()));
                     }
                 }
                 if breaker_cfg.is_some() && !entry.breaker.is_configured() {
@@ -502,7 +535,7 @@ impl AppState {
             return c.clone();
         }
         self.http_clients
-            .entry(spec)
+            .entry(spec.clone())
             .or_insert_with(|| crate::proxy::build_client(&spec))
             .clone()
     }
