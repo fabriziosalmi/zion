@@ -57,6 +57,7 @@ mod dns;
 mod doctor;
 mod drain;
 mod error;
+mod h2_guard;
 mod health;
 mod http_conditional;
 mod import;
@@ -1377,7 +1378,16 @@ async fn handle_http_connection(
     net::set_keepalive(&stream, state.config.load().tcp_keepalive_secs);
     net::set_user_timeout(&stream, state.config.load().tcp_user_timeout_secs);
 
-    let io = TokioIo::new(stream);
+    // The plaintext listener speaks HTTP/2 to a client that opens with the preface, so the
+    // control-frame bound (#475) applies here as on :443.
+    let io = h2_guard::H2Guard::new(
+        stream,
+        h2_guard::Limits {
+            control_per_sec: state.cfg().h2_control_frames_per_sec,
+        },
+    );
+    let (h2_verdict, flood_log_state) = (io.verdict(), state.clone());
+    let io = TokioIo::new(io);
     // Connection-level idle timeout — matches the HTTPS path (1h, generous
     // enough for keep-alive; header_read_timeout bounds the slowloris header
     // phase, per-request limits live in handle_http).
@@ -1395,6 +1405,7 @@ async fn handle_http_connection(
         drain::serve(conn.as_mut(), drain::subscribe(), |c| c.graceful_shutdown()),
     )
     .await;
+    log_h2_flood(&h2_verdict, &flood_log_state, addr);
 }
 
 /// Run the HTTPS / TLS accept loop. On non-Linux or without the
@@ -1467,6 +1478,34 @@ async fn run_https_accept_loop(
             }
         }
     }
+}
+
+/// Say that a connection was closed by the HTTP/2 control-frame bound (#475). The metric
+/// counts every one; the line is throttled to about one a second, process-wide, so the
+/// client that floods frames cannot flood the log by reconnecting.
+fn log_h2_flood(verdict: &h2_guard::Verdict, state: &AppState, peer: SocketAddr) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+    let Some(flood) = verdict.get() else {
+        return;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if now_ms.saturating_sub(LAST_LOG_MS.load(Ordering::Relaxed)) < 1000 {
+        return;
+    }
+    LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+    logging::warn(
+        "h2_flood",
+        &format!(
+            "{} from {}: connection closed (h2_control_frames_per_sec = {})",
+            flood.as_str(),
+            state.redact.ip_label(peer.ip()),
+            state.cfg().h2_control_frames_per_sec
+        ),
+    );
 }
 
 /// Rate-limit TLS-handshake failure logging to ~one line per second,
@@ -1653,16 +1692,23 @@ fn spawn_https_handler(
         // The cfg-arms are mutually exclusive, so `io` resolves to a
         // single concrete type per build (no dyn / boxing needed —
         // `serve_connection_with_upgrades` is generic over the IO).
+        // HTTP/2 control-frame bound (#475): the guard reads the frame headers as they go by
+        // and stops reading from a connection that floods.
+        let h2_limits = h2_guard::Limits {
+            control_per_sec: state.cfg().h2_control_frames_per_sec,
+        };
         #[cfg(all(target_os = "linux", feature = "ktls"))]
         let io = match crate::ktls::try_upgrade(tls_stream).await {
-            Ok(ktls_stream) => TokioIo::new(ktls_stream),
+            Ok(ktls_stream) => h2_guard::H2Guard::new(ktls_stream, h2_limits),
             Err(e) => {
                 logq::line(&format!("  kTLS upgrade failed, closing connection: {e}"));
                 return;
             }
         };
         #[cfg(not(all(target_os = "linux", feature = "ktls")))]
-        let io = TokioIo::new(tls_stream);
+        let io = h2_guard::H2Guard::new(tls_stream, h2_limits);
+        let (h2_verdict, flood_log_state) = (io.verdict(), state.clone());
+        let io = TokioIo::new(io);
         // Connection-level idle timeout. 1h to cover long-lived HTTP/2
         // mux / WebSocket / SSE; per-request timeouts are in process_request.
         let conn = builder.serve_connection_with_upgrades(
@@ -1717,6 +1763,7 @@ fn spawn_https_handler(
             drain::serve(conn.as_mut(), drain::subscribe(), |c| c.graceful_shutdown()),
         )
         .await;
+        log_h2_flood(&h2_verdict, &flood_log_state, remote_addr);
     });
 }
 

@@ -72,6 +72,63 @@ conn_limit = (RAM_MB / 4) * 1024 / 50    # ~50KB per TLS connection estimate
 
 Clamped to 1,000–100,000. Connections beyond the limit are silently dropped at the TCP level.
 
+## HTTP/2 control-frame floods
+
+HTTP/2 has frames that carry no request and that a server must still read, and often answer:
+`PING`, `SETTINGS`, `WINDOW_UPDATE`, `PRIORITY`, `RST_STREAM`. One connection can send them as fast
+as the network takes them. The HTTP/2 library bounds streams reset as soon as they are opened
+(Rapid Reset, CVE-2023-44487) and nothing else, so such a connection was served to its last frame
+and never closed. The cost per frame is small (two million `PING`s cost about 0.13 s of one core),
+which makes this a way to keep a core busy per connection, not an outage; the per-IP connection
+limit was the only bound.
+
+`[server] h2_control_frames_per_sec` closes a connection that sends more than that many control
+frames in one second, with `GOAWAY(ENHANCE_YOUR_CALM)`:
+
+```toml
+[server]
+h2_control_frames_per_sec = 1000
+```
+
+It is **off by default** (`0`): a limit that is wrong for your clients closes their connections,
+and Zion has not measured every client. With no limit the frames are still counted, and
+`zion_h2_control_frames_peak` reports the most any one connection sent in a second: read it on
+your traffic, then set the limit well above it.
+
+What counts, and what does not:
+
+| Frame | Counted |
+|---|---|
+| `PING`, `SETTINGS` (and their acks), `PRIORITY`, `GOAWAY` | yes |
+| A frame type the server does not know (it reads and drops it) | yes, or it would be the way around the limit |
+| `DATA` with no payload that does not end its stream | yes |
+| `RST_STREAM` | only beyond the streams the connection opened: cancelling a request is free |
+| `WINDOW_UPDATE` | separately: 1,000 a second, plus one per 256 bytes of response written to the client in that second |
+| `HEADERS`, `CONTINUATION`, `DATA` with a payload | no: that is a request, bounded by the stream, header-size and rate limits |
+
+Measured on one connection:
+
+| Client | Control frames per second | Response bytes per `WINDOW_UPDATE` (300 MB download) |
+|---|---|---|
+| curl 8.7 (`--http2`) | 2 | 5 MB |
+| nghttp 1.69, default and 64 KiB windows | 2 | 18 KB |
+| h2load 1.69, 100 streams per connection | 2 | over 100 MB |
+| Chrome 154 | 2 to 3 | 2.2 MB |
+| Chrome 154 cancelling 100 downloads in flight, three times in a second | 2 (and 302 `RST_STREAM`s, not counted) | 5 MB |
+
+So `1000` is over 300 times what these clients send, and their `WINDOW_UPDATE`s are 70 times or
+more under the allowance of one per 256 bytes.
+
+Firefox, Safari and gRPC clients were not measured. gRPC clients send a `PING` with the data they
+receive to estimate bandwidth, which can be many a second on a fast link: measure before setting a
+limit in front of one.
+
+The bound applies however the client got to HTTP/2: ALPN `h2`, a TLS connection that negotiated
+nothing and opens with the HTTP/2 preface, or the preface on the plaintext listener. A closed
+connection is counted in `zion_h2_control_flood_closed_total{reason}` and logged with the client
+address (one line a second at most). The `GOAWAY` is sent if the connection takes it at once; a
+client that is still sending when the socket closes may see a reset instead.
+
 ## Protecting the upstream
 
 Two opt-in, per-upstream limits keep a struggling backend from taking the proxy down with it (see the
