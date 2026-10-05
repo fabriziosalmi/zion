@@ -4325,3 +4325,243 @@ async fn the_waf_scans_the_headers_a_profile_lists() {
         "a WAF route that lists no header does not scan headers (unchanged default)"
     );
 }
+
+// ── Singleflight: waiters always get an answer ──────────────────────────────
+//
+// Concurrent misses for one key share one origin fetch. Whatever becomes of that fetch,
+// every request that waited on it has to be answered. From v0.8.0 to v0.9.10 it was not:
+// a waiter kept the channel it waited on open, so a fetch that stored nothing left all of
+// them waiting for good; and a fetch abandoned because its client went away left its
+// registration behind, so every later request for that URL waited on a fetch that no
+// longer existed.
+
+/// GET `uri` and read the whole response, as a client that stays does: (status,
+/// `X-Zion-Cache`).
+async fn get_whole(st: &Arc<AppState>, uri: &str) -> (u16, String) {
+    let resp = process_request(
+        get(uri, &[]),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    let status = resp.status().as_u16();
+    let cache = resp
+        .headers()
+        .get("x-zion-cache")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let _ = resp.into_body().collect().await;
+    (status, cache)
+}
+
+/// `n` simultaneous GETs of `uri`, each read to the end: the statuses, or `None` when they
+/// are not all answered within `within`.
+async fn concurrent_statuses(
+    st: &Arc<AppState>,
+    uri: &'static str,
+    n: usize,
+    within: Duration,
+) -> Option<Vec<u16>> {
+    let mut requests = tokio::task::JoinSet::new();
+    for _ in 0..n {
+        let st = st.clone();
+        requests.spawn(async move { get_whole(&st, uri).await.0 });
+    }
+    let all = async {
+        let mut statuses = Vec::with_capacity(n);
+        while let Some(status) = requests.join_next().await {
+            statuses.push(status.expect("the request task"));
+        }
+        statuses
+    };
+    tokio::time::timeout(within, all).await.ok()
+}
+
+/// The response is not stored (a 404, a 500, `no-store`): every one of the requests that
+/// arrived together gets it, and they do not take turns at the origin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_waiting_on_a_fetch_that_stores_nothing_are_all_answered() {
+    for (status, cc) in [
+        (404u16, "public, max-age=60"),
+        (500, "public, max-age=60"),
+        (200, "no-store"),
+    ] {
+        let (o, st) = rig_cc("", cc).await;
+        o.status.store(status, Ordering::Relaxed);
+        o.delay_ms.store(200, Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
+        let statuses = concurrent_statuses(&st, "/missing", 12, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|| {
+                panic!("{status} {cc:?}: some of the 12 requests never got an answer")
+            });
+        assert_eq!(statuses, vec![status; 12], "{status} {cc:?}");
+        // The first fetch, then the eleven others together: about two origin delays, not
+        // twelve (2.4 s) as it would be if each wake elected one fetcher.
+        assert!(
+            t0.elapsed() < Duration::from_millis(1_500),
+            "{status} {cc:?}: took {:?}, the waiters queued for the origin",
+            t0.elapsed()
+        );
+        assert!(
+            (2..=12).contains(&hits(&o)),
+            "{status} {cc:?}: {} origin fetches",
+            hits(&o)
+        );
+        assert_eq!(st.inflight.len(), 0, "no registration is left behind");
+    }
+}
+
+/// The happy path keeps its property: one origin fetch for all of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_arriving_together_for_a_storable_response_share_one_fetch() {
+    let (o, st) = rig("").await;
+    o.delay_ms.store(200, Ordering::Relaxed);
+    let statuses = concurrent_statuses(&st, "/shared", 12, Duration::from_secs(5))
+        .await
+        .expect("all answered");
+    assert_eq!(statuses, vec![200; 12]);
+    assert_eq!(hits(&o), 1, "coalesced on one fetch");
+    settle().await;
+    assert_eq!(st.inflight.len(), 0);
+    assert_eq!(get_whole(&st, "/shared").await, (200, "HIT".to_string()));
+    assert_eq!(hits(&o), 1);
+}
+
+/// The fetcher's client reads the headers and leaves before the body is through: nothing
+/// is stored, and the requests that were waiting for it are answered all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_waiting_on_a_fetch_whose_client_left_mid_body_are_answered() {
+    let (o, st) = rig("").await;
+    o.delay_ms.store(200, Ordering::Relaxed);
+    *o.big.lock().unwrap() = Some((4 * 1024 * 1024, false));
+    // `send` drops the response as soon as it has the status: a client that went away.
+    let leaver = tokio::spawn({
+        let st = st.clone();
+        async move { send(&st, Method::GET, "/big").await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let statuses = concurrent_statuses(&st, "/big", 6, Duration::from_secs(5))
+        .await
+        .expect("the waiters are answered");
+    assert_eq!(statuses, vec![200; 6]);
+    assert_eq!(leaver.await.unwrap(), 200);
+    settle().await;
+    assert_eq!(st.inflight.len(), 0);
+}
+
+/// A client that goes away while its request is being fetched: hyper drops the request
+/// future there and then. The URL must still be answerable afterwards, by the cache-miss
+/// path like any other, and requests that were waiting on that fetch must be answered too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_abandoned_by_its_client_does_not_leave_the_url_unanswerable() {
+    let (o, st) = rig("").await;
+    o.delay_ms.store(400, Ordering::Relaxed);
+    // The fetcher, abandoned mid-fetch, and two requests already waiting on it.
+    let fetcher = tokio::spawn({
+        let st = st.clone();
+        async move { send(&st, Method::GET, "/abandoned").await }
+    });
+    // (wait for the fetch to be under way: registered, and at the origin)
+    let under_way = async {
+        while st.inflight.len() != 1 || hits(&o) != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), under_way)
+        .await
+        .expect("the fetch started");
+    let waiters = tokio::spawn({
+        let st = st.clone();
+        async move { concurrent_statuses(&st, "/abandoned", 2, Duration::from_secs(5)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    fetcher.abort();
+    let _ = fetcher.await;
+
+    assert_eq!(
+        waiters.await.unwrap(),
+        Some(vec![200, 200]),
+        "the requests that were waiting on it are answered"
+    );
+    // And a request that comes later, by which time nothing is registered.
+    let later = tokio::time::timeout(Duration::from_secs(5), get_whole(&st, "/abandoned"))
+        .await
+        .expect("a later request for the same URL is answered");
+    assert_eq!(later.0, 200);
+    settle().await;
+    assert_eq!(st.inflight.len(), 0, "the abandoned registration is gone");
+}
+
+/// The fetcher finishes and publishes before any other request has subscribed (the channel
+/// is created with no receiver). A request that took the sender out of the map a moment
+/// earlier and subscribes a moment later must see the completion, not wait on a channel
+/// nobody writes to again. `Sender::send` stores nothing when there is no receiver, which
+/// is how 1 to 4 requests in 300,000 hung under load.
+#[tokio::test]
+async fn completion_published_before_anyone_subscribed_is_seen_by_a_late_subscriber() {
+    let (_o, st) = rig("").await;
+    let key: Arc<str> = Arc::from("/late");
+    // The fetcher registers...
+    let (tx, inserted) = st
+        .inflight
+        .get_or_insert_with(key.clone(), || tokio::sync::watch::channel(false).0);
+    assert!(inserted);
+    let fetching = crate::dispatch::Fetching::for_tests(st.clone(), key.clone(), tx);
+    // ... a second request finds the registration...
+    let (seen, inserted) = st
+        .inflight
+        .get_or_insert_with(key.clone(), || tokio::sync::watch::channel(false).0);
+    assert!(!inserted);
+    // ... the fetcher completes, with nobody subscribed yet...
+    fetching.stored();
+    assert_eq!(st.inflight.len(), 0, "and takes its registration out");
+    // ... and only then does the second request subscribe and wait, as the code does.
+    let mut rx = seen.subscribe();
+    drop(seen);
+    let woke = tokio::time::timeout(Duration::from_secs(2), rx.wait_for(|v| *v)).await;
+    assert!(
+        matches!(woke, Ok(Ok(_))),
+        "the late subscriber saw the completion"
+    );
+}
+
+/// The guard takes out its own registration and no one else's: by the time a long body
+/// has been streamed, another request may be the fetcher for the same key.
+#[tokio::test]
+async fn a_finished_fetch_removes_its_own_registration_and_not_its_successors() {
+    let (_o, st) = rig("").await;
+    let key: Arc<str> = Arc::from("/k");
+    let register = || {
+        st.inflight
+            .get_or_insert_with(key.clone(), || tokio::sync::watch::channel(false).0)
+    };
+    let (tx, _) = register();
+    let first = crate::dispatch::Fetching::for_tests(st.clone(), key.clone(), tx);
+    // The first registration is purged from under it (as an explicit remove would), and a
+    // second fetch registers under the same key.
+    st.inflight.remove(&key);
+    let (tx2, inserted) = register();
+    assert!(inserted);
+    let second = crate::dispatch::Fetching::for_tests(st.clone(), key.clone(), tx2);
+    drop(first);
+    assert_eq!(
+        st.inflight.len(),
+        1,
+        "the successor's registration is untouched"
+    );
+    // A waiter on the second fetch is woken with an error when it ends without storing.
+    let (seen, _) = register();
+    let mut rx = seen.subscribe();
+    drop(seen);
+    drop(second);
+    assert_eq!(st.inflight.len(), 0);
+    let woke = tokio::time::timeout(Duration::from_secs(2), rx.wait_for(|v| *v)).await;
+    assert!(
+        matches!(woke, Ok(Err(_))),
+        "a fetch that stored nothing closes the channel"
+    );
+}
