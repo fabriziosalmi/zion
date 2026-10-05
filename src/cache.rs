@@ -14,7 +14,7 @@ use dashmap::DashMap;
 use hyper::header::HeaderValue;
 use hyper::StatusCode;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -124,6 +124,10 @@ struct L1Entry {
     freshness_secs: u64,
     /// Cache generation at promotion time — stale if < StaticCache.generation.
     generation: u64,
+    /// The key's stripe and that stripe's generation at promotion time: stale when the
+    /// stripe has moved on, which it does whenever an entry under it is stored or removed.
+    stripe: u32,
+    stripe_gen: u64,
 }
 
 /// L2 entry — with TTL.
@@ -246,10 +250,19 @@ impl L1Cache {
     }
 
     #[inline]
-    fn get(&mut self, path: &str, current_gen: u64) -> Option<CacheHit> {
+    fn get(
+        &mut self,
+        path: &str,
+        current_gen: u64,
+        stripes: &[std::sync::atomic::AtomicU64],
+    ) -> Option<CacheHit> {
         let (entry, node_idx) = self.map.get(path)?;
-        if Instant::now() >= entry.expires_at || entry.generation < current_gen {
-            // Expired or stale generation — remove
+        if Instant::now() >= entry.expires_at
+            || entry.generation < current_gen
+            || stripes[entry.stripe as usize].load(std::sync::atomic::Ordering::Acquire)
+                != entry.stripe_gen
+        {
+            // Expired, or the shared store changed under it — remove
             let idx = *node_idx;
             self.unlink(idx);
             self.free.push(idx);
@@ -283,6 +296,7 @@ impl L1Cache {
         initial_age_secs: u64,
         freshness_secs: u64,
         generation: u64,
+        (stripe, stripe_gen): (u32, u64),
     ) {
         // If key already exists, update in place and move to MRU
         if let Some((entry, node_idx)) = self.map.get_mut(path.as_ref()) {
@@ -294,6 +308,8 @@ impl L1Cache {
                 initial_age_secs,
                 freshness_secs,
                 generation,
+                stripe,
+                stripe_gen,
             };
             let idx = *node_idx;
             self.touch(idx);
@@ -322,6 +338,8 @@ impl L1Cache {
                     initial_age_secs,
                     freshness_secs,
                     generation,
+                    stripe,
+                    stripe_gen,
                 },
                 idx,
             ),
@@ -415,11 +433,16 @@ impl TagIndex {
 pub struct StaticCache {
     l2: Option<DashMap<Arc<str>, L2Entry>>,
     l1_max_entries: usize,
-    /// Monotonic counter bumped on every L2 insert/update.
-    /// L1 caches store the generation at promotion time; on get, if the
-    /// global generation has advanced, the L1 entry is stale and re-fetched
-    /// from L2. This prevents serving stale data for the TTL duration.
+    /// Bumped by the operations that remove many entries at once (a purge of everything,
+    /// of a prefix, of a path, of a tag). L1 caches store it at promotion time; on get, if
+    /// it has advanced, the L1 entry is stale and re-fetched from L2.
     generation: std::sync::atomic::AtomicU64,
+    /// One generation per stripe of keys, bumped when an entry under the stripe is stored
+    /// or removed (an eviction included). An L1 copy is valid while its key's stripe has
+    /// not moved, so a store or an eviction invalidates the copies of the keys that share
+    /// the stripe, about one in [`STRIPES`], and not every L1 entry of every thread as a
+    /// single shared generation did (#525).
+    stripes: Box<[std::sync::atomic::AtomicU64]>,
     /// Which request headers each primary key's responses vary on (RFC 9111 §4.1).
     pub vary: crate::vary::VaryRules,
     /// Surrogate-Key tag index. Its lock also orders tagged inserts against tag purges.
@@ -429,6 +452,10 @@ pub struct StaticCache {
     /// Bumped by every tag purge (and `purge_all`): a response fetched before a purge must not
     /// be stored after it (see [`StaticCache::insert_tagged`]).
     tag_epoch: std::sync::atomic::AtomicU64,
+    /// The stored entries in the order they were stored, each with the time it was stored
+    /// at: the front is the next to be evicted. An item whose entry has since been replaced
+    /// or removed no longer matches the store and is skipped.
+    queue: Mutex<VecDeque<(Arc<str>, Instant)>>,
     /// What the stored entries cost in memory ([`entry_cost`] of each), plus the room
     /// reserved by inserts in progress. Every change to the store goes through
     /// `map_insert` / `map_remove` / `map_retain`, which keep it exact.
@@ -453,6 +480,23 @@ pub fn default_budget_mb(usable_memory_mb: u64) -> u64 {
     (usable_memory_mb / 8).max(32)
 }
 
+/// How many stripes the keys are spread over for L1 invalidation. More stripes, fewer
+/// L1 copies invalidated by a store that has nothing to do with them.
+const STRIPES: usize = 1024;
+
+/// The stripe of a key (FNV-1a; any spread will do, it only has to be the same every time).
+fn stripe_of(key: &str) -> usize {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (h % STRIPES as u64) as usize
+}
+
+/// Queue items tolerated beyond twice the entries before the queue is rebuilt.
+const QUEUE_SLACK: usize = 1024;
+
 /// What one entry is counted as, on top of its key and body: the entry itself, its
 /// metadata (a few short header values) and its slot in the map. An estimate, there so
 /// that a cache of empty bodies is not counted as free.
@@ -470,80 +514,95 @@ fn entry_cost(key: &str, entry: &L2Entry) -> u64 {
 /// from the shared store on every hit.
 const L1_MAX_BODY_BYTES: usize = 64 * 1024;
 
-/// Entries one eviction round looks at: a bounded sample, never the whole map.
+/// Queue entries one eviction round looks at.
 const EVICT_SAMPLE: usize = 64;
-/// Most eviction rounds one insert runs before it stores its entry regardless. A round that
-/// removes nothing means another thread took the victim, so the map shrank anyway; the limit
-/// only bounds the work of a single insert.
+/// Most eviction rounds one insert runs before it gives up making room: with
+/// [`EVICT_SAMPLE`] it bounds the work of a single insert.
 const EVICT_ROUNDS: usize = 8;
 
 impl StaticCache {
-    /// One eviction round over a sample of the store: drop what has expired, or else the
-    /// entries closest to expiring, one of them and then as many more as it takes to free
-    /// `need_bytes`. Returns nothing: what was freed shows in `self.bytes`, and a round that
-    /// frees nothing means another thread took the same victims.
+    /// One eviction round: remove the entries that were stored first, one of them and then
+    /// as many more as it takes to free `need_bytes`, looking at no more than
+    /// [`EVICT_SAMPLE`] places in the queue. What was freed shows in `self.bytes`.
+    ///
+    /// The oldest stored go first because that is cheap to know and fair: the eviction
+    /// used to pick among the first 64 entries of the map in its iteration order, always
+    /// the same corner of it, so the entries that hashed there were evicted as soon as
+    /// they were stored while the rest of the cache never moved. Under a skewed load
+    /// (Zipf, a cache a third the size of the key set) that kept 57 % of requests as
+    /// hits where evicting the oldest keeps 82 % (#525).
     ///
     /// `keep` is never a victim: the key an insert is about to replace. Its bytes are already
     /// counted against the room that insert reserved, so evicting it frees nothing the insert
     /// can use, and the count would end over the budget by exactly its size.
     fn evict_round(&self, need_bytes: u64, keep: Option<&str>) {
-        let now = Instant::now();
-        // First pass, which is all an insert at the entry cap needs and costs what it did
-        // before there was a budget: what has expired, and the one entry closest to it.
-        let mut expired: Vec<Arc<str>> = Vec::new();
-        let mut oldest: Option<(Arc<str>, Instant)> = None;
-        self.sample(|key, expires_at| {
-            if keep == Some(key.as_ref()) {
-                return;
-            }
-            if now >= expires_at {
-                expired.push(key.clone());
-            } else if oldest.as_ref().is_none_or(|(_, at)| expires_at < *at) {
-                oldest = Some((key.clone(), expires_at));
-            }
-        });
-        let mut freed = 0u64;
-        for key in &expired {
-            freed += self.map_remove(key).map_or(0, |e| entry_cost(key, &e));
-        }
-        if expired.is_empty() {
-            if let Some((key, _)) = &oldest {
-                freed += self.map_remove(key).map_or(0, |e| entry_cost(key, &e));
-            }
-        }
-        if freed >= need_bytes {
-            return;
-        }
-        // The bytes ask for more than that: the rest of the sample, soonest to expire first.
-        let mut rest: Vec<(Arc<str>, Instant)> = Vec::new();
-        self.sample(|key, expires_at| {
-            if keep != Some(key.as_ref()) {
-                rest.push((key.clone(), expires_at));
-            }
-        });
-        rest.sort_by_key(|(_, expires_at)| *expires_at);
-        for (key, _) in &rest {
-            if freed >= need_bytes {
+        let (mut freed, mut victims) = (0u64, 0usize);
+        let mut kept = None;
+        for _ in 0..EVICT_SAMPLE {
+            if victims > 0 && freed >= need_bytes {
                 break;
             }
-            freed += self.map_remove(key).map_or(0, |e| entry_cost(key, &e));
+            let Some((key, stored_at)) = self.lock_queue().pop_front() else {
+                break;
+            };
+            if keep == Some(key.as_ref()) {
+                kept = Some((key, stored_at));
+                continue;
+            }
+            // An entry stored again since, or already gone, is not this queue item's.
+            if let Some(e) = self.map_remove_stored_at(&key, stored_at) {
+                freed += entry_cost(&key, &e);
+                victims += 1;
+            }
+        }
+        if let Some(item) = kept {
+            self.lock_queue().push_back(item); // still stored: it keeps a place in the queue
         }
     }
 
-    /// Visit the entries one eviction round looks at: (key, when it expires).
-    fn sample(&self, mut visit: impl FnMut(&Arc<str>, Instant)) {
+    fn lock_queue(&self) -> std::sync::MutexGuard<'_, VecDeque<(Arc<str>, Instant)>> {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Note that an entry was stored, for the eviction order. Entries that left the store
+    /// some other way (a purge, a replacement) leave their item behind; when those outnumber
+    /// the entries the queue is rebuilt without them, so it stays in proportion to the store.
+    fn enqueue(&self, key: Arc<str>, stored_at: Instant) {
+        let mut queue = self.lock_queue();
+        queue.push_back((key, stored_at));
+        if queue.len() > 2 * self.len() + QUEUE_SLACK {
+            queue.retain(|(key, stored_at)| self.stored_at(key) == Some(*stored_at));
+        }
+    }
+
+    /// When the entry under `key` was stored, if there is one.
+    fn stored_at(&self, key: &str) -> Option<Instant> {
         match &self.l2 {
-            Some(l2) => {
-                for e in l2.iter().take(EVICT_SAMPLE) {
-                    visit(e.key(), e.expires_at);
-                }
-            }
+            Some(l2) => l2.get(key).map(|e| e.inserted_at),
+            None => LOCAL_L2.with(|m| m.borrow().get(key).map(|e| e.inserted_at)),
+        }
+    }
+
+    /// Remove the entry under `key` if it is the one stored at `stored_at`, with its cost.
+    fn map_remove_stored_at(&self, key: &str, stored_at: Instant) -> Option<L2Entry> {
+        let removed = match &self.l2 {
+            Some(l2) => l2
+                .remove_if(key, |_, e| e.inserted_at == stored_at)
+                .map(|(_, e)| e),
             None => LOCAL_L2.with(|m| {
-                for (k, v) in m.borrow().iter().take(EVICT_SAMPLE) {
-                    visit(k, v.expires_at);
+                let mut m = m.borrow_mut();
+                if m.get(key).is_some_and(|e| e.inserted_at == stored_at) {
+                    m.remove(key)
+                } else {
+                    None
                 }
             }),
+        };
+        if let Some(e) = &removed {
+            self.sub_bytes(entry_cost(key, e));
+            self.touch_stripe(key);
         }
+        removed
     }
 
     /// The byte budget in force for this cache (`0` = none).
@@ -588,8 +647,15 @@ impl StaticCache {
         };
         if let Some(e) = &removed {
             self.sub_bytes(entry_cost(key, e));
+            self.touch_stripe(key);
         }
         removed
+    }
+
+    /// An entry under `key` was stored or removed: L1 copies of the keys of its stripe are
+    /// no longer to be trusted.
+    fn touch_stripe(&self, key: &str) {
+        self.stripes[stripe_of(key)].fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Keep the entries `keep` says to, drop the others and their cost: how many went.
@@ -636,10 +702,14 @@ impl StaticCache {
             l2,
             l1_max_entries: l1_max,
             generation: std::sync::atomic::AtomicU64::new(0),
+            stripes: (0..STRIPES)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
             vary: crate::vary::VaryRules::default(),
             tags: Mutex::new(TagIndex::default()),
             tagged_keys: std::sync::atomic::AtomicUsize::new(0),
             tag_epoch: std::sync::atomic::AtomicU64::new(0),
+            queue: Mutex::new(VecDeque::new()),
             bytes: std::sync::atomic::AtomicU64::new(0),
             own_budget: None,
         }
@@ -883,7 +953,7 @@ impl StaticCache {
         let l1_hit = L1.with(|l1| {
             let mut l1 = l1.borrow_mut();
             let l1 = l1.get_or_insert_with(|| L1Cache::new(l1_max));
-            l1.get(path, current_gen)
+            l1.get(path, current_gen, &self.stripes)
         });
 
         if let Some(hit) = l1_hit {
@@ -895,6 +965,11 @@ impl StaticCache {
         // undercounted misses and inflated the hit-rate). Expired = Stale, kept
         // in place for origin revalidation (§4.3), NOT evicted. Fresh = promote
         // to L1 and serve.
+        // The stripe's generation is read BEFORE the entry: if the entry is replaced in
+        // between, the copy promoted below carries the older generation and is thrown
+        // away at its next use, where reading it after could bless a replaced entry.
+        let stripe = stripe_of(path);
+        let stripe_gen = self.stripes[stripe].load(std::sync::atomic::Ordering::Acquire);
         let Some(entry) = l2_concurrent.get(path) else {
             crate::metrics::METRICS.cache_misses.fetch_add(1, Relaxed);
             return CacheLookup::Miss;
@@ -933,9 +1008,14 @@ impl StaticCache {
                     initial_age_secs,
                     freshness_secs,
                     current_gen,
+                    (stripe as u32, stripe_gen),
                 );
             });
         }
+        // Served from the shared store: an L1 hit never gets here.
+        crate::metrics::METRICS
+            .cache_shared_hits
+            .fetch_add(1, Relaxed);
 
         crate::metrics::METRICS.cache_hits.fetch_add(1, Relaxed);
         CacheLookup::Fresh(CacheHit {
@@ -1066,9 +1146,11 @@ impl StaticCache {
     fn store_reserved(&self, key: Arc<str>, entry: L2Entry, cost: u64, reserved: u64, budget: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         // The count holds `reserved`; what really changed is `cost` less the entry replaced.
+        let stored_at = entry.inserted_at;
         let replaced = self
             .map_insert_raw(key.clone(), entry)
             .map_or(0, |old| entry_cost(&key, &old));
+        self.enqueue(key.clone(), stored_at);
         let settled = cost.saturating_sub(replaced);
         if settled >= reserved {
             self.bytes.fetch_add(settled - reserved, Relaxed);
@@ -1095,9 +1177,9 @@ impl StaticCache {
                     .fetch_add(1, Relaxed);
             }
         }
-        // Bump generation so L1 caches on other threads see the update
-        self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        // L1 copies of this key on other threads (and of the few keys that share its
+        // stripe) must see the update. Not every L1 entry there is: see `stripes`.
+        self.touch_stripe(&key);
     }
 
     pub fn len(&self) -> usize {
@@ -1124,6 +1206,8 @@ impl StaticCache {
         }
         // (entry by entry, not `clear`: an insert racing with it keeps its bytes counted)
         let n = self.map_retain(|_| false);
+        // (the queue is left alone: its items no longer match anything and go at the next
+        // rebuild, where clearing it here could drop the item of an insert racing with this)
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         n
@@ -1922,6 +2006,331 @@ mod tests {
         assert_eq!(hit.meta.etag.unwrap().as_bytes(), &[b'a'; 10][..]);
         assert_eq!(hit.meta.last_modified.unwrap().as_bytes(), &[b'a'; 29][..]);
     }
+    // ── L1 invalidation by stripe (#525) ─────────────────────────────────────
+
+    /// Does this thread hold a valid L1 copy of `key`? (Asking drops a stale one, as a
+    /// lookup would.)
+    fn l1_has(cache: &StaticCache, key: &str) -> bool {
+        let generation = cache.generation.load(std::sync::atomic::Ordering::Acquire);
+        L1.with(|l1| {
+            l1.borrow_mut()
+                .as_mut()
+                .is_some_and(|l1| l1.get(key, generation, &cache.stripes).is_some())
+        })
+    }
+
+    /// `n` keys that do not share a stripe with `not_with`, and one that does.
+    fn keys_by_stripe(not_with: &str, n: usize) -> (Vec<String>, String) {
+        let stripe = stripe_of(not_with);
+        let mut others = Vec::new();
+        let mut same = None;
+        for i in 0..1_000_000 {
+            let k = format!("/other/{i}");
+            if stripe_of(&k) != stripe {
+                if others.len() < n {
+                    others.push(k);
+                }
+            } else if same.is_none() {
+                same = Some(k);
+            }
+            if others.len() == n && same.is_some() {
+                break;
+            }
+        }
+        assert_eq!(others.len(), n, "keys do not spread over the stripes");
+        (others, same.expect("a key of the same stripe"))
+    }
+
+    /// The point of #525: storing other responses must not throw away this thread's copies.
+    /// With one generation for the whole cache, every store did, on every thread.
+    #[test]
+    fn storing_other_keys_leaves_an_l1_copy_valid() {
+        let cache = StaticCache::with_byte_budget(0);
+        if cache.l2.is_none() {
+            return; // a single-core machine has no L1 tier
+        }
+        put(&cache, "/hot", 100, 600);
+        assert!(cache.get("/hot").fresh().is_some()); // promoted
+        assert!(l1_has(&cache, "/hot"));
+        let (others, _) = keys_by_stripe("/hot", 500);
+        for k in &others {
+            put(&cache, k, 100, 600);
+        }
+        assert!(
+            l1_has(&cache, "/hot"),
+            "500 stores of other keys later, the L1 copy is still good"
+        );
+        // Evicting other entries does not touch it either.
+        for k in &others[..100] {
+            assert!(cache.remove_key(k));
+        }
+        assert!(l1_has(&cache, "/hot"));
+    }
+
+    #[test]
+    fn storing_or_removing_a_key_invalidates_its_own_l1_copy() {
+        let cache = StaticCache::with_byte_budget(0);
+        if cache.l2.is_none() {
+            return;
+        }
+        cache.insert("/k", Bytes::from("old"), default_meta(), 600, 0, 0);
+        assert!(cache.get("/k").fresh().is_some());
+        assert!(l1_has(&cache, "/k"));
+        // Replaced while still fresh (a client forced a refetch): the copy must go.
+        cache.insert("/k", Bytes::from("new"), default_meta(), 600, 0, 0);
+        assert!(
+            !l1_has(&cache, "/k"),
+            "the copy of the replaced entry is stale"
+        );
+        assert_eq!(cache.get("/k").fresh().unwrap().body, Bytes::from("new"));
+        assert!(l1_has(&cache, "/k"), "and the new one was promoted");
+        // Removed from the shared store, as an eviction does: an L1 copy must not outlive
+        // it (it did, until its TTL, while evictions left the generation alone).
+        assert!(cache.map_remove("/k").is_some());
+        assert!(!l1_has(&cache, "/k"));
+        assert!(matches!(cache.get("/k"), CacheLookup::Miss));
+    }
+
+    /// A store invalidates the copies of the keys that share its stripe. That costs them
+    /// one trip to the shared store, where the entry still is.
+    #[test]
+    fn a_key_of_the_same_stripe_is_refetched_from_the_shared_store_not_lost() {
+        let cache = StaticCache::with_byte_budget(0);
+        if cache.l2.is_none() {
+            return;
+        }
+        put(&cache, "/hot", 100, 600);
+        assert!(cache.get("/hot").fresh().is_some());
+        let (_, same) = keys_by_stripe("/hot", 0);
+        put(&cache, &same, 100, 600);
+        assert!(!l1_has(&cache, "/hot"), "same stripe: invalidated");
+        assert!(cache.get("/hot").fresh().is_some(), "and found again");
+        assert!(l1_has(&cache, "/hot"));
+    }
+
+    /// The copy lives in another thread's L1: that thread must see the replacement.
+    #[test]
+    fn a_replacement_is_seen_by_a_thread_that_holds_the_old_copy() {
+        let cache = std::sync::Arc::new(StaticCache::with_byte_budget(0));
+        if cache.l2.is_none() {
+            return;
+        }
+        cache.insert("/k", Bytes::from("old"), default_meta(), 600, 0, 0);
+        let (promoted_tx, promoted_rx) = std::sync::mpsc::channel();
+        let (replaced_tx, replaced_rx) = std::sync::mpsc::channel::<()>();
+        let reader = std::thread::spawn({
+            let cache = cache.clone();
+            move || {
+                assert_eq!(cache.get("/k").fresh().unwrap().body, Bytes::from("old"));
+                assert!(l1_has(&cache, "/k"));
+                promoted_tx.send(()).unwrap();
+                replaced_rx.recv().unwrap();
+                cache.get("/k").fresh().unwrap().body
+            }
+        });
+        promoted_rx.recv().unwrap();
+        cache.insert("/k", Bytes::from("new"), default_meta(), 600, 0, 0);
+        replaced_tx.send(()).unwrap();
+        assert_eq!(reader.join().unwrap(), Bytes::from("new"));
+    }
+
+    /// The operations that remove many entries at once still invalidate every L1 copy.
+    #[test]
+    fn purges_invalidate_l1_copies_whatever_their_stripe() {
+        let cache = StaticCache::with_byte_budget(0);
+        if cache.l2.is_none() {
+            return;
+        }
+        let promote = |cache: &StaticCache| {
+            for k in ["/a/1\u{1f}", "/b/1\u{1f}"] {
+                put(cache, k, 10, 600);
+                assert!(cache.get(k).fresh().is_some());
+                assert!(l1_has(cache, k));
+            }
+        };
+        promote(&cache);
+        cache.purge_prefix("/a/");
+        assert!(!l1_has(&cache, "/a/1\u{1f}"));
+        promote(&cache);
+        cache.invalidate_path("/b/1");
+        assert!(!l1_has(&cache, "/b/1\u{1f}"));
+        promote(&cache);
+        cache.purge_all();
+        assert!(!l1_has(&cache, "/a/1\u{1f}") && !l1_has(&cache, "/b/1\u{1f}"));
+    }
+
+    #[test]
+    fn keys_spread_over_the_stripes() {
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..20_000 {
+            seen.insert(stripe_of(&format!("/assets/app.{i}.js\u{1f}gzip")));
+        }
+        assert!(seen.len() > STRIPES * 9 / 10, "{} stripes used", seen.len());
+        assert_eq!(stripe_of("/x"), stripe_of("/x"));
+    }
+
+    // ── Eviction order (#525) ────────────────────────────────────────────────
+
+    /// Store a tiny body under `key`, the cache capped at `cap` entries.
+    fn put_capped(cache: &StaticCache, key: &str, cap: usize) {
+        cache.insert(key, Bytes::from_static(b"x"), default_meta(), 600, 0, cap);
+    }
+
+    #[test]
+    fn the_entries_stored_first_are_the_first_to_go() {
+        for cache in both_backends(0) {
+            for i in 0..5 {
+                put_capped(&cache, &format!("/k{i}"), 5);
+            }
+            put_capped(&cache, "/k5", 5);
+            put_capped(&cache, "/k6", 5);
+            assert_eq!(cache.len(), 5);
+            assert!(
+                !cache.holds("/k0") && !cache.holds("/k1"),
+                "the two oldest went"
+            );
+            for i in 2..=6 {
+                assert!(cache.holds(&format!("/k{i}")), "/k{i} stays");
+            }
+        }
+    }
+
+    /// Storing a key again makes it the newest: its old place in the queue is not a reason
+    /// to evict the response that was just stored.
+    #[test]
+    fn a_key_stored_again_is_evicted_as_the_newest_not_as_the_oldest() {
+        for cache in both_backends(0) {
+            for k in ["/a", "/b", "/c"] {
+                put_capped(&cache, k, 3);
+            }
+            put_capped(&cache, "/a", 3); // replaced: no room needed, and now the newest
+            assert_eq!(cache.len(), 3);
+            put_capped(&cache, "/d", 3);
+            assert!(cache.holds("/a"), "the entry just stored again is kept");
+            assert!(!cache.holds("/b"), "the oldest of the others went");
+            put_capped(&cache, "/e", 3);
+            assert!(!cache.holds("/c") && cache.holds("/a"));
+            put_capped(&cache, "/f", 3);
+            assert!(!cache.holds("/a"), "and it goes when its turn comes");
+            assert_eq!(cache.len(), 3);
+        }
+        // The same when it is stored again with room to spare: its first place in the queue
+        // is still there when the cache fills, and belongs to an entry that is gone.
+        for cache in both_backends(0) {
+            put_capped(&cache, "/a", 3);
+            put_capped(&cache, "/b", 3);
+            put_capped(&cache, "/a", 3); // two entries, three queue items
+            put_capped(&cache, "/c", 3);
+            put_capped(&cache, "/d", 3); // at the cap: the oldest entry is "/b", not "/a"
+            assert!(
+                cache.holds("/a"),
+                "the stale queue item did not evict the new entry"
+            );
+            assert!(!cache.holds("/b"));
+            assert_eq!(cache.len(), 3);
+        }
+    }
+
+    /// An insert that fails to make room leaves the entry it meant to replace where it was.
+    /// That entry was skipped by the eviction on the insert's behalf: it must still have a
+    /// place in the queue, or nothing would ever evict it.
+    #[test]
+    fn an_entry_spared_for_a_replacement_that_did_not_happen_is_still_evictable() {
+        const SMALL: usize = 1_000;
+        let budget = (SMALL as u64 + 1) * cost("/s0000", 4);
+        for cache in both_backends(budget) {
+            put(&cache, "/old", 4, 600); // the oldest, at the front of the queue
+            for i in 0..SMALL {
+                put(&cache, &format!("/s{i:04}"), 4, 600);
+            }
+            // A replacement for "/old" too large to make room for in one insert.
+            put(&cache, "/old", (budget as usize) * 4 / 5, 600);
+            assert!(
+                matches!(cache.get("/old"), CacheLookup::Fresh(h) if h.body.len() == 4),
+                "the small entry is still there"
+            );
+            // Fill the cache again: "/old" takes its turn like any other entry.
+            for i in 0..3 * SMALL {
+                put(&cache, &format!("/t{i:04}"), 4, 600);
+            }
+            assert!(!cache.holds("/old"), "it was evicted in its turn");
+            assert_eq!(cache.bytes(), cache.recount());
+        }
+    }
+
+    /// Entries that leave some other way (replaced, purged) leave their queue item behind.
+    /// The queue must not grow with them: a cache that refreshes the same keys for days
+    /// never evicts, and would otherwise queue an item per refresh for ever.
+    #[test]
+    fn the_queue_stays_in_proportion_to_the_store() {
+        for cache in both_backends(0) {
+            for round in 0..200 {
+                for i in 0..50 {
+                    put_capped(&cache, &format!("/k{i}"), 0); // the same 50 keys, no cap
+                }
+                if round % 20 == 0 {
+                    cache.purge_prefix("/k1");
+                }
+            }
+            let queued = cache.lock_queue().len();
+            assert!(
+                queued <= 2 * cache.len() + QUEUE_SLACK + 1,
+                "{queued} queue items for {} entries",
+                cache.len()
+            );
+            // And after a purge of everything, what is stored next is evictable as usual.
+            cache.purge_all();
+            for i in 0..2_000 {
+                put_capped(&cache, &format!("/n{i}"), 100);
+            }
+            assert_eq!(cache.len(), 100);
+            assert!(cache.holds("/n1999") && !cache.holds("/n0"));
+        }
+    }
+
+    /// What the eviction order is for. A skewed load (Zipf) over three times as many keys
+    /// as the cache holds: evicting the oldest keeps about 80 % of requests as hits. Picking
+    /// victims from the first entries of the map in its iteration order, as the cache did,
+    /// kept 57 %: the keys that hashed there were evicted as soon as they were stored, the
+    /// popular ones among them over and over.
+    #[test]
+    fn a_skewed_load_keeps_a_high_hit_rate_at_the_cap() {
+        const UNIVERSE: usize = 6_000;
+        const CAP: usize = 2_000;
+        const REQUESTS: usize = 300_000;
+        let total: f64 = (1..=UNIVERSE).map(|r| 1.0 / r as f64).sum();
+        let mut acc = 0.0;
+        let cdf: Vec<f64> = (1..=UNIVERSE)
+            .map(|r| {
+                acc += 1.0 / r as f64 / total;
+                acc
+            })
+            .collect();
+        // Keys whose text has nothing to do with their popularity.
+        let keys: Vec<String> = (0..UNIVERSE)
+            .map(|i| format!("/obj/{:x}", (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)))
+            .collect();
+        let cache = StaticCache::with_byte_budget(0);
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut hits = 0usize;
+        for _ in 0..REQUESTS {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let u = (x >> 11) as f64 / (1u64 << 53) as f64;
+            let k = cdf.partition_point(|c| *c < u).min(UNIVERSE - 1);
+            // The shared store only: this thread's own copies would hide the evictions.
+            if cache.holds(&keys[k]) {
+                hits += 1;
+            } else {
+                put_capped(&cache, &keys[k], CAP);
+            }
+        }
+        let rate = 100.0 * hits as f64 / REQUESTS as f64;
+        assert!(rate > 72.0, "hit rate {rate:.1} %");
+        assert_eq!(cache.len(), CAP);
+    }
+
     // ── The byte budget (#524) ───────────────────────────────────────────────
 
     /// A body of `len` bytes, cached for `ttl` seconds.

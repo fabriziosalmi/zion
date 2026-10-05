@@ -242,7 +242,7 @@ circuit, its failure re-opens it. Values shown are the defaults.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `mode` | string | `"memory"` | Cache mode (`"memory"` or `"none"`) |
-| `max_entries` | usize | `10000` | Maximum cached entries; the LRU evicts at this cap. `0` caches nothing (every insert evicts first) — it is not "unlimited".. The cache as a whole is also bounded in bytes, by `[server] cache_max_memory_mb` |
+| `max_entries` | usize | `10000` | Maximum cached entries; at this cap the entries stored first are evicted to make room. `0` caches nothing (every insert evicts first) — it is not "unlimited". The cache as a whole is also bounded in bytes, by `[server] cache_max_memory_mb` |
 | `ttl_seconds` | u64 | `3600` | Time-to-live in seconds (default: 1 hour — a header-less origin response must not be frozen for a year; RFC 9111 §4.2.2 heuristic freshness). |
 | `max_object_mb` | u64 | `50` | Largest response body (MiB) the profile will store; must be >= 1. A bigger one is streamed to the client whole and never cached, so one large object cannot push thousands of small ones out. A declared `Content-Length` over the limit skips buffering altogether. `zion_cache_too_large` counts the refusals |
 | `normalize_query` | bool | `false` | Sort the query parameters in the **cache key**, so `?b=2&a=1` and `?a=1&b=2` share one entry. Opt-in: only safe when the origin does not care about parameter order. Parameters with the same name keep their relative order (`?x=1&x=2` is not `?x=2&x=1`), names are compared exactly, and the upstream is always sent the query as the client wrote it |

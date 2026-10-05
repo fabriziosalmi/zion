@@ -555,6 +555,9 @@ pub struct Metrics {
     /// Entries in the shared response cache, sampled when `/metrics` is rendered. Compare it
     /// with the profiles' `max_entries`: it is what showed (too late) that the cap was not
     /// holding under concurrent inserts (#481).
+    /// Cache hits answered from the shared store, a worker's own L1 copy being absent or
+    /// no longer valid. `cache_hits` minus this is what the L1 tier served.
+    pub cache_shared_hits: AtomicU64,
     pub cache_entries: AtomicU64,
     /// What the response cache holds, in bytes (keys, bodies and a fixed cost per entry).
     pub cache_bytes: AtomicU64,
@@ -650,6 +653,7 @@ impl Metrics {
             health_probe_rounds_total: AtomicU64::new(0),
             health_probe_last_round_timestamp_seconds: AtomicU64::new(0),
             active_connections: AtomicI64::new(0),
+            cache_shared_hits: AtomicU64::new(0),
             cache_entries: AtomicU64::new(0),
             cache_bytes: AtomicU64::new(0),
             cache_budget_skipped: AtomicU64::new(0),
@@ -1107,6 +1111,18 @@ impl Metrics {
                                 zion_cache_entries ",
         );
         out.extend_from_slice(itoa_buf.format(self.cache_entries.load(Relaxed)).as_bytes());
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_cache_shared_hits_total Cache hits answered from the shared store; zion_cache_hits minus this were answered from a worker thread's own copy.\n\
+                                # TYPE zion_cache_shared_hits_total counter\n\
+                                zion_cache_shared_hits_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.cache_shared_hits.load(Relaxed))
+                .as_bytes(),
+        );
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(
