@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Security
+
+- **With rate limiting on, a full rate map froze the proxy.** When the per-IP rate limiter's map reached `rate_limit_max_tracked_ips` and one of the first entries it looked at was stale, it removed that entry while still iterating over the map: the thread waited for a lock it was holding itself and never came back, and every request that needed the same part of the map waited behind it. In a test with a cap of 4, the fifth client hung and after it every request did, `/metrics` included, until restart. Reaching the cap takes 100,000 distinct client addresses within a minute by default, which one host with an IPv6 prefix can produce, so this is a way for an unauthenticated client to stop the proxy. It affects every release since 0.1.8, and only configurations with `rate_limit_rps` set (it is off by default). **Upgrade if you use `rate_limit_rps`.**
+
 ### Changed
 
 - **The response cache has a memory budget: `[server] cache_max_memory_mb`** (#524). The cache was bounded by entries (10,000 per profile by default) and by object size (50 MiB), not by bytes: requests for distinct URLs of a cached route could make it hold entries times object size, far more than the machine has. It now keeps a count of what it holds (keys, bodies and 256 bytes per entry) and stays within a budget: a response that would exceed it evicts the entries closest to expiring, as many as it takes, and is served without being stored if room cannot be made. In a test, 200 distinct 1 MiB responses through a 16 MiB budget left 16 MiB in the cache and the process 60 MiB larger; without the budget the cache held all 200. **Upgrade note:** the budget is on by default, at an eighth of the memory the process may use (the cgroup limit in a container) and never less than 32 MiB. A cache that used to hold more than that now evicts earlier: watch `zion_cache_bytes` against the budget and `zion_cache_budget_skipped_total`, and raise `cache_max_memory_mb` if the hit rate drops. `0` turns the budget off.
