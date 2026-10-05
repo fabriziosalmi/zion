@@ -45,6 +45,24 @@ to_epoch() { # RFC 3339 (Z or +hh:mm, optional fraction) -> epoch; 0 when empty 
     || date -d "$t" +%s 2>/dev/null || echo 0
 }
 
+from_epoch() { # epoch -> "YYYY-MM-DDTHH:MM:SSZ" (BSD date, then GNU date)
+  date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ
+}
+
+# newest <timestamp>... -> the most recent of the RFC 3339 timestamps given; empty when
+# none parses
+newest() {
+  local best="" best_epoch=0 t e
+  for t in "$@"; do
+    e=$(to_epoch "$t")
+    if ((e > best_epoch)); then
+      best_epoch=$e
+      best=$t
+    fi
+  done
+  echo "$best"
+}
+
 # classify <last_success_epoch|0> <created_epoch|0> <max_age_h> <now_epoch>
 # prints: OK <age_h> | NEW <age_h> | STALE never | STALE <age_h>
 classify() {
@@ -101,9 +119,43 @@ if [[ "${1:-}" == "--selftest" ]]; then
   check "STALE never" 0 0 336 $NOW
   # a success always beats newness
   check "OK 5" $((NOW - 5 * H)) $((NOW - 6 * H)) 336 $NOW
+  # newest: the later of two answers wins whatever their order, an empty or unparsable
+  # answer never does, and nothing in gives nothing out
+  newer="2026-10-05T04:06:30Z"
+  older="2026-09-06T04:00:58Z"
+  for got in "$(newest "$older" "$newer")" "$(newest "$newer" "$older")" \
+    "$(newest "" "$newer")" "$(newest "$newer" "")" "$(newest "garbage" "$newer" "")"; do
+    if [[ "$got" != "$newer" ]]; then
+      echo "selftest FAILED: newest gave '$got', expected '$newer'"
+      fail=1
+    fi
+  done
+  [[ -z "$(newest)" && -z "$(newest "" "garbage")" ]] || { echo "selftest FAILED: newest of nothing"; fail=1; }
+  [[ "$(from_epoch "$(to_epoch "$newer")")" == "$newer" ]] || { echo "selftest FAILED: from_epoch"; fail=1; }
   ((fail == 0)) && echo "selftest ok"
   exit "$fail"
 fi
+
+# last_scheduled_success <workflow file> <start of the freshness window>
+# The creation time of the most recent successful SCHEDULED run, asked three ways:
+#   1. filtered by event and status;
+#   2. the same, within the freshness window only (this form was never stale in the
+#      sample above, and can only answer with a run that is fresh);
+#   3. the last 30 scheduled runs, the first success picked here.
+# All three are filtered by `event` on the server: several of these workflows
+# (scorecard, supply-chain, codeql) also run on push and pull_request, and a window
+# of all their runs fills up with those.
+last_scheduled_success() {
+  local name="$1" since="$2" runs="repos/$REPO/actions/workflows/$1/runs?event=schedule"
+  local a b c
+  a=$(gh api "$runs&status=success&per_page=1" \
+    --jq '.workflow_runs[0].created_at // empty' 2>/dev/null) || true
+  b=$(gh api "$runs&status=success&per_page=1&created=%3E$since" \
+    --jq '.workflow_runs[0].created_at // empty' 2>/dev/null) || true
+  c=$(gh api "$runs&per_page=30" \
+    --jq '[.workflow_runs[] | select(.conclusion == "success")][0].created_at // empty' 2>/dev/null) || true
+  newest "$a" "$b" "$c"
+}
 
 now_epoch=$(date -u +%s)
 stale=0
@@ -139,20 +191,35 @@ for f in "$WF_DIR"/*.yml; do
   # Asking for the latest conclusion instead would go green again the moment a
   # manual dispatch succeeded, while the schedule stayed broken.
   #
-  # Filtered server-side rather than by fetching N runs and filtering here.
-  # Several of these workflows (scorecard, supply-chain, codeql) also run on
-  # push and pull_request, so any fixed window can fill up with unrelated runs
-  # and push the last scheduled success out of view — reporting STALE for a
-  # perfectly healthy workflow. A watchdog that cries wolf gets muted, which
-  # returns us to exactly the problem it exists to solve.
-  last_ok=$(gh api \
-    "repos/$REPO/actions/workflows/$name/runs?event=schedule&status=success&per_page=1" \
-    --jq '.workflow_runs[0].created_at // empty' 2>/dev/null) || true
+  # GitHub's filtered run listings sometimes answer from a state weeks old. On
+  # 2026-10-05 the query below gave 2026-09-06 as the last scheduled success of a
+  # workflow that had succeeded five hours earlier, for three workflows in one run
+  # and for none a minute later; sampled 45 times, a listing filtered by `event`
+  # and `status` was stale twice and one filtered by `event` alone once. So the
+  # question is asked three ways (see last_scheduled_success) and the most recent
+  # answer is believed: each answer is a real success, so the newest can only be
+  # nearer the truth. A workflow that still looks stale is asked about again, up
+  # to three times, before it is reported: a wrong STALE needs every answer of
+  # every round to be wrong.
+  #
+  # A watchdog that cries wolf gets muted, which returns us to exactly the problem
+  # it exists to solve.
+  window_start=$(from_epoch $((now_epoch - max_age_h * 3600)))
+  last_ok=""
+  for attempt in 1 2 3; do
+    last_ok=$(newest "$last_ok" "$(last_scheduled_success "$name" "$window_start")")
+    last_epoch=0
+    [[ -n "$last_ok" ]] && last_epoch=$(to_epoch "$last_ok")
+    if ((last_epoch > 0 && (now_epoch - last_epoch) / 3600 <= max_age_h)); then
+      break
+    fi
+    if ((attempt < 3)); then
+      sleep "${CRON_FRESHNESS_RETRY_SLEEP:-5}"
+    fi
+  done
 
   checked=$((checked + 1))
 
-  last_epoch=0
-  [[ -n "$last_ok" ]] && last_epoch=$(to_epoch "$last_ok")
   created_epoch=0
   if ((last_epoch == 0)); then
     # only needed to tell "new" from "stale" when there is no scheduled success to judge by
