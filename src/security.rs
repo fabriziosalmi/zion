@@ -295,21 +295,31 @@ fn try_evict_stale(
     current_window: u32,
 ) -> bool {
     const EVICT_PROBE_LIMIT: usize = 16;
-    // DashMap::iter() walks shards sequentially. We iterate and remove
-    // the first stale entry we find, bounded by EVICT_PROBE_LIMIT.
-    for entry in rate_map.iter().take(EVICT_PROBE_LIMIT) {
-        let val = entry
-            .value()
-            .packed
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if RateEntry::window(val) != current_window {
-            let ip = *entry.key();
-            drop(entry); // release shard lock before remove
+    // Find the first stale entry among the first few, and only then remove it: the
+    // iterator holds a read lock on the shard it is in for as long as it lives, and
+    // `remove` takes the write lock of that same shard. Removing from inside the loop
+    // (dropping the entry first released nothing: the iterator kept its own guard)
+    // blocked the thread for good, and behind it every request whose address fell in
+    // that shard. It happened whenever the map was at its cap and the probe found a
+    // stale entry, from v0.1.8 on.
+    let stale = rate_map
+        .iter()
+        .take(EVICT_PROBE_LIMIT)
+        .find(|entry| {
+            let val = entry
+                .value()
+                .packed
+                .load(std::sync::atomic::Ordering::Relaxed);
+            RateEntry::window(val) != current_window
+        })
+        .map(|entry| *entry.key());
+    match stale {
+        Some(ip) => {
             rate_map.remove(&ip);
-            return true;
+            true
         }
+        None => false,
     }
-    false
 }
 
 /// Scavenge stale entries from the rate map. Designed to be called
@@ -685,7 +695,7 @@ mod proxy_tests {
         // cap of 2 distinct IPs: the third live client is denied, tracked ones are not
         assert!(check_rate_limit(
             100,
-            3600,
+            WINDOW,
             2,
             &map,
             &RateSweep::default(),
@@ -693,7 +703,7 @@ mod proxy_tests {
         ));
         assert!(check_rate_limit(
             100,
-            3600,
+            WINDOW,
             2,
             &map,
             &RateSweep::default(),
@@ -701,7 +711,7 @@ mod proxy_tests {
         ));
         assert!(!check_rate_limit(
             100,
-            3600,
+            WINDOW,
             2,
             &map,
             &RateSweep::default(),
@@ -709,7 +719,7 @@ mod proxy_tests {
         ));
         assert!(check_rate_limit(
             100,
-            3600,
+            WINDOW,
             2,
             &map,
             &RateSweep::default(),
@@ -718,7 +728,7 @@ mod proxy_tests {
         // a larger cap admits it
         assert!(check_rate_limit(
             100,
-            3600,
+            WINDOW,
             3,
             &map,
             &RateSweep::default(),
@@ -726,18 +736,88 @@ mod proxy_tests {
         ));
     }
 
+    /// The window these tests use, in seconds: one that does not roll over while a test
+    /// runs. (With an hour, a test that straddled the top of the hour saw every address it
+    /// had just stored as stale: it happened under Miri, which is slow, and it is how the
+    /// deadlock below was found.) The next boundary is in 2033.
+    const WINDOW: u64 = 1_000_000_000;
+
+    /// The window now, and the one before it.
+    fn windows() -> (u32, u32) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let current = (now / WINDOW) as u32;
+        (current, current - 1)
+    }
+
+    /// Run `f` on another thread and return what it returns, or fail the test if it has
+    /// not come back in ten seconds: a deadlock must be a failure, not a hung test run.
+    fn must_return<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the rate limiter did not return: it is blocked on its own map")
+    }
+
+    /// The map is at its cap and one of the first entries the probe looks at is stale: the
+    /// ordinary case once a site has seen more addresses than the cap. The probe removed it
+    /// while still iterating, and never returned.
+    #[test]
+    fn the_probe_removes_a_stale_entry_and_returns() {
+        // Few entries, all stale: whatever order the map iterates in, the probe finds one.
+        for stale_entries in [1u32, 4, 16, 40] {
+            let (admitted, left) = must_return(move || {
+                let (_, previous) = windows();
+                let map = crate::numa::NumaAwareMap::new();
+                for n in 0..stale_entries {
+                    map.insert(
+                        std::net::IpAddr::from(n.to_be_bytes()),
+                        RateEntry::new(previous),
+                    );
+                }
+                let newcomer = std::net::IpAddr::from([203, 0, 113, 7]);
+                let admitted = check_rate_limit(
+                    100,
+                    WINDOW,
+                    stale_entries as usize,
+                    &map,
+                    &RateSweep::default(),
+                    newcomer,
+                );
+                // And the map is usable afterwards, for writes too.
+                map.insert(
+                    std::net::IpAddr::from([203, 0, 113, 8]),
+                    RateEntry::new(previous),
+                );
+                map.remove(&std::net::IpAddr::from([203, 0, 113, 8]));
+                (admitted, map.len())
+            });
+            assert!(
+                admitted,
+                "{stale_entries} stale entries: the newcomer is admitted"
+            );
+            assert_eq!(
+                left, stale_entries as usize,
+                "one stale entry made room for it"
+            );
+        }
+    }
+
     /// A rate map at its cap, holding `live_head` addresses seen in the current window in
     /// the places the cheap probe looks at, and addresses of a past window everywhere else.
     /// Returns the map and the current window.
     fn map_at_cap_with_stale_entries_beyond_the_probe(
         cap: u32,
-        window_secs: u64,
     ) -> (crate::numa::NumaAwareMap<std::net::IpAddr, RateEntry>, u32) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let current = (now / window_secs) as u32;
+        let current = (now / WINDOW) as u32;
         let map = crate::numa::NumaAwareMap::new();
         for n in 0..cap {
             let ip = std::net::IpAddr::from(n.to_be_bytes());
@@ -757,12 +837,12 @@ mod proxy_tests {
     #[test]
     fn a_map_full_of_addresses_from_past_windows_admits_a_new_client() {
         const CAP: u32 = 5_000;
-        let (map, _) = map_at_cap_with_stale_entries_beyond_the_probe(CAP, 3_600);
+        let (map, _) = map_at_cap_with_stale_entries_beyond_the_probe(CAP);
         assert_eq!(map.len(), CAP as usize);
         let sweep = RateSweep::default();
         let newcomer = std::net::IpAddr::from([203, 0, 113, 7]);
         assert!(
-            check_rate_limit(100, 3_600, CAP as usize, &map, &sweep, newcomer),
+            check_rate_limit(100, WINDOW, CAP as usize, &map, &sweep, newcomer),
             "a new client is admitted: the map was full of stale entries"
         );
         assert_eq!(
@@ -779,12 +859,12 @@ mod proxy_tests {
     #[test]
     fn the_full_sweep_runs_once_per_window() {
         const CAP: u32 = 2_000;
-        let (map, current) = map_at_cap_with_stale_entries_beyond_the_probe(CAP, 3_600);
+        let (map, current) = map_at_cap_with_stale_entries_beyond_the_probe(CAP);
         let sweep = RateSweep::default();
         let ip = |n: u8| std::net::IpAddr::from([203, 0, 113, n]);
         assert!(check_rate_limit(
             100,
-            3_600,
+            WINDOW,
             CAP as usize,
             &map,
             &sweep,
@@ -803,14 +883,14 @@ mod proxy_tests {
         }
         let before = map.len();
         assert!(
-            !check_rate_limit(100, 3_600, before, &map, &sweep, ip(2)),
+            !check_rate_limit(100, WINDOW, before, &map, &sweep, ip(2)),
             "no second sweep in the same window"
         );
         assert_eq!(map.len(), before, "nothing was removed");
         // A fresh marker (as in the next window) sweeps again.
         assert!(check_rate_limit(
             100,
-            3_600,
+            WINDOW,
             before,
             &map,
             &RateSweep::default(),
@@ -827,19 +907,19 @@ mod proxy_tests {
         let sweep = RateSweep::default();
         let ip = |n: u32| std::net::IpAddr::from(n.to_be_bytes());
         for n in 0..500 {
-            assert!(check_rate_limit(100, 3_600, 500, &map, &sweep, ip(n)));
+            assert!(check_rate_limit(100, WINDOW, 500, &map, &sweep, ip(n)));
         }
-        assert!(!check_rate_limit(100, 3_600, 500, &map, &sweep, ip(9_999)));
+        assert!(!check_rate_limit(100, WINDOW, 500, &map, &sweep, ip(9_999)));
         assert!(!check_rate_limit(
             100,
-            3_600,
+            WINDOW,
             500,
             &map,
             &RateSweep::default(),
             ip(9_998)
         ));
         assert_eq!(map.len(), 500);
-        assert!(check_rate_limit(100, 3_600, 500, &map, &sweep, ip(3)));
+        assert!(check_rate_limit(100, WINDOW, 500, &map, &sweep, ip(3)));
     }
 
     #[test]
