@@ -137,9 +137,34 @@ impl VaryRule {
 
 /// Primary key → the headers its responses vary on. Expires with the responses it
 /// describes, and is bounded, so it cannot outgrow the cache it indexes.
-#[derive(Default)]
 pub struct VaryRules {
     map: DashMap<Arc<str>, Arc<VaryRule>>,
+    /// The soonest expiry among the rules, in milliseconds since `epoch`: before it, a
+    /// sweep of a full index can free nothing, and a new key is refused without looking at
+    /// the index. Set by each sweep and lowered by each rule installed. `0` = unknown.
+    soonest_expiry_ms: std::sync::atomic::AtomicU64,
+    /// When the last sweep started (same clock); `0` = never.
+    last_sweep_ms: std::sync::atomic::AtomicU64,
+    epoch: Instant,
+    /// Sweeps of the whole index so far.
+    sweeps: std::sync::atomic::AtomicU64,
+}
+
+/// The least time between two sweeps of a full index. A sweep reads every rule and locks
+/// every shard: which URLs miss the cache is the client's choice, so the sweep must not be
+/// something each of them can trigger (#526).
+const SWEEP_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+impl Default for VaryRules {
+    fn default() -> Self {
+        Self {
+            map: DashMap::new(),
+            soonest_expiry_ms: std::sync::atomic::AtomicU64::new(0),
+            last_sweep_ms: std::sync::atomic::AtomicU64::new(0),
+            epoch: Instant::now(),
+            sweeps: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
 }
 
 impl VaryRules {
@@ -167,20 +192,72 @@ impl VaryRules {
                 return Some(existing);
             }
         }
-        if self.map.len() >= max_rules.max(1) {
-            let now = Instant::now();
-            self.map.retain(|_, r| now < r.expires_at);
-            if self.map.len() >= max_rules.max(1) {
-                return None;
-            }
+        if self.map.len() >= max_rules.max(1) && !self.make_room(max_rules.max(1)) {
+            return None;
         }
         let rule = Arc::new(VaryRule {
             names,
             expires_at: Instant::now() + Duration::from_secs(ttl_secs),
             variants: Mutex::new(HashSet::new()),
         });
+        // A rule that expires before the soonest known one moves the next useful sweep up.
+        let expires_ms = self.ms(rule.expires_at);
+        let soonest = &self.soonest_expiry_ms;
+        let mut known = soonest.load(std::sync::atomic::Ordering::Relaxed);
+        while known != 0 && expires_ms < known {
+            match soonest.compare_exchange_weak(
+                known,
+                expires_ms,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(now) => known = now,
+            }
+        }
         self.map.insert(Arc::from(primary), rule.clone());
         Some(rule)
+    }
+
+    /// Milliseconds since `epoch`, never `0` (which the atomics use for "not set").
+    fn ms(&self, t: Instant) -> u64 {
+        t.saturating_duration_since(self.epoch).as_millis() as u64 + 1
+    }
+
+    /// The index is full: drop the rules that have expired, if a sweep can free one and
+    /// none ran in the last [`SWEEP_MIN_INTERVAL`]. `false` when there is still no room.
+    /// When no sweep is due the answer costs two comparisons: before, every miss of a new
+    /// varying URL swept the whole index, found the rules still alive, and was refused
+    /// anyway.
+    fn make_room(&self, max_rules: usize) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = Instant::now();
+        let now_ms = self.ms(now);
+        let last = self.last_sweep_ms.load(Relaxed);
+        let too_soon = last != 0 && now_ms < last + SWEEP_MIN_INTERVAL.as_millis() as u64;
+        if too_soon || now_ms < self.soonest_expiry_ms.load(Relaxed) {
+            return false;
+        }
+        // One thread sweeps; the others see that a sweep has just started.
+        if self
+            .last_sweep_ms
+            .compare_exchange(last, now_ms, Relaxed, Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        self.sweeps.fetch_add(1, Relaxed);
+        let mut soonest: Option<Instant> = None;
+        self.map.retain(|_, r| {
+            let live = now < r.expires_at;
+            if live {
+                soonest = Some(soonest.map_or(r.expires_at, |s| s.min(r.expires_at)));
+            }
+            live
+        });
+        self.soonest_expiry_ms
+            .store(soonest.map_or(0, |s| self.ms(s)), Relaxed);
+        self.map.len() < max_rules
     }
 
     pub fn remove(&self, primary: &str) {
@@ -311,6 +388,134 @@ mod tests {
         let n = vec!["x-a".to_string()];
         let long = "a".repeat(MAX_VALUE_LEN + 200);
         assert!(variant_key("/p", &n, &req(&[("x-a", &long)])).is_none());
+    }
+
+    fn sweeps(rules: &VaryRules) -> u64 {
+        rules.sweeps.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #526: with the index full of rules that are still alive, each new varying URL used
+    /// to sweep the whole index (every shard locked) and be refused anyway. Which URLs
+    /// miss is the client's choice. Now the first one sweeps and the rest are refused for
+    /// the price of a comparison.
+    #[test]
+    fn a_full_index_of_live_rules_refuses_without_sweeping_each_time() {
+        let rules = VaryRules::default();
+        for i in 0..500 {
+            assert!(rules
+                .install(&format!("/p{i}"), vec!["x-a".into()], 600, 500)
+                .is_some());
+        }
+        assert_eq!(sweeps(&rules), 0, "no sweep while there is room");
+        for i in 0..10_000 {
+            assert!(
+                rules
+                    .install(&format!("/new{i}"), vec!["x-a".into()], 600, 500)
+                    .is_none(),
+                "full of live rules: refused"
+            );
+        }
+        assert_eq!(sweeps(&rules), 1, "one sweep for 10,000 refusals");
+        assert_eq!(rules.map.len(), 500);
+        // A key that has its rule is not affected by any of this.
+        assert!(rules.install("/p7", vec!["x-a".into()], 600, 500).is_some());
+        assert!(rules.get("/p7").is_some());
+    }
+
+    #[test]
+    fn expired_rules_make_room_for_new_ones() {
+        let rules = VaryRules::default();
+        rules.install("/gone", vec!["x-a".into()], 0, 3).unwrap(); // expires at once
+        rules.install("/b", vec!["x-a".into()], 600, 3).unwrap();
+        rules.install("/c", vec!["x-a".into()], 600, 3).unwrap();
+        // (`map.len()`, not `get`: `get` would drop the expired rule itself)
+        assert_eq!(rules.map.len(), 3);
+        assert!(
+            rules.install("/d", vec!["x-a".into()], 600, 3).is_some(),
+            "the expired rule was swept and its place taken"
+        );
+        assert_eq!(sweeps(&rules), 1);
+        assert!(rules.map.get("/gone").is_none());
+        assert_eq!(rules.map.len(), 3);
+    }
+
+    /// The refusal is cheap only until a sweep could free something. A rule that expires
+    /// soon, installed after the last sweep, must bring the next sweep forward: or the
+    /// index would stay full of nothing for as long as its longest-lived rules.
+    #[test]
+    fn a_rule_about_to_expire_is_swept_when_it_does_not_an_hour_later() {
+        let rules = VaryRules::default();
+        for i in 0..3 {
+            rules
+                .install(&format!("/long{i}"), vec!["x-a".into()], 3_600, 3)
+                .unwrap();
+        }
+        assert!(rules.install("/x", vec!["x-a".into()], 3_600, 3).is_none());
+        assert_eq!(
+            sweeps(&rules),
+            1,
+            "swept once: the soonest expiry is an hour away"
+        );
+        // One long-lived rule goes (a purge), and a rule that lives one second takes its place.
+        rules.remove("/long0");
+        rules.install("/short", vec!["x-a".into()], 1, 3).unwrap();
+        assert!(
+            rules.install("/y", vec!["x-a".into()], 3_600, 3).is_none(),
+            "full"
+        );
+        assert_eq!(sweeps(&rules), 1, "and nothing to sweep yet");
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert!(
+            rules.install("/y", vec!["x-a".into()], 3_600, 3).is_some(),
+            "the short-lived rule expired: swept, and its place taken"
+        );
+        assert_eq!(sweeps(&rules), 2);
+        assert!(rules.map.get("/short").is_none());
+    }
+
+    /// A second later nothing has changed: the rules all live for an hour, and a sweep that
+    /// can free nothing is not run just because one is allowed.
+    #[test]
+    fn a_full_index_is_not_swept_again_before_a_rule_can_have_expired() {
+        let rules = VaryRules::default();
+        for i in 0..20 {
+            rules
+                .install(&format!("/p{i}"), vec!["x-a".into()], 3_600, 20)
+                .unwrap();
+        }
+        assert!(rules.install("/x", vec!["x-a".into()], 3_600, 20).is_none());
+        assert_eq!(sweeps(&rules), 1);
+        std::thread::sleep(SWEEP_MIN_INTERVAL + Duration::from_millis(100));
+        assert!(rules.install("/x", vec!["x-a".into()], 3_600, 20).is_none());
+        assert_eq!(sweeps(&rules), 1, "nothing could have expired: no sweep");
+    }
+
+    /// And when rules expire one after the other, the sweeps are spaced: not one per rule.
+    #[test]
+    fn sweeps_are_at_least_a_second_apart() {
+        let rules = VaryRules::default();
+        for i in 0..50 {
+            rules
+                .install(&format!("/p{i}"), vec!["x-a".into()], 600, 50)
+                .unwrap();
+        }
+        assert!(rules.install("/x", vec!["x-a".into()], 600, 50).is_none());
+        assert_eq!(sweeps(&rules), 1);
+        // Rules that expire at once keep arriving in freed places; the index is full of
+        // expired rules again and again within the same second.
+        for round in 0..20 {
+            rules.remove(&format!("/p{round}"));
+            rules
+                .install(&format!("/e{round}"), vec!["x-a".into()], 0, 50)
+                .unwrap();
+            let _ = rules.install(&format!("/n{round}"), vec!["x-a".into()], 600, 50);
+        }
+        assert_eq!(sweeps(&rules), 1, "no second sweep within the interval");
+        std::thread::sleep(SWEEP_MIN_INTERVAL + Duration::from_millis(100));
+        assert!(rules
+            .install("/after", vec!["x-a".into()], 600, 50)
+            .is_some());
+        assert_eq!(sweeps(&rules), 2);
     }
 
     #[test]
