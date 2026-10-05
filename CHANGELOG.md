@@ -4,6 +4,19 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.9.12] - 2026-10-05
+
+**Security release: with rate limiting on, a full rate map froze the proxy.** If `rate_limit_rps` is set, upgrade: when the per-IP rate map reached `rate_limit_max_tracked_ips` a request thread could block for ever on the map, and every request behind it. Also in this release: the response cache has a memory budget, a full cache keeps far more hits, and the rate limiter no longer refuses new clients while its map is full of addresses it no longer needs.
+
+### Upgrade notes
+
+- **Upgrade if you use `rate_limit_rps`.** Nothing to configure.
+- **The response cache now has a memory budget, on by default**: an eighth of the memory the process may use (the cgroup limit in a container), never less than 32 MiB. A cache that used to hold more than that evicts earlier. Watch `zion_cache_bytes` against the budget and `zion_cache_budget_skipped_total`; raise `[server] cache_max_memory_mb` if the hit rate drops, or set it to `0` for no budget.
+- **A full cache evicts the entries stored first**, where it used to pick among the first few of its map. Hit rates under a full cache go up (57 % to 82 % in the test that found it); nothing to configure.
+- **`rate_limit_max_tracked_ips` now means what its documentation said**: a new address is refused only when the map holds that many addresses seen in the current window. Before, a map at the cap could refuse new clients for up to a minute.
+- **The embedded Italian and EU-27 address tables are the 2026-10-05 snapshot.** It corrects three blocks that were wrong since 0.9.2 (a research network counted as plain EU space, a residential block counted as a datacenter, an Italian residential block missing); how those tables are refreshed is under review (#568).
+- No setting was removed.
+
 ### Security
 
 - **With rate limiting on, a full rate map froze the proxy.** When the per-IP rate limiter's map reached `rate_limit_max_tracked_ips` and one of the first entries it looked at was stale, it removed that entry while still iterating over the map: the thread waited for a lock it was holding itself and never came back, and every request that needed the same part of the map waited behind it. In a test with a cap of 4, the fifth client hung and after it every request did, `/metrics` included, until restart. Reaching the cap takes 100,000 distinct client addresses within a minute by default, which one host with an IPv6 prefix can produce, so this is a way for an unauthenticated client to stop the proxy. It affects every release since 0.1.8, and only configurations with `rate_limit_rps` set (it is off by default). **Upgrade if you use `rate_limit_rps`.**
