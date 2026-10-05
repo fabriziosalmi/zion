@@ -583,6 +583,35 @@ mod tests {
         assert_eq!(snap.tcp_user_timeout_secs, 33);
     }
 
+    /// `h2_control_frames_per_sec` is read from the live snapshot when a connection is
+    /// accepted (#475), so a reload that sets, changes or removes it must reach the snapshot.
+    #[test]
+    fn the_h2_control_frame_limit_is_carried_in_the_snapshot() {
+        let build = |line: &str| {
+            let cfg = parse_inline(&format!(
+                r#"
+            [server]
+            listen_http = "0.0.0.0:8080"
+            listen_https = "0.0.0.0:8443"
+            {line}
+            [tls]
+            cert_path = "/tmp/zion-test.crt"
+            key_path  = "/tmp/zion-test.key"
+            [upstreams]
+            api = "http://api:8000"
+            [[route]]
+            path = "/api/{{*rest}}"
+            upstream = "api"
+        "#
+            ));
+            ResolvedAppConfig::try_build(&cfg, TEST_CONN_LIMIT_MAX)
+                .expect("test config builds")
+                .h2_control_frames_per_sec
+        };
+        assert_eq!(build(""), 0);
+        assert_eq!(build("h2_control_frames_per_sec = 750"), 750);
+    }
+
     /// Building a snapshot must not change the running DNS policy: a reload that is built but
     /// then rejected (or a build that is never published) leaves it alone. Only publishing
     /// applies it.

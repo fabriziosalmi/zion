@@ -286,6 +286,17 @@ pub struct ServerConfig {
     /// pause you accept (for example `300`). Retuned live on reload for new connections.
     #[serde(default = "default_tcp_user_timeout_secs")]
     pub tcp_user_timeout_secs: u64,
+    /// HTTP/2 control frames one connection may send per second before it is closed with
+    /// `GOAWAY(ENHANCE_YOUR_CALM)`: `PING`, `SETTINGS`, `PRIORITY`, empty `DATA`, frames of
+    /// a type the server skips, and `RST_STREAM`s beyond the streams the client opened.
+    /// `WINDOW_UPDATE`s are bounded separately, in proportion to the response bytes the
+    /// client was sent. `0` (the default) sets no limit; the frames are still counted, and
+    /// `zion_h2_control_frames_peak` shows the highest rate any connection reached, which
+    /// is the number to read before choosing a limit. `1`..`9` is refused: an ordinary
+    /// client sends two or three when it connects. Read at accept, so a reload applies it
+    /// to new connections.
+    #[serde(default)]
+    pub h2_control_frames_per_sec: u32,
     /// Log format: "text" (default) or "json".
     #[serde(default = "default_log_format")]
     pub log_format: String,
@@ -337,6 +348,9 @@ pub struct ServerConfig {
 fn default_xff_mode() -> String {
     "append".to_string()
 }
+
+/// The lowest `h2_control_frames_per_sec` that is not `0` (no limit).
+const H2_CONTROL_FRAMES_PER_SEC_MIN: u32 = 10;
 
 fn default_tcp_user_timeout_secs() -> u64 {
     crate::net::DEFAULT_TCP_USER_TIMEOUT_SECS
@@ -1909,6 +1923,14 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             ));
         }
     }
+    if (1..H2_CONTROL_FRAMES_PER_SEC_MIN).contains(&config.server.h2_control_frames_per_sec) {
+        errors.push(format!(
+            "server.h2_control_frames_per_sec = {} would close ordinary clients, which send two \
+             or three control frames when they connect: use {H2_CONTROL_FRAMES_PER_SEC_MIN} or \
+             more, or 0 for no limit",
+            config.server.h2_control_frames_per_sec
+        ));
+    }
     if config.server.rate_limit_max_tracked_ips == 0 {
         errors.push(
             "server.rate_limit_max_tracked_ips must be >= 1 (a cap of 0 would deny every new client)"
@@ -2963,6 +2985,44 @@ mod tests {
         assert_eq!(parse("").server.log_queue_lines, 8192);
         assert_eq!(parse("log_queue_lines = 100").server.log_queue_lines, 100);
         assert_eq!(parse("log_queue_lines = 0").server.log_queue_lines, 0);
+    }
+
+    #[test]
+    fn h2_control_frames_per_sec_is_off_by_default_and_refuses_a_limit_that_breaks_clients() {
+        let cfg = |extra: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n{extra}\n[tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstream.u]\nurl=\"http://a:1\"\n[[route]]\npath=\"/{{*r}}\"\nupstream=\"u\"\n"
+            )
+        };
+        let limit = |extra: &str| -> u32 {
+            toml::from_str::<ZionConfig>(&cfg(extra))
+                .unwrap()
+                .server
+                .h2_control_frames_per_sec
+        };
+        // (the placeholder cert/key paths fail the file checks; only this setting matters here)
+        let errs = |extra: &str| validate_str(&cfg(extra), "t").err().unwrap_or_default();
+        assert_eq!(limit(""), 0, "no limit unless asked for");
+        for ok in [
+            "",
+            "h2_control_frames_per_sec = 0",
+            "h2_control_frames_per_sec = 10",
+        ] {
+            assert!(!errs(ok).contains("h2_control_frames_per_sec"), "{ok}");
+        }
+        assert_eq!(limit("h2_control_frames_per_sec = 1000"), 1000);
+        // A client's own SETTINGS, its SETTINGS ack and a PING are three: a limit below
+        // ten is a typo or a misunderstanding, and it would close every connection.
+        for low in [1, 3, 9] {
+            let e = errs(&format!("h2_control_frames_per_sec = {low}"));
+            assert!(
+                e.contains(&format!(
+                    "server.h2_control_frames_per_sec = {low} would close"
+                )) && e.contains("use 10 or more, or 0 for no limit"),
+                "{e}"
+            );
+        }
+        assert!(toml::from_str::<ZionConfig>(&cfg("h2_control_frames_per_sec = -1")).is_err());
     }
 
     #[test]
