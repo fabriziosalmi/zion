@@ -15,11 +15,16 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Fixed
 
+- **A full cache evicted the wrong entries** (#525). To make room the cache looked at the first 64 entries of its map, in the map's own order: always the same corner of it. The entries that hashed there were evicted as soon as they were stored, the popular ones among them over and over, while the rest of the cache never moved until it expired. Under a skewed load (Zipf popularity, a cache a third the size of the key set) 57 % of requests were hits. The cache now evicts the entries stored first, and the same load gives 82 %. A key stored again counts as new.
+- **Storing one response made every worker throw away its own copies of all the others** (#525). Each worker thread keeps copies of small hot responses so that a hit does not touch the shared store; every store bumped one counter that invalidated all of them, on all threads. Copies are now invalidated by key (in 1,024 groups): with a second client storing new URLs continuously, 99.8 % of hits on a hot object are answered from the worker's own copy. On the test machine this did not change CPU measurably end to end (a lookup is 0.36 µs of a 28 µs request); under 8 threads on one hot key a lookup that finds its copy takes 0.96 µs against 3.3 µs when it does not.
+- **An entry evicted from the shared cache could still be served from a worker's own copy** until its TTL. An eviction now invalidates the copies of that key.
+
 - **The rate limiter turned new clients away while its map was full of addresses it no longer needed** (#528). At `rate_limit_max_tracked_ips` the limiter made room by looking for a stale entry among the first 16 of the map, always the same ones. When those belonged to clients still active, every new address was refused with `429` although the rest of the map held addresses not seen for up to a minute (the background clean-up runs every 60 s). A site with more distinct clients per minute than the cap, 100,000 by default, refused new visitors under ordinary traffic. The map is now swept in full when that look finds nothing, once per window at most (about 5 ms per 100,000 entries), so a new address is refused only when the map really holds that many addresses seen in the current window. The setting's documentation said to size it for the clients of one window; that is now what it means.
 
 ### Added
 
 - **`zion_cache_bytes`** (gauge) and **`zion_cache_budget_skipped_total`** (counter), for the budget above.
+- **`zion_cache_shared_hits_total`**: cache hits answered from the shared store; `zion_cache_hits` minus this were answered from a worker thread's own copy.
 
 ## [0.9.11] - 2026-10-05
 
