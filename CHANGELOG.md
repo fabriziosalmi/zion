@@ -4,6 +4,15 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **The response cache has a memory budget: `[server] cache_max_memory_mb`** (#524). The cache was bounded by entries (10,000 per profile by default) and by object size (50 MiB), not by bytes: requests for distinct URLs of a cached route could make it hold entries times object size, far more than the machine has. It now keeps a count of what it holds (keys, bodies and 256 bytes per entry) and stays within a budget: a response that would exceed it evicts the entries closest to expiring, as many as it takes, and is served without being stored if room cannot be made. In a test, 200 distinct 1 MiB responses through a 16 MiB budget left 16 MiB in the cache and the process 60 MiB larger; without the budget the cache held all 200. **Upgrade note:** the budget is on by default, at an eighth of the memory the process may use (the cgroup limit in a container) and never less than 32 MiB. A cache that used to hold more than that now evicts earlier: watch `zion_cache_bytes` against the budget and `zion_cache_budget_skipped_total`, and raise `cache_max_memory_mb` if the hit rate drops. `0` turns the budget off.
+- **A worker thread's own hot cache keeps small bodies only** (64 KiB or less). Those per-thread copies are outside the budget and could keep a large body alive after the shared cache had dropped it. Larger responses are served from the shared cache on every hit.
+
+### Added
+
+- **`zion_cache_bytes`** (gauge) and **`zion_cache_budget_skipped_total`** (counter), for the budget above.
+
 ## [0.9.11] - 2026-10-05
 
 **Security release for cached routes: one client could make a URL unanswerable for everyone, and requests could wait for ever.** If a route uses `mode = "static_cache"` or a `cache_profile`, upgrade. A client that closed its connection while its request was being fetched from the origin left that URL without an answer for every later request, until restart; and when the origin's response was not stored (a `404`, a `500`, `no-store`), only the first of the requests that had arrived together was answered. Nothing else changes in this release, and there is nothing to configure.

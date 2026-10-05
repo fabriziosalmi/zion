@@ -429,7 +429,46 @@ pub struct StaticCache {
     /// Bumped by every tag purge (and `purge_all`): a response fetched before a purge must not
     /// be stored after it (see [`StaticCache::insert_tagged`]).
     tag_epoch: std::sync::atomic::AtomicU64,
+    /// What the stored entries cost in memory ([`entry_cost`] of each), plus the room
+    /// reserved by inserts in progress. Every change to the store goes through
+    /// `map_insert` / `map_remove` / `map_retain`, which keep it exact.
+    bytes: std::sync::atomic::AtomicU64,
+    /// A budget for this cache alone, in place of the process-wide one (tests).
+    own_budget: Option<std::sync::atomic::AtomicU64>,
 }
+
+/// The memory budget of the response cache, in bytes: `[server] cache_max_memory_mb`,
+/// applied at boot and when a reload is published. `0` = no budget.
+static BYTE_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set the process-wide byte budget of the response cache (`0` = none). A lower budget
+/// takes effect as entries are stored: each insert evicts until the cache is under it.
+pub fn configure(budget_bytes: u64) {
+    BYTE_BUDGET.store(budget_bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The budget when `cache_max_memory_mb` is not set: an eighth of the memory the process
+/// may use (the cgroup limit when there is one), and never less than 32 MiB.
+pub fn default_budget_mb(usable_memory_mb: u64) -> u64 {
+    (usable_memory_mb / 8).max(32)
+}
+
+/// What one entry is counted as, on top of its key and body: the entry itself, its
+/// metadata (a few short header values) and its slot in the map. An estimate, there so
+/// that a cache of empty bodies is not counted as free.
+const ENTRY_OVERHEAD_BYTES: u64 = 256;
+
+/// The memory one stored entry is counted as.
+fn entry_cost(key: &str, entry: &L2Entry) -> u64 {
+    (key.len() + entry.body.len()) as u64 + ENTRY_OVERHEAD_BYTES
+}
+
+/// The largest body a worker thread keeps in its own L1 cache. L1 entries are not in the
+/// byte budget (they are clones the shared store may have evicted since), and each thread
+/// holds up to `l1_hot_entries` of them: without a cap, a few hundred large objects per
+/// thread could stay alive long after the store dropped them. Larger bodies are served
+/// from the shared store on every hit.
+const L1_MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// Entries one eviction round looks at: a bounded sample, never the whole map.
 const EVICT_SAMPLE: usize = 64;
@@ -439,26 +478,144 @@ const EVICT_SAMPLE: usize = 64;
 const EVICT_ROUNDS: usize = 8;
 
 impl StaticCache {
-    /// One eviction round over a sample of the shared map: drop what has expired, or else the
-    /// entry closest to expiring.
-    fn evict_round(l2: &DashMap<Arc<str>, L2Entry>) {
+    /// One eviction round over a sample of the store: drop what has expired, or else the
+    /// entries closest to expiring, one of them and then as many more as it takes to free
+    /// `need_bytes`. Returns nothing: what was freed shows in `self.bytes`, and a round that
+    /// frees nothing means another thread took the same victims.
+    ///
+    /// `keep` is never a victim: the key an insert is about to replace. Its bytes are already
+    /// counted against the room that insert reserved, so evicting it frees nothing the insert
+    /// can use, and the count would end over the budget by exactly its size.
+    fn evict_round(&self, need_bytes: u64, keep: Option<&str>) {
         let now = Instant::now();
-        let mut expired_keys: Vec<Arc<str>> = Vec::new();
+        // First pass, which is all an insert at the entry cap needs and costs what it did
+        // before there was a budget: what has expired, and the one entry closest to it.
+        let mut expired: Vec<Arc<str>> = Vec::new();
         let mut oldest: Option<(Arc<str>, Instant)> = None;
-        for entry in l2.iter().take(EVICT_SAMPLE) {
-            if now >= entry.expires_at {
-                expired_keys.push(entry.key().clone());
-            } else if oldest.as_ref().is_none_or(|(_, at)| entry.expires_at < *at) {
-                oldest = Some((entry.key().clone(), entry.expires_at));
+        self.sample(|key, expires_at| {
+            if keep == Some(key.as_ref()) {
+                return;
+            }
+            if now >= expires_at {
+                expired.push(key.clone());
+            } else if oldest.as_ref().is_none_or(|(_, at)| expires_at < *at) {
+                oldest = Some((key.clone(), expires_at));
+            }
+        });
+        let mut freed = 0u64;
+        for key in &expired {
+            freed += self.map_remove(key).map_or(0, |e| entry_cost(key, &e));
+        }
+        if expired.is_empty() {
+            if let Some((key, _)) = &oldest {
+                freed += self.map_remove(key).map_or(0, |e| entry_cost(key, &e));
             }
         }
-        for key in &expired_keys {
-            l2.remove(key);
+        if freed >= need_bytes {
+            return;
         }
-        if expired_keys.is_empty() {
-            if let Some((key, _)) = oldest {
-                l2.remove(&key);
+        // The bytes ask for more than that: the rest of the sample, soonest to expire first.
+        let mut rest: Vec<(Arc<str>, Instant)> = Vec::new();
+        self.sample(|key, expires_at| {
+            if keep != Some(key.as_ref()) {
+                rest.push((key.clone(), expires_at));
             }
+        });
+        rest.sort_by_key(|(_, expires_at)| *expires_at);
+        for (key, _) in &rest {
+            if freed >= need_bytes {
+                break;
+            }
+            freed += self.map_remove(key).map_or(0, |e| entry_cost(key, &e));
+        }
+    }
+
+    /// Visit the entries one eviction round looks at: (key, when it expires).
+    fn sample(&self, mut visit: impl FnMut(&Arc<str>, Instant)) {
+        match &self.l2 {
+            Some(l2) => {
+                for e in l2.iter().take(EVICT_SAMPLE) {
+                    visit(e.key(), e.expires_at);
+                }
+            }
+            None => LOCAL_L2.with(|m| {
+                for (k, v) in m.borrow().iter().take(EVICT_SAMPLE) {
+                    visit(k, v.expires_at);
+                }
+            }),
+        }
+    }
+
+    /// The byte budget in force for this cache (`0` = none).
+    fn budget(&self) -> u64 {
+        self.own_budget
+            .as_ref()
+            .unwrap_or(&BYTE_BUDGET)
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// What the cache holds, in bytes as [`entry_cost`] counts them.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn sub_bytes(&self, n: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Never below zero: a counter that wrapped would look like a cache over any budget.
+        let mut seen = self.bytes.load(Relaxed);
+        while let Err(now) =
+            self.bytes
+                .compare_exchange_weak(seen, seen.saturating_sub(n), Relaxed, Relaxed)
+        {
+            seen = now;
+        }
+    }
+
+    /// Store an entry in whichever backend is in use, without touching the byte count
+    /// (the caller reserved the room): the entry it replaced, if any.
+    fn map_insert_raw(&self, key: Arc<str>, entry: L2Entry) -> Option<L2Entry> {
+        match &self.l2 {
+            Some(l2) => l2.insert(key, entry),
+            None => LOCAL_L2.with(|m| m.borrow_mut().insert(key, entry)),
+        }
+    }
+
+    /// Remove one entry, and its cost from the byte count.
+    fn map_remove(&self, key: &str) -> Option<L2Entry> {
+        let removed = match &self.l2 {
+            Some(l2) => l2.remove(key).map(|(_, e)| e),
+            None => LOCAL_L2.with(|m| m.borrow_mut().remove(key)),
+        };
+        if let Some(e) = &removed {
+            self.sub_bytes(entry_cost(key, e));
+        }
+        removed
+    }
+
+    /// Keep the entries `keep` says to, drop the others and their cost: how many went.
+    fn map_retain(&self, mut keep: impl FnMut(&str) -> bool) -> usize {
+        let (mut removed, mut freed) = (0usize, 0u64);
+        let mut visit = |k: &Arc<str>, e: &mut L2Entry| {
+            let stay = keep(k);
+            if !stay {
+                removed += 1;
+                freed += entry_cost(k, e);
+            }
+            stay
+        };
+        match &self.l2 {
+            Some(l2) => l2.retain(&mut visit),
+            None => LOCAL_L2.with(|m| m.borrow_mut().retain(&mut visit)),
+        }
+        self.sub_bytes(freed);
+        removed
+    }
+
+    /// The cost of the entry stored under `key`, `0` when there is none.
+    fn cost_of(&self, key: &str) -> u64 {
+        match &self.l2 {
+            Some(l2) => l2.get(key).map_or(0, |e| entry_cost(key, &e)),
+            None => LOCAL_L2.with(|m| m.borrow().get(key).map_or(0, |e| entry_cost(key, e))),
         }
     }
 
@@ -483,6 +640,39 @@ impl StaticCache {
             tags: Mutex::new(TagIndex::default()),
             tagged_keys: std::sync::atomic::AtomicUsize::new(0),
             tag_epoch: std::sync::atomic::AtomicU64::new(0),
+            bytes: std::sync::atomic::AtomicU64::new(0),
+            own_budget: None,
+        }
+    }
+
+    /// A cache with a byte budget of its own, whatever the process-wide one is.
+    #[cfg(test)]
+    fn with_byte_budget(budget_bytes: u64) -> Self {
+        Self {
+            own_budget: Some(std::sync::atomic::AtomicU64::new(budget_bytes)),
+            ..Self::new()
+        }
+    }
+
+    /// The same on the single-worker backend (a map local to the calling thread), which a
+    /// machine with one core selects and a test machine never does.
+    #[cfg(test)]
+    fn single_worker_with_byte_budget(budget_bytes: u64) -> Self {
+        // The map belongs to the thread, not to the cache: start from an empty one.
+        LOCAL_L2.with(|m| m.borrow_mut().clear());
+        Self {
+            l2: None,
+            ..Self::with_byte_budget(budget_bytes)
+        }
+    }
+
+    /// The bytes the store holds, counted entry by entry: what `bytes` must equal when
+    /// no insert is in progress.
+    #[cfg(test)]
+    fn recount(&self) -> u64 {
+        match &self.l2 {
+            Some(l2) => l2.iter().map(|e| entry_cost(e.key(), &e)).sum(),
+            None => LOCAL_L2.with(|m| m.borrow().iter().map(|(k, e)| entry_cost(k, e)).sum()),
         }
     }
 
@@ -503,10 +693,7 @@ impl StaticCache {
     }
 
     fn remove_key(&self, key: &str) -> bool {
-        match &self.l2 {
-            Some(l2) => l2.remove(key).is_some(),
-            None => LOCAL_L2.with(|m| m.borrow_mut().remove(key).is_some()),
-        }
+        self.map_remove(key).is_some()
     }
 
     fn sync_tagged_keys(&self, idx: &TagIndex) {
@@ -731,21 +918,24 @@ impl StaticCache {
         let initial_age_secs = entry.initial_age_secs;
         drop(entry); // release DashMap read lock
 
-        // Promote to L1 preserving the original birth time, TTL and generation.
-        L1.with(|l1| {
-            let mut l1 = l1.borrow_mut();
-            let l1 = l1.get_or_insert_with(|| L1Cache::new(l1_max));
-            l1.insert(
-                key,
-                body.clone(),
-                meta.clone(),
-                inserted_at,
-                expires_at,
-                initial_age_secs,
-                freshness_secs,
-                current_gen,
-            );
-        });
+        // Promote to L1 preserving the original birth time, TTL and generation. Small
+        // bodies only: see L1_MAX_BODY_BYTES.
+        if body.len() <= L1_MAX_BODY_BYTES {
+            L1.with(|l1| {
+                let mut l1 = l1.borrow_mut();
+                let l1 = l1.get_or_insert_with(|| L1Cache::new(l1_max));
+                l1.insert(
+                    key,
+                    body.clone(),
+                    meta.clone(),
+                    inserted_at,
+                    expires_at,
+                    initial_age_secs,
+                    freshness_secs,
+                    current_gen,
+                );
+            });
+        }
 
         crate::metrics::METRICS.cache_hits.fetch_add(1, Relaxed);
         CacheLookup::Fresh(CacheHit {
@@ -799,76 +989,112 @@ impl StaticCache {
     ) {
         // Every store goes through here: nothing kept may reference the upstream's buffer.
         let meta = meta.detached();
-        // `let-else`: bind l2 for the concurrent path, diverge (return) on the
-        // single-core path — mirrors get(), removes the `unreachable!()` abort.
-        let Some(l2_concurrent) = &self.l2 else {
-            // Lock-free single-core backend insertion
-            LOCAL_L2.with(|map| {
-                let mut m = map.borrow_mut();
-                let mut rounds = 0;
-                while max_entries > 0 && m.len() >= max_entries && rounds < EVICT_ROUNDS {
-                    rounds += 1;
-                    let now = Instant::now();
-                    let mut expired_keys = Vec::new();
-                    let mut oldest: Option<(Arc<str>, Instant)> = None;
-                    for (k, v) in m.iter().take(EVICT_SAMPLE) {
-                        if now >= v.expires_at {
-                            expired_keys.push(k.clone());
-                        } else if oldest.as_ref().is_none_or(|(_, at)| v.expires_at < *at) {
-                            oldest = Some((k.clone(), v.expires_at));
-                        }
-                    }
-                    for k in &expired_keys {
-                        m.remove(k);
-                    }
-                    if expired_keys.is_empty() {
-                        if let Some((k, _)) = oldest {
-                            m.remove(&k);
-                        }
-                    }
-                }
-                let now = Instant::now();
-                m.insert(
-                    Arc::from(path),
-                    L2Entry {
-                        body,
-                        meta,
-                        inserted_at: now,
-                        expires_at: expiry_from(now, freshness_secs, initial_age_secs),
-                        initial_age_secs,
-                        freshness_secs,
-                    },
-                );
-            });
-            return;
+        let key: Arc<str> = Arc::from(path);
+        let now = Instant::now();
+        let entry = L2Entry {
+            body,
+            meta,
+            inserted_at: now,
+            expires_at: expiry_from(now, freshness_secs, initial_age_secs),
+            initial_age_secs,
+            freshness_secs,
         };
+        let cost = entry_cost(&key, &entry);
+        let budget = self.budget();
+        let Some(reserved) = self.make_room(&key, cost, max_entries, budget) else {
+            return; // no room for it: served, not stored
+        };
+        self.store_reserved(key, entry, cost, reserved, budget);
+    }
 
-        // Make room. One round is not enough under concurrency: every thread that evicts at
-        // the same moment samples the same entries and picks the same victim, and all but one
-        // of those removals find it gone. Inserting anyway grew the map by one entry per
-        // collision, for good: it was never brought back under the cap (#481). So evict until
-        // there is room, counting only what this thread really removed; the same loop shrinks
-        // a map that is over its cap because a reload lowered it.
+    /// Make room for an entry of `cost` under `key`, by count and by bytes, and reserve the
+    /// bytes it adds. `None` when room cannot be made: nothing is reserved, and whatever is
+    /// stored under the key stays. The first half of [`Self::insert`]; the second is
+    /// [`Self::store_reserved`].
+    fn make_room(&self, key: &str, cost: u64, max_entries: usize, budget: u64) -> Option<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if budget > 0 && cost > budget {
+            // It would not fit in an empty cache.
+            crate::metrics::METRICS
+                .cache_budget_skipped
+                .fetch_add(1, Relaxed);
+            return None;
+        }
+
+        // By count. One round is not enough under concurrency: every thread that evicts at
+        // the same moment samples the same entries and picks the same victims, and all but
+        // one of those removals find them gone. Inserting anyway grew the map by one entry
+        // per collision, for good: it was never brought back under the cap (#481). So evict
+        // until there is room; the same loop shrinks a map that is over its cap because a
+        // reload lowered it.
         if max_entries > 0 {
             let mut rounds = 0;
-            while l2_concurrent.len() >= max_entries && rounds < EVICT_ROUNDS {
-                Self::evict_round(l2_concurrent);
+            while self.len() >= max_entries && rounds < EVICT_ROUNDS {
+                self.evict_round(0, None);
                 rounds += 1;
             }
         }
 
-        let now = Instant::now();
-        l2_concurrent.insert(
-            Arc::from(path),
-            L2Entry {
-                body,
-                meta,
-                inserted_at: now,
-                expires_at: expiry_from(now, freshness_secs, initial_age_secs),
-                initial_age_secs,
-                freshness_secs,
-            },
-        );
+        // By bytes (#524). The room is reserved first, so that threads storing at the same
+        // moment see each other's entries: what is stored never exceeds the budget. An entry
+        // that replaces one under the same key (a revalidation re-stores the same body)
+        // reserves only the difference, or it would evict others to make room for bytes that
+        // are already counted.
+        let reserved = cost.saturating_sub(self.cost_of(key));
+        let mut total = self.bytes.fetch_add(reserved, Relaxed) + reserved;
+        if budget > 0 {
+            let mut rounds = 0;
+            while total > budget && rounds < EVICT_ROUNDS {
+                self.evict_round(total - budget, Some(key));
+                rounds += 1;
+                total = self.bytes.load(Relaxed);
+            }
+            if total > budget {
+                // No room could be made within the work one insert may do.
+                self.sub_bytes(reserved);
+                crate::metrics::METRICS
+                    .cache_budget_skipped
+                    .fetch_add(1, Relaxed);
+                return None;
+            }
+        }
+        Some(reserved)
+    }
+
+    /// Store `entry`, for which [`Self::make_room`] reserved `reserved` bytes, and settle
+    /// the count with what was really replaced.
+    fn store_reserved(&self, key: Arc<str>, entry: L2Entry, cost: u64, reserved: u64, budget: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // The count holds `reserved`; what really changed is `cost` less the entry replaced.
+        let replaced = self
+            .map_insert_raw(key.clone(), entry)
+            .map_or(0, |old| entry_cost(&key, &old));
+        let settled = cost.saturating_sub(replaced);
+        if settled >= reserved {
+            self.bytes.fetch_add(settled - reserved, Relaxed);
+        } else {
+            self.sub_bytes(reserved - settled);
+        }
+        if cost < replaced {
+            self.sub_bytes(replaced - cost);
+        }
+        // The entry measured when the room was reserved is not the one replaced when another
+        // thread removed or shrank it in between: then this insert took more room than it
+        // reserved. Make that room now, and give the entry up if it cannot be made, so the
+        // budget still holds.
+        if budget > 0 && settled > reserved {
+            let mut rounds = 0;
+            while self.bytes.load(Relaxed) > budget && rounds < EVICT_ROUNDS {
+                self.evict_round(self.bytes.load(Relaxed) - budget, Some(&key));
+                rounds += 1;
+            }
+            if self.bytes.load(Relaxed) > budget {
+                self.map_remove(&key);
+                crate::metrics::METRICS
+                    .cache_budget_skipped
+                    .fetch_add(1, Relaxed);
+            }
+        }
         // Bump generation so L1 caches on other threads see the update
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -896,18 +1122,8 @@ impl StaticCache {
             *idx = TagIndex::default();
             self.sync_tagged_keys(&idx);
         }
-        let n = if let Some(l2) = &self.l2 {
-            let n = l2.len();
-            l2.clear();
-            n
-        } else {
-            LOCAL_L2.with(|m| {
-                let mut m = m.borrow_mut();
-                let n = m.len();
-                m.clear();
-                n
-            })
-        };
+        // (entry by entry, not `clear`: an insert racing with it keeps its bytes counted)
+        let n = self.map_retain(|_| false);
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         n
@@ -928,22 +1144,7 @@ impl StaticCache {
         let hit = |k: &str| k.starts_with(&exact) || k.starts_with(&with_query);
         self.vary.remove_prefix(&exact);
         self.vary.remove_prefix(&with_query);
-        let mut removed = 0;
-        if let Some(l2) = &self.l2 {
-            l2.retain(|k, _| {
-                let drop = hit(k);
-                removed += usize::from(drop);
-                !drop
-            });
-        } else {
-            LOCAL_L2.with(|m| {
-                m.borrow_mut().retain(|k, _| {
-                    let drop = hit(k);
-                    removed += usize::from(drop);
-                    !drop
-                });
-            });
-        }
+        let removed = self.map_retain(|k| !hit(k));
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         removed
@@ -951,31 +1152,7 @@ impl StaticCache {
 
     pub fn purge_prefix(&self, prefix: &str) -> usize {
         self.vary.remove_prefix(prefix);
-        let mut removed = 0;
-        if let Some(l2) = &self.l2 {
-            let keys: Vec<Arc<str>> = l2
-                .iter()
-                .filter(|e| e.key().starts_with(prefix))
-                .map(|e| e.key().clone())
-                .collect();
-            for k in &keys {
-                l2.remove(k);
-                removed += 1;
-            }
-        } else {
-            LOCAL_L2.with(|m| {
-                let mut m = m.borrow_mut();
-                let keys: Vec<Arc<str>> = m
-                    .keys()
-                    .filter(|k| k.starts_with(prefix))
-                    .cloned()
-                    .collect();
-                for k in &keys {
-                    m.remove(k);
-                    removed += 1;
-                }
-            });
-        }
+        let removed = self.map_retain(|k| !k.starts_with(prefix));
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         removed
@@ -1744,5 +1921,493 @@ mod tests {
         );
         assert_eq!(hit.meta.etag.unwrap().as_bytes(), &[b'a'; 10][..]);
         assert_eq!(hit.meta.last_modified.unwrap().as_bytes(), &[b'a'; 29][..]);
+    }
+    // ── The byte budget (#524) ───────────────────────────────────────────────
+
+    /// A body of `len` bytes, cached for `ttl` seconds.
+    fn put(cache: &StaticCache, key: &str, len: usize, ttl: u64) {
+        cache.insert(key, Bytes::from(vec![7u8; len]), default_meta(), ttl, 0, 0);
+    }
+
+    fn stored(cache: &StaticCache, key: &str) -> bool {
+        !matches!(cache.get(key), CacheLookup::Miss)
+    }
+
+    fn cost(key: &str, len: usize) -> u64 {
+        (key.len() + len) as u64 + ENTRY_OVERHEAD_BYTES
+    }
+
+    #[test]
+    fn the_default_budget_is_an_eighth_of_the_memory_and_never_tiny() {
+        assert_eq!(default_budget_mb(16_384), 2_048);
+        assert_eq!(default_budget_mb(512), 64, "a 512 MiB container");
+        assert_eq!(default_budget_mb(256), 32);
+        assert_eq!(default_budget_mb(100), 32, "the floor");
+    }
+
+    /// Both backends: the shared map, and the thread-local one a single-core machine uses.
+    fn both_backends(budget: u64) -> [StaticCache; 2] {
+        [
+            StaticCache::with_byte_budget(budget),
+            StaticCache::single_worker_with_byte_budget(budget),
+        ]
+    }
+
+    #[test]
+    fn the_cache_never_holds_more_than_its_budget() {
+        // Room for four 1,000-byte bodies and not five.
+        let budget = 4 * cost("/k0", 1_000) + 500;
+        for cache in both_backends(budget) {
+            // Later keys expire later: the ones stored first are the ones to go.
+            for i in 0..10u64 {
+                put(&cache, &format!("/k{i}"), 1_000, 100 + i);
+                assert!(cache.bytes() <= budget, "after /k{i}: {}", cache.bytes());
+                assert_eq!(cache.bytes(), cache.recount());
+            }
+            assert_eq!(cache.len(), 4);
+            for i in 0..6 {
+                assert!(!stored(&cache, &format!("/k{i}")), "/k{i} was evicted");
+            }
+            for i in 6..10 {
+                assert!(
+                    stored(&cache, &format!("/k{i}")),
+                    "/k{i} is the newest four"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_large_response_makes_room_by_evicting_as_many_as_it_takes() {
+        let budget = 40 * cost("/s00", 1_000);
+        for cache in both_backends(budget) {
+            for i in 0..40u64 {
+                put(&cache, &format!("/s{i:02}"), 1_000, 100 + i);
+            }
+            assert_eq!(cache.len(), 40);
+            // A body that costs as much as sixteen small ones and a bit: seventeen have to
+            // go, in one insert, and no more than that.
+            put(&cache, "/big", 20 * 1_000, 1_000);
+            assert!(stored(&cache, "/big"), "room was made");
+            assert!(cache.bytes() <= budget);
+            assert_eq!(cache.bytes(), cache.recount());
+            assert_eq!(cache.len(), 40 - 17 + 1);
+            assert!(
+                stored(&cache, "/s17"),
+                "the eighteenth to expire was not needed"
+            );
+            assert!(!stored(&cache, "/s16"), "the seventeenth was");
+            assert!(stored(&cache, "/s39"), "the ones expiring last stay");
+            assert!(!stored(&cache, "/s00"), "the ones expiring first went");
+        }
+    }
+
+    #[test]
+    fn a_response_larger_than_the_budget_is_not_stored_and_evicts_nothing() {
+        let budget = 10_000;
+        for cache in both_backends(budget) {
+            put(&cache, "/small", 1_000, 60);
+            let skipped = || {
+                crate::metrics::METRICS
+                    .cache_budget_skipped
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            };
+            let before = skipped();
+            put(&cache, "/huge", 10_000, 60); // its cost is over 10,000 with the key
+            assert!(!stored(&cache, "/huge"));
+            assert!(stored(&cache, "/small"), "nothing was evicted for it");
+            assert!(skipped() > before, "and it is counted");
+            assert_eq!(cache.bytes(), cost("/small", 1_000));
+            // An entry under the same key is left as it was, not replaced and not removed.
+            put(&cache, "/v", 100, 60);
+            put(&cache, "/v", 20_000, 60);
+            assert!(matches!(cache.get("/v"), CacheLookup::Fresh(h) if h.body.len() == 100));
+        }
+    }
+
+    /// A revalidation re-stores the body the cache already holds. Its bytes are counted
+    /// already: it must not evict others to make room for itself.
+    #[test]
+    fn storing_the_same_body_again_evicts_nothing() {
+        let budget = 4 * cost("/k0", 1_000) + 100;
+        for cache in both_backends(budget) {
+            for i in 0..4u64 {
+                put(&cache, &format!("/k{i}"), 1_000, 100 + i);
+            }
+            assert_eq!(cache.len(), 4);
+            for _ in 0..3 {
+                cache.refresh(
+                    "/k1",
+                    Bytes::from(vec![7u8; 1_000]),
+                    default_meta(),
+                    500,
+                    0,
+                    0,
+                );
+            }
+            assert_eq!(cache.len(), 4, "the full cache kept all four");
+            assert_eq!(cache.bytes(), cache.recount());
+            // A smaller and then a larger body under the same key: the count follows.
+            put(&cache, "/k1", 10, 500);
+            assert_eq!(cache.bytes(), cache.recount());
+            put(&cache, "/k1", 900, 500);
+            assert_eq!(cache.bytes(), cache.recount());
+            assert_eq!(cache.len(), 4);
+        }
+    }
+
+    /// Replacing an entry with a larger one that expires soon: the room it needs comes from
+    /// the other entries, not from the entry being replaced (whose bytes the new one takes
+    /// over) and not from the new entry itself.
+    #[test]
+    fn a_larger_replacement_evicts_another_entry_and_is_itself_stored() {
+        let budget = 2 * cost("/a", 1_000) + 500;
+        for cache in both_backends(budget) {
+            put(&cache, "/a", 1_000, 100);
+            put(&cache, "/b", 1_000, 200);
+            // 1,000 bytes more under "/a", and the first of the three to expire.
+            put(&cache, "/a", 2_000, 1);
+            assert!(
+                matches!(cache.get("/a"), CacheLookup::Fresh(h) if h.body.len() == 2_000),
+                "the replacement is stored"
+            );
+            assert!(!stored(&cache, "/b"), "the room came from the other entry");
+            assert_eq!(cache.bytes(), cost("/a", 2_000));
+            assert_eq!(cache.bytes(), cache.recount());
+        }
+    }
+
+    /// Between the moment an insert reserves its room and the moment it stores, another
+    /// thread can remove the entry it meant to replace (a purge, or an eviction of its own).
+    /// The insert then adds its whole cost where it reserved the difference: it has to find
+    /// that room after the fact, or the cache is left over its budget.
+    #[test]
+    fn an_entry_removed_between_reserve_and_store_does_not_leave_the_cache_over_budget() {
+        let budget = 2 * cost("/a", 1_000) + 100;
+        for cache in both_backends(budget) {
+            put(&cache, "/a", 1_000, 100);
+            put(&cache, "/b", 1_000, 200);
+            // This thread: a slightly larger body for "/a" reserves the 50 bytes it adds.
+            let key: Arc<str> = Arc::from("/a");
+            let now = Instant::now();
+            let entry = L2Entry {
+                body: Bytes::from(vec![7u8; 1_050]),
+                meta: default_meta(),
+                inserted_at: now,
+                expires_at: expiry_from(now, 400, 0),
+                initial_age_secs: 0,
+                freshness_secs: 400,
+            };
+            let new_cost = entry_cost(&key, &entry);
+            let reserved = cache.make_room(&key, new_cost, 0, budget).expect("room");
+            assert_eq!(reserved, 50);
+            // Another thread: "/a" is purged, and "/c" stored in the room that left.
+            assert!(cache.remove_key("/a"));
+            put(&cache, "/c", 1_000, 300);
+            assert!(stored(&cache, "/b") && stored(&cache, "/c"));
+            // This thread again: it stores, replacing nothing.
+            cache.store_reserved(key, entry, new_cost, reserved, budget);
+            assert!(cache.bytes() <= budget, "{} > {budget}", cache.bytes());
+            assert_eq!(cache.bytes(), cache.recount());
+            assert!(stored(&cache, "/a"), "the new entry is kept");
+            assert!(
+                !stored(&cache, "/b"),
+                "and the room came from the next to expire"
+            );
+            assert!(stored(&cache, "/c"));
+        }
+    }
+
+    /// The same race, where the room cannot be found after the fact within the eviction one
+    /// insert may do: the entry is given up. The budget is the thing that must hold.
+    #[test]
+    fn an_insert_that_lost_its_room_and_cannot_find_it_again_gives_the_entry_up() {
+        const SMALL: usize = 2_000;
+        let budget = SMALL as u64 * cost("/s0000", 4);
+        for cache in both_backends(budget) {
+            // A body of four fifths of the budget under "/a", re-stored by this thread: no
+            // bytes to reserve, the ones it holds are counted.
+            let big = (budget as usize) * 4 / 5;
+            put(&cache, "/a", big, 1_000);
+            let key: Arc<str> = Arc::from("/a");
+            let now = Instant::now();
+            let entry = L2Entry {
+                body: Bytes::from(vec![7u8; big]),
+                meta: default_meta(),
+                inserted_at: now,
+                expires_at: expiry_from(now, 1_000, 0),
+                initial_age_secs: 0,
+                freshness_secs: 1_000,
+            };
+            let new_cost = entry_cost(&key, &entry);
+            let reserved = cache.make_room(&key, new_cost, 0, budget).expect("room");
+            assert_eq!(reserved, 0);
+            // Meanwhile "/a" is purged and its room is taken by small entries, many more
+            // than one insert may evict.
+            assert!(cache.remove_key("/a"));
+            for i in 0..SMALL {
+                put(&cache, &format!("/s{i:04}"), 4, 100);
+            }
+            assert!(cache.len() > 1_900);
+            cache.store_reserved(key, entry, new_cost, reserved, budget);
+            assert!(cache.bytes() <= budget, "{} > {budget}", cache.bytes());
+            assert_eq!(cache.bytes(), cache.recount());
+            assert!(!stored(&cache, "/a"), "given up, not kept over the budget");
+        }
+    }
+
+    /// One insert does a bounded amount of eviction (EVICT_ROUNDS samples of EVICT_SAMPLE
+    /// entries). When that is not enough room, the response is not stored: the budget is a
+    /// bound, not a target. The attempts that follow find the room.
+    #[test]
+    fn when_one_insert_cannot_make_enough_room_nothing_is_stored_over_the_budget() {
+        const SMALL: usize = 2_000;
+        let per_entry = cost("/s0000", 4);
+        let budget = SMALL as u64 * per_entry;
+        for cache in both_backends(budget) {
+            for i in 0..SMALL {
+                put(&cache, &format!("/s{i:04}"), 4, 100);
+            }
+            assert_eq!(cache.len(), SMALL);
+            // Four fifths of the budget in one body: 1,600 small entries would have to go,
+            // and one insert evicts 512 at most.
+            let big = (budget as usize) * 4 / 5;
+            let skipped = || {
+                crate::metrics::METRICS
+                    .cache_budget_skipped
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            };
+            let before = skipped();
+            put(&cache, "/big", big, 1_000);
+            assert!(!stored(&cache, "/big"), "not stored at the first attempt");
+            assert!(cache.bytes() <= budget, "{} > {budget}", cache.bytes());
+            assert_eq!(cache.bytes(), cache.recount());
+            assert!(skipped() > before, "and counted");
+            assert!(cache.len() < SMALL, "the attempt did evict");
+            let mut attempts = 1;
+            while !stored(&cache, "/big") {
+                attempts += 1;
+                assert!(attempts < 10, "room was never made");
+                put(&cache, "/big", big, 1_000);
+                assert!(cache.bytes() <= budget);
+            }
+            assert_eq!(cache.bytes(), cache.recount());
+        }
+    }
+
+    #[test]
+    fn a_lower_budget_shrinks_the_cache_as_entries_are_stored() {
+        let cache = StaticCache::with_byte_budget(0); // no budget
+        for i in 0..200u64 {
+            put(&cache, &format!("/k{i:03}"), 1_000, 100 + i);
+        }
+        assert_eq!(cache.len(), 200, "no budget: bounded by nothing here");
+        let budget = 10 * cost("/k000", 1_000);
+        cache
+            .own_budget
+            .as_ref()
+            .unwrap()
+            .store(budget, std::sync::atomic::Ordering::Relaxed);
+        // One insert evicts a bounded amount, so it takes a few of them to come down.
+        let mut inserts = 0;
+        while cache.bytes() > budget {
+            inserts += 1;
+            assert!(inserts < 50, "the cache did not shrink: {}", cache.bytes());
+            put(&cache, "/new", 1_000, 10_000);
+        }
+        assert!(cache.len() <= 10);
+        assert_eq!(cache.bytes(), cache.recount());
+    }
+
+    #[test]
+    fn every_way_out_of_the_cache_gives_its_bytes_back() {
+        for cache in both_backends(0) {
+            let fill = |cache: &StaticCache| {
+                for i in 0..20 {
+                    put(cache, &format!("/a/{i}\u{1f}"), 100 + i, 60);
+                    put(cache, &format!("/b/{i}?q=1\u{1f}"), 300 + i, 60);
+                }
+                assert_eq!(cache.bytes(), cache.recount());
+                assert!(cache.bytes() > 0);
+            };
+            fill(&cache);
+            assert_eq!(cache.purge_prefix("/a/"), 20);
+            assert_eq!(cache.bytes(), cache.recount());
+            assert_eq!(cache.invalidate_path("/b/3"), 1);
+            assert_eq!(cache.bytes(), cache.recount());
+            assert_eq!(cache.purge_all(), 19);
+            assert_eq!(cache.bytes(), 0);
+
+            // By tag, and by the entry cap.
+            let epoch = cache.tag_epoch();
+            for i in 0..10 {
+                cache.insert_tagged(
+                    &format!("/t/{i}"),
+                    Bytes::from(vec![1u8; 500]),
+                    default_meta(),
+                    60,
+                    0,
+                    0,
+                    &["group".to_string()],
+                    epoch,
+                );
+            }
+            assert_eq!(cache.bytes(), cache.recount());
+            assert_eq!(cache.purge_tags(&["group"]), 10);
+            assert_eq!(cache.bytes(), 0);
+            for i in 0..30u64 {
+                cache.insert(
+                    &format!("/c/{i}"),
+                    Bytes::from(vec![1u8; 200]),
+                    default_meta(),
+                    60 + i,
+                    0,
+                    5, // max_entries
+                );
+            }
+            assert_eq!(cache.len(), 5);
+            assert_eq!(cache.bytes(), cache.recount());
+        }
+    }
+
+    /// Threads storing at the same moment reserve their room before they look for it, so
+    /// what is stored stays within the budget; and when they are done the count is exact.
+    #[test]
+    fn the_budget_holds_under_concurrent_inserts() {
+        const THREADS: usize = 8;
+        const BODY: usize = 4_000;
+        let budget = 64 * cost("/t0/0000", BODY);
+        let cache = std::sync::Arc::new(StaticCache::with_byte_budget(budget));
+        let most_seen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let (cache, most_seen) = (cache.clone(), most_seen.clone());
+                std::thread::spawn(move || {
+                    for i in 0..4_000u64 {
+                        let key = format!("/t{t}/{i:04}");
+                        cache.insert(
+                            &key,
+                            Bytes::from(vec![t as u8; BODY]),
+                            default_meta(),
+                            60 + (i % 50),
+                            0,
+                            0,
+                        );
+                        most_seen.fetch_max(cache.bytes(), std::sync::atomic::Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(cache.bytes(), cache.recount(), "the count is exact at rest");
+        assert!(cache.bytes() <= budget, "{} > {budget}", cache.bytes());
+        assert!(
+            cache.len() > 32,
+            "the cache is in use, not emptied: {}",
+            cache.len()
+        );
+        // While they ran, the count never passed the budget by more than the reservations
+        // of the other threads.
+        let most = most_seen.load(std::sync::atomic::Ordering::Relaxed);
+        let slack = THREADS as u64 * cost("/t0/0000", BODY);
+        assert!(most <= budget + slack, "{most} > {budget} + {slack}");
+    }
+
+    /// A worker thread's own L1 cache is outside the budget, so it only takes small bodies.
+    #[test]
+    fn a_large_body_is_served_from_the_shared_store_and_not_kept_per_thread() {
+        let cache = StaticCache::with_byte_budget(0);
+        if cache.l2.is_none() {
+            return; // a single-core machine has no L1 tier
+        }
+        put(&cache, "/small", L1_MAX_BODY_BYTES, 60);
+        put(&cache, "/large", L1_MAX_BODY_BYTES + 1, 60);
+        for key in ["/small", "/large"] {
+            assert!(matches!(cache.get(key), CacheLookup::Fresh(_)));
+            assert!(matches!(cache.get(key), CacheLookup::Fresh(_)), "and again");
+        }
+        let in_l1 = |key: &str| {
+            L1.with(|l1| {
+                l1.borrow()
+                    .as_ref()
+                    .is_some_and(|l1| l1.map.contains_key(key))
+            })
+        };
+        assert!(in_l1("/small"), "a body at the cap is promoted");
+        assert!(!in_l1("/large"), "one byte more and it is not");
+    }
+
+    mod byte_count_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        #[derive(Clone, Debug)]
+        enum Op {
+            Put {
+                key: u8,
+                len: usize,
+                ttl: u64,
+                max_entries: usize,
+            },
+            PurgePrefix(u8),
+            Invalidate(u8),
+            PurgeAll,
+        }
+
+        fn any_op() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                8 => (0u8..24, 0usize..3_000, 1u64..500, prop_oneof![Just(0usize), 4usize..12])
+                    .prop_map(|(key, len, ttl, max_entries)| Op::Put { key, len, ttl, max_entries }),
+                1 => (0u8..3).prop_map(Op::PurgePrefix),
+                1 => (0u8..24).prop_map(Op::Invalidate),
+                1 => Just(Op::PurgeAll),
+            ]
+        }
+
+        fn key_of(n: u8) -> String {
+            format!("/p{}/{n}\u{1f}", n % 3)
+        }
+
+        proptest! {
+            /// Whatever is done to the cache, in whatever order and with or without a
+            /// budget, the byte count equals the bytes of what it holds, and with a budget
+            /// it never passes it.
+            #[test]
+            fn the_count_is_exact_and_the_budget_holds(
+                ops in proptest::collection::vec(any_op(), 1..120),
+                budget in prop_oneof![Just(0u64), 1_000u64..20_000],
+                single_worker in any::<bool>(),
+            ) {
+                let cache = if single_worker {
+                    StaticCache::single_worker_with_byte_budget(budget)
+                } else {
+                    StaticCache::with_byte_budget(budget)
+                };
+                for op in ops {
+                    match op {
+                        Op::Put { key, len, ttl, max_entries } => cache.insert(
+                            &key_of(key),
+                            Bytes::from(vec![0u8; len]),
+                            default_meta(),
+                            ttl,
+                            0,
+                            max_entries,
+                        ),
+                        Op::PurgePrefix(p) => { cache.purge_prefix(&format!("/p{p}/")); }
+                        Op::Invalidate(k) => {
+                            let key = key_of(k);
+                            cache.invalidate_path(key.trim_end_matches('\u{1f}'));
+                        }
+                        Op::PurgeAll => { cache.purge_all(); }
+                    }
+                    prop_assert_eq!(cache.bytes(), cache.recount());
+                    if budget > 0 {
+                        prop_assert!(cache.bytes() <= budget);
+                    }
+                }
+            }
+        }
     }
 }

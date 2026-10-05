@@ -607,6 +607,23 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     }
     let resolved = ResolvedAppConfig::try_build(&config, conn_ceiling)?;
     dns::configure(resolved.dns_stale_secs, resolved.dns_timeout_ms);
+    cache::configure(resolved.cache_budget_bytes);
+    logging::info(
+        "boot",
+        &match (
+            resolved.cache_budget_bytes / (1024 * 1024),
+            config.server.cache_max_memory_mb,
+        ) {
+            (0, _) => {
+                "response cache: no memory budget (server.cache_max_memory_mb = 0)".to_string()
+            }
+            (mb, Some(_)) => format!("response cache budget {mb} MiB (server.cache_max_memory_mb)"),
+            (mb, None) => format!(
+                "response cache budget {mb} MiB (an eighth of {} MB of memory)",
+                platform.ram_mb
+            ),
+        },
+    );
 
     // Boot-time visibility: structured logs for the bits operators
     // commonly check at startup. (Validation of `xff_mode` happens
