@@ -1155,11 +1155,13 @@ mod tests {
             ("max_connections = 6000", "5000 → 6000"),
             ("", "5000 → unset"),
         ] {
+            // (the error text is compared, not printed: it is built by the function that
+            // also names the TLS paths, and a test log is no place for those)
             let e = push(&store, changed).unwrap_err();
             assert!(
                 e.contains(&format!("server.max_connections changed ({shown})"))
-                    && e.contains("restart"),
-                "{e}"
+                    && e.contains("needs a restart"),
+                "refused, but not for the change of max_connections ({shown})"
             );
             assert!(Arc::ptr_eq(&live, &store.load_full()), "snapshot unchanged");
         }
@@ -1170,7 +1172,7 @@ mod tests {
         let e = push(&store, "max_connections = 5000").unwrap_err();
         assert!(
             e.contains("server.max_connections changed (unset → 5000)"),
-            "{e}"
+            "refused, but not for max_connections being set"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
