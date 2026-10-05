@@ -195,7 +195,7 @@ gets a bodiless **304 Not Modified** when the file is unchanged — the same
 browser-caching behavior nginx gives you out of the box, so a cut-over doesn't
 regress asset revalidation. Byte-range requests are honored too (`206` +
 `Accept-Ranges: bytes`, `416` when unsatisfiable), so media seeking and resumable
-downloads work. Large files (above 64 MiB) stream frame-by-frame with bounded
+downloads work. Files above 576 KiB stream frame-by-frame with bounded
 memory rather than being buffered whole, so there is **no file-size limit** on a
 static route — a video or install image serves fine. With `precompressed = true`,
 a `.br`/`.gz` sidecar next to a file is served when the client's `Accept-Encoding`
