@@ -24,7 +24,14 @@ pub struct Platform {
     pub os: &'static str,
     pub arch: &'static str,
     pub cpu_cores: usize,
+    /// The memory this process may use: the machine's RAM, or the limit of the cgroup it
+    /// runs in when that is lower (a container, a systemd unit with `MemoryMax=`). Every
+    /// size derived from memory uses this one.
     pub ram_mb: u64,
+    /// The machine's RAM, whatever the cgroup allows.
+    pub host_ram_mb: u64,
+    /// The cgroup memory limit, when there is one below the machine's RAM.
+    pub cgroup_limit_mb: Option<u64>,
 
     // ── CPU Features ──
     pub has_aes_ni: bool, // hardware AES acceleration (Intel AES-NI / ARM CE)
@@ -91,7 +98,8 @@ pub fn detect() -> &'static Platform {
             .map(|n| n.get())
             .unwrap_or(1);
 
-        let ram_mb = detect_ram_mb();
+        let host_ram_mb = detect_ram_mb();
+        let (ram_mb, cgroup_limit_mb) = usable_memory_mb(host_ram_mb, detect_cgroup_limit_bytes());
         let l1d = detect_l1d_cache_size();
 
         // ── Probe time: detection only (no calibration) ──
@@ -120,6 +128,8 @@ pub fn detect() -> &'static Platform {
             arch: std::env::consts::ARCH,
             cpu_cores,
             ram_mb,
+            host_ram_mb,
+            cgroup_limit_mb,
 
             has_aes_ni: detect_aes(),
             has_sha256: detect_sha256(),
@@ -397,6 +407,8 @@ pub fn dump_platform_json(p: &Platform) -> String {
         "arch": p.arch,
         "cores": p.cpu_cores,
         "ram_mb": p.ram_mb,
+        "host_ram_mb": p.host_ram_mb,
+        "cgroup_limit_mb": p.cgroup_limit_mb,
         "tier": p.tier().label(),
         "tier_score": p.tier_score(),
         "projected_kreqs_cached": p.projected_kreqs_cached(),
@@ -452,7 +464,14 @@ fn render<W: std::io::Write>(p: &Platform, s: &Style, w: &mut W) -> std::io::Res
         w,
         s,
         "ram",
-        &fmt_bytes(p.ram_mb * 1024 * 1024),
+        &match p.cgroup_limit_mb {
+            Some(_) => format!(
+                "{} (cgroup limit; the host has {})",
+                fmt_bytes(p.ram_mb * 1024 * 1024),
+                fmt_bytes(p.host_ram_mb * 1024 * 1024)
+            ),
+            None => fmt_bytes(p.ram_mb * 1024 * 1024),
+        },
         Some(if p.ram_mb >= 16_000 {
             Mark::Good
         } else if p.ram_mb >= 4_000 {
@@ -860,10 +879,16 @@ fn upgrade_hint(p: &Platform) -> String {
             .to_string();
     }
     if p.ram_mb < 4096 {
-        return format!(
-            "only {} MB RAM — conn limit capped at {}. add memory for higher concurrency.",
-            p.ram_mb, p.conn_limit
-        );
+        return match p.cgroup_limit_mb {
+            Some(limit) => format!(
+                "cgroup memory limit {limit} MB — conn limit {}. raise the limit for higher concurrency.",
+                p.conn_limit
+            ),
+            None => format!(
+                "only {} MB RAM — conn limit capped at {}. add memory for higher concurrency.",
+                p.ram_mb, p.conn_limit
+            ),
+        };
     }
     if p.cpu_cores < 4 {
         return format!(
@@ -1120,6 +1145,104 @@ fn detect_ram_mb() -> u64 {
     }
 }
 
+/// The memory limit of the cgroup this process runs in, in bytes, when one is set.
+/// `/proc/meminfo` reports the machine: in a container limited to 512 MiB on a 64 GiB node
+/// it says 64 GiB, and a connection ceiling sized from that admits connections until the
+/// kernel kills the process.
+fn detect_cgroup_limit_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        cgroup_memory_limit(std::path::Path::new("/sys/fs/cgroup"), &membership)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// The lowest memory limit that applies to a process whose `/proc/self/cgroup` is
+/// `membership`, read from the cgroup filesystem mounted at `root`.
+///
+/// A limit set on any ancestor applies, so the cgroup and every directory above it are
+/// read: `memory.max` and `memory.high` on the unified hierarchy (v2; above `memory.high`
+/// the kernel throttles the process to a crawl, which for a proxy is as good as the kill at
+/// `memory.max`), `memory.limit_in_bytes` under the `memory` controller on v1. In a
+/// container the path in `membership` can be the host's, which does not exist under the
+/// container's own mount: the walk then finds nothing until it reaches `root`, where the
+/// container's limit is.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn cgroup_memory_limit(root: &std::path::Path, membership: &str) -> Option<u64> {
+    let mut lowest: Option<u64> = None;
+    for line in membership.lines() {
+        // "<hierarchy id>:<controllers>:<path>"; v2 has no controllers listed.
+        let mut fields = line.splitn(3, ':');
+        let (Some(_), Some(controllers), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (base, files): (std::path::PathBuf, &[&str]) = if controllers.is_empty() {
+            (root.to_path_buf(), &["memory.max", "memory.high"])
+        } else if controllers.split(',').any(|c| c == "memory") {
+            (root.join("memory"), &["memory.limit_in_bytes"])
+        } else {
+            continue;
+        };
+        // A path that climbs out ("/../..", seen from inside a cgroup namespace) names
+        // nothing under this mount: only the mount's own root applies.
+        let below: std::path::PathBuf = if path.split('/').any(|part| part == "..") {
+            std::path::PathBuf::new()
+        } else {
+            path.split('/').filter(|part| !part.is_empty()).collect()
+        };
+        let mut dir = base.join(below);
+        loop {
+            for file in files {
+                let limit = std::fs::read_to_string(dir.join(file))
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok()) // "max" is no limit
+                    .filter(|&bytes| bytes > 0);
+                if let Some(bytes) = limit {
+                    lowest = Some(lowest.map_or(bytes, |l| l.min(bytes)));
+                }
+            }
+            if dir == base || !dir.pop() {
+                break;
+            }
+        }
+    }
+    lowest
+}
+
+/// (the memory to size things from, the cgroup limit if it is what decided), in MiB.
+/// A cgroup "limit" at or above the machine's RAM is not one: cgroup v1 reports
+/// 8 exabytes for "unlimited".
+fn usable_memory_mb(host_ram_mb: u64, cgroup_limit_bytes: Option<u64>) -> (u64, Option<u64>) {
+    match cgroup_limit_bytes.map(|bytes| bytes / 1_048_576) {
+        Some(limit_mb) if limit_mb < host_ram_mb => (limit_mb, Some(limit_mb)),
+        _ => (host_ram_mb, None),
+    }
+}
+
+static CONN_CEILING: OnceLock<usize> = OnceLock::new();
+
+/// Fix the connection ceiling for the life of the process: `[server] max_connections` when
+/// it is set, the value derived from memory otherwise. Called once at boot, before any
+/// listener; a later call does not change it.
+pub fn set_conn_ceiling(configured: Option<usize>) -> usize {
+    *CONN_CEILING.get_or_init(|| configured.unwrap_or_else(|| detect().conn_limit))
+}
+
+/// The connection ceiling in force (the memory-derived one until
+/// [`set_conn_ceiling`] has run).
+pub fn conn_ceiling() -> usize {
+    CONN_CEILING
+        .get()
+        .copied()
+        .unwrap_or_else(|| detect().conn_limit)
+}
+
 fn detect_aes() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
@@ -1371,6 +1494,8 @@ mod tests {
             arch: "x86_64",
             cpu_cores: cores,
             ram_mb,
+            host_ram_mb: ram_mb,
+            cgroup_limit_mb: None,
             has_aes_ni: aes,
             has_sha256: aes,
             has_neon: false,
@@ -1391,6 +1516,153 @@ mod tests {
             calibration_us: None,
             numa_nodes: 1,
         }
+    }
+
+    // ── Memory: the cgroup limit, and what is sized from it (#527) ────────────
+
+    /// A cgroup filesystem under a temp dir: `(relative file, content)` pairs.
+    fn cgroup_tree(tag: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("zion-cgroup-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (file, content) in files {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn the_cgroup_v2_limit_is_the_lowest_of_the_cgroup_and_its_ancestors() {
+        // A systemd unit with MemoryMax=512M under a slice limited to 2G.
+        let root = cgroup_tree(
+            "v2",
+            &[
+                ("system.slice/memory.max", "2147483648\n"),
+                ("system.slice/zion.service/memory.max", "536870912\n"),
+                ("system.slice/zion.service/memory.high", "max\n"),
+            ],
+        );
+        let unit = "0::/system.slice/zion.service\n";
+        assert_eq!(cgroup_memory_limit(&root, unit), Some(512 * MIB));
+
+        // The limit is on the parent only ("max" below it is no limit).
+        let root = cgroup_tree(
+            "v2-parent",
+            &[
+                ("kubepods/memory.max", "268435456\n"),
+                ("kubepods/pod1/memory.max", "max\n"),
+            ],
+        );
+        assert_eq!(
+            cgroup_memory_limit(&root, "0::/kubepods/pod1\n"),
+            Some(256 * MIB)
+        );
+
+        // memory.high below memory.max: the process is throttled there, so it is the limit.
+        let root = cgroup_tree(
+            "v2-high",
+            &[
+                ("app/memory.max", "1073741824\n"),
+                ("app/memory.high", "805306368\n"),
+            ],
+        );
+        assert_eq!(cgroup_memory_limit(&root, "0::/app\n"), Some(768 * MIB));
+
+        // No limit anywhere.
+        let root = cgroup_tree("v2-none", &[("app/memory.max", "max\n")]);
+        assert_eq!(cgroup_memory_limit(&root, "0::/app\n"), None);
+        assert_eq!(cgroup_memory_limit(&root, ""), None);
+        assert_eq!(cgroup_memory_limit(&root, "garbage\n0\n::\n"), None);
+    }
+
+    #[test]
+    fn a_container_finds_its_limit_at_the_root_of_its_own_mount() {
+        // Docker and Kubernetes with a private cgroup namespace: the process is at "/",
+        // and the container's limit is the mount's root.
+        let root = cgroup_tree("ns", &[("memory.max", "536870912\n")]);
+        assert_eq!(cgroup_memory_limit(&root, "0::/\n"), Some(512 * MIB));
+        // Seen from inside a namespace the path can climb out of it: it names nothing
+        // under this mount, and must not be followed out of `root`.
+        std::fs::write(root.parent().unwrap().join("memory.max"), "1048576\n").unwrap();
+        assert_eq!(cgroup_memory_limit(&root, "0::/../..\n"), Some(512 * MIB));
+        let _ = std::fs::remove_file(root.parent().unwrap().join("memory.max"));
+
+        // cgroup v1: the path is the host's ("/docker/<id>") and does not exist under the
+        // container's mount, whose root holds the limit. Other controllers are not memory.
+        let root = cgroup_tree("v1", &[("memory/memory.limit_in_bytes", "268435456\n")]);
+        let membership = "12:pids:/docker/abc\n7:cpu,cpuacct:/docker/abc\n4:memory:/docker/abc\n";
+        assert_eq!(cgroup_memory_limit(&root, membership), Some(256 * MIB));
+        // ... and when it does exist, the lower of the two applies.
+        let root = cgroup_tree(
+            "v1-nested",
+            &[
+                ("memory/memory.limit_in_bytes", "9223372036854771712\n"),
+                ("memory/docker/abc/memory.limit_in_bytes", "134217728\n"),
+            ],
+        );
+        assert_eq!(
+            cgroup_memory_limit(&root, "4:memory:/docker/abc\n"),
+            Some(128 * MIB)
+        );
+    }
+
+    #[test]
+    fn memory_is_the_cgroup_limit_only_when_it_is_below_the_machine() {
+        // 512 MiB container on a 64 GiB node: the limit decides.
+        assert_eq!(usable_memory_mb(65_536, Some(512 * MIB)), (512, Some(512)));
+        // No limit, or cgroup v1's "unlimited" (8 EiB), or a limit above the RAM: the RAM.
+        assert_eq!(usable_memory_mb(8_192, None), (8_192, None));
+        assert_eq!(
+            usable_memory_mb(8_192, Some(9_223_372_036_854_771_712)),
+            (8_192, None)
+        );
+        assert_eq!(usable_memory_mb(8_192, Some(16_384 * MIB)), (8_192, None));
+        assert_eq!(usable_memory_mb(8_192, Some(8_192 * MIB)), (8_192, None));
+    }
+
+    /// The finding of #527: the Helm chart's 512 Mi limit on a 64 GiB node gave 65,536
+    /// connections, about 16 GiB at 256 KB each. Sized from the limit it is the floor.
+    #[test]
+    fn the_connection_ceiling_follows_the_memory_the_process_may_use() {
+        let (node, _) = usable_memory_mb(65_536, None);
+        assert_eq!(compute_conn_limit(node), 65_536);
+        let (pod, limit) = usable_memory_mb(65_536, Some(512 * MIB));
+        assert_eq!(limit, Some(512));
+        assert_eq!(compute_conn_limit(pod), 1_000, "512 MiB: the floor");
+        let (pod, _) = usable_memory_mb(65_536, Some(4_096 * MIB));
+        assert_eq!(compute_conn_limit(pod), 4_096);
+    }
+
+    #[test]
+    fn the_boot_report_names_the_cgroup_limit() {
+        let p = Platform {
+            ram_mb: 512,
+            host_ram_mb: 65_536,
+            cgroup_limit_mb: Some(512),
+            conn_limit: 1_000,
+            ..synthetic(8, 512, true, "linux")
+        };
+        let json: serde_json::Value = serde_json::from_str(&dump_platform_json(&p)).unwrap();
+        assert_eq!(json["ram_mb"], 512);
+        assert_eq!(json["host_ram_mb"], 65_536);
+        assert_eq!(json["cgroup_limit_mb"], 512);
+        assert!(
+            upgrade_hint(&p).contains("cgroup memory limit 512 MB"),
+            "{}",
+            upgrade_hint(&p)
+        );
+        // Without a limit the hint talks about the machine.
+        let p = synthetic(8, 512, true, "linux");
+        assert!(upgrade_hint(&p).contains("only 512 MB RAM"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&dump_platform_json(&p)).unwrap()
+                ["cgroup_limit_mb"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]

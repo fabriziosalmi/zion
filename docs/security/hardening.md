@@ -64,13 +64,42 @@ When `rate_limit_rps = 0` (default), rate limiting is disabled — the code retu
 
 ## Connection limit
 
-Maximum concurrent connections are bounded by a `Semaphore` sized to available RAM:
+The number of client connections held open at once, on both listeners together, is bounded by a
+semaphore. The connection that would exceed it is closed at accept, before the TLS handshake, and
+counted in `zion_connections_rejected_global`.
+
+By default the ceiling is derived from memory:
 
 ```text
-conn_limit = (RAM_MB / 4) * 1024 / 50    # ~50KB per TLS connection estimate
+conn_limit = (memory_MB / 4) * 1024 / 256    # a quarter of the memory, 256 KB per connection
 ```
 
-Clamped to 1,000–100,000. Connections beyond the limit are silently dropped at the TCP level.
+clamped to 1,000–100,000. The memory is the machine's RAM, or the **cgroup limit** when one is set
+below it (`memory.max` or `memory.high` of the cgroup or any of its ancestors; `memory.limit_in_bytes`
+on cgroup v1): a container, a Kubernetes pod, a systemd unit with `MemoryMax=`. Before v0.10 the
+limit was ignored, so a pod limited to 512 MiB on a 32 GiB node admitted 31,980 connections and
+would be killed by the kernel long before it shed one; it now admits 1,000. The boot report shows
+which figure was used (`ram  512 MB (cgroup limit; the host has 32.0 GB)`).
+
+`[server] max_connections` sets the ceiling explicitly, to go above 100,000 on a large machine or
+below the derived value where memory is tight. It is read at start; a reload that changes it is
+refused.
+
+What a connection costs, measured on Linux (release build, 2,000 connections in each state):
+
+| State of the connection | Memory |
+|---|---|
+| TLS handshake done, no request yet | 14 KB |
+| HTTP/1.1 keep-alive, idle after a request | 46 KB |
+| HTTP/2, idle after a request | 49 KB |
+| HTTP/1.1, a large static file being sent to a client that is not reading | 829 KB |
+| HTTP/2, the same on one stream (a connection carries up to 128 streams) | 903 KB |
+
+The 256 KB of the formula is a budget between the idle and the busy figures, not a bound: 1,000
+connections that are all stuck mid-download hold about 900 MB. Where that matters (a small
+container that serves large files), set `max_connections` from the busy figure, and
+`max_connections_per_ip` (an eighth of the ceiling by default) so that one address cannot take
+the whole of it.
 
 ## HTTP/2 control-frame floods
 

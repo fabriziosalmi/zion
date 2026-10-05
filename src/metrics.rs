@@ -1703,7 +1703,7 @@ pub fn snapshot_json(
             "has_tcp_fastopen": platform.has_tcp_fastopen,
             "has_tcp_quickack": platform.has_tcp_quickack,
             "worker_threads": platform.worker_threads,
-            "conn_limit": platform.conn_limit,
+            "conn_limit": crate::bootstrap::conn_ceiling(),
             // NUMA topology — 1 unless built with `--features numa-aware`
             // on a multi-socket Linux box (issue #50).
             "numa_nodes": platform.numa_nodes,

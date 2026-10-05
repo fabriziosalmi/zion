@@ -204,11 +204,13 @@ With `hot_reload = true` (default), certificate renewal requires no restart:
 ## Scaling & limits
 
 **Per-node connection ceiling.** The global concurrent-connection limit is
-derived from RAM (25% of RAM ÷ 256 KB per connection) but **hard-capped at
-100,000** per node. This is a deliberate design limit, not just a RAM guard: on
-a large box the formula would allow far more, but the admission semaphore caps
-at 100k and the 100,001st concurrent connection is shed. Raise it only by
-changing the clamp in `compute_conn_limit` and rebuilding.
+derived from memory (25% of it ÷ 256 KB per connection), between 1,000 and
+100,000. The memory is the cgroup limit when the process runs under one (a
+container, a pod, a systemd unit with `MemoryMax=`), the machine's RAM
+otherwise. The connection over the ceiling is shed at accept. To go above
+100,000 on a large box, or below the derived value in a small container, set
+`[server] max_connections` (read at start). See
+[Hardening](/security/hardening#connection-limit) for what a connection costs.
 
 **Per-replica enforcement (multi-replica).** Rate limiting
 (`rate_limit_rps`), the per-IP connection cap (`max_connections_per_ip`), and

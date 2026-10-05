@@ -580,7 +580,32 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     // proxies, XFF policy, rate-limit settings — everything that follows
     // from `zion.toml`). This is the single entry point that future
     // hot-reload phases will re-invoke and atomic-swap.
-    let resolved = ResolvedAppConfig::try_build(&config, platform.conn_limit)?;
+    // The connection ceiling, fixed here for the life of the process: the configured
+    // `max_connections`, or the value derived from memory (the cgroup limit when there
+    // is one). The per-IP default and the tarpit cap below are derived from it.
+    let conn_ceiling = bootstrap::set_conn_ceiling(config.server.max_connections);
+    if let Some(configured) = config.server.max_connections {
+        let derived = platform.conn_limit;
+        let needs_mb = configured as u64 * 256 / 1024;
+        if configured > derived {
+            logging::warn(
+                "boot",
+                &format!(
+                    "server.max_connections = {configured} is above the {derived} derived from {} MB of memory: at 256 KB a connection that many need about {needs_mb} MB",
+                    platform.ram_mb
+                ),
+            );
+        } else {
+            logging::info(
+                "boot",
+                &format!(
+                    "connection ceiling {configured} (server.max_connections; {derived} would be derived from {} MB of memory)",
+                    platform.ram_mb
+                ),
+            );
+        }
+    }
+    let resolved = ResolvedAppConfig::try_build(&config, conn_ceiling)?;
     dns::configure(resolved.dns_stale_secs, resolved.dns_timeout_ms);
 
     // Boot-time visibility: structured logs for the bits operators
@@ -765,7 +790,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         http_client: proxy::build_http_client(proxy::DEFAULT_CONNECT_TIMEOUT_MS, false),
         http_clients: dashmap::DashMap::new(),
         static_cache: cache::StaticCache::new(),
-        conn_limit: Arc::new(Semaphore::new(platform.conn_limit)),
+        conn_limit: Arc::new(Semaphore::new(conn_ceiling)),
         acme_challenges: acme::new_challenge_store(),
         limiters: Limiters {
             rate_map: Arc::new(numa::NumaAwareMap::new()),
@@ -835,7 +860,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     reload::spawn_config_watcher(
         config_path.clone().into(),
         state.config.clone(),
-        platform.conn_limit,
+        conn_ceiling,
         // Cloned: the admin API (below) shares the SAME change channel so an
         // admin push notifies the listener supervisor exactly like a file edit.
         Some(config_change_tx.clone()),
@@ -950,7 +975,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                 }
                 if let Some((auth, write_token)) = auth_and_token {
                     let ctx = std::sync::Arc::new(admin::AdminReloadCtx {
-                        conn_limit_max: platform.conn_limit,
+                        conn_limit_max: conn_ceiling,
                         change_notifier: Some(config_change_tx.clone()),
                         config_path: config_path.clone().into(),
                         boot_tls_cert: Some(config.tls.cert_path.clone()),
@@ -1218,7 +1243,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     // conn_limit has MAX permits; available = MAX - in_flight.
     // We try to acquire ALL permits (meaning all connections finished).
     let drain_timeout = std::time::Duration::from_secs(30);
-    let max = platform.conn_limit;
+    let max = conn_ceiling;
     let in_flight = max - state.conn_limit.available_permits();
     if in_flight > 0 {
         logging::info(
