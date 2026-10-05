@@ -57,6 +57,7 @@ mod dns;
 mod doctor;
 mod drain;
 mod error;
+mod h2_guard;
 mod health;
 mod http_conditional;
 mod import;
@@ -579,7 +580,32 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     // proxies, XFF policy, rate-limit settings — everything that follows
     // from `zion.toml`). This is the single entry point that future
     // hot-reload phases will re-invoke and atomic-swap.
-    let resolved = ResolvedAppConfig::try_build(&config, platform.conn_limit)?;
+    // The connection ceiling, fixed here for the life of the process: the configured
+    // `max_connections`, or the value derived from memory (the cgroup limit when there
+    // is one). The per-IP default and the tarpit cap below are derived from it.
+    let conn_ceiling = bootstrap::set_conn_ceiling(config.server.max_connections);
+    if let Some(configured) = config.server.max_connections {
+        let derived = platform.conn_limit;
+        let needs_mb = configured as u64 * 256 / 1024;
+        if configured > derived {
+            logging::warn(
+                "boot",
+                &format!(
+                    "server.max_connections = {configured} is above the {derived} derived from {} MB of memory: at 256 KB a connection that many need about {needs_mb} MB",
+                    platform.ram_mb
+                ),
+            );
+        } else {
+            logging::info(
+                "boot",
+                &format!(
+                    "connection ceiling {configured} (server.max_connections; {derived} would be derived from {} MB of memory)",
+                    platform.ram_mb
+                ),
+            );
+        }
+    }
+    let resolved = ResolvedAppConfig::try_build(&config, conn_ceiling)?;
     dns::configure(resolved.dns_stale_secs, resolved.dns_timeout_ms);
 
     // Boot-time visibility: structured logs for the bits operators
@@ -764,7 +790,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         http_client: proxy::build_http_client(proxy::DEFAULT_CONNECT_TIMEOUT_MS, false),
         http_clients: dashmap::DashMap::new(),
         static_cache: cache::StaticCache::new(),
-        conn_limit: Arc::new(Semaphore::new(platform.conn_limit)),
+        conn_limit: Arc::new(Semaphore::new(conn_ceiling)),
         acme_challenges: acme::new_challenge_store(),
         limiters: Limiters {
             rate_map: Arc::new(numa::NumaAwareMap::new()),
@@ -834,7 +860,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     reload::spawn_config_watcher(
         config_path.clone().into(),
         state.config.clone(),
-        platform.conn_limit,
+        conn_ceiling,
         // Cloned: the admin API (below) shares the SAME change channel so an
         // admin push notifies the listener supervisor exactly like a file edit.
         Some(config_change_tx.clone()),
@@ -949,7 +975,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                 }
                 if let Some((auth, write_token)) = auth_and_token {
                     let ctx = std::sync::Arc::new(admin::AdminReloadCtx {
-                        conn_limit_max: platform.conn_limit,
+                        conn_limit_max: conn_ceiling,
                         change_notifier: Some(config_change_tx.clone()),
                         config_path: config_path.clone().into(),
                         boot_tls_cert: Some(config.tls.cert_path.clone()),
@@ -1217,7 +1243,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     // conn_limit has MAX permits; available = MAX - in_flight.
     // We try to acquire ALL permits (meaning all connections finished).
     let drain_timeout = std::time::Duration::from_secs(30);
-    let max = platform.conn_limit;
+    let max = conn_ceiling;
     let in_flight = max - state.conn_limit.available_permits();
     if in_flight > 0 {
         logging::info(
@@ -1377,7 +1403,16 @@ async fn handle_http_connection(
     net::set_keepalive(&stream, state.config.load().tcp_keepalive_secs);
     net::set_user_timeout(&stream, state.config.load().tcp_user_timeout_secs);
 
-    let io = TokioIo::new(stream);
+    // The plaintext listener speaks HTTP/2 to a client that opens with the preface, so the
+    // control-frame bound (#475) applies here as on :443.
+    let io = h2_guard::H2Guard::new(
+        stream,
+        h2_guard::Limits {
+            control_per_sec: state.cfg().h2_control_frames_per_sec,
+        },
+    );
+    let (h2_verdict, flood_log_state) = (io.verdict(), state.clone());
+    let io = TokioIo::new(io);
     // Connection-level idle timeout — matches the HTTPS path (1h, generous
     // enough for keep-alive; header_read_timeout bounds the slowloris header
     // phase, per-request limits live in handle_http).
@@ -1395,6 +1430,7 @@ async fn handle_http_connection(
         drain::serve(conn.as_mut(), drain::subscribe(), |c| c.graceful_shutdown()),
     )
     .await;
+    log_h2_flood(&h2_verdict, &flood_log_state, addr);
 }
 
 /// Run the HTTPS / TLS accept loop. On non-Linux or without the
@@ -1467,6 +1503,34 @@ async fn run_https_accept_loop(
             }
         }
     }
+}
+
+/// Say that a connection was closed by the HTTP/2 control-frame bound (#475). The metric
+/// counts every one; the line is throttled to about one a second, process-wide, so the
+/// client that floods frames cannot flood the log by reconnecting.
+fn log_h2_flood(verdict: &h2_guard::Verdict, state: &AppState, peer: SocketAddr) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+    let Some(flood) = verdict.get() else {
+        return;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if now_ms.saturating_sub(LAST_LOG_MS.load(Ordering::Relaxed)) < 1000 {
+        return;
+    }
+    LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+    logging::warn(
+        "h2_flood",
+        &format!(
+            "{} from {}: connection closed (h2_control_frames_per_sec = {})",
+            flood.as_str(),
+            state.redact.ip_label(peer.ip()),
+            state.cfg().h2_control_frames_per_sec
+        ),
+    );
 }
 
 /// Rate-limit TLS-handshake failure logging to ~one line per second,
@@ -1653,16 +1717,23 @@ fn spawn_https_handler(
         // The cfg-arms are mutually exclusive, so `io` resolves to a
         // single concrete type per build (no dyn / boxing needed —
         // `serve_connection_with_upgrades` is generic over the IO).
+        // HTTP/2 control-frame bound (#475): the guard reads the frame headers as they go by
+        // and stops reading from a connection that floods.
+        let h2_limits = h2_guard::Limits {
+            control_per_sec: state.cfg().h2_control_frames_per_sec,
+        };
         #[cfg(all(target_os = "linux", feature = "ktls"))]
         let io = match crate::ktls::try_upgrade(tls_stream).await {
-            Ok(ktls_stream) => TokioIo::new(ktls_stream),
+            Ok(ktls_stream) => h2_guard::H2Guard::new(ktls_stream, h2_limits),
             Err(e) => {
                 logq::line(&format!("  kTLS upgrade failed, closing connection: {e}"));
                 return;
             }
         };
         #[cfg(not(all(target_os = "linux", feature = "ktls")))]
-        let io = TokioIo::new(tls_stream);
+        let io = h2_guard::H2Guard::new(tls_stream, h2_limits);
+        let (h2_verdict, flood_log_state) = (io.verdict(), state.clone());
+        let io = TokioIo::new(io);
         // Connection-level idle timeout. 1h to cover long-lived HTTP/2
         // mux / WebSocket / SSE; per-request timeouts are in process_request.
         let conn = builder.serve_connection_with_upgrades(
@@ -1717,6 +1788,7 @@ fn spawn_https_handler(
             drain::serve(conn.as_mut(), drain::subscribe(), |c| c.graceful_shutdown()),
         )
         .await;
+        log_h2_flood(&h2_verdict, &flood_log_state, remote_addr);
     });
 }
 

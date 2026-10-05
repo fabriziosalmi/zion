@@ -234,6 +234,25 @@ where
         None
     }
 
+    /// Remove `k` if it is present and `pred` holds for its value: for an owner taking
+    /// out the entry it put in, and not the one a later owner registered under the same
+    /// key. Looks on the local shard first, then on the rest, like `remove`.
+    pub fn remove_if(&self, k: &K, pred: impl Fn(&V) -> bool) -> Option<(K, V)> {
+        let local = self.local_idx();
+        if let Some(kv) = self.shards[local].remove_if(k, |_, v| pred(v)) {
+            return Some(kv);
+        }
+        for (i, shard) in self.shards.iter().enumerate() {
+            if i == local {
+                continue;
+            }
+            if let Some(kv) = shard.remove_if(k, |_, v| pred(v)) {
+                return Some(kv);
+            }
+        }
+        None
+    }
+
     /// Total entries across all shards.
     #[inline]
     pub fn len(&self) -> usize {

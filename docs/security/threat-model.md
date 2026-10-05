@@ -87,6 +87,20 @@ ClientHello stream.
 - **Residual**: no SYN cookies / connection-rate cap at L4 — that belongs
   to the network layer (LB, AWS Shield, ipset).
 
+**D — denial of service**: one HTTP/2 connection sending control frames
+(`PING`, `SETTINGS`, `WINDOW_UPDATE`, unknown frame types, `RST_STREAM` for
+streams it never opened) at wire speed.
+- **Mitigation**: `[server] h2_control_frames_per_sec` closes the
+  connection with `GOAWAY(ENHANCE_YOUR_CALM)`, on every way into HTTP/2
+  (ALPN, or the preface on either listener). Rapid Reset, CONTINUATION
+  floods and header bombs are bounded by the HTTP/2 library and the limits
+  pinned in `main.rs` (`H2_*`).
+- **Residual**: the limit is opt-in (default `0`, count only), so an
+  instance that has not set it keeps a flooding connection open; the cost
+  is CPU (about 65 ns per frame), not memory, and the per-IP connection cap
+  bounds how many such connections one address holds. See
+  [Hardening](hardening.md#http-2-control-frame-floods).
+
 **E — elevation of privilege**: cert reload races with in-flight handshake,
 allowing an attacker to keep using a revoked cert.
 - **Mitigation**: hot-reload is `ArcSwap` ([ADR-0001](../adr/0001-arcswap-config-hot-reload.md))

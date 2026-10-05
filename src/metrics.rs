@@ -510,6 +510,14 @@ pub struct Metrics {
     /// Tokens accepted on a profile without `max_token_lifetime_secs` although they expire
     /// more than 24 h from now: what the future default cap would refuse (#553).
     pub auth_long_lived_tokens: AtomicU64,
+    /// HTTP/2 connections closed for sending more control frames in a second than
+    /// `h2_control_frames_per_sec` allows (#475)...
+    pub h2_flood_closed_control: AtomicU64,
+    /// ... and for more `WINDOW_UPDATE`s than the response bytes they were sent account for.
+    pub h2_flood_closed_window_update: AtomicU64,
+    /// The most control frames any one HTTP/2 connection sent in one second since start:
+    /// what to look at before choosing `h2_control_frames_per_sec`.
+    pub h2_control_frames_peak: AtomicU64,
     /// Total bytes received on the gossip socket (decoded or not).
     pub mesh_gossip_bytes_in: AtomicU64,
     /// Total bytes sent on the gossip socket.
@@ -625,6 +633,9 @@ impl Metrics {
             mesh_claims_dropped_rate: AtomicU64::new(0),
             mesh_score_lookups: AtomicU64::new(0),
             auth_long_lived_tokens: AtomicU64::new(0),
+            h2_flood_closed_control: AtomicU64::new(0),
+            h2_flood_closed_window_update: AtomicU64::new(0),
+            h2_control_frames_peak: AtomicU64::new(0),
             mesh_gossip_bytes_in: AtomicU64::new(0),
             mesh_gossip_bytes_out: AtomicU64::new(0),
             acme_renewals_total: AtomicU64::new(0),
@@ -1392,6 +1403,32 @@ impl Metrics {
                 .as_bytes(),
         );
         out.extend_from_slice(
+            b"\n# HELP zion_h2_control_flood_closed_total HTTP/2 connections closed for a control-frame flood (h2_control_frames_per_sec), by what flooded.\n\
+                                # TYPE zion_h2_control_flood_closed_total counter\n\
+                                zion_h2_control_flood_closed_total{reason=\"control_frames\"} ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.h2_flood_closed_control.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\nzion_h2_control_flood_closed_total{reason=\"window_update\"} ");
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.h2_flood_closed_window_update.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(
+            b"\n# HELP zion_h2_control_frames_peak Most control frames one HTTP/2 connection sent in one second since start.\n\
+                                # TYPE zion_h2_control_frames_peak gauge\n\
+                                zion_h2_control_frames_peak ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.h2_control_frames_peak.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(
             b"\n# HELP zion_mesh_score_lookups_total Dispatcher hits that found a mesh score for the client IP.\n\
                                 # TYPE zion_mesh_score_lookups_total counter\n\
                                 zion_mesh_score_lookups_total ",
@@ -1666,7 +1703,7 @@ pub fn snapshot_json(
             "has_tcp_fastopen": platform.has_tcp_fastopen,
             "has_tcp_quickack": platform.has_tcp_quickack,
             "worker_threads": platform.worker_threads,
-            "conn_limit": platform.conn_limit,
+            "conn_limit": crate::bootstrap::conn_ceiling(),
             // NUMA topology — 1 unless built with `--features numa-aware`
             // on a multi-socket Linux box (issue #50).
             "numa_nodes": platform.numa_nodes,

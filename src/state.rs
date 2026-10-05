@@ -65,6 +65,11 @@ pub(crate) struct ResolvedAppConfig {
     pub(crate) tcp_keepalive_secs: u64,
     /// `[server] tcp_user_timeout_secs` (0 = kernel default).
     pub(crate) tcp_user_timeout_secs: u64,
+    /// `[server] h2_control_frames_per_sec` (0 = no limit).
+    pub(crate) h2_control_frames_per_sec: u32,
+    /// `[server] max_connections` as configured. The ceiling itself is fixed at start
+    /// (`bootstrap::conn_ceiling`); this is kept to refuse a reload that changes it.
+    pub(crate) max_connections: Option<usize>,
     /// Upstream DNS policy (`[server] dns_stale_secs`, `dns_timeout_ms`). Carried in the
     /// snapshot and applied by `crate::dns::configure` only when the snapshot is published,
     /// so a rejected reload leaves the running policy alone.
@@ -122,6 +127,8 @@ impl ResolvedAppConfig {
             max_connections_per_ip: 0,
             tcp_keepalive_secs: crate::net::DEFAULT_TCP_KEEPALIVE_SECS,
             tcp_user_timeout_secs: crate::net::DEFAULT_TCP_USER_TIMEOUT_SECS,
+            h2_control_frames_per_sec: 0,
+            max_connections: None,
             dns_stale_secs: crate::dns::DEFAULT_STALE_SECS,
             dns_timeout_ms: crate::dns::DEFAULT_TIMEOUT_MS,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
@@ -410,6 +417,8 @@ impl ResolvedAppConfig {
             max_connections_per_ip,
             tcp_keepalive_secs: config.server.tcp_keepalive_secs,
             tcp_user_timeout_secs: config.server.tcp_user_timeout_secs,
+            h2_control_frames_per_sec: config.server.h2_control_frames_per_sec,
+            max_connections: config.server.max_connections,
             dns_stale_secs: config.server.dns_stale_secs,
             dns_timeout_ms: config.server.dns_timeout_ms,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]

@@ -205,10 +205,23 @@ fn reload_now_inner(
         }
     }
 
+    let previous = state_config.load_full();
+
+    // Refuse a reload that changes `[server] max_connections`. The ceiling is a
+    // semaphore sized at start, and the per-IP default and the tarpit cap are
+    // derived from it: applying half of that would leave them disagreeing.
+    if new_config.server.max_connections != previous.max_connections {
+        let shown = |v: Option<usize>| v.map_or("unset".to_string(), |n| n.to_string());
+        return Err(format!(
+            "server.max_connections changed ({} → {}): the connection ceiling is fixed at start, so changing it needs a restart — reload rejected, running config unchanged",
+            shown(previous.max_connections),
+            shown(new_config.server.max_connections)
+        ));
+    }
+
     // 2. Rebuild on the current thread. The catch_unwind guards a deeper panic
     // escaping validation — effective in debug/test (panic=unwind); a no-op in
     // release (panic=abort aborts before unwinding). See PANIC DOCTRINE in main.
-    let previous = state_config.load_full();
     let snapshot = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rebuild(&new_config, &previous, conn_limit_max)
     })) {
@@ -581,6 +594,35 @@ mod tests {
         let snap =
             ResolvedAppConfig::try_build(&cfg, TEST_CONN_LIMIT_MAX).expect("test config builds");
         assert_eq!(snap.tcp_user_timeout_secs, 33);
+    }
+
+    /// `h2_control_frames_per_sec` is read from the live snapshot when a connection is
+    /// accepted (#475), so a reload that sets, changes or removes it must reach the snapshot.
+    #[test]
+    fn the_h2_control_frame_limit_is_carried_in_the_snapshot() {
+        let build = |line: &str| {
+            let cfg = parse_inline(&format!(
+                r#"
+            [server]
+            listen_http = "0.0.0.0:8080"
+            listen_https = "0.0.0.0:8443"
+            {line}
+            [tls]
+            cert_path = "/tmp/zion-test.crt"
+            key_path  = "/tmp/zion-test.key"
+            [upstreams]
+            api = "http://api:8000"
+            [[route]]
+            path = "/api/{{*rest}}"
+            upstream = "api"
+        "#
+            ));
+            ResolvedAppConfig::try_build(&cfg, TEST_CONN_LIMIT_MAX)
+                .expect("test config builds")
+                .h2_control_frames_per_sec
+        };
+        assert_eq!(build(""), 0);
+        assert_eq!(build("h2_control_frames_per_sec = 750"), 750);
     }
 
     /// Building a snapshot must not change the running DNS policy: a reload that is built but
@@ -1059,6 +1101,79 @@ mod tests {
             "the accepted reload did swap"
         );
         assert!(reload_failures() > before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[server] max_connections` sizes a semaphore at start, and the per-IP default and
+    /// the tarpit cap follow it: a reload that sets, changes or removes it is refused, and
+    /// one that leaves it as it was is not.
+    #[test]
+    fn reload_now_rejects_a_change_of_max_connections() {
+        use arc_swap::ArcSwap;
+        let dir = std::env::temp_dir().join(format!("zion-reload-maxconn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = (dir.join("c.crt"), dir.join("k.key"));
+        std::fs::write(&cert, b"-").unwrap();
+        std::fs::write(&key, b"-").unwrap();
+        let body = |server: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:8080\"\nlisten_https=\"0.0.0.0:8443\"\n{server}\n\
+                 [tls]\ncert_path='{}'\nkey_path='{}'\n\
+                 [upstreams]\napi=\"http://api:8000\"\n\
+                 [[route]]\npath=\"/api/{{*rest}}\"\nupstream=\"api\"\n",
+                cert.display(),
+                key.display()
+            )
+        };
+        let push = |store: &Arc<ArcSwap<ResolvedAppConfig>>, server: &str| {
+            reload_now(
+                ConfigSource::Body(body(server)),
+                store,
+                TEST_CONN_LIMIT_MAX,
+                None,
+                None,
+                None,
+            )
+        };
+        let started_with = |server: &str| {
+            let snap =
+                ResolvedAppConfig::try_build(&parse_inline(&body(server)), TEST_CONN_LIMIT_MAX)
+                    .unwrap();
+            Arc::new(ArcSwap::from_pointee(snap))
+        };
+
+        // Started with 5,000.
+        let store = started_with("max_connections = 5000");
+        assert!(push(&store, "max_connections = 5000\nrate_limit_rps = 7").is_ok());
+        assert_eq!(
+            store.load().rate_limit_rps,
+            7,
+            "the rest of the reload applied"
+        );
+        let live = store.load_full();
+        for (changed, shown) in [
+            ("max_connections = 6000", "5000 → 6000"),
+            ("", "5000 → unset"),
+        ] {
+            // (the error text is compared, not printed: it is built by the function that
+            // also names the TLS paths, and a test log is no place for those)
+            let e = push(&store, changed).unwrap_err();
+            assert!(
+                e.contains(&format!("server.max_connections changed ({shown})"))
+                    && e.contains("needs a restart"),
+                "refused, but not for the change of max_connections ({shown})"
+            );
+            assert!(Arc::ptr_eq(&live, &store.load_full()), "snapshot unchanged");
+        }
+
+        // Started without it.
+        let store = started_with("");
+        assert!(push(&store, "rate_limit_rps = 9").is_ok());
+        let e = push(&store, "max_connections = 5000").unwrap_err();
+        assert!(
+            e.contains("server.max_connections changed (unset → 5000)"),
+            "refused, but not for max_connections being set"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

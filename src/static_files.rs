@@ -24,19 +24,26 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::proxy::ZionBody;
 
-/// Buffer-whole-into-memory threshold. At or below this a body — a full file or a
-/// single range slice — is read into one `Bytes` and served as a `Full` body (the
-/// low-latency common case). Above it the body is streamed frame-by-frame instead
-/// (see [`stream_file`]), so an arbitrarily large file never sits in memory whole
-/// — the memory-amplification concern the ADR-0015 v1 guarded with a hard 413.
-const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-
 /// Per-read chunk size for a streamed file body.
 const STREAM_CHUNK: usize = 64 * 1024;
 /// Frames buffered between the file reader and the socket. Bounds in-flight memory
 /// to about `STREAM_CHUNK × (STREAM_CHANNEL_CAP + 1)` while keeping the reader
 /// slightly ahead of the network.
 const STREAM_CHANNEL_CAP: usize = 8;
+
+/// Buffer-whole-into-memory threshold. At or below this a body — a full file or a
+/// single range slice — is read into one `Bytes` and served as a `Full` body (CSS,
+/// JS, icons: one read, no task). Above it the body is streamed frame-by-frame
+/// (see [`stream_file`]).
+///
+/// It is what a streamed body holds in flight anyway (576 KiB), so no request holds
+/// more than that, whatever the file. Every request reads its own copy, and one
+/// HTTP/2 connection carries 128 of them: when this was 64 MiB, a single connection
+/// asking 100 times for a 60 MiB file took the process from 12 MiB to 4.6 GB, and
+/// kept it there for as long as it did not read (#562).
+const BUFFER_WHOLE_MAX_BYTES: u64 = (STREAM_CHUNK * (STREAM_CHANNEL_CAP + 1)) as u64;
+// Whatever the stream constants become, no request reads megabytes whole.
+const _: () = assert!(BUFFER_WHOLE_MAX_BYTES <= 1024 * 1024);
 
 /// Turn a request-path tail (already stripped of the route prefix) into a safe
 /// RELATIVE path under the serve root, or `None` if it must be refused. Pure —
@@ -385,7 +392,7 @@ async fn read_file(
     }
     // A large file streams frame-by-frame instead of buffering whole; a small one
     // takes the low-latency one-shot read.
-    if total > MAX_FILE_BYTES {
+    if total > BUFFER_WHOLE_MAX_BYTES {
         let file = match tokio::fs::File::open(path).await {
             Ok(f) => f,
             Err(_) => return resp(StatusCode::NOT_FOUND),
@@ -580,9 +587,8 @@ pub(crate) fn if_range_allows_stored(
         .is_some_and(|lm| lm.trim() == v)
 }
 
-/// Read `[start, end]` from `path` and answer `206 Partial Content`. The slice is
-/// bounded by [`MAX_FILE_BYTES`] (the same memory guard as the full read) — a
-/// larger single range is refused with 413 until streaming lands.
+/// Read `[start, end]` from `path` and answer `206 Partial Content`. A slice larger
+/// than [`BUFFER_WHOLE_MAX_BYTES`] is streamed, like a full file of that size.
 async fn read_range(
     path: &Path,
     mime: &'static str,
@@ -601,7 +607,7 @@ async fn read_range(
         return resp(StatusCode::INTERNAL_SERVER_ERROR);
     }
     // A large slice streams from the seek position; a small one is read whole.
-    if len > MAX_FILE_BYTES {
+    if len > BUFFER_WHOLE_MAX_BYTES {
         return partial_response(
             mime,
             start,
@@ -1305,10 +1311,8 @@ mod serve_tests {
     }
 
     // ── Streaming bodies (stream_file) ────────────────────────────────────────
-    // The >MAX_FILE_BYTES serve path just opens the file and hands it to
-    // stream_file; these prove that machinery byte-for-byte without writing a
-    // 64 MiB fixture into the unit suite. The threshold path itself is exercised
-    // live (a >64 MiB file over a real socket).
+    // These prove the stream_file machinery byte-for-byte; the threshold that
+    // chooses between it and the one-shot read is tested below.
 
     async fn collect(body: ZionBody) -> Vec<u8> {
         body.collect().await.unwrap().to_bytes().to_vec()
@@ -1352,6 +1356,66 @@ mod serve_tests {
         let got = collect(stream_file(capped, Some(limit as u64))).await;
         assert_eq!(got.len(), limit);
         assert_eq!(got, data[..limit], "limited stream stops on the exact byte");
+    }
+
+    // ── Buffer or stream (#562) ───────────────────────────────────────────────
+
+    /// A one-shot body knows its exact size; a streamed one is a channel and does not.
+    fn is_buffered(r: &Response<ZionBody>) -> bool {
+        use hyper::body::Body;
+        r.body().size_hint().exact().is_some()
+    }
+
+    fn content_length(r: &Response<ZionBody>) -> u64 {
+        let v = r.headers().get(hyper::header::CONTENT_LENGTH).unwrap();
+        v.to_str().unwrap().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_file_over_the_threshold_is_streamed_and_one_at_it_is_read_whole() {
+        let root = root("buffer-or-stream");
+        let at = BUFFER_WHOLE_MAX_BYTES as usize;
+        let data: Vec<u8> = (0..at + 1).map(|i| (i % 251) as u8).collect();
+        std::fs::write(root.0.join("at.bin"), &data[..at]).unwrap();
+        std::fs::write(root.0.join("over.bin"), &data).unwrap();
+
+        let r = get_h(&root.0, "at.bin", HeaderMap::new()).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(
+            is_buffered(&r),
+            "a file of the threshold size is read whole"
+        );
+        assert_eq!(content_length(&r), at as u64);
+        assert!(body_bytes(r).await == data[..at]);
+
+        let r = get_h(&root.0, "over.bin", HeaderMap::new()).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(!is_buffered(&r), "one byte more and it is streamed");
+        assert_eq!(content_length(&r), at as u64 + 1, "with its length");
+        assert!(body_bytes(r).await == data, "and every byte");
+    }
+
+    #[tokio::test]
+    async fn a_range_over_the_threshold_is_streamed_too() {
+        let root = root("buffer-or-stream-range");
+        let at = BUFFER_WHOLE_MAX_BYTES as usize;
+        let data: Vec<u8> = (0..at * 2).map(|i| (i % 251) as u8).collect();
+        std::fs::write(root.0.join("big.bin"), &data).unwrap();
+
+        // A slice of exactly the threshold, from an offset: read whole.
+        let range = format!("bytes=7-{}", 7 + at - 1);
+        let r = get_h(&root.0, "big.bin", one(hyper::header::RANGE, &range)).await;
+        assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(is_buffered(&r));
+        assert!(body_bytes(r).await == data[7..7 + at]);
+
+        // One byte more: streamed, from the same offset, to the exact byte.
+        let range = format!("bytes=7-{}", 7 + at);
+        let r = get_h(&root.0, "big.bin", one(hyper::header::RANGE, &range)).await;
+        assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(!is_buffered(&r), "a large slice is not read whole either");
+        assert_eq!(content_length(&r), at as u64 + 1);
+        assert!(body_bytes(r).await == data[7..7 + at + 1]);
     }
 
     // ── Precompressed sidecars (.br / .gz via Accept-Encoding) ────────────────
