@@ -64,6 +64,29 @@ it), not a hang.
   overwrite could interleave old/new bytes (a pre-existing static-serving TOCTOU,
   not introduced here).
 
+## Amendment (2026-10-05, #562): the threshold is 576 KiB, not 64 MiB
+
+Keeping the 64 MiB constant as the threshold left the last sentence of the Context
+true: a file of up to 64 MiB sat in memory whole under every concurrent request.
+One HTTP/2 connection carries 128 requests, and nothing is shared between them.
+Measured, one connection and 100 requests:
+
+| | before | after |
+|---|---|---|
+| memory held while the client reads nothing (32 MiB file) | 3,224 MiB | 91 MiB |
+| peak resident size while a fast client reads (60 MiB file) | 2.9 to 5.0 GB | 0.6 to 0.8 GB |
+
+The threshold is now `STREAM_CHUNK × (STREAM_CHANNEL_CAP + 1)`, what a streamed
+body holds in flight anyway: buffering a file of that size or less costs no more
+memory than streaming it, and above it a request holds a bounded amount whatever
+the file. A compile-time assertion keeps it at or under 1 MiB.
+
+The cost is CPU for files between 576 KiB and 64 MiB, which moved from the
+one-shot read to the streamed path (loopback, saturated, release build): 1 MiB
+files 2,630 → 2,280 requests/s with 1.7 times the CPU per request; 10 MiB files
+the same throughput with 1.9 times the CPU. Files of 512 KiB and less are
+unchanged. The per-chunk cost of the streamed path is the thing to optimise next.
+
 ## Alternatives considered
 
 - **Always stream** — rejected: a task + channel on every tiny CSS/JS response is
