@@ -3,7 +3,7 @@ name: zion
 description: Zion Edge Gateway — high-performance Rust TLS reverse proxy with WAF
 type: application
 version: 0.3.0
-appVersion: "0.9.9"
+appVersion: "0.9.11"
 home: https://fabriziosalmi.github.io/zion
 sources:
   - https://github.com/fabriziosalmi/zion
@@ -29,7 +29,7 @@ annotations:
     - kind: added
       description: terminationGracePeriodSeconds (default 45, covering Zion's drain)
     - kind: changed
-      description: Bump appVersion to 0.9.9
+      description: Bump appVersion to 0.9.11
     - kind: added
       description: ZION_AUDIT_HMAC_KEY wired from a Kubernetes Secret when [audit] is enabled
     - kind: added
