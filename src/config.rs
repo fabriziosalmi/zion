@@ -297,6 +297,15 @@ pub struct ServerConfig {
     /// to new connections.
     #[serde(default)]
     pub h2_control_frames_per_sec: u32,
+    /// The most client connections held open at once, on both listeners together; the
+    /// next one is refused at accept and counted in
+    /// `zion_connections_rejected_global_total`. Unset (the default), it is derived from
+    /// memory: a quarter of it at 256 KB a connection, between 1,000 and 100,000, where
+    /// memory is the cgroup limit when there is one below the machine's RAM. Set it to
+    /// go above 100,000 on a large machine, or below the derived value where memory is
+    /// shared with something else. Read at start: a reload that changes it is refused.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
     /// Log format: "text" (default) or "json".
     #[serde(default = "default_log_format")]
     pub log_format: String,
@@ -348,6 +357,10 @@ pub struct ServerConfig {
 fn default_xff_mode() -> String {
     "append".to_string()
 }
+
+/// The highest `max_connections` accepted: each connection is a file descriptor and at
+/// least tens of kilobytes, and ten million of them is past what one process serves.
+const MAX_CONNECTIONS_CEILING: usize = 10_000_000;
 
 /// The lowest `h2_control_frames_per_sec` that is not `0` (no limit).
 const H2_CONTROL_FRAMES_PER_SEC_MIN: u32 = 10;
@@ -1923,6 +1936,20 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             ));
         }
     }
+    if let Some(n) = config.server.max_connections {
+        if n == 0 {
+            errors.push(
+                "server.max_connections = 0 would refuse every connection: leave it out to derive \
+                 the ceiling from memory"
+                    .to_string(),
+            );
+        } else if n > MAX_CONNECTIONS_CEILING {
+            errors.push(format!(
+                "server.max_connections = {n} is above {MAX_CONNECTIONS_CEILING}, the most this \
+                 setting accepts"
+            ));
+        }
+    }
     if (1..H2_CONTROL_FRAMES_PER_SEC_MIN).contains(&config.server.h2_control_frames_per_sec) {
         errors.push(format!(
             "server.h2_control_frames_per_sec = {} would close ordinary clients, which send two \
@@ -2985,6 +3012,38 @@ mod tests {
         assert_eq!(parse("").server.log_queue_lines, 8192);
         assert_eq!(parse("log_queue_lines = 100").server.log_queue_lines, 100);
         assert_eq!(parse("log_queue_lines = 0").server.log_queue_lines, 0);
+    }
+
+    #[test]
+    fn max_connections_is_optional_and_refuses_zero_and_the_absurd() {
+        let cfg = |extra: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n{extra}\n[tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstream.u]\nurl=\"http://a:1\"\n[[route]]\npath=\"/{{*r}}\"\nupstream=\"u\"\n"
+            )
+        };
+        let parsed = |extra: &str| -> Option<usize> {
+            toml::from_str::<ZionConfig>(&cfg(extra))
+                .unwrap()
+                .server
+                .max_connections
+        };
+        // (the placeholder cert/key paths fail the file checks; only this setting matters here)
+        let errs = |extra: &str| validate_str(&cfg(extra), "t").err().unwrap_or_default();
+        assert_eq!(parsed(""), None, "derived from memory unless set");
+        assert_eq!(parsed("max_connections = 250000"), Some(250_000));
+        for ok in ["", "max_connections = 1", "max_connections = 10000000"] {
+            assert!(!errs(ok).contains("max_connections"), "{ok}");
+        }
+        let e = errs("max_connections = 0");
+        assert!(
+            e.contains("server.max_connections = 0 would refuse every connection"),
+            "{e}"
+        );
+        let e = errs("max_connections = 10000001");
+        assert!(
+            e.contains("server.max_connections = 10000001 is above 10000000"),
+            "{e}"
+        );
     }
 
     #[test]
