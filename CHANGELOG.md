@@ -4,7 +4,17 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
-**Heads-up: the default of `max_token_lifetime_secs` becomes 86400 (24 h) in the next minor release** (#553). Nothing is refused yet. See below how to find out whether it affects you.
+## [0.9.10] - 2026-10-05
+
+**Security release: a static route could be made to hold gigabytes by one connection.** `mode = "static"` read every file of up to 64 MiB whole into memory for each request; one HTTP/2 connection asking 100 times for a 32 MiB file held 3.2 GB for as long as it chose not to read (#562). Also in this release: the connection ceiling follows the container's memory limit, HTTP/2 control-frame floods can be bounded, the WAF can scan header values, and zion can present a client certificate to an upstream.
+
+### Upgrade notes
+
+- **Upgrade if a static route serves files larger than a megabyte.** Nothing to configure: files above 576 KiB are streamed. They cost more CPU per request than before (about 1.7 times at 1 MiB, measured on loopback); files of 512 KiB and less are served as they were.
+- **In a container, the connection ceiling is now derived from the container's memory limit**, not from the node's RAM, so it is lower than before wherever the limit is below the node's memory (512 MiB: 1,000 connections, where a 32 GiB node used to give 31,980). The per-IP default, an eighth of the ceiling, follows. If the container really serves more connections than that, set `[server] max_connections`.
+- **`max_token_lifetime_secs = 0` now means "no cap".** It used to mean a cap of zero seconds, which refused every token.
+- **Heads-up: the default of `max_token_lifetime_secs` becomes 86400 (24 h) in the next minor release** (#553). Nothing is refused yet: tokens the future default would refuse are counted in `zion_auth_long_lived_tokens_total` and warned about, see below.
+- The new settings (`h2_control_frames_per_sec`, `scan_headers`, the upstream mTLS settings, `max_connections`) are off or unset by default. No setting was removed.
 
 ### Added
 
