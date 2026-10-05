@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.9.11] - 2026-10-05
+
+**Security release for cached routes: one client could make a URL unanswerable for everyone, and requests could wait for ever.** If a route uses `mode = "static_cache"` or a `cache_profile`, upgrade. A client that closed its connection while its request was being fetched from the origin left that URL without an answer for every later request, until restart; and when the origin's response was not stored (a `404`, a `500`, `no-store`), only the first of the requests that had arrived together was answered. Nothing else changes in this release, and there is nothing to configure.
+
 ### Security
 
 - **Requests to a cached route could wait for ever, and one client could make a URL unanswerable for everyone.** Concurrent cache misses for the same URL share one origin fetch: the first request fetches, the others wait for it. Three defects in that hand-over, on routes with `mode = "static_cache"` or a `cache_profile`:
