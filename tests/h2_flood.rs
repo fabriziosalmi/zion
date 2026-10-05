@@ -79,6 +79,9 @@ impl Zion {
         }
         std::fs::write(dir.join("www/big.bin"), big_body()).unwrap();
         std::fs::write(dir.join("www/small.txt"), "hello\n").unwrap();
+        // Larger than the 64 KiB a connection may be sent before its first WINDOW_UPDATE,
+        // so a download of it that the client never acknowledges stays in flight.
+        std::fs::write(dir.join("www/mid.bin"), &big_body()[..256 * 1024]).unwrap();
         let limit = limit
             .map(|l| format!("h2_control_frames_per_sec = {l}\n"))
             .unwrap_or_default();
@@ -632,13 +635,15 @@ fn cancelling_every_stream_in_flight_is_not_a_flood() {
     conn.write_all(&out).unwrap();
     let mut next_stream = 1u32;
     for round in 0..3 {
-        // 100 downloads, each let run until its response has begun (a stream reset before
-        // the server took it up is h2's Rapid Reset business, not this test's)...
+        // 100 downloads of a file that does not fit the connection's flow-control window
+        // (this client never widens it), each let run until its response has begun: a
+        // stream reset before the server took it up is h2's Rapid Reset business, not this
+        // test's...
         let streams: Vec<u32> = (0..100).map(|i| next_stream + 2 * i).collect();
         next_stream += 200;
         let opened: Vec<u8> = streams
             .iter()
-            .flat_map(|id| get(*id, "/files/big.bin"))
+            .flat_map(|id| get(*id, "/files/mid.bin"))
             .collect();
         conn.write_all(&opened).unwrap();
         conn.flush().unwrap();
