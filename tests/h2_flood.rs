@@ -286,6 +286,15 @@ fn read_frame(s: &mut dyn Conn) -> Option<(u8, u8, u32, Vec<u8>)> {
     ))
 }
 
+/// The error code of a `GOAWAY` payload (the four bytes after the last stream id);
+/// `u32::MAX` for a payload too short to hold one.
+fn goaway_code(payload: &[u8]) -> u32 {
+    match payload.get(4..8) {
+        Some(code) => u32::from_be_bytes([code[0], code[1], code[2], code[3]]),
+        None => u32::MAX,
+    }
+}
+
 /// What the server sent until it closed the connection (or stopped talking).
 #[derive(Debug, Default)]
 struct Seen {
@@ -304,9 +313,7 @@ fn drain(conn: &mut dyn Conn, patience: Duration) -> Seen {
         match read_frame(conn) {
             Some((PING, flags, _, _)) if flags & 1 == 1 => seen.ping_acks += 1,
             Some((SETTINGS, flags, _, _)) if flags & 1 == 1 => seen.settings_acks += 1,
-            Some((GOAWAY, _, _, p)) if p.len() >= 8 => {
-                seen.goaway = Some(u32::from_be_bytes([p[4], p[5], p[6], p[7]]));
-            }
+            Some((GOAWAY, _, _, p)) => seen.goaway = Some(goaway_code(&p)),
             Some(_) => {}
             None => {
                 // EOF, a reset, or the read timeout: only the first two are an end.
@@ -567,7 +574,10 @@ fn a_download_with_a_window_update_per_frame_is_not_a_flood() {
             (SETTINGS, 0) if flags & 1 == 0 => {
                 conn.write_all(&frame(SETTINGS, 1, 0, &[])).unwrap();
             }
-            (GOAWAY, _) => panic!("zion sent GOAWAY during a download: {payload:?}"),
+            (GOAWAY, _) => panic!(
+                "zion sent GOAWAY during a download, error code {}",
+                goaway_code(&payload)
+            ),
             _ => {}
         }
     }
@@ -638,7 +648,9 @@ fn cancelling_every_stream_in_flight_is_not_a_flood() {
                 Some((HEADERS, _, id, _)) => {
                     begun.insert(id);
                 }
-                Some((GOAWAY, _, _, p)) => panic!("round {round}: GOAWAY {p:?}"),
+                Some((GOAWAY, _, _, p)) => {
+                    panic!("round {round}: GOAWAY, error code {}", goaway_code(&p))
+                }
                 Some(_) => {}
                 None => panic!(
                     "round {round}: the connection ended, {} responses begun",
