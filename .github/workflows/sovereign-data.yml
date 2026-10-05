@@ -210,6 +210,7 @@ jobs:
           echo "Automated weekly refresh of the ${{ matrix.adjective }} table."
           echo
           cat "$RUNNER_TEMP/summary.md"
+          echo
           echo "### Checked before this PR opened"
           echo
           echo "- The three source files: RIPE's record counts, date and published MD5; IPtoASN covering the address space with no hole; none older than a week."
