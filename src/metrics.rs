@@ -556,6 +556,11 @@ pub struct Metrics {
     /// with the profiles' `max_entries`: it is what showed (too late) that the cap was not
     /// holding under concurrent inserts (#481).
     pub cache_entries: AtomicU64,
+    /// What the response cache holds, in bytes (keys, bodies and a fixed cost per entry).
+    pub cache_bytes: AtomicU64,
+    /// Responses not stored because no room could be made for them within
+    /// `cache_max_memory_mb` (or they are larger than it).
+    pub cache_budget_skipped: AtomicU64,
 
     // ── Runtime resource gauges (process self-introspection) ─────────
     // Sampled from `/proc/self` once per `/metrics` scrape (and per JSON
@@ -646,6 +651,8 @@ impl Metrics {
             health_probe_last_round_timestamp_seconds: AtomicU64::new(0),
             active_connections: AtomicI64::new(0),
             cache_entries: AtomicU64::new(0),
+            cache_bytes: AtomicU64::new(0),
+            cache_budget_skipped: AtomicU64::new(0),
             process_resident_memory_bytes: AtomicU64::new(0),
             process_open_fds: AtomicU64::new(0),
             request_duration: LatencyHistogram::new(),
@@ -1100,6 +1107,24 @@ impl Metrics {
                                 zion_cache_entries ",
         );
         out.extend_from_slice(itoa_buf.format(self.cache_entries.load(Relaxed)).as_bytes());
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_cache_bytes Memory held by the shared response cache: keys, bodies and a fixed cost per entry (bounded by cache_max_memory_mb).\n\
+                                # TYPE zion_cache_bytes gauge\n\
+                                zion_cache_bytes ",
+        );
+        out.extend_from_slice(itoa_buf.format(self.cache_bytes.load(Relaxed)).as_bytes());
+        out.extend_from_slice(
+            b"\n# HELP zion_cache_budget_skipped_total Responses not stored because no room could be made within cache_max_memory_mb.\n\
+                                # TYPE zion_cache_budget_skipped_total counter\n\
+                                zion_cache_budget_skipped_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.cache_budget_skipped.load(Relaxed))
+                .as_bytes(),
+        );
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(

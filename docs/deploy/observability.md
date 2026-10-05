@@ -118,6 +118,8 @@ feature-gated series (absent, not zero, without the feature) is called out.
 | `zion_h2_control_flood_closed_total{reason}` | counter | HTTP/2 connections closed by `h2_control_frames_per_sec`. `reason="control_frames"`: over the limit; `reason="window_update"`: more `WINDOW_UPDATE`s than the response bytes it was sent account for. A value that rises with ordinary clients means the limit is too low for them |
 | `zion_h2_control_frames_peak` | gauge | The most control frames one HTTP/2 connection sent in one second since start (counted with or without a limit). Read it before setting `h2_control_frames_per_sec`; ordinary clients sit at 2 to 3 |
 | `zion_cache_entries` | gauge | Responses held in the shared response cache, all profiles together. Each profile is capped by its `max_entries`; a value that keeps rising past the sum of the caps is a bug |
+| `zion_cache_bytes` | gauge | Memory held by the shared response cache: keys, bodies and 256 bytes per entry. Bounded by `[server] cache_max_memory_mb`; a value that stays at the budget with a low hit rate means the budget is small for the traffic |
+| `zion_cache_budget_skipped_total` | counter | Responses served but not stored because no room could be made for them within the cache's memory budget, or because one response is larger than the whole budget |
 | `zion_auth_long_lived_tokens_total` | counter | Tokens accepted with more than 24 h left on an auth profile that has no `max_token_lifetime_secs`. The default cap becomes 24 h in the next minor release: this counts what it would refuse |
 | `zion_bulkhead_in_flight{upstream}` | gauge | Requests currently inside an upstream that has `max_in_flight` |
 | `zion_bulkhead_limit{upstream}` | gauge | The `max_in_flight` last applied to it |

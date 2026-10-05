@@ -264,6 +264,7 @@ fn reload_now_inner(
 
     // 3. Atomic swap + generation bump + best-effort notify.
     crate::dns::configure(snapshot.dns_stale_secs, snapshot.dns_timeout_ms);
+    crate::cache::configure(snapshot.cache_budget_bytes);
     state_config.store(Arc::new(snapshot));
     let gen = CONFIG_GENERATION.fetch_add(1, Ordering::Release) + 1;
     if let Some(tx) = change_notifier {
@@ -623,6 +624,39 @@ mod tests {
         };
         assert_eq!(build(""), 0);
         assert_eq!(build("h2_control_frames_per_sec = 750"), 750);
+    }
+
+    /// The response cache's byte budget (#524) is applied from the snapshot when a reload is
+    /// published: set, it is that many MiB; `0` is no budget; unset, an eighth of the memory.
+    #[test]
+    fn the_cache_budget_is_carried_in_the_snapshot() {
+        let build = |line: &str| {
+            let cfg = parse_inline(&format!(
+                r#"
+            [server]
+            listen_http = "0.0.0.0:8080"
+            listen_https = "0.0.0.0:8443"
+            {line}
+            [tls]
+            cert_path = "/tmp/zion-test.crt"
+            key_path  = "/tmp/zion-test.key"
+            [upstreams]
+            api = "http://api:8000"
+            [[route]]
+            path = "/api/{{*rest}}"
+            upstream = "api"
+        "#
+            ));
+            ResolvedAppConfig::try_build(&cfg, TEST_CONN_LIMIT_MAX)
+                .expect("test config builds")
+                .cache_budget_bytes
+        };
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(build("cache_max_memory_mb = 64"), 64 * MIB);
+        assert_eq!(build("cache_max_memory_mb = 0"), 0);
+        let derived = crate::cache::default_budget_mb(crate::bootstrap::detect().ram_mb);
+        assert_eq!(build(""), derived * MIB);
+        assert!(derived >= 32);
     }
 
     /// Building a snapshot must not change the running DNS policy: a reload that is built but

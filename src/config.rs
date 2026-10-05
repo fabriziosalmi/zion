@@ -306,6 +306,15 @@ pub struct ServerConfig {
     /// shared with something else. Read at start: a reload that changes it is refused.
     #[serde(default)]
     pub max_connections: Option<usize>,
+    /// The most memory the response cache may hold, in MiB, over all profiles together
+    /// (keys, bodies and a fixed cost per entry). A response that would take it over the
+    /// budget makes room by evicting the entries closest to expiring, and is not stored
+    /// when room cannot be made. Unset (the default), it is an eighth of the memory the
+    /// process may use (the cgroup limit when there is one), at least 32. `0` = no
+    /// budget: the cache is bounded by `max_entries` and `max_object_mb` alone. Applied
+    /// on reload: a lower budget shrinks the cache as entries are stored.
+    #[serde(default)]
+    pub cache_max_memory_mb: Option<u64>,
     /// Log format: "text" (default) or "json".
     #[serde(default = "default_log_format")]
     pub log_format: String,

@@ -67,6 +67,10 @@ pub(crate) struct ResolvedAppConfig {
     pub(crate) tcp_user_timeout_secs: u64,
     /// `[server] h2_control_frames_per_sec` (0 = no limit).
     pub(crate) h2_control_frames_per_sec: u32,
+    /// The response cache's byte budget (`[server] cache_max_memory_mb`, or derived from
+    /// memory; `0` = none). Applied by `crate::cache::configure` when the snapshot is
+    /// published.
+    pub(crate) cache_budget_bytes: u64,
     /// `[server] max_connections` as configured. The ceiling itself is fixed at start
     /// (`bootstrap::conn_ceiling`); this is kept to refuse a reload that changes it.
     pub(crate) max_connections: Option<usize>,
@@ -129,6 +133,7 @@ impl ResolvedAppConfig {
             tcp_user_timeout_secs: crate::net::DEFAULT_TCP_USER_TIMEOUT_SECS,
             h2_control_frames_per_sec: 0,
             max_connections: None,
+            cache_budget_bytes: 0,
             dns_stale_secs: crate::dns::DEFAULT_STALE_SECS,
             dns_timeout_ms: crate::dns::DEFAULT_TIMEOUT_MS,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
@@ -419,6 +424,13 @@ impl ResolvedAppConfig {
             tcp_user_timeout_secs: config.server.tcp_user_timeout_secs,
             h2_control_frames_per_sec: config.server.h2_control_frames_per_sec,
             max_connections: config.server.max_connections,
+            cache_budget_bytes: config
+                .server
+                .cache_max_memory_mb
+                .unwrap_or_else(|| {
+                    crate::cache::default_budget_mb(crate::bootstrap::detect().ram_mb)
+                })
+                .saturating_mul(1024 * 1024),
             dns_stale_secs: config.server.dns_stale_secs,
             dns_timeout_ms: config.server.dns_timeout_ms,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
