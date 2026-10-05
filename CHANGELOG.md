@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **With the `Vary` index full, every new varying URL cost a scan of the whole index** (#526). The index of "this URL's responses vary on these headers" is bounded like the cache. Once it was full, each cache miss on a new URL of a route that sends `Vary` swept every rule looking for expired ones (locking every part of the index), found them still alive, and was refused a place anyway: work in proportion to the index, for a request whose URL the client chooses. With 10,000 rules that was 20 µs per such miss, with a million 10 ms. A full index is now swept only when a rule can have expired and not more than once a second; in between, the refusal costs 0.2 µs whatever the size.
+
 ## [0.9.12] - 2026-10-05
 
 **Security release: with rate limiting on, a full rate map froze the proxy.** If `rate_limit_rps` is set, upgrade: when the per-IP rate map reached `rate_limit_max_tracked_ips` a request thread could block for ever on the map, and every request behind it. Also in this release: the response cache has a memory budget, a full cache keeps far more hits, and the rate limiter no longer refuses new clients while its map is full of addresses it no longer needs.
