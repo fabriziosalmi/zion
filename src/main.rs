@@ -811,6 +811,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         acme_challenges: acme::new_challenge_store(),
         limiters: Limiters {
             rate_map: Arc::new(numa::NumaAwareMap::new()),
+            rate_sweep: security::RateSweep::default(),
             conn_per_ip: Arc::new(connlimit::PerIpConnLimiter::new()),
             #[cfg(feature = "tls-fingerprint")]
             tls_fp_bans: tls_fp::BanSet::new(),
@@ -2046,6 +2047,7 @@ fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
         cfg.rate_limit_window,
         cfg.rate_limit_max_tracked_ips,
         &state.limiters.rate_map,
+        &state.limiters.rate_sweep,
         ip,
     )
 }
