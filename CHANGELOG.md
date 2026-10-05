@@ -4,6 +4,15 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Security
+
+- **Requests to a cached route could wait for ever, and one client could make a URL unanswerable for everyone.** Concurrent cache misses for the same URL share one origin fetch: the first request fetches, the others wait for it. Three defects in that hand-over, on routes with `mode = "static_cache"` or a `cache_profile`:
+  - **A client that went away while its request was being fetched left the URL dead.** The fetch was abandoned with its registration still in place, so every later request for that URL waited on a fetch that no longer existed, until the process was restarted. One request, closed before the origin answered, was enough; no authentication is involved. Present in 0.7.5, and probably in every release that coalesces requests.
+  - **When the response was not stored, only the first request got it** (0.8.0 to 0.9.10). A `404`, a `500`, a response with `no-store` or one too large to cache: the request that fetched it was answered and every request that had been waiting for it hung. Six simultaneous requests for a missing asset left five clients waiting until they gave up.
+  - **Under load a waiting request could miss the completion** even of a stored response (1 to 4 requests in 300,000 in a benchmark), and hang the same way.
+
+  A waiting request now holds nothing that keeps its own wait alive, the fetch's registration is removed however the fetch ends (the request being dropped included), and completion is published so that a request arriving at that very moment sees it. Requests that waited for a response that was not stored now go to the origin themselves, together, as they would on a route without a cache. **Upgrade if you use `static_cache` or a `cache_profile`.**
+
 ## [0.9.10] - 2026-10-05
 
 **Security release: a static route could be made to hold gigabytes by one connection.** `mode = "static"` read every file of up to 64 MiB whole into memory for each request; one HTTP/2 connection asking 100 times for a 32 MiB file held 3.2 GB for as long as it chose not to read (#562). Also in this release: the connection ceiling follows the container's memory limit, HTTP/2 control-frame floods can be bounded, the WAF can scan header values, and zion can present a client certificate to an upstream.

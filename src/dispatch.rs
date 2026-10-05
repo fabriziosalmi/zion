@@ -1516,10 +1516,13 @@ fn spawn_swr_refresh(job: SwrRefresh) {
                 .cache_swr_refresh_failures
                 .fetch_add(1, Relaxed);
         }
-        job.state.inflight.remove(&job.key);
+        // Published before the registration goes, and with `send_replace` (see
+        // `Fetching::stored`); when the refresh failed the sender is dropped unpublished
+        // and waiters fetch for themselves.
         if ok {
-            let _ = tx.send(true);
+            tx.send_replace(true);
         }
+        job.state.inflight.remove(&job.key);
     });
 }
 
@@ -2468,10 +2471,19 @@ async fn handle_static_cache(
     // between our registration and our `.await`, we still observe it and return
     // immediately instead of hanging.
     //
-    // A waiter whose fetcher aborted (sender dropped without `true`) wakes,
-    // re-checks the cache, and on a miss loops to try to become the fetcher
-    // itself (or wait on whichever fetcher took over). Progress is guaranteed
-    // as long as fetches terminate.
+    // A waiter whose fetcher ended without storing anything (the response was not
+    // storable, the fetch failed, or the fetcher's client went away) wakes when the
+    // channel closes, re-checks the cache, and on a miss fetches for itself, alone.
+    //
+    // Two things make that wake happen, and both were missing from v0.8.0 to v0.9.10:
+    //  - a waiter keeps a receiver and nothing else. It used to keep the sender it was
+    //    handed, which kept the channel open for itself and for every other waiter:
+    //    after a response that was not stored (a 404, a 500, `no-store`), every request
+    //    that had been waiting hung for good;
+    //  - the fetcher's registration is a guard ([`Fetching`]) that takes itself out of
+    //    the map when dropped. The request future is dropped, at any `.await`, when its
+    //    client goes away: without the guard the registration stayed, and every later
+    //    request for that URL waited on a fetch that no longer existed.
     let tx = loop {
         let (tx, inserted) = state
             .inflight
@@ -2482,7 +2494,8 @@ async fn handle_static_cache(
         }
         // Someone else is fetching — wait for them.
         let mut rx = tx.subscribe();
-        let _ = rx.wait_for(|v| *v).await;
+        drop(tx);
+        let fetcher_stored = rx.wait_for(|v| *v).await.is_ok();
         // The fetcher may have just learned that this key varies, so the entry for
         // THIS request can now live under a secondary key: look it up afresh, under its own
         // primary key and, when it takes identity, under the identity one.
@@ -2498,11 +2511,34 @@ async fn handle_static_cache(
             // get() already counted this hit — don't double-count it here.
             return Ok(fresh_hit_response(hit, req.method(), req.headers()));
         }
-        // Cache miss/stale after wait (fetcher aborted, or stored a
-        // non-cacheable response, or one for another encoding set): loop to fetch
-        // ourselves, under this request's own key so that clients with different
-        // encodings do not queue behind each other.
-        path_owned = Arc::from(cache_key.as_str());
+        // Nothing usable after the wait. Two cases:
+        //
+        // The fetcher stored a response and it is not one this request can use (it was
+        // encoded for another encoding set, and this wait was under the shared identity
+        // key): wait once more, under this request's own key, with the other clients of
+        // its encoding set, so that there is one fetch per set and not one per client.
+        //
+        // Anything else (the fetcher stored nothing, or this was already the request's own
+        // key): fetch alone, and not behind another fetcher. A response that is not
+        // storable would otherwise be fetched by one waiter at a time, each wake electing
+        // the next, and requests would queue for as long as they arrive faster than the
+        // origin answers. The key is then this request's alone: the next turn of the loop
+        // registers it and goes to the origin.
+        if fetcher_stored && path_owned.as_ref() != cache_key.as_str() {
+            path_owned = Arc::from(cache_key.as_str());
+        } else {
+            static ALONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            path_owned = Arc::from(format!(
+                "{cache_key}\u{0}{}",
+                ALONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+        }
+    };
+    // From here the registration is taken out when this fetch ends, however it ends.
+    let fetching = Fetching {
+        state: state.clone(),
+        key: path_owned,
+        tx,
     };
 
     // Opt-in circuit breaker: if the upstream's circuit is open, do not contact it. A stale
@@ -2516,7 +2552,7 @@ async fn handle_static_cache(
         match breaker_admit(entry) {
             Ok(p) => probe = p,
             Err(ms) => {
-                state.inflight.remove(&path_owned);
+                drop(fetching);
                 if let Some(hit) = stale_entry.as_ref().filter(|h| !h.meta.must_revalidate) {
                     metrics::METRICS
                         .cache_stale_if_error
@@ -2533,9 +2569,9 @@ async fn handle_static_cache(
     let req_headers = req.headers().clone();
 
     // RAM miss — fetch from upstream.
-    // On error, drop the inflight sender. Waiters' wait_for() returns Err
-    // (channel closed without receiving `true`), they re-check the cache,
-    // miss, and fall through to fetch themselves.
+    // On error `fetching` is dropped. Waiters' wait_for() returns Err (channel
+    // closed without receiving `true`), they re-check the cache, miss, and fetch
+    // for themselves.
     let resp = match proxy::proxy_pass(
         &state.client_for(rule.client_spec()),
         req,
@@ -2552,7 +2588,7 @@ async fn handle_static_cache(
             if let Some(entry) = &breaker_cached {
                 entry.breaker.record(false, breaker::now_ms(), probe.take());
             }
-            state.inflight.remove(&path_owned);
+            drop(fetching);
             // stale-if-error (RFC 9111 §4.2.4): if we were revalidating a stale
             // entry and the origin is unreachable, serve the stale body rather
             // than fail — a flapping origin doesn't take cached content down.
@@ -2562,7 +2598,6 @@ async fn handle_static_cache(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(cache_response(hit, "STALE"));
             }
-            // tx drops at end of scope → channel closed → waiters get Err
             return Err(e);
         }
     };
@@ -2577,7 +2612,7 @@ async fn handle_static_cache(
     // to answer from the stale copy — unless the origin forbade stale responses.
     if let Some(hit) = revalidate.as_ref() {
         if matches!(resp.status().as_u16(), 500 | 502 | 503 | 504) && !hit.meta.must_revalidate {
-            state.inflight.remove(&path_owned);
+            drop(fetching);
             metrics::METRICS
                 .cache_stale_if_error
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2611,8 +2646,7 @@ async fn handle_static_cache(
                 cache_max,
                 tag_epoch,
             );
-            state.inflight.remove(&path_owned);
-            let _ = tx.send(true); // waiters observe the revived (fresh) entry
+            fetching.stored(); // waiters observe the revived (fresh) entry
             crate::metrics::METRICS
                 .cache_revalidations
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2702,9 +2736,9 @@ async fn handle_static_cache(
         };
         let Some(store_key) = store_key else {
             // Stream the body straight to the client without caching.
-            // Drop the inflight sender (no `true` sent): waiters fall through
-            // to a fresh fetch, since cache will not be populated for this key.
-            state.inflight.remove(&path_owned);
+            // Drop the registration (no `true` sent): waiters fetch for themselves,
+            // since the cache will not be populated for this key.
+            drop(fetching);
             if cacheable {
                 // Storable in principle but refused by the Vary policy or its cap.
                 metrics::METRICS
@@ -2722,7 +2756,7 @@ async fn handle_static_cache(
         // `Surrogate-Key` tags (purge by tag). Tags that cannot be tracked mean the entry could
         // never be purged by them, so the response is streamed through without being stored.
         let Ok(tags) = cache::surrogate_keys(&parts.headers) else {
-            state.inflight.remove(&path_owned);
+            drop(fetching);
             metrics::METRICS
                 .cache_tag_uncached
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2758,13 +2792,13 @@ async fn handle_static_cache(
         let stream_body = http_body_util::StreamBody::new(stream);
 
         let state_clone = state.clone();
-        let path_clone = path_owned.clone();
         let store_key_clone = store_key.clone();
         let meta_clone = meta.clone();
-        let tx_clone = tx.clone();
 
-        // Cache Tee-Reader Pipeline
+        // Cache Tee-Reader Pipeline. The registration moves into it: the fetch is not over
+        // until the body is, and it ends with the task however the task ends.
         tokio::spawn(async move {
+            let fetching = fetching;
             let mut cache_buffer = bytes::BytesMut::new();
             let mut total_bytes = 0;
             let mut cache_aborted = false;
@@ -2793,17 +2827,15 @@ async fn handle_static_cache(
 
                         // Stream chunk directly to the client immediately
                         if sender.send(Ok(f)).await.is_err() {
-                            // Client disconnected mid-stream. Drop inflight without
-                            // signaling completion: cache buffer is partial/aborted.
-                            // Waiters' wait_for returns Err and they re-fetch.
-                            state_clone.inflight.remove(&path_clone);
+                            // Client disconnected mid-stream: the buffer is partial.
+                            // `fetching` drops without signaling completion; waiters'
+                            // wait_for returns Err and they fetch for themselves.
                             return;
                         }
                     }
                     Some(Err(e)) => {
-                        // Upstream chunking failed — drop inflight (abort signal).
+                        // Upstream chunking failed: `fetching` drops (abort signal).
                         let _ = sender.send(Err(e)).await;
-                        state_clone.inflight.remove(&path_clone);
                         return;
                     }
                     None => {
@@ -2834,17 +2866,14 @@ async fn handle_static_cache(
                     .cache_tag_uncached
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            let stored = outcome == Some(cache::TagStore::Stored);
-            if stored {
+            if outcome == Some(cache::TagStore::Stored) {
                 // Cache populated: signal `true` so waiters' wait_for resolves
                 // immediately at the next poll, even if they hadn't subscribed
-                // before this point. Send before remove so the value is the
-                // last-observed state when the sender drops.
-                let _ = tx_clone.send(true);
+                // before this point.
+                fetching.stored();
             }
-            // (else cache_aborted — body exceeded max_object: don't
-            //  signal completion; waiters re-fetch through normal miss path.)
-            state_clone.inflight.remove(&path_clone);
+            // (else not stored, e.g. the body exceeded max_object: `fetching` drops
+            //  without signaling; waiters fetch for themselves.)
         });
 
         let mut resp = Response::from_parts(parts, stream_body.boxed());
@@ -2863,11 +2892,54 @@ async fn handle_static_cache(
         return Ok(resp);
     }
 
-    // Non-200 or non-cacheable: drop inflight without signaling completion.
-    // Waiters re-check the cache (miss) and fall through to fetch themselves.
-    state.inflight.remove(&path_owned);
+    // Non-200 or non-cacheable: the registration ends without signaling completion.
+    // Waiters re-check the cache (miss) and fetch for themselves.
+    drop(fetching);
 
     Ok(resp)
+}
+
+/// A request's place in the singleflight map: it became the fetcher for `key`, and other
+/// requests for that key wait on `tx`. Dropping it takes the registration out and closes
+/// the channel, which is what wakes the waiters when the fetch stored nothing; and it is
+/// dropped whichever way the fetch ends, the request future being dropped mid-fetch
+/// included (hyper does that when the client goes away).
+pub(crate) struct Fetching {
+    state: Arc<AppState>,
+    key: Arc<str>,
+    tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl Fetching {
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        state: Arc<AppState>,
+        key: Arc<str>,
+        tx: tokio::sync::watch::Sender<bool>,
+    ) -> Self {
+        Self { state, key, tx }
+    }
+
+    /// The response is in the cache: tell the waiters to read it there. Published before
+    /// the registration goes, so a request arriving in between finds `true`.
+    ///
+    /// `send_replace`, not `send`: `send` stores nothing when no receiver exists, and none
+    /// does until a second request arrives (the channel is created without one). A request
+    /// that took this sender out of the map just before it was removed, and subscribed just
+    /// after a `send`, saw `false` on a channel nobody would ever write to again.
+    pub(crate) fn stored(self) {
+        self.tx.send_replace(true);
+    }
+}
+
+impl Drop for Fetching {
+    fn drop(&mut self) {
+        // Only this fetch's own registration: by the time a streamed body ends, another
+        // request may have registered under the same key.
+        self.state
+            .inflight
+            .remove_if(&self.key, |tx| tx.same_channel(&self.tx));
+    }
 }
 
 // ==========================================================================
