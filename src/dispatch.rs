@@ -116,6 +116,7 @@ fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
         cfg.rate_limit_window,
         cfg.rate_limit_max_tracked_ips,
         &state.limiters.rate_map,
+        &state.limiters.rate_sweep,
         ip,
     )
 }

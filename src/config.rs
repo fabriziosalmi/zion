@@ -246,9 +246,12 @@ pub struct ServerConfig {
     #[serde(default = "default_rate_window")]
     pub rate_limit_window_secs: u64,
     /// Max distinct client IPs the per-IP rate limiter tracks. Default 100 000.
-    /// At the cap, stale entries are evicted; if every entry is live the new IP is
-    /// DENIED (fail-closed), so size this above the number of distinct clients you
-    /// expect inside one window. Each entry costs roughly 40 bytes.
+    /// At the cap, the addresses not seen in the current window are removed (a look at
+    /// a few entries first, then a sweep of the whole map, once per window at most);
+    /// if every address was seen in this window the new IP is DENIED (fail-closed).
+    /// So size this above the number of distinct clients you expect inside one
+    /// window. Each entry costs roughly 40 bytes; a sweep takes about 5 ms per
+    /// 100 000 entries.
     #[serde(default = "default_rate_map_entries")]
     pub rate_limit_max_tracked_ips: usize,
     /// Max *concurrent* connections from a single source IP.

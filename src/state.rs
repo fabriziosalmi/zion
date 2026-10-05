@@ -469,6 +469,8 @@ pub(crate) struct Limiters {
     /// calling thread's current node — same-socket workers stay
     /// cache-local, cross-socket fallback scans on get-miss.
     pub(crate) rate_map: Arc<numa::NumaAwareMap<std::net::IpAddr, RateEntry>>,
+    /// When `rate_map` was last swept in full at its cap (once per window).
+    pub(crate) rate_sweep: security::RateSweep,
     /// Per-IP concurrent-connection limiter. The cap is read from the config
     /// snapshot at accept time; the global ceiling stays the `conn_limit`
     /// semaphore on `AppState`.
@@ -595,6 +597,7 @@ impl AppState {
             acme_challenges: acme::new_challenge_store(),
             limiters: Limiters {
                 rate_map: Arc::new(numa::NumaAwareMap::new()),
+                rate_sweep: security::RateSweep::default(),
                 conn_per_ip: Arc::new(connlimit::PerIpConnLimiter::new()),
                 #[cfg(feature = "tls-fingerprint")]
                 tls_fp_bans: tls_fp::BanSet::new(),

@@ -166,17 +166,18 @@ impl RateEntry {
 /// Eliminates the CAS-store gap that could lose counts during window transitions.
 ///
 /// **Saturation policy: fail-CLOSED.** When the map hits the cap
-/// (`max_tracked_ips`, default `MAX_RATE_MAP_ENTRIES`) we attempt to evict stale
-/// entries (expired windows) in a bounded probe.
-/// If eviction yields space, the new IP is tracked normally. If the map is
-/// genuinely full of active IPs (e.g. botnet), the request is denied —
-/// the safe default for a security gate.
+/// (`max_tracked_ips`, default `MAX_RATE_MAP_ENTRIES`) room is made by removing
+/// entries of past windows: first a look at a few entries, then, once per window
+/// at most, a sweep of the whole map (see [`RateSweep`]). A new IP is denied only
+/// when the map holds `max_tracked_ips` addresses that were all seen in the current
+/// window (e.g. a botnet): the safe default for a security gate.
 #[inline]
 pub fn check_rate_limit(
     rate_limit_rps: u32,
     rate_limit_window: u64,
     max_tracked_ips: usize,
     rate_map: &crate::numa::NumaAwareMap<std::net::IpAddr, RateEntry>,
+    sweep: &RateSweep,
     ip: std::net::IpAddr,
 ) -> bool {
     if rate_limit_rps == 0 {
@@ -226,17 +227,63 @@ pub fn check_rate_limit(
 
     // First request from this IP — cap total tracked IPs to prevent memory exhaustion.
     // Fail-CLOSED: if we can't make room, deny rather than bypass the limiter.
-    if rate_map.len() >= max_tracked_ips {
-        // Attempt to evict stale entries in a bounded probe (up to 8 random samples).
-        // DashMap iteration is shard-sequential — we take the first stale entry.
-        if !try_evict_stale(rate_map, current_window) {
-            // Map is genuinely full of active-window entries (botnet-scale).
-            // Fail CLOSED: deny the request rather than allowing unlimited bypass.
+    if rate_map.len() >= max_tracked_ips && !try_evict_stale(rate_map, current_window) {
+        // No stale entry among the first few. That says nothing about the rest: the
+        // probe looks at the same entries every time, and while those belong to
+        // clients that are active the map can be full of addresses not seen for a
+        // minute and still turn every new client away (#528). So sweep all of it,
+        // once per window: the sweep reads every entry, and under a real flood each
+        // request would otherwise pay for one.
+        if sweep.claim(current_window) {
+            remove_stale(rate_map, current_window);
+        }
+        if rate_map.len() >= max_tracked_ips {
+            // Full of addresses seen in this window (or another thread is still
+            // sweeping). Fail CLOSED: deny rather than let the limiter be bypassed.
             return false;
         }
     }
     rate_map.insert(ip, RateEntry::new(current_window));
     true
+}
+
+/// The window in which the rate map was last swept in full because it was at its cap:
+/// what makes that sweep happen once per window and not once per request. Kept next to
+/// the map it belongs to.
+#[derive(Debug, Default)]
+pub struct RateSweep {
+    /// The window number plus one; `0` = never.
+    last: std::sync::atomic::AtomicU64,
+}
+
+impl RateSweep {
+    /// `true` for the first caller in `window`, who then does the sweep.
+    fn claim(&self, window: u32) -> bool {
+        let mark = u64::from(window) + 1;
+        self.last.swap(mark, std::sync::atomic::Ordering::Relaxed) != mark
+    }
+}
+
+/// Remove every entry whose window is not `current_window`; how many went.
+fn remove_stale(
+    rate_map: &crate::numa::NumaAwareMap<std::net::IpAddr, RateEntry>,
+    current_window: u32,
+) -> usize {
+    let mut stale_ips = Vec::new();
+    for entry in rate_map.iter() {
+        let val = entry
+            .value()
+            .packed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if RateEntry::window(val) != current_window {
+            stale_ips.push(*entry.key());
+        }
+    }
+    let removed = stale_ips.len();
+    for ip in stale_ips {
+        rate_map.remove(&ip);
+    }
+    removed
 }
 
 /// Attempt to evict one stale entry (expired window) from the rate map.
@@ -280,22 +327,7 @@ pub fn scavenge_rate_map(
         .unwrap_or_default()
         .as_secs();
     let current_window = (now / rate_limit_window) as u32;
-
-    let mut stale_ips = Vec::new();
-    for entry in rate_map.iter() {
-        let val = entry
-            .value()
-            .packed
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if RateEntry::window(val) != current_window {
-            stale_ips.push(*entry.key());
-        }
-    }
-    let removed = stale_ips.len();
-    for ip in stale_ips {
-        rate_map.remove(&ip);
-    }
-    removed
+    remove_stale(rate_map, current_window)
 }
 
 // ============================================================================
@@ -651,12 +683,163 @@ mod proxy_tests {
         let map = crate::numa::NumaAwareMap::new();
         let ip = |n: u8| std::net::IpAddr::from([10, 0, 0, n]);
         // cap of 2 distinct IPs: the third live client is denied, tracked ones are not
-        assert!(check_rate_limit(100, 3600, 2, &map, ip(1)));
-        assert!(check_rate_limit(100, 3600, 2, &map, ip(2)));
-        assert!(!check_rate_limit(100, 3600, 2, &map, ip(3)));
-        assert!(check_rate_limit(100, 3600, 2, &map, ip(1)));
+        assert!(check_rate_limit(
+            100,
+            3600,
+            2,
+            &map,
+            &RateSweep::default(),
+            ip(1)
+        ));
+        assert!(check_rate_limit(
+            100,
+            3600,
+            2,
+            &map,
+            &RateSweep::default(),
+            ip(2)
+        ));
+        assert!(!check_rate_limit(
+            100,
+            3600,
+            2,
+            &map,
+            &RateSweep::default(),
+            ip(3)
+        ));
+        assert!(check_rate_limit(
+            100,
+            3600,
+            2,
+            &map,
+            &RateSweep::default(),
+            ip(1)
+        ));
         // a larger cap admits it
-        assert!(check_rate_limit(100, 3600, 3, &map, ip(3)));
+        assert!(check_rate_limit(
+            100,
+            3600,
+            3,
+            &map,
+            &RateSweep::default(),
+            ip(3)
+        ));
+    }
+
+    /// A rate map at its cap, holding `live_head` addresses seen in the current window in
+    /// the places the cheap probe looks at, and addresses of a past window everywhere else.
+    /// Returns the map and the current window.
+    fn map_at_cap_with_stale_entries_beyond_the_probe(
+        cap: u32,
+        window_secs: u64,
+    ) -> (crate::numa::NumaAwareMap<std::net::IpAddr, RateEntry>, u32) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let current = (now / window_secs) as u32;
+        let map = crate::numa::NumaAwareMap::new();
+        for n in 0..cap {
+            let ip = std::net::IpAddr::from(n.to_be_bytes());
+            map.insert(ip, RateEntry::new(current - 1));
+        }
+        // Whatever order the map iterates in, its first entries are the ones probed.
+        let head: Vec<std::net::IpAddr> = map.iter().take(64).map(|e| *e.key()).collect();
+        for ip in head {
+            map.insert(ip, RateEntry::new(current));
+        }
+        (map, current)
+    }
+
+    /// #528: the probe at the cap looks at the first few entries, always the same ones. With
+    /// those in use, a map otherwise full of addresses not seen since a past window turned
+    /// every new client away until the 60 s scavenger ran. It is now swept.
+    #[test]
+    fn a_map_full_of_addresses_from_past_windows_admits_a_new_client() {
+        const CAP: u32 = 5_000;
+        let (map, _) = map_at_cap_with_stale_entries_beyond_the_probe(CAP, 3_600);
+        assert_eq!(map.len(), CAP as usize);
+        let sweep = RateSweep::default();
+        let newcomer = std::net::IpAddr::from([203, 0, 113, 7]);
+        assert!(
+            check_rate_limit(100, 3_600, CAP as usize, &map, &sweep, newcomer),
+            "a new client is admitted: the map was full of stale entries"
+        );
+        assert_eq!(
+            map.len(),
+            64 + 1,
+            "what is left is what was seen in this window, and the newcomer"
+        );
+        assert!(map.get(&newcomer).is_some());
+    }
+
+    /// The sweep reads every entry, so it runs once per window at most: under a flood of
+    /// new addresses each request would otherwise pay for one. A second time at the cap in
+    /// the same window, with nothing stale where the probe looks, is a refusal.
+    #[test]
+    fn the_full_sweep_runs_once_per_window() {
+        const CAP: u32 = 2_000;
+        let (map, current) = map_at_cap_with_stale_entries_beyond_the_probe(CAP, 3_600);
+        let sweep = RateSweep::default();
+        let ip = |n: u8| std::net::IpAddr::from([203, 0, 113, n]);
+        assert!(check_rate_limit(
+            100,
+            3_600,
+            CAP as usize,
+            &map,
+            &sweep,
+            ip(1)
+        ));
+        assert_eq!(map.len(), 65);
+        // Fill it again in the same window: addresses of this window where the probe
+        // looks, stale ones behind them.
+        for n in 0..CAP {
+            let stale = std::net::IpAddr::from((0x0a00_0000u32 + n).to_be_bytes());
+            map.insert(stale, RateEntry::new(current - 1));
+        }
+        let head: Vec<std::net::IpAddr> = map.iter().take(64).map(|e| *e.key()).collect();
+        for addr in head {
+            map.insert(addr, RateEntry::new(current));
+        }
+        let before = map.len();
+        assert!(
+            !check_rate_limit(100, 3_600, before, &map, &sweep, ip(2)),
+            "no second sweep in the same window"
+        );
+        assert_eq!(map.len(), before, "nothing was removed");
+        // A fresh marker (as in the next window) sweeps again.
+        assert!(check_rate_limit(
+            100,
+            3_600,
+            before,
+            &map,
+            &RateSweep::default(),
+            ip(2)
+        ));
+        assert!(map.len() < before);
+    }
+
+    /// A map full of addresses that ARE of this window is full: the newcomer is refused,
+    /// sweep or no sweep, and an address already tracked is not.
+    #[test]
+    fn a_map_full_of_addresses_of_this_window_still_fails_closed() {
+        let map = crate::numa::NumaAwareMap::new();
+        let sweep = RateSweep::default();
+        let ip = |n: u32| std::net::IpAddr::from(n.to_be_bytes());
+        for n in 0..500 {
+            assert!(check_rate_limit(100, 3_600, 500, &map, &sweep, ip(n)));
+        }
+        assert!(!check_rate_limit(100, 3_600, 500, &map, &sweep, ip(9_999)));
+        assert!(!check_rate_limit(
+            100,
+            3_600,
+            500,
+            &map,
+            &RateSweep::default(),
+            ip(9_998)
+        ));
+        assert_eq!(map.len(), 500);
+        assert!(check_rate_limit(100, 3_600, 500, &map, &sweep, ip(3)));
     }
 
     #[test]
@@ -756,7 +939,7 @@ mod proptests {
             let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
             let mut allowed = 0;
             for _ in 0..burst {
-                if check_rate_limit(rps, 1, MAX_RATE_MAP_ENTRIES, &map, ip) {
+                if check_rate_limit(rps, 1, MAX_RATE_MAP_ENTRIES, &map, &RateSweep::default(), ip) {
                     allowed += 1;
                 }
             }
@@ -780,7 +963,7 @@ mod proptests {
             let map = crate::numa::NumaAwareMap::new();
             let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 2).into();
             for _ in 0..burst {
-                prop_assert!(check_rate_limit(0, 1, MAX_RATE_MAP_ENTRIES, &map, ip));
+                prop_assert!(check_rate_limit(0, 1, MAX_RATE_MAP_ENTRIES, &map, &RateSweep::default(), ip));
             }
         }
 
@@ -798,12 +981,12 @@ mod proptests {
             let mut allowed_a = 0;
             let mut allowed_b = 0;
             for _ in 0..burst_a {
-                if check_rate_limit(rps, 1, MAX_RATE_MAP_ENTRIES, &map, ip_a) {
+                if check_rate_limit(rps, 1, MAX_RATE_MAP_ENTRIES, &map, &RateSweep::default(), ip_a) {
                     allowed_a += 1;
                 }
             }
             for _ in 0..burst_b {
-                if check_rate_limit(rps, 1, MAX_RATE_MAP_ENTRIES, &map, ip_b) {
+                if check_rate_limit(rps, 1, MAX_RATE_MAP_ENTRIES, &map, &RateSweep::default(), ip_b) {
                     allowed_b += 1;
                 }
             }
