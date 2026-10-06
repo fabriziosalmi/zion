@@ -32,7 +32,7 @@ pub const CURATED_ASNS: &[(u32, IpClass)] = &[
     (12874, IpClass::ResidentialIta),
     (16232, IpClass::ResidentialIta),
     (16276, IpClass::DatacenterIta),
-    (24940, IpClass::DatacenterIta),
+    (24608, IpClass::ResidentialIta),
     (30722, IpClass::ResidentialIta),
     (31034, IpClass::DatacenterIta),
     (34758, IpClass::DatacenterIta),

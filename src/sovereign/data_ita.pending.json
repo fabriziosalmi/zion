@@ -14,7 +14,7 @@
     "12874": "ResidentialIta",
     "16232": "ResidentialIta",
     "16276": "DatacenterIta",
-    "24940": "DatacenterIta",
+    "24608": "ResidentialIta",
     "30722": "ResidentialIta",
     "31034": "DatacenterIta",
     "34758": "DatacenterIta",
@@ -28,7 +28,11 @@
     "210278": "ResidentialIta"
   },
   "pending": [
-    {"family": "v4", "block": "2.159.128.0/18", "observed": null, "seen": 1, "first": "2026-10-06", "last": "2026-10-06"},
-    {"family": "v4", "block": "79.48.0.0/16", "observed": "ResidentialIta", "seen": 1, "first": "2026-10-06", "last": "2026-10-06"}
+    {"family": "v4", "block": "5.84.0.0/14", "observed": "ResidentialIta", "seen": 1, "first": "2026-10-06", "last": "2026-10-06"},
+    {"family": "v4", "block": "31.188.0.0/15", "observed": "ResidentialIta", "seen": 1, "first": "2026-10-06", "last": "2026-10-06"},
+    {"family": "v4", "block": "37.226.0.0/15", "observed": "ResidentialIta", "seen": 1, "first": "2026-10-06", "last": "2026-10-06"},
+    {"family": "v4", "block": "62.13.160.0/19", "observed": "ResidentialIta", "seen": 1, "first": "2026-10-06", "last": "2026-10-06"},
+    {"family": "v4", "block": "79.48.0.0/16", "observed": "ResidentialIta", "seen": 1, "first": "2026-10-06", "last": "2026-10-06"},
+    {"family": "v4", "block": "185.97.108.0/22", "observed": "ResidentialIta", "seen": 1, "first": "2026-10-06", "last": "2026-10-06"}
   ]
 }
