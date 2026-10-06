@@ -273,6 +273,32 @@ expected holder (a legitimate reassignment still in scope) or remove the ASN
 a deliberate one-off. The generated file header records the snapshot date the
 holders were validated on.
 
+Two things were added to this check since. **The country.** A name alone lets
+"Orange" in Mali pass for Orange in France, so each curated ASN must also be
+registered where the list expects it: in Italy for the Italian list (OVH and
+Hetzner are the two named exceptions, in France and Germany), in an EU-27
+country for the EU list. The country comes from the BGP table itself, with no
+lookup. **A lookup that fails is not a drift.** RIPEstat times out now and
+then; each lookup is tried four times (after 2, 6 and 20 seconds), and if it
+still fails the refresh stops with its own message and exit status (5): nothing
+in the list needs fixing, run it again.
+
+### What the curated list leaves out
+
+A list goes stale without anyone touching it: an operator moves customers to a
+second ASN, a new one grows. Every refresh PR ends with the share of the
+region's announced IPv4 space that a curated ASN originates, and the eight
+largest origins that are not on the list, for example:
+
+```
+Of the announced IPv4 addresses registered in the region, 84% are originated by a curated ASN (43,436,544 of 51,436,544).
+
+| AS3302 AS-IRIDEOS (IT)  | 617,984 |
+| AS24608 WINDTRE-AS (IT) | 549,888 |
+```
+
+Adding or removing an ASN stays a decision made by hand, in the generator.
+
 The generator's tests live in `scripts/test_generate_sovereign_data.py`
 (fixture-based, no network; they run in CI and at the start of every refresh)
 and the pinned `golden_classify_*` tests in

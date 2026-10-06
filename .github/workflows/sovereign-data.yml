@@ -133,9 +133,12 @@ jobs:
         # curated ASN against its LIVE RIPEstat holder, builds the table and
         # measures it against the one on master. It stops, and no PR opens, when:
         #   exit 4  a source file fails its integrity checks;
-        #   exit 2  a curated ASN changed holder (RIPE reassigns ASNs: the old
+        #   exit 2  a curated ASN changed holder, or is registered in a country
+        #           the list does not expect (RIPE reassigns ASNs: the old
         #           pipeline chased the number and re-labelled the new holder's
         #           ranges with the old Italian/EU role);
+        #   exit 5  RIPEstat did not answer for an ASN after four attempts
+        #           (nothing is known to be wrong: run it again);
         #   exit 3  the new table moves a class by more than a fifth.
         # Each of these is INTENTIONAL and needs a human.
         #
@@ -162,6 +165,8 @@ jobs:
           2) echo "::error title=Sovereign holder drift::A curated ${{ matrix.region }} ASN no longer matches its live RIPEstat holder (see the drift report in the log). The dataset will NOT refresh until scripts/generate_sovereign_data.py is corrected by hand. This is fail-closed on purpose — a reassigned ASN must never be re-labelled with a sovereign role automatically."
              exit 1 ;;
           3) echo "::error title=Sovereign refresh over budget::The new ${{ matrix.region }} table moves a class by more than a fifth (see the job summary). That is a broken input or an edit of the curated ASN list, not a week of routing changes. No PR was opened. If the list was edited, regenerate by hand with --allow-over-budget and review the result."
+             exit 1 ;;
+          5) echo "::error title=Sovereign holder lookup failed::RIPEstat did not answer for a curated ${{ matrix.region }} ASN after four attempts (see HOLDER LOOKUP FAILED in the log). This is not a drift and nothing in the list needs fixing: run the workflow again."
              exit 1 ;;
           4) echo "::error title=Sovereign source refused::A downloaded source file failed its integrity checks (see INPUT REFUSED in the log): truncated, replaced, changed after the download, or stale. No table was generated from it."
              exit 1 ;;
