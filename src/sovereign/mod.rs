@@ -71,6 +71,15 @@ impl IpClass {
         }
     }
 
+    /// The class a label names (as in [`IpClass::as_str`], any case), among the
+    /// classes this build has. `None` for anything else.
+    pub fn from_label(label: &str) -> Option<Self> {
+        ALL_CLASSES
+            .iter()
+            .copied()
+            .find(|c| c.as_str().eq_ignore_ascii_case(label))
+    }
+
     /// Stable index into [`CLASS_COUNTERS`]. Hand-rolled instead of
     /// `enum_iterator` so this stays a `const fn` and the enum stays
     /// `#[derive(Copy)]`-able. Update both sides if a new variant lands.
@@ -98,6 +107,22 @@ impl IpClass {
         }
     }
 }
+
+/// Every class of this build, in the order of [`IpClass::index`].
+const ALL_CLASSES: &[IpClass] = &[
+    IpClass::GovIta,
+    IpClass::ResidentialIta,
+    IpClass::DatacenterIta,
+    #[cfg(feature = "geo-eu")]
+    IpClass::Eu,
+    #[cfg(feature = "geo-eu")]
+    IpClass::GovEu,
+    #[cfg(feature = "geo-eu")]
+    IpClass::ResidentialEu,
+    #[cfg(feature = "geo-eu")]
+    IpClass::DatacenterEu,
+    IpClass::Unknown,
+];
 
 /// Per-class request counters. Bumped on every classification result by
 /// `record_classification`. Exposed on `/metrics` as
@@ -312,6 +337,214 @@ fn lookup6(ip: u128, ranges: &[CidrEntry6]) -> IpClass {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Operator overrides (`[sovereign.overrides]`)
+// ═══════════════════════════════════════════════════════════════════
+//
+// The tables are compiled in, and they are built from what registries and
+// BGP say. When a row is wrong for the operator (their own office range, a
+// partner's network, a block the table has not caught up with), fixing it
+// must not take a rebuild: a CIDR and a class in the config, read at boot
+// and on reload, and consulted before the tables.
+
+/// Resolved `[sovereign.overrides]`: disjoint address ranges with a class,
+/// sorted for binary search. Nested prefixes are flattened when the config is
+/// loaded, so a request costs one search and the most specific prefix wins.
+#[derive(Debug, Clone, Default)]
+pub struct Overrides {
+    v4: Vec<(u32, u32, IpClass)>,
+    v6: Vec<(u128, u128, IpClass)>,
+    entries: usize,
+}
+
+impl Overrides {
+    /// Parse and flatten `"CIDR" = "class"` pairs. Every problem is reported,
+    /// not only the first: an operator fixing a list wants the whole list.
+    pub fn from_config<'a, I>(pairs: I) -> Result<Self, Vec<String>>
+    where
+        I: IntoIterator<Item = (&'a String, &'a String)>,
+    {
+        let mut errors = Vec::new();
+        let mut v4: Vec<(u128, u128, IpClass)> = Vec::new();
+        let mut v6: Vec<(u128, u128, IpClass)> = Vec::new();
+        let mut entries = 0;
+        for (cidr, label) in pairs {
+            let class = IpClass::from_label(label);
+            if class.is_none() {
+                errors.push(format!(
+                    "sovereign.overrides \"{cidr}\": \"{label}\" is not a class of this build (known: {})",
+                    known_class_labels().join(", ")
+                ));
+            }
+            match parse_cidr(cidr) {
+                Ok((start, end, is_v4)) => {
+                    if let Some(class) = class {
+                        if is_v4 { &mut v4 } else { &mut v6 }.push((start, end, class));
+                        entries += 1;
+                    }
+                }
+                Err(why) => errors.push(format!("sovereign.overrides \"{cidr}\": {why}")),
+            }
+        }
+        for family in [&mut v4, &mut v6] {
+            // A parent before its children: by start, then the larger block first.
+            family.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            for w in family.windows(2) {
+                if (w[0].0, w[0].1) == (w[1].0, w[1].1) {
+                    errors.push(format!(
+                        "sovereign.overrides: the same network is listed twice ({})",
+                        if w[0].1 <= u128::from(u32::MAX) {
+                            std::net::Ipv4Addr::from(w[0].0 as u32).to_string()
+                        } else {
+                            std::net::Ipv6Addr::from(w[0].0).to_string()
+                        }
+                    ));
+                }
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        Ok(Self {
+            v4: flatten(&v4)
+                .into_iter()
+                .map(|(s, e, c)| (s as u32, e as u32, c))
+                .collect(),
+            v6: flatten(&v6),
+            entries,
+        })
+    }
+
+    /// How many `"CIDR" = "class"` pairs are in force.
+    pub fn len(&self) -> usize {
+        self.entries
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries == 0
+    }
+
+    /// The class the operator gave this address, if any. An override to
+    /// `unknown` is an answer too: it takes the address out of the tables.
+    #[inline]
+    pub fn lookup(&self, ip: IpAddr) -> Option<IpClass> {
+        if self.entries == 0 {
+            return None;
+        }
+        match ip {
+            IpAddr::V4(v4) => find(u32::from(v4), &self.v4),
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => find(u32::from(v4), &self.v4),
+                None => find(u128::from(v6), &self.v6),
+            },
+        }
+    }
+}
+
+/// Classify an address: the operator's overrides first, then the tables.
+#[inline]
+pub fn classify_with(overrides: &Overrides, ip: IpAddr) -> IpClass {
+    overrides.lookup(ip).unwrap_or_else(|| classify(ip))
+}
+
+/// The range containing `ip` in a sorted, disjoint list.
+#[inline]
+fn find<T: Copy + Ord>(ip: T, ranges: &[(T, T, IpClass)]) -> Option<IpClass> {
+    let idx = ranges.partition_point(|r| r.0 <= ip);
+    let r = ranges.get(idx.checked_sub(1)?)?;
+    (ip <= r.1).then_some(r.2)
+}
+
+/// `a.b.c.d/len`, `x:y::/len` or a bare address, as inclusive bounds and
+/// "is IPv4". Strict: a prefix with host bits set is refused, because
+/// `10.1.2.3/8` is more often a typo for a /32 than a way to write `10/8`.
+fn parse_cidr(text: &str) -> Result<(u128, u128, bool), String> {
+    let (addr, len) = match text.split_once('/') {
+        Some((a, l)) => (a, Some(l)),
+        None => (text, None),
+    };
+    let ip: IpAddr = addr
+        .parse()
+        .map_err(|_| "not an address or a CIDR (e.g. 203.0.113.0/24, 2001:db8::/32)".to_string())?;
+    let (value, bits, is_v4) = match ip {
+        IpAddr::V4(v4) => (u128::from(u32::from(v4)), 32u32, true),
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => {
+            return Err("an IPv4-mapped IPv6 address: write the IPv4 network".to_string())
+        }
+        IpAddr::V6(v6) => (u128::from(v6), 128u32, false),
+    };
+    let len: u32 = match len {
+        None => bits,
+        Some(l) => l
+            .parse()
+            .ok()
+            .filter(|n| *n <= bits && l.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or_else(|| format!("the prefix length must be 0 to {bits}"))?,
+    };
+    // `::/0` leaves 128 host bits: a shift by the whole width is not defined.
+    let host_mask: u128 = match bits - len {
+        128 => u128::MAX,
+        host_bits => (1u128 << host_bits) - 1,
+    };
+    if value & host_mask != 0 {
+        let network = value & !host_mask;
+        let shown = if is_v4 {
+            std::net::Ipv4Addr::from(network as u32).to_string()
+        } else {
+            std::net::Ipv6Addr::from(network).to_string()
+        };
+        return Err(format!(
+            "has bits set beyond the /{len}: write {shown}/{len}, or the single address with /{bits}"
+        ));
+    }
+    Ok((value, value | host_mask, is_v4))
+}
+
+/// Turn nested prefixes into disjoint ranges where the most specific prefix
+/// wins. `entries` is sorted parent-before-child (by start, larger first) and
+/// holds no duplicate. Two CIDR blocks either nest or do not touch, so one
+/// pass with a stack of the blocks currently open is enough.
+fn flatten(entries: &[(u128, u128, IpClass)]) -> Vec<(u128, u128, IpClass)> {
+    fn emit(out: &mut Vec<(u128, u128, IpClass)>, start: u128, end: u128, class: IpClass) {
+        match out.last_mut() {
+            Some(last) if last.2 == class && last.1.checked_add(1) == Some(start) => last.1 = end,
+            _ => out.push((start, end, class)),
+        }
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    let mut open: Vec<(u128, u128, IpClass)> = Vec::new();
+    // The first address not written yet; `None` once the top of the space is written.
+    let mut cursor: Option<u128> = Some(0);
+    for &entry in entries {
+        // Blocks that end before this one starts are finished.
+        while let Some(&top) = open.last() {
+            if top.1 >= entry.0 {
+                break;
+            }
+            if let Some(at) = cursor.filter(|at| *at <= top.1) {
+                emit(&mut out, at, top.1, top.2);
+            }
+            cursor = top.1.checked_add(1);
+            open.pop();
+        }
+        // What is left on top contains this one: its part before it is written.
+        if let (Some(&top), Some(at)) = (open.last(), cursor) {
+            if at < entry.0 {
+                emit(&mut out, at, entry.0 - 1, top.2);
+            }
+        }
+        cursor = Some(entry.0);
+        open.push(entry);
+    }
+    while let Some(top) = open.pop() {
+        if let Some(at) = cursor.filter(|at| *at <= top.1) {
+            emit(&mut out, at, top.1, top.2);
+        }
+        cursor = top.1.checked_add(1);
+    }
+    out
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Data age
 // ═══════════════════════════════════════════════════════════════════
 //
@@ -431,6 +664,12 @@ pub struct SovereignConfig {
     /// hard deny.
     #[serde(default)]
     pub enforce: EnforceConfig,
+
+    /// `[sovereign.overrides]`: `"CIDR" = "class"`. Consulted before the
+    /// compiled-in tables, the most specific prefix wins. Read at boot and on
+    /// reload, so a wrong row in a table does not need a rebuild.
+    #[serde(default)]
+    pub overrides: std::collections::BTreeMap<String, String>,
 }
 
 /// `[sovereign.enforce]` — promotes the origin tag / mesh-reputation
@@ -622,6 +861,7 @@ impl Default for SovereignConfig {
             signal_listen: "0.0.0.0:9443".to_string(),
             log_classification: true,
             enforce: EnforceConfig::default(),
+            overrides: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1066,6 +1306,335 @@ mod tests {
         assert!(v4_addresses(t, IpClass::ResidentialEu) > 94_000_000);
         assert!(v4_addresses(t, IpClass::DatacenterEu) > 7_500_000);
         assert!(data_eu::RANGES6.len() >= 11_000);
+    }
+
+    // ── Operator overrides ────────────────────────────────────────────
+    fn overrides(pairs: &[(&str, &str)]) -> Result<Overrides, Vec<String>> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(c, l)| (c.to_string(), l.to_string()))
+            .collect();
+        Overrides::from_config(owned.iter().map(|(c, l)| (c, l)))
+    }
+
+    fn class_of(o: &Overrides, ip: &str) -> Option<IpClass> {
+        o.lookup(ip.parse().unwrap())
+    }
+
+    #[test]
+    fn a_cidr_parses_to_its_first_and_last_address() {
+        assert_eq!(
+            parse_cidr("203.0.113.0/24"),
+            Ok((0xCB00_7100, 0xCB00_71FF, true))
+        );
+        assert_eq!(
+            parse_cidr("203.0.113.7"),
+            Ok((0xCB00_7107, 0xCB00_7107, true))
+        );
+        assert_eq!(
+            parse_cidr("203.0.113.7/32"),
+            Ok((0xCB00_7107, 0xCB00_7107, true))
+        );
+        assert_eq!(parse_cidr("0.0.0.0/0"), Ok((0, 0xFFFF_FFFF, true)));
+        let db8 = 0x2001_0db8u128 << 96;
+        assert_eq!(
+            parse_cidr("2001:db8::/32"),
+            Ok((db8, db8 | ((1u128 << 96) - 1), false))
+        );
+        assert_eq!(parse_cidr("2001:db8::1"), Ok((db8 | 1, db8 | 1, false)));
+        assert_eq!(parse_cidr("::/0"), Ok((0, u128::MAX, false)));
+    }
+
+    #[test]
+    fn a_cidr_that_is_not_one_says_why() {
+        for bad in [
+            "",
+            "203.0.113",
+            "203.0.113.0/",
+            "example.com",
+            "203.0.113.0/24/1",
+            "/24",
+        ] {
+            assert!(
+                parse_cidr(bad)
+                    .unwrap_err()
+                    .starts_with("not an address or a CIDR")
+                    || parse_cidr(bad)
+                        .unwrap_err()
+                        .starts_with("the prefix length"),
+                "{bad:?}: {:?}",
+                parse_cidr(bad)
+            );
+        }
+        for bad in [
+            "203.0.113.0/33",
+            "203.0.113.0/-1",
+            "203.0.113.0/+8",
+            "203.0.113.0/ 8",
+            "203.0.113.0/8x",
+        ] {
+            assert_eq!(
+                parse_cidr(bad).unwrap_err(),
+                "the prefix length must be 0 to 32",
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            parse_cidr("2001:db8::/129").unwrap_err(),
+            "the prefix length must be 0 to 128"
+        );
+        // Host bits set: say what the network is.
+        assert_eq!(
+            parse_cidr("203.0.113.7/24").unwrap_err(),
+            "has bits set beyond the /24: write 203.0.113.0/24, or the single address with /32"
+        );
+        assert_eq!(
+            parse_cidr("2001:db8::1/32").unwrap_err(),
+            "has bits set beyond the /32: write 2001:db8::/32, or the single address with /128"
+        );
+        assert_eq!(
+            parse_cidr("::ffff:203.0.113.0/120").unwrap_err(),
+            "an IPv4-mapped IPv6 address: write the IPv4 network"
+        );
+    }
+
+    #[test]
+    fn every_problem_in_an_override_list_is_reported() {
+        let errs = overrides(&[
+            ("203.0.113.0/24", "residential_ita"),
+            ("198.51.100.9/24", "gov_ita"),
+            ("192.0.2.0/24", "datacentre_ita"),
+            ("not-a-cidr", "also-not-a-class"),
+        ])
+        .unwrap_err();
+        assert_eq!(errs.len(), 4, "{errs:#?}");
+        assert!(errs.iter().any(|e| e
+            .starts_with("sovereign.overrides \"198.51.100.9/24\": has bits set beyond the /24")));
+        assert!(errs.iter().any(|e| e.starts_with(
+            "sovereign.overrides \"192.0.2.0/24\": \"datacentre_ita\" is not a class of this build (known: gov_ita, "
+        )));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("\"also-not-a-class\" is not a class")));
+        assert!(errs
+            .iter()
+            .any(|e| e.starts_with("sovereign.overrides \"not-a-cidr\": not an address")));
+    }
+
+    #[test]
+    fn the_same_network_written_twice_is_refused() {
+        let errs = overrides(&[
+            ("2001:db8::/32", "gov_ita"),
+            ("2001:0db8:0::/32", "unknown"),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            errs,
+            ["sovereign.overrides: the same network is listed twice (2001:db8::)"]
+        );
+        let errs =
+            overrides(&[("203.0.113.7", "gov_ita"), ("203.0.113.7/32", "gov_ita")]).unwrap_err();
+        assert_eq!(
+            errs,
+            ["sovereign.overrides: the same network is listed twice (203.0.113.7)"]
+        );
+        // The same prefix in the two families is two networks.
+        assert!(overrides(&[("0.0.0.0/0", "unknown"), ("::/0", "unknown")]).is_ok());
+    }
+
+    #[test]
+    fn the_most_specific_override_wins() {
+        let o = overrides(&[
+            ("203.0.113.0/24", "residential_ita"),
+            ("203.0.113.64/26", "datacenter_ita"),
+            ("203.0.113.80/32", "Gov_Ita"), // labels in any case
+            ("2001:db8::/32", "gov_ita"),
+            ("2001:db8:ff00::/40", "unknown"),
+        ])
+        .unwrap();
+        assert_eq!(o.len(), 5);
+        assert!(!o.is_empty());
+        assert_eq!(class_of(&o, "203.0.112.255"), None);
+        assert_eq!(class_of(&o, "203.0.113.0"), Some(IpClass::ResidentialIta));
+        assert_eq!(class_of(&o, "203.0.113.63"), Some(IpClass::ResidentialIta));
+        assert_eq!(class_of(&o, "203.0.113.64"), Some(IpClass::DatacenterIta));
+        assert_eq!(class_of(&o, "203.0.113.79"), Some(IpClass::DatacenterIta));
+        assert_eq!(class_of(&o, "203.0.113.80"), Some(IpClass::GovIta));
+        assert_eq!(class_of(&o, "203.0.113.81"), Some(IpClass::DatacenterIta));
+        assert_eq!(class_of(&o, "203.0.113.127"), Some(IpClass::DatacenterIta));
+        assert_eq!(class_of(&o, "203.0.113.128"), Some(IpClass::ResidentialIta));
+        assert_eq!(class_of(&o, "203.0.113.255"), Some(IpClass::ResidentialIta));
+        assert_eq!(class_of(&o, "203.0.114.0"), None);
+        // IPv6, and an override to `unknown` is an answer, not an absence.
+        assert_eq!(class_of(&o, "2001:db8::1"), Some(IpClass::GovIta));
+        assert_eq!(class_of(&o, "2001:db8:ff00::1"), Some(IpClass::Unknown));
+        assert_eq!(
+            class_of(&o, "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff"),
+            Some(IpClass::Unknown)
+        );
+        assert_eq!(class_of(&o, "2001:db9::"), None);
+        // An IPv4 client seen through a dual-stack socket is the same client.
+        assert_eq!(class_of(&o, "::ffff:203.0.113.80"), Some(IpClass::GovIta));
+    }
+
+    #[test]
+    fn an_override_can_cover_the_whole_address_space() {
+        let o = overrides(&[
+            ("0.0.0.0/0", "unknown"),
+            ("255.255.255.255", "gov_ita"),
+            ("::/0", "residential_ita"),
+            ("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "gov_ita"),
+            ("::", "datacenter_ita"),
+        ])
+        .unwrap();
+        assert_eq!(class_of(&o, "0.0.0.0"), Some(IpClass::Unknown));
+        assert_eq!(class_of(&o, "255.255.255.254"), Some(IpClass::Unknown));
+        assert_eq!(class_of(&o, "255.255.255.255"), Some(IpClass::GovIta));
+        assert_eq!(class_of(&o, "::"), Some(IpClass::DatacenterIta));
+        assert_eq!(class_of(&o, "::1"), Some(IpClass::ResidentialIta));
+        assert_eq!(
+            class_of(&o, "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe"),
+            Some(IpClass::ResidentialIta)
+        );
+        assert_eq!(
+            class_of(&o, "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+            Some(IpClass::GovIta)
+        );
+    }
+
+    #[test]
+    fn no_overrides_answer_nothing() {
+        let o = overrides(&[]).unwrap();
+        assert!(o.is_empty());
+        assert_eq!(o.len(), 0);
+        assert_eq!(class_of(&o, "203.0.113.1"), None);
+        assert_eq!(class_of(&Overrides::default(), "2001:db8::1"), None);
+        // `classify_with` then is `classify`.
+        for ip in ["8.8.8.8", "193.205.0.1", "2001:760::1"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert_eq!(classify_with(&o, ip), classify(ip));
+        }
+    }
+
+    #[test]
+    fn labels_name_the_classes_of_this_build() {
+        for &label in known_class_labels() {
+            assert_eq!(IpClass::from_label(label).unwrap().as_str(), label);
+            assert_eq!(
+                IpClass::from_label(&label.to_uppercase()).unwrap().as_str(),
+                label
+            );
+        }
+        assert_eq!(ALL_CLASSES.len(), known_class_labels().len());
+        assert_eq!(IpClass::from_label("datacentre_ita"), None);
+        assert_eq!(IpClass::from_label(""), None);
+        #[cfg(not(feature = "geo-eu"))]
+        assert_eq!(IpClass::from_label("eu"), None);
+    }
+
+    // An override decides before the tables do, in both directions: a foreign
+    // address made Italian, and an Italian one taken out.
+    #[cfg(feature = "geo-ita")]
+    #[test]
+    fn an_override_is_consulted_before_the_tables() {
+        let o = overrides(&[
+            ("8.8.8.0/24", "gov_ita"),
+            ("193.205.0.0/24", "unknown"),
+            ("2001:760::/64", "datacenter_ita"),
+        ])
+        .unwrap();
+        let class = |ip: &str| classify_with(&o, ip.parse().unwrap());
+        assert_eq!(classify("8.8.8.8".parse().unwrap()), IpClass::Unknown);
+        assert_eq!(class("8.8.8.8"), IpClass::GovIta);
+        assert_eq!(classify("193.205.0.1".parse().unwrap()), IpClass::GovIta);
+        assert_eq!(class("193.205.0.1"), IpClass::Unknown);
+        assert_eq!(class("2001:760::1"), IpClass::DatacenterIta);
+        // Next to an override the table still answers.
+        assert_eq!(class("193.205.1.1"), IpClass::GovIta);
+        assert_eq!(class("2001:760:1::1"), IpClass::GovIta);
+        assert_eq!(class("8.8.4.4"), IpClass::Unknown);
+    }
+
+    mod override_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        const CLASSES: [IpClass; 4] = [
+            IpClass::GovIta,
+            IpClass::ResidentialIta,
+            IpClass::DatacenterIta,
+            IpClass::Unknown,
+        ];
+
+        /// Up to 24 prefixes inside a block of 4,096 addresses: `(offset, extra
+        /// prefix bits 0..=12, class)`.
+        fn prefixes() -> impl Strategy<Value = Vec<(u32, u32, usize)>> {
+            proptest::collection::vec((0u32..4096, 0u32..=12, 0usize..4), 0..24)
+        }
+
+        /// The class of the most specific prefix that contains `offset`, the way
+        /// a person would look it up: try every prefix, keep the longest.
+        fn by_hand(list: &[(u32, u32, IpClass)], offset: u32) -> Option<IpClass> {
+            list.iter()
+                .filter(|(start, bits, _)| offset >> (12 - bits) == start >> (12 - bits))
+                .max_by_key(|(_, bits, _)| *bits)
+                .map(|(_, _, class)| *class)
+        }
+
+        fn dedup(raw: Vec<(u32, u32, usize)>) -> Vec<(u32, u32, IpClass)> {
+            let mut seen = std::collections::BTreeSet::new();
+            raw.into_iter()
+                .map(|(offset, bits, class)| {
+                    let start = (offset >> (12 - bits)) << (12 - bits);
+                    (start, bits, CLASSES[class])
+                })
+                .filter(|(start, bits, _)| seen.insert((*start, *bits)))
+                .collect()
+        }
+
+        proptest! {
+            #[test]
+            fn ipv4_lookup_is_the_most_specific_prefix(raw in prefixes()) {
+                let list = dedup(raw);
+                let base = u32::from(std::net::Ipv4Addr::new(10, 20, 0, 0));
+                let pairs: Vec<(String, String)> = list.iter().map(|(start, bits, class)| (
+                    format!("{}/{}", std::net::Ipv4Addr::from(base + start), 20 + bits),
+                    class.as_str().to_string(),
+                )).collect();
+                let o = Overrides::from_config(pairs.iter().map(|(c, l)| (c, l))).unwrap();
+                prop_assert_eq!(o.len(), list.len());
+                for offset in 0..4096u32 {
+                    let ip = IpAddr::V4(std::net::Ipv4Addr::from(base + offset));
+                    prop_assert_eq!(o.lookup(ip), by_hand(&list, offset), "offset {}", offset);
+                }
+                // Outside the block nothing answers.
+                prop_assert_eq!(o.lookup(IpAddr::V4(std::net::Ipv4Addr::from(base - 1))), None);
+                prop_assert_eq!(o.lookup(IpAddr::V4(std::net::Ipv4Addr::from(base + 4096))), None);
+                // Written down as sorted ranges that do not touch needlessly.
+                for w in o.v4.windows(2) {
+                    prop_assert!(w[0].1 < w[1].0);
+                    prop_assert!(!(w[0].1 + 1 == w[1].0 && w[0].2 == w[1].2));
+                }
+            }
+
+            #[test]
+            fn ipv6_lookup_is_the_most_specific_prefix(raw in prefixes()) {
+                let list = dedup(raw);
+                // The last 4,096 addresses of the space: the top edge is where
+                // "one past the end" does not exist.
+                let base = u128::MAX - 4095;
+                let pairs: Vec<(String, String)> = list.iter().map(|(start, bits, class)| (
+                    format!("{}/{}", std::net::Ipv6Addr::from(base + u128::from(*start)), 116 + bits),
+                    class.as_str().to_string(),
+                )).collect();
+                let o = Overrides::from_config(pairs.iter().map(|(c, l)| (c, l))).unwrap();
+                for offset in 0..4096u32 {
+                    let ip = IpAddr::V6(std::net::Ipv6Addr::from(base + u128::from(offset)));
+                    prop_assert_eq!(o.lookup(ip), by_hand(&list, offset), "offset {}", offset);
+                }
+                prop_assert_eq!(o.lookup(IpAddr::V6(std::net::Ipv6Addr::from(base - 1))), None);
+            }
+        }
     }
 
     // ── Data age ──────────────────────────────────────────────────────

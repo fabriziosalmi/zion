@@ -64,6 +64,37 @@ deny    = ["unknown"]          # IpClass labels denied with 403. On a geo-eu
                                # (0.0 = off; requires --features sovereign-aimp)
 ```
 
+## Overrides: your own word on an address
+
+The tables are compiled in, and they say what registries and BGP say. When a
+row is wrong for you (your office range, a partner's network, a block the
+table has not caught up with), you do not need a rebuild:
+
+```toml
+[sovereign.overrides]
+"203.0.113.0/24"  = "residential_ita"   # our branch offices
+"203.0.113.64/26" = "datacenter_ita"    # ...except the server room
+"2001:db8::/32"   = "unknown"           # take this range out of the tables
+```
+
+- Each key is a CIDR or a single address, IPv4 or IPv6. Each value is a class
+  label (`gov_ita`, `residential_ita`, `datacenter_ita`, `unknown`, and on a
+  `geo-eu` build `eu`, `gov_eu`, `residential_eu`, `datacenter_eu`).
+- **Overrides are consulted before the tables, and the most specific prefix
+  wins.** `unknown` is a class like the others: it takes a range out of
+  whatever the tables say.
+- **Read at boot and on reload.** Edit the file and the next request sees it.
+  The boot and reload log says how many are in force.
+- **A list with a mistake is refused whole**, at boot and on reload, with every
+  problem named: a CIDR with bits set beyond its prefix (`203.0.113.7/24`: the
+  message gives the network to write), a class that does not exist in this
+  build, the same network twice. On reload the previous list stays in force.
+  An override that did nothing in silence would be worse than none.
+
+The class an override gives is what the logs, the metric and
+`[sovereign.enforce]` then see. An override is how you correct one row today;
+if the row is wrong for everyone, it is also worth an issue.
+
 Classification is a **signal by default** — it only affects logs/metrics until
 you enable `[sovereign.enforce]`. The class labels used in `deny` are the
 snake-case `IpClass` names: `gov_ita`, `residential_ita`, `datacenter_ita`,
