@@ -75,6 +75,7 @@ RESIDENTIAL_ASNS = {
     12874: "Fastweb",
     30722: "Vodafone",           # Vodafone Italia (now Fastweb-owned; AS-name retains VODAFONE)
     1267: "Wind Tre",
+    24608: "Wind Tre",           # Wind Tre's second ASN (549,888 IPv4 addresses on 2026-10-06)
     8612: "Tiscali",
     35612: "Eolo",               # NGI / EOLO
     210278: "Sky Italia",
@@ -90,7 +91,8 @@ DATACENTER_ASNS = {
     39120: "Convergenze",        # ex-Serverplan, now Convergenze (IT operator)
     34758: "Axera",              # ex-FlameNetworks, now Axera (IT)
     16276: "OVH",                # OVH (FR) — curated as operating in IT
-    24940: "Hetzner",            # Hetzner (DE) — curated as operating in IT
+    # Hetzner (AS24940) was here on the same grounds. It announces no space
+    # registered in Italy, so under `registered_in` it gave the table nothing.
 }
 
 # ── EU-27 member states (ISO-3166 alpha-2, RIPE `cc` field). ──────────
@@ -144,16 +146,16 @@ REGIONS = {
             (DATACENTER_ASNS, "DatacenterIta"),
         ],
         # A class listed here needs more than a curated ASN: the range must also
-        # be registered (RIPE delegation) in one of these countries. OVH and
-        # Hetzner are curated as hosters that operate in Italy, and they
-        # announce space registered in France, Germany, Israel: before this
+        # be registered (RIPE delegation) in one of these countries. OVH is
+        # curated as a hoster that operates in Italy (Hetzner was too), and it
+        # announces space registered in France, Germany, Israel: before this
         # rule, 85 % of the IPv4 addresses called `DatacenterIta` were
         # registered outside Italy.
         "registered_in": {"DatacenterIta": {"IT"}},
-        # Where the curated ASNs themselves are registered. OVH and Hetzner are
-        # the two foreign companies on the Italian list, each with its country.
+        # Where the curated ASNs themselves are registered. OVH is the one
+        # foreign company on the Italian list, with its country.
         "asn_countries": {"IT"},
-        "asn_country_exceptions": {16276: "FR", 24940: "DE"},
+        "asn_country_exceptions": {16276: "FR"},
     },
     "eu": {
         "module": "data_eu",
@@ -165,6 +167,12 @@ REGIONS = {
             (RESIDENTIAL_EU_ASNS, "ResidentialEu"),
             (DATACENTER_EU_ASNS, "DatacenterEu"),
         ],
+        # An EU role is for space registered in the EU-27, like the baseline it
+        # refines. The curated EU hosters announce a great deal that is not: on
+        # 2026-10-06 only 19 % of the IPv6 called `DatacenterEu` was registered in
+        # a member state (68 % was registered in the Seychelles), and 83 % of the
+        # IPv4. What a curated ASN announces outside the EU-27 gets no class.
+        "registered_in": {"GovEu": EU27, "ResidentialEu": EU27, "DatacenterEu": EU27},
         "asn_countries": EU27,
         "asn_country_exceptions": {},
     },

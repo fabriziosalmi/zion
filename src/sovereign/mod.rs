@@ -1012,21 +1012,20 @@ mod tests {
         assert_eq!(classify("8.8.8.8".parse().unwrap()), IpClass::Unknown);
     }
 
-    // `DatacenterIta` needs a curated hoster AND space registered in Italy.
-    // 2.26.132.0 is announced by OVH (AS16276, on the Italian list as a hoster
-    // that operates in Italy) from a block registered in the United States: it
-    // was `DatacenterIta` until the rule, and is not Italian by either the
-    // registry or the announcing company.
+    // A role class needs a curated ASN AND space registered in the region.
+    // 2.26.132.0 is announced by OVH (AS16276, curated on both lists) from a
+    // block registered in the United States. It was `DatacenterIta`, then
+    // `DatacenterEu`; by the registry it is neither Italian nor in the EU-27.
     #[cfg(feature = "geo-ita")]
     #[test]
-    fn a_curated_hoster_range_registered_abroad_is_not_italian() {
-        let class = classify("2.26.132.0".parse().unwrap());
-        assert_ne!(class, IpClass::DatacenterIta);
-        // The EU table has no such rule (yet): there it is an OVH range.
+    fn a_curated_hoster_range_registered_outside_the_region_has_no_class() {
+        assert_eq!(classify("2.26.132.0".parse().unwrap()), IpClass::Unknown);
+        // The same company's space registered in France keeps its EU role.
         #[cfg(feature = "geo-eu")]
-        assert_eq!(class, IpClass::DatacenterEu);
-        #[cfg(not(feature = "geo-eu"))]
-        assert_eq!(class, IpClass::Unknown);
+        assert_eq!(
+            classify("57.128.0.1".parse().unwrap()),
+            IpClass::DatacenterEu
+        );
     }
 
     #[cfg(feature = "geo-eu")]
@@ -1104,8 +1103,8 @@ mod tests {
     /// Curated Italian ASNs with no pinned address, each with the reason.
     #[cfg(feature = "geo-ita")]
     const ITALIAN_WITHOUT_POINT: &[(u32, &str)] = &[(
-        24940,
-        "Hetzner announces no space registered in Italy: with the registry rule it gives the Italian table nothing",
+        24608,
+        "Wind Tre's second ASN, curated on 2026-10-06: an added ASN waits two weekly snapshots like any observation, so its ranges are not in the table yet. Pin 5.84.0.1 once they are",
     )];
 
     #[cfg(feature = "geo-eu")]
@@ -1304,7 +1303,7 @@ mod tests {
         assert!(v4_addresses(t, IpClass::Eu) > 265_000_000);
         assert!(v4_addresses(t, IpClass::GovEu) > 16_000_000);
         assert!(v4_addresses(t, IpClass::ResidentialEu) > 94_000_000);
-        assert!(v4_addresses(t, IpClass::DatacenterEu) > 7_500_000);
+        assert!(v4_addresses(t, IpClass::DatacenterEu) > 6_400_000);
         assert!(data_eu::RANGES6.len() >= 11_000);
     }
 

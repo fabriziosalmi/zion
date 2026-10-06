@@ -212,7 +212,7 @@ def test_a_curated_asn_registered_elsewhere_is_a_drift():
 
 def test_the_real_lists_expect_the_countries_they_are_made_of():
     assert gsd.REGIONS["ita"]["asn_countries"] == {"IT"}
-    assert gsd.REGIONS["ita"]["asn_country_exceptions"] == {16276: "FR", 24940: "DE"}
+    assert gsd.REGIONS["ita"]["asn_country_exceptions"] == {16276: "FR"}
     assert gsd.REGIONS["eu"]["asn_countries"] == gsd.EU27
     # Every exception is an ASN on the list.
     for region in gsd.REGIONS.values():
@@ -928,7 +928,22 @@ def test_published_ranges_outside_their_registered_space_are_found():
 
 def test_the_italian_datacenter_class_is_confined_to_italy():
     assert gsd.REGIONS["ita"]["registered_in"] == {"DatacenterIta": {"IT"}}
-    assert "registered_in" not in gsd.REGIONS["eu"]
+
+
+def test_the_eu_role_classes_are_confined_to_the_eu_27():
+    assert gsd.REGIONS["eu"]["registered_in"] == {
+        "GovEu": gsd.EU27, "ResidentialEu": gsd.EU27, "DatacenterEu": gsd.EU27}
+    # The baseline is the registry itself and needs no such rule.
+    assert "Eu" not in gsd.REGIONS["eu"]["registered_in"]
+    assert len(gsd.EU27) == 27 and "GB" not in gsd.EU27 and "CH" not in gsd.EU27
+
+
+def test_the_curated_lists_after_the_october_2026_review():
+    ita = {asn for asns, _ in gsd.REGIONS["ita"]["asn_roles"] for asn in asns}
+    assert 24608 in gsd.RESIDENTIAL_ASNS and gsd.RESIDENTIAL_ASNS[24608] == "Wind Tre"
+    assert 24940 not in ita                    # Hetzner: off the Italian list...
+    assert 24940 in gsd.DATACENTER_EU_ASNS     # ...and still on the EU one
+    assert gsd.holder_matches("Wind Tre", "WINDTRE-AS WIND TRE S.P.A.")
 
 
 # ── Hysteresis ───────────────────────────────────────────────────────────────

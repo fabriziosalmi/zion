@@ -30,20 +30,23 @@ cargo build --release --features geo-ita     # Italy only
 | `gov_ita`, `residential_ita` | a curated Italian ASN of that role announces it |
 | `datacenter_ita` | a curated hoster announces it **and** the block is registered in Italy (RIPE delegation with country `IT`) |
 | `eu` | the block is registered in an EU-27 country and no curated EU ASN announces it |
-| `gov_eu`, `residential_eu`, `datacenter_eu` | a curated EU ASN of that role announces it, wherever the block is registered |
+| `gov_eu`, `residential_eu`, `datacenter_eu` | a curated EU ASN of that role announces it **and** the block is registered in an EU-27 country |
 | `unknown` | none of the above |
 
-The Italian table is consulted first. `datacenter_ita` carries the second
-condition because two of the curated hosters, OVH and Hetzner, are on the
-Italian list as companies that operate in Italy, and they announce space
-registered in France, Germany, the United States, Israel. Without the
-condition 85 % of the IPv4 addresses called `datacenter_ita` were registered
-outside Italy. The EU role classes have no such condition today: a block
-that LeaseWeb announces and that is registered in the Seychelles is
-`datacenter_eu`.
+The Italian table is consulted first.
 
-With neither feature, `classify()` always returns `Unknown` and the whole
-subsystem is compiled out (zero cost).
+**A role is for space registered in the region.** The curated hosters announce
+a great deal that is not: OVH is on the Italian list as a company that
+operates in Italy, and announces space registered in France, Germany, the
+United States; LeaseWeb, on the EU list, announces IPv6 registered in the
+Seychelles. Before the condition, 85 % of the IPv4 addresses called
+`datacenter_ita` were registered outside Italy, and 81 % of the IPv6 called
+`datacenter_eu` outside the EU-27. A block registered outside a class's
+region does not get that class: an OVH block registered in France is not
+`datacenter_ita` (on a `geo-eu` build it is `datacenter_eu`), and one
+registered in the United States is `unknown` on every build. `gov_ita` and
+`residential_ita` carry no such condition (their space is registered in Italy
+as it is).
 
 ## Configuration
 
@@ -275,9 +278,8 @@ holders were validated on.
 
 Two things were added to this check since. **The country.** A name alone lets
 "Orange" in Mali pass for Orange in France, so each curated ASN must also be
-registered where the list expects it: in Italy for the Italian list (OVH and
-Hetzner are the two named exceptions, in France and Germany), in an EU-27
-country for the EU list. The country comes from the BGP table itself, with no
+registered where the list expects it: in Italy for the Italian list (OVH is
+the one named exception, in France), in an EU-27 country for the EU list. The country comes from the BGP table itself, with no
 lookup. **A lookup that fails is not a drift.** RIPEstat times out now and
 then; each lookup is tried four times (after 2, 6 and 20 seconds), and if it
 still fails the refresh stops with its own message and exit status (5): nothing
