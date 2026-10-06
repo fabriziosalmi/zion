@@ -114,12 +114,53 @@ block that "leaves" a class because another ASN of the same operator now
 announces it reads differently from one that is no longer announced at all.
 
 The thresholds were set on the nine weekly tables from 2026-08-12 to
-2026-10-05. The block rule singles out the changes that were later found wrong
-or short-lived in that period (a research network's /13 dropped from `gov_eu`
-for a week, a /16 turned into `datacenter_eu` by a two-week announcement). It
-flags such a change; it does not prevent it. A table is still one BGP snapshot,
-and a range that is announced on and off still enters and leaves with it
-([#568](https://github.com/fabriziosalmi/zion/issues/568)).
+2026-10-05.
+
+### The table follows the snapshots with a delay
+
+One snapshot says what a curated ASN announced at one moment. Prefixes are
+announced on and off, moved between the ASNs of one operator, lent for two
+weeks. A table that copied each snapshot labelled real clients wrongly for a
+week at a time: in nine weeks, 49 runs of addresses went from one class to
+another and back.
+
+So the published table is not the snapshot:
+
+| A run of addresses | changes in the table |
+|---|---|
+| has no class and is observed in one | after **2** weekly snapshots that agree |
+| has a class and is observed without it, or in another | after **3** |
+| is observed back in its published class before that | never; the count starts again |
+
+Two runs of the refresh count as two snapshots only when they are 5 days or
+more apart, so running it again the same day does not hurry anything.
+
+What has been observed and is not yet published is kept in
+`src/sovereign/data_<region>.pending.json`, committed with the table. Each
+refresh PR shows it in its diff, and its body lists the largest runs that are
+waiting (`1 of 3`, `2 of 3`) and the ones that went back.
+
+What this costs: a new allocation or a new announcement is classified one
+week late, and a range that really left keeps its class for two more weeks.
+With `[sovereign.enforce] deny = ["unknown"]` that is the safer direction (a
+real client is not turned away because of one snapshot); with a deny list of
+datacenter classes it means a range that stopped being a datacenter is denied
+for two more weeks.
+
+**Edits to the curated ASN list are not delayed.** When an ASN is removed from
+the list, or given another role, the ranges it announces are re-labelled at
+the next refresh: a removal is a correction, and making it wait three weeks
+would keep a wrong label on purpose. An ASN that is added waits like any other
+observation. The list each table was last built with is recorded in the same
+`.pending.json`.
+
+To publish a snapshot as it is and clear the memory (after a change to the
+generator's rules, by hand): `--no-hysteresis`.
+
+On the nine historical weeks, replayed through this rule: the research
+network's /13 that left `gov_eu` for one week, the /17 that was `datacenter_eu`
+for two, and the three /18s of an Italian ISP that came and went are never
+published.
 
 ### The holder-validation guarantee
 

@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "region": "ita",
+  "snapshot": "2026-10-06",
+  "rule": "a run enters a class after 2 weekly snapshots, leaves or changes class after 3",
+  "curated": {
+    "137": "GovIta",
+    "1267": "ResidentialIta",
+    "2598": "GovIta",
+    "3269": "ResidentialIta",
+    "8612": "ResidentialIta",
+    "8968": "DatacenterIta",
+    "12797": "DatacenterIta",
+    "12874": "ResidentialIta",
+    "16232": "ResidentialIta",
+    "16276": "DatacenterIta",
+    "24940": "DatacenterIta",
+    "30722": "ResidentialIta",
+    "31034": "DatacenterIta",
+    "34758": "DatacenterIta",
+    "35612": "ResidentialIta",
+    "39120": "DatacenterIta",
+    "41325": "GovIta",
+    "49367": "DatacenterIta",
+    "60798": "DatacenterIta",
+    "197075": "DatacenterIta",
+    "201333": "DatacenterIta",
+    "210278": "ResidentialIta"
+  },
+  "pending": [
+    {"family": "v4", "block": "2.159.128.0/18", "observed": null, "seen": 1, "first": "2026-10-06", "last": "2026-10-06"},
+    {"family": "v4", "block": "79.48.0.0/16", "observed": "ResidentialIta", "seen": 1, "first": "2026-10-06", "last": "2026-10-06"},
+    {"family": "v4", "block": "87.82.206.0/24", "observed": null, "seen": 1, "first": "2026-10-06", "last": "2026-10-06"},
+    {"family": "v4", "block": "185.216.126.0/24", "observed": null, "seen": 1, "first": "2026-10-06", "last": "2026-10-06"},
+    {"family": "v4", "block": "200.141.186.0/24", "observed": null, "seen": 1, "first": "2026-10-06", "last": "2026-10-06"}
+  ]
+}

@@ -851,6 +851,230 @@ def unannounced_asns(asn_to_class: dict[int, str], role_v4: dict[int, list[Range
     the list."""
     return sorted(asn for asn in asn_to_class if not role_v4.get(asn))
 
+# ── Hysteresis ─────────────────────────────────────────────────────────────
+# One snapshot says what a curated ASN announced at one moment. Prefixes are
+# announced on and off, moved between the ASNs of one operator, borrowed for two
+# weeks. A table that copies each snapshot labels real clients wrongly for a
+# week at a time. So the published table follows the snapshots with a delay:
+#
+#   * a run of addresses with no class gets one after ENTER_AFTER consecutive
+#     snapshots that agree on it;
+#   * a run that has a class loses or changes it after LEAVE_AFTER.
+#
+# What has been observed and not yet published is kept in a small file next to
+# the table (`data_<region>.pending.json`), committed with it: the memory of the
+# pipeline is in the repository, and every refresh shows it in its diff.
+
+ENTER_AFTER = 2
+LEAVE_AFTER = 3
+# Two runs count as two snapshots only this many days apart: a refresh run again
+# the same day, or the day after, is the same week's observation.
+MIN_SPACING_DAYS = 5
+
+STATE_VERSION = 1
+
+
+@dataclass
+class Pending:
+    """A run of addresses observed in a class other than the published one."""
+    family: str
+    start: int
+    end: int
+    observed: str | None
+    seen: int
+    first: str
+    last: str
+
+    @property
+    def size(self) -> int:
+        return self.end - self.start + 1
+
+    def facts(self) -> tuple:
+        return (self.observed, self.seen, self.first, self.last)
+
+
+@dataclass
+class Settled:
+    """One family after a snapshot: the table to publish, what still waits,
+    what was published now (`applied`, with how long it waited) and what stopped
+    being observed before it was published (`went_back`)."""
+    table: list[Range]
+    pending: list[Pending]
+    applied: list[Pending]
+    went_back: list[Pending]
+
+
+def _days_between(earlier: str, later: str) -> int:
+    return (datetime.strptime(later, "%Y-%m-%d") - datetime.strptime(earlier, "%Y-%m-%d")).days
+
+
+def _extend(seq: list, item, same) -> None:
+    """Append `item`, or grow the last element when it touches it and `same`."""
+    if seq and seq[-1].end + 1 == item.start and same(seq[-1], item):
+        seq[-1].end = item.end
+    else:
+        seq.append(item)
+
+
+def settle_family(published: list[Range], observed: list[Range], pending: list[Pending],
+                  snapshot: str, family: str) -> Settled:
+    """Advance one family by one snapshot. All three inputs are sorted and
+    non-overlapping; every address is decided on its own, runs are only how the
+    result is written down."""
+    bounds = set()
+    for seq in (published, observed, pending):
+        for r in seq:
+            bounds.add(r.start)
+            bounds.add(r.end + 1)
+    points = sorted(bounds)
+    out = Settled([], [], [], [])
+    same_class = lambda a, b: a.ip_class == b.ip_class
+    same_facts = lambda a, b: a.facts() == b.facts()
+    pi = oi = qi = 0
+    for i in range(len(points) - 1):
+        s, e = points[i], points[i + 1] - 1
+        while pi < len(published) and published[pi].end < s:
+            pi += 1
+        while oi < len(observed) and observed[oi].end < s:
+            oi += 1
+        while qi < len(pending) and pending[qi].end < s:
+            qi += 1
+        p = published[pi].ip_class if pi < len(published) and published[pi].start <= s else None
+        o = observed[oi].ip_class if oi < len(observed) and observed[oi].start <= s else None
+        q = pending[qi] if qi < len(pending) and pending[qi].start <= s else None
+
+        final = p
+        if o == p:
+            if q is not None:
+                _extend(out.went_back, Pending(family, s, e, *q.facts()), same_facts)
+        else:
+            if q is not None and q.observed == o:
+                fresh = _days_between(q.last, snapshot) >= MIN_SPACING_DAYS
+                seen, first, last = q.seen + fresh, q.first, snapshot if fresh else q.last
+            else:
+                seen, first, last = 1, snapshot, snapshot
+            waited = Pending(family, s, e, o, seen, first, last)
+            if seen >= (ENTER_AFTER if p is None else LEAVE_AFTER):
+                _extend(out.applied, waited, same_facts)
+                final = o
+            else:
+                _extend(out.pending, waited, same_facts)
+        if final is not None:
+            _extend(out.table, Range(s, e, final), same_class)
+    return out
+
+
+def patch_family(table: list[Range], changes: list[Change]) -> list[Range]:
+    """`table` with every run in `changes` set to its new class."""
+    as_ranges = [Range(c.start, c.end, c.new or "", ROLE_PRIORITY) for c in changes]
+    base = [Range(r.start, r.end, r.ip_class, BASELINE_PRIORITY) for r in table]
+    patched = [r for r in resolve_priority(base + as_ranges) if r.ip_class]
+    return merge_same_class([Range(r.start, r.end, r.ip_class) for r in patched])
+
+
+def without(pending: list[Pending], changes: list[Change]) -> list[Pending]:
+    """`pending` minus the addresses of `changes` (both sorted, non-overlapping)."""
+    out: list[Pending] = []
+    ci = 0
+    for q in pending:
+        at = q.start
+        while ci < len(changes) and changes[ci].end < at:
+            ci += 1
+        k = ci
+        while k < len(changes) and changes[k].start <= q.end:
+            if changes[k].start > at:
+                out.append(Pending(q.family, at, changes[k].start - 1, *q.facts()))
+            at = max(at, changes[k].end + 1)
+            k += 1
+        if at <= q.end:
+            out.append(Pending(q.family, at, q.end, *q.facts()))
+    return out
+
+
+def parse_block(family: str, text: str) -> tuple[int, int]:
+    """The inverse of format_block: `a.b.c.d/len` or `first-last`."""
+    addr = ipaddress.IPv4Address if family == "v4" else ipaddress.IPv6Address
+    if "/" in text:
+        net = ipaddress.ip_network(text, strict=True)
+        return int(net.network_address), int(net.broadcast_address)
+    first, last = text.split("-")
+    return int(addr(first)), int(addr(last))
+
+
+def load_state(path: Path, region: str) -> tuple[dict[int, str] | None, dict[str, list[Pending]]]:
+    """Read `data_<region>.pending.json`: the curated list the table was last
+    built with, and what waits. A missing file is an empty memory."""
+    pending: dict[str, list[Pending]] = {"v4": [], "v6": []}
+    if not Path(path).exists():
+        return None, pending
+    state = json.loads(Path(path).read_text())
+    if state.get("version") != STATE_VERSION or state.get("region") != region:
+        raise InputError(f"{path}: not a version-{STATE_VERSION} state file for {region!r}")
+    for row in state["pending"]:
+        start, end = parse_block(row["family"], row["block"])
+        pending[row["family"]].append(Pending(row["family"], start, end, row["observed"],
+                                              row["seen"], row["first"], row["last"]))
+    for family in pending:
+        pending[family].sort(key=lambda q: q.start)
+    return {int(asn): cls for asn, cls in state["curated"].items()}, pending
+
+
+def dump_state(region: str, snapshot: str, curated: dict[int, str],
+               pending: dict[str, list[Pending]]) -> str:
+    """The state file: one curated ASN and one waiting run per line, in a fixed
+    order, so that a refresh shows up as a readable diff."""
+    lines = [
+        "{",
+        f'  "version": {STATE_VERSION},',
+        f'  "region": {json.dumps(region)},',
+        f'  "snapshot": {json.dumps(snapshot)},',
+        f'  "rule": "a run enters a class after {ENTER_AFTER} weekly snapshots, '
+        f'leaves or changes class after {LEAVE_AFTER}",',
+        '  "curated": {',
+    ]
+    asns = sorted(curated)
+    lines += [f'    "{asn}": {json.dumps(curated[asn])}' + ("," if asn != asns[-1] else "")
+              for asn in asns]
+    lines += ["  },", '  "pending": [']
+    rows = [json.dumps({"family": q.family, "block": format_block(q.family, q.start, q.end),
+                        "observed": q.observed, "seen": q.seen, "first": q.first, "last": q.last})
+            for family in ("v4", "v6") for q in pending[family]]
+    lines += [f"    {row}" + ("," if i < len(rows) - 1 else "") for i, row in enumerate(rows)]
+    lines += ["  ]", "}", ""]
+    return "\n".join(lines)
+
+
+@dataclass
+class Refresh:
+    """What one snapshot does to a region: the table to publish and the memory
+    to keep, with what happened on the way."""
+    table: dict[str, list[Range]]
+    pending: dict[str, list[Pending]]
+    applied: list[Pending]
+    went_back: list[Pending]
+    curation: list[Change]
+
+
+def settle(published: dict[str, list[Range]], observed: dict[str, list[Range]],
+           pending: dict[str, list[Pending]], snapshot: str,
+           curation: dict[str, list[Change]] | None = None) -> Refresh:
+    """Advance both families by one snapshot. `curation` holds the runs whose
+    class changed because the curated list did (an ASN removed, or given another
+    role): those are published at once. A removal is a correction, and making it
+    wait three weeks would keep a wrong label on purpose."""
+    out = Refresh({}, {}, [], [], [])
+    for family in ("v4", "v6"):
+        base, waiting = published[family], pending[family]
+        edits = (curation or {}).get(family, [])
+        if edits:
+            base, waiting = patch_family(base, edits), without(waiting, edits)
+            out.curation += edits
+        settled = settle_family(base, observed[family], waiting, snapshot, family)
+        out.table[family], out.pending[family] = settled.table, settled.pending
+        out.applied += settled.applied
+        out.went_back += settled.went_back
+    return out
+
 CLASS_LABEL = {
     'GovIta': 'GOVERNMENT / INSTITUTIONAL',
     'ResidentialIta': 'RESIDENTIAL ISPs',
@@ -899,6 +1123,10 @@ def generate_rust(v4: list[Range], v6: list[Range], region: dict,
         '//! Sources: RIPE NCC delegated stats + IPtoASN (iptoasn.com), v4 + v6.',
         f'//! Snapshot date: {snapshot_date} (curated-ASN holders validated'
         ' against RIPEstat as-overview on this date — see the generator).',
+        '//!',
+        f'//! The table follows the weekly snapshots with a delay: a run of addresses enters a',
+        f'//! class after {ENTER_AFTER} snapshots that agree, and leaves or changes class after {LEAVE_AFTER}. What is',
+        f'//! observed and not yet published is in `{region["module"]}.pending.json`, next to this file.',
         '',
         'use super::{CidrEntry, CidrEntry6, IpClass};',
         '',
@@ -985,12 +1213,74 @@ def render_changes(changes: list[Change], describer: Describer | None) -> list[s
     return lines
 
 
+# How many waiting runs the summary lists per family, largest first.
+SUMMARY_WAITING = {"v4": 10, "v6": 5}
+
+
+def render_memory(refresh: Refresh, old: dict, describer: Describer | None) -> list[str]:
+    """What the hysteresis holds back, as Markdown: the runs waiting to be
+    published and the ones that went back before they were."""
+    lines = []
+    published = {f: SpanIndex([(r.start, r.end, r.ip_class) for r in old[f]]) for f in ("v4", "v6")}
+    waiting = [q for f in ("v4", "v6") for q in refresh.pending[f]]
+    if refresh.applied or refresh.curation:
+        lines += [
+            f"{len(refresh.applied)} runs are published now after waiting their snapshots"
+            + (f"; {len(refresh.curation)} more at once, because the curated ASN list changed."
+               if refresh.curation else "."),
+            "",
+        ]
+    if waiting:
+        lines += [
+            "### Observed, not yet published",
+            "",
+            f"A run enters a class after {ENTER_AFTER} weekly snapshots that agree and leaves or "
+            f"changes class after {LEAVE_AFTER}. {len(waiting)} runs are waiting; the largest:",
+            "",
+            "| Block | Size | Published as | Observed as | Seen | Since | Announced by | Registered in |",
+            "|---|---:|---|---|---|---|---|---|",
+        ]
+        for family in ("v4", "v6"):
+            mine = sorted((q for q in waiting if q.family == family), key=lambda q: -q.size)
+            for q in mine[:SUMMARY_WAITING[family]]:
+                now = format_cover(published[family].cover(q.start, q.end), "no class")
+                # A run can straddle published classes, with a different wait for each.
+                need = "/".join(str(n) for n in sorted({
+                    ENTER_AFTER if label is None else LEAVE_AFTER
+                    for label in published[family].cover(q.start, q.end)}))
+                size = format_size(family, q.size).replace(" addresses", "")
+                lines.append(
+                    f"| `{format_block(family, q.start, q.end)}` | {size} | {now} "
+                    f"| {q.observed or 'no class'} | {q.seen} of {need} | {q.first} "
+                    f"| {describer.announced_by(q) if describer else ''} "
+                    f"| {describer.registered_in(q) if describer else ''} |")
+        lines.append("")
+    if refresh.went_back:
+        gone = sorted(refresh.went_back, key=lambda q: -(q.size if q.family == "v4" else q.size >> 96))
+        lines += [
+            "### Observed and gone again",
+            "",
+            f"{len(gone)} runs were waiting and are back to their published class. The table "
+            "never changed for them. The largest:",
+            "",
+            "| Block | Size | Published as | Was observed as | Seen | First seen |",
+            "|---|---:|---|---|---:|---|",
+        ]
+        for q in gone[:8]:
+            now = format_cover(published[q.family].cover(q.start, q.end), "no class")
+            size = format_size(q.family, q.size).replace(" addresses", "")
+            lines.append(f"| `{format_block(q.family, q.start, q.end)}` | {size} | {now} "
+                         f"| {q.observed or 'no class'} | {q.seen} | {q.first} |")
+        lines.append("")
+    return lines
+
+
 def render_summary(region: dict, sources: dict, old: dict | None, new: dict,
                    budget: Budget, changes: list[Change] | None = None,
-                   describer: Describer | None = None) -> str:
+                   describer: Describer | None = None, refresh: Refresh | None = None) -> str:
     """The refresh in Markdown, for the pull request: what it was built from,
     what needs a look, how many addresses each class holds before and after,
-    and the largest blocks that change class."""
+    the largest blocks that change class, and what is held back."""
     ripe, v4, v6 = sources["ripe"], sources["iptoasn_v4"], sources["iptoasn_v6"]
     lines = [
         "### Built from",
@@ -1031,6 +1321,8 @@ def render_summary(region: dict, sources: dict, old: dict | None, new: dict,
         lines.append(f"| `{cls}` | " + " | ".join(cells) + " |")
     lines.append("")
     lines += render_changes(changes or [], describer)
+    if refresh is not None:
+        lines += render_memory(refresh, old, describer)
     return "\n".join(lines)
 
 
@@ -1054,6 +1346,12 @@ def main():
                         help='Write the table even if a class moved by more than '
                              f'{round(REFUSE_CLASS_SHARE * 100)} %% (default: refuse). For a refresh that '
                              'follows an edit of the curated ASN list.')
+    parser.add_argument('--state', default=None,
+                        help='The memory of the hysteresis (default: next to --output, '
+                             'data_<region>.pending.json). Read, then rewritten.')
+    parser.add_argument('--no-hysteresis', action='store_true',
+                        help='Publish this snapshot as it is and forget what was waiting. For '
+                             'a regeneration by hand after a change of the rules.')
     parser.add_argument('--report', default=None, help='Write what changed as JSON here.')
     parser.add_argument('--summary', default=None,
                         help='Write what changed as Markdown here (the pull request body).')
@@ -1104,15 +1402,48 @@ def main():
 
     v4 = build_family(role_v4, asn_to_class, ripe["v4"], region["baseline_class"])
     v6 = build_family(role_v6, asn_to_class, ripe["v6"], region["baseline_class"])
-    print(f'  Final: {len(v4)} v4 + {len(v6)} v6 non-overlapping ranges')
+    print(f'  Observed: {len(v4)} v4 + {len(v6)} v6 non-overlapping ranges')
 
     if not v4 and not v6:
         print('ERROR: no ranges produced', file=sys.stderr)
         sys.exit(EXIT_NO_RANGES)
 
-    new = {"v4": v4, "v6": v6}
+    observed = {"v4": v4, "v6": v6}
     previous = Path(args.previous or args.output)
     old = parse_rust_table(previous) if previous.exists() else None
+    state_path = Path(args.state) if args.state else Path(args.output).with_suffix(".pending.json")
+
+    # The published table follows the snapshots with a delay (see "Hysteresis").
+    # The first table of a region, and a regeneration by hand with
+    # --no-hysteresis, are the snapshot itself.
+    if old is None or args.no_hysteresis:
+        refresh = Refresh(observed, {"v4": [], "v6": []}, [], [], [])
+    else:
+        try:
+            last_curated, pending = load_state(state_path, args.region)
+        except (InputError, KeyError, ValueError) as e:
+            print(f'INPUT REFUSED: state file {state_path}: {e}', file=sys.stderr)
+            sys.exit(EXIT_INPUT)
+        curation = None
+        if last_curated is not None and last_curated != asn_to_class:
+            # ASNs removed from the list, or given another role, since the last
+            # refresh: what they announce today is re-labelled today. An ASN that
+            # was added waits like any other observation.
+            kept = {asn: asn_to_class[asn] for asn in last_curated if asn in asn_to_class}
+            build = lambda roles, f, table, base: build_family(
+                table, roles, base, region["baseline_class"])
+            curation = {
+                f: diff_family(build(last_curated, f, t, ripe[f]), build(kept, f, t, ripe[f]), f)
+                for f, t in (("v4", role_v4), ("v6", role_v6))}
+            print(f'  Curated list changed: {sum(len(c) for c in curation.values())} runs '
+                  f're-labelled at once')
+        refresh = settle(old, observed, pending, snapshot_date, curation)
+        print(f'  Hysteresis: {len(refresh.applied)} runs published after waiting, '
+              f'{sum(len(q) for q in refresh.pending.values())} waiting, '
+              f'{len(refresh.went_back)} went back')
+    new = refresh.table
+    v4, v6 = new["v4"], new["v6"]
+    print(f'  To publish: {len(v4)} v4 + {len(v6)} v6 ranges')
     describer = Describer(
         {"v4": load_origins(Path(args.iptoasn), "v4"), "v6": load_origins(Path(args.iptoasn6), "v6")},
         load_registry(Path(args.ripe)))
@@ -1138,12 +1469,17 @@ def main():
                 "announced_by": describer.announced_by(c),
                 "registered_in": describer.registered_in(c),
             } for c in changes],
+            "waiting": sum(len(q) for q in refresh.pending.values()),
+            "published_after_waiting": len(refresh.applied),
+            "went_back": len(refresh.went_back),
+            "relabelled_by_curation": len(refresh.curation),
             "needs_review": bool(budget.review or budget.refuse),
             "refused": refused,
         }, indent=2) + "\n")
     if args.summary:
-        Path(args.summary).write_text(
-            render_summary(region, sources, old, new, budget, changes, describer))
+        Path(args.summary).write_text(render_summary(
+            region, sources, old, new, budget, changes, describer,
+            refresh if old is not None else None))
 
     for line in budget.review:
         print(f'  REVIEW: {line}')
@@ -1160,7 +1496,8 @@ def main():
         print('\n--allow-over-budget set: writing it anyway.', file=sys.stderr)
 
     Path(args.output).write_text(generate_rust(v4, v6, region, snapshot_date))
-    print(f'  Written to {args.output}')
+    state_path.write_text(dump_state(args.region, snapshot_date, asn_to_class, refresh.pending))
+    print(f'  Written to {args.output} and {state_path}')
 
 
 if __name__ == '__main__':
