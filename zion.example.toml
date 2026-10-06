@@ -53,6 +53,13 @@ listen_https = "0.0.0.0:443"
 # enabled = true
 # log_classification = false   # also emit a per-request `sovereign` log line
 #
+# Your own word on an address, before the compiled-in tables (the most specific
+# prefix wins; read at boot and on reload; a list with a mistake is refused):
+# [sovereign.overrides]
+# "203.0.113.0/24"  = "residential_ita"
+# "203.0.113.64/26" = "datacenter_ita"
+# "2001:db8::/32"   = "unknown"
+#
 # Tag-driven enforcement (#150) — promotes the origin tag / mesh score
 # from a *signal* to an opt-in admission DENY. Off by default. The local
 # WAF / rate-limit / auth gates stay authoritative; this only adds a deny.

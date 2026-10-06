@@ -85,6 +85,10 @@ pub(crate) struct ResolvedAppConfig {
     /// `--features sovereign-aimp`.
     #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
     pub(crate) enforce: sovereign::EnforcePolicy,
+    /// Resolved `[sovereign.overrides]`: the operator's own CIDR → class
+    /// pairs, consulted before the compiled-in tables.
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    pub(crate) sovereign_overrides: sovereign::Overrides,
     /// Pre-parsed listen address for plain HTTP. `None` if the config
     /// string is malformed; the listener supervisor logs the parse error
     /// at reload time and keeps the previously-bound listener.
@@ -138,6 +142,8 @@ impl ResolvedAppConfig {
             dns_timeout_ms: crate::dns::DEFAULT_TIMEOUT_MS,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             enforce: sovereign::EnforcePolicy::default(),
+            #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+            sovereign_overrides: sovereign::Overrides::default(),
             listen_http: None,
             listen_https: None,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
@@ -359,6 +365,38 @@ impl ResolvedAppConfig {
             (sov.enabled, sov.log_classification)
         };
 
+        // `[sovereign.overrides]`. Validation has already refused a list with a
+        // bad CIDR or class, so an error here means the config reached this
+        // point unvalidated: run without overrides and say so.
+        #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+        let sovereign_overrides =
+            match sovereign::Overrides::from_config(&config.sovereign.overrides) {
+                Ok(overrides) => {
+                    if !overrides.is_empty() {
+                        logging::info(
+                            "sovereign",
+                            &format!(
+                                "{} address override(s) in force, consulted before the tables{}",
+                                overrides.len(),
+                                if config.sovereign.enabled {
+                                    ""
+                                } else {
+                                    " (no effect: [sovereign] enabled = false)"
+                                }
+                            ),
+                        );
+                    }
+                    overrides
+                }
+                Err(problems) => {
+                    logging::warn(
+                        "sovereign",
+                        &format!("[sovereign.overrides] ignored: {}", problems.join("; ")),
+                    );
+                    sovereign::Overrides::default()
+                }
+            };
+
         // Resolve the tag-driven enforcement policy (#150) and warn on any
         // deny label that matches no known IpClass — a typo would silently
         // never fire, which is exactly the failure an operator can't see.
@@ -453,6 +491,8 @@ impl ResolvedAppConfig {
             dns_timeout_ms: config.server.dns_timeout_ms,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             enforce,
+            #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+            sovereign_overrides,
             listen_http,
             listen_https,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]

@@ -245,7 +245,8 @@ async fn sovereign_class(
     {
         use crate::sovereign;
         if cfg.sovereign_enabled {
-            let ip_class = sovereign::classify(client_ip);
+            // The operator's own `[sovereign.overrides]` first, then the tables.
+            let ip_class = sovereign::classify_with(&cfg.sovereign_overrides, client_ip);
             sovereign::record_classification(ip_class);
             req.extensions_mut().insert(ip_class);
             // Tag-driven enforcement (#150): deny classes the operator

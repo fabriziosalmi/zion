@@ -2351,6 +2351,15 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     // to `0.0.0.0:9443` at boot, binding the gossip control plane to every
     // interface — a fat-fingered address would quietly expose it to the
     // internet. Fail validation instead of guessing a (world-open) default.
+    // `[sovereign.overrides]` decides the class of a client before the tables do.
+    // A CIDR that does not parse or a class that does not exist would be an
+    // override that silently does nothing: refuse the config, with every problem
+    // in the list.
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    if let Err(problems) = crate::sovereign::Overrides::from_config(&config.sovereign.overrides) {
+        errors.extend(problems);
+    }
+
     // The mesh accepts reputation claims that can get clients refused: only from
     // nodes the operator named. Without the list, anyone who reaches the UDP port
     // could mint a key and inject scores.
@@ -4221,6 +4230,52 @@ enabledd = true
         assert!(bad.contains("\"abcd\" is not a node id"), "{bad}");
         // a disabled mesh accepts nothing, so it needs no list
         assert!(!errs("enabled=false\n").contains("trusted_keys"));
+    }
+
+    /// `[sovereign.overrides]` is read as `"CIDR" = "class"`, and a list with a
+    /// CIDR or a class that is wrong is refused whole: an override that does
+    /// nothing in silence is worse than no override.
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    #[test]
+    fn sovereign_overrides_parse_and_are_validated() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n[sovereign]\nenabled=true\n";
+        let parse = |overrides: &str| -> ZionConfig {
+            toml::from_str(&format!("{base}[sovereign.overrides]\n{overrides}")).unwrap()
+        };
+        let good =
+            parse("\"203.0.113.0/24\" = \"residential_ita\"\n\"2001:db8::/32\" = \"unknown\"\n");
+        assert_eq!(good.sovereign.overrides.len(), 2);
+        assert_eq!(
+            good.sovereign.overrides["203.0.113.0/24"],
+            "residential_ita"
+        );
+        assert!(!semantic_errors(&good)
+            .join("\n")
+            .contains("sovereign.overrides"));
+
+        let bad = parse(
+            "\"203.0.113.9/24\" = \"residential_ita\"\n\"192.0.2.0/24\" = \"residental_ita\"\n",
+        );
+        let errs = semantic_errors(&bad).join("\n");
+        assert!(
+            errs.contains("sovereign.overrides \"203.0.113.9/24\": has bits set beyond the /24"),
+            "{errs}"
+        );
+        assert!(
+            errs.contains("\"residental_ita\" is not a class of this build"),
+            "{errs}"
+        );
+
+        // No table at all: nothing to say.
+        let none: ZionConfig = toml::from_str(base).unwrap();
+        assert!(none.sovereign.overrides.is_empty());
+        // A key that is not `overrides` is still refused by the section.
+        assert!(toml::from_str::<ZionConfig>(&format!(
+            "{base}[sovereign.override]\n\"203.0.113.0/24\" = \"unknown\"\n"
+        ))
+        .is_err());
     }
 
     #[cfg(feature = "sovereign-aimp")]

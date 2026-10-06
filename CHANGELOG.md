@@ -6,6 +6,7 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **`[sovereign.overrides]`: your own class for an address or a range** (#568). The address tables are compiled in, so a row that was wrong for you needed a rebuild. A CIDR and a class in the config are now consulted before the tables, the most specific prefix first, in IPv4 and IPv6; `unknown` takes a range out of the tables. The list is read at boot and on reload. One with a mistake (a CIDR with bits set beyond its prefix, a class this build does not have, the same network twice) is refused whole with every problem named, and on reload the previous list stays in force.
 - **A build with the address tables says how old they are** (#568). The tables behind `[sovereign]` are compiled in, and nothing on a running machine said which week they were from. The boot line now names the day of each table's last snapshot (`address tables: ita 2026-10-06, eu 2026-10-06`), a table more than 45 days old is a warning at boot, and `/metrics` carries `zion_sovereign_data_snapshot_timestamp_seconds{region}`, so `(time() - …) / 86400 > 45` can alert on it. The Grafana dashboard has a panel for it. Only on builds with `geo-ita` or `geo-eu`.
 
 ### Changed

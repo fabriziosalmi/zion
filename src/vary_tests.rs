@@ -4565,3 +4565,66 @@ async fn a_finished_fetch_removes_its_own_registration_and_not_its_successors() 
         "a fetch that stored nothing closes the channel"
     );
 }
+
+// ── [sovereign.overrides]: the gate asks the operator's list first ──────────
+
+/// The class that `[sovereign.enforce]` acts on is the operator's override when
+/// there is one, in both directions: an address the tables do not know is denied
+/// because the operator calls it a datacenter, and an address the tables call
+/// `gov_ita` passes because the operator calls it `unknown`.
+#[cfg(feature = "geo-ita")]
+#[tokio::test]
+async fn the_sovereign_gate_consults_the_operator_overrides_first() {
+    let (port, _) = named_origin("A").await;
+    let state = |overrides: &str| {
+        let toml = format!(
+            r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[sovereign]
+enabled = true
+[sovereign.enforce]
+enabled = true
+deny = ["datacenter_ita", "gov_ita"]
+{overrides}
+[upstreams]
+a = "http://127.0.0.1:{port}"
+[[route]]
+path = "/{{*rest}}"
+upstream = "a"
+"#
+        );
+        AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).unwrap())
+    };
+    let status = |st: Arc<AppState>, peer: &'static str| async move {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/page")
+            .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+            .unwrap();
+        let peer: SocketAddr = format!("{peer}:40000").parse().unwrap();
+        process_request(req, st, peer, false)
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    };
+
+    // The tables alone: 198.51.100.0/24 is documentation space (unknown), GARR is gov_ita.
+    let plain = state("");
+    assert_eq!(status(plain.clone(), "198.51.100.7").await, 200);
+    assert_eq!(status(plain.clone(), "193.205.0.1").await, 403);
+
+    let st = state(
+        "[sovereign.overrides]\n\"198.51.100.0/24\" = \"datacenter_ita\"\n\"193.205.0.0/24\" = \"unknown\"\n",
+    );
+    assert_eq!(status(st.clone(), "198.51.100.7").await, 403);
+    assert_eq!(status(st.clone(), "198.51.101.7").await, 200);
+    assert_eq!(status(st.clone(), "193.205.0.1").await, 200);
+    // One /24 further the table still answers.
+    assert_eq!(status(st.clone(), "193.205.1.1").await, 403);
+}
