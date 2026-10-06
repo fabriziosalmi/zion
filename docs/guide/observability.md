@@ -92,6 +92,23 @@ stats + IPtoASN). The `eu` class is the EU-27 country-level
 baseline; `gov_eu` / `residential_eu` / `datacenter_eu` are the more
 specific curated-ASN roles that override it.
 
+**How old the tables are.** They are compiled in, so a binary classifies with
+the address space of the day it was built for as long as it runs. Each table
+carries the day of its last snapshot:
+
+```text
+zion_sovereign_data_snapshot_timestamp_seconds{region="ita"} 1791244800
+zion_sovereign_data_snapshot_timestamp_seconds{region="eu"}  1791244800
+```
+
+The same days are in the boot line (`address tables: ita 2026-10-06, eu
+2026-10-06`), and a table older than 45 days is a `WARN` at boot. To alert on
+it:
+
+```text
+(time() - zion_sovereign_data_snapshot_timestamp_seconds) / 86400 > 45
+```
+
 **Reading "% EU vs non-EU traffic"** — sum the EU-family classes over the
 grand total. In PromQL:
 

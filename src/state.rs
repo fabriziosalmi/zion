@@ -330,13 +330,31 @@ impl ResolvedAppConfig {
                 } else {
                     "ita"
                 };
+                let tables = sovereign::snapshots()
+                    .iter()
+                    .map(|(region, date)| format!("{region} {date}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 logging::info(
                     "sovereign",
                     &format!(
-                        "Sovereign Edge active (region={}, log_classification={})",
-                        region_label, sov.log_classification
+                        "Sovereign Edge active (region={}, log_classification={}, address tables: {})",
+                        region_label, sov.log_classification, tables
                     ),
                 );
+                // The tables are compiled in: a binary that keeps running keeps
+                // classifying with the address space of the day it was built.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                for (region, date, age) in sovereign::stale_tables(now) {
+                    logging::warn(
+                        "sovereign",
+                        &format!(
+                            "the {region} address table is {age} days old (snapshot of {date}): address space is reallocated every week, so clients are classified with stale data. Rebuild from a newer release",
+                        ),
+                    );
+                }
             }
             (sov.enabled, sov.log_classification)
         };

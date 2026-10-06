@@ -120,6 +120,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake pkg-config build-essential libssl-dev
       - run: cargo test --locked ${{ matrix.features }} --no-fail-fast
+      # The address tables are behind the geo-* features, so the default run
+      # compiles none of them. Their tests (structure, one pinned address per
+      # curated ASN, floors, data age) run here too, not only with all features.
+      - name: Sovereign tables (geo-eu)
+        if: matrix.flavor == 'default'
+        run: cargo test --locked --features geo-eu sovereign
 
   # ── 4. Tests across host OS (smoke matrix — catches Win/Mac drift early). ─
   test-os:
