@@ -4,10 +4,19 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
-### Added
+## [0.9.13] - 2026-10-06
 
-- **`[sovereign.overrides]`: your own class for an address or a range** (#568). The address tables are compiled in, so a row that was wrong for you needed a rebuild. A CIDR and a class in the config are now consulted before the tables, the most specific prefix first, in IPv4 and IPv6; `unknown` takes a range out of the tables. The list is read at boot and on reload. One with a mistake (a CIDR with bits set beyond its prefix, a class this build does not have, the same network twice) is refused whole with every problem named, and on reload the previous list stays in force.
-- **A build with the address tables says how old they are** (#568). The tables behind `[sovereign]` are compiled in, and nothing on a running machine said which week they were from. The boot line now names the day of each table's last snapshot (`address tables: ita 2026-10-06, eu 2026-10-06`), a table more than 45 days old is a warning at boot, and `/metrics` carries `zion_sovereign_data_snapshot_timestamp_seconds{region}`, so `(time() - …) / 86400 > 45` can alert on it. The Grafana dashboard has a panel for it. Only on builds with `geo-ita` or `geo-eu`.
+**The Italian and EU address tables (`geo-ita`, `geo-eu`): what a class means changed, and so did how the tables are kept.** The official binaries and the container are built without them, so if you run those this release brings you one fix (a full `Vary` index, below). If you build with a `geo-*` feature, read the upgrade notes: two classes answer differently.
+
+### Upgrade notes
+
+- **If you do not build with `geo-ita` or `geo-eu`: nothing to do.**
+- **A role class now needs a registration in the region, not only a curated ASN.** `datacenter_ita` holds 1.3 million IPv4 addresses where it held 9.2 million: what a curated hoster announces from space registered outside Italy is no longer Italian. `datacenter_eu` loses 17 % of its IPv4 and 81 % of its IPv6 (space registered outside the EU-27, most of it in the Seychelles); `residential_eu` loses 0.25 %, `gov_eu` 0.05 %. What leaves is `datacenter_eu` when it is registered in a member state and `unknown` otherwise. **If you deny, allow or count a datacenter class, check your rules and dashboards against this.** `gov_ita`, `residential_ita` and `eu` do not change.
+- **The tables follow the weekly snapshots with a delay.** A range enters a class after 2 weekly snapshots that agree and leaves or changes after 3. New address space is classified a week later than before, and a range that really left keeps its class for two more weeks. Ranges that were announced on and off no longer flip.
+- **`[sovereign.overrides]` is new**: your own class for a CIDR, read before the tables, at boot and on reload. If a row is wrong for you, this corrects it without a rebuild.
+- **A build now says how old its tables are**: in the boot line, with a warning past 45 days, and as `zion_sovereign_data_snapshot_timestamp_seconds{region}`. A long-running binary will start warning; rebuild from a newer release to refresh the tables.
+- **The embedded tables are the 2026-10-06 snapshot.** Wind Tre's second ASN (AS24608) is curated from this release, and its 533,504 addresses not yet in the table enter with a later refresh, as any new observation does.
+- No setting was removed.
 
 ### Changed
 
@@ -21,6 +30,11 @@ All notable changes to Zion Edge Gateway are documented here.
 ### Fixed
 
 - **With the `Vary` index full, every new varying URL cost a scan of the whole index** (#526). The index of "this URL's responses vary on these headers" is bounded like the cache. Once it was full, each cache miss on a new URL of a route that sends `Vary` swept every rule looking for expired ones (locking every part of the index), found them still alive, and was refused a place anyway: work in proportion to the index, for a request whose URL the client chooses. With 10,000 rules that was 20 µs per such miss, with a million 10 ms. A full index is now swept only when a rule can have expired and not more than once a second; in between, the refusal costs 0.2 µs whatever the size.
+
+### Added
+
+- **`[sovereign.overrides]`: your own class for an address or a range** (#568). The address tables are compiled in, so a row that was wrong for you needed a rebuild. A CIDR and a class in the config are now consulted before the tables, the most specific prefix first, in IPv4 and IPv6; `unknown` takes a range out of the tables. The list is read at boot and on reload. One with a mistake (a CIDR with bits set beyond its prefix, a class this build does not have, the same network twice) is refused whole with every problem named, and on reload the previous list stays in force.
+- **A build with the address tables says how old they are** (#568). The tables behind `[sovereign]` are compiled in, and nothing on a running machine said which week they were from. The boot line now names the day of each table's last snapshot (`address tables: ita 2026-10-06, eu 2026-10-06`), a table more than 45 days old is a warning at boot, and `/metrics` carries `zion_sovereign_data_snapshot_timestamp_seconds{region}`, so `(time() - …) / 86400 > 45` can alert on it. The Grafana dashboard has a panel for it. Only on builds with `geo-ita` or `geo-eu`.
 
 ## [0.9.12] - 2026-10-05
 
