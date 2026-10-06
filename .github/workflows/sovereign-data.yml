@@ -202,6 +202,14 @@ jobs:
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+        # A second run on the same day finds the branch of the first. Pushing
+        # over it would be refused, and a second refresh for one day adds
+        # nothing (the memory counts runs less than 5 days apart as one).
+        if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null; then
+          echo "::notice title=Refresh already opened today::The branch $BRANCH exists: today's ${{ matrix.region }} refresh was already opened. Nothing pushed."
+          exit 0
+        fi
+
         git checkout -b "$BRANCH"
         git add ${{ matrix.output }} ${{ matrix.state }}
         # -s is required: dco.yml gates every pull_request to master on a
@@ -214,11 +222,17 @@ jobs:
 
         git push origin "$BRANCH"
 
+        # Refreshes of this region that are still open were never merged, and
+        # what they observed was never recorded. The new one says so at the top
+        # and, once it exists, the older ones are closed in its favour.
+        scripts/supersede_refresh_prs.sh list ${{ matrix.region }} "$BRANCH" > "$RUNNER_TEMP/older.md"
+
         # The body is what the generator measured: the sources and their dates,
         # what needs a look, addresses per class before and after.
         {
           echo "Automated weekly refresh of the ${{ matrix.adjective }} table."
           echo
+          cat "$RUNNER_TEMP/older.md"
           cat "$RUNNER_TEMP/summary.md"
           echo
           echo "### Checked before this PR opened"
@@ -234,17 +248,17 @@ jobs:
         # A refresh that moves a class by more than 2 %, or a /18 (IPv6: a /32)
         # in or out of a role class, opens as a DRAFT: marking it ready is the
         # act of having looked at the list at the top of the body.
+        create=(--title "data(sovereign): weekly ${{ matrix.adjective }} CIDR refresh ($(date +%Y-%m-%d))"
+                --body-file "$RUNNER_TEMP/body.md")
         if [ "${{ steps.generate.outputs.needs_review }}" = "true" ]; then
-          gh pr create --draft \
-            --title "data(sovereign): weekly ${{ matrix.adjective }} CIDR refresh ($(date +%Y-%m-%d))" \
-            --body-file "$RUNNER_TEMP/body.md" \
-            --label "sovereign-data,automated,sovereign-review"
+          create+=(--draft --label "sovereign-data,automated,sovereign-review")
         else
-          gh pr create \
-            --title "data(sovereign): weekly ${{ matrix.adjective }} CIDR refresh ($(date +%Y-%m-%d))" \
-            --body-file "$RUNNER_TEMP/body.md" \
-            --label "sovereign-data,automated"
+          create+=(--label "sovereign-data,automated")
         fi
+        url="$(gh pr create "${create[@]}")"
+        echo "$url"
+
+        scripts/supersede_refresh_prs.sh close ${{ matrix.region }} "$BRANCH" "$url"
       env:
         # Dedicated PAT, not GITHUB_TOKEN: repo-wide policy blocks Actions from
         # creating pull requests, and the narrow fix is a token scoped to this

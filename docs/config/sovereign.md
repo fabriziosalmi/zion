@@ -159,6 +159,12 @@ What has been observed and is not yet published is kept in
 refresh PR shows it in its diff, and its body lists the largest runs that are
 waiting (`1 of 3`, `2 of 3`) and the ones that went back.
 
+That memory advances only when a refresh PR is **merged**. One left open is a
+week of sightings that was never recorded. The next refresh says so at the top
+of its body, counts from what is on master, and closes the older PR of the
+same region with a comment (`scripts/supersede_refresh_prs.sh`); branches are
+left in place.
+
 What this costs: a new allocation or a new announcement is classified one
 week late, and a range that really left keeps its class for two more weeks.
 With `[sovereign.enforce] deny = ["unknown"]` that is the safer direction (a
