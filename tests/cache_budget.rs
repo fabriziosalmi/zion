@@ -3,7 +3,7 @@
 //!
 //! The cache was bounded by entry count (10,000 by default) and by object size (50 MiB),
 //! not by bytes: a client asking for distinct URLs of a cached route could make it hold
-//! entries x object size. `[server] cache_max_memory_mb` bounds the total. Here 200
+//! entries x object size. `[server] cache_max_memory_mb` bounds the total. Here 600
 //! distinct 1 MiB responses are requested through a cache with a 16 MiB budget: the cache
 //! stays within it, by its own count and by the memory of the process, and it still serves
 //! hits.
@@ -22,8 +22,26 @@ use common::{free_port, process_memory_mib};
 
 const MIB: usize = 1024 * 1024;
 const BUDGET_MIB: u64 = 16;
-/// Distinct 1 MiB objects requested.
-const OBJECTS: usize = 200;
+/// Distinct 1 MiB objects requested. Enough that a cache with no budget and one with a
+/// budget end far apart on any allocator (see `MAX_GROWTH_MIB`).
+const OBJECTS: usize = 600;
+/// What the process may grow by while `OBJECTS` MiB go through a 16 MiB cache.
+///
+/// Measured (debug build, 2026-10-06), growth after 600 MiB of cacheable responses:
+///
+/// |                     | Linux (glibc)   | macOS       |
+/// |---------------------|-----------------|-------------|
+/// | 16 MiB budget       | 94 to 125 MiB   | 88 to 90    |
+/// | no budget           | 1,213 to 1,271  | 644 to 652  |
+///
+/// With the budget the growth does not follow what is offered: 200, 400, 800 and 1,600
+/// MiB all end between 96 and 131 MiB on Linux. Most of it is the allocator keeping what
+/// the churn freed, and it differs by platform and by run. The bound is therefore set
+/// between the two rows with room on both sides (more than twice the highest budgeted
+/// run, less than half the lowest unbudgeted one), not next to one platform's number:
+/// the first version said 110 MiB after 200 objects, measured on macOS, and failed four
+/// runs in ten on Linux.
+const MAX_GROWTH_MIB: u64 = 300;
 
 struct Zion {
     child: Child,
@@ -205,7 +223,7 @@ fn the_cache_stays_within_its_memory_budget_and_still_serves_hits() {
     };
     let before = process_memory_mib(zion.child.id());
 
-    // 200 distinct objects of 1 MiB: 200 MiB offered to a 16 MiB cache.
+    // 600 distinct objects of 1 MiB: 600 MiB offered to a 16 MiB cache.
     for n in 0..OBJECTS {
         let (status, cache, size) = get(&zion, &format!("/obj/{n}"));
         assert_eq!((status, size), (200, MIB), "object {n}");
@@ -238,10 +256,10 @@ fn the_cache_stays_within_its_memory_budget_and_still_serves_hits() {
     eprintln!(
         "memory: {before} MiB before, {after} MiB after {OBJECTS} MiB of cacheable responses"
     );
-    // Measured: about 55 MiB of growth with the budget, over 200 without it.
     assert!(
-        after.saturating_sub(before) < 110,
-        "the process grew by {} MiB ({before} -> {after}) with a {BUDGET_MIB} MiB cache budget",
+        after.saturating_sub(before) < MAX_GROWTH_MIB,
+        "the process grew by {} MiB ({before} -> {after}) with a {BUDGET_MIB} MiB cache budget \
+         and {OBJECTS} MiB offered: it must stay under {MAX_GROWTH_MIB}",
         after.saturating_sub(before)
     );
 
