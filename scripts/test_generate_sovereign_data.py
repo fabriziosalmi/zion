@@ -93,6 +93,164 @@ def test_accent_and_legal_form_are_normalized():
     assert gsd._tokens("Aruba S.p.A.") == {"aruba"}
 
 
+# ── Lookups that fail, and ASNs registered in the wrong country ──────────────
+
+@contextlib.contextmanager
+def ripestat(answers):
+    """Replace the live lookup: `answers[asn]` is a list consumed one item per
+    attempt, each a holder name or an exception. Yields (attempts, waits)."""
+    attempts, waits = [], []
+
+    def holder(asn, timeout=15):
+        attempts.append(asn)
+        got = answers[asn].pop(0) if len(answers[asn]) > 1 else answers[asn][0]
+        if isinstance(got, Exception):
+            raise got
+        return got
+
+    saved = gsd.time.sleep
+    gsd.time.sleep = waits.append
+    try:
+        with patched(fetch_holder=holder):
+            yield attempts, waits
+    finally:
+        gsd.time.sleep = saved
+
+
+def outcome(fn, *args, **kwargs):
+    """(exit code or None, stderr) of a call that may sys.exit."""
+    err = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+        try:
+            fn(*args, **kwargs)
+        except SystemExit as e:
+            return e.code, err.getvalue()
+    return None, err.getvalue()
+
+
+def test_a_lookup_is_tried_again_before_it_counts_as_failed():
+    down = TimeoutError("timed out")
+    with ripestat({1: ["Example"]}) as (attempts, waits):
+        assert gsd.fetch_holder_patiently(1) == "Example" and attempts == [1] and waits == []
+    with ripestat({1: [down, down, "Example"]}) as (attempts, waits), \
+            contextlib.redirect_stderr(io.StringIO()) as err:
+        assert gsd.fetch_holder_patiently(1) == "Example"
+        assert attempts == [1, 1, 1] and waits == [2, 6]
+        assert "AS1: lookup failed (TimeoutError), trying again in 2 s" in err.getvalue()
+    with ripestat({1: [down]}) as (attempts, waits), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            gsd.fetch_holder_patiently(1)
+            raise AssertionError("four failures must raise")
+        except TimeoutError:
+            pass
+        assert attempts == [1, 1, 1, 1] and waits == [2, 6, 20]
+
+
+def test_an_unreachable_lookup_is_not_called_a_drift():
+    wanted = {64496: "Example", 64497: "Example"}
+    down = TimeoutError("timed out")
+    # One ASN answers after two failures, the other answers at once: no problem at all.
+    with ripestat({64496: [down, down, "EXAMPLE-AS Example Org"], 64497: ["Example Ltd"]}):
+        code, err = outcome(gsd.validate_holders, wanted)
+        assert code is None and "DRIFT" not in err and "LOOKUP FAILED" not in err
+    # RIPEstat down for one ASN: its own exit code, and no talk of fixing the list.
+    with ripestat({64496: [down], 64497: ["Example Ltd"]}):
+        code, err = outcome(gsd.validate_holders, wanted)
+        assert code == gsd.EXIT_LOOKUP == 5
+        assert "HOLDER LOOKUP FAILED" in err and "HOLDER DRIFT" not in err
+        assert "AS64496   (Example): TimeoutError: timed out" in err
+        assert "tried 4 times. This is not a drift" in err
+    # A real drift: exit 2, as before.
+    with ripestat({64496: ["Somebody Else"], 64497: ["Example Ltd"]}):
+        code, err = outcome(gsd.validate_holders, wanted)
+        assert code == gsd.EXIT_HOLDER_DRIFT == 2
+        assert "HOLDER DRIFT" in err and "LOOKUP FAILED" not in err
+    # Both at once: the drift decides the exit code, and both are listed.
+    with ripestat({64496: ["Somebody Else"], 64497: [down]}):
+        code, err = outcome(gsd.validate_holders, wanted)
+        assert code == gsd.EXIT_HOLDER_DRIFT and "HOLDER DRIFT" in err and "LOOKUP FAILED" in err
+    # --allow-drift carries on, and names what it carried.
+    with ripestat({64496: ["Somebody Else"], 64497: [down]}), \
+            contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        assert gsd.validate_holders(wanted, allow_drift=True) == {64496, 64497}
+
+
+def test_the_country_of_each_asn_is_read_from_the_bgp_table():
+    with workdir() as d:
+        (d / "v4").write_text("192.0.2.0\t192.0.2.255\t64496\tIT\tExample\n"
+                              "192.0.3.0\t192.0.3.255\t0\tNone\tNot routed\n"
+                              "198.51.100.0\t198.51.100.255\t64497\tFR\tOther\n"
+                              "short\n")
+        (d / "v6").write_text("2001:db8::\t2001:db8::ffff\t64498\tDE\tThird\n")
+        assert gsd.asn_countries([d / "v4", d / "v6"]) == {64496: "IT", 64497: "FR", 64498: "DE"}
+
+
+def test_a_curated_asn_registered_elsewhere_is_a_drift():
+    ita = {"asn_countries": {"IT"}, "asn_country_exceptions": {16276: "FR"}}
+    wanted = {137: "GARR", 3215: "Orange", 16276: "OVH", 99: "Silent"}
+    # GARR in Italy and OVH in France are as curated; AS99 announces nothing.
+    assert gsd.misplaced_asns(wanted, {137: "IT", 16276: "FR", 3215: "IT"}, ita) == []
+    # The name still says Orange, the registry says Mali.
+    assert gsd.misplaced_asns(wanted, {137: "IT", 16276: "FR", 3215: "ML"}, ita) == [
+        (3215, "Orange", "registered in ML, expected IT")]
+    # The exception names one country, not "anything foreign".
+    assert gsd.misplaced_asns(wanted, {16276: "DE"}, ita) == [
+        (16276, "OVH", "registered in DE, expected FR")]
+    eu = {"asn_countries": gsd.EU27, "asn_country_exceptions": {}}
+    assert gsd.misplaced_asns(wanted, {137: "IT", 3215: "FR", 16276: "FR"}, eu) == []
+    assert gsd.misplaced_asns(wanted, {3215: "GB"}, eu) == [
+        (3215, "Orange", "registered in GB, expected an EU-27 country")]
+    # A region that names no country checks none.
+    assert gsd.misplaced_asns(wanted, {3215: "ML"}, {}) == []
+    # It stops the refresh as a drift does.
+    with ripestat({a: [n] for a, n in wanted.items()}):
+        code, err = outcome(gsd.validate_holders, wanted,
+                            misplaced=gsd.misplaced_asns(wanted, {3215: "ML"}, ita))
+        assert code == gsd.EXIT_HOLDER_DRIFT
+        assert "AS3215    expected ~ 'Orange'   →   registered in ML, expected IT" in err
+
+
+def test_the_real_lists_expect_the_countries_they_are_made_of():
+    assert gsd.REGIONS["ita"]["asn_countries"] == {"IT"}
+    assert gsd.REGIONS["ita"]["asn_country_exceptions"] == {16276: "FR", 24940: "DE"}
+    assert gsd.REGIONS["eu"]["asn_countries"] == gsd.EU27
+    # Every exception is an ASN on the list.
+    for region in gsd.REGIONS.values():
+        curated = {asn for asns, _ in region["asn_roles"] for asn in asns}
+        assert set(region["asn_country_exceptions"]) <= curated
+
+
+def test_coverage_counts_what_the_curated_list_leaves_out():
+    # Registered at home: 0-999 and 2000-2999. Abroad: 1000-1999.
+    registry = gsd.SpanIndex([(0, 999, "IT"), (1000, 1999, "FR"), (2000, 2999, "IT")])
+    origins = gsd.SpanIndex([
+        (0, 499, "AS1 CURATED (IT)"),
+        (500, 1499, "AS2 BIG-STRANGER (IT)"),     # 500 at home, 500 abroad
+        (2000, 2099, "AS3 SMALL-STRANGER (IT)"),
+        (2100, 2199, "AS1 CURATED (IT)"),
+        (2500, 2799, "AS4 MID-STRANGER (NL)"),
+    ])
+    c = gsd.curated_coverage(origins, registry, {"IT"}, {1})
+    assert (c.curated, c.announced) == (600, 1500)
+    assert c.missing == [("AS2 BIG-STRANGER (IT)", 500), ("AS4 MID-STRANGER (NL)", 300),
+                         ("AS3 SMALL-STRANGER (IT)", 100)]
+    assert gsd.curated_coverage(origins, registry, {"IT"}, {1}, keep=1).missing == [
+        ("AS2 BIG-STRANGER (IT)", 500)]
+    # Another country, another answer; and a country with nothing announced.
+    assert gsd.curated_coverage(origins, registry, {"FR"}, {1}).announced == 500
+    empty = gsd.curated_coverage(origins, registry, {"ES"}, {1})
+    assert (empty.curated, empty.announced, empty.missing) == (0, 0, [])
+    assert gsd.render_coverage(gsd.REGIONS["ita"], empty) == []
+
+    lines = gsd.render_coverage(gsd.REGIONS["ita"], c)
+    assert lines[0] == "### What the curated ASN list leaves out"
+    assert lines[2] == ("Of the announced IPv4 addresses registered in the region, 40% are "
+                        "originated by a curated ASN (600 of 1,500). The rest is not in the "
+                        "table. The largest origins that are not on the list:")
+    assert "| AS2 BIG-STRANGER (IT) | 500 |" in lines
+    assert "The rest is `Eu`, with no role." in gsd.render_coverage(gsd.REGIONS["eu"], c)[2]
+
+
 # ── Fixtures for the source files ────────────────────────────────────────────
 
 V4, V6 = ipaddress.IPv4Address, ipaddress.IPv6Address
@@ -1047,15 +1205,19 @@ def write_sources(d, ripe=None, v4=None, v6=None, day="2026-10-05"):
     (d / "v6").write_text(iptoasn_text(v6 or v6_rows(), V6))
 
 
-def run_generator(d, *extra, write=True, day="2026-10-05", region=None, **sources):
-    """Run main() on fixture files in `d`. Returns (exit code, stderr, lookups)."""
+def run_generator(d, *extra, write=True, day="2026-10-05", region=None, answer=None, **sources):
+    """Run main() on fixture files in `d`. Returns (exit code, stderr, lookups).
+    `answer(asn)` stands in for RIPEstat: a holder name, or an exception to raise."""
     if write:
         write_sources(d, day=day, **sources)
     lookups = []
 
     def holder(asn, timeout=15):
         lookups.append(asn)
-        return "EXAMPLE-AS Example Org"
+        got = answer(asn) if answer else "EXAMPLE-AS Example Org"
+        if isinstance(got, Exception):
+            raise got
+        return got
 
     argv = ["gen", "--region", "ita", "--ripe", str(d / "ripe"), "--iptoasn", str(d / "v4"),
             "--iptoasn6", str(d / "v6"), "--snapshot-date", day, *extra]
@@ -1252,6 +1414,34 @@ def test_a_class_confined_to_a_country_drops_what_is_outside_at_once():
         assert [(str(V4(r.start)), r.ip_class) for r in gsd.parse_rust_table(out)["v4"]] == [
             ("192.0.2.0", "GovIta")]
         assert json.loads(state.read_text())["pending"] == []
+
+
+def test_generator_tells_an_unreachable_lookup_from_a_drift_and_checks_countries():
+    with workdir() as d:
+        out, summ = d / "data.rs", d / "summary.md"
+        # RIPEstat down for one ASN: exit 5, nothing written.
+        code, err, lookups = run_generator(
+            d, "--output", str(out),
+            answer=lambda asn: TimeoutError("timed out") if asn == 64497 else "Example Org")
+        assert code == gsd.EXIT_LOOKUP and "HOLDER LOOKUP FAILED" in err and not out.exists()
+        assert lookups == [64496] + [64497] * 4
+        # The fixture's ASNs are registered in "ZZ": a region that expects Italy refuses them.
+        strict = dict(TEST_REGION, asn_countries={"IT"}, asn_country_exceptions={64497: "ZZ"})
+        code, err, _ = run_generator(d, "--output", str(out), region=strict)
+        assert code == gsd.EXIT_HOLDER_DRIFT and not out.exists()
+        assert "AS64496   expected ~ 'Example'   →   registered in ZZ, expected IT" in err
+        assert "AS64497" not in err  # the exception holds
+        # As curated, it runs, and the summary says what the list leaves out.
+        relaxed = dict(TEST_REGION, asn_countries={"ZZ"})
+        assert run_generator(d, "--output", str(out), "--summary", str(summ), region=relaxed)[0] == 0
+        text = summ.read_text()
+        assert "### What the curated ASN list leaves out" in text
+        assert "100% are originated by a curated ASN (256 of 256)" in text
+        # And on every later refresh, after the comparison with the table it replaces.
+        assert run_generator(d, "--output", str(out), "--summary", str(summ), region=relaxed)[0] == 0
+        text = summ.read_text()
+        assert text.index("### Italian addresses per class") < text.index(
+            "### What the curated ASN list leaves out")
 
 
 def test_a_damaged_state_file_stops_the_refresh():

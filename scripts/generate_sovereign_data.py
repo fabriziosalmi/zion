@@ -52,6 +52,7 @@ EXIT_NO_RANGES = 1
 EXIT_HOLDER_DRIFT = 2    # a curated ASN changed holder
 EXIT_OVER_BUDGET = 3     # the refresh moves a class by more than REFUSE_CLASS_SHARE
 EXIT_INPUT = 4           # a source file failed its integrity checks
+EXIT_LOOKUP = 5          # RIPEstat could not be reached: nothing is known to be wrong
 
 # ── Italian ASN classification ──────────────────────────────────
 #
@@ -149,6 +150,10 @@ REGIONS = {
         # rule, 85 % of the IPv4 addresses called `DatacenterIta` were
         # registered outside Italy.
         "registered_in": {"DatacenterIta": {"IT"}},
+        # Where the curated ASNs themselves are registered. OVH and Hetzner are
+        # the two foreign companies on the Italian list, each with its country.
+        "asn_countries": {"IT"},
+        "asn_country_exceptions": {16276: "FR", 24940: "DE"},
     },
     "eu": {
         "module": "data_eu",
@@ -160,6 +165,8 @@ REGIONS = {
             (RESIDENTIAL_EU_ASNS, "ResidentialEu"),
             (DATACENTER_EU_ASNS, "DatacenterEu"),
         ],
+        "asn_countries": EU27,
+        "asn_country_exceptions": {},
     },
 }
 
@@ -227,39 +234,107 @@ def fetch_holder(asn: int, timeout: int = 15) -> str:
         return json.load(r)["data"]["holder"]
 
 
+# Seconds to wait before the second, third and fourth attempt at one lookup.
+LOOKUP_BACKOFF = (2, 6, 20)
+
+
+def fetch_holder_patiently(asn: int) -> str:
+    """fetch_holder, tried again after a failure. RIPEstat times out now and
+    then, and one timeout among fifty lookups used to stop the whole refresh
+    under the name of a holder drift. Raises the last error when every attempt
+    failed."""
+    for wait in (*LOOKUP_BACKOFF, None):
+        try:
+            return fetch_holder(asn)
+        except Exception as e:  # noqa: BLE001 - any failure of the lookup is retried
+            if wait is None:
+                raise
+            # Said out loud: a refresh that takes minutes should show why.
+            print(f"  AS{asn}: lookup failed ({type(e).__name__}), trying again in {wait} s",
+                  file=sys.stderr)
+            time.sleep(wait)
+    raise AssertionError("unreachable")
+
+
+def asn_countries(paths: list[Path]) -> dict[int, str]:
+    """The country each ASN is registered in, as IPtoASN gives it on every row
+    the ASN originates (one country per ASN across both files)."""
+    out: dict[int, str] = {}
+    for path in paths:
+        with open(path, errors="replace") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 5 and parts[2] != "0":
+                    out.setdefault(int(parts[2]), parts[3])
+    return out
+
+
+def misplaced_asns(asn_to_expected: dict[int, str], registered: dict[int, str],
+                   region: dict) -> list[tuple[int, str, str]]:
+    """Curated ASNs registered in a country the list does not expect: `(ASN,
+    expected holder, what was found)`. The holder's name alone lets "Orange" in
+    Mali pass for Orange in France; the country does not. An ASN that announces
+    nothing has no country here and is reported elsewhere."""
+    out = []
+    for asn in sorted(asn_to_expected):
+        found = registered.get(asn)
+        if found is None:
+            continue
+        wanted = region.get("asn_country_exceptions", {}).get(asn)
+        allowed = {wanted} if wanted else region.get("asn_countries")
+        if allowed and found not in allowed:
+            out.append((asn, asn_to_expected[asn],
+                        f"registered in {safe_text(found, 2)}, expected "
+                        f"{' or '.join(sorted(allowed)) if len(allowed) < 4 else 'an EU-27 country'}"))
+    return out
+
+
 def validate_holders(asn_to_expected: dict[int, str], allow_drift: bool = False,
-                     sleep: float = 0.2) -> set[int]:
+                     sleep: float = 0.2,
+                     misplaced: list[tuple[int, str, str]] | None = None) -> set[int]:
     """GET each curated ASN's live holder, compare to the expected name, and
-    fail closed (exit 2) on any drift unless allow_drift. Returns drifted ASNs."""
-    drift = []
+    fail closed on any drift unless allow_drift (exit 2). `misplaced` adds the
+    ASNs found registered in the wrong country (see misplaced_asns) to the
+    drift. A lookup that fails after its retries is not a drift: nothing is
+    known to be wrong, and the refresh stops under its own name (exit 5).
+    Returns the ASNs that drifted or could not be looked up."""
+    drift = list(misplaced or [])
+    unreachable = []
     for asn in sorted(asn_to_expected):
         expected = asn_to_expected[asn]
         try:
-            live = fetch_holder(asn)
-        except Exception as e:  # a lookup failure is drift, never a silent pass
-            drift.append((asn, expected, f"<lookup failed: {e}>"))
+            live = fetch_holder_patiently(asn)
+        except Exception as e:  # noqa: BLE001 - reported below, never a silent pass
+            unreachable.append((asn, expected, f"{type(e).__name__}: {e}"))
             continue
         if not holder_matches(expected, live):
-            drift.append((asn, expected, live))
+            drift.append((asn, expected, f"live '{live}'"))
         time.sleep(sleep)
-    if not drift:
+    if not drift and not unreachable:
         print(f"  Holder validation: {len(asn_to_expected)} curated ASNs, 0 drift.")
         return set()
-    print("\nHOLDER DRIFT — a curated ASN no longer matches its live holder:",
-          file=sys.stderr)
-    for asn, expected, live in drift:
-        print(f"  AS{asn:<7} expected ~ '{expected}'   →   live '{live}'", file=sys.stderr)
-    print("\nFix each BY HAND in scripts/generate_sovereign_data.py:\n"
-          "  • legitimate reassignment, still sovereign → update the expected name;\n"
-          "  • reassigned to a non-sovereign/foreign holder → REMOVE the ASN.",
-          file=sys.stderr)
+    if drift:
+        print("\nHOLDER DRIFT — a curated ASN no longer matches what it was curated as:",
+              file=sys.stderr)
+        for asn, expected, found in sorted(drift):
+            print(f"  AS{asn:<7} expected ~ '{expected}'   →   {found}", file=sys.stderr)
+        print("\nFix each BY HAND in scripts/generate_sovereign_data.py:\n"
+              "  • legitimate reassignment, still sovereign → update the expected name;\n"
+              "  • reassigned to a non-sovereign/foreign holder → REMOVE the ASN.",
+              file=sys.stderr)
+    if unreachable:
+        print("\nHOLDER LOOKUP FAILED — RIPEstat did not answer for:", file=sys.stderr)
+        for asn, expected, why in unreachable:
+            print(f"  AS{asn:<7} ({expected}): {why}", file=sys.stderr)
+        print(f"\nEach was tried {len(LOOKUP_BACKOFF) + 1} times. This is not a drift: nothing "
+              "in the list needs fixing. Run the refresh again.", file=sys.stderr)
     if not allow_drift:
         print("\nRefusing to generate (fail-closed). Pass --allow-drift to override.",
               file=sys.stderr)
-        sys.exit(EXIT_HOLDER_DRIFT)
-    print("\n--allow-drift set: generating anyway (drifted ASNs are still emitted).",
+        sys.exit(EXIT_HOLDER_DRIFT if drift else EXIT_LOOKUP)
+    print("\n--allow-drift set: generating anyway (these ASNs are still emitted).",
           file=sys.stderr)
-    return {asn for asn, _, _ in drift}
+    return {asn for asn, _, _ in drift + unreachable}
 
 
 @dataclass
@@ -1295,6 +1370,56 @@ def _count(family: str, n: int) -> str:
     return f"{n:,}" if family == "v4" else f"{n / (1 << 80):,.0f} /48s"
 
 
+@dataclass
+class Coverage:
+    """How much of a region's announced IPv4 space the curated list accounts
+    for, and the largest origins it does not have."""
+    curated: int
+    announced: int
+    missing: list[tuple[str, int]]
+
+
+def curated_coverage(origins: SpanIndex, registry: SpanIndex, countries: set[str],
+                     curated: set[int], keep: int = 8) -> Coverage:
+    """Walk the IPv4 space registered in `countries` and add up, per origin
+    ASN, what is announced in it. A list goes stale without anyone touching it:
+    an operator moves its customers to a second ASN, a new one grows."""
+    per: dict[str, int] = {}
+    for start, end, cc in registry.spans:
+        if cc not in countries:
+            continue
+        for label, n in origins.cover(start, end).items():
+            if label is not None:
+                per[label] = per.get(label, 0) + n
+    asn_of = lambda label: int(label.split(" ", 1)[0][2:])
+    inside = sum(n for label, n in per.items() if asn_of(label) in curated)
+    missing = sorted(((label, n) for label, n in per.items() if asn_of(label) not in curated),
+                     key=lambda kv: (-kv[1], kv[0]))
+    return Coverage(inside, sum(per.values()), missing[:keep])
+
+
+def render_coverage(region: dict, coverage: Coverage) -> list[str]:
+    """The curated list against the region's announced space, as Markdown."""
+    if not coverage.announced:
+        return []
+    lines = [
+        "### What the curated ASN list leaves out",
+        "",
+        f"Of the announced IPv4 addresses registered in the region, "
+        f"{coverage.curated / coverage.announced:.0%} are originated by a curated ASN "
+        f"({coverage.curated:,} of {coverage.announced:,})."
+        + (f" The rest is `{region['baseline_class']}`, with no role."
+           if region["baseline_class"] else " The rest is not in the table.")
+        + " The largest origins that are not on the list:",
+        "",
+        "| Origin | IPv4 addresses registered in the region |",
+        "|---|---:|",
+    ]
+    lines += [f"| {label} | {n:,} |" for label, n in coverage.missing]
+    lines.append("")
+    return lines
+
+
 # How many changes the summary lists per family, largest first.
 SUMMARY_LARGEST = {"v4": 12, "v6": 8}
 
@@ -1393,7 +1518,8 @@ def render_memory(refresh: Refresh, old: dict, describer: Describer | None) -> l
 
 def render_summary(region: dict, sources: dict, old: dict | None, new: dict,
                    budget: Budget, changes: list[Change] | None = None,
-                   describer: Describer | None = None, refresh: Refresh | None = None) -> str:
+                   describer: Describer | None = None, refresh: Refresh | None = None,
+                   coverage: Coverage | None = None) -> str:
     """The refresh in Markdown, for the pull request: what it was built from,
     what needs a look, how many addresses each class holds before and after,
     the largest blocks that change class, and what is held back."""
@@ -1418,7 +1544,8 @@ def render_summary(region: dict, sources: dict, old: dict | None, new: dict,
         lines += ["### Needs a look before merging", ""]
         lines += [f"- {x}" for x in budget.review] + [""]
     if old is None:
-        return "\n".join(lines)
+        # A first table has nothing to be compared with.
+        return "\n".join(lines + (render_coverage(region, coverage) if coverage else []))
     lines += [
         f"### {region['adjective']} addresses per class",
         "",
@@ -1439,6 +1566,8 @@ def render_summary(region: dict, sources: dict, old: dict | None, new: dict,
     lines += render_changes(changes or [], describer)
     if refresh is not None:
         lines += render_memory(refresh, old, describer)
+    if coverage is not None:
+        lines += render_coverage(region, coverage)
     return "\n".join(lines)
 
 
@@ -1506,7 +1635,9 @@ def main():
     asn_to_expected = {asn: name for asns, _ in region["asn_roles"]
                        for asn, name in asns.items()}
     print(f'  Validating {len(asn_to_expected)} curated ASN holders against RIPEstat…')
-    validate_holders(asn_to_expected, allow_drift=args.allow_drift)
+    asn_cc = asn_countries([Path(args.iptoasn), Path(args.iptoasn6)])
+    validate_holders(asn_to_expected, allow_drift=args.allow_drift,
+                     misplaced=misplaced_asns(asn_to_expected, asn_cc, region))
 
     ripe = parse_ripe_delegated(Path(args.ripe), region["countries"])
     print(f'  RIPE: {len(ripe["v4"])} v4 + {len(ripe["v6"])} v6 allocations')
@@ -1610,9 +1741,11 @@ def main():
             "refused": refused,
         }, indent=2) + "\n")
     if args.summary:
+        coverage = curated_coverage(describer.origins["v4"], describer.registry["v4"],
+                                    region["countries"], set(asn_to_class))
         Path(args.summary).write_text(render_summary(
             region, sources, old, new, budget, changes, describer,
-            refresh if old is not None else None))
+            refresh if old is not None else None, coverage))
 
     for line in budget.review:
         print(f'  REVIEW: {line}')
