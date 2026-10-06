@@ -142,6 +142,13 @@ REGIONS = {
             (RESIDENTIAL_ASNS, "ResidentialIta"),
             (DATACENTER_ASNS, "DatacenterIta"),
         ],
+        # A class listed here needs more than a curated ASN: the range must also
+        # be registered (RIPE delegation) in one of these countries. OVH and
+        # Hetzner are curated as hosters that operate in Italy, and they
+        # announce space registered in France, Germany, Israel: before this
+        # rule, 85 % of the IPv4 addresses called `DatacenterIta` were
+        # registered outside Italy.
+        "registered_in": {"DatacenterIta": {"IT"}},
     },
     "eu": {
         "module": "data_eu",
@@ -567,16 +574,57 @@ def resolve_priority(ranges: list[Range]) -> list[Range]:
     return out
 
 
+def intersect(ranges: list[Range], allowed: list[Range]) -> list[Range]:
+    """The parts of `ranges` that lie inside `allowed`. Both are sorted and
+    non-overlapping; the pieces keep the class of the range they come from."""
+    out: list[Range] = []
+    ai = 0
+    for r in ranges:
+        while ai < len(allowed) and allowed[ai].end < r.start:
+            ai += 1
+        k = ai
+        while k < len(allowed) and allowed[k].start <= r.end:
+            out.append(Range(max(r.start, allowed[k].start), min(r.end, allowed[k].end),
+                             r.ip_class, r.priority))
+            k += 1
+    return out
+
+
+def outside(ranges: list[Range], allowed: list[Range]) -> list[Range]:
+    """The parts of `ranges` that lie outside `allowed`: what intersect() drops."""
+    out: list[Range] = []
+    ai = 0
+    for r in ranges:
+        at = r.start
+        while ai < len(allowed) and allowed[ai].end < at:
+            ai += 1
+        k = ai
+        while k < len(allowed) and allowed[k].start <= r.end:
+            if allowed[k].start > at:
+                out.append(Range(at, allowed[k].start - 1, r.ip_class, r.priority))
+            at = max(at, allowed[k].end + 1)
+            k += 1
+        if at <= r.end:
+            out.append(Range(at, r.end, r.ip_class, r.priority))
+    return out
+
+
 def build_family(role_by_asn: dict[int, list[Range]], asn_to_class: dict[int, str],
-                 baseline: list[Range], baseline_class: str | None) -> list[Range]:
+                 baseline: list[Range], baseline_class: str | None,
+                 registered: dict[str, list[Range]] | None = None) -> list[Range]:
     """Combine curated-ASN role ranges (priority) with the optional country
-    baseline into a sorted, non-overlapping set for one address family."""
+    baseline into a sorted, non-overlapping set for one address family.
+    `registered` maps a class to the address space it is confined to: what a
+    curated ASN announces outside it gets no role."""
     ranges: list[Range] = []
     for asn, rs in role_by_asn.items():
         cls = asn_to_class.get(asn)
         if cls:
-            for r in rs:
-                ranges.append(Range(r.start, r.end, cls, ROLE_PRIORITY))
+            mine = [Range(r.start, r.end, cls, ROLE_PRIORITY)
+                    for r in sorted(rs, key=lambda r: r.start)]
+            if registered and cls in registered:
+                mine = intersect(mine, registered[cls])
+            ranges += mine
     if baseline_class is not None:
         for r in baseline:
             ranges.append(Range(r.start, r.end, baseline_class, BASELINE_PRIORITY))
@@ -1044,6 +1092,22 @@ def dump_state(region: str, snapshot: str, curated: dict[int, str],
     return "\n".join(lines)
 
 
+def confine_family(published: list[Range], observed: list[Range],
+                   registered: dict[str, list[Range]], family: str) -> list[Change]:
+    """Published runs of a confined class that lie outside the space the class
+    is confined to, each with the class this snapshot gives those addresses.
+    No snapshot can observe them in that class again, so there is nothing to
+    wait for: they change at once. This is what applies a new `registered_in`
+    rule to a table built before it, and what follows a block that the registry
+    moves to another country."""
+    stray: list[Range] = []
+    for cls, allowed in registered.items():
+        stray += outside([r for r in published if r.ip_class == cls], allowed)
+    stray.sort(key=lambda r: r.start)
+    support = merge_same_class([Range(r.start, r.end, "") for r in stray])
+    return diff_family(stray, intersect(observed, support), family)
+
+
 @dataclass
 class Refresh:
     """What one snapshot does to a region: the table to publish and the memory
@@ -1226,7 +1290,8 @@ def render_memory(refresh: Refresh, old: dict, describer: Describer | None) -> l
     if refresh.applied or refresh.curation:
         lines += [
             f"{len(refresh.applied)} runs are published now after waiting their snapshots"
-            + (f"; {len(refresh.curation)} more at once, because the curated ASN list changed."
+            + (f"; {len(refresh.curation)} more at once: the curated ASN list changed, or a "
+               f"range is outside the countries its class is confined to."
                if refresh.curation else "."),
             "",
         ]
@@ -1400,15 +1465,26 @@ def main():
     print(f'  IPtoASN: {len(role_v4)} v4 ASNs + {len(role_v6)} v6 ASNs loaded; '
           f'{len(asn_to_class)} curated')
 
-    v4 = build_family(role_v4, asn_to_class, ripe["v4"], region["baseline_class"])
-    v6 = build_family(role_v6, asn_to_class, ripe["v6"], region["baseline_class"])
+    # Classes confined to the space registered in some countries (see REGIONS).
+    registered = {"v4": {}, "v6": {}}
+    for cls, countries in region.get("registered_in", {}).items():
+        space = parse_ripe_delegated(Path(args.ripe), countries)
+        for f in ("v4", "v6"):
+            registered[f][cls] = merge_same_class(space[f])
+
+    def observe(roles: dict[int, str]) -> dict[str, list[Range]]:
+        """The table this snapshot gives for a curated list."""
+        return {f: build_family(by_asn, roles, ripe[f], region["baseline_class"], registered[f])
+                for f, by_asn in (("v4", role_v4), ("v6", role_v6))}
+
+    observed = observe(asn_to_class)
+    v4, v6 = observed["v4"], observed["v6"]
     print(f'  Observed: {len(v4)} v4 + {len(v6)} v6 non-overlapping ranges')
 
     if not v4 and not v6:
         print('ERROR: no ranges produced', file=sys.stderr)
         sys.exit(EXIT_NO_RANGES)
 
-    observed = {"v4": v4, "v6": v6}
     previous = Path(args.previous or args.output)
     old = parse_rust_table(previous) if previous.exists() else None
     state_path = Path(args.state) if args.state else Path(args.output).with_suffix(".pending.json")
@@ -1430,14 +1506,20 @@ def main():
             # refresh: what they announce today is re-labelled today. An ASN that
             # was added waits like any other observation.
             kept = {asn: asn_to_class[asn] for asn in last_curated if asn in asn_to_class}
-            build = lambda roles, f, table, base: build_family(
-                table, roles, base, region["baseline_class"])
-            curation = {
-                f: diff_family(build(last_curated, f, t, ripe[f]), build(kept, f, t, ripe[f]), f)
-                for f, t in (("v4", role_v4), ("v6", role_v6))}
+            before, after = observe(last_curated), observe(kept)
+            curation = {f: diff_family(before[f], after[f], f) for f in ("v4", "v6")}
             print(f'  Curated list changed: {sum(len(c) for c in curation.values())} runs '
                   f're-labelled at once')
-        refresh = settle(old, observed, pending, snapshot_date, curation)
+        # A published range of a confined class outside its registered space
+        # does not wait either (see confine_family).
+        strays = {f: confine_family(old[f], observed[f], registered[f], f) for f in ("v4", "v6")}
+        if any(strays.values()):
+            print(f'  Outside their registered space: {sum(len(c) for c in strays.values())} '
+                  f'runs re-labelled at once')
+        base = {f: patch_family(old[f], strays[f]) for f in ("v4", "v6")}
+        pending = {f: without(pending[f], strays[f]) for f in ("v4", "v6")}
+        refresh = settle(base, observed, pending, snapshot_date, curation)
+        refresh.curation = [c for f in ("v4", "v6") for c in strays[f]] + refresh.curation
         print(f'  Hysteresis: {len(refresh.applied)} runs published after waiting, '
               f'{sum(len(q) for q in refresh.pending.values())} waiting, '
               f'{len(refresh.went_back)} went back')
