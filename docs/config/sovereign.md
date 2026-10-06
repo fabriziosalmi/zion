@@ -107,7 +107,11 @@ one it replaces:
 | A curated ASN originates no IPv4 range | same: draft PR |
 
 The PR body is written by the generator (`--summary`): the sources and their
-dates, what needs a look, and the addresses each class holds before and after.
+dates, what needs a look, the addresses each class holds before and after, and
+the largest blocks that change class. Each block comes with the ASN that
+announces it in this snapshot and the country RIPE has it registered in, so a
+block that "leaves" a class because another ASN of the same operator now
+announces it reads differently from one that is no longer announced at all.
 
 The thresholds were set on the nine weekly tables from 2026-08-12 to
 2026-10-05. The block rule singles out the changes that were later found wrong

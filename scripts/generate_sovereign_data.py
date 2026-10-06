@@ -33,6 +33,7 @@ Region models:
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
 import ipaddress
 import json
@@ -585,6 +586,114 @@ def build_family(role_by_asn: dict[int, list[Range]], asn_to_class: dict[int, st
     return resolved
 
 
+# ── Who announces a block, and where it is registered ──────────────────────
+# A change in the table is a run of addresses and two class names. To judge it a
+# reviewer needs two more facts, both already in the source files: which ASN
+# originates those addresses in this snapshot, and in which country the registry
+# has them.
+
+_SAFE_TEXT = re.compile(r"[^A-Za-z0-9 ._-]+")
+
+
+def safe_text(text: str, limit: int = 40) -> str:
+    """Text from a source file made fit for a pull request body: letters,
+    digits, space, dot, underscore and dash only, and no longer than `limit`.
+    AS names are written by whoever registered the AS; none of it may become
+    Markdown, a link or a mention."""
+    out = " ".join(_SAFE_TEXT.sub(" ", text).split())
+    return out if len(out) <= limit else out[:limit - 1].rstrip() + "…"
+
+
+class SpanIndex:
+    """Labelled address intervals, sorted and non-overlapping, with one question:
+    how many addresses of a block does each label cover?"""
+
+    def __init__(self, spans: list[tuple[int, int, str]]):
+        self.spans = sorted(spans)
+        self.starts = [s[0] for s in self.spans]
+
+    def cover(self, start: int, end: int) -> dict[str | None, int]:
+        """Addresses of [start, end] per label, most first; `None` counts the
+        addresses no interval covers."""
+        out: dict[str | None, int] = {}
+        left = end - start + 1
+        i = max(bisect.bisect_right(self.starts, start) - 1, 0)
+        while i < len(self.spans) and self.spans[i][0] <= end:
+            s, e, label = self.spans[i]
+            n = min(e, end) - max(s, start) + 1
+            if n > 0:
+                out[label] = out.get(label, 0) + n
+                left -= n
+            i += 1
+        if left:
+            out[None] = left
+        return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
+
+def load_origins(path: Path, family: str) -> SpanIndex:
+    """IPtoASN as an index: `AS1267 ASN-WINDTRE IUNET (IT)` per announced range.
+    "Not routed" rows are left out, so they count as covered by nothing."""
+    addr = ipaddress.IPv4Address if family == "v4" else ipaddress.IPv6Address
+    spans = []
+    with open(path, errors="replace") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 5 or parts[2] == "0":
+                continue
+            label = f"AS{int(parts[2])} {safe_text(parts[4])} ({safe_text(parts[3], 2)})"
+            spans.append((int(addr(parts[0])), int(addr(parts[1])), label))
+    return SpanIndex(spans)
+
+
+def load_registry(path: Path) -> dict[str, SpanIndex]:
+    """RIPE's delegations as an index per family: the country code of every
+    allocation, whatever the country."""
+    spans: dict[str, list[tuple[int, int, str]]] = {"v4": [], "v6": []}
+    with open(path) as f:
+        for line in f:
+            parts = line.strip().split("|")
+            if len(parts) < 7 or parts[0] != "ripencc":
+                continue
+            cc = parts[1] if re.fullmatch(r"[A-Z]{2}", parts[1]) else "??"
+            try:
+                if parts[2] == "ipv4":
+                    start = int(ipaddress.IPv4Address(parts[3]))
+                    spans["v4"].append((start, start + int(parts[4]) - 1, cc))
+                elif parts[2] == "ipv6":
+                    net = ipaddress.IPv6Network(f"{parts[3]}/{parts[4]}", strict=False)
+                    spans["v6"].append((int(net.network_address), int(net.broadcast_address), cc))
+            except (ValueError, ipaddress.AddressValueError):
+                continue
+    return {family: SpanIndex(s) for family, s in spans.items()}
+
+
+def format_cover(cover: dict[str | None, int], nothing: str, keep: int = 2) -> str:
+    """`IT`, or `DE 60 %, FR 40 %`, or `AS1 X (IT) 75 %, not announced 25 %`:
+    the labels covering a block with their share, the largest `keep` of them."""
+    total = sum(cover.values())
+    if not total:
+        return nothing
+    items = [(label if label is not None else nothing, n) for label, n in cover.items()]
+    if len(items) == 1:
+        return items[0][0]
+    shown = [f"{label} {n / total:.0%}".replace("%", " %") for label, n in items[:keep]]
+    if len(items) > keep:
+        shown.append(f"{len(items) - keep} more")
+    return ", ".join(shown)
+
+
+class Describer:
+    """What the source files say about a run of addresses."""
+
+    def __init__(self, origins: dict[str, SpanIndex], registry: dict[str, SpanIndex]):
+        self.origins, self.registry = origins, registry
+
+    def announced_by(self, c: Change) -> str:
+        return format_cover(self.origins[c.family].cover(c.start, c.end), "not announced")
+
+    def registered_in(self, c: Change) -> str:
+        return format_cover(self.registry[c.family].cover(c.start, c.end), "not in RIPE's file")
+
 # ── Change budget ──────────────────────────────────────────────────────────
 # A refresh is compared with the table it replaces. The comparison is on
 # addresses, not on lines of generated Rust: one row can be a /8 or a /24.
@@ -672,7 +781,9 @@ def format_size(family: str, n: int) -> str:
     if family == "v4":
         return f"{n:,} addresses"
     sites = n / (1 << 80)
-    return f"{sites:,.0f} /48s" if sites >= 1 else "less than a /48"
+    if sites < 1:
+        return "less than a /48"
+    return "1 /48" if round(sites) == 1 else f"{sites:,.0f} /48s"
 
 
 # A class may move by this share of its addresses in one refresh before a human
@@ -703,8 +814,9 @@ class Budget:
 
 
 def check_budget(old: dict[str, list[Range]], new: dict[str, list[Range]],
-                 baseline_class: str | None) -> Budget:
-    """Compare a refreshed table with the one it replaces."""
+                 baseline_class: str | None, describer: Describer | None = None) -> Budget:
+    """Compare a refreshed table with the one it replaces. With a `describer`,
+    each block is followed by who announces it and where it is registered."""
     budget = Budget([], [])
     for family in ("v4", "v6"):
         before, after = class_totals(old[family]), class_totals(new[family])
@@ -724,9 +836,12 @@ def check_budget(old: dict[str, list[Range]], new: dict[str, list[Range]],
         for c in diff_family(old[family], new[family], family):
             role = [cls for cls in (c.old, c.new) if cls is not None and cls != baseline_class]
             if role and c.size >= REVIEW_BLOCK[family]:
-                budget.review.append(
-                    f"{format_block(family, c.start, c.end)} ({format_size(family, c.size)}) "
-                    f"moves from {c.old or 'no class'} to {c.new or 'no class'}")
+                line = (f"{format_block(family, c.start, c.end)} ({format_size(family, c.size)}) "
+                        f"moves from {c.old or 'no class'} to {c.new or 'no class'}")
+                if describer:
+                    line += (f": {describer.announced_by(c)}; "
+                             f"registered in {describer.registered_in(c)}")
+                budget.review.append(line)
     return budget
 
 
@@ -837,10 +952,45 @@ def _count(family: str, n: int) -> str:
     return f"{n:,}" if family == "v4" else f"{n / (1 << 80):,.0f} /48s"
 
 
+# How many changes the summary lists per family, largest first.
+SUMMARY_LARGEST = {"v4": 12, "v6": 8}
+
+
+def render_changes(changes: list[Change], describer: Describer | None) -> list[str]:
+    """The largest changes of a refresh as Markdown tables, one per family."""
+    lines = []
+    for family, title in (("v4", "IPv4"), ("v6", "IPv6")):
+        mine = sorted((c for c in changes if c.family == family), key=lambda c: -c.size)
+        if not mine:
+            continue
+        shown = mine[:SUMMARY_LARGEST[family]]
+        lines += [
+            f"### Largest {title} changes",
+            "",
+            "| Block | Size | From | To | Announced by | Registered in |",
+            "|---|---:|---|---|---|---|",
+        ]
+        for c in shown:
+            size = format_size(family, c.size).replace(" addresses", "")
+            lines.append(
+                f"| `{format_block(family, c.start, c.end)}` | {size} "
+                f"| {c.old or 'no class'} | {c.new or 'no class'} "
+                f"| {describer.announced_by(c) if describer else ''} "
+                f"| {describer.registered_in(c) if describer else ''} |")
+        lines.append("")
+        if len(mine) > len(shown):
+            rest = sum(c.size for c in mine[len(shown):])
+            lines += [f"{len(mine) - len(shown)} smaller {title} changes are not listed "
+                      f"({format_size(family, rest)} in all).", ""]
+    return lines
+
+
 def render_summary(region: dict, sources: dict, old: dict | None, new: dict,
-                   budget: Budget) -> str:
+                   budget: Budget, changes: list[Change] | None = None,
+                   describer: Describer | None = None) -> str:
     """The refresh in Markdown, for the pull request: what it was built from,
-    what needs a look, and how many addresses each class holds before and after."""
+    what needs a look, how many addresses each class holds before and after,
+    and the largest blocks that change class."""
     ripe, v4, v6 = sources["ripe"], sources["iptoasn_v4"], sources["iptoasn_v6"]
     lines = [
         "### Built from",
@@ -880,6 +1030,7 @@ def render_summary(region: dict, sources: dict, old: dict | None, new: dict,
             cells += [_count(family, b), _count(family, a), change]
         lines.append(f"| `{cls}` | " + " | ".join(cells) + " |")
     lines.append("")
+    lines += render_changes(changes or [], describer)
     return "\n".join(lines)
 
 
@@ -962,7 +1113,13 @@ def main():
     new = {"v4": v4, "v6": v6}
     previous = Path(args.previous or args.output)
     old = parse_rust_table(previous) if previous.exists() else None
-    budget = check_budget(old, new, region["baseline_class"]) if old else Budget([], [])
+    describer = Describer(
+        {"v4": load_origins(Path(args.iptoasn), "v4"), "v6": load_origins(Path(args.iptoasn6), "v6")},
+        load_registry(Path(args.ripe)))
+    changes = ([c for f in ("v4", "v6") for c in diff_family(old[f], new[f], f)]
+               if old else [])
+    budget = (check_budget(old, new, region["baseline_class"], describer)
+              if old else Budget([], []))
     for asn in unannounced_asns(asn_to_class, role_v4):
         budget.review.append(f"AS{asn} ({asn_to_expected[asn]}) is curated as "
                              f"{asn_to_class[asn]} and originates no IPv4 range in this snapshot")
@@ -975,11 +1132,18 @@ def main():
             "sources": sources,
             "review": budget.review,
             "refuse": budget.refuse,
+            "changes": [{
+                "family": c.family, "block": format_block(c.family, c.start, c.end),
+                "addresses": c.size, "from": c.old, "to": c.new,
+                "announced_by": describer.announced_by(c),
+                "registered_in": describer.registered_in(c),
+            } for c in changes],
             "needs_review": bool(budget.review or budget.refuse),
             "refused": refused,
         }, indent=2) + "\n")
     if args.summary:
-        Path(args.summary).write_text(render_summary(region, sources, old, new, budget))
+        Path(args.summary).write_text(
+            render_summary(region, sources, old, new, budget, changes, describer))
 
     for line in budget.review:
         print(f'  REVIEW: {line}')
