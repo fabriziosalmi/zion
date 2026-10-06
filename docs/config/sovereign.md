@@ -23,6 +23,25 @@ cargo build --release --features geo-eu     # EU + Italy
 cargo build --release --features geo-ita     # Italy only
 ```
 
+### What each class means
+
+| Class | An address gets it when |
+|---|---|
+| `gov_ita`, `residential_ita` | a curated Italian ASN of that role announces it |
+| `datacenter_ita` | a curated hoster announces it **and** the block is registered in Italy (RIPE delegation with country `IT`) |
+| `eu` | the block is registered in an EU-27 country and no curated EU ASN announces it |
+| `gov_eu`, `residential_eu`, `datacenter_eu` | a curated EU ASN of that role announces it, wherever the block is registered |
+| `unknown` | none of the above |
+
+The Italian table is consulted first. `datacenter_ita` carries the second
+condition because two of the curated hosters, OVH and Hetzner, are on the
+Italian list as companies that operate in Italy, and they announce space
+registered in France, Germany, the United States, Israel. Without the
+condition 85 % of the IPv4 addresses called `datacenter_ita` were registered
+outside Italy. The EU role classes have no such condition today: a block
+that LeaseWeb announces and that is registered in the Seychelles is
+`datacenter_eu`.
+
 With neither feature, `classify()` always returns `Unknown` and the whole
 subsystem is compiled out (zero cost).
 
@@ -153,6 +172,13 @@ the next refresh: a removal is a correction, and making it wait three weeks
 would keep a wrong label on purpose. An ASN that is added waits like any other
 observation. The list each table was last built with is recorded in the same
 `.pending.json`.
+
+**Nor is a range outside the countries its class is confined to.** A published
+`datacenter_ita` range that is not registered in Italy loses the class at the
+next refresh: no snapshot can observe it in that class again, so there is
+nothing to wait for. This is how the rule reached the table that was built
+before it, and how the table follows a block that the registry moves to
+another country.
 
 To publish a snapshot as it is and clear the memory (after a change to the
 generator's rules, by hand): `--no-hysteresis`.

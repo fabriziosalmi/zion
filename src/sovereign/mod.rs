@@ -681,13 +681,31 @@ mod tests {
             classify("2.16.17.0".parse().unwrap()),
             IpClass::ResidentialIta
         );
-        // 2.26.132.0 — a curated Italian datacenter/hosting range.
+        // 62.123.0.1 — Retelit (AS12797), a curated hoster, in space registered
+        // in Italy: both conditions of `DatacenterIta`.
         assert_eq!(
-            classify("2.26.132.0".parse().unwrap()),
+            classify("62.123.0.1".parse().unwrap()),
             IpClass::DatacenterIta
         );
         // A non-sovereign IP stays Unknown.
         assert_eq!(classify("8.8.8.8".parse().unwrap()), IpClass::Unknown);
+    }
+
+    // `DatacenterIta` needs a curated hoster AND space registered in Italy.
+    // 2.26.132.0 is announced by OVH (AS16276, on the Italian list as a hoster
+    // that operates in Italy) from a block registered in the United States: it
+    // was `DatacenterIta` until the rule, and is not Italian by either the
+    // registry or the announcing company.
+    #[cfg(feature = "geo-ita")]
+    #[test]
+    fn a_curated_hoster_range_registered_abroad_is_not_italian() {
+        let class = classify("2.26.132.0".parse().unwrap());
+        assert_ne!(class, IpClass::DatacenterIta);
+        // The EU table has no such rule (yet): there it is an OVH range.
+        #[cfg(feature = "geo-eu")]
+        assert_eq!(class, IpClass::DatacenterEu);
+        #[cfg(not(feature = "geo-eu"))]
+        assert_eq!(class, IpClass::Unknown);
     }
 
     #[cfg(feature = "geo-eu")]

@@ -29,9 +29,6 @@
   },
   "pending": [
     {"family": "v4", "block": "2.159.128.0/18", "observed": null, "seen": 1, "first": "2026-10-06", "last": "2026-10-06"},
-    {"family": "v4", "block": "79.48.0.0/16", "observed": "ResidentialIta", "seen": 1, "first": "2026-10-06", "last": "2026-10-06"},
-    {"family": "v4", "block": "87.82.206.0/24", "observed": null, "seen": 1, "first": "2026-10-06", "last": "2026-10-06"},
-    {"family": "v4", "block": "185.216.126.0/24", "observed": null, "seen": 1, "first": "2026-10-06", "last": "2026-10-06"},
-    {"family": "v4", "block": "200.141.186.0/24", "observed": null, "seen": 1, "first": "2026-10-06", "last": "2026-10-06"}
+    {"family": "v4", "block": "79.48.0.0/16", "observed": "ResidentialIta", "seen": 1, "first": "2026-10-06", "last": "2026-10-06"}
   ]
 }

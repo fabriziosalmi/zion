@@ -678,6 +678,81 @@ def test_curated_asns_that_announce_nothing_are_named():
     assert gsd.unannounced_asns(roles, announced) == [64497, 64498]
 
 
+# ── A class confined to the space registered in a country ────────────────────
+
+def test_intersect_agrees_with_a_brute_force_comparison():
+    rng = random.Random(14)
+    for _ in range(300):
+        ranges = random_table(rng, merged=False)
+        allowed = gsd.merge_same_class([gsd.Range(r.start, r.end, "x") for r in random_table(rng)])
+        inside = {ip for r in allowed for ip in range(r.start, r.end + 1)}
+        want = {ip: c for ip, c in as_map(ranges, space=10**6).items() if ip in inside}
+        got = gsd.intersect(ranges, allowed)
+        assert as_map(got, space=10**6) == want
+        for a, b in zip(got, got[1:]):
+            assert a.end < b.start
+    assert gsd.intersect([gsd.Range(0, 9, "A")], []) == []
+    assert gsd.intersect([], [gsd.Range(0, 9, "x")]) == []
+
+
+def test_a_confined_class_stops_at_the_registry_border():
+    # AS64496 (datacenter) announces 0-199; only 100-149 is registered at home.
+    # AS64497 (residential) announces 300-399 and is not confined.
+    by_asn = {64496: [gsd.Range(0, 199, "Unknown")], 64497: [gsd.Range(300, 399, "Unknown")]}
+    roles = {64496: "DatacenterIta", 64497: "ResidentialIta"}
+    home = {"DatacenterIta": [gsd.Range(100, 149, "Unknown")]}
+    assert key(gsd.build_family(by_asn, roles, [], None)) == [
+        (0, 199, "DatacenterIta"), (300, 399, "ResidentialIta")]
+    assert key(gsd.build_family(by_asn, roles, [], None, home)) == [
+        (100, 149, "DatacenterIta"), (300, 399, "ResidentialIta")]
+    # With a country baseline, what falls outside the rule falls back to it.
+    baseline = [gsd.Range(0, 119, "Unknown")]
+    assert key(gsd.build_family(by_asn, roles, baseline, "Eu", home)) == [
+        (0, 99, "Eu"), (100, 149, "DatacenterIta"), (300, 399, "ResidentialIta")]
+    # Rows of an ASN in any order, and home space in two pieces.
+    by_asn[64496] = [gsd.Range(120, 199, "Unknown"), gsd.Range(0, 119, "Unknown")]
+    home = {"DatacenterIta": [gsd.Range(10, 19, "Unknown"), gsd.Range(100, 149, "Unknown")]}
+    assert key(gsd.build_family(by_asn, roles, [], None, home)) == [
+        (10, 19, "DatacenterIta"), (100, 149, "DatacenterIta"), (300, 399, "ResidentialIta")]
+
+
+def test_outside_is_what_intersect_drops():
+    rng = random.Random(15)
+    for _ in range(300):
+        ranges = random_table(rng, merged=False)
+        allowed = gsd.merge_same_class([gsd.Range(r.start, r.end, "x") for r in random_table(rng)])
+        inside = {ip for r in allowed for ip in range(r.start, r.end + 1)}
+        whole = as_map(ranges, space=10**6)
+        got = gsd.outside(ranges, allowed)
+        assert as_map(got, space=10**6) == {ip: c for ip, c in whole.items() if ip not in inside}
+        for a, b in zip(got, got[1:]):
+            assert a.end < b.start
+    assert key(gsd.outside([gsd.Range(0, 9, "A")], [])) == [(0, 9, "A")]
+
+
+def test_published_ranges_outside_their_registered_space_are_found():
+    published = [gsd.Range(0, 99, "DatacenterIta"), gsd.Range(100, 199, "ResidentialIta"),
+                 gsd.Range(300, 399, "DatacenterIta")]
+    home = {"DatacenterIta": [gsd.Range(50, 349, "Unknown")]}
+    # Outside: 0-49 and 350-399. This snapshot calls 0-19 residential.
+    observed = [gsd.Range(0, 19, "ResidentialIta"), gsd.Range(50, 99, "DatacenterIta")]
+    got = gsd.confine_family(published, observed, home, "v4")
+    assert [(c.start, c.end, c.old, c.new) for c in got] == [
+        (0, 19, "DatacenterIta", "ResidentialIta"), (20, 49, "DatacenterIta", None),
+        (350, 399, "DatacenterIta", None)]
+    # A class that is not confined is left alone wherever it is...
+    far = published + [gsd.Range(500, 599, "ResidentialIta")]
+    assert gsd.confine_family(far, observed, home, "v4") == got
+    # ...and so is a table inside its space.
+    assert gsd.confine_family(published, observed, {}, "v4") == []
+    assert gsd.confine_family(published[1:2], observed, home, "v4") == []
+
+
+def test_the_italian_datacenter_class_is_confined_to_italy():
+    assert gsd.REGIONS["ita"]["registered_in"] == {"DatacenterIta": {"IT"}}
+    assert "registered_in" not in gsd.REGIONS["eu"]
+
+
 # ── Hysteresis ───────────────────────────────────────────────────────────────
 
 def as_map(table, space=440):
@@ -1104,7 +1179,8 @@ def test_an_asn_taken_off_the_curated_list_loses_its_ranges_at_once():
         assert [r.ip_class for r in gsd.parse_rust_table(out)["v4"]] == ["GovIta"]
         state_now = json.loads(state.read_text())
         assert state_now["curated"] == {"64496": "GovIta"} and state_now["pending"] == []
-        assert "1 more at once, because the curated ASN list changed." in summ.read_text()
+        assert ("1 more at once: the curated ASN list changed, or a range is outside the "
+                "countries its class is confined to.") in summ.read_text()
 
         # Put back, it is an addition: it waits its two snapshots.
         assert run_generator(d, *args, day="2026-10-19")[0] == 0
@@ -1112,6 +1188,50 @@ def test_an_asn_taken_off_the_curated_list_loses_its_ranges_at_once():
         assert json.loads(state.read_text())["pending"][0]["observed"] == "ResidentialIta"
         assert run_generator(d, *args, day="2026-10-26")[0] == 0
         assert [r.ip_class for r in gsd.parse_rust_table(out)["v4"]] == ["GovIta", "ResidentialIta"]
+
+
+def test_a_class_confined_to_a_country_drops_what_is_outside_at_once():
+    # The fixture: 192.0.2.0/24 registered in IT (AS64496, GovIta) and
+    # 198.51.100.0/24 registered in FR (AS64497, ResidentialIta).
+    confined = dict(TEST_REGION, registered_in={"ResidentialIta": {"IT"}})
+    # Both ASNs silent in IPv4: another, uncurated one announces their blocks.
+    quiet = [(s, e, 64511 if asn else 0) for s, e, asn in v4_rows()]
+    with workdir() as d:
+        out, state, summ, rep = (d / "data.rs", d / "data.pending.json", d / "summary.md",
+                                 d / "report.json")
+        assert run_generator(d, "--output", str(out), day="2026-10-05")[0] == 0
+        # A week later both are silent: both /24s start waiting to leave.
+        assert run_generator(d, "--output", str(out), day="2026-10-12", v4=quiet)[0] == 0
+        assert [r.ip_class for r in gsd.parse_rust_table(out)["v4"]] == ["GovIta", "ResidentialIta"]
+        waiting = json.loads(state.read_text())["pending"]
+        assert [(q["block"], q["seen"]) for q in waiting] == [
+            ("192.0.2.0/24", 1), ("198.51.100.0/24", 1)]
+
+        # The rule arrives: ResidentialIta must be registered in Italy. The class
+        # empties, so the refresh is refused until someone says it is meant.
+        code, err, _ = run_generator(d, "--output", str(out), day="2026-10-13", v4=quiet,
+                                     region=confined)
+        assert code == gsd.EXIT_OVER_BUDGET
+        code, _, _ = run_generator(d, "--output", str(out), "--summary", str(summ),
+                                   "--report", str(rep), "--allow-over-budget",
+                                   day="2026-10-13", v4=quiet, region=confined)
+        assert code == 0
+        # The French /24 lost its class today, and is no longer waiting for
+        # anything; the Italian one still waits, at 1.
+        assert [(str(V4(r.start)), r.ip_class) for r in gsd.parse_rust_table(out)["v4"]] == [
+            ("192.0.2.0", "GovIta")]
+        assert json.loads(state.read_text())["pending"] == waiting[:1]
+        report = json.loads(rep.read_text())
+        assert (report["relabelled_by_curation"], report["went_back"], report["waiting"]) == (1, 0, 1)
+        assert "Observed and gone again" not in summ.read_text()
+        assert "0 runs are published now after waiting their snapshots; 1 more at once" \
+            in summ.read_text()
+        # And it stays out: the next snapshots do not bring it back.
+        assert run_generator(d, "--output", str(out), day="2026-10-20", region=confined)[0] == 0
+        assert run_generator(d, "--output", str(out), day="2026-10-27", region=confined)[0] == 0
+        assert [(str(V4(r.start)), r.ip_class) for r in gsd.parse_rust_table(out)["v4"]] == [
+            ("192.0.2.0", "GovIta")]
+        assert json.loads(state.read_text())["pending"] == []
 
 
 def test_a_damaged_state_file_stops_the_refresh():
