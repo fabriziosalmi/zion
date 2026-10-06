@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """Generate sovereign CIDR data for Zion from RIPE NCC and IPtoASN sources.
 
-Usage (Italy — ASN-role only):
+Usage (the files come from scripts/fetch_sovereign_sources.sh):
     python3 generate_sovereign_data.py \
         --region ita \
-        --ripe delegated-ripencc-latest \
-        --iptoasn ip2asn-v4.tsv \
-        --iptoasn6 ip2asn-v6.tsv \
+        --ripe delegated-ripencc-latest --ripe-md5 delegated-ripencc-latest.md5 \
+        --iptoasn ip2asn-v4.tsv --iptoasn6 ip2asn-v6.tsv \
+        --manifest SOURCES.tsv \
         --output src/sovereign/data_ita.rs
 
-Usage (EU — hybrid: country baseline + curated-ASN role override):
-    python3 generate_sovereign_data.py \
-        --region eu \
-        --ripe delegated-ripencc-latest \
-        --iptoasn ip2asn-v4.tsv \
-        --iptoasn6 ip2asn-v6.tsv \
-        --output src/sovereign/data_eu.rs
+`--region eu` builds the hybrid EU table (country baseline + curated-ASN role
+override) into src/sovereign/data_eu.rs.
+
+Before it writes anything the generator checks the source files (exit 4),
+validates every curated ASN against its live RIPEstat holder (exit 2) and
+measures the new table against the one it replaces (exit 3 past the refusal
+threshold). `--verify-only` stops after the first of these.
 
 Produces two sorted, non-overlapping arrays — `RANGES` (IPv4, u32) and
 `RANGES6` (IPv6, u128) — for binary search in the Zion classifier.
@@ -33,15 +33,24 @@ Region models:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
+import re
 import sys
 import time
 import unicodedata
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+
+# Exit codes: the workflow tells a human which of these happened.
+EXIT_NO_RANGES = 1
+EXIT_HOLDER_DRIFT = 2    # a curated ASN changed holder
+EXIT_OVER_BUDGET = 3     # the refresh moves a class by more than REFUSE_CLASS_SHARE
+EXIT_INPUT = 4           # a source file failed its integrity checks
 
 # ── Italian ASN classification ──────────────────────────────────
 #
@@ -117,7 +126,7 @@ DATACENTER_EU_ASNS = {
     12876: "Scaleway",           # FR
     8560: "IONOS",               # DE
     12797: "Retelit",            # ex-Aruba, now Retelit (IT)
-    60781: "LeaseWeb", 16265: "LeaseWeb",  # NL
+    60781: "LeaseWeb",           # NL (AS16265, its other ASN, last announced a prefix in 2020)
     51167: "Contabo",            # DE
 }
 
@@ -239,7 +248,7 @@ def validate_holders(asn_to_expected: dict[int, str], allow_drift: bool = False,
     if not allow_drift:
         print("\nRefusing to generate (fail-closed). Pass --allow-drift to override.",
               file=sys.stderr)
-        sys.exit(2)
+        sys.exit(EXIT_HOLDER_DRIFT)
     print("\n--allow-drift set: generating anyway (drifted ASNs are still emitted).",
           file=sys.stderr)
     return {asn for asn, _, _ in drift}
@@ -303,6 +312,211 @@ def parse_iptoasn(path: Path, family: str) -> dict[int, list[Range]]:
                 continue
     return asn_ranges
 
+
+# ── Input integrity ────────────────────────────────────────────────────────
+# The tables are only as good as the three files they are built from, and a
+# download can go wrong quietly: a truncated transfer, an error page saved as
+# data, a mirror serving last month's file. Each check below refuses one of
+# those before a single range is emitted. They rely on what the files say about
+# themselves (RIPE's record counts and date, IPtoASN covering the address space
+# end to end), so they need no hand-tuned expectation of "how big is normal".
+
+class InputError(Exception):
+    """A source file is truncated, replaced, stale or otherwise not what it claims."""
+
+
+# IPtoASN lists the routed space in order and fills what is not routed with
+# "Not routed" rows, so consecutive rows touch: a hole is a slice of the file
+# that went missing. The one hole the IPv6 file has by construction is in the
+# reserved space below 2000::/3 (between ::1 and 64:ff9b::1:0:0).
+IPTOASN_V6_GLOBAL_UNICAST = int(ipaddress.IPv6Address("2000::"))
+# The v4 file spans the first to the last announced prefix: it must start inside
+# 1.0.0.0/8 and reach 223.0.0.0/8, the last unicast /8 (what a cut past that
+# point loses is APNIC space no table here uses). The v6 file is padded to both
+# ends of the space.
+IPTOASN_V4_MUST_START_BY = int(ipaddress.IPv4Address("1.255.255.255"))
+IPTOASN_V4_MUST_REACH = int(ipaddress.IPv4Address("223.0.0.0"))
+IPTOASN_V6_END = (1 << 128) - 1
+# Sanity floors, far below today's 538,650 / 183,433 rows and 79,140 / 38,236
+# origin ASNs: they only stop a well-formed file that is not a full table.
+IPTOASN_MIN_ROWS = {"v4": 300_000, "v6": 100_000}
+IPTOASN_MIN_ASNS = {"v4": 60_000, "v6": 25_000}
+
+RIPE_MAX_AGE_DAYS = 7
+
+
+def verify_ripe(path: Path, md5_path: Path | None = None,
+                today: str | None = None) -> dict:
+    """Check a RIPE NCC delegated-stats file against its own header, summary
+    lines and (if given) the `.md5` RIPE publishes next to it. Returns the
+    file's date and record counts. Raises InputError."""
+    raw = Path(path).read_bytes()
+    if md5_path is not None:
+        published = re.search(r"\b[0-9a-fA-F]{32}\b", Path(md5_path).read_text())
+        if not published:
+            raise InputError(f"RIPE: {md5_path} holds no MD5 digest")
+        actual = hashlib.md5(raw, usedforsecurity=False).hexdigest()
+        if actual != published.group(0).lower():
+            raise InputError(f"RIPE: MD5 is {actual}, RIPE publishes "
+                             f"{published.group(0).lower()} (partial or replaced download)")
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError as e:
+        raise InputError(f"RIPE: not a delegated-stats file ({e})") from None
+
+    header = None
+    summary: dict[str, int] = {}
+    counted: dict[str, int] = {}
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("|")
+        if header is None:
+            if len(parts) != 7 or parts[0] != "2" or parts[1] != "ripencc":
+                raise InputError(f"RIPE: line {n} is not a version-2 ripencc header: "
+                                 f"{line[:60]!r}")
+            header = parts
+            continue
+        if len(parts) == 6 and parts[1] == "*" and parts[5] == "summary":
+            summary[parts[2]] = int(parts[4])
+            continue
+        if len(parts) < 7 or parts[0] != "ripencc" or parts[2] not in ("ipv4", "ipv6", "asn"):
+            raise InputError(f"RIPE: line {n} is not a record: {line[:60]!r}")
+        counted[parts[2]] = counted.get(parts[2], 0) + 1
+    if header is None:
+        raise InputError("RIPE: no header line (empty file)")
+    for kind in ("ipv4", "ipv6", "asn"):
+        if kind not in summary:
+            raise InputError(f"RIPE: no summary line for {kind}")
+        if counted.get(kind, 0) != summary[kind]:
+            raise InputError(f"RIPE: {counted.get(kind, 0)} {kind} records, the file's own "
+                             f"summary says {summary[kind]} (truncated?)")
+    if sum(counted.values()) != int(header[3]):
+        raise InputError(f"RIPE: {sum(counted.values())} records, the header says {header[3]}")
+
+    try:
+        end = datetime.strptime(header[5], "%Y%m%d").date()
+    except ValueError:
+        raise InputError(f"RIPE: header end date {header[5]!r} is not a date") from None
+    ref = (datetime.strptime(today, "%Y-%m-%d").date() if today
+           else datetime.now(timezone.utc).date())
+    age = (ref - end).days
+    if age > RIPE_MAX_AGE_DAYS:
+        raise InputError(f"RIPE: file is dated {end.isoformat()}, {age} days before {ref.isoformat()} "
+                         f"(more than {RIPE_MAX_AGE_DAYS}: a stale mirror or cache)")
+    return {"date": end.isoformat(), "records": counted, "md5_checked": md5_path is not None}
+
+
+def verify_iptoasn(path: Path, family: str) -> dict:
+    """Check an IPtoASN table for one address family: every row parses, rows are
+    in order with no hole between them, the table reaches the end of the address
+    space and is the size of a full table. Returns its row and origin-ASN counts. Raises InputError."""
+    addr = ipaddress.IPv4Address if family == "v4" else ipaddress.IPv6Address
+    name = f"IPtoASN {family}"
+    rows = 0
+    asns: set[int] = set()
+    first = prev_end = None
+    with open(path, errors="replace") as f:
+        for n, line in enumerate(f, 1):
+            parts = line.rstrip("\n").split("\t")
+            try:
+                if len(parts) < 5:
+                    raise ValueError("fewer than 5 columns")
+                start, end, asn = int(addr(parts[0])), int(addr(parts[1])), int(parts[2])
+            except (ValueError, ipaddress.AddressValueError) as e:
+                raise InputError(f"{name}: line {n} does not parse ({e}): {line[:60]!r}") from None
+            if end < start:
+                raise InputError(f"{name}: line {n} ends before it starts")
+            if prev_end is not None:
+                if start <= prev_end:
+                    raise InputError(f"{name}: line {n} is out of order or overlaps the previous row")
+                if start != prev_end + 1 and (family == "v4" or start > IPTOASN_V6_GLOBAL_UNICAST):
+                    raise InputError(f"{name}: line {n} does not follow the previous row: "
+                                     f"{addr(prev_end + 1)} to {addr(start - 1)} is missing")
+            else:
+                first = start
+            prev_end = end
+            rows += 1
+            if asn:
+                asns.add(asn)
+    if rows == 0:
+        raise InputError(f"{name}: empty file")
+    if family == "v4":
+        if first > IPTOASN_V4_MUST_START_BY:
+            raise InputError(f"{name}: starts at {addr(first)}, not inside 1.0.0.0/8 (head missing)")
+        if prev_end < IPTOASN_V4_MUST_REACH:
+            raise InputError(f"{name}: ends at {addr(prev_end)}, before 223.0.0.0/8 (truncated)")
+    else:
+        if first != 0:
+            raise InputError(f"{name}: starts at {addr(first)}, not at :: (head missing)")
+        if prev_end != IPTOASN_V6_END:
+            raise InputError(f"{name}: ends at {addr(prev_end)}, not at the end of the "
+                             f"address space (truncated)")
+    if rows < IPTOASN_MIN_ROWS[family]:
+        raise InputError(f"{name}: {rows} rows, fewer than {IPTOASN_MIN_ROWS[family]} "
+                         f"(not a full table)")
+    if len(asns) < IPTOASN_MIN_ASNS[family]:
+        raise InputError(f"{name}: {len(asns)} origin ASNs, fewer than "
+                         f"{IPTOASN_MIN_ASNS[family]} (not a full table)")
+    return {"rows": rows, "asns": len(asns)}
+
+
+IPTOASN_MAX_AGE_DAYS = 7
+
+
+def load_manifest(path: Path) -> dict[str, dict]:
+    """Read the SOURCES.tsv that scripts/fetch_sovereign_sources.sh writes next to
+    the files it downloads: name, URL, HTTP Last-Modified, size, SHA-256."""
+    out: dict[str, dict] = {}
+    for line in Path(path).read_text().splitlines():
+        parts = line.split("\t")
+        if len(parts) != 5:
+            raise InputError(f"manifest: not five columns: {line[:60]!r}")
+        name, url, modified, size, sha256 = parts
+        out[name] = {"url": url, "last_modified": modified, "bytes": int(size), "sha256": sha256}
+    return out
+
+
+def verify_against_manifest(path: Path, manifest: dict[str, dict], today: str | None) -> dict:
+    """The file is the one that was downloaded (size and SHA-256), and the server
+    did not hand out an old one (Last-Modified). Returns the manifest entry."""
+    name = Path(path).name
+    entry = manifest.get(name)
+    if entry is None:
+        raise InputError(f"manifest: no entry for {name}")
+    raw = Path(path).read_bytes()
+    if len(raw) != entry["bytes"] or hashlib.sha256(raw).hexdigest() != entry["sha256"]:
+        raise InputError(f"{name}: not the file the manifest describes "
+                         f"(size or SHA-256 differs: changed after the download)")
+    try:
+        modified = parsedate_to_datetime(entry["last_modified"]).date()
+    except (TypeError, ValueError):
+        raise InputError(f"{name}: no usable Last-Modified in the manifest "
+                         f"({entry['last_modified']!r})") from None
+    ref = (datetime.strptime(today, "%Y-%m-%d").date() if today
+           else datetime.now(timezone.utc).date())
+    age = (ref - modified).days
+    if age > IPTOASN_MAX_AGE_DAYS:
+        raise InputError(f"{name}: last modified {modified.isoformat()}, {age} days before "
+                         f"{ref.isoformat()} (more than {IPTOASN_MAX_AGE_DAYS}: a stale file)")
+    return entry
+
+
+def verify_inputs(ripe: Path, iptoasn4: Path, iptoasn6: Path, md5: Path | None = None,
+                  manifest_path: Path | None = None, today: str | None = None) -> dict:
+    """Run every integrity check on the three source files. Returns what they
+    say about themselves, for the report. Raises InputError on the first failure."""
+    sources = {
+        "ripe": verify_ripe(ripe, md5, today),
+        "iptoasn_v4": verify_iptoasn(iptoasn4, "v4"),
+        "iptoasn_v6": verify_iptoasn(iptoasn6, "v6"),
+    }
+    if manifest_path is not None:
+        manifest = load_manifest(manifest_path)
+        for key, path in (("ripe", ripe), ("iptoasn_v4", iptoasn4), ("iptoasn_v6", iptoasn6)):
+            sources[key]["last_modified"] = verify_against_manifest(
+                path, manifest, today)["last_modified"]
+    return sources
 
 def merge_same_class(ranges: list[Range]) -> list[Range]:
     """Merge overlapping/adjacent ranges that share a class."""
@@ -371,6 +585,157 @@ def build_family(role_by_asn: dict[int, list[Range]], asn_to_class: dict[int, st
     return resolved
 
 
+# ── Change budget ──────────────────────────────────────────────────────────
+# A refresh is compared with the table it replaces. The comparison is on
+# addresses, not on lines of generated Rust: one row can be a /8 or a /24.
+
+_TABLE_ROW = re.compile(r"^\s*(cr6?)\(0x([0-9A-Fa-f]+), 0x([0-9A-Fa-f]+), IpClass::(\w+)\),")
+
+
+def parse_rust_table(path: Path) -> dict[str, list[Range]]:
+    """Read back a generated `data_*.rs`: {'v4': [...], 'v6': [...]}."""
+    out: dict[str, list[Range]] = {"v4": [], "v6": []}
+    with open(path) as f:
+        for line in f:
+            m = _TABLE_ROW.match(line)
+            if m:
+                fam = "v4" if m.group(1) == "cr" else "v6"
+                out[fam].append(Range(int(m.group(2), 16), int(m.group(3), 16), m.group(4)))
+    return out
+
+
+@dataclass
+class Change:
+    """A run of addresses whose class differs between two tables. `None` is
+    "not in the table" (the classifier answers `Unknown`)."""
+    family: str
+    start: int
+    end: int
+    old: str | None
+    new: str | None
+
+    @property
+    def size(self) -> int:
+        return self.end - self.start + 1
+
+
+def diff_family(old: list[Range], new: list[Range], family: str) -> list[Change]:
+    """Every run of addresses classified differently by two sorted,
+    non-overlapping range lists, in address order."""
+    bounds = set()
+    for r in old:
+        bounds.add(r.start)
+        bounds.add(r.end + 1)
+    for r in new:
+        bounds.add(r.start)
+        bounds.add(r.end + 1)
+    points = sorted(bounds)
+    out: list[Change] = []
+    oi = ni = 0
+    for i in range(len(points) - 1):
+        seg_start, seg_end = points[i], points[i + 1] - 1
+        while oi < len(old) and old[oi].end < seg_start:
+            oi += 1
+        while ni < len(new) and new[ni].end < seg_start:
+            ni += 1
+        a = old[oi].ip_class if oi < len(old) and old[oi].start <= seg_start else None
+        b = new[ni].ip_class if ni < len(new) and new[ni].start <= seg_start else None
+        if a == b:
+            continue
+        last = out[-1] if out else None
+        if last and last.end + 1 == seg_start and last.old == a and last.new == b:
+            last.end = seg_end
+        else:
+            out.append(Change(family, seg_start, seg_end, a, b))
+    return out
+
+
+def class_totals(ranges: list[Range]) -> dict[str, int]:
+    """Addresses per class."""
+    totals: dict[str, int] = {}
+    for r in ranges:
+        totals[r.ip_class] = totals.get(r.ip_class, 0) + r.end - r.start + 1
+    return totals
+
+
+def format_block(family: str, start: int, end: int) -> str:
+    """A run of addresses as CIDR text: one prefix when it is one, else
+    `first-last`."""
+    addr = ipaddress.IPv4Address if family == "v4" else ipaddress.IPv6Address
+    nets = list(ipaddress.summarize_address_range(addr(start), addr(end)))
+    return str(nets[0]) if len(nets) == 1 else f"{addr(start)}-{addr(end)}"
+
+
+def format_size(family: str, n: int) -> str:
+    """An address count a person can read: addresses in IPv4, /48 sites in IPv6
+    (an IPv6 /32 is 79,228,162,514,264,337,593,543,950,336 addresses, or 65,536 /48s)."""
+    if family == "v4":
+        return f"{n:,} addresses"
+    sites = n / (1 << 80)
+    return f"{sites:,.0f} /48s" if sites >= 1 else "less than a /48"
+
+
+# A class may move by this share of its addresses in one refresh before a human
+# has to look.
+REVIEW_CLASS_SHARE = 0.02
+# One run of addresses this large entering or leaving a role class is looked at
+# whatever the share: a /18 in IPv4, a /32 (one provider allocation) in IPv6.
+# Role classes come from what a curated ASN announces in one BGP snapshot. The
+# country baseline comes from the registry and is held to the share alone.
+REVIEW_BLOCK = {"v4": 1 << 14, "v6": 1 << 96}
+# Past this share the refresh is refused outright: it is the signature of a
+# broken input or of an edit to the curated list, not of a week of routing.
+REFUSE_CLASS_SHARE = 0.20
+#
+# Calibration, on the nine weekly tables from 2026-08-12 to 2026-10-05: the block
+# rule singles out SURF's /13 leaving GovEu, the /16 a Scaleway announcement
+# turned into DatacenterEu for two weeks, and the Wind Tre and TIM blocks that
+# came and went; the refusal fires once, on the week the curated list was cut
+# (GovEu lost 90 % of its IPv6).
+
+
+@dataclass
+class Budget:
+    """What a refresh changes, measured against REVIEW_* and REFUSE_*.
+    `review` asks for a human look, `refuse` stops the refresh."""
+    review: list[str]
+    refuse: list[str]
+
+
+def check_budget(old: dict[str, list[Range]], new: dict[str, list[Range]],
+                 baseline_class: str | None) -> Budget:
+    """Compare a refreshed table with the one it replaces."""
+    budget = Budget([], [])
+    for family in ("v4", "v6"):
+        before, after = class_totals(old[family]), class_totals(new[family])
+        for cls in sorted(set(before) | set(after)):
+            b, a = before.get(cls, 0), after.get(cls, 0)
+            if b == 0:
+                budget.review.append(f"IP{family} class {cls} is new "
+                                     f"({format_size(family, a)})")
+                continue
+            share = abs(a - b) / b
+            line = (f"IP{family} class {cls} goes from {format_size(family, b)} to "
+                    f"{format_size(family, a)} ({(a - b) / b:+.1%})")
+            if share > REFUSE_CLASS_SHARE:
+                budget.refuse.append(line)
+            elif share > REVIEW_CLASS_SHARE:
+                budget.review.append(line)
+        for c in diff_family(old[family], new[family], family):
+            role = [cls for cls in (c.old, c.new) if cls is not None and cls != baseline_class]
+            if role and c.size >= REVIEW_BLOCK[family]:
+                budget.review.append(
+                    f"{format_block(family, c.start, c.end)} ({format_size(family, c.size)}) "
+                    f"moves from {c.old or 'no class'} to {c.new or 'no class'}")
+    return budget
+
+
+def unannounced_asns(asn_to_class: dict[int, str], role_v4: dict[int, list[Range]]) -> list[int]:
+    """Curated ASNs that originate no IPv4 range in this snapshot: either the
+    ASN went quiet and its ranges are leaving the table, or it should not be on
+    the list."""
+    return sorted(asn for asn in asn_to_class if not role_v4.get(asn))
+
 CLASS_LABEL = {
     'GovIta': 'GOVERNMENT / INSTITUTIONAL',
     'ResidentialIta': 'RESIDENTIAL ISPs',
@@ -416,7 +781,7 @@ def generate_rust(v4: list[Range], v6: list[Range], region: dict,
         '//! AUTO-GENERATED by scripts/generate_sovereign_data.py',
         '//! DO NOT EDIT MANUALLY — changes will be overwritten by CI.',
         '//!',
-        '//! Sources: RIPE NCC delegated stats + IPtoASN (Team Cymru), v4 + v6.',
+        '//! Sources: RIPE NCC delegated stats + IPtoASN (iptoasn.com), v4 + v6.',
         f'//! Snapshot date: {snapshot_date} (curated-ASN holders validated'
         ' against RIPEstat as-overview on this date — see the generator).',
         '',
@@ -467,13 +832,80 @@ def generate_rust(v4: list[Range], v6: list[Range], region: dict,
     return '\n'.join(lines)
 
 
+def _count(family: str, n: int) -> str:
+    """A table cell: addresses in IPv4, /48 sites in IPv6."""
+    return f"{n:,}" if family == "v4" else f"{n / (1 << 80):,.0f} /48s"
+
+
+def render_summary(region: dict, sources: dict, old: dict | None, new: dict,
+                   budget: Budget) -> str:
+    """The refresh in Markdown, for the pull request: what it was built from,
+    what needs a look, and how many addresses each class holds before and after."""
+    ripe, v4, v6 = sources["ripe"], sources["iptoasn_v4"], sources["iptoasn_v6"]
+    lines = [
+        "### Built from",
+        "",
+        "| Source | Dated | Holds |",
+        "|---|---|---|",
+        f"| RIPE NCC delegated stats | {ripe['date']} | "
+        f"{sum(ripe['records'].values()):,} records, counts "
+        f"{'and MD5 ' if ripe.get('md5_checked') else ''}checked |",
+        f"| IPtoASN IPv4 | {v4.get('last_modified', 'not recorded')} | "
+        f"{v4['rows']:,} rows, {v4['asns']:,} origin ASNs |",
+        f"| IPtoASN IPv6 | {v6.get('last_modified', 'not recorded')} | "
+        f"{v6['rows']:,} rows, {v6['asns']:,} origin ASNs |",
+        "",
+    ]
+    if budget.refuse:
+        lines += ["### Refused", ""] + [f"- {x}" for x in budget.refuse] + [""]
+    if budget.review:
+        lines += ["### Needs a look before merging", ""]
+        lines += [f"- {x}" for x in budget.review] + [""]
+    if old is None:
+        return "\n".join(lines)
+    lines += [
+        f"### {region['adjective']} addresses per class",
+        "",
+        "| Class | IPv4 before | IPv4 after | Change | IPv6 before | IPv6 after | Change |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    totals = {(f, when): class_totals(t[f])
+              for f in ("v4", "v6") for when, t in (("old", old), ("new", new))}
+    classes = sorted({c for t in totals.values() for c in t})
+    for cls in classes:
+        cells = []
+        for family in ("v4", "v6"):
+            b, a = totals[(family, "old")].get(cls, 0), totals[(family, "new")].get(cls, 0)
+            change = f"{(a - b) / b:+.2%}" if b else "new"
+            cells += [_count(family, b), _count(family, a), change]
+        lines.append(f"| `{cls}` | " + " | ".join(cells) + " |")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Generate sovereign CIDR data for Zion')
     parser.add_argument('--region', default='ita', choices=sorted(REGIONS))
     parser.add_argument('--ripe', required=True, help='Path to delegated-ripencc-latest')
+    parser.add_argument('--ripe-md5', default=None,
+                        help='Path to the .md5 RIPE publishes next to the file; checked if given.')
     parser.add_argument('--iptoasn', required=True, help='Path to ip2asn-v4.tsv')
     parser.add_argument('--iptoasn6', required=True, help='Path to ip2asn-v6.tsv')
-    parser.add_argument('--output', required=True, help='Output .rs file path')
+    parser.add_argument('--manifest', default=None,
+                        help='SOURCES.tsv from scripts/fetch_sovereign_sources.sh: the files must '
+                             'match it and must not be stale.')
+    parser.add_argument('--verify-only', action='store_true',
+                        help='Check the source files and stop: no lookups, nothing generated.')
+    parser.add_argument('--output', default=None, help='Output .rs file path')
+    parser.add_argument('--previous', default=None,
+                        help='Table to measure the change against (default: the file at --output).')
+    parser.add_argument('--allow-over-budget', action='store_true',
+                        help='Write the table even if a class moved by more than '
+                             f'{round(REFUSE_CLASS_SHARE * 100)} %% (default: refuse). For a refresh that '
+                             'follows an edit of the curated ASN list.')
+    parser.add_argument('--report', default=None, help='Write what changed as JSON here.')
+    parser.add_argument('--summary', default=None,
+                        help='Write what changed as Markdown here (the pull request body).')
     parser.add_argument('--allow-drift', action='store_true',
                         help='Generate even if a curated ASN drifted from its expected '
                              'holder (default: fail closed). Drifted ASNs are still emitted.')
@@ -481,6 +913,24 @@ def main():
                         help='Snapshot date stamped in the generated header (default: today UTC).')
     args = parser.parse_args()
     snapshot_date = args.snapshot_date or datetime.now(timezone.utc).date().isoformat()
+
+    # The files first: they are checked offline, before any lookup, and nothing
+    # is derived from a file that fails.
+    try:
+        sources = verify_inputs(
+            Path(args.ripe), Path(args.iptoasn), Path(args.iptoasn6),
+            md5=Path(args.ripe_md5) if args.ripe_md5 else None,
+            manifest_path=Path(args.manifest) if args.manifest else None,
+            today=snapshot_date)
+    except InputError as e:
+        print(f'INPUT REFUSED: {e}', file=sys.stderr)
+        sys.exit(EXIT_INPUT)
+    print(f'  Sources verified: RIPE {sources["ripe"]["date"]}, '
+          f'IPtoASN {sources["iptoasn_v4"]["rows"]:,} v4 + {sources["iptoasn_v6"]["rows"]:,} v6 rows')
+    if args.verify_only:
+        return
+    if not args.output:
+        parser.error('--output is required unless --verify-only')
 
     region = REGIONS[args.region]
     asn_to_class = {asn: cls for asns, cls in region["asn_roles"] for asn in asns}
@@ -507,7 +957,43 @@ def main():
 
     if not v4 and not v6:
         print('ERROR: no ranges produced', file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_NO_RANGES)
+
+    new = {"v4": v4, "v6": v6}
+    previous = Path(args.previous or args.output)
+    old = parse_rust_table(previous) if previous.exists() else None
+    budget = check_budget(old, new, region["baseline_class"]) if old else Budget([], [])
+    for asn in unannounced_asns(asn_to_class, role_v4):
+        budget.review.append(f"AS{asn} ({asn_to_expected[asn]}) is curated as "
+                             f"{asn_to_class[asn]} and originates no IPv4 range in this snapshot")
+    refused = bool(budget.refuse) and not args.allow_over_budget
+
+    if args.report:
+        Path(args.report).write_text(json.dumps({
+            "region": args.region,
+            "snapshot_date": snapshot_date,
+            "sources": sources,
+            "review": budget.review,
+            "refuse": budget.refuse,
+            "needs_review": bool(budget.review or budget.refuse),
+            "refused": refused,
+        }, indent=2) + "\n")
+    if args.summary:
+        Path(args.summary).write_text(render_summary(region, sources, old, new, budget))
+
+    for line in budget.review:
+        print(f'  REVIEW: {line}')
+    if budget.refuse:
+        print('\nOVER BUDGET: the refresh moves a class by more than '
+              f'{REFUSE_CLASS_SHARE:.0%}:', file=sys.stderr)
+        for line in budget.refuse:
+            print(f'  {line}', file=sys.stderr)
+        if refused:
+            print('\nRefusing to write the table. If the curated ASN list was edited, this '
+                  'is expected: rerun by hand with --allow-over-budget and review the result.',
+                  file=sys.stderr)
+            sys.exit(EXIT_OVER_BUDGET)
+        print('\n--allow-over-budget set: writing it anyway.', file=sys.stderr)
 
     Path(args.output).write_text(generate_rust(v4, v6, region, snapshot_date))
     print(f'  Written to {args.output}')
