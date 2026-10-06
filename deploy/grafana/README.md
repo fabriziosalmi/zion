@@ -54,9 +54,11 @@ Every metric Zion exposes at `/metrics` has a panel here.
 
 ## Note on optional metrics
 
-Two panels depend on a feature and read absent on a default build (that's
-expected, not a misconfiguration): `zion_sovereign_classifications_total`
-(`--features geo-ita`/`geo-eu`) is genuinely `#[cfg]`-gated. The `zion_acme_*`
+The two sovereign panels depend on a feature and read absent on a default
+build (that's expected, not a misconfiguration):
+`zion_sovereign_classifications_total` and
+`zion_sovereign_data_snapshot_timestamp_seconds` (`--features geo-ita`/`geo-eu`)
+are genuinely `#[cfg]`-gated. The `zion_acme_*`
 and `zion_mesh_*` metrics are **always emitted** — they render as a flat `0`
 line until you build with `--features acme` / `sovereign-aimp` respectively, so
 their panels show zero rather than "no data".

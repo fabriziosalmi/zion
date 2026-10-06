@@ -138,6 +138,7 @@ feature-gated series (absent, not zero, without the feature) is called out.
 | Metric | Type | Description |
 |---|---|---|
 | `zion_sovereign_classifications_total{class="…"}` | counter | Requests classified by origin (IT/EU/unknown), by class |
+| `zion_sovereign_data_snapshot_timestamp_seconds{region="ita"\|"eu"}` | gauge | Day of the last snapshot in each compiled-in address table, in seconds since the epoch. `(time() - …) / 86400` is the age of the data in days |
 
 ### Histograms
 

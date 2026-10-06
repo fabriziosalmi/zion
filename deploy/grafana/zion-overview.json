@@ -265,6 +265,14 @@
         { "refId": "A", "expr": "sum(rate(zion_traces_emitted_total{instance=~\"$instance\"}[5m]))", "legendFormat": "traces/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
         { "refId": "B", "expr": "sum(rate(zion_traces_invalid_total{instance=~\"$instance\"}[5m]))", "legendFormat": "invalid traceparent/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
         { "refId": "C", "expr": "sum(rate(zion_admin_rejects_total{instance=~\"$instance\"}[5m]))", "legendFormat": "admin rejects/s", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ] },
+
+    { "id": 108, "type": "stat", "title": "Sovereign address tables — age (days)", "description": "Days since the last snapshot in each compiled-in address table (zion_sovereign_data_snapshot_timestamp_seconds). The tables are compiled in: the age grows until the binary is rebuilt. Absent without --features geo-ita / geo-eu.", "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 76 },
+      "fieldConfig": { "defaults": { "unit": "d", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 30 }, { "color": "red", "value": 45 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+      "targets": [
+        { "refId": "A", "expr": "max by (region) ((time() - zion_sovereign_data_snapshot_timestamp_seconds{instance=~\"$instance\"}) / 86400)", "legendFormat": "{{region}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
       ] }
   ]
 }

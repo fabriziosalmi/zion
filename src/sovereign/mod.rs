@@ -312,6 +312,87 @@ fn lookup6(ip: u128, ranges: &[CidrEntry6]) -> IpClass {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Data age
+// ═══════════════════════════════════════════════════════════════════
+//
+// The tables are compiled in. They are refreshed in the repository every
+// week, and a binary keeps the ones it was built with for as long as it
+// runs: without a date, nothing on the machine says how old they are.
+
+/// The tables compiled into this build: `(region, day of the last snapshot)`.
+pub fn snapshots() -> &'static [(&'static str, &'static str)] {
+    &[
+        #[cfg(feature = "geo-ita")]
+        ("ita", data_ita::SNAPSHOT_DATE),
+        #[cfg(feature = "geo-eu")]
+        ("eu", data_eu::SNAPSHOT_DATE),
+    ]
+}
+
+/// A table older than this is reported at boot. Six weekly refreshes: address
+/// space is allocated, moved and re-announced every week, and the table also
+/// waits up to three snapshots before it follows.
+pub const STALE_AFTER_DAYS: i64 = 45;
+
+/// Days from 1970-01-01 to a `YYYY-MM-DD` date (proleptic Gregorian calendar).
+/// `None` when the text is not a date.
+pub fn days_from_civil(date: &str) -> Option<i64> {
+    let b = date.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let num = |s: &str| -> Option<i64> {
+        s.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| s.parse().ok())
+            .flatten()
+    };
+    let (y, m, d) = (num(&date[0..4])?, num(&date[5..7])?, num(&date[8..10])?);
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_len = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if d < 1 || d > month_len {
+        return None;
+    }
+    // Days-from-civil, with the year starting in March so that the leap day
+    // is the last day of the year.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+/// Midnight UTC of a snapshot date, in seconds since the epoch.
+pub fn snapshot_epoch_secs(date: &str) -> Option<i64> {
+    days_from_civil(date).map(|d| d * 86_400)
+}
+
+/// How many whole days old a snapshot date is at `now_secs` (seconds since
+/// the epoch). Negative when the date is in the future (a clock set wrong).
+pub fn age_days(date: &str, now_secs: u64) -> Option<i64> {
+    days_from_civil(date).map(|d| (now_secs / 86_400) as i64 - d)
+}
+
+/// The compiled-in tables older than [`STALE_AFTER_DAYS`] at `now_secs`:
+/// `(region, snapshot date, age in days)`.
+pub fn stale_tables(now_secs: u64) -> Vec<(&'static str, &'static str, i64)> {
+    snapshots()
+        .iter()
+        .filter_map(|&(region, date)| {
+            let age = age_days(date, now_secs)?;
+            (age > STALE_AFTER_DAYS).then_some((region, date, age))
+        })
+        .collect()
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Sovereign Config (parsed from zion.toml)
 // ═══════════════════════════════════════════════════════════════════
 
@@ -725,6 +806,350 @@ mod tests {
             classify("62.171.128.1".parse().unwrap()),
             IpClass::DatacenterEu
         );
+    }
+
+    // ── One pinned address per curated ASN ───────────────────────────
+    //
+    // The tables are regenerated every week. These addresses are what a
+    // refresh must not move without someone noticing: for each curated ASN,
+    // one address in its largest long-held block, with the class it must
+    // have. A refresh that drops an ASN, or a change that breaks the lookup,
+    // fails here by name. An address that really moved (the operator gave the
+    // block back) is updated by hand, which is the point.
+    //
+    // `(ASN, address, class)`. Chosen on the 2026-10-06 tables.
+    #[cfg(feature = "geo-ita")]
+    const ITALIAN_POINTS: &[(u32, &str, IpClass)] = &[
+        (137, "193.205.0.1", IpClass::GovIta), // GARR
+        (137, "2001:760::1", IpClass::GovIta),
+        (2598, "192.65.131.1", IpClass::GovIta), // CNR
+        (2598, "2001:67c:1b08::1", IpClass::GovIta),
+        (41325, "84.38.60.1", IpClass::GovIta), // Regione Marche
+        (3269, "79.10.0.1", IpClass::ResidentialIta), // TIM
+        (3269, "2a01:2000::1", IpClass::ResidentialIta),
+        (16232, "2.192.0.1", IpClass::ResidentialIta), // TIM mobile
+        (16232, "2a03:8980::1", IpClass::ResidentialIta),
+        (12874, "93.32.0.1", IpClass::ResidentialIta), // Fastweb
+        (12874, "2001:b00::1", IpClass::ResidentialIta),
+        (30722, "93.64.0.1", IpClass::ResidentialIta), // Vodafone Italia
+        (30722, "2a01:820::1", IpClass::ResidentialIta),
+        (1267, "151.20.0.1", IpClass::ResidentialIta), // Wind Tre
+        (1267, "2a02:b000::1", IpClass::ResidentialIta),
+        (8612, "84.220.0.1", IpClass::ResidentialIta), // Tiscali
+        (8612, "2a01:7d0::1", IpClass::ResidentialIta),
+        (35612, "146.241.0.1", IpClass::ResidentialIta), // Eolo
+        (35612, "2001:4c90::1", IpClass::ResidentialIta),
+        (210278, "101.56.0.1", IpClass::ResidentialIta), // Sky Italia
+        (210278, "2a0e:400::1", IpClass::ResidentialIta),
+        (31034, "80.211.0.1", IpClass::DatacenterIta), // Aruba
+        (31034, "2a00:6d40::1", IpClass::DatacenterIta),
+        (12797, "62.123.128.1", IpClass::DatacenterIta), // Retelit (ex Atlanet)
+        (60798, "45.14.184.1", IpClass::DatacenterIta),  // Servereasy
+        (60798, "2a00:82e0::1", IpClass::DatacenterIta),
+        (49367, "95.141.40.1", IpClass::DatacenterIta), // Seflow
+        (49367, "2a0a:5b80::1", IpClass::DatacenterIta),
+        (201333, "212.54.240.1", IpClass::DatacenterIta), // Naquadria
+        (201333, "2a02:4722::1", IpClass::DatacenterIta),
+        (197075, "37.77.160.1", IpClass::DatacenterIta), // Active Network
+        (197075, "2a03:ff80::1", IpClass::DatacenterIta),
+        (8968, "78.4.0.1", IpClass::DatacenterIta), // Retelit (ex BT Italia)
+        (8968, "2a02:4d80::1", IpClass::DatacenterIta),
+        (39120, "89.21.192.1", IpClass::DatacenterIta), // Convergenze
+        (39120, "2a01:9a80::1", IpClass::DatacenterIta),
+        (34758, "31.6.80.1", IpClass::DatacenterIta), // Axera
+        (34758, "2a04:2080::1", IpClass::DatacenterIta),
+        (16276, "45.66.82.1", IpClass::DatacenterIta), // OVH, its block registered in Italy
+    ];
+
+    /// Curated Italian ASNs with no pinned address, each with the reason.
+    #[cfg(feature = "geo-ita")]
+    const ITALIAN_WITHOUT_POINT: &[(u32, &str)] = &[(
+        24940,
+        "Hetzner announces no space registered in Italy: with the registry rule it gives the Italian table nothing",
+    )];
+
+    #[cfg(feature = "geo-eu")]
+    const EU_POINTS: &[(u32, &str, IpClass)] = &[
+        (20965, "62.40.96.1", IpClass::GovEu), // GEANT
+        (20965, "2001:798::1", IpClass::GovEu),
+        (21320, "83.97.88.1", IpClass::GovEu), // GEANT
+        (680, "141.44.0.1", IpClass::GovEu),   // DFN
+        (680, "2001:4cf0::1", IpClass::GovEu),
+        (2200, "132.166.0.1", IpClass::GovEu), // Renater
+        (2200, "2a07:2e40::1", IpClass::GovEu),
+        (766, "193.144.0.1", IpClass::GovEu), // RedIRIS
+        (766, "2001:720::1", IpClass::GovEu),
+        (1103, "145.144.0.1", IpClass::GovEu), // SURF
+        (1103, "2001:611::1", IpClass::GovEu),
+        (3320, "79.192.0.1", IpClass::ResidentialEu), // Deutsche Telekom
+        (3320, "2003:100::1", IpClass::ResidentialEu),
+        (3209, "188.96.0.1", IpClass::ResidentialEu), // Vodafone Germany
+        (3209, "2a00::1", IpClass::ResidentialEu),
+        (3215, "90.10.0.1", IpClass::ResidentialEu), // Orange
+        (3215, "2a01:cb00::1", IpClass::ResidentialEu),
+        (12322, "82.224.0.1", IpClass::ResidentialEu), // Free
+        (12322, "2a01:e30::1", IpClass::ResidentialEu),
+        (3352, "83.32.0.1", IpClass::ResidentialEu), // Telefonica
+        (3352, "2a02:9100::1", IpClass::ResidentialEu),
+        (1136, "77.160.0.1", IpClass::ResidentialEu), // KPN
+        (1136, "2a02:a400::1", IpClass::ResidentialEu),
+        (5432, "109.128.0.1", IpClass::ResidentialEu), // Proximus
+        (5432, "2a02:a000::1", IpClass::ResidentialEu),
+        (5617, "83.10.0.1", IpClass::ResidentialEu), // Orange Polska
+        (5617, "2a01:1200::1", IpClass::ResidentialEu),
+        (8447, "91.112.0.1", IpClass::ResidentialEu), // A1 Telekom Austria
+        (8447, "2001:850::1", IpClass::ResidentialEu),
+        (16276, "57.128.0.1", IpClass::DatacenterEu), // OVH
+        (16276, "2001:41d0::1", IpClass::DatacenterEu),
+        (24940, "2.28.0.1", IpClass::DatacenterEu), // Hetzner
+        (24940, "2a06:be80::1", IpClass::DatacenterEu),
+        (213230, "5.161.0.1", IpClass::DatacenterEu), // Hetzner
+        (213230, "2a01:4ff::1", IpClass::DatacenterEu),
+        (12876, "51.15.0.1", IpClass::DatacenterEu), // Scaleway
+        (12876, "2001:bc8:7000::1", IpClass::DatacenterEu),
+        (8560, "82.223.0.1", IpClass::DatacenterEu), // IONOS
+        (8560, "2a0d:7f00::1", IpClass::DatacenterEu),
+        (60781, "85.17.0.1", IpClass::DatacenterEu), // LeaseWeb
+        (60781, "2a01:b2e0::1", IpClass::DatacenterEu),
+        (51167, "169.58.0.1", IpClass::DatacenterEu), // Contabo
+        (51167, "2a02:c204::1", IpClass::DatacenterEu),
+    ];
+
+    /// Curated EU ASNs with no pinned EU address: they are Italian operators,
+    /// and the Italian table, consulted first, already answers for their space.
+    #[cfg(feature = "geo-eu")]
+    const EU_WITHOUT_POINT: &[(u32, &str)] = &[
+        (137, "GARR: its space is in the Italian table"),
+        (2598, "CNR: its space is in the Italian table"),
+        (3269, "TIM: its space is in the Italian table"),
+        (12797, "Retelit: its space is in the Italian table"),
+    ];
+
+    /// Addresses that must stay `Unknown` on every build: large networks
+    /// outside the EU-27, among them three European countries that are not
+    /// members.
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    const OUTSIDE: &[(&str, &str)] = &[
+        ("8.8.8.8", "Google, US"),
+        ("1.1.1.1", "Cloudflare, US"),
+        ("77.88.8.8", "Yandex, RU"),
+        ("114.114.114.114", "114DNS, CN"),
+        ("212.58.244.1", "BBC, GB: not in the EU-27"),
+        ("195.176.0.1", "SWITCH, CH: not in the EU-27"),
+        ("158.36.0.1", "Sikt, NO: not in the EU-27"),
+        ("2606:4700:4700::1111", "Cloudflare, US"),
+        ("2001:4860:4860::8888", "Google, US"),
+        ("2a02:6b8::feed:ff", "Yandex, RU"),
+        ("2001:630::1", "Jisc, GB: not in the EU-27"),
+        ("2001:620::1", "SWITCH, CH: not in the EU-27"),
+    ];
+
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    fn check_points(points: &[(u32, &str, IpClass)]) {
+        let wrong: Vec<String> = points
+            .iter()
+            .filter_map(|&(asn, ip, want)| {
+                let got = classify(ip.parse().unwrap());
+                (got != want).then(|| format!("AS{asn} {ip}: {got:?}, expected {want:?}"))
+            })
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "pinned addresses moved:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// Every curated ASN is either pinned or excused, and nothing is pinned or
+    /// excused that is not curated: the list in the generator and the points
+    /// here cannot drift apart.
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    fn check_coverage(
+        curated: &[(u32, IpClass)],
+        points: &[(u32, &str, IpClass)],
+        excused: &[(u32, &str)],
+    ) {
+        use std::collections::BTreeSet;
+        let curated: BTreeSet<u32> = curated.iter().map(|&(asn, _)| asn).collect();
+        let pinned: BTreeSet<u32> = points.iter().map(|&(asn, _, _)| asn).collect();
+        let excused: BTreeSet<u32> = excused.iter().map(|&(asn, _)| asn).collect();
+        let covered: BTreeSet<u32> = pinned.union(&excused).copied().collect();
+        assert_eq!(
+            curated.difference(&covered).collect::<Vec<_>>(),
+            Vec::<&u32>::new(),
+            "curated ASNs with no pinned address and no stated reason"
+        );
+        assert_eq!(
+            covered.difference(&curated).collect::<Vec<_>>(),
+            Vec::<&u32>::new(),
+            "pinned or excused ASNs that are not on the curated list"
+        );
+        assert_eq!(
+            pinned.intersection(&excused).collect::<Vec<_>>(),
+            Vec::<&u32>::new(),
+            "ASNs both pinned and excused"
+        );
+    }
+
+    #[cfg(feature = "geo-ita")]
+    #[test]
+    fn every_curated_italian_asn_keeps_its_pinned_address() {
+        check_points(ITALIAN_POINTS);
+        check_coverage(
+            data_ita::CURATED_ASNS,
+            ITALIAN_POINTS,
+            ITALIAN_WITHOUT_POINT,
+        );
+        // The role of each point is the role its ASN is curated with.
+        for &(asn, ip, class) in ITALIAN_POINTS {
+            let curated = data_ita::CURATED_ASNS.iter().find(|c| c.0 == asn).unwrap();
+            assert_eq!(curated.1, class, "AS{asn} {ip}");
+        }
+    }
+
+    #[cfg(feature = "geo-eu")]
+    #[test]
+    fn every_curated_eu_asn_keeps_its_pinned_address() {
+        check_points(EU_POINTS);
+        check_coverage(data_eu::CURATED_ASNS, EU_POINTS, EU_WITHOUT_POINT);
+        for &(asn, ip, class) in EU_POINTS {
+            let curated = data_eu::CURATED_ASNS.iter().find(|c| c.0 == asn).unwrap();
+            assert_eq!(curated.1, class, "AS{asn} {ip}");
+        }
+    }
+
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    #[test]
+    fn large_networks_outside_the_region_stay_unknown() {
+        let wrong: Vec<String> = OUTSIDE
+            .iter()
+            .filter_map(|&(ip, who)| {
+                let got = classify(ip.parse().unwrap());
+                (got != IpClass::Unknown).then(|| format!("{ip} ({who}): {got:?}"))
+            })
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "classified, and must not be:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    // ── Floors ────────────────────────────────────────────────────────
+    // A table that lost most of a class still sorts and does not overlap.
+    // Each floor is about three quarters of the class on 2026-10-06.
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    fn v4_addresses(ranges: &[CidrEntry], class: IpClass) -> u64 {
+        ranges
+            .iter()
+            .filter(|e| e.class == class)
+            .map(|e| u64::from(e.end - e.start) + 1)
+            .sum()
+    }
+
+    #[cfg(feature = "geo-ita")]
+    #[test]
+    fn the_italian_table_holds_each_class() {
+        let t = data_ita::RANGES;
+        assert!(v4_addresses(t, IpClass::GovIta) > 2_000_000);
+        assert!(v4_addresses(t, IpClass::ResidentialIta) > 29_000_000);
+        assert!(v4_addresses(t, IpClass::DatacenterIta) > 1_000_000);
+        assert!(data_ita::RANGES6.len() >= 20);
+    }
+
+    #[cfg(feature = "geo-eu")]
+    #[test]
+    fn the_eu_table_holds_each_class() {
+        let t = data_eu::RANGES;
+        assert!(v4_addresses(t, IpClass::Eu) > 265_000_000);
+        assert!(v4_addresses(t, IpClass::GovEu) > 16_000_000);
+        assert!(v4_addresses(t, IpClass::ResidentialEu) > 94_000_000);
+        assert!(v4_addresses(t, IpClass::DatacenterEu) > 7_500_000);
+        assert!(data_eu::RANGES6.len() >= 11_000);
+    }
+
+    // ── Data age ──────────────────────────────────────────────────────
+    #[test]
+    fn days_from_civil_counts_from_the_epoch() {
+        assert_eq!(days_from_civil("1970-01-01"), Some(0));
+        assert_eq!(days_from_civil("1970-01-02"), Some(1));
+        assert_eq!(days_from_civil("1969-12-31"), Some(-1));
+        assert_eq!(days_from_civil("2000-03-01"), Some(11_017));
+        assert_eq!(days_from_civil("2026-10-06"), Some(20_732));
+        // Leap years: 2024 and 2000 have a 29 February, 2026 and 1900 do not.
+        assert_eq!(
+            days_from_civil("2024-03-01").unwrap() - days_from_civil("2024-02-28").unwrap(),
+            2
+        );
+        assert_eq!(
+            days_from_civil("2026-03-01").unwrap() - days_from_civil("2026-02-28").unwrap(),
+            1
+        );
+        assert!(days_from_civil("2000-02-29").is_some());
+        assert!(days_from_civil("1900-02-29").is_none());
+        // A year is 365 or 366 days wherever it is taken.
+        assert_eq!(
+            days_from_civil("2027-01-01").unwrap() - days_from_civil("2026-01-01").unwrap(),
+            365
+        );
+    }
+
+    #[test]
+    fn days_from_civil_refuses_what_is_not_a_date() {
+        for bad in [
+            "",
+            "2026-10-6",
+            "2026/10/06",
+            "2026-13-01",
+            "2026-00-10",
+            "2026-04-31",
+            "2026-02-30",
+            "2026-10-00",
+            "20261006",
+            "2026-1O-06",
+            "+026-10-06",
+            "2026-10-06 ",
+        ] {
+            assert_eq!(days_from_civil(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn age_is_counted_in_whole_days() {
+        let midnight = 20_732 * 86_400; // 2026-10-06T00:00:00Z
+        assert_eq!(snapshot_epoch_secs("2026-10-06"), Some(midnight as i64));
+        assert_eq!(age_days("2026-10-06", midnight), Some(0));
+        assert_eq!(age_days("2026-10-06", midnight + 86_399), Some(0));
+        assert_eq!(age_days("2026-10-06", midnight + 86_400), Some(1));
+        assert_eq!(age_days("2026-10-06", midnight - 1), Some(-1));
+        assert_eq!(age_days("not a date", midnight), None);
+    }
+
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    #[test]
+    fn a_table_is_stale_past_forty_five_days_and_not_before() {
+        let (region, date) = snapshots()[0];
+        let day0 = (days_from_civil(date).unwrap() * 86_400) as u64;
+        assert!(stale_tables(day0).is_empty());
+        assert!(stale_tables(day0 + 45 * 86_400).is_empty());
+        let stale = stale_tables(day0 + 46 * 86_400);
+        assert_eq!(stale.len(), snapshots().len());
+        assert_eq!(stale[0], (region, date, 46));
+        // A clock set before the snapshot is not staleness.
+        assert!(stale_tables(0).is_empty());
+    }
+
+    #[test]
+    fn the_build_lists_the_tables_it_carries() {
+        let regions: Vec<&str> = snapshots().iter().map(|s| s.0).collect();
+        let mut want: Vec<&str> = Vec::new();
+        if cfg!(feature = "geo-ita") {
+            want.push("ita");
+        }
+        if cfg!(feature = "geo-eu") {
+            want.push("eu");
+        }
+        assert_eq!(regions, want);
     }
 
     #[cfg(feature = "geo-eu")]

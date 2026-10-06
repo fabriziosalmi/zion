@@ -12,6 +12,40 @@
 
 use super::{CidrEntry, CidrEntry6, IpClass};
 
+/// The day of the last weekly snapshot folded into this table. The binary
+/// reports it at boot and on `/metrics`, so the age of the data is visible
+/// where the binary runs.
+pub const SNAPSHOT_DATE: &str = "2026-10-06";
+
+/// The curated ASNs this table is built from, with the role each one gives
+/// to what it announces. The tests hold one pinned address for each.
+#[allow(dead_code)]
+#[rustfmt::skip]
+pub const CURATED_ASNS: &[(u32, IpClass)] = &[
+    (137, IpClass::GovIta),
+    (1267, IpClass::ResidentialIta),
+    (2598, IpClass::GovIta),
+    (3269, IpClass::ResidentialIta),
+    (8612, IpClass::ResidentialIta),
+    (8968, IpClass::DatacenterIta),
+    (12797, IpClass::DatacenterIta),
+    (12874, IpClass::ResidentialIta),
+    (16232, IpClass::ResidentialIta),
+    (16276, IpClass::DatacenterIta),
+    (24940, IpClass::DatacenterIta),
+    (30722, IpClass::ResidentialIta),
+    (31034, IpClass::DatacenterIta),
+    (34758, IpClass::DatacenterIta),
+    (35612, IpClass::ResidentialIta),
+    (39120, IpClass::DatacenterIta),
+    (41325, IpClass::GovIta),
+    (49367, IpClass::DatacenterIta),
+    (60798, IpClass::DatacenterIta),
+    (197075, IpClass::DatacenterIta),
+    (201333, IpClass::DatacenterIta),
+    (210278, IpClass::ResidentialIta),
+];
+
 /// Sorted by start IP (ascending), non-overlapping.
 #[rustfmt::skip]
 pub static RANGES: &[CidrEntry] = &[
@@ -838,5 +872,50 @@ mod tests {
         for w in RANGES6.windows(2) {
             assert!(w[0].end < w[1].start, "RANGES6 overlap");
         }
+    }
+
+    #[test]
+    fn every_entry_ends_at_or_after_its_start() {
+        assert!(RANGES.iter().all(|e| e.start <= e.end));
+        assert!(RANGES6.iter().all(|e| e.start <= e.end));
+    }
+
+    /// Nothing a client on the Internet can come from is reserved space: a
+    /// row inside it means a source file was wrong.
+    #[test]
+    fn no_entry_touches_reserved_space() {
+        // 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.168/16, 224/3.
+        const RESERVED: &[(u32, u32)] = &[
+            (0x0000_0000, 0x00FF_FFFF),
+            (0x0A00_0000, 0x0AFF_FFFF),
+            (0x6440_0000, 0x647F_FFFF),
+            (0x7F00_0000, 0x7FFF_FFFF),
+            (0xA9FE_0000, 0xA9FE_FFFF),
+            (0xAC10_0000, 0xAC1F_FFFF),
+            (0xC0A8_0000, 0xC0A8_FFFF),
+            (0xE000_0000, 0xFFFF_FFFF),
+        ];
+        for e in RANGES {
+            for &(lo, hi) in RESERVED {
+                assert!(
+                    e.end < lo || e.start > hi,
+                    "{:#010X} is in reserved space",
+                    e.start
+                );
+            }
+        }
+        // Global unicast is 2000::/3; everything else is reserved or special.
+        for e in RANGES6 {
+            assert!(
+                e.start >> 125 == 1 && e.end >> 125 == 1,
+                "{:#034X} is outside 2000::/3",
+                e.start
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_date_is_a_date() {
+        assert!(crate::sovereign::days_from_civil(SNAPSHOT_DATE).is_some());
     }
 }
