@@ -457,6 +457,127 @@ def test_blocks_and_sizes_read_like_a_person_writes_them():
     assert gsd.format_size("v4", 524288) == "524,288 addresses"
     assert gsd.format_size("v6", 1 << 96) == "65,536 /48s"
     assert gsd.format_size("v6", 1 << 64) == "less than a /48"
+    assert gsd.format_size("v6", 1 << 80) == "1 /48"
+    assert gsd.format_size("v6", 1 << 81) == "2 /48s"
+
+
+# ── Who announces a block, and where it is registered ────────────────────────
+
+def test_span_index_agrees_with_a_brute_force_count():
+    rng = random.Random(579)
+    for _ in range(200):
+        spans = [(r.start, r.end, r.ip_class) for r in random_table(rng, merged=False)]
+        rng.shuffle(spans)  # the index sorts
+        index = gsd.SpanIndex(spans)
+        for _ in range(20):
+            start = rng.randrange(0, 440)
+            end = start + rng.randrange(0, 60)
+            want = {}
+            for ip in range(start, end + 1):
+                label = next((l for s, e, l in spans if s <= ip <= e), None)
+                want[label] = want.get(label, 0) + 1
+            got = index.cover(start, end)
+            assert got == want, (start, end)
+            assert list(got.values()) == sorted(got.values(), reverse=True)
+    assert gsd.SpanIndex([]).cover(5, 9) == {None: 5}
+
+
+def test_text_from_a_source_file_cannot_become_markdown():
+    assert gsd.safe_text("ASN-WINDTRE IUNET") == "ASN-WINDTRE IUNET"
+    hostile = "x | [click](https://evil.example) @maintainer <img src=x> `code` **b**"
+    cleaned = gsd.safe_text(hostile, limit=200)
+    assert cleaned == "x click https evil.example maintainer img src x code b"
+    assert not set(cleaned) & set("|[]()@<>`*:/")
+    assert gsd.safe_text("a" * 60) == "a" * 39 + "…"
+    assert gsd.safe_text("a" * 40) == "a" * 40
+    assert gsd.safe_text("  spaced \t out\n") == "spaced out"
+
+
+def test_cover_reads_as_a_sentence():
+    assert gsd.format_cover({"IT": 256}, "nowhere") == "IT"
+    assert gsd.format_cover({None: 256}, "not announced") == "not announced"
+    assert gsd.format_cover({}, "not announced") == "not announced"
+    assert gsd.format_cover({"DE": 60, "FR": 40}, "x") == "DE 60 %, FR 40 %"
+    assert gsd.format_cover({"AS1 X (IT)": 75, None: 25}, "not announced") \
+        == "AS1 X (IT) 75 %, not announced 25 %"
+    assert gsd.format_cover({"A": 5, "B": 3, "C": 1, "D": 1}, "x") == "A 50 %, B 30 %, 2 more"
+
+
+def describer_for(d):
+    """A Describer over the fixture files written in `d`."""
+    return gsd.Describer(
+        {"v4": gsd.load_origins(d / "v4", "v4"), "v6": gsd.load_origins(d / "v6", "v6")},
+        gsd.load_registry(d / "ripe"))
+
+
+def test_a_block_is_described_by_its_origin_and_its_registry():
+    with workdir() as d:
+        write_sources(d)
+        who = describer_for(d)
+    block = lambda a, b, fam="v4": gsd.Change(
+        fam, int((V4 if fam == "v4" else V6)(a)), int((V4 if fam == "v4" else V6)(b)), "X", None)
+    c = block("192.0.2.0", "192.0.2.255")
+    assert who.announced_by(c) == "AS64496 fixture (ZZ)" and who.registered_in(c) == "IT"
+    # Half announced, half not; half registered in France, half nowhere in the file.
+    c = block("198.51.100.128", "198.51.101.127")
+    assert who.announced_by(c) == "AS64497 fixture (ZZ) 50 %, not announced 50 %"
+    assert who.registered_in(c) == "FR 50 %, not in RIPE's file 50 %"
+    # The address after the last one of a delegation belongs to nobody.
+    c = block("192.0.2.255", "192.0.3.0")
+    assert who.registered_in(c) == "IT 50 %, not in RIPE's file 50 %"
+    assert who.announced_by(c) == "AS64496 fixture (ZZ) 50 %, not announced 50 %"
+    c = block("203.0.113.0", "203.0.113.255")
+    assert who.announced_by(c) == "not announced" and who.registered_in(c) == "not in RIPE's file"
+    c = block("2001:db8::", "2001:db8::ffff", "v6")
+    assert who.announced_by(c) == "AS64496 fixture (ZZ)" and who.registered_in(c) == "IT"
+
+
+def test_registry_and_origin_labels_are_cleaned_on_load():
+    with workdir() as d:
+        (d / "ripe").write_text(ripe_text([
+            "ripencc|it|ipv4|192.0.2.0|256|20100101|allocated",   # not a country code
+            "ripencc|FR|ipv4|not-an-address|256|20100101|allocated",
+        ]))
+        (d / "v4").write_text("192.0.2.0\t192.0.2.255\t64496\tI|T\tEvil [x](y) | @you\n"
+                              "short row\n")
+        reg = gsd.load_registry(d / "ripe")
+        assert reg["v4"].cover(int(V4("192.0.2.0")), int(V4("192.0.2.255"))) == {"??": 256}
+        org = gsd.load_origins(d / "v4", "v4")
+        assert list(org.cover(int(V4("192.0.2.0")), int(V4("192.0.2.9")))) == [
+            "AS64496 Evil x y you (I…)"]
+
+
+def test_review_lines_and_summary_say_who_and_where():
+    s = int(V4("198.18.0.0"))  # RFC 2544 benchmarking space, aligned on a /18
+    old = {"v4": [gsd.Range(0, BIG - 1, "Eu")], "v6": []}
+    new = {"v4": [gsd.Range(0, BIG - 1, "Eu"), gsd.Range(s, s + (1 << 14) - 1, "GovEu")], "v6": []}
+    who = gsd.Describer(
+        {"v4": gsd.SpanIndex([(s, s + (1 << 14) - 1, "AS64496 Example (IT)")]), "v6": gsd.SpanIndex([])},
+        {"v4": gsd.SpanIndex([(s, s + (1 << 13) - 1, "IT")]), "v6": gsd.SpanIndex([])})
+    b = gsd.check_budget(old, new, "Eu", who)
+    assert b.review == [
+        "IPv4 class GovEu is new (16,384 addresses)",
+        "198.18.0.0/18 (16,384 addresses) moves from no class to GovEu: "
+        "AS64496 Example (IT); registered in IT 50 %, not in RIPE's file 50 %"], b.review
+    # Without a describer the line stops at the classes.
+    assert gsd.check_budget(old, new, "Eu").review[1] == \
+        "198.18.0.0/18 (16,384 addresses) moves from no class to GovEu"
+    changes = gsd.diff_family(old["v4"], new["v4"], "v4")
+    lines = gsd.render_changes(changes, who)
+    assert lines[0] == "### Largest IPv4 changes"
+    assert lines[4] == ("| `198.18.0.0/18` | 16,384 | no class | GovEu | AS64496 Example (IT) "
+                        "| IT 50 %, not in RIPE's file 50 % |")
+    assert not any("IPv6" in l for l in lines)
+
+
+def test_summary_lists_the_largest_changes_and_counts_the_rest():
+    # Twenty separate /24s enter a class: twelve are listed, eight are counted.
+    changes = [gsd.Change("v4", i << 16, (i << 16) + 255 + i, None, "GovIta") for i in range(20)]
+    lines = gsd.render_changes(changes, None)
+    rows = [l for l in lines if l.startswith("| `")]
+    assert len(rows) == 12 and rows[0].startswith("| `0.19.0.0-0.19.1.18` | 275 |")
+    assert "8 smaller IPv4 changes are not listed (2,076 addresses in all)." in lines
+    assert gsd.render_changes([], None) == []
 
 
 # ── The change budget ────────────────────────────────────────────────────────
@@ -634,9 +755,17 @@ def test_generator_refuses_a_refresh_over_budget_and_keeps_the_old_table():
         assert report["review"] == [
             "AS64497 (Example) is curated as ResidentialIta and originates no IPv4 range "
             "in this snapshot"]
-        # By hand, with the flag, it is written.
-        code, _, _ = run_generator(d, "--output", str(out), "--allow-over-budget", v4=rows)
+        assert report["changes"] == [{
+            "family": "v4", "block": "198.51.100.0/24", "addresses": 256,
+            "from": "ResidentialIta", "to": None,
+            "announced_by": "not announced", "registered_in": "FR"}]
+        # By hand, with the flag, it is written, and the summary shows the block.
+        summ = d / "summary.md"
+        code, _, _ = run_generator(d, "--output", str(out), "--allow-over-budget",
+                                   "--summary", str(summ), v4=rows)
         assert code == 0 and out.read_text() != before
+        assert "| `198.51.100.0/24` | 256 | ResidentialIta | no class | not announced | FR |" \
+            in summ.read_text()
 
 
 def test_generator_checks_the_files_before_any_lookup():
