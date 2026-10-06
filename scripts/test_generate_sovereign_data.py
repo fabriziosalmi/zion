@@ -418,6 +418,26 @@ def test_generated_table_reads_back_identical():
         assert key(got["v4"]) == key(v4) and key(got["v6"]) == key(v6)
 
 
+def test_generated_file_carries_its_date_and_its_curated_list():
+    region = gsd.REGIONS["ita"]
+    text = gsd.generate_rust([gsd.Range(1 << 24, (1 << 24) + 255, "GovIta")], [], region,
+                             "2026-10-06")
+    assert 'pub const SNAPSHOT_DATE: &str = "2026-10-06";' in text
+    # Every curated ASN once, with its role, in ascending order.
+    rows = [l.strip() for l in text.split("pub const CURATED_ASNS")[1].split("];")[0].splitlines()
+            if l.strip().startswith("(")]
+    want = sorted((asn, cls) for asns, cls in region["asn_roles"] for asn in asns)
+    assert rows == [f"({asn}, IpClass::{cls})," for asn, cls in want]
+    assert "(137, IpClass::GovIta)," in rows and "(31034, IpClass::DatacenterIta)," in rows
+    # The table rows are still the only thing read back.
+    with workdir() as d:
+        (d / "t.rs").write_text(text)
+        assert key(gsd.parse_rust_table(d / "t.rs")["v4"]) == [(1 << 24, (1 << 24) + 255, "GovIta")]
+    for name in ("every_entry_ends_at_or_after_its_start", "no_entry_touches_reserved_space",
+                 "snapshot_date_is_a_date"):
+        assert f"fn {name}()" in text
+
+
 def test_diff_agrees_with_a_brute_force_comparison():
     rng = random.Random(2026)
     for i in range(400):

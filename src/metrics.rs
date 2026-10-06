@@ -1639,6 +1639,24 @@ classifications since process start.\n# TYPE zion_sovereign_classifications_tota
                 out.extend_from_slice(itoa_buf.format(count).as_bytes());
                 out.extend_from_slice(b"\n");
             }
+            // The age of the compiled-in tables, as the day of their last
+            // snapshot: `time() - this` is how stale the classification is.
+            out.extend_from_slice(
+                b"# HELP zion_sovereign_data_snapshot_timestamp_seconds Day of the last \
+snapshot in each compiled-in address table, in seconds since the epoch.\n\
+# TYPE zion_sovereign_data_snapshot_timestamp_seconds gauge\n",
+            );
+            for &(region, date) in crate::sovereign::snapshots() {
+                if let Some(secs) = crate::sovereign::snapshot_epoch_secs(date) {
+                    out.extend_from_slice(
+                        b"zion_sovereign_data_snapshot_timestamp_seconds{region=\"",
+                    );
+                    out.extend_from_slice(region.as_bytes());
+                    out.extend_from_slice(b"\"} ");
+                    out.extend_from_slice(itoa_buf.format(secs).as_bytes());
+                    out.extend_from_slice(b"\n");
+                }
+            }
         }
 
         if openmetrics {
@@ -2128,6 +2146,46 @@ mod tests {
             option_env!("ZION_COMMIT_DATE").unwrap_or("unknown"),
         )));
         assert!(out.contains("zion_connections_rejected_global 0"));
+    }
+
+    /// The day of each compiled-in address table is on `/metrics`, in both
+    /// exposition formats.
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
+    #[test]
+    fn render_carries_the_snapshot_day_of_each_address_table() {
+        let m = Metrics::new();
+        for openmetrics in [false, true] {
+            let out = String::from_utf8(m.render(openmetrics).to_vec()).unwrap();
+            let lines: Vec<&str> = out
+                .lines()
+                .filter(|l| l.starts_with("zion_sovereign_data_snapshot_timestamp_seconds{"))
+                .collect();
+            let want: Vec<String> = crate::sovereign::snapshots()
+                .iter()
+                .map(|&(region, date)| {
+                    format!(
+                        "zion_sovereign_data_snapshot_timestamp_seconds{{region=\"{region}\"}} {}",
+                        crate::sovereign::snapshot_epoch_secs(date).unwrap()
+                    )
+                })
+                .collect();
+            assert!(!want.is_empty());
+            assert_eq!(lines, want);
+            assert!(out.contains("# TYPE zion_sovereign_data_snapshot_timestamp_seconds gauge"));
+            // Midnight UTC of a day: a multiple of 86,400.
+            for l in &lines {
+                let secs: i64 = l.rsplit(' ').next().unwrap().parse().unwrap();
+                assert!(secs > 1_700_000_000 && secs % 86_400 == 0, "{l}");
+            }
+        }
+    }
+
+    /// A build with no address table has no such family at all.
+    #[cfg(not(any(feature = "geo-ita", feature = "geo-eu")))]
+    #[test]
+    fn render_has_no_snapshot_day_without_address_tables() {
+        let out = String::from_utf8(Metrics::new().render(false).to_vec()).unwrap();
+        assert!(!out.contains("zion_sovereign_data_snapshot_timestamp_seconds"));
     }
 
     #[test]

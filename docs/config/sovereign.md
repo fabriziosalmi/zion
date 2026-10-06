@@ -188,6 +188,36 @@ network's /13 that left `gov_eu` for one week, the /17 that was `datacenter_eu`
 for two, and the three /18s of an Italian ISP that came and went are never
 published.
 
+### How old the data in a running binary is
+
+The tables are compiled in. The repository refreshes them every week; a binary
+keeps the ones it was built with. Each table carries the day of its last
+snapshot, and the binary shows it in three places:
+
+- the boot line: `Sovereign Edge active (region=eu, ..., address tables: ita
+  2026-10-06, eu 2026-10-06)`;
+- a `WARN` at boot when a table is more than 45 days old;
+- `/metrics`: `zion_sovereign_data_snapshot_timestamp_seconds{region="..."}`
+  (see [observability](../guide/observability.md)).
+
+### What the tests hold the tables to
+
+Each refresh PR runs, in CI, against the table it proposes:
+
+- structure: rows sorted, not overlapping, ending at or after their start, and
+  none in reserved space (`10/8`, `127/8`, `224/3`..., or outside `2000::/3`);
+- **one pinned address per curated ASN**, IPv4 and IPv6 where the ASN has both,
+  with the class it must have (82 addresses). An ASN that drops out of a
+  table, or a lookup that breaks, fails by name. The test also checks the list
+  itself: an ASN added to the generator without a pinned address fails;
+- twelve addresses that must stay `unknown`: large networks in the US, Russia
+  and China, and in the United Kingdom, Switzerland and Norway, which are in
+  Europe and not in the EU-27;
+- a floor on the addresses of each class, at about three quarters of today's.
+
+A pinned address that really moved (the operator gave the block back) is
+updated by hand. That is the point of pinning it.
+
 ### The holder-validation guarantee
 
 The curated ASN sets in the generator are not bare numbers with a comment —
