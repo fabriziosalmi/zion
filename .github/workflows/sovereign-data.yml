@@ -80,11 +80,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `state` is the memory of the hysteresis: what was observed and is
+          # not yet published. The generator reads and rewrites it next to the
+          # table, and it is committed with it.
           - region: ita
             output: src/sovereign/data_ita.rs
+            state: src/sovereign/data_ita.pending.json
             adjective: Italian
           - region: eu
             output: src/sovereign/data_eu.rs
+            state: src/sovereign/data_eu.pending.json
             adjective: EU-27
     steps:
     # Fail with a sentence a human can act on. Without this, a missing secret
@@ -133,6 +138,10 @@ jobs:
         #           ranges with the old Italian/EU role);
         #   exit 3  the new table moves a class by more than a fifth.
         # Each of these is INTENTIONAL and needs a human.
+        #
+        # The table it writes is not the snapshot: a run of addresses enters a
+        # class after 2 weekly snapshots that agree and leaves after 3. What is
+        # still waiting goes to ${{ matrix.state }}.
         src="$RUNNER_TEMP/sovereign-sources"
         code=0
         python3 scripts/generate_sovereign_data.py \
@@ -165,7 +174,8 @@ jobs:
     - name: Check for changes
       id: diff
       run: |
-        if git diff --quiet ${{ matrix.output }}; then
+        # --porcelain, not `git diff`: the state file is untracked the first time.
+        if [ -z "$(git status --porcelain -- ${{ matrix.output }} ${{ matrix.state }})" ]; then
           echo "changed=false" >> "$GITHUB_OUTPUT"
         else
           LINES_ADDED=$(git diff --stat ${{ matrix.output }} | tail -1 | grep -oP '\d+ insertion' | grep -oP '\d+' || echo "0")
@@ -193,7 +203,7 @@ jobs:
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
         git checkout -b "$BRANCH"
-        git add ${{ matrix.output }}
+        git add ${{ matrix.output }} ${{ matrix.state }}
         # -s is required: dco.yml gates every pull_request to master on a
         # Signed-off-by trailer, so an unsigned commit here would open a PR that
         # can never merge.
@@ -216,6 +226,7 @@ jobs:
           echo "- The three source files: RIPE's record counts, date and published MD5; IPtoASN covering the address space with no hole; none older than a week."
           echo "- Every curated ASN still matches its live RIPEstat holder (the job stops otherwise, so a reassigned ASN is not re-labelled with a sovereign role)."
           echo "- No class moves by more than a fifth (the job stops otherwise)."
+          echo "- Nothing here was seen only once: a run enters a class after 2 weekly snapshots that agree and leaves or changes class after 3. What is still waiting is in \`${{ matrix.state }}\`."
           echo
           echo "CI additionally runs \`ranges_are_sorted\`, \`ranges_dont_overlap\` and the pinned golden classification test."
         } > "$RUNNER_TEMP/body.md"

@@ -17,6 +17,7 @@ RFC 3849, RFC 5398) wherever the checks leave a choice.
 """
 
 import contextlib
+import datetime
 import hashlib
 import io
 import ipaddress
@@ -677,6 +678,263 @@ def test_curated_asns_that_announce_nothing_are_named():
     assert gsd.unannounced_asns(roles, announced) == [64497, 64498]
 
 
+# ── Hysteresis ───────────────────────────────────────────────────────────────
+
+def as_map(table, space=440):
+    """A table as {address: class}, for the brute-force models."""
+    return {ip: r.ip_class for r in table for ip in range(r.start, min(r.end, space) + 1)}
+
+
+def as_table(mapping):
+    """{address: class} back to sorted, merged ranges."""
+    out = []
+    for ip in sorted(mapping):
+        if out and out[-1].end + 1 == ip and out[-1].ip_class == mapping[ip]:
+            out[-1].end = ip
+        else:
+            out.append(gsd.Range(ip, ip, mapping[ip]))
+    return out
+
+
+def key(table):
+    return [(r.start, r.end, r.ip_class) for r in table]
+
+
+def per_address(pending):
+    return {ip: q.facts() for q in pending for ip in range(q.start, q.end + 1)}
+
+
+def model_step(published, waiting, observed, day):
+    """One snapshot, one address at a time, with no notion of runs: the rule as
+    a person would state it."""
+    applied, went_back = {}, {}
+    for ip in set(published) | set(observed) | set(waiting):
+        p, o, q = published.get(ip), observed.get(ip), waiting.get(ip)
+        if o == p:
+            if q:
+                went_back[ip] = waiting.pop(ip)
+            continue
+        if q and q[0] == o:
+            fresh = gsd._days_between(q[3], day) >= gsd.MIN_SPACING_DAYS
+            q = (o, q[1] + 1, q[2], day) if fresh else q
+        else:
+            q = (o, 1, day, day)
+        if q[1] >= (gsd.ENTER_AFTER if p is None else gsd.LEAVE_AFTER):
+            applied[ip] = q
+            waiting.pop(ip, None)
+            if o is None:
+                del published[ip]
+            else:
+                published[ip] = o
+        else:
+            waiting[ip] = q
+    return applied, went_back
+
+
+def test_settle_agrees_with_a_per_address_model():
+    rng = random.Random(568)
+    for _ in range(120):
+        table = random_table(rng)
+        pending = []
+        m_pub, m_wait = as_map(table), {}
+        observed = random_table(rng)
+        day = datetime.date(2026, 8, 10)
+        for _ in range(9):
+            day += datetime.timedelta(days=rng.choice([0, 1, 4, 5, 7, 7, 7, 9]))
+            if rng.random() < 0.45:
+                observed = random_table(rng)  # otherwise the same observation again
+            got = gsd.settle_family(table, observed, pending, day.isoformat(), "v4")
+            applied, went_back = model_step(m_pub, m_wait, as_map(observed), day.isoformat())
+            assert key(got.table) == key(as_table(m_pub))
+            assert per_address(got.pending) == m_wait
+            assert per_address(got.applied) == applied
+            assert per_address(got.went_back) == went_back
+            # Written down as sorted runs that do not touch needlessly.
+            for seq in (got.table, got.pending, got.applied, got.went_back):
+                for a, b in zip(seq, seq[1:]):
+                    assert a.end < b.start
+            for a, b in zip(got.pending, got.pending[1:]):
+                assert not (a.end + 1 == b.start and a.facts() == b.facts())
+            table, pending = got.table, got.pending
+
+
+def weeks(n, start=datetime.date(2026, 10, 5)):
+    return [(start + datetime.timedelta(weeks=i)).isoformat() for i in range(n)]
+
+
+def run_snapshots(table, observations):
+    """Feed (day, observed) pairs through settle_family; the table after each."""
+    pending, tables = [], []
+    for day, observed in observations:
+        got = gsd.settle_family(table, observed, pending, day, "v4")
+        table, pending = got.table, got.pending
+        tables.append((key(table), got))
+    return tables
+
+
+def test_a_run_enters_a_class_after_two_weekly_snapshots():
+    new = [gsd.Range(100, 199, "GovIta")]
+    w = weeks(3)
+    steps = run_snapshots([], [(w[0], new), (w[1], new)])
+    assert steps[0][0] == [] and [q.seen for q in steps[0][1].pending] == [1]
+    assert steps[1][0] == [(100, 199, "GovIta")] and steps[1][1].pending == []
+    assert [(q.seen, q.first, q.last) for q in steps[1][1].applied] == [(2, w[0], w[1])]
+
+
+def test_a_run_leaves_or_changes_class_after_three():
+    table = [gsd.Range(100, 199, "GovIta")]
+    w = weeks(4)
+    for observed in ([], [gsd.Range(100, 199, "ResidentialIta")]):
+        steps = run_snapshots(table, [(d, observed) for d in w[:3]])
+        assert steps[0][0] == steps[1][0] == [(100, 199, "GovIta")]
+        assert [q.seen for q in steps[1][1].pending] == [2]
+        assert steps[2][0] == key(observed) and steps[2][1].pending == []
+
+
+def test_runs_on_the_same_day_are_one_snapshot():
+    new = [gsd.Range(100, 199, "GovIta")]
+    steps = run_snapshots([], [("2026-10-05", new), ("2026-10-05", new), ("2026-10-06", new),
+                               ("2026-10-09", new), ("2026-10-10", new)])
+    # Four days after the first sighting is still the same week...
+    assert [s[0] for s in steps[:4]] == [[]] * 4
+    assert [q.seen for q in steps[3][1].pending] == [1]
+    # ...five days after is the next one.
+    assert steps[4][0] == [(100, 199, "GovIta")]
+
+
+def test_a_flap_is_never_published():
+    table = [gsd.Range(0, 999, "ResidentialIta")]
+    gone = [gsd.Range(0, 499, "ResidentialIta"), gsd.Range(600, 999, "ResidentialIta")]
+    w = weeks(6)
+    # Away one week, back; away two weeks, back.
+    steps = run_snapshots(table, [(w[0], gone), (w[1], table), (w[2], gone), (w[3], gone),
+                                  (w[4], table), (w[5], table)])
+    assert all(s[0] == [(0, 999, "ResidentialIta")] for s in steps)
+    assert [(q.start, q.end, q.seen) for q in steps[1][1].went_back] == [(500, 599, 1)]
+    assert [(q.start, q.end, q.seen) for q in steps[4][1].went_back] == [(500, 599, 2)]
+    assert steps[5][1].went_back == [] and steps[5][1].pending == []
+
+
+def test_a_different_observation_starts_the_count_again():
+    table = [gsd.Range(0, 99, "GovIta")]
+    res, dc = [gsd.Range(0, 99, "ResidentialIta")], [gsd.Range(0, 99, "DatacenterIta")]
+    w = weeks(5)
+    steps = run_snapshots(table, [(w[0], res), (w[1], res), (w[2], dc), (w[3], dc), (w[4], dc)])
+    assert [s[0] for s in steps[:4]] == [[(0, 99, "GovIta")]] * 4
+    assert [(q.observed, q.seen, q.first) for q in steps[2][1].pending] == [("DatacenterIta", 1, w[2])]
+    assert steps[2][1].went_back == []
+    assert steps[4][0] == [(0, 99, "DatacenterIta")]
+
+
+def test_a_steady_observation_is_reached_and_then_nothing_moves():
+    rng = random.Random(3)
+    for _ in range(40):
+        table, observed = random_table(rng), random_table(rng)
+        steps = run_snapshots(table, [(d, observed) for d in weeks(5)])
+        assert steps[2][0] == key(observed)          # three snapshots are always enough
+        for _, got in steps[3:]:
+            assert key(got.table) == key(observed)
+            assert got.pending == got.applied == got.went_back == []
+
+
+def test_patching_a_table_and_cutting_the_waiting_list():
+    rng = random.Random(11)
+    for _ in range(150):
+        table, other = random_table(rng), random_table(rng)
+        changes = [c for c in gsd.diff_family(table, other, "v4") if rng.random() < 0.5]
+        want = as_map(table)
+        for c in changes:
+            for ip in range(c.start, c.end + 1):
+                if c.new is None:
+                    want.pop(ip, None)
+                else:
+                    want[ip] = c.new
+        assert key(gsd.patch_family(table, changes)) == key(as_table(want))
+
+        pending = [gsd.Pending("v4", r.start, r.end, r.ip_class, 1, "2026-10-05", "2026-10-05")
+                   for r in random_table(rng, merged=False)]
+        cut = {ip for c in changes for ip in range(c.start, c.end + 1)}
+        kept = gsd.without(pending, changes)
+        assert per_address(kept) == {ip: f for ip, f in per_address(pending).items() if ip not in cut}
+        for a, b in zip(kept, kept[1:]):
+            assert a.end < b.start
+
+
+def test_a_curated_list_edit_is_published_at_once():
+    table = {"v4": [gsd.Range(0, 99, "GovIta"), gsd.Range(200, 299, "ResidentialIta")], "v6": []}
+    # The ASN behind 0-99 was removed from the list; 300-399 is a new ASN's.
+    observed = {"v4": [gsd.Range(200, 399, "ResidentialIta")], "v6": []}
+    waiting = {"v4": [gsd.Pending("v4", 50, 99, None, 2, "2026-09-21", "2026-09-28"),
+                      gsd.Pending("v4", 200, 249, None, 2, "2026-09-21", "2026-09-28")], "v6": []}
+    edits = {"v4": [gsd.Change("v4", 0, 99, "GovIta", None)]}
+    got = gsd.settle(table, observed, waiting, "2026-10-05", edits)
+    # 0-99 is gone today, and what waited on those addresses is settled with it.
+    # 200-249 was waiting to leave and is observed again: it went back. 300-399
+    # is new and waits like any other.
+    assert key(got.table["v4"]) == [(200, 299, "ResidentialIta")]
+    assert [(c.start, c.end, c.old, c.new) for c in got.curation] == [(0, 99, "GovIta", None)]
+    assert [(q.start, q.end, q.observed, q.seen) for q in got.pending["v4"]] == [
+        (300, 399, "ResidentialIta", 1)]
+    assert [(q.start, q.end) for q in got.went_back] == [(200, 249)]
+    assert got.applied == []
+    # Without the edit the removal waits its three snapshots like anything else.
+    got = gsd.settle(table, observed, {"v4": [], "v6": []}, "2026-10-05")
+    assert key(got.table["v4"]) == key(table["v4"]) and got.curation == []
+
+
+def test_state_file_round_trip():
+    rng = random.Random(7)
+    curated = {137: "GovIta", 3269: "ResidentialIta", 31034: "DatacenterIta"}
+    for _ in range(30):
+        pending = {
+            "v4": [gsd.Pending("v4", r.start << 8, (r.end << 8) | 255, rng.choice(CLASSES + [None]),
+                               rng.randrange(1, 3), "2026-09-28", "2026-10-05")
+                   for r in random_table(rng, merged=False)],
+            "v6": [gsd.Pending("v6", r.start << 90, (r.end << 90) | ((1 << 90) - 1), "GovIta",
+                               1, "2026-10-05", "2026-10-05") for r in random_table(rng)],
+        }
+        text = gsd.dump_state("ita", "2026-10-05", curated, pending)
+        with workdir() as d:
+            (d / "s.json").write_text(text)
+            got_curated, got = gsd.load_state(d / "s.json", "ita")
+            assert got_curated == curated and got == pending
+            assert gsd.dump_state("ita", "2026-10-05", got_curated, got) == text
+            assert "not a version-1 state file for 'eu'" in refused(gsd.load_state, d / "s.json", "eu")
+        assert json.loads(text)["snapshot"] == "2026-10-05"
+    with workdir() as d:
+        assert gsd.load_state(d / "missing.json", "ita") == (None, {"v4": [], "v6": []})
+        (d / "s.json").write_text(gsd.dump_state("ita", "2026-10-05", curated,
+                                                 {"v4": [], "v6": []}).replace('"version": 1', '"version": 2'))
+        assert "not a version-1 state file" in refused(gsd.load_state, d / "s.json", "ita")
+
+
+def test_state_file_is_one_item_per_line():
+    pending = {"v4": [gsd.Pending("v4", int(V4("2.159.128.0")), int(V4("2.159.191.255")), None,
+                                  1, "2026-10-06", "2026-10-06")], "v6": []}
+    text = gsd.dump_state("ita", "2026-10-06", {1267: "ResidentialIta", 137: "GovIta"}, pending)
+    assert text.splitlines()[6:11] == [
+        '    "137": "GovIta",',
+        '    "1267": "ResidentialIta"',
+        '  },',
+        '  "pending": [',
+        '    {"family": "v4", "block": "2.159.128.0/18", "observed": null, "seen": 1, '
+        '"first": "2026-10-06", "last": "2026-10-06"}',
+    ]
+
+
+def test_blocks_parse_back():
+    rng = random.Random(5)
+    for family, bits in (("v4", 32), ("v6", 128)):
+        for _ in range(300):
+            start = rng.randrange(0, 1 << bits)
+            end = min((1 << bits) - 1, start + rng.randrange(0, 1 << rng.randrange(1, bits)))
+            if rng.random() < 0.5:  # an aligned prefix
+                size = 1 << rng.randrange(0, bits)
+                start -= start % size
+                end = start + size - 1
+            assert gsd.parse_block(family, gsd.format_block(family, start, end)) == (start, end)
+
+
 # ── The generator, end to end ────────────────────────────────────────────────
 
 TEST_REGION = {
@@ -686,16 +944,18 @@ TEST_REGION = {
 }
 
 
-def write_sources(d, ripe=None, v4=None, v6=None):
-    (d / "ripe").write_text(ripe or ripe_text())
+def write_sources(d, ripe=None, v4=None, v6=None, day="2026-10-05"):
+    # RIPE's file is dated the day before the run, as the real one is.
+    dated = (datetime.date.fromisoformat(day) - datetime.timedelta(days=1)).strftime("%Y%m%d")
+    (d / "ripe").write_text(ripe or ripe_text(date=dated))
     (d / "v4").write_text(iptoasn_text(v4 or v4_rows(), V4))
     (d / "v6").write_text(iptoasn_text(v6 or v6_rows(), V6))
 
 
-def run_generator(d, *extra, write=True, **sources):
+def run_generator(d, *extra, write=True, day="2026-10-05", region=None, **sources):
     """Run main() on fixture files in `d`. Returns (exit code, stderr, lookups)."""
     if write:
-        write_sources(d, **sources)
+        write_sources(d, day=day, **sources)
     lookups = []
 
     def holder(asn, timeout=15):
@@ -703,9 +963,9 @@ def run_generator(d, *extra, write=True, **sources):
         return "EXAMPLE-AS Example Org"
 
     argv = ["gen", "--region", "ita", "--ripe", str(d / "ripe"), "--iptoasn", str(d / "v4"),
-            "--iptoasn6", str(d / "v6"), "--snapshot-date", "2026-10-05", *extra]
+            "--iptoasn6", str(d / "v6"), "--snapshot-date", day, *extra]
     err, code = io.StringIO(), 0
-    with small_tables(), patched(REGIONS={"ita": TEST_REGION}, fetch_holder=holder), \
+    with small_tables(), patched(REGIONS={"ita": region or TEST_REGION}, fetch_holder=holder), \
             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
         saved, sys.argv = sys.argv, argv
         saved_sleep, gsd.time.sleep = gsd.time.sleep, lambda s: None
@@ -738,16 +998,63 @@ def test_generator_writes_table_report_and_summary():
         assert code == 0 and report["review"] == [] and "| `GovIta` | 256 | 256 | +0.00% |" in summ.read_text()
 
 
-def test_generator_refuses_a_refresh_over_budget_and_keeps_the_old_table():
+def without_as64497():
+    """The IPv4 fixture with AS64497 announcing nothing."""
+    return [(s, e, 0 if asn == 64497 else asn) for s, e, asn in v4_rows()]
+
+
+def test_generator_holds_a_change_back_until_it_has_been_seen_enough():
     with workdir() as d:
-        out, rep = d / "data.rs", d / "report.json"
-        assert run_generator(d, "--output", str(out))[0] == 0
-        before = out.read_text()
-        # AS64497 stops announcing: its class empties.
-        rows = [(s, e, 0 if asn == 64497 else asn) for s, e, asn in v4_rows()]
-        code, err, _ = run_generator(d, "--output", str(out), "--report", str(rep), v4=rows)
+        out, rep, summ = d / "data.rs", d / "report.json", d / "summary.md"
+        state = d / "data.pending.json"
+        args = ["--output", str(out), "--report", str(rep), "--summary", str(summ)]
+        assert run_generator(d, *args, day="2026-10-05")[0] == 0
+        first = out.read_text()
+        assert json.loads(state.read_text())["pending"] == []
+        assert json.loads(state.read_text())["curated"] == {"64496": "GovIta", "64497": "ResidentialIta"}
+
+        # AS64497 stops announcing. One week: the table keeps its /24.
+        gone = without_as64497()
+        assert run_generator(d, *args, day="2026-10-12", v4=gone)[0] == 0
+        assert key(gsd.parse_rust_table(out)["v4"]) == key(
+            [gsd.Range(int(V4("192.0.2.0")), int(V4("192.0.2.255")), "GovIta"),
+             gsd.Range(int(V4("198.51.100.0")), int(V4("198.51.100.255")), "ResidentialIta")])
+        assert json.loads(state.read_text())["pending"] == [
+            {"family": "v4", "block": "198.51.100.0/24", "observed": None, "seen": 1,
+             "first": "2026-10-12", "last": "2026-10-12"}]
+        report = json.loads(rep.read_text())
+        assert (report["waiting"], report["changes"], report["needs_review"]) == (1, [], True)
+        assert ("| `198.51.100.0/24` | 256 | ResidentialIta | no class | 1 of 3 | 2026-10-12 "
+                "| not announced | FR |") in summ.read_text()
+
+        # The same snapshot run again two days later is not a second sighting.
+        assert run_generator(d, *args, day="2026-10-14", v4=gone)[0] == 0
+        assert json.loads(state.read_text())["pending"][0]["seen"] == 1
+
+        # It comes back: nothing ever changed, and the summary says it was seen.
+        assert run_generator(d, *args, day="2026-10-19")[0] == 0
+        assert json.loads(state.read_text())["pending"] == []
+        assert json.loads(rep.read_text())["went_back"] == 1
+        assert "| `198.51.100.0/24` | 256 | ResidentialIta | no class | 1 | 2026-10-12 |" \
+            in summ.read_text()
+        assert out.read_text() == first.replace("2026-10-05", "2026-10-19")
+
+
+def test_generator_refuses_a_refresh_over_budget_and_keeps_table_and_memory():
+    with workdir() as d:
+        out, rep, state = d / "data.rs", d / "report.json", d / "data.pending.json"
+        args = ["--output", str(out), "--report", str(rep)]
+        assert run_generator(d, *args, day="2026-10-05")[0] == 0
+        gone = without_as64497()
+        assert run_generator(d, *args, day="2026-10-12", v4=gone)[0] == 0
+        assert run_generator(d, *args, day="2026-10-19", v4=gone)[0] == 0
+        before, memory = out.read_text(), state.read_text()
+        assert json.loads(memory)["pending"][0]["seen"] == 2
+
+        # Third week: the /24 would leave, and with it the whole class.
+        code, err, _ = run_generator(d, *args, day="2026-10-26", v4=gone)
         assert code == gsd.EXIT_OVER_BUDGET and "OVER BUDGET" in err
-        assert out.read_text() == before
+        assert out.read_text() == before and state.read_text() == memory
         report = json.loads(rep.read_text())
         assert report["refused"] is True and report["needs_review"] is True
         assert report["refuse"] == [
@@ -761,11 +1068,66 @@ def test_generator_refuses_a_refresh_over_budget_and_keeps_the_old_table():
             "announced_by": "not announced", "registered_in": "FR"}]
         # By hand, with the flag, it is written, and the summary shows the block.
         summ = d / "summary.md"
-        code, _, _ = run_generator(d, "--output", str(out), "--allow-over-budget",
-                                   "--summary", str(summ), v4=rows)
+        code, _, _ = run_generator(d, *args, "--allow-over-budget", "--summary", str(summ),
+                                   day="2026-10-26", v4=gone)
         assert code == 0 and out.read_text() != before
         assert "| `198.51.100.0/24` | 256 | ResidentialIta | no class | not announced | FR |" \
             in summ.read_text()
+        assert "1 runs are published now after waiting their snapshots." in summ.read_text()
+        assert json.loads(state.read_text())["pending"] == []
+
+
+def test_no_hysteresis_publishes_the_snapshot_and_forgets():
+    with workdir() as d:
+        out, state = d / "data.rs", d / "data.pending.json"
+        args = ["--output", str(out)]
+        assert run_generator(d, *args, day="2026-10-05")[0] == 0
+        gone = without_as64497()
+        assert run_generator(d, *args, day="2026-10-12", v4=gone)[0] == 0
+        assert len(json.loads(state.read_text())["pending"]) == 1
+        code, _, _ = run_generator(d, *args, "--no-hysteresis", "--allow-over-budget",
+                                   day="2026-10-13", v4=gone)
+        assert code == 0
+        assert [r.ip_class for r in gsd.parse_rust_table(out)["v4"]] == ["GovIta"]
+        assert json.loads(state.read_text())["pending"] == []
+
+
+def test_an_asn_taken_off_the_curated_list_loses_its_ranges_at_once():
+    with workdir() as d:
+        out, state, summ = d / "data.rs", d / "data.pending.json", d / "summary.md"
+        args = ["--output", str(out), "--summary", str(summ), "--allow-over-budget"]
+        assert run_generator(d, *args, day="2026-10-05")[0] == 0
+        # AS64497 is removed from the list (say its holder changed); it still announces.
+        edited = dict(TEST_REGION, asn_roles=[({64496: "Example"}, "GovIta")])
+        code, _, lookups = run_generator(d, *args, day="2026-10-12", region=edited)
+        assert code == 0 and lookups == [64496]
+        assert [r.ip_class for r in gsd.parse_rust_table(out)["v4"]] == ["GovIta"]
+        state_now = json.loads(state.read_text())
+        assert state_now["curated"] == {"64496": "GovIta"} and state_now["pending"] == []
+        assert "1 more at once, because the curated ASN list changed." in summ.read_text()
+
+        # Put back, it is an addition: it waits its two snapshots.
+        assert run_generator(d, *args, day="2026-10-19")[0] == 0
+        assert [r.ip_class for r in gsd.parse_rust_table(out)["v4"]] == ["GovIta"]
+        assert json.loads(state.read_text())["pending"][0]["observed"] == "ResidentialIta"
+        assert run_generator(d, *args, day="2026-10-26")[0] == 0
+        assert [r.ip_class for r in gsd.parse_rust_table(out)["v4"]] == ["GovIta", "ResidentialIta"]
+
+
+def test_a_damaged_state_file_stops_the_refresh():
+    with workdir() as d:
+        out, state = d / "data.rs", d / "data.pending.json"
+        assert run_generator(d, "--output", str(out))[0] == 0
+        before = out.read_text()
+        for damage in ("{", '{"version": 1, "region": "ita"}',
+                       state.read_text().replace('"region": "ita"', '"region": "eu"')):
+            state.write_text(damage)
+            code, err, _ = run_generator(d, "--output", str(out), day="2026-10-12")
+            assert code == gsd.EXIT_INPUT and "state file" in err, damage
+            assert out.read_text() == before
+        # A missing one is an empty memory, not an error.
+        state.unlink()
+        assert run_generator(d, "--output", str(out), day="2026-10-12")[0] == 0
 
 
 def test_generator_checks_the_files_before_any_lookup():
