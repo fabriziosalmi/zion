@@ -2,6 +2,9 @@
 //! mTLS from zion to an upstream (#503), with the real binary and a backend that REQUIRES a
 //! client certificate (`openssl s_server -Verify`), behind a private CA.
 //!
+//! The same PKI also serves the test of an upstream that closes its TLS session without a
+//! `close_notify` (#598).
+//!
 //! Unix only, and skipped when `openssl` or `curl` is not installed.
 #![cfg(unix)]
 
@@ -393,6 +396,134 @@ fn zion_presents_its_client_certificate_to_an_upstream_that_requires_one() {
     assert!(
         log.contains("upstream.backend") && log.contains("does not match"),
         "{log}"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// A TLS backend (rustls, in this process) that answers HTTP/1.0 and then closes the TCP
+/// connection without a TLS `close_notify`. The response is delimited by that close, so zion
+/// cannot tell its end from a truncation. Returns the port.
+fn truncating_backend(dir: &Path) -> u16 {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::io::{Read, Write};
+    let read = |f: &str| fs::read(dir.join(f)).unwrap();
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut read("server.pem").as_slice())
+            .collect::<Result<_, _>>()
+            .unwrap();
+    let key: PrivateKeyDer<'static> =
+        rustls_pemfile::private_key(&mut read("server.key").as_slice())
+            .unwrap()
+            .unwrap();
+    let config = std::sync::Arc::new(
+        rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap(),
+    );
+    let port = free_port();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    std::thread::spawn(move || {
+        for tcp in listener.incoming().flatten() {
+            let config = config.clone();
+            std::thread::spawn(move || {
+                let mut tcp = tcp;
+                let Ok(mut conn) = rustls::ServerConnection::new(config) else {
+                    return;
+                };
+                let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tls.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = tls.write_all(b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nhello");
+                let _ = tls.flush();
+                // No `send_close_notify()`: the socket is dropped as it is.
+                let _ = tcp.shutdown(std::net::Shutdown::Both);
+            });
+        }
+    });
+    port
+}
+
+/// An upstream that closes without `close_notify` is not silent: each cut-off response is
+/// counted (`zion_upstream_body_errors_total{kind="tls_truncated"}`) and the first of them in
+/// a ten-second window is logged with the upstream's address. The client still sees the
+/// failure (zion cannot know the response was complete); this is about the operator seeing it.
+#[test]
+fn an_upstream_that_closes_without_close_notify_is_counted_and_logged() {
+    let dir = std::env::temp_dir().join(format!(
+        "zion-upstream-trunc-{}-{}",
+        std::process::id(),
+        free_port()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    if Command::new("curl").arg("--version").output().is_err() || !pki(&dir) {
+        eprintln!("SKIP: openssl / curl not available");
+        return;
+    }
+    let d = dir.to_string_lossy().into_owned();
+    let backend_port = truncating_backend(&dir);
+    let https_port = free_port();
+    let _z = Proc(
+        zion(
+            &dir,
+            &format!("url = \"https://localhost:{backend_port}\"\nca_path = \"{d}/ca.pem\""),
+            https_port,
+            "trunc.log",
+        )
+        .spawn()
+        .expect("spawn zion"),
+    );
+    wait_port(https_port, "zion");
+    assert_eq!(
+        upstream_up(https_port, backend_port, "1"),
+        "1",
+        "the probe reaches the backend"
+    );
+
+    let counter = || -> u64 {
+        get(https_port, "/metrics")
+            .1
+            .lines()
+            .find(|l| l.starts_with("zion_upstream_body_errors_total{kind=\"tls_truncated\"}"))
+            .and_then(|l| l.split_whitespace().last())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    let before = counter();
+    for _ in 0..3 {
+        // The status line comes first on HTTP/1.1, so curl still reports the 200.
+        let (status, _) = get(https_port, "/");
+        assert_eq!(status, 200);
+    }
+    // The error reaches the counter a moment after curl has what it needs.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while counter() - before < 3 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let log = fs::read_to_string(dir.join("trunc.log")).unwrap();
+    assert_eq!(
+        counter() - before,
+        3,
+        "three cut-off responses, three counts\n{log}"
+    );
+    let lines: Vec<_> = log
+        .lines()
+        .filter(|l| l.contains("close_notify") && l.contains(&format!("localhost:{backend_port}")))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "one warning per interval, naming the upstream:\n{log}"
     );
     let _ = fs::remove_dir_all(dir);
 }

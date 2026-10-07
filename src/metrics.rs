@@ -463,6 +463,10 @@ pub struct Metrics {
     /// (the eager HA failover in `proxy::proxy_pass`). Rate > 0 with no upstream
     /// marked down means members are flapping.
     pub upstream_failovers_total: AtomicU64,
+    /// Upstream responses cut off after their headers: the upstream closed its TLS session
+    /// without a `close_notify` (`tls_truncated`), or the body failed some other way (`other`).
+    pub upstream_body_errors_tls_truncated: AtomicU64,
+    pub upstream_body_errors_other: AtomicU64,
     /// Requests denied (403) by tag-driven enforcement because the origin
     /// class is on the `[sovereign.enforce] deny` list (#150).
     pub enforcement_denied_class: AtomicU64,
@@ -628,6 +632,8 @@ impl Metrics {
             connections_rejected_per_ip: AtomicU64::new(0),
             connections_rejected_global: AtomicU64::new(0),
             upstream_failovers_total: AtomicU64::new(0),
+            upstream_body_errors_tls_truncated: AtomicU64::new(0),
+            upstream_body_errors_other: AtomicU64::new(0),
             enforcement_denied_class: AtomicU64::new(0),
             enforcement_denied_mesh_score: AtomicU64::new(0),
             tarpit_active: AtomicU64::new(0),
@@ -1589,6 +1595,24 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.upstream_failovers_total.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_upstream_body_errors_total Upstream responses cut off after their headers were sent on: kind=\"tls_truncated\" is an upstream that closed its TLS session without close_notify, kind=\"other\" any other failure reading the body.\n\
+                                # TYPE zion_upstream_body_errors_total counter\n\
+                                zion_upstream_body_errors_total{kind=\"tls_truncated\"} ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.upstream_body_errors_tls_truncated.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\nzion_upstream_body_errors_total{kind=\"other\"} ");
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.upstream_body_errors_other.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");
