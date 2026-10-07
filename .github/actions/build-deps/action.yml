@@ -1,0 +1,24 @@
+name: Install build dependencies
+description: >
+  cmake, pkg-config, build-essential and libssl-dev on a Linux runner, with bounded waits and
+  retries. A bare `apt-get update` once hung for twenty minutes on a runner whose package
+  mirror stalled, and with it the required CI check for the PR.
+runs:
+  using: composite
+  steps:
+    - name: apt-get install (retried, bounded)
+      shell: bash
+      # The step itself is bounded too: a mirror that accepts the connection and then says
+      # nothing is not covered by apt's own timeouts on every path.
+      run: |
+        opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+        for attempt in 1 2 3; do
+          if timeout 240 sudo apt-get "${opts[@]}" update \
+            && timeout 600 sudo apt-get "${opts[@]}" install -y cmake pkg-config build-essential libssl-dev; then
+            exit 0
+          fi
+          echo "::warning::apt-get failed or timed out (attempt ${attempt} of 3)"
+          sleep 10
+        done
+        echo "::error::could not install the build dependencies in three attempts"
+        exit 1

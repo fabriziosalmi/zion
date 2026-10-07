@@ -91,9 +91,7 @@ jobs:
         with:
           shared-key: clippy-${{ matrix.flavor }}
       - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+        uses: ./.github/actions/build-deps
       - name: clippy
         run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
 
@@ -117,9 +115,7 @@ jobs:
         with:
           shared-key: test-${{ matrix.flavor }}
       - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+        uses: ./.github/actions/build-deps
       - run: cargo test --locked ${{ matrix.features }} --no-fail-fast
       # The address tables are behind the geo-* features, so the default run
       # compiles none of them. Their tests (structure, one pinned address per
@@ -170,9 +166,7 @@ jobs:
         with:
           shared-key: msrv
       - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+        uses: ./.github/actions/build-deps
       # Don't run lints here — clippy on a pinned old toolchain produces noise
       # unrelated to MSRV. We just need to know the project still *compiles*.
       # Note: NO `--all-targets` on this step. The MSRV contract covers the
@@ -194,9 +188,7 @@ jobs:
         with:
           shared-key: doc
       - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+        uses: ./.github/actions/build-deps
       - run: cargo doc --locked --all-features --no-deps --document-private-items
 
   # Helm chart: lint, render with every values file in deploy/helm/zion/ci/, and run
@@ -213,9 +205,7 @@ jobs:
         with:
           shared-key: helm
       - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake pkg-config build-essential libssl-dev
+        uses: ./.github/actions/build-deps
       - run: cargo build --locked
       - run: helm version --short
       - run: scripts/check-helm-chart.sh target/debug/zion
