@@ -109,6 +109,10 @@ pub(crate) fn rebuild(
         entry.pool.configure_outlier(fresh.pool.outlier_cfg());
         entry.probe_host.store(fresh.probe_host.load_full());
         entry.probe_client.store(fresh.probe_client.load_full());
+        entry.set_thresholds(
+            fresh.unhealthy_threshold.load(Ordering::Relaxed),
+            fresh.healthy_threshold.load(Ordering::Relaxed),
+        );
         merged.insert(url.clone(), entry);
     }
     snap.health_map = Arc::new(merged);
@@ -469,6 +473,7 @@ mod tests {
             pool: crate::pool::MemberStats::new(),
             probe_host: arc_swap::ArcSwapOption::empty(),
             probe_client: arc_swap::ArcSwapOption::empty(),
+            ..health::UpstreamHealth::new_healthy()
         });
         let mut old_map = fnv::FnvHashMap::default();
         old_map.insert(url.clone(), old_health.clone());
@@ -515,6 +520,41 @@ mod tests {
         assert_eq!(merged_arc.backoff_us.load(Ordering::Relaxed), 700_000);
     }
 
+    /// A reload may change the probe thresholds of an upstream whose health state it keeps.
+    #[test]
+    fn rebuild_applies_the_probe_thresholds_of_the_new_config_to_a_kept_entry() {
+        let url = "http://api:8000".to_string();
+        let old_health = Arc::new(health::UpstreamHealth::new_healthy());
+        assert_eq!(old_health.unhealthy_threshold.load(Ordering::Relaxed), 2);
+        let mut old_map = fnv::FnvHashMap::default();
+        old_map.insert(url.clone(), old_health.clone());
+        let previous = ResolvedAppConfig::test_with_health(Arc::new(old_map));
+        let parsed: ZionConfig = toml::from_str(
+            r#"
+            [server]
+            listen_http = "0.0.0.0:8080"
+            listen_https = "0.0.0.0:8443"
+            [tls]
+            cert_path = "/tmp/zion-test.crt"
+            key_path  = "/tmp/zion-test.key"
+            [upstream.api]
+            url = "http://api:8000"
+            unhealthy_threshold = 5
+            healthy_threshold = 3
+            [[route]]
+            path = "/api/{*rest}"
+            upstream = "api"
+        "#,
+        )
+        .unwrap();
+        let merged =
+            rebuild(&parsed, &previous, TEST_CONN_LIMIT_MAX).expect("test config rebuilds");
+        let kept = merged.health_map.get(url.as_str()).unwrap();
+        assert!(Arc::ptr_eq(kept, &old_health), "the entry itself is kept");
+        assert_eq!(kept.unhealthy_threshold.load(Ordering::Relaxed), 5);
+        assert_eq!(kept.healthy_threshold.load(Ordering::Relaxed), 3);
+    }
+
     #[test]
     fn rebuild_creates_fresh_state_for_new_upstreams() {
         // Old snapshot has "api"; new config swaps it for "billing".
@@ -530,6 +570,7 @@ mod tests {
                 pool: crate::pool::MemberStats::new(),
                 probe_host: arc_swap::ArcSwapOption::empty(),
                 probe_client: arc_swap::ArcSwapOption::empty(),
+                ..health::UpstreamHealth::new_healthy()
             }),
         );
         let previous = ResolvedAppConfig::test_with_health(Arc::new(old_map));

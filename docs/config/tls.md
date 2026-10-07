@@ -168,3 +168,5 @@ If compiled without `--features acme`, Zion falls back to executing `state_dir/r
 - Be a regular file (not a symlink)
 - Not be world-writable
 - Exit 0 on success
+
+The script is given 10 minutes. Past that it is killed together with everything it started, the attempt counts as a failed renewal (`zion_acme_renewal_failures_total`) and is retried on the usual backoff. The native ACME flow has the same 10-minute limit.
