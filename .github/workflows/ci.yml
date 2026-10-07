@@ -235,6 +235,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: python3 scripts/test_generate_sovereign_data.py
       - run: scripts/test_supersede_refresh_prs.sh
+      - run: python3 benchmarks/regress/test_compare.py
+      - run: python3 benchmarks/regress/test_run.py
       - run: shellcheck scripts/fetch_sovereign_sources.sh scripts/supersede_refresh_prs.sh scripts/test_supersede_refresh_prs.sh
 
   # ── 7. Roll-up — single required check for branch protection. ─────────────
