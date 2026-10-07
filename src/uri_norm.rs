@@ -178,12 +178,29 @@ pub fn sorted_query(query: &str) -> Cow<'_, str> {
     Cow::Owned(params.join("&"))
 }
 
+/// The normalized form of `path`, or `None` when one pass of normalization does not reach a
+/// canonical form. The result is what is routed, checked against policy and sent upstream,
+/// and the upstream decodes it once more: a path that still has something to normalize after
+/// the pass (decoding can complete an escape that a stray `%` had started) would be read
+/// differently by zion and by the upstream. Such a path is refused, not iterated on: the
+/// number of passes an adversarial path can demand grows with its length, and a path a
+/// client writes honestly always reaches its canonical form in one.
+pub fn try_normalize_path(path: &str) -> Option<Cow<'_, str>> {
+    let out = normalize_path(path);
+    if matches!(out, Cow::Borrowed(_)) || is_normal(&out) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
 /// Rewrite `req`'s URI to its normalized path (query untouched). `Ok(())` when the request
-/// was already normal or has been rewritten; `Err(())` when the normalized URI cannot be
+/// was already normal or has been rewritten; `Err(())` when the path cannot be brought to a
+/// canonical form in one pass (see [`try_normalize_path`]) or the normalized URI cannot be
 /// rebuilt (the caller answers 400). Shared by the HTTPS pipeline and the plaintext :80
 /// handler, which routes and forwards ACME challenges on its own.
 pub fn rewrite_request<B>(req: &mut hyper::Request<B>) -> Result<(), ()> {
-    let normalized = normalize_path(req.uri().path());
+    let normalized = try_normalize_path(req.uri().path()).ok_or(())?;
     if matches!(normalized, Cow::Borrowed(_)) {
         return Ok(()); // already normal: no allocation, no rewrite
     }

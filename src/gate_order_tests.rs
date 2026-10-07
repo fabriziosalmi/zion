@@ -273,6 +273,18 @@ async fn dot_segments_and_duplicate_slashes_cannot_dodge_a_route() {
     }
 }
 
+/// A path that one pass of normalization does not bring to a canonical form is refused
+/// outright (400): zion would route one reading and the upstream decode another. Nothing an
+/// honest client writes is affected (see `uri_norm`'s property tests).
+#[tokio::test]
+async fn a_path_that_needs_a_second_pass_is_refused_not_routed() {
+    let st = state(0);
+    for p in ["/%%36%39nternal/x", "/open/%%32%65%%32%65/internal/x"] {
+        assert_eq!(get(&st, EXTERNAL, p).await, 400, "{p}");
+        assert_eq!(get(&st, INTERNAL, p).await, 400, "{p}: for everyone");
+    }
+}
+
 #[tokio::test]
 async fn built_in_endpoints_are_reached_through_any_spelling_of_their_path() {
     let st = state(0);
