@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The container image no longer depends on the builder's `umask`.** Rebuilding v0.10.0's image (the first built with `rewrite-timestamp`) gave the same layers as the published one, the compiled binary included, except the one that holds `/etc/zion/zion.toml`: its file mode was `0664` under a `umask 002` and `0644` under `022`. The file is now put in place in the build stage with explicit modes (`0755` for the directory, `0644` for the file). (#538)
+
 ## [0.10.0] - 2026-10-07
 
 **A token that expires more than 24 hours from now is refused by default: read the first upgrade note before you upgrade.** The rest is a latency fix for requests with a body to an HTTP/2 upstream on Linux, release-build reproducibility, and the last archived dependency gone.
