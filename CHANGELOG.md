@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Security
+
+- **Path normalization is checked for canonical form, and a path that needs a second pass is refused with `400`.** zion normalizes the request path before routing, policy checks and forwarding, and the upstream decodes it once more. A path that decoding left in a non-canonical state could be routed by zion under one reading and served by the upstream under another, which bypasses route-level policy such as `internal_only`. Such paths are now refused instead of routed; a path written correctly is never affected. Found by reading the code while planning #533; the fix is tested through the real gate pipeline. If you run an upstream that serves content you protect with `internal_only`, auth or WAF profiles on specific paths, upgrade.
+
 ## [0.9.13] - 2026-10-06
 
 **The Italian and EU address tables (`geo-ita`, `geo-eu`): what a class means changed, and so did how the tables are kept.** The official binaries and the container are built without them, so if you run those this release brings you one fix (a full `Vary` index, below). If you build with a `geo-*` feature, read the upgrade notes: two classes answer differently.
