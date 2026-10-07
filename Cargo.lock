@@ -5069,7 +5069,7 @@ dependencies = [
 
 [[package]]
 name = "zion"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "aho-corasick",
  "aimp_node",
