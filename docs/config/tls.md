@@ -155,6 +155,12 @@ For testing, use the Let's Encrypt staging environment:
 directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
 ```
 
+### A renewal that was killed half way
+
+A renewal writes the new key and then the new certificate, each with an atomic rename, and keeps a link to the old key (`<key_path>.zion-bak-<pid>`) until both are in place. A `kill -9` or a power loss between the two renames leaves the new key beside the old certificate, a pair that cannot serve TLS.
+
+At **boot**, when the configured key does not match the configured certificate and a `<key_path>.zion-bak-*` file beside it does, zion puts that key back, logs a `WARN` that says so, and keeps the key it replaced as `<key_path>.zion-unpaired`. The renewal runs again at its next check. A pair that does not match and has no matching backup still refuses to boot (exit code 3), as before. A running zion never does this: a renewal in progress may be between its two renames.
+
 ### Fallback: renew.sh
 
 If compiled without `--features acme`, Zion falls back to executing `state_dir/renew.sh` (if it exists). This allows external certificate management tools (e.g., certbot) to handle renewal. The script must:

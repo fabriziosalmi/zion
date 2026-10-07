@@ -547,6 +547,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     //  build entry point.)
 
     // 3. Load initial TLS — build acceptor once, cache via ArcSwap
+    tls::recover_interrupted_renewals(&config.tls);
     let initial_tls = tls::load_tls_config(&config.tls).map_err(error::ZionError::Tls)?;
     let acceptor = TlsAcceptor::from(Arc::new(initial_tls));
     let tls_acceptor_store = Arc::new(ArcSwap::from_pointee(acceptor));
