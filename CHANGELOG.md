@@ -4,6 +4,17 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.9.15] - 2026-10-07
+
+**Reliability and visibility: things that went wrong quietly now say so, and a few that could hurt after a crash or a lost packet no longer do.** Two behaviours change; read the first two notes.
+
+### Upgrade notes
+
+- **A health probe that fails once no longer marks the upstream down.** An upstream now needs `unhealthy_threshold` (default `2`) failed probes in a row; one that is failing is probed again within 100 to 300 ms, so a backend that is really down is marked down a fraction of a second later than before. `unhealthy_threshold = 1` in `[upstream.x]` is the old behaviour. `healthy_threshold` (default `1`) is the number of successes in a row that brings it back.
+- **A request body that breaks on the way is answered `400` (or `408` if it stalls), not `413`.** `413` now means only that the body was over the size cap. If you alert on `413`, expect it to drop to the real oversize uploads.
+- No setting was removed. New, all optional: `unhealthy_threshold`, `healthy_threshold`, `client_crl_enforce_next_update` (in `[tls]` and `[admin]`, default `false`: an expired CRL keeps being applied, as before).
+- New metrics: `zion_audit_prune_failures_total`, `zion_upstream_body_errors_total{kind}`, `zion_mesh_recv_errors_total`, `zion_tls_client_crl_next_update_timestamp_seconds{listener}`. Alert on the last one: `time() - zion_tls_client_crl_next_update_timestamp_seconds > 0`.
+
 ### Fixed
 
 - **Audit retention (`[audit] max_files`) only counts and deletes the writer's own segments.** The prune took every file named `<log>.<anything>` next to the log, so an operator's `audit.log.verified` or a logrotate `audit.log.1.gz` counted toward the limit and could be deleted as the oldest. It now matches `<log>.<nanoseconds>[.<n>]` only. (#536)
