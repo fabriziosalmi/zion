@@ -64,7 +64,11 @@ pub struct AuditConfig {
     pub max_size_mb: Option<u64>,
     /// How many rotated segments to keep on disk; the oldest are pruned first.
     /// `0` keeps them all (operator manages retention out-of-band). Default 10,
-    /// so the on-disk ceiling is `max_size_mb * (max_files + 1)`.
+    /// so the on-disk ceiling is `max_size_mb * (max_files + 1)`. Only the
+    /// writer's own segments (`<log>.<nanoseconds>`) count and are deleted; a
+    /// file you keep next to the log (`audit.log.verified`, `audit.log.1.gz`)
+    /// is never touched. A delete that fails is logged and counted in
+    /// `zion_audit_prune_failures_total`.
     #[serde(default = "default_max_files")]
     pub max_files: usize,
     /// How often (milliseconds) the active segment is `fsync`ed. Each record is
@@ -1331,11 +1335,30 @@ async fn rotate_paths(path: &str, max_files: usize) -> std::io::Result<String> {
     Ok(rotated)
 }
 
+/// True when `name` is a segment this writer produced from `base`: `<base>.<nanos>`
+/// or, after a same-instant collision, `<base>.<nanos>.<n>` (see `rotate_paths`).
+/// Anything else next to the log (`audit.log.verified`, `audit.log.1.gz`, an
+/// operator's export) is not ours to count or delete.
+fn is_own_segment(base: &str, name: &str) -> bool {
+    let Some(suffix) = name
+        .strip_prefix(base)
+        .and_then(|rest| rest.strip_prefix('.'))
+    else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match suffix.split_once('.') {
+        None => digits(suffix),
+        Some((stamp, n)) => digits(stamp) && digits(n),
+    }
+}
+
 /// Delete the oldest rotated segments so at most `max_files` remain (`0` keeps
-/// them all). A rotated segment is any sibling named `<basename>.<suffix>`;
-/// ordering is by modification time so it is robust to the suffix format. Prune
-/// failures are non-fatal — retention is best-effort, never a reason to drop an
-/// audit event.
+/// them all). Only the writer's own segments count (`is_own_segment`); ordering
+/// is by modification time. A failed delete never stops the writer (retention is
+/// best-effort, never a reason to drop an audit event) but it is not silent: it is
+/// logged and counted, because a retention bound that stops holding ends with a
+/// full disk.
 async fn prune_old_segments(path: &str, max_files: usize) {
     if max_files == 0 {
         return;
@@ -1345,26 +1368,29 @@ async fn prune_old_segments(path: &str, max_files: usize) {
         (Some(d), Some(b)) => (d.to_path_buf(), b.to_string()),
         _ => return,
     };
-    let prefix = format!("{base}.");
     let mut rd = match tokio::fs::read_dir(&dir).await {
         Ok(r) => r,
-        Err(_) => return,
+        Err(e) => {
+            prune_failed(&dir, &e);
+            return;
+        }
     };
     let mut segments: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
     while let Ok(Some(entry)) = rd.next_entry().await {
         let name = entry.file_name();
-        let name = name.to_string_lossy();
-        // A rotated segment is `<base>.<suffix>`; the active `<base>` has no
-        // trailing dot and is excluded by the prefix test.
-        if name.starts_with(&prefix) {
-            let mtime = entry
-                .metadata()
-                .await
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            segments.push((mtime, entry.path()));
+        if !is_own_segment(&base, &name.to_string_lossy()) {
+            continue;
         }
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        segments.push((
+            meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+            entry.path(),
+        ));
     }
     if segments.len() <= max_files {
         return;
@@ -1372,8 +1398,21 @@ async fn prune_old_segments(path: &str, max_files: usize) {
     segments.sort_by_key(|(t, _)| *t); // oldest first
     let remove_n = segments.len() - max_files;
     for (_, seg) in segments.into_iter().take(remove_n) {
-        let _ = tokio::fs::remove_file(&seg).await;
+        if let Err(e) = tokio::fs::remove_file(&seg).await {
+            prune_failed(&seg, &e);
+        }
     }
+}
+
+fn prune_failed(what: &std::path::Path, e: &std::io::Error) {
+    observability::AUDIT_PRUNE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+    crate::logging::warn(
+        "audit",
+        &format!(
+            "cannot prune rotated audit segment {}: {e} — [audit] max_files is not being enforced and segments will accumulate",
+            what.display()
+        ),
+    );
 }
 
 fn now_iso8601() -> String {
@@ -2579,6 +2618,122 @@ mod tests {
             !rotated.is_empty() && rotated.len() <= 2,
             "max_files=2 must cap retained segments; got {}",
             rotated.len()
+        );
+    }
+
+    #[test]
+    fn only_the_writers_own_names_are_segments() {
+        // What `rotate_paths` produces.
+        assert!(is_own_segment("audit.log", "audit.log.1790000000000000000"));
+        assert!(is_own_segment(
+            "audit.log",
+            "audit.log.1790000000000000000.3"
+        ));
+        // What an operator leaves next to it: not ours, never counted or deleted.
+        for foreign in [
+            "audit.log",
+            "audit.log.",
+            "audit.log.verified",
+            "audit.log.1.gz",
+            "audit.log.1790000000000000000.gz",
+            "audit.log.1790000000000000000.",
+            "audit.log.1790000000000000000.x",
+            "audit.log.1790000000000000000.3.4",
+            "audit.log.bak.1790000000000000000",
+            "audit.logx.1790000000000000000",
+            "other.log.1790000000000000000",
+        ] {
+            assert!(!is_own_segment("audit.log", foreign), "{foreign}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pruning_never_touches_files_the_writer_did_not_create() {
+        let dir = tempdir();
+        let log = dir.join("audit.log");
+        let mut ours = Vec::new();
+        for i in 0..5u64 {
+            let f = dir.join(format!("audit.log.{}", 1_790_000_000_000_000_000u64 + i));
+            std::fs::write(&f, b"x").unwrap();
+            // Older stamp = older mtime, so the order is the one the writer would see.
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + i);
+            std::fs::File::options()
+                .write(true)
+                .open(&f)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+            ours.push(f);
+        }
+        let foreign: Vec<_> = ["audit.log.verified", "audit.log.1.gz"]
+            .iter()
+            .map(|n| {
+                let f = dir.join(n);
+                std::fs::write(&f, b"evidence").unwrap();
+                // Older than every segment of ours: the first thing a mtime-ordered prune would take.
+                let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10);
+                std::fs::File::options()
+                    .write(true)
+                    .open(&f)
+                    .unwrap()
+                    .set_modified(t)
+                    .unwrap();
+                f
+            })
+            .collect();
+
+        // A directory with a segment's name is not a segment either (and cannot be unlinked).
+        let lookalike = dir.join("audit.log.1790000000000000099");
+        std::fs::create_dir(&lookalike).unwrap();
+
+        prune_old_segments(log.to_str().unwrap(), 2).await;
+
+        assert!(lookalike.is_dir());
+        for f in &foreign {
+            assert!(
+                f.exists(),
+                "{f:?} is not a segment of the writer and must survive"
+            );
+        }
+        let left: Vec<_> = ours.iter().filter(|f| f.exists()).collect();
+        assert_eq!(
+            left,
+            vec![&ours[3], &ours[4]],
+            "the two newest of ours stay"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_prune_is_counted_and_does_not_stop_the_writer() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir();
+        let log = dir.join("audit.log");
+        for i in 0..3u64 {
+            std::fs::write(
+                dir.join(format!("audit.log.{}", 1_790_000_000_000_000_000u64 + i)),
+                b"x",
+            )
+            .unwrap();
+        }
+        // A read-only directory refuses unlink, unless we are root (then there is no failure to provoke).
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = dir.join("probe");
+        let can_write = std::fs::write(&probe, b"x").is_ok();
+        if can_write {
+            std::fs::remove_file(&probe).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipped: running with rights that ignore directory permissions");
+            return;
+        }
+        let before = observability::AUDIT_PRUNE_FAILURES_TOTAL.load(Ordering::Relaxed);
+        prune_old_segments(log.to_str().unwrap(), 1).await;
+        let after = observability::AUDIT_PRUNE_FAILURES_TOTAL.load(Ordering::Relaxed);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            after - before,
+            2,
+            "two segments over the bound, two failed deletes, both counted"
         );
     }
 

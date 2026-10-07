@@ -4,6 +4,11 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Audit retention (`[audit] max_files`) only counts and deletes the writer's own segments.** The prune took every file named `<log>.<anything>` next to the log, so an operator's `audit.log.verified` or a logrotate `audit.log.1.gz` counted toward the limit and could be deleted as the oldest. It now matches `<log>.<nanoseconds>[.<n>]` only. (#536)
+- **A failed prune is logged and counted** (`zion_audit_prune_failures_total`) instead of ignored; before, a retention bound that stopped holding was visible only when the disk filled. (#535)
+
 ## [0.9.14] - 2026-10-07
 
 **Security release: path normalization could leave a path non-canonical, bypassing per-route policy.** If you rely on Zion's per-path policy (`internal_only`, `auth_profile`, WAF profile selection) to protect content on an upstream that decodes the request path, upgrade. Advisory: GHSA-fgvc-6568-8g3c.
