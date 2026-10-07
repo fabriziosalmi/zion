@@ -27,8 +27,12 @@ on:
       # WAF effectiveness depends on the request/body pipeline that FEEDS the
       # scanner, not just waf.rs: dispatch.rs runs the URI/body gates and the
       # streaming scan, proxy.rs handles body collection. A recall regression
-      # can originate there, so the corpus gate must trigger on them too.
+      # can originate there, so the corpus gate must trigger on them too. The same goes
+      # for what runs before the scanner sees the request: the gates in dispatch/ and the
+      # path normalizer (a change there can lower recall or add false positives).
       - "src/dispatch.rs"
+      - "src/dispatch/**"
+      - "src/uri_norm.rs"
       - "src/proxy.rs"
       - "benchmarks/waf-corpus/**"
       - ".github/workflows/waf-corpus.yml"
@@ -37,6 +41,8 @@ on:
     paths:
       - "src/waf.rs"
       - "src/dispatch.rs"
+      - "src/dispatch/**"
+      - "src/uri_norm.rs"
       - "src/proxy.rs"
       - "benchmarks/waf-corpus/**"
 
