@@ -525,6 +525,16 @@ fn mtls_get(port: u16, cert: &std::path::Path, key: &std::path::Path) -> u16 {
 
 /// GET `path` over TLS with a client certificate; the status, 0 when the handshake is refused.
 fn tls_get(port: u16, path: &str, cert: &std::path::Path, key: &std::path::Path) -> u16 {
+    tls_get_body(port, path, cert, key).0
+}
+
+/// Like [`tls_get`], with the response body as well.
+fn tls_get_body(
+    port: u16,
+    path: &str,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> (u16, String) {
     let mut child = Command::new("openssl")
         .args([
             "s_client",
@@ -550,12 +560,14 @@ fn tls_get(port: u16, path: &str, cert: &std::path::Path, key: &std::path::Path)
         )
         .ok(); // a refused handshake closes the pipe before the request is written
     let out = child.wait_with_output().unwrap();
-    String::from_utf8_lossy(&out.stdout)
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let status = text
         .lines()
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|c| c.parse().ok())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    (status, text)
 }
 
 /// `auth = "mtls"` trusts `admin.client_ca_path` only: a client certificate issued by the
@@ -643,7 +655,8 @@ fn admin_mtls_trusts_only_the_admin_ca() {
 }
 
 /// A CA that can sign CRLs, two client certificates (`good`, `bad`), a CRL that revokes
-/// nothing (`crl-empty.pem`) and one that revokes `bad` (`crl.pem`), all in `dir`.
+/// nothing (`crl-empty.pem`), one that revokes `bad` (`crl.pem`) and the same one valid for a
+/// second only (`crl-expired.pem`), all in `dir`.
 fn pki_with_crl(dir: &std::path::Path) -> bool {
     let d = dir.to_string_lossy();
     let p = |f: &str| dir.join(f).to_string_lossy().into_owned();
@@ -725,6 +738,8 @@ fn pki_with_crl(dir: &std::path::Path) -> bool {
         && ca(&["-gencrl", "-out", &p("crl-empty.pem")])
         && ca(&["-revoke", &p("bad.pem")])
         && ca(&["-gencrl", "-out", &p("crl.pem")])
+        // The same list, but valid for one second only: expired by the time it is used.
+        && ca(&["-gencrl", "-crlsec", "1", "-out", &p("crl-expired.pem")])
 }
 
 /// A certificate on the CRL is refused at the handshake, on the data plane and on the admin
@@ -838,4 +853,239 @@ fn a_revoked_client_certificate_is_refused_and_a_new_crl_needs_no_restart() {
         "a certificate that is not on the CRL keeps working"
     );
     let _ = fs::remove_dir_all(dir);
+}
+
+/// A daemon with the data plane and the admin API both requiring a client certificate and both
+/// reading `published/crl.pem`, which starts as `crl-expired.pem`: a list whose `nextUpdate` is
+/// in the past. `enforce` sets `client_crl_enforce_next_update` on both.
+struct CrlDaemon {
+    dir: std::path::PathBuf,
+    https_port: u16,
+    admin_port: u16,
+    _daemon: Daemon,
+}
+
+impl CrlDaemon {
+    fn boot(enforce: bool) -> Option<Self> {
+        let dir = std::env::temp_dir().join(format!(
+            "zion-crl-expiry-{}-{}",
+            std::process::id(),
+            free_port()
+        ));
+        fs::create_dir_all(dir.join("server")).unwrap();
+        let server_ok = openssl(&[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost",
+            "-keyout",
+            &dir.join("server/k.pem").to_string_lossy(),
+            "-out",
+            &dir.join("server/c.pem").to_string_lossy(),
+        ]);
+        if !(server_ok && pki_with_crl(&dir)) {
+            eprintln!("SKIP: openssl could not make the test certificates");
+            return None;
+        }
+        fs::create_dir_all(dir.join("published")).unwrap();
+        fs::copy(dir.join("crl-expired.pem"), dir.join("published/crl.pem")).unwrap();
+        // `-crlsec 1`: make sure the second is over before anything reads the list.
+        std::thread::sleep(Duration::from_millis(2200));
+        let d = dir.to_string_lossy();
+        let (https_port, admin_port) = (free_port(), free_port());
+        let enforce = format!("client_crl_enforce_next_update = {enforce}\n");
+        let cfg = format!(
+            "[server]\nlisten_http = \"127.0.0.1:{}\"\nlisten_https = \"127.0.0.1:{https_port}\"\n\n\
+             [tls]\ncert_path = \"{d}/server/c.pem\"\nkey_path = \"{d}/server/k.pem\"\n\
+             client_auth = \"required\"\nclient_ca_path = \"{d}/ca.pem\"\n\
+             client_crl_path = \"{d}/published/crl.pem\"\n{enforce}\n\
+             [upstreams]\nbackend = \"http://127.0.0.1:9\"\n\n\
+             [[route]]\npath = \"/{{*rest}}\"\nupstream = \"backend\"\n\n\
+             [admin]\nlisten = \"127.0.0.1:{admin_port}\"\nauth = \"mtls\"\n\
+             client_ca_path = \"{d}/ca.pem\"\nclient_crl_path = \"{d}/published/crl.pem\"\n\
+             {enforce}rate_limit_rps = 1000\n",
+            free_port()
+        );
+        fs::write(dir.join("zion.toml"), cfg).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_zion"))
+            .env("ZION_CONFIG", dir.join("zion.toml"))
+            .env("ZION_BOOT_FAST", "1")
+            .env("ZION_LAST_GASP_PATH", dir.join("gasp.jsonl"))
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(dir.join("daemon.log")).unwrap())
+            .spawn()
+            .expect("spawn zion");
+        let me = Self {
+            dir,
+            https_port,
+            admin_port,
+            _daemon: Daemon(child),
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while TcpStream::connect(("127.0.0.1", admin_port)).is_err()
+            || TcpStream::connect(("127.0.0.1", https_port)).is_err()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the daemon never came up: {}",
+                me.log()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Some(me)
+    }
+
+    fn log(&self) -> String {
+        fs::read_to_string(self.dir.join("daemon.log")).unwrap_or_default()
+    }
+
+    /// (data plane, admin API) status for the client certificate `who`; 0 = refused.
+    fn statuses(&self, who: &str) -> (u16, u16) {
+        let (cert, key) = (
+            self.dir.join(format!("{who}.pem")),
+            self.dir.join(format!("{who}.key")),
+        );
+        (
+            tls_get(self.https_port, "/healthz", &cert, &key),
+            mtls_get(self.admin_port, &cert, &key),
+        )
+    }
+
+    /// The `nextUpdate` gauge of each listener, `(tls, admin)`, as `/metrics` shows it. The
+    /// data plane serves it to `good`, so a refused `good` shows as `None`.
+    fn gauges(&self) -> (Option<u64>, Option<u64>) {
+        let (_, body) = tls_get_body(
+            self.https_port,
+            "/metrics",
+            &self.dir.join("good.pem"),
+            &self.dir.join("good.key"),
+        );
+        let gauge = |listener: &str| {
+            body.lines()
+                .find(|l| {
+                    l.starts_with(&format!(
+                        "zion_tls_client_crl_next_update_timestamp_seconds{{listener=\"{listener}\"}}"
+                    ))
+                })
+                .and_then(|l| l.split_whitespace().last())
+                .and_then(|v| v.parse().ok())
+        };
+        (gauge("tls"), gauge("admin"))
+    }
+
+    /// Replace the published CRL, as a deploy would (write, then rename).
+    fn publish(&self, file: &str) {
+        fs::copy(self.dir.join(file), self.dir.join("published/crl.tmp")).unwrap();
+        fs::rename(
+            self.dir.join("published/crl.tmp"),
+            self.dir.join("published/crl.pem"),
+        )
+        .unwrap();
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// A CRL whose `nextUpdate` has passed keeps being applied by default (#601): the certificate it
+/// lists is still refused and the others still admitted, because failing closed would lock every
+/// client out, the admin API included, the day whoever publishes the list stops. What changes is
+/// that it is no longer silent: a gauge with the `nextUpdate` per listener for the alert, a
+/// warning at load, and the gauge follows a reload that replaces the list.
+#[test]
+fn an_expired_crl_still_applies_and_is_reported() {
+    let Some(z) = CrlDaemon::boot(false) else {
+        return;
+    };
+    assert_eq!(z.statuses("good"), (200, 200), "{}", z.log());
+    assert_eq!(
+        z.statuses("bad"),
+        (0, 0),
+        "the expired list still refuses what it lists"
+    );
+
+    let log = z.log();
+    let line = log
+        .lines()
+        .find(|l| l.contains("published/crl.pem") && l.contains("expired"))
+        .unwrap_or_else(|| panic!("no warning about the expired list:\n{log}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(
+        line.contains("client_crl_enforce_next_update"),
+        "the warning says how to refuse instead: {line}"
+    );
+    assert!(
+        !log.contains("BEGIN X509 CRL"),
+        "the list itself is never logged"
+    );
+
+    let (tls, admin) = z.gauges();
+    let (tls, admin) = (tls.expect("tls gauge"), admin.expect("admin gauge"));
+    assert_eq!(tls, admin, "one file, one nextUpdate");
+    let now = now_secs();
+    assert!(
+        tls < now && tls > now - 3600,
+        "nextUpdate {tls} should be a few seconds ago ({now})"
+    );
+
+    // A list valid for a day replaces it: the gauge follows, still without a restart.
+    z.publish("crl.pem");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let (tls, admin) = z.gauges();
+        if tls.is_some_and(|t| t > now_secs()) && admin.is_some_and(|t| t > now_secs()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the gauge did not follow the reload ({tls:?}, {admin:?}): {}",
+            z.log()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert_eq!(z.statuses("good"), (200, 200));
+    assert_eq!(z.statuses("bad"), (0, 0));
+    let _ = fs::remove_dir_all(&z.dir);
+}
+
+/// With `client_crl_enforce_next_update = true` an out-of-date list refuses every client, the
+/// ones it does not list included, until it is replaced: a strict deployment chooses that
+/// knowingly.
+#[test]
+fn an_expired_crl_refuses_every_client_when_asked_to() {
+    let Some(z) = CrlDaemon::boot(true) else {
+        return;
+    };
+    assert_eq!(z.statuses("good"), (0, 0), "{}", z.log());
+    assert_eq!(z.statuses("bad"), (0, 0));
+    assert!(
+        z.log()
+            .lines()
+            .any(|l| l.contains("expired") && l.contains("refused")),
+        "the warning says clients are being refused:\n{}",
+        z.log()
+    );
+    z.publish("crl.pem");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while z.statuses("good") != (200, 200) {
+        assert!(
+            Instant::now() < deadline,
+            "a fresh list did not bring the good certificate back: {}",
+            z.log()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert_eq!(z.statuses("bad"), (0, 0));
+    let _ = fs::remove_dir_all(&z.dir);
 }

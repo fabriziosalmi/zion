@@ -675,6 +675,7 @@ pub async fn run_soak() -> i32 {
         acme: None,
         client_ca_path: None,
         client_crl_path: None,
+        client_crl_enforce_next_update: false,
         client_auth: "none".into(),
         fingerprint: None,
     };

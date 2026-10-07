@@ -1640,6 +1640,7 @@ impl Metrics {
         // in their own module to avoid coupling the metrics renderer to
         // tracing internals.
         crate::observability::render_counters(&mut out);
+        crate::crl::render(&mut out);
         {
             let mut bulkheads = String::new();
             crate::bulkhead::render(&mut bulkheads, &escape_label);
