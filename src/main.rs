@@ -53,6 +53,7 @@ mod cache;
 mod cli;
 mod config;
 mod connlimit;
+mod crl;
 mod dns;
 mod doctor;
 mod drain;
@@ -925,6 +926,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                             &config.tls.key_path,
                             ca,
                             admin_cfg.client_crl_path.as_deref(),
+                            admin_cfg.client_crl_enforce_next_update,
                         ) {
                             Ok(acc) => {
                                 let store = std::sync::Arc::new(ArcSwap::from_pointee(acc));
@@ -938,6 +940,7 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
                                         config.tls.key_path.clone(),
                                         ca.to_string(),
                                         admin_cfg.client_crl_path.clone(),
+                                        admin_cfg.client_crl_enforce_next_update,
                                     );
                                 }
                                 Some(admin::AdminAuth::Mtls(store))

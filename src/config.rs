@@ -144,6 +144,10 @@ pub struct AdminConfig {
     /// the handshake. Re-read when the file changes. See `[tls] client_crl_path`.
     #[serde(default)]
     pub client_crl_path: Option<String>,
+    /// As `[tls] client_crl_enforce_next_update`, for the admin listener: an out-of-date CRL
+    /// refuses every admin client certificate. Default `false`. Needs `client_crl_path`.
+    #[serde(default)]
+    pub client_crl_enforce_next_update: bool,
 }
 
 fn default_admin_listen() -> String {
@@ -536,10 +540,18 @@ pub struct TlsConfig {
     /// unknown revocation status is not accepted). Only the client's own certificate is
     /// checked, not the intermediates. The file is re-read when it changes (with
     /// `hot_reload`), so revoking a certificate needs no restart. The CRL's `nextUpdate` is
-    /// not enforced: an out-of-date list keeps being applied rather than locking every client
-    /// out.
+    /// not enforced by default: an out-of-date list keeps being applied rather than locking
+    /// every client out, and zion warns and reports the date (see
+    /// `client_crl_enforce_next_update`).
     #[serde(default)]
     pub client_crl_path: Option<String>,
+    /// Refuse every client certificate once the CRL's `nextUpdate` has passed (default
+    /// `false`: the out-of-date list keeps being applied, and zion warns and reports the date
+    /// in `zion_tls_client_crl_next_update_timestamp_seconds{listener="tls"}`). Set it where
+    /// failing closed is the policy: the day whoever publishes the list stops, no client
+    /// gets in until a fresh one is. Needs `client_crl_path`.
+    #[serde(default)]
+    pub client_crl_enforce_next_update: bool,
     /// Client auth mode: "none" (default), "optional", "required".
     #[serde(default = "default_client_auth")]
     pub client_auth: String,
@@ -2360,7 +2372,21 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                 .to_string(),
         );
     }
+    if config.tls.client_crl_enforce_next_update && config.tls.client_crl_path.is_none() {
+        errors.push(
+            "tls.client_crl_enforce_next_update is set but tls.client_crl_path is not: there is \
+             no list whose date could be enforced"
+                .to_string(),
+        );
+    }
     if let Some(admin) = &config.admin {
+        if admin.client_crl_enforce_next_update && admin.client_crl_path.is_none() {
+            errors.push(
+                "admin.client_crl_enforce_next_update is set but admin.client_crl_path is not: \
+                 there is no list whose date could be enforced"
+                    .to_string(),
+            );
+        }
         if admin.client_crl_path.is_some() && admin.auth != "mtls" {
             errors.push(
                 "admin.client_crl_path is set but admin.auth is not \"mtls\": no client \

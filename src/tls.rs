@@ -253,16 +253,25 @@ pub(crate) fn load_crls(
 /// and, with `crl_path`, the client's own certificate must not be revoked. A certificate
 /// whose issuer has no CRL in the file is refused (rustls' default: an unknown status is not
 /// "good"). `optional` lets a client connect without a certificate at all.
+/// `enforce_next_update` makes a CRL past its `nextUpdate` refuse every client.
 fn client_cert_verifier(
     roots: rustls::RootCertStore,
     crl_path: Option<&str>,
     optional: bool,
+    listener: crate::crl::Listener,
+    enforce_next_update: bool,
 ) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, String> {
     let mut builder = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots));
     if let Some(path) = crl_path {
-        builder = builder
-            .with_crls(load_crls(path)?)
-            .only_check_end_entity_revocation();
+        let crls = load_crls(path)?;
+        // The gauge and the warning follow every load, so a replaced file is seen at once.
+        crate::crl::report(listener, path, &crls, enforce_next_update);
+        builder = builder.with_crls(crls).only_check_end_entity_revocation();
+        // By default an out-of-date list keeps being applied; opting in refuses every client
+        // once its nextUpdate has passed.
+        if enforce_next_update {
+            builder = builder.enforce_revocation_expiration();
+        }
     }
     if optional {
         builder = builder.allow_unauthenticated();
@@ -283,6 +292,7 @@ pub(crate) fn admin_mtls_acceptor(
     key_path: &str,
     ca_path: &str,
     crl_path: Option<&str>,
+    enforce_crl_next_update: bool,
 ) -> Result<TlsAcceptor, String> {
     // Server identity (reuses the daemon's cert/key).
     let cert_file =
@@ -298,8 +308,14 @@ pub(crate) fn admin_mtls_acceptor(
 
     // Client CA → REQUIRED verifier (not optional: a client cert chaining to this CA is
     // mandatory), minus whatever the CRL revokes.
-    let verifier = client_cert_verifier(client_roots(ca_path, "admin client CA")?, crl_path, false)
-        .map_err(|e| format!("admin {e}"))?;
+    let verifier = client_cert_verifier(
+        client_roots(ca_path, "admin client CA")?,
+        crl_path,
+        false,
+        crate::crl::Listener::Admin,
+        enforce_crl_next_update,
+    )
+    .map_err(|e| format!("admin {e}"))?;
 
     let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_client_cert_verifier(verifier)
@@ -318,6 +334,7 @@ pub(crate) fn spawn_admin_tls_watcher(
     key_path: String,
     ca_path: String,
     crl_path: Option<String>,
+    enforce_crl_next_update: bool,
 ) {
     let signal = Arc::new(Notify::new());
     let on_event = signal.clone();
@@ -364,7 +381,7 @@ pub(crate) fn spawn_admin_tls_watcher(
                 crl_path.clone(),
             );
             let rebuilt = tokio::task::spawn_blocking(move || {
-                admin_mtls_acceptor(&cert, &key, &ca, crl.as_deref())
+                admin_mtls_acceptor(&cert, &key, &ca, crl.as_deref(), enforce_crl_next_update)
             })
             .await;
             match rebuilt {
@@ -445,6 +462,8 @@ pub fn load_tls_config(tls: &TlsConfig) -> Result<ServerConfig, String> {
                 client_roots(ca_path, "Client CA")?,
                 tls.client_crl_path.as_deref(),
                 client_auth_mode == "optional",
+                crate::crl::Listener::Tls,
+                tls.client_crl_enforce_next_update,
             )?;
 
             eprintln!(
@@ -977,8 +996,14 @@ mod tests {
         let garbage = path("garbage.der", &[0x30, 0x03, 0x01, 0x02, 0x03]);
         assert_eq!(super::load_crls(&garbage).unwrap().len(), 1);
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let e = super::client_cert_verifier(rustls::RootCertStore::empty(), Some(&garbage), false)
-            .expect_err("garbage is not a CRL");
+        let e = super::client_cert_verifier(
+            rustls::RootCertStore::empty(),
+            Some(&garbage),
+            false,
+            crate::crl::Listener::Tls,
+            false,
+        )
+        .expect_err("garbage is not a CRL");
         assert!(e.contains("client certificate verifier"), "{e}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -989,7 +1014,8 @@ mod tests {
         // committed); the mTLS happy path is covered by the reproducible smoke
         // in the PR. Here we assert the builder fails cleanly (Err, not panic)
         // when the cert/key/CA paths don't exist.
-        let r = super::admin_mtls_acceptor("/no/cert.pem", "/no/key.pem", "/no/ca.pem", None);
+        let r =
+            super::admin_mtls_acceptor("/no/cert.pem", "/no/key.pem", "/no/ca.pem", None, false);
         assert!(r.is_err(), "missing cert/key/ca must yield Err");
     }
 
