@@ -178,6 +178,7 @@ impl ResolvedAppConfig {
         // The same URL can appear in many routes — dedup via FnvHashMap.
         let mut map = fnv::FnvHashMap::default();
         let mut outlier_claimed: std::collections::HashSet<String> = Default::default();
+        let mut thresholds_claimed: std::collections::HashSet<String> = Default::default();
         let mut warned_probe_host: std::collections::HashSet<String> = Default::default();
         for route in &config.route {
             // A static route has no upstream to probe.
@@ -264,6 +265,12 @@ impl ResolvedAppConfig {
                 if let Some(c) = &probe_client {
                     if entry.probe_client.load().is_none() {
                         entry.probe_client.store(Some(c.clone()));
+                    }
+                }
+                // The first upstream table to name an endpoint decides its probe thresholds.
+                if let Some(u) = detailed {
+                    if thresholds_claimed.insert(url.clone()) {
+                        entry.set_thresholds(u.unhealthy_threshold, u.healthy_threshold);
                     }
                 }
                 if breaker_cfg.is_some() && !entry.breaker.is_configured() {

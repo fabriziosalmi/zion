@@ -87,6 +87,8 @@ refused.
 | `client_cert_path` / `client_key_path` | string? | none | The certificate (PEM chain) and key zion presents to this upstream: **mTLS**. Set both. Used by proxied requests, every pool attempt, WebSocket upgrades, cache fetches and the health probe (an mTLS-only backend would refuse a probe without it and be marked down). Read and checked when the config is built: a missing file, or a key that is not the certificate's, is a config error. Read again on every config reload, so a renewed certificate takes effect with a reload, no restart. `https://` endpoints only; two tables that name the same endpoint must use the same TLS settings |
 | `preserve_host` | bool | `false` | Send the client's `Host` instead of the upstream's own (see below) |
 | `health_host` | string? | none | `Host` the health probe sends (default: the upstream's own address) |
+| `unhealthy_threshold` | int | `2` | Consecutive failed health probes that mark a healthy upstream down (1–10). One lost probe no longer sends the traffic elsewhere; a suspect upstream is probed again within a fraction of a second. `1` is the behaviour before 0.9.15 (a single failure is down) |
+| `healthy_threshold` | int | `1` | Consecutive successful health probes that bring a down upstream back (1–10) |
 
 Legacy format `[upstreams]` (flat key-value map of name to URL) is also supported.
 

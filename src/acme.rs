@@ -231,6 +231,27 @@ fn check_cert_expiry(cert_path: &str, renew_before_days: u64) -> bool {
 // ACME flow — feature-gated
 // ============================================================================
 
+/// How long one renewal attempt may take, whichever way it is done. A hung CA or a hung
+/// script must not hold the renewal loop for good: the attempt fails, is counted, and is
+/// retried on the usual backoff.
+const RENEWAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// `fut`, or an error once `limit` has passed (and `fut` is dropped, which cancels it).
+#[cfg(feature = "acme")]
+async fn with_deadline<T>(
+    limit: std::time::Duration,
+    what: &str,
+    fut: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(format!(
+            "{what} did not finish within {} s and was abandoned",
+            limit.as_secs()
+        )),
+    }
+}
+
 /// Perform the actual ACME order and certificate issuance.
 /// When compiled with `--features acme`, uses instant-acme for the full flow.
 /// Otherwise, falls back to renew.sh or returns an error.
@@ -246,9 +267,15 @@ async fn do_renewal(
     // the ACME lifecycle counters (issue #59) so the soak workflow and
     // production dashboards can alert on renewal failures.
     #[cfg(feature = "acme")]
-    let result = do_renewal_native(config, _challenge_store, _tls_config).await;
+    let result = with_deadline(
+        RENEWAL_DEADLINE,
+        "the ACME renewal",
+        do_renewal_native(config, _challenge_store, _tls_config),
+    )
+    .await;
+    // The script has its own deadline, because it must be killed, not only abandoned.
     #[cfg(not(feature = "acme"))]
-    let result = do_renewal_script(config).await;
+    let result = do_renewal_script(config, RENEWAL_DEADLINE).await;
 
     match &result {
         Ok(()) => {
@@ -459,7 +486,10 @@ async fn do_renewal_native(
 /// `acme` feature — with it, `do_renewal` always takes the native path.
 /// C-05: Security hardening — validate script before execution.
 #[cfg(not(feature = "acme"))]
-async fn do_renewal_script(config: &crate::config::AcmeConfig) -> Result<(), String> {
+async fn do_renewal_script(
+    config: &crate::config::AcmeConfig,
+    limit: std::time::Duration,
+) -> Result<(), String> {
     crate::logging::warn(
         "acme",
         "native ACME not compiled in (missing --features acme). \
@@ -496,22 +526,88 @@ async fn do_renewal_script(config: &crate::config::AcmeConfig) -> Result<(), Str
     }
 
     crate::logging::info("acme", &format!("running renewal script: {script}"));
-    let output = tokio::process::Command::new("bash")
-        .arg(&script)
+    run_renew_script(&script, &config.state_dir, limit).await
+}
+
+/// Run `bash <script>` with a restricted environment, for at most `limit`. Past it the script
+/// and everything it started are killed: a renewal script is usually a wrapper
+/// (`certbot renew`), and killing only the shell would leave the real work running.
+#[cfg(not(feature = "acme"))]
+async fn run_renew_script(
+    script: &str,
+    state_dir: &str,
+    limit: std::time::Duration,
+) -> Result<(), String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.arg(script)
         // Restrict environment to prevent injection via env vars
         .env_clear()
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-        .env("HOME", &config.state_dir)
-        .output()
-        .await
+        .env("HOME", state_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // Its own process group, so that the whole group can be killed.
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("failed to run renew.sh: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("renew.sh failed: {stderr}"));
+    let pid = child.id();
+    // What the script says on stderr, up to 64 KiB (it only matters when it fails).
+    let mut stderr = child.stderr.take();
+    let reader = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(s) = stderr.as_mut() {
+            let _ = s.take(64 * 1024).read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    match tokio::time::timeout(limit, child.wait()).await {
+        Ok(Ok(status)) => {
+            let stderr = reader.await.unwrap_or_default();
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "renew.sh failed: {}",
+                    String::from_utf8_lossy(&stderr)
+                ))
+            }
+        }
+        Ok(Err(e)) => Err(format!("failed to run renew.sh: {e}")),
+        Err(_) => {
+            kill_process_group(pid);
+            let _ = child.kill().await; // the shell itself, where there is no process group to kill
+            reader.abort();
+            Err(format!(
+                "renew.sh did not finish within {} s and was killed",
+                limit.as_secs()
+            ))
+        }
     }
-    Ok(())
 }
+
+/// SIGKILL the process group led by `pid` (the group `run_renew_script` made).
+#[cfg(all(not(feature = "acme"), any(target_os = "linux", target_os = "macos")))]
+fn kill_process_group(pid: Option<u32>) {
+    if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
+        // SAFETY: `kill` only sends a signal. `pid` is a child of this process that has not
+        // been reaped (its `wait` future was dropped, not completed), so its group id cannot
+        // belong to anyone else yet.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
+#[cfg(all(
+    not(feature = "acme"),
+    not(any(target_os = "linux", target_os = "macos"))
+))]
+fn kill_process_group(_pid: Option<u32>) {}
 
 // ============================================================================
 // Soak driver (issue #59) — `zion acme-soak`
@@ -945,6 +1041,123 @@ async fn serve_challenges(listener: tokio::net::TcpListener, store: ChallengeSto
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "acme")]
+    #[tokio::test]
+    async fn a_renewal_that_never_finishes_fails_instead_of_blocking_the_loop() {
+        let started = std::time::Instant::now();
+        let r: Result<(), String> = with_deadline(
+            std::time::Duration::from_millis(100),
+            "the ACME renewal",
+            std::future::pending(),
+        )
+        .await;
+        let e = r.unwrap_err();
+        assert!(e.contains("did not finish"), "{e}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // What finishes in time is passed through, success and failure alike.
+        let ok = with_deadline(std::time::Duration::from_secs(5), "x", async { Ok(7) }).await;
+        assert_eq!(ok, Ok(7));
+        let err: Result<(), String> =
+            with_deadline(std::time::Duration::from_secs(5), "x", async {
+                Err("the CA said no".to_string())
+            })
+            .await;
+        assert_eq!(err, Err("the CA said no".to_string()));
+    }
+
+    #[cfg(all(unix, not(feature = "acme")))]
+    mod renew_script {
+        use super::super::run_renew_script;
+        use std::time::Duration;
+
+        fn dir(tag: &str) -> std::path::PathBuf {
+            let d = std::env::temp_dir().join(format!("zion-renew-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        fn alive(pid: &str) -> bool {
+            std::process::Command::new("kill")
+                .args(["-0", pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+
+        #[tokio::test]
+        async fn a_script_that_succeeds_or_fails_is_reported_as_before() {
+            let d = dir("plain");
+            let ok = d.join("ok.sh");
+            std::fs::write(&ok, "exit 0\n").unwrap();
+            assert_eq!(
+                run_renew_script(
+                    ok.to_str().unwrap(),
+                    d.to_str().unwrap(),
+                    Duration::from_secs(30)
+                )
+                .await,
+                Ok(())
+            );
+            let bad = d.join("bad.sh");
+            std::fs::write(&bad, "echo 'the CA said no' >&2\nexit 3\n").unwrap();
+            let e = run_renew_script(
+                bad.to_str().unwrap(),
+                d.to_str().unwrap(),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                e.contains("renew.sh failed") && e.contains("the CA said no"),
+                "{e}"
+            );
+            std::fs::remove_dir_all(&d).ok();
+        }
+
+        /// A script that hangs is killed together with what it started: a renewal script is
+        /// typically a wrapper, and the shell is not the process doing the work.
+        #[tokio::test]
+        async fn a_script_that_hangs_is_killed_with_its_children() {
+            let d = dir("hang");
+            let script = d.join("hang.sh");
+            std::fs::write(
+                &script,
+                format!(
+                    "echo $$ > {d}/shell.pid\nsleep 300 &\necho $! > {d}/child.pid\nwait\n",
+                    d = d.display()
+                ),
+            )
+            .unwrap();
+            let started = std::time::Instant::now();
+            let e = run_renew_script(
+                script.to_str().unwrap(),
+                d.to_str().unwrap(),
+                Duration::from_millis(700),
+            )
+            .await
+            .unwrap_err();
+            assert!(e.contains("was killed"), "{e}");
+            assert!(started.elapsed() < Duration::from_secs(20));
+            let shell = std::fs::read_to_string(d.join("shell.pid")).unwrap();
+            let child = std::fs::read_to_string(d.join("child.pid")).unwrap();
+            // Give the kernel a moment to tear the processes down.
+            for _ in 0..50 {
+                if !alive(shell.trim()) && !alive(child.trim()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(!alive(shell.trim()), "the shell is still running");
+            assert!(
+                !alive(child.trim()),
+                "what the script started is still running"
+            );
+            std::fs::remove_dir_all(&d).ok();
+        }
+    }
 
     #[test]
     fn a_failed_renewal_is_retried_soon_with_backoff() {

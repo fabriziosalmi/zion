@@ -777,6 +777,18 @@ struct RawUpstream {
     preserve_host: bool,
     #[serde(default)]
     health_host: Option<String>,
+    #[serde(default = "default_unhealthy_threshold")]
+    unhealthy_threshold: u32,
+    #[serde(default = "default_healthy_threshold")]
+    healthy_threshold: u32,
+}
+
+fn default_unhealthy_threshold() -> u32 {
+    crate::health::DEFAULT_UNHEALTHY_THRESHOLD
+}
+
+fn default_healthy_threshold() -> u32 {
+    crate::health::DEFAULT_HEALTHY_THRESHOLD
 }
 
 /// How a pool of several endpoints assigns a request to a member.
@@ -1003,6 +1015,15 @@ pub struct UpstreamConfig {
     /// `ALLOWED_HOSTS`): it would answer the probe 4xx and be marked down.
     #[serde(default)]
     pub health_host: Option<String>,
+    /// Consecutive failed active probes that mark a healthy upstream down (1–10, default 2):
+    /// one lost probe does not send its traffic elsewhere. A suspect upstream is probed again
+    /// within a fraction of a second, so the second probe follows the first closely. `1`
+    /// restores the behaviour before this setting (a single failure is down).
+    #[serde(default = "default_unhealthy_threshold")]
+    pub unhealthy_threshold: u32,
+    /// Consecutive successful active probes that bring a down upstream back (1–10, default 1).
+    #[serde(default = "default_healthy_threshold")]
+    pub healthy_threshold: u32,
 }
 
 impl TryFrom<RawUpstream> for UpstreamConfig {
@@ -1035,6 +1056,8 @@ impl TryFrom<RawUpstream> for UpstreamConfig {
             max_in_flight: raw.max_in_flight,
             preserve_host: raw.preserve_host,
             health_host: raw.health_host,
+            unhealthy_threshold: raw.unhealthy_threshold,
+            healthy_threshold: raw.healthy_threshold,
         })
     }
 }
@@ -1832,6 +1855,16 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             if !valid {
                 errors.push(format!(
                     "upstream.{name}.health_host must be a host name (optionally with :port), got {h:?}"
+                ));
+            }
+        }
+        for (key, n) in [
+            ("unhealthy_threshold", up.unhealthy_threshold),
+            ("healthy_threshold", up.healthy_threshold),
+        ] {
+            if !(1..=10).contains(&n) {
+                errors.push(format!(
+                    "upstream.{name}.{key} must be 1..=10 (consecutive probe results), got {n}"
                 ));
             }
         }
@@ -2935,6 +2968,49 @@ mod tests {
                 "{ok}"
             );
         }
+    }
+
+    #[test]
+    fn probe_thresholds_default_to_two_and_one_and_are_bounded() {
+        let cfg = |up: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+                 [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstream.u]\nurl=\"http://a:1\"\n{up}\n\
+                 [[route]]\npath=\"/{{*r}}\"\nupstream=\"u\"\n"
+            )
+        };
+        let d: ZionConfig = toml::from_str(&cfg("")).unwrap();
+        assert_eq!(
+            (
+                d.upstream["u"].unhealthy_threshold,
+                d.upstream["u"].healthy_threshold
+            ),
+            (2, 1)
+        );
+        let c: ZionConfig =
+            toml::from_str(&cfg("unhealthy_threshold = 5\nhealthy_threshold = 3")).unwrap();
+        assert_eq!(
+            (
+                c.upstream["u"].unhealthy_threshold,
+                c.upstream["u"].healthy_threshold
+            ),
+            (5, 3)
+        );
+        // (the config as a whole may be refused for other reasons: the cert files do not exist)
+        let e = validate_str(&cfg("unhealthy_threshold = 1\nhealthy_threshold = 10"), "t")
+            .err()
+            .unwrap_or_default();
+        assert!(!e.contains("_threshold"), "the bounds are inclusive: {e}");
+        for bad in [
+            "unhealthy_threshold = 0",
+            "unhealthy_threshold = 11",
+            "healthy_threshold = 0",
+            "healthy_threshold = 11",
+        ] {
+            let e = validate_str(&cfg(bad), "t").err().unwrap_or_default();
+            assert!(e.contains("_threshold must be 1..=10"), "{bad}: {e}");
+        }
+        assert!(toml::from_str::<ZionConfig>(&cfg("unhealthy_threshold = -1")).is_err());
     }
 
     #[test]

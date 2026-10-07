@@ -58,7 +58,20 @@ pub struct UpstreamHealth {
     /// CA, a client certificate): a probe sent without them fails the handshake of an
     /// mTLS-only upstream and marks it down. Set from the config, re-applied on reload.
     pub probe_client: arc_swap::ArcSwapOption<crate::proxy::HttpClient>,
+    /// Consecutive failed probes that take a healthy upstream out (`[upstream.x]
+    /// unhealthy_threshold`), and consecutive successful ones that bring a down one back
+    /// (`healthy_threshold`). Re-applied on every reload.
+    pub unhealthy_threshold: std::sync::atomic::AtomicU32,
+    pub healthy_threshold: std::sync::atomic::AtomicU32,
+    /// The run of probe failures / successes in progress. Prober-private, like `backoff_us`.
+    pub fail_streak: std::sync::atomic::AtomicU32,
+    pub ok_streak: std::sync::atomic::AtomicU32,
 }
+
+/// Defaults of `unhealthy_threshold` and `healthy_threshold`: one lost probe does not take a
+/// healthy upstream out, one good probe brings a down one back.
+pub const DEFAULT_UNHEALTHY_THRESHOLD: u32 = 2;
+pub const DEFAULT_HEALTHY_THRESHOLD: u32 = 1;
 
 impl UpstreamHealth {
     /// Update latency using Exponentially Weighted Moving Average (alpha = 0.125).
@@ -93,6 +106,54 @@ impl UpstreamHealth {
             pool: crate::pool::MemberStats::new(),
             probe_host: arc_swap::ArcSwapOption::empty(),
             probe_client: arc_swap::ArcSwapOption::empty(),
+            unhealthy_threshold: std::sync::atomic::AtomicU32::new(DEFAULT_UNHEALTHY_THRESHOLD),
+            healthy_threshold: std::sync::atomic::AtomicU32::new(DEFAULT_HEALTHY_THRESHOLD),
+            fail_streak: std::sync::atomic::AtomicU32::new(0),
+            ok_streak: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Set how many consecutive probe results flip the state (a `0` counts as `1`).
+    pub fn set_thresholds(&self, unhealthy: u32, healthy: u32) {
+        self.unhealthy_threshold.store(unhealthy.max(1), Relaxed);
+        self.healthy_threshold.store(healthy.max(1), Relaxed);
+    }
+
+    /// Feed one active-probe result and return whether the upstream is healthy after it. A
+    /// healthy upstream goes down after `unhealthy_threshold` failures in a row; a down one
+    /// comes back after `healthy_threshold` successes in a row. A result of the other kind
+    /// ends the run, so a single lost probe does not flap a healthy backend.
+    pub fn record_probe(&self, probe_ok: bool) -> bool {
+        if probe_ok {
+            self.fail_streak.store(0, Relaxed);
+            let run = self.ok_streak.fetch_add(1, Relaxed).saturating_add(1);
+            if run >= self.healthy_threshold.load(Relaxed) {
+                self.healthy.store(true, Relaxed);
+            }
+        } else {
+            self.ok_streak.store(0, Relaxed);
+            let run = self.fail_streak.fetch_add(1, Relaxed).saturating_add(1);
+            if run >= self.unhealthy_threshold.load(Relaxed) {
+                self.healthy.store(false, Relaxed);
+            }
+        }
+        self.healthy.load(Relaxed)
+    }
+
+    /// Schedule the next probe after `record_probe(probe_ok)`. An upstream that is healthy
+    /// and has no failure pending is checked on the steady cadence. One that is failing
+    /// (down, or healthy with a failure not yet confirmed) is checked on the DOWN backoff, so
+    /// a first lost probe is confirmed or cleared within a fraction of a second. One that is
+    /// coming back but not yet trusted is checked again at the base delay.
+    pub fn schedule_after_probe(&self, probe_ok: bool, now_us: u64) {
+        if self.healthy.load(Relaxed) && self.fail_streak.load(Relaxed) == 0 {
+            self.reschedule(true, now_us);
+        } else if probe_ok {
+            self.backoff_us.store(PROBE_BASE_US, Relaxed);
+            self.next_probe_at_us
+                .store(now_us.saturating_add(PROBE_BASE_US), Relaxed);
+        } else {
+            self.reschedule(false, now_us);
         }
     }
 
@@ -219,12 +280,15 @@ pub async fn probe_round(
     for (url, up) in due {
         let (client, http1) = (client.clone(), http1.clone());
         join_set.spawn(async move {
-            let (healthy, lat) = probe(&client, &http1, &url, &up).await;
+            let (probe_ok, lat) = probe(&client, &http1, &url, &up).await;
             up.update_latency(lat);
-            let was_healthy = up.healthy.swap(healthy, Relaxed);
-            // A success resets the backoff and returns to the STEADY cadence; a
-            // failure draws the next decorrelated-jitter delay.
-            up.reschedule(healthy, base.elapsed().as_micros() as u64);
+            let healthy = probe_ok;
+            let was_healthy = up.healthy.load(Relaxed);
+            // The state flips only after the configured run of equal results.
+            let healthy = up.record_probe(healthy);
+            // A settled-healthy upstream goes back to the STEADY cadence; a failing one
+            // draws the next decorrelated-jitter delay.
+            up.schedule_after_probe(probe_ok, base.elapsed().as_micros() as u64);
             if was_healthy && !healthy {
                 let next_ms = up.backoff_us.load(Relaxed) / 1000;
                 let url = crate::http_util::redact_userinfo(&url);
@@ -523,5 +587,128 @@ mod tests {
             );
             now += delay;
         }
+    }
+
+    // ── consecutive-result thresholds on the active probe (#540) ────────────
+
+    fn with_thresholds(unhealthy: u32, healthy: u32) -> UpstreamHealth {
+        let up = UpstreamHealth::new_healthy();
+        up.set_thresholds(unhealthy, healthy);
+        up
+    }
+
+    #[test]
+    fn one_failed_probe_does_not_take_a_healthy_upstream_out_and_the_second_does() {
+        let up = UpstreamHealth::new_healthy(); // the defaults: 2 failures, 1 success
+        assert!(up.record_probe(false), "one lost probe: still up");
+        up.schedule_after_probe(false, 0);
+        let delay = up.next_probe_at_us.load(Relaxed);
+        assert!(
+            (PROBE_BASE_US..=PROBE_BASE_US * PROBE_MULT).contains(&delay),
+            "a suspect upstream is checked again within {PROBE_BASE_US}..{} us, not on the \
+             steady cadence; got {delay}",
+            PROBE_BASE_US * PROBE_MULT
+        );
+        assert!(!up.record_probe(false), "two in a row: down");
+        assert!(!up.healthy.load(Relaxed));
+    }
+
+    #[test]
+    fn a_success_between_failures_starts_the_count_again() {
+        let up = with_thresholds(2, 1);
+        assert!(up.record_probe(false));
+        assert!(up.record_probe(true));
+        up.schedule_after_probe(true, 0);
+        assert_eq!(
+            up.next_probe_at_us.load(Relaxed),
+            STEADY_US,
+            "settled again: steady"
+        );
+        assert!(
+            up.record_probe(false),
+            "the earlier failure no longer counts"
+        );
+        assert!(!up.record_probe(false));
+    }
+
+    #[test]
+    fn recovery_waits_for_as_many_successes_as_configured() {
+        let up = with_thresholds(1, 3);
+        assert!(
+            !up.record_probe(false),
+            "threshold 1: a single failure is down"
+        );
+        assert!(!up.record_probe(true));
+        up.schedule_after_probe(true, 10);
+        assert_eq!(
+            up.next_probe_at_us.load(Relaxed),
+            10 + PROBE_BASE_US,
+            "a recovery that is not confirmed yet is checked again at the base delay"
+        );
+        assert!(!up.record_probe(true));
+        assert!(!up.record_probe(false), "a failure resets the successes");
+        assert!(!up.record_probe(true));
+        assert!(!up.record_probe(true));
+        assert!(up.record_probe(true), "the third in a row brings it back");
+    }
+
+    #[test]
+    fn thresholds_of_one_are_the_behaviour_before_the_thresholds() {
+        let up = with_thresholds(1, 1);
+        assert!(!up.record_probe(false));
+        assert!(up.record_probe(true));
+    }
+
+    #[test]
+    fn a_threshold_of_zero_means_one() {
+        let up = with_thresholds(0, 0);
+        assert!(!up.record_probe(false));
+        assert!(up.record_probe(true));
+    }
+
+    /// The real prober against a real listener: the first probe that fails keeps the
+    /// upstream up, the second takes it out, one success brings it back.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // sockets, a TLS client (aws-lc FFI)
+    async fn probe_rounds_apply_the_thresholds() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::AtomicBool;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let answer_ok = Arc::new(AtomicBool::new(false));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let flag = answer_ok.clone();
+        std::thread::spawn(move || {
+            for mut c in listener.incoming().flatten() {
+                let mut buf = [0u8; 1024];
+                let _ = c.read(&mut buf);
+                let status = if flag.load(Relaxed) {
+                    "200 OK"
+                } else {
+                    "503 Service Unavailable"
+                };
+                let _ = c.write_all(
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                );
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}");
+        let up = Arc::new(UpstreamHealth::new_healthy());
+        let mut m = FnvHashMap::default();
+        m.insert(url, up.clone());
+        let map: HealthMap = Arc::new(m);
+        let client =
+            crate::proxy::build_http_client(crate::proxy::DEFAULT_CONNECT_TIMEOUT_MS, false);
+        let base = tokio::time::Instant::now();
+        let round = || async {
+            up.next_probe_at_us.store(0, Relaxed); // due now
+            probe_round(&map, base, &client, &client).await;
+            up.healthy.load(Relaxed)
+        };
+        assert!(round().await, "first failed probe: still up");
+        assert!(!round().await, "second: down");
+        answer_ok.store(true, Relaxed);
+        assert!(round().await, "one success: back");
     }
 }
