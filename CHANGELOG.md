@@ -4,9 +4,21 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
-### Changed (behaviour)
+## [0.10.0] - 2026-10-07
+
+**A token that expires more than 24 hours from now is refused by default: read the first upgrade note before you upgrade.** The rest is a latency fix for requests with a body to an HTTP/2 upstream on Linux, release-build reproducibility, and the last archived dependency gone.
+
+### Upgrade notes
+
+- **If you issue tokens that live longer than 24 hours, set `max_token_lifetime_secs` before upgrading.** `[auth_profile.x] max_token_lifetime_secs` now defaults to `86400` (it was unset, meaning no cap): a profile without it answers `403` to a token whose `exp` is further out. Set it to the longest lifetime you issue, or to `0` for no cap. If `zion_auth_long_lived_tokens_total` stayed at zero since 0.9.9, nothing changes for you. (#553)
+- **Requests with a body to an HTTP/2 upstream are faster on Linux (no configuration).** They no longer wait ~40 ms on the way (see Fixed). If you sized timeouts or capacity around that latency, they now have headroom.
+- No setting was removed. `h2_control_frames_per_sec` stays off by default (see Documentation).
+
+### Changed
 
 - **A token that expires more than 24 hours from now is refused by default.** `[auth_profile.x] max_token_lifetime_secs` now defaults to `86400` (it was unset, meaning no cap): a profile without the setting answers `403` to a token whose `exp` is further out than that (plus `leeway_secs`). This was announced in 0.9.9 (#553, step 1: a boot warning and `zion_auth_long_lived_tokens_total`). **Before upgrading**, if you issue tokens that live longer than 24 hours, set `max_token_lifetime_secs` to the longest lifetime you issue, or to `0` for no cap; if the counter stayed at zero, nothing changes for you. The first refusal each minute is logged with the token's remaining lifetime and the cap (never the token); the boot message for a profile without the setting is now informational. `zion_auth_long_lived_tokens_total` now counts the tokens accepted past 24 h under `0` or a larger cap. (#553)
+- **Release builds are pinned further, and the container image can be rebuilt to the same digest.** `cargo-zigbuild` (0.23.4) and `cargo-cyclonedx` (0.5.9) are installed at the versions that built v0.9.15 instead of "latest" (zig was already 0.13.0). The image's `created` label and annotation are the commit's time, not the clock's, and the per-arch images are exported with `rewrite-timestamp=true`, so layer file times no longer carry the checkout's. Measured on two no-cache builds of one commit: the compiled binary is identical (same sha256); the image digests differ without `rewrite-timestamp` and are equal with it. The first release built this way is the next one. A weekly job (`reproducibility.yml`) now rebuilds the latest release's Linux musl binary from its tag and compares it with the published one. The Dockerfile comment that promised a bit-stable plain `docker build` is corrected. (#538)
+- **`rustls-pemfile` is gone.** It is archived (RUSTSEC-2025-0134) and read every certificate and key zion loads; the advisory ignore was due to expire on 2026-12-01. PEM files are now read through `rustls::pki_types`, the parser `rustls-pemfile` itself wrapped, so what zion accepts does not change: a test records how the old crate read 41 inputs (every key kind, chains, CRLF, junk between blocks, damaged blocks) and the new reader must read them the same. Boot with every key kind (RSA PKCS#8 and PKCS#1, EC SEC1 and PKCS#8, Ed25519) is tested against the real binary. One difference an operator may see: a certificate or key path that is a directory now fails with the system's error instead of a PEM parse error. No setting changes. (#537)
 
 ### Fixed
 
@@ -15,11 +27,6 @@ All notable changes to Zion Edge Gateway are documented here.
 ### Documentation
 
 - **`h2_control_frames_per_sec` stays opt-in, with measured numbers.** Measured through zion (#561): grpc-go sends thousands of control frames a second on a fast link (one `PING` per batch of data, so the rate follows the round-trip time: 1,411 with unary calls and 1,700 on a bidirectional stream at 0.2 ms, 17,200 on loopback), so a default of `1000` would close busy gRPC connections; the C-core gRPC clients send 6 to 13, curl, nghttp, h2load and Chrome 2 to 3. The guide now says to read `zion_h2_control_frames_peak` first when gRPC is in front. The rig (`benchmarks/h2-control/`) reproduces the numbers and measures a browser. Firefox and Safari are not measured yet. (#561)
-
-### Changed
-
-- **Release builds are pinned further, and the container image can be rebuilt to the same digest.** `cargo-zigbuild` (0.23.4) and `cargo-cyclonedx` (0.5.9) are installed at the versions that built v0.9.15 instead of "latest" (zig was already 0.13.0). The image's `created` label and annotation are the commit's time, not the clock's, and the per-arch images are exported with `rewrite-timestamp=true`, so layer file times no longer carry the checkout's. Measured on two no-cache builds of one commit: the compiled binary is identical (same sha256); the image digests differ without `rewrite-timestamp` and are equal with it. The first release built this way is the next one. A weekly job (`reproducibility.yml`) now rebuilds the latest release's Linux musl binary from its tag and compares it with the published one. The Dockerfile comment that promised a bit-stable plain `docker build` is corrected. (#538)
-- **`rustls-pemfile` is gone.** It is archived (RUSTSEC-2025-0134) and read every certificate and key zion loads; the advisory ignore was due to expire on 2026-12-01. PEM files are now read through `rustls::pki_types`, the parser `rustls-pemfile` itself wrapped, so what zion accepts does not change: a test records how the old crate read 41 inputs (every key kind, chains, CRLF, junk between blocks, damaged blocks) and the new reader must read them the same. Boot with every key kind (RSA PKCS#8 and PKCS#1, EC SEC1 and PKCS#8, Ed25519) is tested against the real binary. One difference an operator may see: a certificate or key path that is a directory now fails with the system's error instead of a PEM parse error. No setting changes. (#537)
 
 ## [0.9.15] - 2026-10-07
 
