@@ -275,6 +275,13 @@ pub fn build_client(spec: &ClientSpec) -> HttpClient {
     );
     // The TLS wrapper needs to see `https://` URIs; it does its own scheme check.
     http.enforce_http(false);
+    // No Nagle on pooled upstream sockets. A request is written as several small frames
+    // (an HTTP/2 HEADERS frame, then its DATA; a gRPC call's message, then its trailers),
+    // and with Nagle the second waits for the ACK of the first, which the peer's delayed
+    // ACK holds back for up to 40 ms on Linux: measured, eight concurrent gRPC unary calls
+    // through zion made 190 calls a second against 14,000 direct. The accepted client
+    // sockets and the WebSocket dials already set it.
+    http.set_nodelay(true);
     // Kernel keepalive on pooled upstream sockets too: a pooled connection to a host
     // that died silently would otherwise be handed to the next request and fail then.
     http.set_keepalive(Some(std::time::Duration::from_secs(
