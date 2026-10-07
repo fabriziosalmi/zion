@@ -172,7 +172,6 @@ impl UpstreamTls {
         cert_path: Option<&str>,
         key_path: Option<&str>,
     ) -> Result<Arc<Self>, String> {
-        use std::io::BufReader;
         let mut digest = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
         let mut read = |role: &str, path: &str| -> Result<Vec<u8>, String> {
             let bytes = std::fs::read(path).map_err(|e| format!("{role} {path}: {e}"))?;
@@ -185,8 +184,7 @@ impl UpstreamTls {
         match ca_path {
             Some(path) => {
                 let pem = read("ca_path", path)?;
-                for cert in rustls_pemfile::certs(&mut BufReader::new(pem.as_slice())) {
-                    let cert = cert.map_err(|e| format!("ca_path {path}: {e}"))?;
+                for cert in crate::pem::certs(&pem).map_err(|e| format!("ca_path {path}: {e}"))? {
                     roots
                         .add(cert)
                         .map_err(|e| format!("ca_path {path}: {e}"))?;
@@ -206,10 +204,9 @@ impl UpstreamTls {
                     .map_err(|e| format!("client certificate: {e}"))?;
                 let cert_pem = read("client_cert_path", cert)?;
                 let key_pem = read("client_key_path", key)?;
-                let chain = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_slice()))
-                    .collect::<Result<Vec<_>, _>>()
+                let chain = crate::pem::certs(&cert_pem)
                     .map_err(|e| format!("client_cert_path {cert}: {e}"))?;
-                let key_der = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_slice()))
+                let key_der = crate::pem::private_key(&key_pem)
                     .map_err(|e| format!("client_key_path {key}: {e}"))?
                     .ok_or_else(|| format!("client_key_path {key}: no private key in the file"))?;
                 (

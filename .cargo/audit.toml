@@ -10,8 +10,6 @@
 ignore = [
     # ── Unmaintained transitive deps (no safe upgrade currently available) ──
     "RUSTSEC-2024-0384",  # `instant` unmaintained (transitive only) — review by 2026-12-01 (re-assessed 2026-10-02: still no replacement upstream)
-    # ── Direct dep needing API migration ──
-    "RUSTSEC-2025-0134",  # `rustls-pemfile` archived; migrate to rustls-pki-types::pem — review by 2026-08-01
     # ── Soundness (unsound) in feature-gated transitive deps ──
     # cargo-audit scans the FLAT lockfile and flags these under `--deny unsound`;
     # cargo-deny's all-features GRAPH does not resolve them, so they are ignored

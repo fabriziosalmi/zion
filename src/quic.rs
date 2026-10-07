@@ -31,16 +31,14 @@ pub static ALT_SVC_H3: hyper::header::HeaderValue =
 /// rustls build, quinn config conversion) so the caller can surface a
 /// `ZionError::Tls` to the operator instead of aborting the daemon.
 pub fn build_quinn_server_config(tls: &TlsConfig) -> Result<quinn::ServerConfig, String> {
-    let cert_file = std::fs::File::open(&tls.cert_path)
-        .map_err(|e| format!("QUIC cert {}: {e}", tls.cert_path))?;
-    let key_file = std::fs::File::open(&tls.key_path)
-        .map_err(|e| format!("QUIC key {}: {e}", tls.key_path))?;
+    let cert_pem =
+        std::fs::read(&tls.cert_path).map_err(|e| format!("QUIC cert {}: {e}", tls.cert_path))?;
+    let key_pem =
+        std::fs::read(&tls.key_path).map_err(|e| format!("QUIC key {}: {e}", tls.key_path))?;
 
-    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("parse QUIC cert PEM: {e}"))?;
+    let certs = crate::pem::certs(&cert_pem).map_err(|e| format!("parse QUIC cert PEM: {e}"))?;
 
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))
+    let key = crate::pem::private_key(&key_pem)
         .map_err(|e| format!("parse QUIC key PEM: {e}"))?
         .ok_or_else(|| "no private key in PEM".to_string())?;
 

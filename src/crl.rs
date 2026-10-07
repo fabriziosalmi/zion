@@ -489,9 +489,7 @@ LGjD25HjJwcYfR4vMJYT25WsG0Y0rBg+4OSb1IiwOt+f1mG++WCfJos86IJH0l2e
 2djc1uTC5O41ELzogJjzA2xakRRUMl51HxE4WwaSkGn6gkxj1ZSicehl11b4qO7Y
 eyOjnQ==
 -----END X509 CRL-----\n";
-        let ders: Vec<_> = rustls_pemfile::crls(&mut PEM.as_bytes())
-            .collect::<Result<_, _>>()
-            .unwrap();
+        let ders = crate::pem::crls(PEM.as_bytes()).unwrap();
         assert_eq!(ders.len(), 1);
         assert_eq!(next_update(ders[0].as_ref()), Some(1_791_380_689));
     }

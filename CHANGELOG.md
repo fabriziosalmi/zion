@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **`rustls-pemfile` is gone.** It is archived (RUSTSEC-2025-0134) and read every certificate and key zion loads; the advisory ignore was due to expire on 2026-12-01. PEM files are now read through `rustls::pki_types`, the parser `rustls-pemfile` itself wrapped, so what zion accepts does not change: a test records how the old crate read 41 inputs (every key kind, chains, CRLF, junk between blocks, damaged blocks) and the new reader must read them the same. Boot with every key kind (RSA PKCS#8 and PKCS#1, EC SEC1 and PKCS#8, Ed25519) is tested against the real binary. One difference an operator may see: a certificate or key path that is a directory now fails with the system's error instead of a PEM parse error. No setting changes. (#537)
+
 ## [0.9.15] - 2026-10-07
 
 **Reliability and visibility: things that went wrong quietly now say so, and a few that could hurt after a crash or a lost packet no longer do.** Two behaviours change; read the first two notes.
