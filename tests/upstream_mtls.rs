@@ -404,17 +404,14 @@ fn zion_presents_its_client_certificate_to_an_upstream_that_requires_one() {
 /// connection without a TLS `close_notify`. The response is delimited by that close, so zion
 /// cannot tell its end from a truncation. Returns the port.
 fn truncating_backend(dir: &Path) -> u16 {
+    use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use std::io::{Read, Write};
     let read = |f: &str| fs::read(dir.join(f)).unwrap();
-    let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut read("server.pem").as_slice())
-            .collect::<Result<_, _>>()
-            .unwrap();
-    let key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut read("server.key").as_slice())
-            .unwrap()
-            .unwrap();
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&read("server.pem"))
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_slice(&read("server.key")).unwrap();
     let config = std::sync::Arc::new(
         rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),

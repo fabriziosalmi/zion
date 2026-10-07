@@ -70,6 +70,7 @@ mod metrics;
 mod net;
 mod numa;
 mod observability;
+mod pem;
 mod pool;
 mod proxy;
 #[cfg(feature = "http3")]

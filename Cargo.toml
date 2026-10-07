@@ -42,7 +42,6 @@ matchit = "0.9"
 
 # TLS + hot-reload
 rustls = "0.23"
-rustls-pemfile = "2"
 tokio-rustls = "0.26"
 arc-swap = "1"
 notify = "7"

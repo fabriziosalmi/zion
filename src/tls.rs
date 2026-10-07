@@ -20,7 +20,6 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::ServerConfig;
 use std::cell::RefCell;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -184,15 +183,13 @@ pub(crate) fn load_certified_key(
     cert_path: &str,
     key_path: &str,
 ) -> Result<Arc<CertifiedKey>, String> {
-    let cert_file =
-        std::fs::File::open(cert_path).map_err(|e| format!("TLS cert {cert_path}: {e}"))?;
-    let key_file = std::fs::File::open(key_path).map_err(|e| format!("TLS key {key_path}: {e}"))?;
+    let cert_pem = std::fs::read(cert_path).map_err(|e| format!("TLS cert {cert_path}: {e}"))?;
+    let key_pem = std::fs::read(key_path).map_err(|e| format!("TLS key {key_path}: {e}"))?;
 
-    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()
+    let certs = crate::pem::certs(&cert_pem)
         .map_err(|e| format!("Failed to parse TLS certificate PEM: {e}"))?;
 
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+    let key = crate::pem::private_key(&key_pem)
         .map_err(|e| format!("Failed to parse TLS key PEM: {e}"))?
         .ok_or_else(|| "No private key found in PEM file".to_string())?;
 
@@ -215,10 +212,9 @@ pub(crate) fn load_certified_key(
 
 /// The CA certificates in `ca_path` as a root store. `what` names the file's role in errors.
 fn client_roots(ca_path: &str, what: &str) -> Result<rustls::RootCertStore, String> {
-    let ca_file = std::fs::File::open(ca_path).map_err(|e| format!("{what} {ca_path}: {e}"))?;
+    let ca_pem = std::fs::read(ca_path).map_err(|e| format!("{what} {ca_path}: {e}"))?;
     let mut root_store = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut BufReader::new(ca_file)) {
-        let cert = cert.map_err(|e| format!("{what} PEM: {e}"))?;
+    for cert in crate::pem::certs(&ca_pem).map_err(|e| format!("{what} PEM: {e}"))? {
         root_store
             .add(cert)
             .map_err(|e| format!("{what} add: {e}"))?;
@@ -233,9 +229,7 @@ pub(crate) fn load_crls(
     path: &str,
 ) -> Result<Vec<rustls::pki_types::CertificateRevocationListDer<'static>>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("client CRL {path}: {e}"))?;
-    let pem: Vec<_> = rustls_pemfile::crls(&mut bytes.as_slice())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("client CRL {path}: {e}"))?;
+    let pem = crate::pem::crls(&bytes).map_err(|e| format!("client CRL {path}: {e}"))?;
     if !pem.is_empty() {
         return Ok(pem);
     }
@@ -295,14 +289,11 @@ pub(crate) fn admin_mtls_acceptor(
     enforce_crl_next_update: bool,
 ) -> Result<TlsAcceptor, String> {
     // Server identity (reuses the daemon's cert/key).
-    let cert_file =
-        std::fs::File::open(cert_path).map_err(|e| format!("admin TLS cert {cert_path}: {e}"))?;
-    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("admin TLS cert PEM: {e}"))?;
-    let key_file =
-        std::fs::File::open(key_path).map_err(|e| format!("admin TLS key {key_path}: {e}"))?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+    let cert_pem =
+        std::fs::read(cert_path).map_err(|e| format!("admin TLS cert {cert_path}: {e}"))?;
+    let certs = crate::pem::certs(&cert_pem).map_err(|e| format!("admin TLS cert PEM: {e}"))?;
+    let key_pem = std::fs::read(key_path).map_err(|e| format!("admin TLS key {key_path}: {e}"))?;
+    let key = crate::pem::private_key(&key_pem)
         .map_err(|e| format!("admin TLS key PEM: {e}"))?
         .ok_or_else(|| "admin TLS key: no private key in PEM".to_string())?;
 
@@ -777,11 +768,7 @@ pub fn spawn_cert_prewarm_task(acceptor_store: Arc<ArcSwap<TlsAcceptor>>, tls: T
 pub fn cert_expiry_secs(cert_path: &str) -> Option<i64> {
     use std::time::SystemTime;
 
-    let file = std::fs::File::open(cert_path).ok()?;
-    let mut reader = BufReader::new(file);
-    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
+    let certs = crate::pem::certs(&std::fs::read(cert_path).ok()?).ok()?;
     let cert_der = certs.first()?;
 
     // Parse the X.509 cert to get notAfter

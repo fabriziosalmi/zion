@@ -181,7 +181,6 @@ pub async fn revoke_cert(
     cert_path: &str,
 ) -> Result<(), String> {
     use instant_acme::{RevocationReason, RevocationRequest};
-    use std::io::BufReader;
 
     // Restore the persisted account that issued the cert.
     let creds_path = std::path::Path::new(&config.state_dir).join("account.json");
@@ -195,9 +194,11 @@ pub async fn revoke_cert(
         .map_err(|e| format!("cannot restore ACME account: {e}"))?;
 
     // Parse the leaf certificate (first PEM block) into DER.
-    let cert_file = std::fs::File::open(cert_path)
-        .map_err(|e| format!("cannot open cert '{cert_path}': {e}"))?;
-    let leaf = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+    let cert_pem =
+        std::fs::read(cert_path).map_err(|e| format!("cannot open cert '{cert_path}': {e}"))?;
+    // The first certificate only, read lazily: a damaged block after it is not this call's business.
+    use rustls::pki_types::pem::PemObject;
+    let leaf = rustls::pki_types::CertificateDer::pem_slice_iter(&cert_pem)
         .next()
         .ok_or_else(|| "no certificate in chain".to_string())?
         .map_err(|e| format!("cannot parse leaf certificate: {e}"))?;
