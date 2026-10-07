@@ -106,6 +106,35 @@ const BODY_FRAME_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// upload near `max_body_mb` would.
 const BODY_COLLECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// What a failed read of the request body means. `Limited` reports overflow as a
+/// `LengthLimitError`; anything else is the client's stream breaking (reset,
+/// malformed chunked framing, a connection that dropped). Telling them apart keeps
+/// `413` meaning "too large", and the cause goes to the log because the response
+/// only says what the client needs to know.
+fn body_read_failure(
+    e: &(dyn std::error::Error + Send + Sync + 'static),
+) -> (StatusCode, &'static str) {
+    if e.downcast_ref::<http_body_util::LengthLimitError>()
+        .is_some()
+    {
+        (StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+    } else {
+        (StatusCode::BAD_REQUEST, "request body read error")
+    }
+}
+
+/// Log why a request body could not be read, at most a few lines every ten seconds:
+/// a client can break an upload as often as it likes.
+fn log_body_failure(remote: &SocketAddr, method: &str, path: &str, what: &str) {
+    static LOG: logging::Throttle = logging::Throttle::new(5, 10);
+    if LOG.allow() {
+        logging::warn(
+            "body",
+            &format!("request body not read: {what} remote={remote} method={method} path={path}"),
+        );
+    }
+}
+
 const CACHE_CONTROL_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
 #[inline]
@@ -676,18 +705,30 @@ async fn process_request_inner(
                             // Trailers / non-data frames: ignore (no body bytes).
                             Err(_other) => continue,
                         },
-                        Ok(Some(Err(_))) => {
+                        Ok(Some(Err(e))) => {
+                            log_body_failure(
+                                &remote_addr,
+                                method,
+                                parts.uri.path(),
+                                &e.to_string(),
+                            );
                             return Ok(text_response(
                                 StatusCode::BAD_REQUEST,
                                 "request body read error",
-                            ))
+                            ));
                         }
                         Ok(None) => break, // EOF
                         Err(_elapsed) => {
+                            log_body_failure(
+                                &remote_addr,
+                                method,
+                                parts.uri.path(),
+                                "no data for 30 s",
+                            );
                             return Ok(text_response(
                                 StatusCode::REQUEST_TIMEOUT,
                                 "request body read timeout",
-                            ))
+                            ));
                         }
                     }
                 }
@@ -739,17 +780,29 @@ async fn process_request_inner(
                 let limited = Limited::new(body, max_body_bytes);
                 match tokio::time::timeout(BODY_COLLECT_TIMEOUT, BodyExt::collect(limited)).await {
                     Ok(Ok(collected)) => collected.to_bytes(),
-                    Ok(Err(_)) => {
-                        return Ok(text_response(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            "request body too large",
-                        ))
+                    Ok(Err(e)) => {
+                        let (status, msg) = body_read_failure(e.as_ref());
+                        if status != StatusCode::PAYLOAD_TOO_LARGE {
+                            log_body_failure(
+                                &remote_addr,
+                                method,
+                                parts.uri.path(),
+                                &e.to_string(),
+                            );
+                        }
+                        return Ok(text_response(status, msg));
                     }
                     Err(_elapsed) => {
+                        log_body_failure(
+                            &remote_addr,
+                            method,
+                            parts.uri.path(),
+                            "not complete after 60 s",
+                        );
                         return Ok(text_response(
                             StatusCode::REQUEST_TIMEOUT,
                             "request body read timeout",
-                        ))
+                        ));
                     }
                 }
             };
@@ -3106,6 +3159,26 @@ mod route_cache {
 
 #[cfg(test)]
 mod tests {
+    /// An oversize body is `413`; a body that broke on the way is `400`, not `413`.
+    #[tokio::test]
+    async fn a_broken_body_is_not_reported_as_too_large() {
+        use http_body_util::{BodyExt, Full, Limited};
+        let over = Limited::new(Full::new(bytes::Bytes::from(vec![0u8; 100])), 10);
+        let e = over
+            .collect()
+            .await
+            .expect_err("100 bytes over a cap of 10");
+        assert_eq!(
+            super::body_read_failure(e.as_ref()).0,
+            hyper::StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let broken = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "stream reset");
+        let (status, msg) = super::body_read_failure(&broken);
+        assert_eq!(status, hyper::StatusCode::BAD_REQUEST);
+        assert_eq!(msg, "request body read error");
+    }
+
     /// A background refresh waits for the origin as long as the request it refreshes would
     /// have (`[upstream.x] request_timeout_ms`), and marks nothing when the default applies.
     #[test]

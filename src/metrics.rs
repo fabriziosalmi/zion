@@ -520,6 +520,8 @@ pub struct Metrics {
     pub h2_control_frames_peak: AtomicU64,
     /// Total bytes received on the gossip socket (decoded or not).
     pub mesh_gossip_bytes_in: AtomicU64,
+    /// Errors reading the gossip socket (the receiver backs off between them).
+    pub mesh_recv_errors: AtomicU64,
     /// Total bytes sent on the gossip socket.
     pub mesh_gossip_bytes_out: AtomicU64,
 
@@ -645,6 +647,7 @@ impl Metrics {
             h2_flood_closed_window_update: AtomicU64::new(0),
             h2_control_frames_peak: AtomicU64::new(0),
             mesh_gossip_bytes_in: AtomicU64::new(0),
+            mesh_recv_errors: AtomicU64::new(0),
             mesh_gossip_bytes_out: AtomicU64::new(0),
             acme_renewals_total: AtomicU64::new(0),
             acme_renewal_failures_total: AtomicU64::new(0),
@@ -1482,6 +1485,18 @@ impl Metrics {
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(
+            b"# HELP zion_mesh_recv_errors_total Errors reading the mesh gossip socket; the receiver backs off up to one second between attempts.\n\
+                                # TYPE zion_mesh_recv_errors_total counter\n\
+                                zion_mesh_recv_errors_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.mesh_recv_errors.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
             b"# HELP zion_mesh_gossip_bytes_in_total Total bytes received on the gossip socket.\n\
                                 # TYPE zion_mesh_gossip_bytes_in_total counter\n\
                                 zion_mesh_gossip_bytes_in_total ",
@@ -2198,6 +2213,15 @@ mod tests {
         assert!(out.contains("zion_process_resident_memory_bytes "));
         assert!(out.contains("# TYPE zion_process_open_fds gauge"));
         assert!(out.contains("zion_process_open_fds "));
+    }
+
+    #[test]
+    fn render_reports_mesh_receive_errors() {
+        let m = Metrics::new();
+        m.mesh_recv_errors.fetch_add(3, Relaxed);
+        let out = String::from_utf8(m.render(false).to_vec()).unwrap();
+        assert!(out.contains("# TYPE zion_mesh_recv_errors_total counter"));
+        assert!(out.contains("\nzion_mesh_recv_errors_total 3\n"));
     }
 
     fn health_of(pairs: &[(&str, bool)]) -> crate::health::HealthMap {

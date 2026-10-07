@@ -695,6 +695,7 @@ mod tests {
         assert!(text.contains("zion_panics_total 7"));
         assert!(text.contains("zion_audit_events_total 13"));
         assert!(text.contains("zion_audit_events_dropped_total"));
+        assert!(text.contains("# TYPE zion_audit_prune_failures_total counter"));
         // ZION-OBS-01: explicit writer liveness, not only a rising drop counter.
         assert!(text.contains("# TYPE zion_audit_writer_up gauge"));
         assert!(text.contains("# TYPE zion_audit_enabled gauge"));

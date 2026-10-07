@@ -730,6 +730,34 @@ fn prune_reputation(map: &DashMap<IpAddr, WafReputation>, max_entries: usize, tt
     }
 }
 
+/// Pause between failed `recv_from` calls: 10 ms, doubling to 1 s, back to 10 ms after
+/// a datagram arrives.
+#[derive(Default)]
+struct RecvBackoff {
+    failures: u32,
+}
+
+impl RecvBackoff {
+    const FIRST: std::time::Duration = std::time::Duration::from_millis(10);
+    const MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
+    fn next_delay(&mut self) -> std::time::Duration {
+        let d = Self::FIRST
+            .saturating_mul(1u32 << self.failures.min(7))
+            .min(Self::MAX);
+        self.failures = self.failures.saturating_add(1);
+        d
+    }
+
+    fn is_first_failure(&self) -> bool {
+        self.failures == 0
+    }
+
+    fn reset(&mut self) {
+        self.failures = 0;
+    }
+}
+
 async fn run_receiver(
     socket: Arc<UdpSocket>,
     reputation: Arc<DashMap<IpAddr, WafReputation>>,
@@ -744,10 +772,25 @@ async fn run_receiver(
         .with_inbound_rate(inbound_claims_per_sec, inbound_claim_burst)
         .with_trusted(&trusted_keys);
 
+    let mut backoff = RecvBackoff::default();
     loop {
         let (len, _peer) = match socket.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(_) => continue,
+            Ok(v) => {
+                backoff.reset();
+                v
+            }
+            Err(e) => {
+                // A socket that keeps failing would otherwise spin this task at full speed.
+                crate::metrics::METRICS
+                    .mesh_recv_errors
+                    .fetch_add(1, Relaxed);
+                // One line per run of failures, not one per attempt.
+                if backoff.is_first_failure() {
+                    eprintln!("aimp_cp: warn: gossip receive failed ({e}) — retrying with backoff");
+                }
+                tokio::time::sleep(backoff.next_delay()).await;
+                continue;
+            }
         };
         // Bytes accounting (issue #69) covers everything that hits
         // our socket — even malformed packets, so traffic-analysis
@@ -1032,6 +1075,23 @@ fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_receiver_backs_off_on_a_failing_socket_and_recovers() {
+        let mut b = RecvBackoff::default();
+        let ms: Vec<u128> = (0..10).map(|_| b.next_delay().as_millis()).collect();
+        assert_eq!(ms, [10, 20, 40, 80, 160, 320, 640, 1000, 1000, 1000]);
+        b.reset();
+        assert_eq!(
+            b.next_delay().as_millis(),
+            10,
+            "a datagram ends the backoff"
+        );
+        let mut long = RecvBackoff::default();
+        for _ in 0..1_000 {
+            assert!(long.next_delay().as_millis() <= 1000);
+        }
+    }
+
     use super::*;
 
     // ── Seed permissions (ZION-SEC-03) ────────────────────────────────────

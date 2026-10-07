@@ -266,6 +266,19 @@ pub(crate) fn bridge_request(
     hyper::Request::from_parts(parts, body)
 }
 
+/// Log an HTTP/3 request that failed inside zion, a few lines every ten seconds at most
+/// (a peer can make this happen as often as it likes). Without it the only trace is a
+/// `500` in the metrics.
+fn log_h3_failure(remote: &SocketAddr, method: &str, path: &str, what: &str) {
+    static LOG: crate::logging::Throttle = crate::logging::Throttle::new(5, 10);
+    if LOG.allow() {
+        crate::logging::warn(
+            "http3",
+            &format!("{what} remote={remote} method={method} path={path}"),
+        );
+    }
+}
+
 /// Handle a single HTTP/3 request through the Zion security pipeline.
 ///
 /// Gates applied (same as handle_https in main.rs):
@@ -296,9 +309,27 @@ where
     let stream_body =
         http_body_util::StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
 
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+
     // Spawn task to sequentially copy HTTP/3 request payload chunks into the Request stream body
+    let body_log = (remote_addr, method.clone(), path.clone());
     tokio::spawn(async move {
-        while let Ok(Some(mut buf)) = recv_stream.recv_data().await {
+        loop {
+            let mut buf = match recv_stream.recv_data().await {
+                Ok(Some(buf)) => buf,
+                Ok(None) => break,
+                // The stream broke: the pipeline sees the body end where it did.
+                Err(e) => {
+                    log_h3_failure(
+                        &body_log.0,
+                        &body_log.1,
+                        &body_log.2,
+                        &format!("request body stream broke: {e}"),
+                    );
+                    break;
+                }
+            };
             use bytes::Buf;
             let rem = buf.remaining();
             let bytes = bytes::Buf::copy_to_bytes(&mut buf, rem);
@@ -317,8 +348,14 @@ where
     // Transform upstream pipeline output to stream HTTP/3 responses back to the client natively
     let resp: hyper::Response<crate::ZionBody> = match resp_result {
         Ok(r) => r,
-        Err(_) => {
+        Err(e) => {
             // Fail safe on generic HTTP internal pipeline errors
+            log_h3_failure(
+                &remote_addr,
+                &method,
+                &path,
+                &format!("pipeline error: {e}"),
+            );
             crate::metrics::METRICS.record_status(500);
             // INVARIANT: builder configured with a single static StatusCode and
             // a unit body never fails — same rationale as the helper above.

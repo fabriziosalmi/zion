@@ -131,6 +131,60 @@ fn format_error(json: bool, color: bool, event: &str, msg: &str) -> String {
     }
 }
 
+/// Lets at most `burst` messages through per `window_secs`, so a log line that a
+/// client can trigger (a broken upload, a reset stream) cannot be turned into a
+/// flood. One `static` per call site; lock-free.
+pub struct Throttle {
+    window_secs: u64,
+    burst: u32,
+    /// `window index << 24 | messages let through in that window`.
+    state: std::sync::atomic::AtomicU64,
+}
+
+impl Throttle {
+    pub const fn new(burst: u32, window_secs: u64) -> Self {
+        Self {
+            window_secs,
+            burst,
+            state: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub fn allow(&self) -> bool {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.allow_at(secs)
+    }
+
+    fn allow_at(&self, now_secs: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let window = now_secs / self.window_secs.max(1);
+        let mut cur = self.state.load(Relaxed);
+        loop {
+            let (cur_window, n) = (cur >> 24, (cur & 0xff_ffff) as u32);
+            let next = if cur_window != window {
+                (window << 24) | 1
+            } else if n < self.burst {
+                cur + 1
+            } else {
+                return false;
+            };
+            if self.burst == 0 {
+                return false;
+            }
+            match self
+                .state
+                .compare_exchange_weak(cur, next, Relaxed, Relaxed)
+            {
+                Ok(_) => return true,
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+}
+
 pub(crate) fn now() -> String {
     // ISO 8601 UTC with microsecond precision — no chrono needed
     let d = std::time::SystemTime::now()
@@ -166,6 +220,18 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_throttle_lets_a_burst_through_per_window_and_then_nothing() {
+        let t = Throttle::new(3, 10);
+        assert!([100, 101, 109].iter().all(|&s| t.allow_at(s)));
+        assert!(!t.allow_at(109), "the fourth in the window is held back");
+        assert!(!t.allow_at(100), "and so is any later one in it");
+        assert!(t.allow_at(110), "the next window starts again");
+        assert!(t.allow_at(119) && t.allow_at(119));
+        assert!(!t.allow_at(119));
+        assert!(!Throttle::new(0, 10).allow_at(5), "a burst of 0 is silence");
+    }
 
     #[test]
     fn stamped_text_line_has_timestamp_level_and_event() {
