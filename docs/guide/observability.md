@@ -412,6 +412,7 @@ Counters wired today (issue #69):
 | `zion_mesh_claims_dropped_total{reason="replay"}` | counter | Inbound envelopes rejected as duplicates (seen-signature filter). |
 | `zion_mesh_claims_dropped_total{reason="rate"}` | counter | Inbound envelopes rejected by the per-source claim rate-cap (flood protection). |
 | `zion_mesh_claims_dropped_total{reason="other"}` | counter | Other rejections — timestamp skew (past/future), magic-prefix mismatch, payload decode error, revocation by non-original source. |
+| `zion_mesh_recv_errors_total` | counter | Errors reading the gossip socket. The receiver backs off (10 ms doubling to 1 s) between failures instead of retrying at full speed, and logs the first failure of a run; a sustained rate means the mesh is deaf. |
 | `zion_mesh_score_lookups_total` | counter | Dispatcher hits that found a mesh score for the client IP — the `X-Zion-Mesh-Score` header rate. |
 | `zion_mesh_gossip_bytes_in_total` | counter | Total bytes received on the gossip socket (covers malformed packets too). |
 | `zion_mesh_gossip_bytes_out_total` | counter | Total bytes sent on the gossip socket. |

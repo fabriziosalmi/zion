@@ -32,6 +32,7 @@ pub struct Metrics {
     pub mesh_score_lookups: AtomicU64,
     pub mesh_gossip_bytes_in: AtomicU64,
     pub mesh_gossip_bytes_out: AtomicU64,
+    pub mesh_recv_errors: AtomicU64,
 }
 
 impl Metrics {
@@ -47,6 +48,7 @@ impl Metrics {
             mesh_score_lookups: AtomicU64::new(0),
             mesh_gossip_bytes_in: AtomicU64::new(0),
             mesh_gossip_bytes_out: AtomicU64::new(0),
+            mesh_recv_errors: AtomicU64::new(0),
         }
     }
 }
