@@ -39,12 +39,15 @@ jobs:
 
       - name: Enable auto-merge for patch updates of cargo and npm
         # package-ecosystem: cargo | npm_and_yarn | github_actions | docker | pip.
-        # A grouped PR carries the group's name; `rust-patch` holds patches only.
+        # A grouped PR is NOT matched by its group name: the first `rust-patch` PR
+        # (#610) carried `pem` 3 -> 4, `fastbloom` 0.14 -> 0.17 and a dozen new
+        # transitive crates besides its patch bumps, because a group updates the
+        # lockfile as a whole. Grouped PRs wait for a person.
         if: >-
           (steps.meta.outputs.package-ecosystem == 'cargo' ||
            steps.meta.outputs.package-ecosystem == 'npm_and_yarn') &&
-          (steps.meta.outputs.update-type == 'version-update:semver-patch' ||
-           steps.meta.outputs.dependency-group == 'rust-patch')
+          steps.meta.outputs.update-type == 'version-update:semver-patch' &&
+          steps.meta.outputs.dependency-group == ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
