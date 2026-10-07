@@ -22,6 +22,7 @@ See [`baseline/README.md`](baseline/README.md) for prerequisites and knobs.
 | `bench-pgo.sh` | Two-phase PGO build (profile → optimized) | ~10–20 min |
 | `bench-mesh.sh` | `--features sovereign-aimp` mesh cost (idle/lookup/3-node) — issue #72 | ~10 min |
 | `bench-profile.sh` | CPU flamegraph profiling via `samply` | ~3 min |
+| [`regress/`](regress/) | before/after regression check: CPU per request on seven data paths, with a measured noise floor | ~9 min |
 
 ## Distributed rig + microbenches
 
