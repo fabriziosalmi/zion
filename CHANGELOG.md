@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Changed (behaviour)
+
+- **A token that expires more than 24 hours from now is refused by default.** `[auth_profile.x] max_token_lifetime_secs` now defaults to `86400` (it was unset, meaning no cap): a profile without the setting answers `403` to a token whose `exp` is further out than that (plus `leeway_secs`). This was announced in 0.9.9 (#553, step 1: a boot warning and `zion_auth_long_lived_tokens_total`). **Before upgrading**, if you issue tokens that live longer than 24 hours, set `max_token_lifetime_secs` to the longest lifetime you issue, or to `0` for no cap; if the counter stayed at zero, nothing changes for you. The first refusal each minute is logged with the token's remaining lifetime and the cap (never the token); the boot message for a profile without the setting is now informational. `zion_auth_long_lived_tokens_total` now counts the tokens accepted past 24 h under `0` or a larger cap. (#553)
+
 ### Fixed
 
 - **A request with a body no longer waits ~40 ms on its way to an upstream (Linux).** The pooled upstream sockets did not set `TCP_NODELAY`, unlike the accepted client sockets and the WebSocket dials. zion writes a request as several small frames (HTTP/2: HEADERS, then DATA), so with Nagle on the second frame waited for the ACK of the first, which the peer's delayed ACK holds back for about 40 ms. Measured with the real binary on Linux: 40 sequential POSTs with a small body to an HTTP/2 upstream took 1,719 ms (43 ms each); with the fix, 65 ms. Eight concurrent gRPC unary calls through zion made 190 calls a second against 14,000 direct to the backend, and 7,900 with the fix. Requests without a body (a plain `GET`) were not affected, which is why the throughput benchmarks never showed it. (#618)

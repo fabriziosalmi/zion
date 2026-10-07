@@ -429,14 +429,13 @@ fn warn_feature_config_gaps(config: &config::ZionConfig) {
     // 24 h in the next minor release (#553): say so now, per profile.
     for (name, profile) in &config.auth_profile {
         if profile.max_token_lifetime_secs.is_none() {
-            logging::warn(
+            logging::info(
                 "config",
                 &format!(
-                    "auth_profile '{name}' has no max_token_lifetime_secs: tokens are accepted \
-                     however far their expiry is. From the next minor release the default is \
-                     86400 (24 h) and tokens further out are refused. Set it to the longest \
-                     lifetime you issue (0 = no cap); zion_auth_long_lived_tokens_total counts \
-                     the tokens the new default would refuse."
+                    "auth_profile '{name}': max_token_lifetime_secs is not set, so the default \
+                     cap of 86400 (24 h) applies and tokens that expire further out are \
+                     refused (before 0.10.0 there was no cap). Set it to the longest lifetime \
+                     you issue, or to 0 for no cap."
                 ),
             );
         }

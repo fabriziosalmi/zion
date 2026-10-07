@@ -68,7 +68,7 @@ waf = true
 | `audience` | string | — | Expected `aud` claim (optional) |
 | `forward_claims` | bool | `true` | Inject `X-Auth-Subject` and `X-Auth-Email` headers to upstream |
 | `leeway_secs` | integer | `30` | Clock-skew tolerance applied to `exp`/`nbf`. `0` is allowed; above `300` is rejected. |
-| `max_token_lifetime_secs` | integer | — | Reject tokens whose `exp` is further in the future than this (plus `leeway_secs`). Unset = no cap. See [Token lifetime and revocation](#token-lifetime-and-revocation). `0` = no cap, on purpose. **Unset becomes `86400` in the next minor release**; until then tokens beyond 24 h are accepted, counted (`zion_auth_long_lived_tokens_total`) and warned about. |
+| `max_token_lifetime_secs` | integer | `86400` | Reject tokens whose `exp` is further in the future than this (plus `leeway_secs`): `403`. **Unset = 86400 (24 h) since 0.10.0** (before it: no cap). `0` = no cap, on purpose. A token accepted with more than 24 h left (under `0` or a cap above 24 h) is counted in `zion_auth_long_lived_tokens_total`. See [Token lifetime and revocation](#token-lifetime-and-revocation). |
 
 ## Supported algorithms
 
@@ -153,13 +153,16 @@ Consequences for operators:
   example `900`) and Zion rejects any token whose `exp` is further out, so a
   mis-issued or forged-by-a-leaked-key token with a far-future `exp` is refused
   instead of living for years. `0` means "no cap", said on purpose.
-- **The default is changing.** Today a profile without the setting has no cap.
-  From the next minor release the default is `86400` (24 h) and a token further
-  out is refused. Until then such a token is accepted, counted in
-  `zion_auth_long_lived_tokens_total`, and warned about in the log (once a minute
-  at most), and zion warns at boot for every profile without the setting. If the
-  counter stays at zero, the change will not affect you; otherwise set the value
-  you need, or `0`.
+- **The default is 24 hours (since 0.10.0).** A profile without
+  `max_token_lifetime_secs` refuses a token whose `exp` is more than `86400`
+  seconds (plus `leeway_secs`) away; before 0.10.0 it accepted any. If you issue
+  tokens that live longer (service tokens of 30 days, say), set the value you
+  need, or `0` for no cap, **before upgrading**: otherwise those tokens get `403`
+  after it. zion logs the first refusal each minute with the token's remaining
+  lifetime and the cap (never the token), and notes at boot every profile that
+  has no setting. The counter `zion_auth_long_lived_tokens_total` now counts the
+  tokens that are still accepted past 24 h because of `0` or a larger cap: the
+  long-lived tokens you chose to keep.
 - `aud` may be a single string or an array (OIDC providers commonly send an
   array); the profile's `audience` must appear in it.
 - A logout / key-compromise event cannot be enforced at the edge mid-lifetime;

@@ -511,8 +511,8 @@ pub struct Metrics {
     pub mesh_claims_dropped_rate: AtomicU64,
     /// Dispatcher hits that found a mesh score for the client IP.
     pub mesh_score_lookups: AtomicU64,
-    /// Tokens accepted on a profile without `max_token_lifetime_secs` although they expire
-    /// more than 24 h from now: what the future default cap would refuse (#553).
+    /// Tokens accepted although they expire more than 24 h from now: the profile sets
+    /// `max_token_lifetime_secs` to `0` or to a cap above 24 h (#553).
     pub auth_long_lived_tokens: AtomicU64,
     /// HTTP/2 connections closed for sending more control frames in a second than
     /// `h2_control_frames_per_sec` allows (#475)...
@@ -1443,7 +1443,7 @@ impl Metrics {
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(
-            b"# HELP zion_auth_long_lived_tokens_total Tokens accepted with more than 24 h left on a profile without max_token_lifetime_secs (the future default cap would refuse them).\n\
+            b"# HELP zion_auth_long_lived_tokens_total Tokens accepted with more than 24 h left: the auth profile sets max_token_lifetime_secs to 0 or to a cap above 24 h. Without the setting the default cap refuses them.\n\
                                 # TYPE zion_auth_long_lived_tokens_total counter\n\
                                 zion_auth_long_lived_tokens_total ",
         );

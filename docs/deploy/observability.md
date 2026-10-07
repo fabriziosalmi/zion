@@ -121,7 +121,7 @@ feature-gated series (absent, not zero, without the feature) is called out.
 | `zion_cache_shared_hits_total` | counter | Cache hits answered from the shared store. `zion_cache_hits` minus this were answered from a worker thread's own copy (bodies of 64 KiB or less); a share of shared hits that grows with the store rate on small objects would mean those copies are being invalidated too often |
 | `zion_cache_bytes` | gauge | Memory held by the shared response cache: keys, bodies and 256 bytes per entry. Bounded by `[server] cache_max_memory_mb`; a value that stays at the budget with a low hit rate means the budget is small for the traffic |
 | `zion_cache_budget_skipped_total` | counter | Responses served but not stored because no room could be made for them within the cache's memory budget, or because one response is larger than the whole budget |
-| `zion_auth_long_lived_tokens_total` | counter | Tokens accepted with more than 24 h left on an auth profile that has no `max_token_lifetime_secs`. The default cap becomes 24 h in the next minor release: this counts what it would refuse |
+| `zion_auth_long_lived_tokens_total` | counter | Tokens accepted with more than 24 h left because the auth profile sets `max_token_lifetime_secs` to `0` or to a cap above 24 h (a profile without the setting refuses them). The long-lived tokens still in use |
 | `zion_bulkhead_in_flight{upstream}` | gauge | Requests currently inside an upstream that has `max_in_flight` |
 | `zion_bulkhead_limit{upstream}` | gauge | The `max_in_flight` last applied to it |
 | `zion_bulkhead_shed_total{upstream}` | counter | Requests refused with `503` because it was at `max_in_flight` |

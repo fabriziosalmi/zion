@@ -142,15 +142,15 @@ pub struct AuthProfileConfig {
     /// every token's life).
     #[serde(default = "default_leeway_secs")]
     pub leeway_secs: u64,
-    /// Upper bound, in seconds, on how far in the future a token's `exp` may be.
-    /// Tokens that outlive it are rejected even though they are otherwise valid.
-    /// Zion has no revocation list, so this is the lever that bounds how long a
-    /// stolen or de-provisioned user's token keeps working: set it to the longest
-    /// token lifetime you actually issue (e.g. 900). `0` = no cap, stated on purpose.
+    /// Upper bound, in seconds, on how far in the future a token's `exp` may be (plus
+    /// `leeway_secs`). Tokens that outlive it are rejected even though they are otherwise
+    /// valid. Zion has no revocation list that survives key theft, so this is the lever
+    /// that bounds how long a stolen or de-provisioned user's token keeps working: set it
+    /// to the longest token lifetime you actually issue (e.g. 900).
     ///
-    /// Unset = no cap **for now**: a token with more than 24 h left is accepted, counted
-    /// (`zion_auth_long_lived_tokens_total`) and warned about, because from the next minor
-    /// release the default becomes 86400 and such a token will be refused (#553).
+    /// Unset = **86400 (24 h)**, the default since 0.10.0 (before it: no cap). `0` = no
+    /// cap, said on purpose. A token accepted with more than 24 h left (under `0`, or a cap
+    /// above 24 h) is counted in `zion_auth_long_lived_tokens_total`.
     #[serde(default)]
     pub max_token_lifetime_secs: Option<u64>,
 }
@@ -179,7 +179,7 @@ pub struct ResolvedAuthProfile {
     pub jwk_set: Arc<arc_swap::ArcSwapOption<jsonwebtoken::jwk::JwkSet>>,
     pub validation: Arc<Validation>,
     pub forward_claims: bool,
-    /// See [`AuthProfileConfig::max_token_lifetime_secs`].
+    /// See [`AuthProfileConfig::max_token_lifetime_secs`]; `None` is the 24 h default.
     pub max_token_lifetime_secs: Option<u64>,
     pub leeway_secs: u64,
 }
@@ -344,42 +344,49 @@ pub mod revocation {
     }
 }
 
-/// The cap that becomes the default of `max_token_lifetime_secs` in the next minor release
-/// (#553). Until then a profile without the setting has no cap, and tokens past this are
-/// counted and warned about so the operator sees what the change will refuse.
-pub const FUTURE_DEFAULT_MAX_TOKEN_LIFETIME_SECS: u64 = 86_400;
+/// The cap a profile without `max_token_lifetime_secs` gets (24 h), since 0.10.0 (#553).
+pub const DEFAULT_MAX_TOKEN_LIFETIME_SECS: u64 = 86_400;
 
 /// What a profile's lifetime cap says about a token expiring at `exp`.
 #[cfg_attr(not(feature = "auth"), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 enum Lifetime {
     Ok,
-    /// Further out than the configured cap (the value carried).
+    /// Further out than the cap (the value carried): refused.
     Refused(u64),
-    /// No cap configured and further out than the future default: accepted today.
-    AcceptedForNow,
+    /// Accepted although it expires more than 24 h from now: the operator set `0` or a cap
+    /// above the default. Counted, so the long-lived tokens still in use are visible.
+    AcceptedBeyondDefault,
 }
 
 #[cfg_attr(not(feature = "auth"), allow(dead_code))]
 fn lifetime_verdict(cap: Option<u64>, exp: u64, now: u64, leeway: u64) -> Lifetime {
     let beyond = |max: u64| exp > now.saturating_add(max).saturating_add(leeway);
-    match cap {
-        Some(0) => Lifetime::Ok, // "no cap", said on purpose
-        Some(max) if beyond(max) => Lifetime::Refused(max),
-        Some(_) => Lifetime::Ok,
-        None if beyond(FUTURE_DEFAULT_MAX_TOKEN_LIFETIME_SECS) => Lifetime::AcceptedForNow,
-        None => Lifetime::Ok,
+    let past_default = beyond(DEFAULT_MAX_TOKEN_LIFETIME_SECS);
+    match cap.unwrap_or(DEFAULT_MAX_TOKEN_LIFETIME_SECS) {
+        0 if past_default => Lifetime::AcceptedBeyondDefault, // "no cap", said on purpose
+        0 => Lifetime::Ok,
+        max if beyond(max) => Lifetime::Refused(max),
+        _ if past_default => Lifetime::AcceptedBeyondDefault,
+        _ => Lifetime::Ok,
     }
 }
 
-/// Count a token the future default would refuse, and say so in the log at most once a
-/// minute (the remaining lifetime only: never the token or its claims).
+/// Count a token accepted past the default cap (`zion_auth_long_lived_tokens_total`).
 #[cfg_attr(not(feature = "auth"), allow(dead_code))]
-fn note_long_lived_token(remaining_secs: u64) {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+fn count_long_lived_token() {
     crate::metrics::METRICS
         .auth_long_lived_tokens
-        .fetch_add(1, Relaxed);
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Say that a token was refused for its lifetime, at most once a minute: since 0.10.0 an
+/// upgrade can start refusing tokens that were accepted before, and the 401 alone does not
+/// tell the operator why. The remaining lifetime and the cap only, never the token or its
+/// claims.
+#[cfg_attr(not(feature = "auth"), allow(dead_code))]
+fn note_refused_long_lived_token(remaining_secs: u64, cap: u64, cap_is_default: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     static LAST_WARNED: AtomicU64 = AtomicU64::new(0);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -391,14 +398,16 @@ fn note_long_lived_token(remaining_secs: u64) {
             .compare_exchange(last, now, Relaxed, Relaxed)
             .is_ok()
     {
+        let which = if cap_is_default {
+            "the default cap (max_token_lifetime_secs is not set)"
+        } else {
+            "its max_token_lifetime_secs"
+        };
         crate::logging::warn(
             "auth",
             &format!(
-                "accepted a token that expires in {} h on a profile without \
-                 max_token_lifetime_secs. From the next minor release the default cap is 24 h \
-                 and such a token is refused: set max_token_lifetime_secs to the longest \
-                 lifetime you issue, or to 0 for no cap (zion_auth_long_lived_tokens_total \
-                 counts them)",
+                "refused a token that expires in {} h: {which} is {cap} s. Set \
+                 max_token_lifetime_secs to the longest lifetime you issue, or to 0 for no cap",
                 remaining_secs / 3600
             ),
         );
@@ -483,11 +492,16 @@ pub fn validate_token(token: &str, profile: &ResolvedAuthProfile) -> Result<Clai
     ) {
         Lifetime::Ok => {}
         Lifetime::Refused(max) => {
+            note_refused_long_lived_token(
+                exp.saturating_sub(now),
+                max,
+                profile.max_token_lifetime_secs.is_none(),
+            );
             return Err(AuthError::InvalidToken(format!(
                 "token lifetime exceeds this profile's max_token_lifetime_secs ({max}s)"
             )));
         }
-        Lifetime::AcceptedForNow => note_long_lived_token(exp.saturating_sub(now)),
+        Lifetime::AcceptedBeyondDefault => count_long_lived_token(),
     }
 
     Ok(token_data.claims)
@@ -809,7 +823,9 @@ mod tests {
             algorithm: "HS256".into(),
             forward_claims: false,
             leeway_secs: 30,
-            max_token_lifetime_secs: None,
+            // These tests are about signatures, audiences and revocation, with tokens that
+            // expire far out: "no cap", said on purpose (the default cap has its own tests).
+            max_token_lifetime_secs: Some(0),
         };
         let profile = resolve_auth_profile(&config).unwrap();
         let (with, without) = (mk(Some("rev-test-token-1")), mk(None));
@@ -858,7 +874,9 @@ mod tests {
             algorithm: "HS256".to_string(),
             forward_claims: true,
             leeway_secs: 30,
-            max_token_lifetime_secs: None,
+            // These tests are about signatures, audiences and revocation, with tokens that
+            // expire far out: "no cap", said on purpose (the default cap has its own tests).
+            max_token_lifetime_secs: Some(0),
         };
 
         let profile = resolve_auth_profile(&config).expect("valid test profile");
@@ -901,7 +919,9 @@ mod tests {
             algorithm: "HS256".to_string(),
             forward_claims: true,
             leeway_secs: 30,
-            max_token_lifetime_secs: None,
+            // These tests are about signatures, audiences and revocation, with tokens that
+            // expire far out: "no cap", said on purpose (the default cap has its own tests).
+            max_token_lifetime_secs: Some(0),
         };
 
         let profile = resolve_auth_profile(&config).expect("valid test profile");
@@ -941,7 +961,9 @@ mod tests {
             algorithm: "HS256".to_string(),
             forward_claims: true,
             leeway_secs: 30,
-            max_token_lifetime_secs: None,
+            // These tests are about signatures, audiences and revocation, with tokens that
+            // expire far out: "no cap", said on purpose (the default cap has its own tests).
+            max_token_lifetime_secs: Some(0),
         };
 
         let profile = resolve_auth_profile(&config).expect("valid test profile");
@@ -970,7 +992,9 @@ mod tests {
             algorithm: "HS256".into(),
             forward_claims: true,
             leeway_secs: 30,
-            max_token_lifetime_secs: None,
+            // These tests are about signatures, audiences and revocation, with tokens that
+            // expire far out: "no cap", said on purpose (the default cap has its own tests).
+            max_token_lifetime_secs: Some(0),
         };
         let token = |key: &str, exp_in: i64| {
             let now = std::time::SystemTime::now()
@@ -1027,15 +1051,15 @@ mod tests {
         std::env::remove_var(cur);
     }
 
-    /// Step 1 of the default lifetime cap (#553): nothing new is refused. A profile without
-    /// the setting accepts a far-off token and flags it; `0` is "no cap" said on purpose and
-    /// flags nothing; a configured cap refuses as before.
+    /// Step 2 of the default lifetime cap (#553): a profile without the setting has a 24 h cap
+    /// and refuses beyond it; `0` is "no cap" said on purpose; a configured cap is its own limit;
+    /// a token accepted past 24 h is flagged so it is counted.
     #[test]
-    fn a_missing_lifetime_cap_flags_long_lived_tokens_without_refusing_them() {
+    fn a_missing_lifetime_cap_means_24_hours_and_zero_means_none() {
         let now = 1_000_000;
         let (hour, day) = (3_600, 86_400);
         let leeway = 30;
-        // No setting: fine up to 24 h (plus leeway), flagged beyond.
+        // No setting: the default cap of 24 h (plus leeway) applies, and refuses beyond it.
         assert_eq!(
             lifetime_verdict(None, now + hour, now, leeway),
             Lifetime::Ok
@@ -1046,16 +1070,29 @@ mod tests {
         );
         assert_eq!(
             lifetime_verdict(None, now + day + leeway + 1, now, leeway),
-            Lifetime::AcceptedForNow
+            Lifetime::Refused(86_400)
         );
         assert_eq!(
             lifetime_verdict(None, u64::MAX, now, leeway),
-            Lifetime::AcceptedForNow
+            Lifetime::Refused(86_400)
         );
-        // 0: no cap, and nothing to flag.
+        // 0: no cap, said on purpose. A token past 24 h is accepted, and flagged so it is counted.
         assert_eq!(
             lifetime_verdict(Some(0), now + 400 * day, now, leeway),
+            Lifetime::AcceptedBeyondDefault
+        );
+        assert_eq!(
+            lifetime_verdict(Some(0), now + hour, now, leeway),
             Lifetime::Ok
+        );
+        // A cap above the default: its own limit, and beyond 24 h is flagged.
+        assert_eq!(
+            lifetime_verdict(Some(7 * day), now + 3 * day, now, leeway),
+            Lifetime::AcceptedBeyondDefault
+        );
+        assert_eq!(
+            lifetime_verdict(Some(7 * day), now + 8 * day, now, leeway),
+            Lifetime::Refused(7 * day)
         );
         // A cap: refused beyond it, as before.
         assert_eq!(
@@ -1070,10 +1107,12 @@ mod tests {
         assert_eq!(lifetime_verdict(None, now - 10, now, leeway), Lifetime::Ok);
     }
 
-    /// End to end through `validate_token`: the 25-hour token is accepted and counted.
+    /// End to end through `validate_token`: a 25-hour token is refused by default (#553), accepted
+    /// with `max_token_lifetime_secs = 0` or a cap above it, and counted when it is; a 1-hour one
+    /// passes everywhere and is not counted.
     #[cfg(feature = "auth")]
     #[tokio::test]
-    async fn a_long_lived_token_is_accepted_and_counted() {
+    async fn a_token_past_24_hours_is_refused_by_default_and_counted_when_allowed() {
         const KEY: &str = "lifetime-key-padding-padding-padding-padding";
         let profile = |cap: Option<u64>| {
             resolve_auth_profile(&AuthProfileConfig {
@@ -1108,15 +1147,27 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
         };
         let before = counted();
+        let refused = validate_token(&token(25 * 3600), &profile(None)).unwrap_err();
         assert!(
-            validate_token(&token(25 * 3600), &profile(None)).is_ok(),
-            "accepted today"
+            matches!(&refused, AuthError::InvalidToken(m) if m.contains("86400")),
+            "by default a token with 25 h left is refused, and says which cap: {refused:?}"
         );
-        assert!(counted() > before, "and counted");
+        assert_eq!(counted(), before, "a refused token is not an accepted one");
+        assert!(
+            validate_token(&token(3600), &profile(None)).is_ok(),
+            "an hour is fine"
+        );
+        assert_eq!(counted(), before, "and not counted");
         assert!(
             validate_token(&token(25 * 3600), &profile(Some(0))).is_ok(),
             "0 = no cap"
         );
+        assert_eq!(counted(), before + 1, "accepted past 24 h: counted");
+        assert!(
+            validate_token(&token(25 * 3600), &profile(Some(7 * 86_400))).is_ok(),
+            "a cap above the default is the operator's choice"
+        );
+        assert_eq!(counted(), before + 2);
         assert!(
             validate_token(&token(25 * 3600), &profile(Some(3600))).is_err(),
             "a configured cap still refuses"
@@ -1215,7 +1266,9 @@ mod tests {
             algorithm: "HS256".to_string(),
             forward_claims: true,
             leeway_secs: 30,
-            max_token_lifetime_secs: None,
+            // These tests are about signatures, audiences and revocation, with tokens that
+            // expire far out: "no cap", said on purpose (the default cap has its own tests).
+            max_token_lifetime_secs: Some(0),
         };
         let profile = resolve_auth_profile(&config).expect("secret_env resolves");
         assert!(
@@ -1235,7 +1288,9 @@ mod tests {
             algorithm: "HS256".to_string(),
             forward_claims: true,
             leeway_secs: 30,
-            max_token_lifetime_secs: None,
+            // These tests are about signatures, audiences and revocation, with tokens that
+            // expire far out: "no cap", said on purpose (the default cap has its own tests).
+            max_token_lifetime_secs: Some(0),
         };
         assert!(
             resolve_auth_profile(&missing).is_err(),
@@ -1294,7 +1349,8 @@ mod tests {
     fn array_audience_is_accepted_when_it_contains_the_configured_one() {
         // OIDC providers commonly emit `aud` as an array; that used to fail to
         // deserialize and the token was rejected outright.
-        let p = resolve_auth_profile(&hmac_cfg(Some("api.zion.dev"), 30, None)).unwrap();
+        // Tokens that expire at u64::MAX: "no cap", said on purpose.
+        let p = resolve_auth_profile(&hmac_cfg(Some("api.zion.dev"), 30, Some(0))).unwrap();
         let ok = token_with(
             u64::MAX,
             Some(Audience::Many(vec!["other".into(), "api.zion.dev".into()])),
@@ -1329,8 +1385,15 @@ mod tests {
                 "{e:?}"
             );
         }
-        // no cap configured: unchanged behaviour
-        let open = resolve_auth_profile(&hmac_cfg(None, 30, None)).unwrap();
+        // Nothing configured: the default cap (24 h) applies since 0.10.0 (#553).
+        let default = resolve_auth_profile(&hmac_cfg(None, 30, None)).unwrap();
+        assert!(validate_token(&short, &default).is_ok());
+        assert!(
+            validate_token(&forever, &default).is_err(),
+            "refused by default"
+        );
+        // 0 = no cap, said on purpose.
+        let open = resolve_auth_profile(&hmac_cfg(None, 30, Some(0))).unwrap();
         assert!(validate_token(&forever, &open).is_ok());
     }
 
