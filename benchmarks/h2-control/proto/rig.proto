@@ -1,0 +1,10 @@
+syntax = "proto3";
+package rig;
+option go_package = "h2rig/rigpb";
+message Req { int64 bytes = 1; int32 chunk = 2; }
+message Chunk { bytes data = 1; }
+service Rig {
+  rpc Download(Req) returns (stream Chunk);
+  rpc Echo(Chunk) returns (Chunk);
+  rpc Chat(stream Chunk) returns (stream Chunk);
+}

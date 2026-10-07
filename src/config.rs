@@ -299,7 +299,8 @@ pub struct ServerConfig {
     /// `WINDOW_UPDATE`s are bounded separately, in proportion to the response bytes the
     /// client was sent. `0` (the default) sets no limit; the frames are still counted, and
     /// `zion_h2_control_frames_peak` shows the highest rate any connection reached, which
-    /// is the number to read before choosing a limit. `1`..`9` is refused: an ordinary
+    /// is the number to read before choosing a limit (grpc-go sends
+    /// thousands a second on a fast link: with gRPC in front, read it first). `1`..`9` is refused: an ordinary
     /// client sends two or three when it connects. Read at accept, so a reload applies it
     /// to new connections.
     #[serde(default)]

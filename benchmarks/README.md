@@ -23,6 +23,7 @@ See [`baseline/README.md`](baseline/README.md) for prerequisites and knobs.
 | `bench-mesh.sh` | `--features sovereign-aimp` mesh cost (idle/lookup/3-node) — issue #72 | ~10 min |
 | `bench-profile.sh` | CPU flamegraph profiling via `samply` | ~3 min |
 | [`regress/`](regress/) | before/after regression check: CPU per request on seven data paths, with a measured noise floor | ~9 min |
+| [`h2-control/`](h2-control/) | HTTP/2 control frames per second sent by real clients (grpc-go, browsers) through zion, to choose `h2_control_frames_per_sec` (#561) | ~1 min |
 
 ## Distributed rig + microbenches
 

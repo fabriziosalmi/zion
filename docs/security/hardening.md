@@ -148,9 +148,22 @@ Measured on one connection:
 So `1000` is over 300 times what these clients send, and their `WINDOW_UPDATE`s are 70 times or
 more under the allowance of one per 256 bytes.
 
-Firefox, Safari and gRPC clients were not measured. gRPC clients send a `PING` with the data they
-receive to estimate bandwidth, which can be many a second on a fast link: measure before setting a
-limit in front of one.
+**grpc-go is different.** It sends a `PING` with the data it receives, to estimate bandwidth, so its
+rate follows the round-trip time. Measured through zion (the rig is in
+[`benchmarks/h2-control/`](https://github.com/fabriziosalmi/zion/tree/master/benchmarks/h2-control)):
+
+| Client-to-zion RTT | One 500 MiB download | 20,000 unary calls, 8 callers | One bidirectional stream |
+|---|---|---|---|
+| loopback | 726 | 2,019 | 5,003 |
+| 0.2 ms | 712 | 1,411 | 1,700 |
+| 1 ms | 412 | 616 | 380 |
+| 5 ms | 169 | 166 | 90 |
+
+On macOS loopback a bidirectional stream reached 17,200. A limit of `1000` would close busy grpc-go
+connections inside a data centre. **If gRPC goes through zion, read `zion_h2_control_frames_peak` on
+real traffic and set the limit well above it (`20000` leaves even loopback grpc-go alone), or leave it
+at `0`.** The C-core gRPC clients (Python, Ruby, C#, PHP) measured 6 to 13. Firefox and Safari have not
+been measured: `benchmarks/h2-control/rig.sh browser` does it.
 
 The bound applies however the client got to HTTP/2: ALPN `h2`, a TLS connection that negotiated
 nothing and opens with the HTTP/2 preface, or the preface on the plaintext listener. A closed
