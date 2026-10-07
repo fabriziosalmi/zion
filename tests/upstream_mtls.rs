@@ -122,15 +122,43 @@ fn wait_port(port: u16, what: &str) {
 }
 
 /// `curl -sk` against zion; (status, body).
+///
+/// HTTP/1.1 on purpose (#592). The backend is `openssl s_server -www`, which delimits its
+/// page by closing the connection and, on LibreSSL, closes it WITHOUT a TLS `close_notify`
+/// (measured: 300 closes of 300). zion cannot tell that from a truncated response, so it
+/// ends the stream with an error after the whole body has been sent. Over HTTP/2 that
+/// error is a `RST_STREAM(INTERNAL_ERROR)`: curl exits 92 on every request, and in about
+/// 2 % of runs the reset reaches curl before it has delivered the response headers, so the
+/// status is `0` although zion logged a 200. Over HTTP/1.1 the status line always comes
+/// first. The test is about the client certificate zion presents, not about that framing.
+///
+/// A status of `0` still means curl got none, and used to be silent: curl's exit code and
+/// its own error line are printed then, so they sit next to the assertion that fails.
 fn get(https_port: u16, path: &str) -> (u16, String) {
     let out = Command::new("curl")
-        .args(["-sk", "--max-time", "10", "-w", "\n%{http_code}"])
+        .args([
+            "-skS",
+            "--http1.1",
+            "--max-time",
+            "10",
+            "-w",
+            "\n%{http_code}",
+        ])
         .arg(format!("https://127.0.0.1:{https_port}{path}"))
         .output()
         .expect("curl");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let (body, code) = text.rsplit_once('\n').unwrap_or(("", "0"));
-    (code.trim().parse().unwrap_or(0), body.to_string())
+    let status = code.trim().parse().unwrap_or(0);
+    if status == 0 {
+        eprintln!(
+            "curl got no HTTP status for GET {path}: exit {:?}, stderr {:?}, stdout {} byte(s)",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim(),
+            out.stdout.len()
+        );
+    }
+    (status, body.to_string())
 }
 
 /// The request did not reach the backend: `502` when this request's own handshake was
@@ -155,6 +183,45 @@ fn upstream_up(https_port: u16, backend_port: u16, want: &str) -> String {
         }
         std::thread::sleep(Duration::from_millis(300));
     }
+}
+
+/// `openssl s_server` requiring a client certificate, on a port that is free when it starts.
+///
+/// `free_port()` frees the port before s_server binds it, so another process can take it in
+/// between: seen once in 80 runs on a busy machine ("the mTLS backend never listened"). A
+/// backend that exited before listening is started again on a new port, up to five times.
+fn start_backend(d: &str) -> (Proc, u16) {
+    for _ in 0..5 {
+        let port = free_port();
+        let child = Command::new("openssl")
+            .args(["s_server", "-accept", &port.to_string(), "-www"])
+            .args(["-cert", &format!("{d}/server.pem")])
+            .args(["-key", &format!("{d}/server.key")])
+            .args(["-CAfile", &format!("{d}/ca.pem"), "-Verify", "1"])
+            // Without this s_server's verify callback logs a bad certificate and carries on.
+            .arg("-verify_return_error")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("openssl s_server");
+        let mut backend = Proc(child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            // Listening, and still ours: if the bind failed, a stranger answers the connect.
+            let exited = backend.0.try_wait().expect("try_wait").is_some();
+            if exited {
+                break;
+            }
+            if TcpStream::connect(("127.0.0.1", port)).is_ok()
+                && backend.0.try_wait().expect("try_wait").is_none()
+            {
+                return (backend, port);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    panic!("openssl s_server never listened, in five tries on five ports");
 }
 
 fn zion(dir: &Path, upstream: &str, https_port: u16, log: &str) -> Command {
@@ -207,25 +274,7 @@ fn zion_presents_its_client_certificate_to_an_upstream_that_requires_one() {
     let d = dir.to_string_lossy().into_owned();
     // The backend: TLS, a certificate from the private CA, and a client certificate from
     // that CA is mandatory (-Verify, capital V).
-    let backend_port = free_port();
-    let backend = Command::new("openssl")
-        .args(["s_server", "-accept", &backend_port.to_string(), "-www"])
-        .args([
-            "-cert",
-            &format!("{d}/server.pem"),
-            "-key",
-            &format!("{d}/server.key"),
-        ])
-        .args(["-CAfile", &format!("{d}/ca.pem"), "-Verify", "1"])
-        // Without this s_server's verify callback logs a bad certificate and carries on.
-        .arg("-verify_return_error")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("openssl s_server");
-    let _backend = Proc(backend);
-    wait_port(backend_port, "the mTLS backend");
+    let (_backend, backend_port) = start_backend(&d);
     let url = format!("url = \"https://localhost:{backend_port}\"\nca_path = \"{d}/ca.pem\"");
     let run = |upstream: &str, log: &str| {
         let https_port = free_port();
