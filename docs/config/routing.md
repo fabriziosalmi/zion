@@ -49,6 +49,10 @@ profiles, used as the cache key, and sent upstream:
 - Dot segments are removed, never climbing above the root (`/a/b/../c` → `/a/c`).
 - Runs of `/` collapse to one (`//a///b` → `/a/b`). A trailing slash is kept.
 - The query string is left exactly as written.
+- A path that one pass of this does not bring to a canonical form is refused with `400`
+  instead of being routed: the upstream decodes the path once more, and zion must not
+  route one reading while the upstream serves another. Nothing a client writes
+  correctly is affected.
 
 Without this, `/open/../internal/x` matches `/open/{*rest}` while an upstream that
 resolves `..` serves `/internal/x`, and `//admin` or `/%61dmin` slip past a `/admin` route.
