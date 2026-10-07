@@ -89,6 +89,19 @@ cors = { allowed_origins = ["https://trusted.example"], allowed_headers = ["X-Cu
 [auth_profile.e2e]
 secret = "e2e-jwt-secret-at-least-32-bytes-long!"
 algorithm = "HS256"
+# The test token expires in 2100. A profile without a cap refuses that since 0.10.0 (default
+# 24 h, #553), so this one says "no cap" on purpose; `e2e_default` below has no setting.
+max_token_lifetime_secs = 0
+
+[auth_profile.e2e_default]
+secret = "e2e-jwt-secret-at-least-32-bytes-long!"
+algorithm = "HS256"
+
+[[route]]
+path = "/auth-default/{*rest}"
+upstream = "backend"
+mode = "standard"
+auth_profile = "e2e_default"
 
 [[route]]
 path = "/auth/{*rest}"

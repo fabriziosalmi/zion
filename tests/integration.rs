@@ -526,6 +526,18 @@ integration_test!(t42_auth_valid_jwt_reaches_backend, {
     assert_eq!(status, 200, "a valid JWT must reach the backend (200)");
 });
 
+// The default cap on a token's lifetime (#553): the same token, valid and expiring in 2100, is
+// refused by a profile without `max_token_lifetime_secs` (24 h) and accepted by one that says 0.
+integration_test!(t42b_auth_default_cap_refuses_a_far_future_token, {
+    let auth = format!("Authorization: Bearer {E2E_JWT}");
+    let (status, _, _) = get_with("/auth-default/x", &["-H", &auth]);
+    // 403, like a token over any configured cap: the credential is understood and refused.
+    assert_eq!(
+        status, 403,
+        "a token that expires in 2100 must be refused by the default 24 h cap"
+    );
+});
+
 integration_test!(t43_cors_preflight_returns_acao, {
     let (status, _, headers) = get_with(
         "/cors/x",
