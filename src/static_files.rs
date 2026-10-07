@@ -24,12 +24,18 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::proxy::ZionBody;
 
-/// Per-read chunk size for a streamed file body.
-const STREAM_CHUNK: usize = 64 * 1024;
-/// Frames buffered between the file reader and the socket. Bounds in-flight memory
-/// to about `STREAM_CHUNK × (STREAM_CHANNEL_CAP + 1)` while keeping the reader
-/// slightly ahead of the network.
-const STREAM_CHANNEL_CAP: usize = 8;
+/// Size of one frame of a streamed file body.
+const STREAM_FRAME: usize = 64 * 1024;
+/// Bytes per blocking read: two frames. One read, one trip through the blocking pool, one
+/// allocation, shared by the frames cut from it; a read per frame cost twice the trips and
+/// copied each chunk twice more (#564).
+const STREAM_BLOCK: usize = 2 * STREAM_FRAME;
+/// Frames in flight for one response: the block being read and the frames queued behind the
+/// socket. Bounds in-flight memory to `STREAM_FRAME * STREAM_IN_FLIGHT_FRAMES` (576 KiB).
+const STREAM_IN_FLIGHT_FRAMES: usize = 9;
+/// Frames buffered between the file reader and the socket (the rest of the in-flight
+/// frames are the block being read).
+const STREAM_CHANNEL_CAP: usize = STREAM_IN_FLIGHT_FRAMES - STREAM_BLOCK / STREAM_FRAME;
 
 /// Buffer-whole-into-memory threshold. At or below this a body — a full file or a
 /// single range slice — is read into one `Bytes` and served as a `Full` body (CSS,
@@ -41,7 +47,7 @@ const STREAM_CHANNEL_CAP: usize = 8;
 /// HTTP/2 connection carries 128 of them: when this was 64 MiB, a single connection
 /// asking 100 times for a 60 MiB file took the process from 12 MiB to 4.6 GB, and
 /// kept it there for as long as it did not read (#562).
-const BUFFER_WHOLE_MAX_BYTES: u64 = (STREAM_CHUNK * (STREAM_CHANNEL_CAP + 1)) as u64;
+const BUFFER_WHOLE_MAX_BYTES: u64 = (STREAM_FRAME * STREAM_IN_FLIGHT_FRAMES) as u64;
 // Whatever the stream constants become, no request reads megabytes whole.
 const _: () = assert!(BUFFER_WHOLE_MAX_BYTES <= 1024 * 1024);
 
@@ -130,39 +136,70 @@ fn full_body(bytes: Bytes) -> ZionBody {
 }
 
 /// Stream `limit` bytes (or to EOF when `None`) from an already-positioned `file`
-/// as a framed [`ZionBody`], never holding more than [`STREAM_CHUNK`] × a small
-/// channel in memory. A read task feeds a bounded channel; the body drains it.
+/// as a framed [`ZionBody`], never holding more than [`STREAM_IN_FLIGHT_FRAMES`] frames. A
+/// read task feeds a bounded channel; the body drains it.
+///
+/// The file is read in blocks of [`STREAM_BLOCK`] on the blocking pool, straight into the
+/// buffer the frames are then cut from (`Bytes::slice`: no copy, one allocation per block).
 ///
 /// A mid-stream read error drops the sender, ending the body early — the same
 /// truncate-on-error behavior as the proxy path. The file was just `stat`ed and
 /// opened, so a fault here is a rare disk error, not a routine path, and the
 /// client sees a short read rather than a hang. The channel item type is
 /// `Result<_, hyper::Error>` to match [`ZionBody`]; only `Ok` frames are ever sent.
-fn stream_file(mut file: tokio::fs::File, limit: Option<u64>) -> ZionBody {
+fn stream_file(file: tokio::fs::File, limit: Option<u64>) -> ZionBody {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, hyper::Error>>(
         STREAM_CHANNEL_CAP,
     );
     tokio::spawn(async move {
+        let mut file = file.into_std().await;
         let mut remaining = limit;
-        let mut buf = vec![0u8; STREAM_CHUNK];
         loop {
             let want = match remaining {
                 Some(0) => break,                                 // served the whole slice
-                Some(n) => (n.min(STREAM_CHUNK as u64)) as usize, // don't overshoot the range
-                None => STREAM_CHUNK,
+                Some(n) => (n.min(STREAM_BLOCK as u64)) as usize, // don't overshoot the range
+                None => STREAM_BLOCK,
             };
-            match file.read(&mut buf[..want]).await {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    let frame = hyper::body::Frame::data(Bytes::copy_from_slice(&buf[..n]));
-                    if tx.send(Ok(frame)).await.is_err() {
-                        break; // the client (receiver) went away
-                    }
-                    if let Some(r) = remaining.as_mut() {
-                        *r -= n as u64;
+            let read = tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                let mut buf = vec![0u8; want];
+                let mut filled = 0;
+                let mut failed = false;
+                while filled < want {
+                    match file.read(&mut buf[filled..]) {
+                        Ok(0) => break, // EOF
+                        Ok(n) => filled += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => {
+                            failed = true; // truncate on a read fault (see doc comment)
+                            break;
+                        }
                     }
                 }
-                Err(_) => break, // truncate on a read fault (see doc comment)
+                buf.truncate(filled);
+                (file, buf, failed)
+            })
+            .await;
+            let Ok((f, buf, failed)) = read else { break };
+            file = f;
+            let block = Bytes::from(buf);
+            let mut at = 0;
+            while at < block.len() {
+                let end = (at + STREAM_FRAME).min(block.len());
+                if tx
+                    .send(Ok(hyper::body::Frame::data(block.slice(at..end))))
+                    .await
+                    .is_err()
+                {
+                    return; // the client (receiver) went away
+                }
+                at = end;
+            }
+            if let Some(r) = remaining.as_mut() {
+                *r -= block.len() as u64;
+            }
+            if failed || block.len() < want {
+                break; // a fault, or EOF inside this block
             }
         }
     });
@@ -1337,11 +1374,11 @@ mod serve_tests {
 
     #[tokio::test]
     async fn stream_file_spans_multiple_chunks() {
-        // A file several STREAM_CHUNKs long exercises the read/send loop across
+        // A file several STREAM_FRAMEs long exercises the read/send loop across
         // many frames; the reassembled body must be byte-exact, and a non-chunk-
         // aligned limit must stop on the exact byte.
         let root = root("stream-big");
-        let n = STREAM_CHUNK * 3 + 12_345; // spans 4 frames, unaligned tail
+        let n = STREAM_FRAME * 3 + 12_345; // spans 4 frames, unaligned tail
         let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
         let path = root.0.join("big.bin");
         std::fs::write(&path, &data).unwrap();
@@ -1351,11 +1388,63 @@ mod serve_tests {
         assert_eq!(got.len(), n);
         assert_eq!(got, data, "whole streamed body must be byte-exact");
 
-        let limit = STREAM_CHUNK + 7; // stop mid-second-chunk
+        let limit = STREAM_FRAME + 7; // stop mid-second-chunk
         let capped = tokio::fs::File::open(&path).await.unwrap();
         let got = collect(stream_file(capped, Some(limit as u64))).await;
         assert_eq!(got.len(), limit);
         assert_eq!(got, data[..limit], "limited stream stops on the exact byte");
+    }
+
+    /// The read loop reads a block at a time and cuts frames from it: every size and limit
+    /// around a frame and a block boundary must come out byte-exact, with the frames sized as
+    /// documented and a file that ends inside a block, on its edge, or one byte past it.
+    #[tokio::test]
+    async fn stream_file_is_exact_around_frame_and_block_boundaries() {
+        use http_body_util::BodyExt;
+        let root = root("stream-boundaries");
+        let sizes = [
+            1,
+            STREAM_FRAME - 1,
+            STREAM_FRAME,
+            STREAM_FRAME + 1,
+            STREAM_BLOCK - 1,
+            STREAM_BLOCK,
+            STREAM_BLOCK + 1,
+            2 * STREAM_BLOCK,
+            3 * STREAM_BLOCK + 7,
+        ];
+        for n in sizes {
+            let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+            let path = root.0.join(format!("f{n}.bin"));
+            std::fs::write(&path, &data).unwrap();
+            let limits = [
+                None,
+                Some(1),
+                Some(STREAM_FRAME as u64),
+                Some(STREAM_BLOCK as u64),
+                Some(STREAM_BLOCK as u64 + 1),
+                Some(n as u64),
+            ];
+            for limit in limits {
+                let want = limit.map_or(n, |l| (l as usize).min(n));
+                let file = tokio::fs::File::open(&path).await.unwrap();
+                let mut body = stream_file(file, limit);
+                let (mut got, mut frames) = (Vec::new(), Vec::new());
+                while let Some(frame) = body.frame().await {
+                    let data = frame.unwrap().into_data().unwrap();
+                    frames.push(data.len());
+                    got.extend_from_slice(&data);
+                }
+                assert_eq!(got, data[..want], "size {n}, limit {limit:?}");
+                // Every frame but the last is a full frame, and none is empty or oversize.
+                let (last, rest) = frames.split_last().unwrap_or((&0, &[]));
+                assert!(
+                    rest.iter().all(|f| *f == STREAM_FRAME) && *last <= STREAM_FRAME,
+                    "size {n}, limit {limit:?}: frames {frames:?}"
+                );
+                assert!(frames.iter().all(|f| *f > 0), "no empty frame: {frames:?}");
+            }
+        }
     }
 
     // ── Buffer or stream (#562) ───────────────────────────────────────────────
