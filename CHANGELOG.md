@@ -11,6 +11,7 @@ All notable changes to Zion Edge Gateway are documented here.
 - **A request body that breaks on the way is `400`, not `413`, and the cause is logged.** On a route with a WAF profile (buffered path) every failed body read was answered `413 request body too large`: a client reset or a malformed chunked body looked like an oversize upload in the client's error and in the status counters. Only an overflow of the size cap is `413` now; a body that did not arrive in time is `408`, and both log the cause (a few lines every ten seconds at most). (#535)
 - **An HTTP/3 request that fails inside zion is logged** with the remote address, method and path, as is an HTTP/3 request body stream that breaks; before, the only trace of the `500` was the metrics. (#535)
 - **The mesh gossip receiver backs off when its socket keeps failing** (10 ms doubling to 1 s) instead of retrying at full speed, logs the first failure of a run, and counts the errors in `zion_mesh_recv_errors_total`. (#535)
+- **An upstream that closes its TLS session without `close_notify` is no longer silent.** When the response is delimited by the close, zion cannot tell its end from a truncation and ends the client's stream with an error (a reset over HTTP/2); nothing said why. The cut-off responses are counted in `zion_upstream_body_errors_total{kind="tls_truncated"}` (`kind="other"` for any other body failure) and the first of each in ten seconds is logged with the upstream's address. Behaviour toward the client is unchanged. (#598)
 
 ## [0.9.14] - 2026-10-07
 

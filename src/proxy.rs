@@ -501,6 +501,76 @@ pub async fn proxy_pass(
     send_request(client, req).await
 }
 
+/// Why reading an upstream response body failed, for the counter and the log.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BodyErrorKind {
+    /// The upstream closed the TCP connection without a TLS `close_notify`. For a response
+    /// delimited by the close that is indistinguishable from a truncation, so the client's
+    /// stream is ended with an error (a reset over HTTP/2) and nothing else says why.
+    TlsTruncated,
+    Other,
+}
+
+fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> BodyErrorKind {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if io.kind() == std::io::ErrorKind::UnexpectedEof
+                && io.to_string().contains("close_notify")
+            {
+                return BodyErrorKind::TlsTruncated;
+            }
+        }
+        cur = err.source();
+    }
+    BodyErrorKind::Other
+}
+
+/// Count a failed read of an upstream response body and log it (a few lines a minute at
+/// most, naming the upstream and nothing of the client or the URL).
+fn note_upstream_body_error(upstream: Option<&hyper::http::uri::Authority>, e: &hyper::Error) {
+    static TRUNCATED_LOG: crate::logging::Throttle = crate::logging::Throttle::new(1, 10);
+    static OTHER_LOG: crate::logging::Throttle = crate::logging::Throttle::new(1, 10);
+    let upstream = upstream.map_or("?", |a| a.as_str());
+    let m = &crate::metrics::METRICS;
+    match classify_body_error(e) {
+        BodyErrorKind::TlsTruncated => {
+            m.upstream_body_errors_tls_truncated
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if TRUNCATED_LOG.allow() {
+                crate::logging::warn(
+                    "proxy",
+                    &format!(
+                        "upstream {upstream} closed the connection without a TLS close_notify; the response is cut off for the client (the upstream should send close_notify, or give the response a Content-Length)"
+                    ),
+                );
+            }
+        }
+        BodyErrorKind::Other => {
+            m.upstream_body_errors_other
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if OTHER_LOG.allow() {
+                crate::logging::warn(
+                    "proxy",
+                    &format!("reading the response body from upstream {upstream} failed: {e}"),
+                );
+            }
+        }
+    }
+}
+
+/// An upstream response body that reports its failures (see `note_upstream_body_error`).
+fn watch_upstream_body(
+    body: hyper::body::Incoming,
+    upstream: Option<hyper::http::uri::Authority>,
+) -> ZionBody {
+    body.map_err(move |e| {
+        note_upstream_body_error(upstream.as_ref(), &e);
+        e
+    })
+    .boxed()
+}
+
 /// Strip hop-by-hop headers from an upstream RESPONSE before relaying it to the
 /// client (RFC 9110 §7.6.1). These are meaningful only on the upstream→zion hop;
 /// hyper frames the client connection itself, so forwarding the upstream's
@@ -545,6 +615,7 @@ async fn send_request_try(
     client: &HttpClient,
     req: Request<ZionBody>,
 ) -> Result<Response<ZionBody>, hyper_util::client::legacy::Error> {
+    let upstream = req.uri().authority().cloned();
     let upstream_start = std::time::Instant::now();
     let result = client.request(req).await;
     crate::metrics::METRICS
@@ -552,7 +623,10 @@ async fn send_request_try(
         .observe(upstream_start.elapsed());
     let (mut parts, body) = result?.into_parts();
     scrub_response_hop_by_hop(&mut parts.headers);
-    Ok(Response::from_parts(parts, body.boxed()))
+    Ok(Response::from_parts(
+        parts,
+        watch_upstream_body(body, upstream),
+    ))
 }
 
 /// High-availability forward over a multi-upstream pool.
@@ -823,6 +897,7 @@ pub async fn proxy_pass_stream(
     };
     let (parts, body) = req.into_parts();
     let req = Request::from_parts(parts, body);
+    let upstream = req.uri().authority().cloned();
 
     match client.request(req).await {
         Ok(resp) => {
@@ -836,7 +911,10 @@ pub async fn proxy_pass_stream(
                 "X-Accel-Buffering",
                 hyper::header::HeaderValue::from_static("no"),
             );
-            Ok(Response::from_parts(parts, body.boxed()))
+            Ok(Response::from_parts(
+                parts,
+                watch_upstream_body(body, upstream),
+            ))
         }
         Err(e) => {
             crate::logging::warn("proxy", &format!("stream proxy error: {e}"));
@@ -905,6 +983,7 @@ async fn send_request(
     req: Request<ZionBody>,
 ) -> Result<Response<ZionBody>, hyper::Error> {
     let context = upstream_context(&req);
+    let upstream = req.uri().authority().cloned();
     let deadline = request_timeout(&req);
     let upstream_start = std::time::Instant::now();
     match tokio::time::timeout(deadline, client.request(req)).await {
@@ -914,7 +993,10 @@ async fn send_request(
                 .observe(upstream_start.elapsed());
             let (mut parts, body) = resp.into_parts();
             scrub_response_hop_by_hop(&mut parts.headers);
-            Ok(Response::from_parts(parts, body.boxed()))
+            Ok(Response::from_parts(
+                parts,
+                watch_upstream_body(body, upstream),
+            ))
         }
         Ok(Err(e)) => {
             crate::metrics::METRICS
@@ -1209,6 +1291,48 @@ async fn send_ws_upgrade(
 
 #[cfg(test)]
 mod tests {
+    /// The error as hyper hands it over: the I/O error is a link in a chain, not the top.
+    #[derive(Debug)]
+    struct Wrapped(Box<dyn std::error::Error + Send + Sync>);
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("error reading a body from connection")
+        }
+    }
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&*self.0)
+        }
+    }
+
+    #[test]
+    fn a_tls_close_without_close_notify_is_told_from_other_body_errors() {
+        use std::io::{Error, ErrorKind};
+        let eof = Error::new(
+            ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+        );
+        assert_eq!(
+            super::classify_body_error(&Wrapped(Box::new(eof))),
+            super::BodyErrorKind::TlsTruncated
+        );
+        // Another unexpected EOF (a plain connection that dropped) is not that.
+        let plain = Error::new(
+            ErrorKind::UnexpectedEof,
+            "connection closed before message completed",
+        );
+        assert_eq!(
+            super::classify_body_error(&Wrapped(Box::new(plain))),
+            super::BodyErrorKind::Other
+        );
+        // Nor is another kind of error that happens to mention it.
+        let reset = Error::new(ErrorKind::ConnectionReset, "no close_notify here");
+        assert_eq!(
+            super::classify_body_error(&Wrapped(Box::new(reset))),
+            super::BodyErrorKind::Other
+        );
+    }
+
     /// Time a GET to a black-holed address (TEST-NET-1: packets dropped, no RST) on
     /// a client built with `connect_timeout_ms`, capped at `cap` so a client with no
     /// deadline cannot hold the test for the full 30s.

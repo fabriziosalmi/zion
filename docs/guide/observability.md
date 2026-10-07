@@ -64,6 +64,7 @@ Six reliability counters are exposed alongside the existing ones:
 | `zion_audit_events_dropped_total` | Audit events dropped: the queue was full (slow disk or `audit.queue_depth` too small) **or** the writer has exited. Use `zion_audit_writer_up` to tell them apart. |
 | `zion_audit_write_failures_total` | Write, flush or fsync errors on the audit log. Non-zero means records are at risk. |
 | `zion_audit_prune_failures_total` | Rotated segments that could not be deleted when enforcing `max_files`. Non-zero means retention is not holding and segments accumulate until the disk is full. |
+| `zion_upstream_body_errors_total{kind}` | counter | Upstream responses cut off after their headers were sent. `kind="tls_truncated"`: the upstream closed its TLS session without `close_notify` (for a response delimited by the close that cannot be told from a truncation, so the client's stream ends with an error; a reset over HTTP/2). `kind="other"`: any other failure reading the body. The first of each in a ten-second window is logged with the upstream's address. |
 | `zion_audit_enabled` (gauge) | `1` when `[audit] enabled = true` started a writer. |
 | `zion_audit_writer_up` (gauge) | `1` while the writer task is running, `0` once it has exited (disk full, fd revoked, reopen failure). Alert on `zion_audit_enabled == 1 and zion_audit_writer_up == 0`. |
 | `zion_audit_last_write_timestamp_seconds` (gauge) | Unix time of the last record flushed successfully. |
