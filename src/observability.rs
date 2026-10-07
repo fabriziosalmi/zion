@@ -36,6 +36,9 @@ pub static AUDIT_EVENTS_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Write, flush or fsync errors on the audit log. Bumped before the writer gives
 /// up, so a dying writer is visible as more than a rising drop count.
 pub static AUDIT_WRITE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Rotated audit segments that could not be deleted (or a directory that could
+/// not be listed) when enforcing `max_files`. Non-zero means retention is not holding.
+pub static AUDIT_PRUNE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// 1 once `[audit] enabled = true` booted a writer, else 0. Alert on
 /// `zion_audit_enabled == 1 and zion_audit_writer_up == 0`.
 pub static AUDIT_ENABLED: AtomicU64 = AtomicU64::new(0);
@@ -77,6 +80,11 @@ pub fn render_counters(out: &mut bytes::BytesMut) {
             "zion_audit_write_failures_total",
             "Audit log write/flush/fsync errors. Non-zero means records are at risk; with zion_audit_writer_up == 0 the audit trail has stopped.",
             AUDIT_WRITE_FAILURES_TOTAL.load(Ordering::Relaxed),
+        ),
+        (
+            "zion_audit_prune_failures_total",
+            "Rotated audit segments that could not be deleted when enforcing max_files. Non-zero means the retention bound is not holding and segments accumulate.",
+            AUDIT_PRUNE_FAILURES_TOTAL.load(Ordering::Relaxed),
         ),
         (
             "zion_traces_emitted_total",
