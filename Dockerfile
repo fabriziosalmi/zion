@@ -99,6 +99,16 @@ RUN cargo build --release --locked --features dist && \
     # The binary's mtime is the commit's, whatever the layer exporter does.
     touch -d "@${SOURCE_DATE_EPOCH}" target/release/zion
 
+# The default config, with modes set here rather than inherited: a file copied from the build
+# context carries the mode of whoever checked it out (0644 under umask 022, 0664 under 002),
+# which would make the image digest depend on the builder's umask. (`COPY --chmod` is not the
+# answer: it also applies to the directories it creates, and /etc/zion must stay 0755.)
+# Found by rebuilding v0.10.0's image: every layer matched except the one with this file.
+COPY zion.example.toml /tmp/zion.example.toml
+RUN mkdir -p /out/etc/zion && \
+    cp /tmp/zion.example.toml /out/etc/zion/zion.toml && \
+    chmod 0755 /out/etc/zion && chmod 0644 /out/etc/zion/zion.toml
+
 # Pre-create the ACME state directory with the nonroot UID we use at runtime.
 # Distroless has no shell to mkdir at runtime, and `COPY --chown` is the only
 # way to lay down a directory with the right ownership in a scratch-style FS.
@@ -132,7 +142,7 @@ LABEL org.opencontainers.image.title="Zion Edge Gateway" \
       org.opencontainers.image.created="$SOURCE_DATE_EPOCH"
 
 COPY --from=builder /build/target/release/zion /usr/local/bin/zion
-COPY zion.example.toml /etc/zion/zion.toml
+COPY --from=builder /out/etc/zion /etc/zion
 # /var/lib/zion holds ACME state (`--features acme`). Pre-created in the
 # builder with ownership 65532:65532; copied verbatim into the runtime FS.
 COPY --from=builder /out/var/lib/zion /var/lib/zion
