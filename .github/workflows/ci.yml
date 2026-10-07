@@ -8,8 +8,9 @@
 #   - `--locked` everywhere — no silent Cargo.lock regeneration in CI.
 #   - Top-level `permissions: contents: read` (least privilege; jobs grant more).
 #   - Step actions pinned to major versions maintained by their owners
-#     (dtolnay, Swatinem) plus first-party `actions/*`. Renovate keeps these
-#     fresh (.github/dependabot.yml).
+#     (dtolnay, Swatinem) plus first-party `actions/*`. Dependabot's version
+#     updates for Actions are paused for now; security updates are not
+#     (.github/dependabot.yml, #537).
 #   - Concurrency cancels superseded runs on the same ref.
 
 name: CI

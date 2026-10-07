@@ -1,10 +1,16 @@
 # Dependabot — automated dependency updates with grouping for sane review load.
 #
 # Strategy:
-#   - Cargo:  daily security, weekly minor/patch (grouped), manual majors.
-#   - Actions: weekly, with explicit rebase strategy.
-#   - Docker:  weekly base-image refresh.
-#   - npm (docs/): weekly for the VitePress site.
+#   - Cargo (root): weekly minor/patch version updates in two groups, at most
+#     3 open PRs; manual majors. Security updates are separate and not limited
+#     by this setting.
+#   - Actions, Docker, npm, pip, benchmarks: version updates are PAUSED
+#     (open-pull-requests-limit: 0) for now, see the note at each entry. A
+#     limit of 0 only stops version updates; security updates still open.
+#
+# Auto-merge (.github/workflows/dependabot-auto-merge.yml) covers PATCH
+# updates of cargo and npm only, once every required check is green. Anything
+# else, GitHub Actions and Docker included, waits for a human. #537.
 #
 # All PRs land with the standard reviewers/labels so the supply-chain
 # pipeline (.github/workflows/supply-chain.yml) re-runs cargo-audit/deny
@@ -16,16 +22,17 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
+      day: "monday"
       time: "06:00"
       timezone: "Europe/Rome"
-    # FROZEN for the v0.7.4 field-validation window. `0` disables version
-    # updates for this ecosystem while leaving every `ignore` rule below
-    # intact — those encode hard-won walls (toml_parser/edition2024 at
-    # 0.9.0, tract-onnx vs the 1.88 anchor, aws-lc-rs vs the unvalidated
-    # FIPS 4.x module) and must survive the freeze. Restore the previous
-    # limits, noted inline, when validation ends.
-    open-pull-requests-limit: 0  # was 10
+    # The freeze for the v0.7.4 field-validation window ended long ago (this is
+    # 0.9.x); it left routine updates unproposed and let dependencies drift into
+    # larger, riskier batches. Every `ignore` rule below still stands: they
+    # encode walls (toml_parser/edition2024 at 0.9.0, tract-onnx vs the 1.88
+    # anchor, aws-lc-rs vs the unvalidated FIPS 4.x module). A low limit keeps
+    # the review load small while the first batches land.
+    open-pull-requests-limit: 3
     labels: ["dependencies", "rust"]
     commit-message:
       prefix: "deps"
@@ -123,12 +130,9 @@ updates:
     commit-message:
       prefix: "deps(bench)"
       include: "scope"
-    # FROZEN for the v0.7.4 field-validation window. `0` disables version
-    # updates for this ecosystem while leaving every `ignore` rule below
-    # intact — those encode hard-won walls (toml_parser/edition2024 at
-    # 0.9.0, tract-onnx vs the 1.88 anchor, aws-lc-rs vs the unvalidated
-    # FIPS 4.x module) and must survive the freeze. Restore the previous
-    # limits, noted inline, when validation ends.
+    # Version updates PAUSED, not forgotten: `0` stops them for this ecosystem
+    # and leaves security updates alone. Cargo (root) was resumed first (#537);
+    # the others follow once its first weeks show the review load is small.
     open-pull-requests-limit: 0  # was 5
 
   # ── GitHub Actions ────────────────────────────────────────────────────────
@@ -141,12 +145,9 @@ updates:
     commit-message:
       prefix: "ci"
       include: "scope"
-    # FROZEN for the v0.7.4 field-validation window. `0` disables version
-    # updates for this ecosystem while leaving every `ignore` rule below
-    # intact — those encode hard-won walls (toml_parser/edition2024 at
-    # 0.9.0, tract-onnx vs the 1.88 anchor, aws-lc-rs vs the unvalidated
-    # FIPS 4.x module) and must survive the freeze. Restore the previous
-    # limits, noted inline, when validation ends.
+    # Version updates PAUSED, not forgotten: `0` stops them for this ecosystem
+    # and leaves security updates alone. Cargo (root) was resumed first (#537);
+    # the others follow once its first weeks show the review load is small.
     open-pull-requests-limit: 0  # was 5
     groups:
       actions:
@@ -163,12 +164,9 @@ updates:
     commit-message:
       prefix: "docker"
       include: "scope"
-    # FROZEN for the v0.7.4 field-validation window. `0` disables version
-    # updates for this ecosystem while leaving every `ignore` rule below
-    # intact — those encode hard-won walls (toml_parser/edition2024 at
-    # 0.9.0, tract-onnx vs the 1.88 anchor, aws-lc-rs vs the unvalidated
-    # FIPS 4.x module) and must survive the freeze. Restore the previous
-    # limits, noted inline, when validation ends.
+    # Version updates PAUSED, not forgotten: `0` stops them for this ecosystem
+    # and leaves security updates alone. Cargo (root) was resumed first (#537);
+    # the others follow once its first weeks show the review load is small.
     open-pull-requests-limit: 0  # was 5
 
   # ── VitePress docs site ───────────────────────────────────────────────────
@@ -181,12 +179,9 @@ updates:
     commit-message:
       prefix: "docs"
       include: "scope"
-    # FROZEN for the v0.7.4 field-validation window. `0` disables version
-    # updates for this ecosystem while leaving every `ignore` rule below
-    # intact — those encode hard-won walls (toml_parser/edition2024 at
-    # 0.9.0, tract-onnx vs the 1.88 anchor, aws-lc-rs vs the unvalidated
-    # FIPS 4.x module) and must survive the freeze. Restore the previous
-    # limits, noted inline, when validation ends.
+    # Version updates PAUSED, not forgotten: `0` stops them for this ecosystem
+    # and leaves security updates alone. Cargo (root) was resumed first (#537);
+    # the others follow once its first weeks show the review load is small.
     open-pull-requests-limit: 0  # was 3
     versioning-strategy: "increase-if-necessary"
 
@@ -205,6 +200,5 @@ updates:
     commit-message:
       prefix: "ml"
       include: "scope"
-    # FROZEN for the v0.7.4 field-validation window, consistent with the other
-    # ecosystems above. Restore to 5 when validation ends.
+    # Version updates PAUSED, consistent with the other ecosystems above.
     open-pull-requests-limit: 0  # was 5
