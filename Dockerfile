@@ -37,8 +37,13 @@ FROM --platform=$TARGETPLATFORM rust:1.97-bookworm@sha256:14bc9c5966e7b3a385794b
 ARG TARGETPLATFORM
 ARG TARGETARCH
 ARG TARGETVARIANT
-# CI passes the commit timestamp; falls back to a fixed deterministic value
-# locally so a `docker build` on a clean tree is still bitwise stable.
+# CI passes the commit timestamp; falls back to a fixed value locally. This pins what the
+# build itself stamps (the binary's mtime, the `created` label). The image is bit-for-bit
+# stable only when it is also exported with `rewrite-timestamp=true` (BuildKit >= 0.13, as
+# release.yml does): without it the layers carry the checkout's file times, and the
+# state directory below its creation time, so two plain `docker build`s differ. Measured
+# (#538): two no-cache builds of one commit compile the same binary (same sha256); the
+# image digests differ without rewrite-timestamp and are equal with it.
 ARG SOURCE_DATE_EPOCH=0
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 
@@ -91,7 +96,7 @@ ENV ZION_COMMIT_DATE=${ZION_COMMIT_DATE}
 # image ships automatic HTTPS and the init wizard out of the box.
 RUN cargo build --release --locked --features dist && \
     strip target/release/zion && \
-    # Best-effort canonicalization for reproducibility.
+    # The binary's mtime is the commit's, whatever the layer exporter does.
     touch -d "@${SOURCE_DATE_EPOCH}" target/release/zion
 
 # Pre-create the ACME state directory with the nonroot UID we use at runtime.

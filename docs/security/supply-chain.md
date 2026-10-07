@@ -128,7 +128,7 @@ export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
 export ZION_GIT_SHA=$(git rev-parse --short=12 HEAD)
 export ZION_COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y-%m-%d HEAD)
 rustup toolchain install 1.88.0 --target x86_64-unknown-linux-musl
-cargo install --locked cargo-zigbuild        # needs zig on PATH
+cargo install --locked cargo-zigbuild --version 0.23.4   # needs zig 0.13.0 on PATH
 cargo +1.88.0 zigbuild --release --locked --features dist --target x86_64-unknown-linux-musl
 strip target/x86_64-unknown-linux-musl/release/zion
 sha256sum target/x86_64-unknown-linux-musl/release/zion
@@ -142,13 +142,18 @@ tar -xzOf zion-v0.9.15-x86_64-unknown-linux-musl.tar.gz zion | sha256sum
 ```
 
 or recreate the archive with the same `tar` flags and compare it against
-`SHA256SUMS`. Two inputs are not pinned by the workflow and can make the bytes
-differ: the `zig` and `cargo-zigbuild` versions. No CI job rebuilds a release
-and compares hashes yet, so treat byte-for-byte reproducibility as a goal, not a
-verified property; a difference you can explain is worth an issue (with your
-toolchain versions). Provenance does not depend on it: every artifact carries a
-SLSA build attestation (`gh attestation verify`) and the commit in its version
-string.
+`SHA256SUMS`. The toolchain is pinned end to end: Rust 1.88.0, `zig` 0.13.0 and
+`cargo-zigbuild` 0.23.4 (the versions that built v0.9.15; the workflow installs
+exactly these), so a rebuild with the same versions should give the same bytes.
+
+A scheduled job, [`reproducibility.yml`](https://github.com/fabriziosalmi/zion/blob/master/.github/workflows/reproducibility.yml),
+does this every Monday for the latest release: it rebuilds the Linux musl binary
+from the tag exactly as above and compares it with the published one, failing (and
+keeping both binaries) on a difference. It covers `x86_64-unknown-linux-musl` only;
+the other targets are built by the same workflow but are not rebuilt and compared.
+A difference you can explain is worth an issue (with your toolchain versions).
+Provenance does not depend on any of this: every artifact carries a SLSA build
+attestation (`gh attestation verify`) and the commit in its version string.
 
 ## Policy: what the supply-chain pipeline blocks
 
