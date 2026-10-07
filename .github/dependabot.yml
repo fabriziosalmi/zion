@@ -9,7 +9,7 @@
 #     limit of 0 only stops version updates; security updates still open.
 #
 # Auto-merge (.github/workflows/dependabot-auto-merge.yml) covers PATCH
-# updates of cargo and npm only, once every required check is green. Anything
+# updates of cargo and npm only, ungrouped, once every required check is green. Anything
 # else, GitHub Actions and Docker included, waits for a human. #537.
 #
 # All PRs land with the standard reviewers/labels so the supply-chain
@@ -62,6 +62,12 @@ updates:
       # until MSRV-core moves to 1.85. Same posture as hyper-rustls above.
       - dependency-name: "dashmap"
         versions: [">=6.2.0"]
+      # hyper-util 0.1.21 is edition 2024 (rustc 1.85): the MSRV job fails at
+      # manifest parse, before any code compiles (seen on the first Dependabot
+      # batch, #610). Hold at 0.1.20 until MSRV-core moves to 1.85. Same posture
+      # as hyper-rustls and dashmap above.
+      - dependency-name: "hyper-util"
+        versions: [">=0.1.21"]
       # criterion 0.8 raised its MSRV to rustc 1.86, well past the 1.82
       # anchor. It's a dev/bench-only dependency with no runtime value, so
       # hold at 0.5.x rather than relitigate MSRV for a benchmark harness.
