@@ -218,7 +218,9 @@ jobs:
 
       - name: Install cargo-zigbuild
         if: matrix.cross == 'zig'
-        run: cargo install --locked cargo-zigbuild
+        # Pinned: the version that built v0.9.15 (an unpinned install changed the release
+        # toolchain whenever upstream published). reproducibility.yml pins the same one.
+        run: cargo install --locked cargo-zigbuild --version 0.23.4
 
       # ── Native build deps ──
       - name: Install build deps (Linux)
@@ -432,7 +434,7 @@ jobs:
           sudo apt-get install -y cmake pkg-config build-essential libssl-dev
 
       - name: Install cargo-cyclonedx
-        run: cargo install --locked cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx --version 0.5.9
 
       - name: Generate CycloneDX SBOM
         # `cargo-cyclonedx --override-filename FOO --format json` writes
@@ -528,6 +530,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The image's `created` is the COMMIT's time, not the clock's: metadata-action
+      # defaults it to "now", which alone makes two builds of one commit differ. The same
+      # value is used for the per-arch images and the manifest list (reproducibility, #538).
+      - name: Image creation time (the commit's)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "IMAGE_CREATED=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" --jq .commit.committer.date)" >> "$GITHUB_ENV"
+
       - name: Image labels
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -540,6 +551,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.url=https://github.com/${{ github.repository }}
             org.opencontainers.image.documentation=https://fabriziosalmi.github.io/zion
+            org.opencontainers.image.created=${{ env.IMAGE_CREATED }}
 
       # Build the single native platform and push it by DIGEST (no tag). A clean
       # single-platform manifest (provenance/sbom off) keeps the digest simple so
@@ -560,7 +572,10 @@ jobs:
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
             ZION_GIT_SHA=${{ env.ZION_GIT_SHA }}
             ZION_COMMIT_DATE=${{ env.ZION_COMMIT_DATE }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          # rewrite-timestamp: layer file times are clamped to SOURCE_DATE_EPOCH, so the
+          # state directory and COPY'd files do not carry this checkout's times (#538).
+          # Two builds of one commit then give one image digest.
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true,rewrite-timestamp=true
 
       # Guard against the "arm64 manifest carries an amd64 binary" class of bug.
       # Done on the NATIVE runner, so the extracted ELF is this arch with no QEMU
@@ -624,6 +639,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The image's `created` is the COMMIT's time, not the clock's: metadata-action
+      # defaults it to "now", which alone makes two builds of one commit differ. The same
+      # value is used for the per-arch images and the manifest list (reproducibility, #538).
+      - name: Image creation time (the commit's)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "IMAGE_CREATED=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" --jq .commit.committer.date)" >> "$GITHUB_ENV"
+
       - name: Image metadata (tags + labels)
         id: meta
         # Emit index-LEVEL annotations so the fused manifest list carries the
@@ -647,6 +671,9 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.url=https://github.com/${{ github.repository }}
             org.opencontainers.image.documentation=https://fabriziosalmi.github.io/zion
+            org.opencontainers.image.created=${{ env.IMAGE_CREATED }}
+          annotations: |
+            org.opencontainers.image.created=${{ env.IMAGE_CREATED }}
 
       - name: Create & push multi-arch manifest
         id: manifest

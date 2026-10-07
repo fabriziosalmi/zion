@@ -1,0 +1,140 @@
+# Rebuild the latest release's Linux musl binary and compare it with the published one.
+#
+# SECURITY.md and release.yml say the release build is reproducible. Until this job nothing
+# ever rebuilt an artifact and compared bytes, so a drift (a toolchain moved, a build script
+# that reads the clock, an unpinned tool) went unnoticed until an outside verifier tried.
+# This runs the documented recipe (docs/security/supply-chain.md, "Reproducing a build"):
+# the commit's tree, Rust 1.88.0, zig 0.13.0, cargo-zigbuild 0.23.4, `--features dist`,
+# SOURCE_DATE_EPOCH = the commit time, strip. The binary is compared with the one inside the
+# published archive; a difference fails the job and uploads both binaries.
+#
+# If the toolchain pins below change, change them in release.yml in the same commit: this
+# job is only meaningful while it builds the way the release does.
+name: reproducibility
+
+on:
+  schedule:
+    - cron: "30 7 * * 1" # Mondays, 07:30 UTC
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to rebuild (default: the latest release)"
+        required: false
+  pull_request:
+    paths:
+      - ".github/workflows/reproducibility.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  rebuild:
+    name: rebuild the latest release (x86_64-unknown-linux-musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Resolve the release to rebuild
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName -q .tagName)}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::unexpected tag '$tag'"; exit 1; }
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Rebuilding ${tag}"
+
+      - name: Download the published archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          mkdir -p published
+          gh release download "$TAG" --repo "${GITHUB_REPOSITORY}" -D published \
+            -p "zion-${TAG}-${TARGET}.tar.gz" -p SHA256SUMS
+          ( cd published && grep " zion-${TAG}-${TARGET}.tar.gz\$" SHA256SUMS | sha256sum -c - )
+          tar -xzOf "published/zion-${TAG}-${TARGET}.tar.gz" zion > published/zion
+          sha256sum published/zion | tee published/zion.sha256
+
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.rel.outputs.tag }}
+          path: src
+
+      # The same inputs release.yml gives the build.
+      - name: Build environment (commit time and stamp)
+        working-directory: src
+        run: |
+          {
+            echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)"
+            echo "ZION_GIT_SHA=$(git rev-parse --short=12 HEAD)"
+            echo "ZION_COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y-%m-%d HEAD)"
+          } >> "$GITHUB_ENV"
+          rm -f rust-toolchain.toml
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: 1.88.0
+          targets: x86_64-unknown-linux-musl
+
+      - name: Setup zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild --version 0.23.4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config build-essential
+
+      - name: Build
+        working-directory: src
+        run: cargo zigbuild --release --locked --features dist --target "${TARGET}"
+
+      - name: Strip and compare
+        working-directory: src
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          bin="target/${TARGET}/release/zion"
+          strip "$bin"
+          mkdir -p ../rebuilt && cp "$bin" ../rebuilt/zion
+          cd ..
+          want="$(cut -d' ' -f1 published/zion.sha256)"
+          got="$(sha256sum rebuilt/zion | cut -d' ' -f1)"
+          {
+            echo "### Rebuild of ${TAG} (${TARGET})"
+            echo
+            echo "| | sha256 of the binary |"
+            echo "|---|---|"
+            echo "| published | \`${want}\` |"
+            echo "| rebuilt   | \`${got}\` |"
+            echo
+            echo "rustc $(rustc --version), zig $(zig version), $(cargo zigbuild --version 2>&1 | head -1)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$want" == "$got" ]]; then
+            echo "Reproduced: ${got}"
+          else
+            echo "::error::The rebuilt binary differs from the published one for ${TAG}"
+            exit 1
+          fi
+
+      - name: Keep both binaries when they differ
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rebuild-mismatch-${{ steps.rel.outputs.tag }}
+          path: |
+            published/zion
+            rebuilt/zion
+          retention-days: 30

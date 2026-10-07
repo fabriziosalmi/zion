@@ -55,7 +55,9 @@ GitHub Actions build:
 - **Cosign keyless signature** for every published container image.
 - **CycloneDX SBOM** attached to each release and attested to the image digest.
 - **Reproducible builds** — `SOURCE_DATE_EPOCH` is wired through the build,
-  archives are normalized, and the toolchain is pinned via `rust-toolchain.toml`.
+  archives are normalized, and the toolchain is pinned (Rust, zig, cargo-zigbuild).
+  A weekly job rebuilds the latest release's Linux musl binary and compares it with
+  the published one (`.github/workflows/reproducibility.yml`).
 
 Verification recipes (`gh attestation verify`, `cosign verify`,
 `cosign verify-attestation`) live in
