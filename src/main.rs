@@ -43,6 +43,7 @@
 
 mod acme;
 mod admin;
+mod alloc_tuning;
 mod atomic_file;
 mod audit;
 mod auth;
@@ -199,6 +200,8 @@ const H2_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 const H2_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn main() {
+    // Before anything allocates much: how mimalloc commits its arena (#590).
+    alloc_tuning::tune();
     // Map a structured boot failure to its conventional exit code so process
     // supervisors (systemd Restart=, k8s restartPolicy) can branch: a config
     // error (2) must NOT trigger a restart loop, a bind error (4) should. The

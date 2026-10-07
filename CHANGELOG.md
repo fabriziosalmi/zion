@@ -6,6 +6,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Fixed
 
+- **A cached megabyte now costs the process about a megabyte on Linux.** mimalloc, the global allocator, commits its arena eagerly by default; with that, the process held 1.7 to 2.1 times what `zion_cache_bytes` counts (bodies of 64 KiB, 300 KiB and 1 MiB alike), so a `cache_max_memory_mb` of N MiB held about 2N. zion now turns eager arena commit off at start-up (an operator's own `MIMALLOC_ARENA_EAGER_COMMIT` still wins). Measured: 1.03 to 1.07 times, the same as glibc's malloc. Idle and light-load resident memory also fell by about half (36 to 18 MiB serving one cached object), with no change in CPU per request or throughput on the regression harness. (#590)
+
+### Fixed
+
 - **The container image no longer depends on the builder's `umask`.** Rebuilding v0.10.0's image (the first built with `rewrite-timestamp`) gave the same layers as the published one, the compiled binary included, except the one that holds `/etc/zion/zion.toml`: its file mode was `0664` under a `umask 002` and `0644` under `022`. The file is now put in place in the build stage with explicit modes (`0755` for the directory, `0644` for the file). (#538)
 
 ## [0.10.0] - 2026-10-07

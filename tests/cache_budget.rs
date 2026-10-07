@@ -215,6 +215,49 @@ fn metric(zion: &Zion, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("no `{name}` in /metrics"))
 }
 
+/// A cached megabyte costs the process about a megabyte (#590).
+///
+/// `cache_max_memory_mb` is a budget on what the cache counts (`zion_cache_bytes`). On Linux
+/// mimalloc's default of committing its arena eagerly made the process hold 1.7 to 2.1 times
+/// that, for bodies of 64 KiB, 300 KiB and 1 MiB alike, so a budget of N MiB held about 2N
+/// (glibc's malloc: 1.0 to 1.1; `src/alloc_tuning.rs`). With no budget, 150 distinct 1 MiB
+/// responses: the growth must stay under 1.5 times what the cache counts (the bug read 1.8
+/// to 1.9 here, macOS 1.1).
+#[test]
+fn a_cached_megabyte_costs_the_process_about_a_megabyte() {
+    const N: usize = 150;
+    let origin = origin();
+    let Some(zion) = start(origin, "cache_max_memory_mb = 0") else {
+        return;
+    };
+    // The first requests pay for connections, TLS state and the page's own buffers.
+    for n in 0..5 {
+        assert_eq!(get(&zion, &format!("/obj/warm{n}")).0, 200);
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+    let (before, counted_before) = (
+        process_memory_mib(zion.child.id()),
+        metric(&zion, "zion_cache_bytes"),
+    );
+    for n in 0..N {
+        let (status, _, size) = get(&zion, &format!("/obj/{n}"));
+        assert_eq!((status, size), (200, MIB), "object {n}");
+    }
+    std::thread::sleep(Duration::from_millis(3000));
+    let after = process_memory_mib(zion.child.id());
+    let counted = (metric(&zion, "zion_cache_bytes") - counted_before) / MIB as u64;
+    let grew = after.saturating_sub(before);
+    eprintln!("cached {counted} MiB (as counted); the process grew by {grew} MiB");
+    assert!(
+        counted >= N as u64,
+        "the cache holds what was offered: {counted} MiB"
+    );
+    assert!(
+        grew * 2 < counted * 3,
+        "the process grew by {grew} MiB for {counted} MiB the cache counts: more than 1.5 times"
+    );
+}
+
 #[test]
 fn the_cache_stays_within_its_memory_budget_and_still_serves_hits() {
     let origin = origin();
