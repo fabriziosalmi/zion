@@ -356,10 +356,12 @@ mod tests {
         for ((name, pem), (recorded_name, recorded)) in corpus.iter().zip(RECORDED) {
             assert_eq!(name, recorded_name);
             let outcome = format!("{:?}{:?}{:?}", new_certs(pem), new_key(pem), new_crls(pem));
+            // The message names the input and leaves the outcome out: it is derived from key
+            // bytes, and a test log is not a place for those (even synthetic ones).
             assert_eq!(
                 digest(outcome.as_bytes()),
                 *recorded,
-                "{name:?} is read differently from before: {outcome}"
+                "{name:?} is read differently from before"
             );
         }
     }
@@ -372,7 +374,7 @@ mod tests {
         // Several certificates come back in file order; other kinds are skipped.
         match new_certs(&find("certificates around a key")) {
             Outcome::Items(v) => assert_eq!(v.len(), 2),
-            other => panic!("{other:?}"),
+            _ => panic!("the certificates around a key were not read as a list"),
         }
         // The first key wins, whatever its kind; a file with no key is `None`, not an error.
         assert!(matches!(
