@@ -17,6 +17,10 @@ All notable changes to Zion Edge Gateway are documented here.
 - **The mesh gossip receiver backs off when its socket keeps failing** (10 ms doubling to 1 s) instead of retrying at full speed, logs the first failure of a run, and counts the errors in `zion_mesh_recv_errors_total`. (#535)
 - **An upstream that closes its TLS session without `close_notify` is no longer silent.** When the response is delimited by the close, zion cannot tell its end from a truncation and ends the client's stream with an error (a reset over HTTP/2); nothing said why. The cut-off responses are counted in `zion_upstream_body_errors_total{kind="tls_truncated"}` (`kind="other"` for any other body failure) and the first of each in ten seconds is logged with the upstream's address. Behaviour toward the client is unchanged. (#598)
 
+### Changed
+
+- **Dependabot proposes Rust crate updates again, and auto-merge is narrower.** Cargo version updates were paused "for the v0.7.4 validation window" and stayed paused; they are now weekly, grouped (patch / minor), at most 3 open at once, and every pin in the `ignore` list still stands. Auto-merge, which covered patch and minor updates of everything, now covers **patch updates of cargo and npm only**; GitHub Actions, Docker and any minor or major update wait for a person. CI configuration only; nothing in the binary changes. (#537)
+
 ## [0.9.14] - 2026-10-07
 
 **Security release: path normalization could leave a path non-canonical, bypassing per-route policy.** If you rely on Zion's per-path policy (`internal_only`, `auth_profile`, WAF profile selection) to protect content on an upstream that decodes the request path, upgrade. Advisory: GHSA-fgvc-6568-8g3c.

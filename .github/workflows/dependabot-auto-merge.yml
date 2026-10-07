@@ -9,11 +9,13 @@
 # deny is never merged by this — it waits for a human, now visible in a queue
 # that otherwise stays empty.
 #
-# Scope (deliberately conservative):
-#   * cargo   — patch and minor only. Major bumps wait for a human.
-#   * actions — patch and minor (pinned by SHA elsewhere; low blast radius).
-#   * docker  — patch and minor (base-image digests).
-# A major version bump of anything is left for manual review.
+# Scope (deliberately narrow, #537):
+#   * cargo and npm (the docs site) — PATCH updates only.
+#   * GitHub Actions and Docker — never. A workflow or a base image runs with
+#     the repository's privileges; a person reads those.
+#   * minor and major updates of anything — a person reads those too.
+# Security updates are Dependabot PRs like the others: a patch fix to a cargo or
+# npm package merges once green; a minor or major one waits for review.
 #
 # Requires: repo setting "Allow auto-merge" enabled, and branch protection
 # with required status checks (ci-success). Without those, the merge step is a
@@ -35,11 +37,14 @@ jobs:
         id: meta
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
 
-      - name: Enable auto-merge for safe classes
-        # Patch/minor for any ecosystem = safe. Major = human review.
+      - name: Enable auto-merge for patch updates of cargo and npm
+        # package-ecosystem: cargo | npm_and_yarn | github_actions | docker | pip.
+        # A grouped PR carries the group's name; `rust-patch` holds patches only.
         if: >-
-          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
-          steps.meta.outputs.update-type == 'version-update:semver-minor'
+          (steps.meta.outputs.package-ecosystem == 'cargo' ||
+           steps.meta.outputs.package-ecosystem == 'npm_and_yarn') &&
+          (steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+           steps.meta.outputs.dependency-group == 'rust-patch')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
