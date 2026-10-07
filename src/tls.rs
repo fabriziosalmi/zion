@@ -139,6 +139,44 @@ impl ResolvesServerCert for SniResolver {
 // CERT LOADING
 // ═══════════════════════════════════════════════════════════════════
 
+/// How the error of [`load_certified_key`] says that the key is not the certificate's.
+const PAIR_MISMATCH: &str = "does not match key";
+
+/// At boot, put back the key of a certificate renewal that was killed half way.
+///
+/// A renewal renames the new key into place and then the new certificate. Killed between the
+/// two (a `kill -9`, a power loss), it leaves the new key beside the old certificate, which
+/// `load_certified_key` refuses, while the old key is still on disk as `<key>.zion-bak-<pid>`
+/// (see `atomic_file::write_cert_key_atomic`). For every configured pair that does not match,
+/// a backup that does match its certificate becomes the key again, and the log says so. The
+/// renewal runs again at its next check. Not for reloads: a renewal that is running may be
+/// between its two renames, and restoring then would break the pair it is about to complete.
+pub(crate) fn recover_interrupted_renewals(tls: &TlsConfig) {
+    let pairs = std::iter::once((&tls.cert_path, &tls.key_path))
+        .chain(tls.sni.iter().map(|e| (&e.cert_path, &e.key_path)));
+    for (cert, key) in pairs {
+        let Err(e) = load_certified_key(cert, key) else {
+            continue;
+        };
+        if !e.contains(PAIR_MISMATCH) {
+            continue;
+        }
+        match crate::atomic_file::restore_key_from_backup(std::path::Path::new(key), |bak| {
+            bak.to_str().is_some_and(|b| load_certified_key(cert, b).is_ok())
+        }) {
+            Ok(Some(bak)) => crate::logging::warn(
+                "tls",
+                &format!(
+                    "TLS key '{key}' did not match certificate '{cert}': a certificate renewal was interrupted. Restored the previous key from '{}'; the key it replaces is kept as '{key}.zion-unpaired'. The certificate will be renewed again at the next check.",
+                    bak.display()
+                ),
+            ),
+            Ok(None) => {}
+            Err(err) => crate::logging::error("tls", &format!("TLS key '{key}': {err}")),
+        }
+    }
+}
+
 /// Load a certificate chain + private key from PEM files.
 /// Returns an error instead of panicking so callers (hot-reload, pre-warm)
 /// can handle failures gracefully by keeping the previous config.
@@ -170,7 +208,7 @@ pub(crate) fn load_certified_key(
     // reload keeps the last-good acceptor and boot fails loudly rather than
     // serving a cert whose key it does not hold.
     ck.keys_match()
-        .map_err(|e| format!("TLS cert '{cert_path}' does not match key '{key_path}': {e}"))?;
+        .map_err(|e| format!("TLS cert '{cert_path}' {PAIR_MISMATCH} '{key_path}': {e}"))?;
 
     Ok(Arc::new(ck))
 }

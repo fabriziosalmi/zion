@@ -167,9 +167,10 @@ pub fn write_atomic_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Both temp files are staged and `fsync`ed FIRST, then renamed into place — key
 /// before cert, so a crash never presents a new certificate without the private
 /// key that matches it. The only residual window is the sub-microsecond gap
-/// between the two `rename` syscalls; the TLS loader additionally verifies
-/// cert/key correspondence and keeps the last-good pair on mismatch, so even
-/// that window degrades to "keep serving the old cert", never a hard outage.
+/// between the two `rename` syscalls. The TLS loader verifies cert/key
+/// correspondence: a hot reload that sees a mismatch keeps the last-good pair,
+/// and a boot that sees one puts the old key back from the backup link this
+/// function leaves until both renames are done ([`restore_key_from_backup`]).
 pub fn write_cert_key_atomic(
     key_path: &Path,
     key_bytes: &[u8],
@@ -213,6 +214,65 @@ pub fn write_cert_key_atomic(
     Ok(())
 }
 
+/// Put back the key of a renewal that died between its two renames.
+///
+/// `write_cert_key_atomic` renames the new key into place, then the new certificate, and
+/// keeps a hard link to the old key (`<key>.zion-bak-<pid>`) until both are done. A kill or
+/// a power loss between the two renames leaves the new key beside the old certificate: a
+/// pair no boot accepts, with the old key still on disk under the backup name. This looks
+/// for such a backup beside `key_path` (newest first) and, for the first one `accepts`
+/// (the caller's test that it belongs to the certificate), makes it the key again. The key
+/// it replaces is kept as `<key>.zion-unpaired`. Returns the backup that was restored.
+///
+/// For boot only. While the process runs, a renewal may be between its two renames, and
+/// putting the old key back then would break the pair the renewal is about to complete.
+pub fn restore_key_from_backup(
+    key_path: &Path,
+    accepts: impl Fn(&Path) -> bool,
+) -> Result<Option<PathBuf>, String> {
+    let Some(name) = key_path.file_name().and_then(|n| n.to_str()) else {
+        return Ok(None);
+    };
+    let prefix = format!("{name}.zion-bak-");
+    let Ok(entries) = std::fs::read_dir(dir_of(key_path)) else {
+        return Ok(None);
+    };
+    let mut backups: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            meta.is_file()
+                .then(|| (meta.modified().unwrap_or(std::time::UNIX_EPOCH), e.path()))
+        })
+        .collect();
+    backups.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    let Some((_, bak)) = backups.into_iter().find(|(_, p)| accepts(p)) else {
+        return Ok(None);
+    };
+    let mut unpaired_name = key_path.file_name().unwrap().to_os_string();
+    unpaired_name.push(".zion-unpaired");
+    let unpaired = key_path.with_file_name(unpaired_name);
+    let _ = std::fs::remove_file(&unpaired);
+    // Keep the key we are about to replace: it is the new key of a renewal that did not finish.
+    std::fs::hard_link(key_path, &unpaired).map_err(|e| {
+        format!(
+            "cannot keep '{}' as '{}' before restoring the previous key: {e}",
+            key_path.display(),
+            unpaired.display()
+        )
+    })?;
+    std::fs::rename(&bak, key_path).map_err(|e| {
+        format!(
+            "cannot restore '{}' from '{}': {e}",
+            key_path.display(),
+            bak.display()
+        )
+    })?;
+    fsync_dir(dir_of(key_path));
+    Ok(Some(bak))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +299,66 @@ mod tests {
         write_atomic_0600(&p, b"secret").unwrap();
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "key file must be created owner-only");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What a kill between the two renames leaves: the new key, the old certificate, and the
+    /// old key under its backup name.
+    fn interrupted_renewal(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("zion-atomic-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (key, cert) = (dir.join("k.pem"), dir.join("c.pem"));
+        write_cert_key_atomic(&key, b"KEY-1", &cert, b"CERT-1").unwrap();
+        let bak = backup_link(&key).expect("a backup of the old key");
+        write_atomic_0600(&key, b"KEY-2").unwrap(); // the first rename of the renewal; then it died
+        (dir, key, bak)
+    }
+
+    #[test]
+    fn an_interrupted_renewal_gets_its_previous_key_back() {
+        let (dir, key, bak) = interrupted_renewal("rk");
+        let restored =
+            restore_key_from_backup(&key, |p| std::fs::read(p).unwrap() == b"KEY-1").unwrap();
+        assert_eq!(restored.as_deref(), Some(bak.as_path()));
+        assert_eq!(std::fs::read(&key).unwrap(), b"KEY-1");
+        assert_eq!(
+            std::fs::read(dir.join("k.pem.zion-unpaired")).unwrap(),
+            b"KEY-2",
+            "the key that was replaced is kept"
+        );
+        assert!(!bak.exists(), "the backup became the key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_backup_that_does_not_belong_to_the_certificate_is_left_alone() {
+        let (dir, key, bak) = interrupted_renewal("rn");
+        let restored = restore_key_from_backup(&key, |_| false).unwrap();
+        assert_eq!(restored, None);
+        assert_eq!(std::fs::read(&key).unwrap(), b"KEY-2");
+        assert!(bak.exists());
+        assert!(!dir.join("k.pem.zion-unpaired").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn restoring_with_no_backup_is_a_no_op() {
+        let dir = std::env::temp_dir().join(format!("zion-atomic-rz-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("k.pem");
+        std::fs::write(&key, b"KEY").unwrap();
+        // A file that merely starts like the key's name is not a backup of it.
+        std::fs::write(dir.join("k.pem.old"), b"x").unwrap();
+        assert_eq!(restore_key_from_backup(&key, |_| true).unwrap(), None);
+        assert_eq!(std::fs::read(&key).unwrap(), b"KEY");
         std::fs::remove_dir_all(&dir).ok();
     }
 
