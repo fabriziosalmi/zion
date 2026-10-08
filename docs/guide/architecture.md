@@ -7,7 +7,8 @@ Zion is a single async Rust binary built on Tokio, Hyper, and rustls. <!-- zion-
 
 ```text
 src/
-├── main.rs        # Composition root: boot, then the listeners and background tasks, then drain on shutdown
+├── main.rs        # Entry point and `async_main`: the boot steps in order, then wait for the shutdown signal
+├── boot.rs        # The boot steps themselves (config, TLS, state, admin API, background tasks, listeners, drain)
 ├── accept.rs      # Accept loops, the per-connection HTTPS service (mTLS/JA4 identity headers, health fast path) and the :80 handler
 ├── state.rs       # AppState, ResolvedAppConfig (ArcSwap snapshot) and the per-source limiters shared by every handler
 ├── http_util.rs   # Request-ID generation and the small response builders (empty/text/405/401, security headers)
