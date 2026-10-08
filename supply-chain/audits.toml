@@ -1,4 +1,8 @@
 
 # cargo-vet audits file
 
-[audits]
+[[audits.jsonwebtoken]]
+who = "Claude Sonnet 5.5 <noreply@anthropic.com> (for Fabrizio Salmi)"
+criteria = "safe-to-deploy"
+delta = "11.0.0 -> 11.1.0"
+notes = "Delta audit: the only source change adds dangerous::insecure_decode_claims, a function in the explicitly dangerous module that decodes claims without validation. No unsafe, no I/O, no change to the verification paths. zion does not call it."
