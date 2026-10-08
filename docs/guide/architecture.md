@@ -206,7 +206,7 @@ Zion uses Tokio's multi-threaded runtime. Worker count is set to available CPU c
 | NUMA-aware sharding | `--features numa-aware` | Per-NUMA-node DashMap shards (Linux multi-socket; single-shard fallback elsewhere) |
 | Init wizard / dev mode | `--features init` | `zion init` / `zion auto` scaffolding + self-signed cert |
 | Live TUI | `--features tui` | `zion top` dashboard |
-| OpenTelemetry export | `--features otel` | OTLP trace exporter |
+| OpenTelemetry export | `--features otel` | OTLP trace exporter; not active yet, zion opens no spans (#640) |
 | FIPS 140-3 | `--features fips` | aws-lc-rs FIPS-validated backend |
 | Sovereign geo | `--features geo-ita` / `geo-eu` | Baked-in IT/EU ASN+CIDR classification |
 | AIMP mesh *(experimental)* | `--features sovereign-aimp` | Ed25519-signed fleet gossip of WAF/reputation |

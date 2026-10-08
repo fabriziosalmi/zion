@@ -229,7 +229,8 @@ init = ["rcgen", "time"]
 dist = ["acme", "init", "auth"]
 # Distributed tracing export to an OTLP collector (Tempo, Jaeger, Honeycomb,
 # Datadog Agent, etc). The base `tracing` integration is always-on; this
-# feature only enables the network exporter.
+# feature only enables the network exporter. NOT ACTIVE YET: zion opens no span, so nothing is
+# exported (#640).
 otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "opentelemetry-semantic-conventions", "tracing-opentelemetry"]
 # FIPS 140-3 mode (Track E). Switches the aws-lc-rs backend to its
 # FIPS-validated build (aws-lc-fips-sys). Requires:
