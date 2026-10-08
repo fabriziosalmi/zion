@@ -743,23 +743,23 @@ version = "0.2.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry]]
-version = "0.32.0"
+version = "0.33.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry-otlp]]
-version = "0.32.0"
+version = "0.33.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry-proto]]
-version = "0.32.0"
+version = "0.33.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry-semantic-conventions]]
-version = "0.32.1"
+version = "0.33.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry_sdk]]
-version = "0.32.1"
+version = "0.33.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.palette]]
@@ -1295,7 +1295,7 @@ version = "0.1.31"
 criteria = "safe-to-deploy"
 
 [[exemptions.tracing-opentelemetry]]
-version = "0.33.0"
+version = "0.34.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tracing-serde]]
