@@ -1,0 +1,170 @@
+name: perf-regression
+
+# Is master slower than the last release? A weekly paired comparison with the regression
+# harness (benchmarks/regress): the release tag and master are built in this job and
+# measured back to back on the same runner, twice each in turn (base, new, base, new), and
+# the job fails only when BOTH rounds say CPU per request got worse beyond the noise.
+#
+# What it can and cannot see. A GitHub runner shares its host: throughput says more about the
+# neighbours than about zion, so only CPU per request (read from /proc, which barely moves
+# with the neighbours) is judged, and a round that disagrees with the other is noise, not a
+# result. A real regression of 10 % or more in a scenario shows in both rounds; one of 3 %
+# does not, and is for the dedicated box (benchmarks/regress/README.md, "Where it runs").
+#
+# Not a required check: it takes about an hour and does not block a merge. It is a cron, so
+# cron-watchdog (scripts/check-cron-freshness.sh) opens an issue when it fails or stops
+# running. The Criterion benches (bench.yml) stay manual.
+
+on:
+  schedule:
+    - cron: "30 3 * * 1" # Monday 03:30 UTC
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Ref to compare master with (default: the latest v* release tag)"
+        required: false
+        default: ""
+      tolerance:
+        description: "Percent beyond which a change counts (the noise can raise it, never lower it)"
+        required: false
+        default: "10"
+  # Run on a change to the harness or to this file, so a broken one is found on its own PR.
+  pull_request:
+    paths:
+      - ".github/workflows/perf-regression.yml"
+      - "benchmarks/regress/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-regression-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  paired:
+    name: master against the last release
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the tags
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: perf-regression
+
+      - name: Install build deps
+        uses: ./.github/actions/build-deps
+
+      - name: Install h2load
+        run: |
+          for attempt in 1 2 3; do
+            if timeout 600 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y nghttp2-client; then
+              exit 0
+            fi
+            echo "::warning::apt-get failed or timed out (attempt ${attempt} of 3)"
+            sleep 10
+          done
+          echo "::error::could not install nghttp2-client in three attempts"
+          exit 1
+
+      - name: Tools the harness needs
+        run: |
+          h2load --version
+          go version
+          taskset --version | head -1
+          nproc
+
+      - name: Pick the base
+        id: base
+        env:
+          INPUT_REF: ${{ inputs.base_ref }}
+        run: |
+          ref="${INPUT_REF:-$(git tag --list 'v*' --sort=-v:refname | head -n 1)}"
+          if [ -z "$ref" ]; then
+            echo "::error::no v* tag to compare with"
+            exit 1
+          fi
+          git rev-parse --verify "${ref}^{commit}" > /dev/null
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "comparing $(git rev-parse --short HEAD) with $ref ($(git rev-parse --short "${ref}^{commit}"))"
+
+      - name: Build master
+        run: cargo build --release --locked --features dist
+
+      - name: Build the base
+        env:
+          BASE_REF: ${{ steps.base.outputs.ref }}
+        run: |
+          git worktree add "$RUNNER_TEMP/zion-base" "$BASE_REF"
+          cd "$RUNNER_TEMP/zion-base"
+          cargo build --release --locked --features dist
+
+      - name: Measure, base and master in turn, twice
+        env:
+          BASE_REF: ${{ steps.base.outputs.ref }}
+        run: |
+          mkdir -p results
+          # The scenarios are the ones a code change reaches; the static ones are I/O-bound and
+          # slow to settle on a shared disk.
+          scenarios=cache_hit_1k,cache_hit_2000_keys,proxy_1k,waf_post_json,uri_normalise
+          for round in 1 2; do
+            python3 benchmarks/regress/run.py --zion "$RUNNER_TEMP/zion-base/target/release/zion" \
+              --out "results/base-$round.json" --label "$BASE_REF" --only "$scenarios"
+            python3 benchmarks/regress/run.py --zion target/release/zion \
+              --out "results/new-$round.json" --label "master $(git rev-parse --short HEAD)" --only "$scenarios"
+          done
+
+      - name: Compare
+        env:
+          TOLERANCE: ${{ inputs.tolerance || '10' }}
+          BASE_REF: ${{ steps.base.outputs.ref }}
+        run: |
+          case "$TOLERANCE" in
+            ''|*[!0-9.]*) echo "::error::tolerance must be a number"; exit 1 ;;
+          esac
+          status=0
+          failed_rounds=0
+          for round in 1 2; do
+            echo "::group::round $round"
+            if python3 benchmarks/regress/compare.py "results/base-$round.json" "results/new-$round.json" \
+                 --judge cpu --tolerance "$TOLERANCE" | tee "results/compare-$round.txt"; then :; else
+              failed_rounds=$((failed_rounds + 1))
+            fi
+            echo "::endgroup::"
+          done
+          {
+            echo "## master against $BASE_REF"
+            echo
+            echo "CPU per request, judged beyond ${TOLERANCE} % or the noise, whichever is larger. The job fails only when both rounds say worse."
+            echo
+            for round in 1 2; do
+              echo "### round $round"
+              echo '```'
+              cat "results/compare-$round.txt"
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$failed_rounds" -eq 2 ]; then
+            echo "::error::CPU per request is worse than $BASE_REF beyond the noise in both rounds"
+            status=1
+          elif [ "$failed_rounds" -eq 1 ]; then
+            echo "::warning::one round says worse and the other does not: noise, not a result"
+          fi
+          exit "$status"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: perf-regression-results
+          path: results/
+          if-no-files-found: ignore
+          retention-days: 90

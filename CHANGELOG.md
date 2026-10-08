@@ -6,6 +6,7 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
+- **A weekly paired performance check.** `perf-regression` builds the latest release and master on the same runner, measures each twice in turn with the regression harness, and fails when both rounds say CPU per request got worse beyond the noise (10 % at least). It catches a regression of about 10 % or more in a scenario, on a shared runner; the dedicated box stays the place for smaller ones. A failing or silenced cron is reported by `cron-watchdog`. `compare.py` gained `--judge cpu`. The list of checks that block a merge is now written down in CONTRIBUTING.md. (#534)
 - **`zion_upstream_connections_opened_total`** counts the TCP connections zion establishes to upstreams. A rate far above the request rate to the same upstreams means connections are not being reused, and each one closed leaves a local port in TIME_WAIT: this is how the churn is seen before the ports run out and requests fail with `502` (#571). An alert on its rate is the early warning. (The failure #571 reported did not reproduce on 0.10.0 or on 0.9.11: 300,000 requests walking 18,750 URLs through a 10,000-entry cache, three runs, no `5xx`, on macOS and on Linux.)
 
 ### Changed

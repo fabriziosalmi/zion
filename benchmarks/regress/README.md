@@ -103,6 +103,17 @@ Requirements: `h2load` (`apt install nghttp2-client`), `go` (for the backend), `
 `python3`, `taskset`. `--quick` runs 2 trials of 3 seconds: a check that the harness
 works, not a measurement.
 
+## The weekly paired run
+
+`.github/workflows/perf-regression.yml` runs every Monday on a GitHub runner: it builds the
+latest `v*` tag and master, measures each twice in turn (base, new, base, new) on the same
+runner, and compares the pairs with `compare.py --judge cpu --tolerance 10`. Only CPU per
+request is judged there (a shared runner's throughput is the neighbours'), and the job fails
+only when **both** rounds say worse. That catches a regression of about 10 % or more in a
+scenario, not one of 3 %: for that, use the box above. The results of the two rounds are
+attached to the run for 90 days. A cron that fails, or that GitHub stopped running, is
+reported by `cron-watchdog`.
+
 ## Limits, said plainly
 
 - Loopback on one box: it measures what zion costs per request, not the network.

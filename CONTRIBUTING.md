@@ -106,3 +106,19 @@ scripts/check-version-sync.sh
 2. Link related GitHub Issues.
 3. Ensure every commit is signed off (DCO).
 4. Wait for the CI pipeline to pass.
+
+### What blocks a merge
+
+`master` is protected: a PR merges when it is up to date with `master` and every one of these checks is green (Dependabot's auto-merge waits for the same list, so a bump that fails `cargo-vet`, `cargo-audit` or `cargo-deny` never merges):
+
+| Check | What it is |
+|---|---|
+| `CI Success` | The roll-up of `ci.yml`: rustfmt (and the rule that every `allow(dead_code)` says why), clippy on ten feature flavours, tests (default and all features), tests on macOS and Windows, MSRV, rustdoc, Helm chart, sovereign generator tests |
+| `integration tests (zion + backend on real sockets)` | The end-to-end suite: the real binary against a real backend |
+| `cargo-deny (advisories / bans / licenses / sources)`, `cargo-audit (advisories)`, `cargo-vet`, `pip-audit (python advisories)` | The supply chain |
+| `CodeQL (rust)`, `CodeQL (actions)`, `gitleaks` | Static analysis and secrets |
+| `dco-check`, `version-sync`, `readme-stats-sync` | Sign-off, one version everywhere, the generated numbers in the README |
+
+Some gates run only when a PR touches the code they guard, so they cannot be required (a required check that does not run blocks the merge forever): `waf-corpus` (detection and the 0 % false-positive gate; also nightly), `equivalence` (the config importers), `tls-conformance` (BoGo), `reload-under-load`, `acme-soak`, the sanitizers in `concurrency` and `stability-soak`, and the `cargo-fuzz` build. They report on the PR; read them when they run.
+
+Two scheduled workflows watch the project rather than a PR: `perf-regression` (weekly: master against the last release, CPU per request, both of two rounds must agree) and `cron-watchdog` (opens an issue when a scheduled workflow fails or stops running).
