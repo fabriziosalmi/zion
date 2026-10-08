@@ -20,22 +20,13 @@ on:
   schedule:
     - cron: "0 4 * * *" # nightly 04:00 UTC
   workflow_dispatch: {}
+  # No `paths` here: this is a required check, and a required check that never starts blocks
+  # the merge. The `scope` job below decides whether the real job runs (scripts/pr-touches.sh).
+  # WAF effectiveness depends on the request/body pipeline that FEEDS the scanner, not just
+  # waf.rs: dispatch/ runs the URI/body gates and the streaming scan, proxy.rs collects bodies,
+  # uri_norm.rs normalizes the path. A recall regression can originate in any of them.
   pull_request:
     branches: [master]
-    paths:
-      - "src/waf.rs"
-      # WAF effectiveness depends on the request/body pipeline that FEEDS the
-      # scanner, not just waf.rs: dispatch.rs runs the URI/body gates and the
-      # streaming scan, proxy.rs handles body collection. A recall regression
-      # can originate there, so the corpus gate must trigger on them too. The same goes
-      # for what runs before the scanner sees the request: the gates in dispatch/ and the
-      # path normalizer (a change there can lower recall or add false positives).
-      - "src/dispatch.rs"
-      - "src/dispatch/**"
-      - "src/uri_norm.rs"
-      - "src/proxy.rs"
-      - "benchmarks/waf-corpus/**"
-      - ".github/workflows/waf-corpus.yml"
   push:
     branches: [master]
     paths:
@@ -59,7 +50,25 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  scope:
+    name: waf-corpus scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          echo "run=$(scripts/pr-touches.sh 'src/waf.rs' 'src/dispatch.rs' 'src/dispatch' 'src/uri_norm.rs' 'src/proxy.rs' 'benchmarks/waf-corpus' '.github/workflows/waf-corpus.yml' 'scripts/pr-touches.sh')" >> "$GITHUB_OUTPUT"
+
   waf-corpus:
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
     name: WAF corpus (detection + 0% false-positive gate)
     runs-on: ubuntu-latest
     timeout-minutes: 25
