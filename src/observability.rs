@@ -8,7 +8,8 @@
 //!     the JSON layer only fires on `tracing::info!` / `warn!` / `error!`.
 //!   - **Opt-in (`--features otel`)**: spans are forwarded to an OTLP
 //!     gRPC collector (Tempo, Jaeger, Honeycomb, Datadog Agent…). Off by
-//!     default — keeps tonic/prost out of the lean binary.
+//!     default — keeps tonic/prost out of the lean binary. NOT ACTIVE YET:
+//!     zion opens no span, so nothing reaches the collector (#640).
 //!
 //! On top of that this module owns the W3C **Trace Context** wire format
 //! (RFC, <https://www.w3.org/TR/trace-context/>). Inbound `traceparent` is
@@ -499,7 +500,8 @@ mod otel {
     //!   1. `OTEL_EXPORTER_OTLP_ENDPOINT` env var
     //!   2. `http://127.0.0.1:4317` (the conventional collector default)
     //!
-    //! The exporter ships `tracing` events as OpenTelemetry spans.
+    //! The exporter ships `tracing` SPANS as OpenTelemetry spans (an event outside a span is
+    //! dropped). zion opens no span yet, so nothing is exported: #640.
 
     use opentelemetry::{global, trace::TracerProvider as _, KeyValue};
     use opentelemetry_otlp::WithExportConfig;
@@ -540,6 +542,13 @@ mod otel {
 
         let tracer = provider.tracer("zion");
         global::set_tracer_provider(provider);
+
+        // Say it at boot, where the operator who built this feature will read it: the exporter
+        // is installed and idle. (Remove with the first span, #640.)
+        crate::logging::warn(
+            "otel",
+            "OTLP exporter installed, but zion opens no tracing span yet, so nothing will be exported (#640)",
+        );
 
         Some(OpenTelemetryLayer::new(tracer))
     }

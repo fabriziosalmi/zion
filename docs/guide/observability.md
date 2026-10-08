@@ -7,12 +7,12 @@
 
 Zion's observability stack covers four concerns:
 
-1. **Distributed tracing** — `tracing` everywhere, optional OTLP gRPC export.
+1. **Distributed tracing** — W3C Trace Context propagation and a trace id on every access-log line, audit record and histogram exemplar. An OTLP gRPC exporter exists behind `--features otel`, but it is **not active yet**: see [Optional OTLP export](#optional-otlp-export).
 2. **Metrics with exemplars** — Prometheus text format upgraded to OpenMetrics so each histogram bucket can carry the trace ID of the latest observation that fell into it.
 3. **Audit log** — HMAC-SHA256-chained JSON-Lines, opt-in.
 4. **Panic hook** — every panic emits one structured JSON record to stderr and to a "last-gasp" file before the process aborts.
 
-All four are always linked into the binary; they're cheap when idle. OTLP export is the only feature gated behind a build flag (`--features otel`) because it pulls in tonic + prost.
+All four are always linked into the binary; they're cheap when idle. The OTLP exporter is the only one gated behind a build flag (`--features otel`) because it pulls in tonic + prost.
 
 ## Distributed tracing
 
@@ -35,15 +35,17 @@ The parsed 16-byte trace ID is attached to the latency histogram as an OpenMetri
 
 ### Optional OTLP export
 
+> **Not active yet.** The exporter is built and wired, but zion opens no `tracing` span (there is no `info_span!` or `#[instrument]` in the request path), and the exporter ships spans, not stand-alone events such as the access log. A build with `--features otel` pointed at a collector connects to nothing and sends nothing: checked on 0.11.0, six requests, no connection from the exporter. What does work without it: `traceparent` is parsed, validated and forwarded to upstreams, and the trace id is in the access log, the audit record and the latency exemplar. A root span per request is tracked in [#640](https://github.com/fabriziosalmi/zion/issues/640); until then use those, or a collector fed from the access log.
+
 ```bash
 cargo build --release --features otel
 OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo.observability.svc:4317 \
     ZION_CONFIG=zion.toml ./target/release/zion
 ```
 
-The exporter ships every span emitted by `tracing::info_span!` / `#[instrument]` to the configured collector. Resource attributes are populated from `service.name=zion` and `service.version` (compile-time crate version). No batching parameters are exposed yet; the SDK default (5-second batch, 512-span queue) is in effect.
+Once zion emits spans, the exporter ships every span emitted by `tracing::info_span!` / `#[instrument]` to the configured collector. Resource attributes are populated from `service.name=zion` and `service.version` (compile-time crate version). No batching parameters are exposed yet; the SDK default (5-second batch, 512-span queue) is in effect.
 
-To verify export end-to-end without a collector, point `OTEL_EXPORTER_OTLP_ENDPOINT` at `http://127.0.0.1:4317` and run `otel-cli` or the [collector contrib distribution](https://github.com/open-telemetry/opentelemetry-collector-contrib) locally.
+To check it once spans exist, point `OTEL_EXPORTER_OTLP_ENDPOINT` at `http://127.0.0.1:4317` and run `otel-cli` or the [collector contrib distribution](https://github.com/open-telemetry/opentelemetry-collector-contrib) locally.
 
 ## Metrics with exemplars
 

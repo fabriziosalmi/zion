@@ -10,6 +10,11 @@ All notable changes to Zion Edge Gateway are documented here.
 - **Internal: `scripts/update-readme-boot-shot.sh` no longer reports success on a stale screenshot.** It deleted nothing before running `vhs` and only checked that the image file existed, so on 0.9.14 it printed success and left the 0.9.13 image in place. It now removes the old image first (and puts it back if `vhs` fails), and refuses an image byte-identical to the committed one when the version changed. (#602)
 
 
+### Documentation
+
+- **`--features otel` is documented as what it is: not active yet.** The OTLP exporter is built and wired, but zion opens no `tracing` span and the exporter ships spans, so a collector receives nothing; the guide, the README, the architecture table, `Cargo.toml` and the module comments said it exported traces. A build with the feature now also logs a WARN at start saying so. `traceparent` propagation and the trace id in the access log, the audit record and the latency exemplar are unaffected and work without the feature. A root span per request is left to its own change (#640, which stays open).
+
+
 ## [0.11.0] - 2026-10-08
 
 **zion now refuses to start with a `[tls] min_version` that is not `"1.2"` or `"1.3"`: read the first upgrade note before you upgrade.** The rest is memory and CPU: the cache costs what it counts on Linux, a cache hit costs the same on every core, and a large static file is about 15 % cheaper. Most of the diff is internal: the boot sequence and the request pipeline are lists of named stages, with the performance measured and unchanged.
