@@ -1242,7 +1242,6 @@ pub use crate::waf::{WafMode, WafProfile};
 // ============================================================================
 
 #[derive(Deserialize, Clone, Debug)]
-#[allow(dead_code)] // `mode` is parsed and not yet read (#636)
 #[serde(deny_unknown_fields)]
 pub struct CacheProfile {
     #[serde(default = "default_cache_mode")]
