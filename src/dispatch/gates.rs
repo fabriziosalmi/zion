@@ -130,20 +130,22 @@ pub(super) async fn run_pre_routing(
     None
 }
 
-/// Gate: URI length.
-fn uri_length(req: &Request<ZionBody>) -> Option<Response<ZionBody>> {
-    // Gate: URI length (reject oversized URIs before routing).
-    // Check full path+query, not just path — an attacker could send a short
-    // path with an enormous query string to consume memory downstream.
+/// Whether the request target (path and query) is longer than [`MAX_URI_LEN`]. The one
+/// definition of the cap: the HTTPS pipeline's gate and the :80 handler both ask it, so the
+/// counting rule cannot drift between them (it did once: `path()` alone let a short path
+/// with a multi-kilobyte query string past the cap on :80).
+pub(crate) fn uri_too_long<B>(req: &Request<B>) -> bool {
     let uri_len = req
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str().len())
         .unwrap_or_else(|| req.uri().path().len());
-    if uri_len > MAX_URI_LEN {
-        return Some(empty_response(StatusCode::URI_TOO_LONG));
-    }
-    None
+    uri_len > MAX_URI_LEN
+}
+
+/// Gate: URI length (reject oversized URIs before routing).
+fn uri_length(req: &Request<ZionBody>) -> Option<Response<ZionBody>> {
+    uri_too_long(req).then(|| empty_response(StatusCode::URI_TOO_LONG))
 }
 
 /// Gate: normalize the request path (RFC 3986 §6.2.2) before anything decides from it.

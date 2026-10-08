@@ -24,14 +24,15 @@
 //!   * QUIC / HTTP/3 listener — its UDP socket is independent and not
 //!     re-bound here.
 
+use crate::accept::run_http_accept_loop;
+use crate::net;
 use crate::state::{AppState, ResolvedAppConfig};
-use crate::{net, run_http_accept_loop};
 // `run_https_accept_loop` is only spawned by the supervisor in the
 // non-io_uring build flavour; on `--features io-uring-accept` the
 // accept loop is owned by the uring thread spawned in `async_main`
 // and the supervisor never calls it.
 #[cfg(not(all(target_os = "linux", feature = "io-uring-accept")))]
-use crate::run_https_accept_loop;
+use crate::accept::run_https_accept_loop;
 use arc_swap::ArcSwap;
 use std::net::SocketAddr;
 use std::sync::Arc;

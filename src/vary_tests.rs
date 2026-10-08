@@ -959,7 +959,7 @@ async fn the_upstream_is_sent_the_normalized_path_and_the_query_untouched() {
 // ── the plaintext :80 handler routes and forwards on its own, so it normalizes too ──
 
 async fn http80(st: &Arc<AppState>, uri: &str) -> (u16, String) {
-    let resp = crate::handle_http(
+    let resp = crate::accept::handle_http(
         get(uri, &[("host", "example.test")]),
         st.clone(),
         "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
@@ -973,6 +973,20 @@ async fn http80(st: &Arc<AppState>, uri: &str) -> (u16, String) {
         .unwrap_or("")
         .to_string();
     (resp.status().as_u16(), loc)
+}
+
+/// The :80 handler asks the same function as the HTTPS pipeline whether the target is too
+/// long, and counts path AND query: a short path with a multi-kilobyte query is refused too
+/// (it would otherwise be reflected into the redirect `Location` and the access log).
+#[tokio::test]
+async fn port_80_refuses_an_oversized_target_path_or_query() {
+    let (_o, st) = rig("").await;
+    let (status, _) = http80(&st, "/a?k=v").await;
+    assert_eq!(status, 301, "control: a normal target is redirected");
+    let (status, loc) = http80(&st, &format!("/{}", "a".repeat(9000))).await;
+    assert_eq!((status, loc.as_str()), (414, ""), "a long path");
+    let (status, loc) = http80(&st, &format!("/a?{}", "q".repeat(9000))).await;
+    assert_eq!((status, loc.as_str()), (414, ""), "a long query");
 }
 
 /// The ACME-fallback shortcut forwards `/.well-known/acme-challenge/*` straight to the
@@ -1757,7 +1771,7 @@ async fn a_trusted_proxy_peer_keeps_its_headers() {
 #[tokio::test]
 async fn the_port_80_acme_fallback_strips_them_too() {
     let (o, st) = rig("").await;
-    let resp = crate::handle_http(
+    let resp = crate::accept::handle_http(
         get("/.well-known/acme-challenge/tok", &hostile_headers()),
         st.clone(),
         "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
@@ -3619,7 +3633,7 @@ async fn the_port_80_acme_fallback_honours_preserve_host() {
         true,
         "",
     );
-    let resp = crate::handle_http(
+    let resp = crate::accept::handle_http(
         get(
             "/.well-known/acme-challenge/tok",
             &[("host", "app.example")],
