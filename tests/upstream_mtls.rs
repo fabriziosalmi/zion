@@ -517,10 +517,12 @@ fn an_upstream_that_closes_without_close_notify_is_counted_and_logged() {
         .lines()
         .filter(|l| l.contains("close_notify") && l.contains(&format!("localhost:{backend_port}")))
         .collect();
-    assert_eq!(
-        lines.len(),
-        1,
-        "one warning per interval, naming the upstream:\n{log}"
+    // One warning per 10-second window, aligned to the clock: three errors a few seconds apart can
+    // straddle a boundary and give two, never three. (Asserting exactly one was a coin flip on a
+    // slow runner.)
+    assert!(
+        (1..=2).contains(&lines.len()),
+        "the three errors give one warning per interval, not one each, naming the upstream:\n{log}"
     );
     let _ = fs::remove_dir_all(dir);
 }
