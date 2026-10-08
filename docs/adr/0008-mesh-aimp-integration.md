@@ -1,6 +1,6 @@
 # ADR-0008: Embed AIMP as the mesh control-plane bus
 
-- **Status**: accepted
+- **Status**: accepted; **experimental since 2026-10-08, rotation / revocation / fleet claims frozen** (see the status update at the end)
 - **Date**: 2026-05-08 (v0.2.x mesh wire-up)
 - **Tags**: mesh, aimp, gossip, identity, federated-state
 
@@ -107,3 +107,24 @@ delegated authority.
 - Threat-model addendum: [`docs/security/threat-model.md`](../security/threat-model.md) §10 (mesh)
 - v0.2.2 wire-up commit: `2490fe8`
 - v0.2.1 mesh-score signal: PR #65
+
+## Status update — 2026-10-08
+
+The decision stands (AIMP as an in-process, opt-in bus), but the mesh is declared **experimental** and
+part of what this ADR anticipated is **frozen**. What exists: signed gossip of WAF reputation to a static
+peer set, an allowlist of trusted node ids (`trusted_keys`, fail closed), replay and timestamp rejection,
+source-bound revocation, an optional per-source rate cap, a persisted identity. Frozen, with their specs
+kept in the issues: signed rotation and revocation claims (#68), `RateSaturation` and the upstream-health
+quorum (#66, #67), and what needs them (quorum, peer quarantine, the XDP reconciler, #53). Where the
+text above says these "land with" a later mesh slice, read "if a real multi-node deployment needs them".
+
+Why: the code went the other way from the TOFU model sketched here. Trust is an operator-provisioned
+allowlist, which is simpler and safer than a self-extending one: a signed `IdentityRetired` claim
+would let the holder of a compromised key promote a new key that stays trusted after the operator
+removes the old one. With an allowlist, rotation and revocation are "add, switch, remove" if
+`trusted_keys` can be reloaded without a restart, and that is the first step to take when the mesh
+unfreezes; the signed claims matter only at a fleet size nobody has asked for. The rate and health
+claims duplicate, across nodes, what a load balancer with affinity and the in-band circuit breaker
+already do for one, and give a trusted peer a lever over other nodes' decisions. Their issues stay
+open as the parked specs.
+

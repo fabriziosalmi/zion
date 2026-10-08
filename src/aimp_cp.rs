@@ -20,6 +20,13 @@
 //! mesh partitions, each node keeps its last known reputation map and
 //! keeps serving — there is no quorum to lose.
 //!
+//! ## Status: experimental
+//!
+//! An opt-in build, not in the release artefacts; the config keys and the wire format can change
+//! in any release. Frozen, with their specs in the issues: signed rotation and revocation claims
+//! (#68), `RateSaturation` and the health quorum (#66, #67), and what needs them. See
+//! `docs/mesh/integration.md` ("Status: experimental").
+//!
 //! ## v0 scope
 //!
 //! * UDP unicast to a static peer list. No mDNS, no bootstrap server.
@@ -33,10 +40,9 @@
 
 // Scaffolding: several public types and methods are present here for
 // the data-plane consumers (XDP map populator, ML threshold updater,
-// dashboard) to call once those wires land. They are intentionally
-// part of the v0.2.x stable surface — keeping them allows downstream
-// integration to land in small PRs without further API churn.
-#![allow(dead_code)]
+// dashboard) to call once those wires land. The module is experimental and
+// its frozen parts (see the module docs) may never land, so the surface is not a stability promise.
+#![allow(dead_code)] // experimental module: part of its surface has no caller while those wires are frozen
 
 use aimp_node::crypto::Identity;
 use aimp_node::crypto::SecurityFirewall;

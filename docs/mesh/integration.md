@@ -9,6 +9,17 @@ deployment topology, peer discovery, key management, and the
 diagnostics surface that exists *today*. Anything tracked-but-not-shipped
 is called out explicitly.
 
+## Status: experimental
+
+The mesh is an experiment, not a supported product feature. Read this before you build on it.
+
+- **An opt-in build, not a release feature.** `--features sovereign-aimp` is off by default and is not in the release binaries or the container image. The `[sovereign_aimp]` keys and the wire format can change in any release, without a deprecation period.
+- **What exists and is tested:** signed gossip of WAF reputation (`WafReputationDelta`) to a static peer set; an allowlist of trusted node ids (`trusted_keys`, required: the mesh refuses to start without it); replay and timestamp-window rejection; revocation of an entry only by the node that wrote it; an optional per-source rate cap (`inbound_claims_per_sec`, off by default); a persisted identity (`identity_path`, mode 0600); anti-entropy. CI builds, lints and tests it with every other feature.
+- **What is frozen** (not planned, specs kept in the issues): signed identity rotation and revocation claims ([#68](https://github.com/fabriziosalmi/zion/issues/68)), `RateSaturation` and the upstream-health quorum ([#66](https://github.com/fabriziosalmi/zion/issues/66), [#67](https://github.com/fabriziosalmi/zion/issues/67)), and everything that needs them (quorum, peer quarantine, the XDP reconciler, [#53](https://github.com/fabriziosalmi/zion/issues/53)). Where this guide or the threat model names one of them, it is a design intent, not a feature.
+- **What is maintained:** security and correctness fixes for what exists.
+- **The payload is signed, not encrypted.** A peer on the path can read the IPs and scores that gossip carries. Keep the gossip port on a private network.
+- **How it unfreezes:** a real multi-node deployment that needs it. The first step then is small and needs no new wire message: reload `trusted_keys` without a restart, a `zion mesh rotate-key` helper, and `docs/security/mesh-identity.md`. The rate claim only after a 3-node chaos run shows that an attacker rotating across the nodes gains a real share of headroom (the issues' own acceptance test), and the health quorum, which duplicates what the circuit breaker does for one instance, last.
+
 ## What the mesh does
 
 Each zion instance gossips signed claims to a configured peer set:
@@ -20,8 +31,8 @@ Each zion instance gossips signed claims to a configured peer set:
 | `UpstreamUnhealthy` (*)     | upstream prober marking a backend down      | health quorum gate (track #67)                   |
 | `IdentityRevoked` (*)       | revocation-key holders                      | envelope verifier (rejects future claims from N) |
 
-(*) Track and identifier reserved; the typed surface lands with the
-v0.4 mesh slice. The bus already carries the envelope shape.
+(*) Reserved name, **frozen**: not implemented and not planned (see
+[Status](#status-experimental)). The bus already carries the envelope shape.
 
 **Local decisions remain authoritative.** The mesh score is forwarded
 to upstreams as a *signal* (`X-Zion-Mesh-Score: 0.NN`) so backends can
@@ -100,7 +111,7 @@ Backup: `identity_path`'s 32 bytes are the only secret material the
 mesh uses for that node. Treat it like a TLS private key — daily
 restic snapshot, restricted ACL, never log the secret.
 
-Rotation (manual, until rotation-claim track lands):
+Rotation (manual; signed rotation claims are frozen, #68):
 
 ```bash
 # 1. Stop zion.
@@ -111,8 +122,9 @@ mv /var/lib/zion/aimp.identity /var/lib/zion/aimp.identity.old
 # 4. Notify peers (out-of-band) of the new node_id.
 ```
 
-Future: signed `IdentityRevoked` + `IdentityIntroduced` claims will
-let peers transition without operator coordination. Tracked at
+A node whose key leaks is revoked by removing its id from every other node's
+`trusted_keys` (a restart today). Signed `IdentityRevoked` / `IdentityIntroduced`
+claims, which would let peers move without operator coordination, are frozen:
 [#68](https://github.com/fabriziosalmi/zion/issues/68).
 
 ## Topology
@@ -226,16 +238,18 @@ checklist:
 5. **Clock skew?** AIMP envelopes include a timestamp; large skews
    may cause replays to be rejected. NTP is required.
 
-## Deferred / tracked
+## Frozen / deferred
 
-Items listed in ADR-0008 "Negative consequences" or referenced above:
+Items listed in ADR-0008 "Negative consequences" or referenced above. The ones marked
+*frozen* are parked until a real multi-node deployment needs them
+([Status](#status-experimental)); the others are open ideas:
 
 * **Sidecar-mode AIMP node** — protocol-compatible alternative to
   in-process. Not on the v0.2.x roadmap; revisited if blast-radius
   reasoning flips (e.g. uid-isolated AIMP under capability sandbox).
-* **Identity rotation claims** — [#68](https://github.com/fabriziosalmi/zion/issues/68).
+* **Identity rotation and revocation claims** (*frozen*) — [#68](https://github.com/fabriziosalmi/zion/issues/68).
 * **Mesh observability metrics** — [#69](https://github.com/fabriziosalmi/zion/issues/69).
-* **Federated rate-limit / upstream-health quorum** — [#66](https://github.com/fabriziosalmi/zion/issues/66),
+* **Federated rate-limit / upstream-health quorum** (*frozen*) — [#66](https://github.com/fabriziosalmi/zion/issues/66),
   [#67](https://github.com/fabriziosalmi/zion/issues/67).
 * **Chaos coverage (split-brain, claim flood, slow gossip)** —
   [#71](https://github.com/fabriziosalmi/zion/issues/71).

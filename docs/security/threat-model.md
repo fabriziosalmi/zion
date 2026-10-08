@@ -370,116 +370,87 @@ fluctuating audit-disk; OOM-kill loop.
 
 ## 10. Mesh (AIMP integration)
 
+> **Experimental.** The mesh is an opt-in build (`--features sovereign-aimp`), not in the release
+> artefacts, and its frozen parts (signed rotation and revocation claims, quorum, peer quarantine, the
+> XDP reconciler) are not implemented: see [Status](../mesh/integration.md#status-experimental).
+> This section states what the code does today. An earlier version of it described mitigations that
+> are design intent only (an encrypted transport, a `[mesh].revocation_pubkeys` revocation authority,
+> quorum before a block, IP anonymisation, mesh audit events); they are listed at the end under
+> "Not implemented".
+
 Surface introduced when zion is built with `--features sovereign-aimp`
-and `[sovereign_aimp].enabled = true`. The full architectural rationale
+and `[sovereign_aimp].enabled = true`. The architectural rationale
 lives in [ADR-0008](../adr/0008-mesh-aimp-integration.md); the operator
 deployment guide is [docs/mesh/integration.md](../mesh/integration.md).
 
-The mesh is a UDP gossip layer carrying signed `MeshClaim` envelopes
-between zion instances. It expands the threat surface in six ways —
-one per STRIDE category. **Local decisions remain authoritative**:
-the mesh is a *signal* layer, never a delegated authority. A claim
-that an IP is malicious lifts the upstream `X-Zion-Mesh-Score`
-header; the local WAF / auth / rate-limit gates run unchanged.
+The mesh is a UDP gossip layer carrying signed envelopes (today one claim type, a WAF reputation
+delta) between zion instances. **Local decisions remain authoritative by default**: a claim that an
+IP is malicious lifts the upstream `X-Zion-Mesh-Score` header, and the local WAF / auth / rate-limit
+gates run unchanged. The one exception is opt-in: with `[sovereign.enforce] mesh_score_deny_above` set
+(off by default), a mesh score above it becomes a `403`. See E.
 
-**S — spoofing**: an attacker forges an envelope claiming to come
-from a trusted peer (a corrupted WAF reputation, a fake
-`UpstreamUnhealthy`, a forged `IdentityRevoked`).
-- **Mitigation**: every `AimpEnvelope` carries an Ed25519 signature
-  over its canonical-encoded body. Receivers accept only envelopes whose
-  origin key is in `[sovereign_aimp].trusted_keys` (required when the mesh
-  is enabled), then verify the signature against
-  `aimp_node::crypto::SecurityFirewall` before any merge. An envelope from
-  an unknown key, even correctly signed, is dropped with
-  `zion_mesh_claims_dropped_total{reason="signature"}` ticked (before 0.9.8
-  any self-signed envelope was accepted). The node's own key is persisted
-  under `[sovereign_aimp].identity_path` with `chmod 600`. Identity rotation is documented in
+**S — spoofing**: an attacker forges an envelope claiming to come from a trusted peer.
+- **Mitigation**: every envelope carries an Ed25519 signature over its body. Receivers accept only
+  envelopes whose origin key is in `[sovereign_aimp].trusted_keys` (required: the mesh refuses to start
+  without it), checked before the signature is verified, then verify the signature with
+  `aimp_node::crypto::SecurityFirewall` before any merge. An envelope from an unknown key, even
+  correctly signed, is dropped with `zion_mesh_claims_dropped_total{reason="signature"}` ticked
+  (before 0.9.8 any self-signed envelope was accepted). The node's own key is persisted under
+  `[sovereign_aimp].identity_path`, mode 0600, and checked at load. Rotation is manual, in
   [docs/mesh/integration.md](../mesh/integration.md) §"Identity management".
-- **Residual**: the trust list is distributed out of band (config
-  management); a node whose key leaks must be removed from every other
-  node's `trusted_keys`. A signed `IdentityIntroduced` claim with quorum
-  is tracked at [#68](https://github.com/fabriziosalmi/zion/issues/68).
+- **Residual**: the trust list is distributed out of band (config management) and read at start; a
+  node whose key leaks must be removed from every other node's `trusted_keys`, which takes a restart.
+  Signed introduction and revocation claims are frozen
+  ([#68](https://github.com/fabriziosalmi/zion/issues/68)).
 
-**T — tampering**: in-flight modification of a claim payload — flip
-a score bit, swap an IP for a neighbouring one, alter a quorum
-threshold.
-- **Mitigation**: AIMP envelopes are AEAD-protected on the Noise
-  transport, so any in-flight bit-flip fails the AEAD tag and is
-  dropped before the verifier sees it. CRDT integrity is enforced
-  via Merkle DAG: any state-changing decision (XDP-trie install,
-  worker-routing change) requires quorum agreement across multiple
-  signed claims, not a single message.
-- **Residual**: a compromised peer signing legitimate-looking but
-  semantically wrong claims (e.g. tagging a benign IP as malicious)
-  is not caught by Tampering mitigations — that's the Spoofing/EoP
-  rows below. Quorum thresholds (`xdp_block_threshold = 0.95` by
-  default) limit the blast radius.
+**T — tampering**: in-flight modification of a claim payload (a score, an IP).
+- **Mitigation**: the signature covers the body, so a modified envelope fails verification and is
+  dropped. Each claim is a self-contained last-writer-wins register; there is no Merkle sync and no
+  quorum (the v0 scope in `aimp_cp.rs`).
+- **Residual**: the payload is **not encrypted**. A path attacker cannot alter a claim but can read it,
+  and can drop or delay packets. A trusted peer signing wrong claims (a benign IP tagged malicious) is
+  not caught here: see E.
 
-**R — repudiation**: a peer denies having published a malicious
-claim that triggered a fleet-wide drop.
-- **Mitigation**: every publish + receive is captured as a signed
-  audit event (`kind=mesh_publish` / `kind=mesh_receive`) carrying
-  the envelope's signature, the resolved `node_id`, and the local
-  HMAC chain prev_hash. The audit log is tamper-evident
-  (ADR-0004), so an attacker who later wants to alter the chain
-  has to break HMAC-SHA256.
-- **Residual**: audit-log integrity depends on `[audit].enabled =
-  true` AND a separately-stored HMAC key (`ZION_AUDIT_HMAC_KEY`).
-  Operators that disable audit lose the repudiation trail.
+**R — repudiation**: a peer denies having published a claim.
+- **Mitigation**: the envelope is signed by the peer's key, which is the proof. Receive-side drops and
+  accepts are counted (`zion_mesh_claims_received_total`, `zion_mesh_claims_dropped_total` by reason)
+  and logged at TRACE.
+- **Residual**: the audit kinds `mesh_publish` and `mesh_receive` are reserved and **nothing emits
+  them**: the mesh leaves no entry in the HMAC-chained audit log.
 
-**I — information disclosure**: an attacker probing the mesh learns
-the local rate-map, the WAF reputation map, or correlates per-IP
-behaviour across nodes from observed gossip traffic.
-- **Mitigation**: opt-in IP anonymisation
-  (`[sovereign_aimp].anonymise_ip = true`, tracked at [#69](https://github.com/fabriziosalmi/zion/issues/69))
-  hashes the IP before publication so the wire envelope carries an
-  opaque identifier, not the address. Anti-entropy SyncReq is
-  rate-capped per peer (`max_inbound_claims_per_peer_per_second`,
-  default 1000) to bound traffic-analysis budget. The gossip listener
-  binds only to the configured `[sovereign_aimp].listen` —
-  NetworkPolicies should restrict ingress to known peer IPs.
-- **Residual**: passive traffic analysis on the gossip path leaks
-  *aggregate* claim cadence (how many blocks per minute the fleet
-  is seeing) even with IP anonymisation. Padding the wire to a
-  fixed-rate isn't shipped today; if traffic-analysis resistance
-  becomes a requirement, AIMP's transport supports cover traffic
-  upstream — wire it on a follow-up.
+**I — information disclosure**: an attacker on the gossip path learns which IPs the fleet is blocking
+and how often.
+- **Mitigation**: the gossip listener binds only to `[sovereign_aimp].listen` (loopback by default when
+  the mesh is enabled without an address); restrict ingress to the peers' addresses with a
+  NetworkPolicy or a firewall.
+- **Residual**: claims carry the IP in the clear and are not encrypted; passive observation shows them
+  and their cadence. Keep the port on a private network. IP anonymisation is not implemented.
 
-**D — denial of service**: an attacker (a peer or a path-attacker
-forging packets to the listener) floods the gossip socket with
-parse-attempts to consume CPU + queue depth.
-- **Mitigation**: inbound rate-cap per peer
-  (`max_inbound_claims_per_peer_per_second`); claim-store size cap
-  with LRU eviction so a memory-exhaustion flood eventually evicts
-  itself; gossip backpressure (envelope-decode + signature-verify
-  is non-blocking and metered against the rate-cap). AEAD on the
-  Noise transport drops malformed packets at the kernel boundary
-  before they reach userspace verification.
-- **Residual**: a peer with a *valid* identity that turns Byzantine
-  can still exhaust its rate-cap budget — the per-peer limit caps
-  the damage but doesn't kick the peer out. Automatic peer
-  quarantine + signed `IdentityRevoked` propagation is the v0.4
-  hardening track.
+**D — denial of service**: a peer, or a path attacker forging packets, floods the gossip socket.
+- **Mitigation**: the replay filter and the trusted-key check run before the signature verification
+  (an unknown key or a repeat costs no Ed25519); a per-source token bucket
+  (`inbound_claims_per_sec`, `inbound_claim_burst`) caps a flooding peer, including one with a valid
+  key, while the others keep flowing; the bucket table and the reputation store are bounded
+  (`MAX_REPUTATION_ENTRIES` = 100,000).
+- **Residual**: the per-source cap is **off by default** (`inbound_claims_per_sec = 0`): set it if you
+  expect adversarial gossip. A valid peer that turns Byzantine is rate-capped at best, never removed;
+  there is no quarantine.
 
-**E — elevation of privilege**: a forged `MeshClaim::IdentityRevoked`
-takes a legitimate peer offline; or a misbehaving peer convinces the
-fleet to drop a benign IP at XDP / kernel level.
-- **Mitigation**: revocation claims are signed by the keys listed
-  in `[mesh].revocation_pubkeys` — NOT by any node's identity key.
-  The revocation list is operator-managed (rotated with the
-  organisation's PKI lifecycle), so a single compromised node
-  cannot revoke itself or its neighbours. State-changing
-  consequences (XDP-LPM install, worker-routing change) require
-  quorum: a single high-score claim does not flip an IP into the
-  kernel drop trie until N peer claims converge above
-  `xdp_block_threshold`. Mesh claims that lift `X-Zion-Mesh-Score`
-  do NOT short-circuit local WAF/auth/rate-limit gates — those
-  remain authoritative.
-- **Residual**: quorum width (default: 3 of 5 peers) is operator-
-  tunable; setting it too low effectively disables the mitigation.
-  A future signed `MeshClaim::QuorumPolicy` whose value is
-  itself revocation-key-signed would close the loop; tracked
-  alongside [#68](https://github.com/fabriziosalmi/zion/issues/68).
+**E — elevation of privilege**: a compromised or forged claim gets a legitimate client refused.
+- **Mitigation**: a node can revoke only the reputation entries it wrote (source-bound revocation, so
+  a peer cannot erase another's). Mesh claims do not short-circuit the local gates unless
+  `mesh_score_deny_above` is set.
+- **Residual**: **a trusted key is a deny authority over IPs** for any node that enables
+  `mesh_score_deny_above`: whoever holds one can get an IP refused on every such node with one signed
+  claim. Leave it off unless you accept that, and keep `trusted_keys` to the smallest set. There is no
+  quorum, no revocation authority separate from the node keys, and no kernel (XDP) block: none of those
+  exist.
+
+**Not implemented** (design intent in earlier text, frozen with #66/#67/#68 and #53 until a real
+multi-node deployment needs them): an encrypted transport; a revocation authority
+(`[mesh].revocation_pubkeys`) and `IdentityRevoked` / `IdentityIntroduced` / `QuorumPolicy` claims; a
+quorum before a block takes effect; the XDP reconciler (`xdp_block_threshold` is parsed and unused);
+`RateSaturation` and the upstream-health claims; IP anonymisation; mesh audit events; peer quarantine.
 
 Source: [`src/aimp_cp.rs`](../../src/aimp_cp.rs).
 
