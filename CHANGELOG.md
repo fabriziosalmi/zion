@@ -7,6 +7,8 @@ All notable changes to Zion Edge Gateway are documented here.
 ### Fixed
 
 - **`[cache_profile.x] mode = "none"` now stores nothing.** The key was documented (`"memory"` or `"none"`) and parsed, but nothing read it: a route that pointed at a `none` profile cached exactly like a `memory` one. It is now an uncached, plain proxied route (every request goes to the upstream, no `X-Zion-Cache` header), even if its mode is `static_cache`. **A config that set `mode = "none"` and was being cached anyway stops caching on upgrade**, which is what it asked for. (#636)
+- **Internal: `scripts/update-readme-boot-shot.sh` no longer reports success on a stale screenshot.** It deleted nothing before running `vhs` and only checked that the image file existed, so on 0.9.14 it printed success and left the 0.9.13 image in place. It now removes the old image first (and puts it back if `vhs` fails), and refuses an image byte-identical to the committed one when the version changed. (#602)
+
 
 ## [0.11.0] - 2026-10-08
 

@@ -45,8 +45,34 @@ path = "/{*rest}"
 upstream = "app"
 EOF
 
+# Delete the old image first, so that "the file exists" afterwards proves vhs wrote it. Before this,
+# the only check was `test -s`, which a stale image passes: on 2026-10-07 the script reported
+# success on v0.9.14 and left the v0.9.13 screenshot in place (#602). Put the old one back if vhs
+# fails, so a failed run leaves the tree as it found it.
+SHOT=docs/img/boot.png
+OLD_SHOT=""
+if [ -f "$SHOT" ]; then
+  OLD_SHOT=$(mktemp)
+  mv "$SHOT" "$OLD_SHOT"
+fi
+restore() { [ -n "$OLD_SHOT" ] && [ -f "$OLD_SHOT" ] && [ ! -s "$SHOT" ] && mv "$OLD_SHOT" "$SHOT"; return 0; }
+trap restore EXIT
+
 vhs docs/img/boot.tape
 rm -rf "$DIR"
 
-test -s docs/img/boot.png || { echo "FATAL: boot.png not produced" >&2; exit 1; }
-echo "docs/img/boot.png regenerated from $(./target/release/zion --version 2>/dev/null || echo 'the freshly built binary')."
+test -s "$SHOT" || { echo "FATAL: vhs did not produce $SHOT" >&2; exit 1; }
+
+# An image byte-identical to the committed one, while the version it should show is not the
+# committed one, was not redrawn from this binary. A rerun with nothing to change is fine
+# (ZION_BOOT_SHOT_ALLOW_UNCHANGED=1).
+committed_version=$(git show HEAD:Cargo.toml 2>/dev/null | awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}')
+current_version=$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)
+if [ -n "$OLD_SHOT" ] && [ "$committed_version" != "$current_version" ] \
+   && [ "${ZION_BOOT_SHOT_ALLOW_UNCHANGED:-0}" != "1" ] \
+   && [ "$(shasum -a 256 < "$SHOT")" = "$(git show HEAD:"$SHOT" 2>/dev/null | shasum -a 256)" ]; then
+  echo "FATAL: $SHOT is identical to the committed one, but the version went from $committed_version to $current_version: it was not redrawn" >&2
+  exit 1
+fi
+[ -n "$OLD_SHOT" ] && rm -f "$OLD_SHOT"
+echo "$SHOT regenerated from $(./target/release/zion --version 2>/dev/null || echo 'the freshly built binary')."
