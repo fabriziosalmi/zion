@@ -4,6 +4,16 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-08
+
+**zion now refuses to start with a `[tls] min_version` that is not `"1.2"` or `"1.3"`: read the first upgrade note before you upgrade.** The rest is memory and CPU: the cache costs what it counts on Linux, a cache hit costs the same on every core, and a large static file is about 15 % cheaper. Most of the diff is internal: the boot sequence and the request pipeline are lists of named stages, with the performance measured and unchanged.
+
+### Upgrade notes
+
+- **If your `zion.toml` sets `[tls] min_version` to anything but `"1.2"` or `"1.3"`, fix it before upgrading.** It used to run as TLS 1.3 only without a word, so `"1.1"`, `"TLS1.2"` (meant to allow 1.2) or `"1.3 "` gave 1.3 and nobody noticed. It is now refused when the file is read, with the key and the allowed values in the message, the same as `xff_mode`, `log_format`, `client_auth` and `admin.auth`, which already were. A file that spells it as the docs do is unaffected; `zion doctor` and a reload report it before it bites.
+- **On Linux, resident memory is lower with no configuration.** mimalloc no longer commits its arena eagerly: a cached megabyte costs about a megabyte (it cost 1.7 to 2.1), and idle memory roughly halves. If you raised `cache_max_memory_mb` or the container's memory limit to make up for the old overhead, you can take it back. An operator's own `MIMALLOC_ARENA_EAGER_COMMIT` still wins.
+- No setting was removed or renamed.
+
 ### Added
 
 - **A weekly paired performance check.** `perf-regression` builds the latest release and master on the same runner, measures each twice in turn with the regression harness, and fails when both rounds say CPU per request got worse beyond the noise (10 % at least). It catches a regression of about 10 % or more in a scenario, on a shared runner; the dedicated box stays the place for smaller ones. A failing or silenced cron is reported by `cron-watchdog`. `compare.py` gained `--judge cpu`. The list of checks that block a merge is now written down in CONTRIBUTING.md. (#534)
@@ -26,6 +36,10 @@ All notable changes to Zion Edge Gateway are documented here.
 - **A cache hit from a worker thread's own copy costs the same on eight threads as on one.** The per-thread copy shared its body and header values with the shared store and every other thread's copy, so each hit was ten atomic operations on cache lines the other cores were using: eight threads on one hot key paid 2,247 ns a lookup against 95 ns for one (macOS; Linux 1,042 against 178). Small bodies (16 KiB or less) are now copied into the thread's L1 at promotion, the response metadata is one `Arc` instead of four header values, and the clock is read once per hit. A lookup is now 43 ns on one to four threads (69 ns on eight, on ten cores) on macOS and 99 ns on one thread and 111 on four on Linux. The end-to-end cost of a request (about 47 us of CPU on the regression harness) does not move beyond the noise: the lookup was never a large part of it, and the change matters on a machine with many cores serving one hot object. The copies are at most 16 KiB each and outside `cache_max_memory_mb`, like the L1 entries they replace. (#577)
 - **Serving a large static file costs about 15 % less CPU.** A static file above 576 KiB is streamed; the streamed path read it 64 KiB at a time through `tokio::fs::File` (two trips through the blocking pool and two extra copies per chunk). It now reads 128 KiB blocks on the blocking pool straight into the buffer the 64 KiB frames are cut from, with the same 576 KiB in-flight bound per request. On the regression harness (Linux): 1 MiB 1,780 to 1,530 us of CPU per request, 10 MiB 16.9 to 14.5 ms; the one-shot read it replaced costs 1,360 and 13.4, so the streamed path is now within 12 % of it (it was 31 %). (#564)
 - **The container image no longer depends on the builder's `umask`.** Rebuilding v0.10.0's image (the first built with `rewrite-timestamp`) gave the same layers as the published one, the compiled binary included, except the one that holds `/etc/zion/zion.toml`: its file mode was `0664` under a `umask 002` and `0644` under `022`. The file is now put in place in the build stage with explicit modes (`0755` for the directory, `0644` for the file). (#538)
+
+### Dependencies
+
+- `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp` and `opentelemetry-semantic-conventions` 0.32 → 0.33 with `tracing-opentelemetry` 0.34 (the `otel` feature; no code change), and `jsonwebtoken` 11.0 → 11.1 (its delta audited). See #640: the `otel` feature currently exports nothing for requests, because zion creates no spans; that is not new.
 
 ## [0.10.0] - 2026-10-07
 
