@@ -35,7 +35,6 @@ pub(super) struct PreCtx {
     /// The client address after trusted-proxy resolution.
     pub(super) client_ip: IpAddr,
     /// The TCP peer (kept for gates that need the raw peer, not the resolved client).
-    #[allow(dead_code)]
     pub(super) remote_addr: SocketAddr,
     /// The request arrived as TLS 1.3 early data (0-RTT).
     pub(super) is_early_data: bool,

@@ -180,7 +180,7 @@ pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
     allow(dead_code)
 )]
 const KEEPALIVE_INTERVAL_SECS: u64 = 10;
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))] // no retry count on Windows
 const KEEPALIVE_RETRIES: u32 = 3;
 
 /// Turn on kernel TCP keepalive: after `idle_secs` of silence the kernel probes every

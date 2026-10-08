@@ -32,7 +32,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 /// Longest window the counters can hold.
-pub const MAX_WINDOW_SECS: u32 = 60;
+pub const MAX_WINDOW_SECS: u32 = crate::config::MAX_BREAKER_WINDOW_SECS;
 /// How long a half-open probe may stay out before another request may take its place.
 pub const PROBE_TIMEOUT_MS: u64 = 30_000;
 
@@ -53,6 +53,17 @@ pub struct BreakerCfg {
     pub window_secs: u32,
     /// How long the circuit stays open before a probe is allowed, in seconds.
     pub open_secs: u32,
+}
+
+impl From<&crate::config::CircuitBreakerConfig> for BreakerCfg {
+    fn from(c: &crate::config::CircuitBreakerConfig) -> Self {
+        BreakerCfg {
+            error_rate_pct: c.error_rate_pct,
+            min_requests: c.min_requests,
+            window_secs: c.window_secs,
+            open_secs: c.open_secs,
+        }
+    }
 }
 
 /// Proof that a request holds the half-open probe slot; hand it back with the outcome.

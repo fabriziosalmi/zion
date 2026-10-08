@@ -126,7 +126,6 @@ pub(crate) enum ConfigSource {
     /// Re-read + validate `zion.toml` from disk (the watcher / `POST /admin/reload`).
     File(PathBuf),
     /// Validate a full TOML body pushed in-memory (`POST /admin/config`).
-    #[allow(dead_code)] // wired by the admin API in a later #26 phase
     Body(String),
 }
 

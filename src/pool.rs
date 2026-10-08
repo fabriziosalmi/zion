@@ -58,6 +58,27 @@ pub enum Algorithm {
     LowestLatency,
 }
 
+impl From<crate::config::LoadBalancing> for Algorithm {
+    fn from(l: crate::config::LoadBalancing) -> Self {
+        match l {
+            crate::config::LoadBalancing::P2c => Algorithm::P2c,
+            crate::config::LoadBalancing::LowestLatency => Algorithm::LowestLatency,
+        }
+    }
+}
+
+impl From<&crate::config::OutlierDetectionConfig> for OutlierCfg {
+    fn from(c: &crate::config::OutlierDetectionConfig) -> Self {
+        OutlierCfg {
+            error_rate_pct: c.error_rate_pct,
+            min_requests: c.min_requests,
+            window_secs: c.window_secs,
+            eject_secs: c.eject_secs,
+            max_ejected_pct: c.max_ejected_pct,
+        }
+    }
+}
+
 /// One second of outcomes. The epoch and both counters live behind one lock, so rolling a slot
 /// over to a new second can never lose or misattribute a concurrent update.
 #[derive(Clone, Copy, Default)]

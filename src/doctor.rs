@@ -50,7 +50,6 @@ impl Check {
     }
     // `fail` is only called from `#[cfg(unix)]` blocks (fd-limit check).
     // Windows builds don't reach a call site, so dead_code fires there.
-    #[allow(dead_code)]
     fn fail(name: &'static str, detail: impl Into<String>, fix: impl Into<String>) -> Self {
         Self {
             name,

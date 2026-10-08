@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct ResolvedRoute {
-    #[allow(dead_code)]
     pub upstream_url: Vec<String>,
     /// TCP connect deadline for this route's upstream (ms; 0 = none). Selects the
     /// HTTP client whose connector enforces it — see `AppState::client_for`.

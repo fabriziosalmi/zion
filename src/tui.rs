@@ -49,7 +49,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Deserialize, Clone, Debug)]
 struct Snapshot {
     version: String,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // part of the snapshot wire contract; the renderer does not show it
     timestamp_ms: u64,
     uptime_secs: u64,
     platform: PlatformSnap,
@@ -63,7 +63,7 @@ struct Snapshot {
 /// that emit a richer payload (and so the field set documents the wire
 /// contract). One single struct-level `allow(dead_code)` is preferred
 /// over per-field annotations to keep the contract visually intact.
-#[allow(dead_code)]
+#[allow(dead_code)] // wire contract: fields the renderer does not consume (see above)
 #[derive(Deserialize, Clone, Debug)]
 struct PlatformSnap {
     os: String,
@@ -95,7 +95,7 @@ struct MetricsSnap {
     rate_limited: u64,
     cache_hits: u64,
     cache_misses: u64,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // wire contract: deserialised, not rendered
     websocket_upgrades: u64,
     active_connections: i64,
     // Process self-introspection. `#[serde(default)]` so a newer `zion top`
@@ -110,14 +110,14 @@ struct MetricsSnap {
     request_p50_us: u64,
     request_p95_us: u64,
     request_p99_us: u64,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // wire contract: deserialised, not rendered
     upstream_p50_us: u64,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // wire contract: deserialised, not rendered
     upstream_p95_us: u64,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // wire contract: deserialised, not rendered
     upstream_p99_us: u64,
     tls_p50_us: u64,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // wire contract: deserialised, not rendered
     tls_p95_us: u64,
 }
 

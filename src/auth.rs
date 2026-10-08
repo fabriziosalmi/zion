@@ -21,7 +21,7 @@ use std::sync::Arc;
 /// The struct is always defined (it appears in `validate_token`'s signature
 /// when the `auth` feature is on) but its fields are only read by code
 /// behind `#[cfg(feature = "auth")]`. Hence the targeted allow.
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "auth"), allow(dead_code))] // built and read only by the auth gate
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
     /// Subject (user ID)
@@ -44,7 +44,7 @@ pub struct Claims {
 }
 
 /// The `aud` claim: one audience or several.
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "auth"), allow(dead_code))] // built and read only by the auth gate
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum Audience {
@@ -61,12 +61,11 @@ impl From<&str> for Audience {
 /// A secret string. It never appears in `Debug` output (so a stray `{:?}` of a
 /// config struct cannot write a signing key to a log or panic message) and its
 /// bytes are wiped when the value is dropped. Deserializes from a plain string.
-#[allow(dead_code)]
 #[derive(Clone, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(String);
 
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "auth"), allow(dead_code))] // `expose` is read only by the auth gate
 impl Secret {
     pub fn expose(&self) -> &str {
         &self.0
@@ -98,7 +97,7 @@ impl From<&str> for Secret {
 /// outside any feature gate so users get clear "unknown auth_profile"
 /// validation errors at startup regardless of build flavour). The fields
 /// are only consumed by code under `#[cfg(feature = "auth")]`.
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "auth"), allow(dead_code))] // built and read only by the auth gate
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct AuthProfileConfig {
@@ -195,7 +194,7 @@ impl std::fmt::Debug for ResolvedAuthProfile {
 
 /// Auth error — returned when validation fails.
 /// Reachable only via `validate_token`, which is `#[cfg(feature = "auth")]`.
-#[allow(dead_code)]
+#[allow(dead_code)] // built only with the `auth` feature, and the payload is read only through Debug
 #[derive(Debug)]
 pub enum AuthError {
     /// Token is malformed or signature invalid
@@ -209,7 +208,6 @@ pub enum AuthError {
 /// Extract Bearer token from Authorization header.
 /// Case-insensitive prefix per RFC 6750 §2.1.
 /// Called only by the auth gate, which is `#[cfg(feature = "auth")]`.
-#[allow(dead_code)]
 #[inline]
 pub fn extract_bearer(auth_header: &str) -> Option<&str> {
     if auth_header.len() < 7 {
@@ -359,7 +357,7 @@ enum Lifetime {
     AcceptedBeyondDefault,
 }
 
-#[cfg_attr(not(feature = "auth"), allow(dead_code))]
+#[cfg_attr(not(feature = "auth"), allow(dead_code))] // called only by the auth gate
 fn lifetime_verdict(cap: Option<u64>, exp: u64, now: u64, leeway: u64) -> Lifetime {
     let beyond = |max: u64| exp > now.saturating_add(max).saturating_add(leeway);
     let past_default = beyond(DEFAULT_MAX_TOKEN_LIFETIME_SECS);

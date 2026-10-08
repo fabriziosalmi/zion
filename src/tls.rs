@@ -393,16 +393,18 @@ pub(crate) fn spawn_admin_tls_watcher(
     });
 }
 
-/// Map the configured `min_version` to the rustls protocol-version list.
-/// **Fail-safe by design (RFC 8446):** only the exact literal `"1.2"` opens the
-/// TLS 1.2 floor; ANY other value — a typo, an empty string, `"1.3"`, `"tls1.2"`
-/// — collapses to TLS-1.3-only. A misconfiguration can therefore never silently
-/// *weaken* the floor, only fail closed to the stronger setting. Pure +
+/// Map the configured `min_version` to the rustls protocol-version list: only `"1.2"` opens the
+/// TLS 1.2 floor, the default is TLS-1.3-only. The setting is a closed set, parsed when the file
+/// is read, so a typo is refused there instead of being run as something else. Pure +
 /// unit-tested.
-fn protocol_versions(min_version: &str) -> Vec<&'static rustls::SupportedProtocolVersion> {
+fn protocol_versions(
+    min_version: crate::config::TlsMinVersion,
+) -> Vec<&'static rustls::SupportedProtocolVersion> {
     match min_version {
-        "1.2" => vec![&rustls::version::TLS12, &rustls::version::TLS13],
-        _ => vec![&rustls::version::TLS13],
+        crate::config::TlsMinVersion::V1_2 => {
+            vec![&rustls::version::TLS12, &rustls::version::TLS13]
+        }
+        crate::config::TlsMinVersion::V1_3 => vec![&rustls::version::TLS13],
     }
 }
 
@@ -443,16 +445,16 @@ pub fn load_tls_config(tls: &TlsConfig) -> Result<ServerConfig, String> {
     };
 
     // TLS version selection (fail-safe: only "1.2" opens the 1.2 floor).
-    let versions = protocol_versions(tls.min_version.as_str());
+    let versions = protocol_versions(tls.min_version);
 
     // mTLS: client certificate verification (downstream)
-    let client_auth_mode = tls.client_auth.as_str();
+    let client_auth_mode = tls.client_auth;
     let mut config = if let Some(ref ca_path) = tls.client_ca_path {
-        if client_auth_mode != "none" {
+        if client_auth_mode != crate::config::ClientAuth::None {
             let verifier = client_cert_verifier(
                 client_roots(ca_path, "Client CA")?,
                 tls.client_crl_path.as_deref(),
-                client_auth_mode == "optional",
+                client_auth_mode == crate::config::ClientAuth::Optional,
                 crate::crl::Listener::Tls,
                 tls.client_crl_enforce_next_update,
             )?;
@@ -937,21 +939,10 @@ fn issue_membarrier() {
 mod tests {
     #[test]
     fn default_client_auth_is_none() {
-        let auth = super::super::config::default_client_auth();
-        assert_eq!(auth, "none");
-    }
-
-    #[test]
-    fn client_auth_mode_required() {
-        let mode = "required";
-        assert!(mode == "required" || mode == "optional" || mode == "none");
-    }
-
-    #[test]
-    fn client_auth_mode_optional() {
-        let mode = "optional";
-        assert_ne!(mode, "none");
-        assert_ne!(mode, "required");
+        assert_eq!(
+            crate::config::ClientAuth::default(),
+            crate::config::ClientAuth::None
+        );
     }
 
     /// A configured CRL that cannot be applied is an error, never "nothing is revoked".
@@ -1006,10 +997,10 @@ mod tests {
         assert!(r.is_err(), "missing cert/key/ca must yield Err");
     }
 
-    // ── TLS version floor (protocol_versions) — RFC 8446 fail-safe ──
+    // ── TLS version floor (protocol_versions) ──
     #[test]
-    fn protocol_versions_floor_opens_only_on_exact_1_2() {
-        let v = super::protocol_versions("1.2");
+    fn protocol_versions_floor_opens_only_on_1_2() {
+        let v = super::protocol_versions(crate::config::TlsMinVersion::V1_2);
         assert_eq!(v.len(), 2, "the 1.2 floor enables TLS 1.2 + 1.3");
         assert!(v
             .iter()
@@ -1020,15 +1011,10 @@ mod tests {
     }
 
     #[test]
-    fn protocol_versions_fail_safe_to_tls13_only() {
-        // Anything that isn't EXACTLY "1.2" — "1.3", empty, a typo, trailing
-        // space — must collapse to TLS-1.3-only. A misconfig can never silently
-        // weaken the floor; it fails closed to the stronger setting.
-        for s in ["1.3", "", "tls1.2", "1.2 ", "TLS1.2", "1", "1.30"] {
-            let v = super::protocol_versions(s);
-            assert_eq!(v.len(), 1, "min_version {s:?} must yield 1.3-only");
-            assert_eq!(v[0].version, rustls::ProtocolVersion::TLSv1_3);
-        }
+    fn protocol_versions_default_is_tls13_only() {
+        let v = super::protocol_versions(crate::config::TlsMinVersion::default());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].version, rustls::ProtocolVersion::TLSv1_3);
     }
 
     // ── Client cert fingerprint (X-Client-Cert-Fingerprint) ──
