@@ -13,7 +13,7 @@ it at a `[cache_profile]`:
 
 ```toml
 [cache_profile.assets]
-mode = "memory"          # in-memory store (the only mode today)
+mode = "memory"          # in-memory store (the default); "none" stores nothing
 max_entries = 10000      # LRU cap; oldest evicted past this
 ttl_seconds = 31536000   # freshness ceiling (see Freshness below)
 
@@ -26,6 +26,12 @@ cache_profile = "assets"
 
 A `static_cache` route with no explicit profile uses a conservative **1-hour**
 default TTL (never a 1-year freeze).
+
+A profile with `mode = "none"` stores nothing: a route that points at it is a plain
+proxied route (every request goes to the upstream, no `X-Zion-Cache` header, and the
+bulkhead and circuit breaker apply as on any uncached route), even when its mode is
+`static_cache`. It is a switch for turning a route's caching off without editing the route,
+for instance in a profile that an environment overrides.
 
 ## What gets cached
 

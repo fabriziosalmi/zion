@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`[cache_profile.x] mode = "none"` now stores nothing.** The key was documented (`"memory"` or `"none"`) and parsed, but nothing read it: a route that pointed at a `none` profile cached exactly like a `memory` one. It is now an uncached, plain proxied route (every request goes to the upstream, no `X-Zion-Cache` header), even if its mode is `static_cache`. **A config that set `mode = "none"` and was being cached anyway stops caching on upgrade**, which is what it asked for. (#636)
+
 ## [0.11.0] - 2026-10-08
 
 **zion now refuses to start with a `[tls] min_version` that is not `"1.2"` or `"1.3"`: read the first upgrade note before you upgrade.** The rest is memory and CPU: the cache costs what it counts on Linux, a cache hit costs the same on every core, and a large static file is about 15 % cheaper. Most of the diff is internal: the boot sequence and the request pipeline are lists of named stages, with the performance measured and unchanged.

@@ -454,6 +454,22 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
         None
     };
 
+    // `mode = "none"` on the profile: it stores nothing, so the route is an uncached one. Dropping
+    // the profile here, instead of teaching the cached handler a bypass, keeps everything that
+    // keys on "has a cache" (the bulkhead, the circuit breaker, the dispatch) consistent. A
+    // `static_cache` route has no other way to be served than the cache path, so it becomes a
+    // plain proxied route (#636).
+    let (cache, mode) = match cache {
+        Some(profile) if profile.mode == CacheMode::None => {
+            let mode = match route.mode() {
+                RouteMode::StaticCache => RouteMode::Standard,
+                other => other,
+            };
+            (None, mode)
+        }
+        other => (other, route.mode()),
+    };
+
     // Pre-parse the FIRST upstream URI at startup for legacy fallback. A static
     // route has no upstream, so it gets placeholder parts the Static dispatch
     // arm never reads.
@@ -566,7 +582,7 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
         upstream_name: route.upstream_name().map(Arc::from),
         upstream_scheme,
         upstream_authority,
-        mode: route.mode(),
+        mode,
         serve_dir,
         spa_fallback,
         precompressed,
