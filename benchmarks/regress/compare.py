@@ -7,7 +7,7 @@ For every scenario and metric it prints the two medians, the change, and a verdi
 A change counts only when it is larger than both the tolerance (default 5 %) and the
 noise of the two sessions (three times the larger spread, as a share of the median),
 so a verdict is never a difference the harness itself produces. Exit status 1 when a
-scenario got worse in CPU per request or in throughput.
+scenario got worse in CPU per request or in throughput (`--judge cpu`: in CPU per request).
 
 `rps` is only a verdict when both sessions kept the server's cores busy (above 80 %):
 otherwise the load generator was the limit and the number is not about zion; it is
@@ -53,6 +53,10 @@ def main() -> int:
     p.add_argument("base", type=Path)
     p.add_argument("new", type=Path)
     p.add_argument("--tolerance", type=float, default=5.0, help="percent (default 5)")
+    p.add_argument("--judge", choices=("all", "cpu"), default="all",
+                   help="what sets the exit status: CPU per request and throughput (default), or CPU "
+                        "per request alone (for a machine shared with other jobs, where throughput "
+                        "says more about the neighbours than about zion)")
     args = p.parse_args()
     base, new = (json.loads(f.read_text()) for f in (args.base, args.new))
 
@@ -79,7 +83,7 @@ def main() -> int:
             note = ""
             if needs_sat and not saturated:
                 v, note = "not judged", "  (server cores below 80 %: the load generator was the limit)"
-            elif v == "worse" and judged:
+            elif v == "worse" and judged and (args.judge == "all" or key == "cpu_us_per_req"):
                 worse = True
             print(f"  {label:11} {bs['median']:>12,.1f} -> {ns['median']:>12,.1f}   {change:+6.1f} %"
                   f"   (beyond {threshold:.1f} %)   {v}{note}")

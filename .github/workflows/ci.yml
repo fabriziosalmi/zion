@@ -232,7 +232,8 @@ jobs:
       - run: python3 benchmarks/regress/test_run.py
       - run: shellcheck scripts/fetch_sovereign_sources.sh scripts/supersede_refresh_prs.sh scripts/test_supersede_refresh_prs.sh
 
-  # ── 7. Roll-up — single required check for branch protection. ─────────────
+  # ── 7. Roll-up of THIS workflow's jobs. Branch protection requires more than this one check
+  #    (integration, supply chain, CodeQL, DCO, ...): the list is in CONTRIBUTING.md. ────────
   ci-success:
     name: CI Success
     if: ${{ always() }}

@@ -98,6 +98,14 @@ def test_throughput_is_not_judged_when_the_server_was_not_busy():
     assert run(result(1000, 50, busy=60.0), result(1000, 60, busy=60.0))[0] == 1
 
 
+def test_judging_cpu_alone_ignores_throughput():
+    # a shared runner: throughput moves with the neighbours, CPU per request does not
+    assert run(result(1000, 50), result(800, 50), "--judge", "cpu")[0] == 0
+    assert run(result(1000, 50), result(1000, 60), "--judge", "cpu")[0] == 1
+    # the verdict is still printed
+    assert "worse" in run(result(1000, 50), result(800, 50), "--judge", "cpu")[1]
+
+
 def test_two_machines_are_flagged():
     code, out = run(result(1000, 50), result(1000, 50, host="other"))
     assert "different machines" in out
