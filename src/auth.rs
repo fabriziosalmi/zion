@@ -1146,28 +1146,30 @@ mod tests {
                 .auth_long_lived_tokens
                 .load(std::sync::atomic::Ordering::Relaxed)
         };
+        // The counter is process-wide and other tests accept far-future tokens under `0` in
+        // parallel, so only a rise is asserted here; "this one is not counted" is what
+        // `a_missing_lifetime_cap_means_24_hours_and_zero_means_none` pins, on the verdict.
         let before = counted();
         let refused = validate_token(&token(25 * 3600), &profile(None)).unwrap_err();
         assert!(
             matches!(&refused, AuthError::InvalidToken(m) if m.contains("86400")),
             "by default a token with 25 h left is refused, and says which cap: {refused:?}"
         );
-        assert_eq!(counted(), before, "a refused token is not an accepted one");
         assert!(
             validate_token(&token(3600), &profile(None)).is_ok(),
             "an hour is fine"
         );
-        assert_eq!(counted(), before, "and not counted");
         assert!(
             validate_token(&token(25 * 3600), &profile(Some(0))).is_ok(),
             "0 = no cap"
         );
-        assert_eq!(counted(), before + 1, "accepted past 24 h: counted");
+        assert!(counted() > before, "accepted past 24 h: counted");
+        let before = counted();
         assert!(
             validate_token(&token(25 * 3600), &profile(Some(7 * 86_400))).is_ok(),
             "a cap above the default is the operator's choice"
         );
-        assert_eq!(counted(), before + 2);
+        assert!(counted() > before, "and counted");
         assert!(
             validate_token(&token(25 * 3600), &profile(Some(3600))).is_err(),
             "a configured cap still refuses"
