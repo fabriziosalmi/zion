@@ -12,11 +12,11 @@
 //! Changing either without the other fails a test.
 
 use super::{check_rate_limit, early_data_rejected, MAX_URI_LEN};
+use crate::http_util::ZionBody;
 use crate::http_util::{
     empty_response, inject_security_headers, method_not_allowed, text_response,
 };
 use crate::metrics;
-use crate::proxy::ZionBody;
 use crate::routing::ResolvedRoute;
 use crate::state::{AppState, ResolvedAppConfig};
 use bytes::Bytes;

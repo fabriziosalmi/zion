@@ -22,7 +22,7 @@ use hyper::{HeaderMap, Method, Response, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::proxy::ZionBody;
+use crate::http_util::ZionBody;
 
 /// Size of one frame of a streamed file body.
 const STREAM_FRAME: usize = 64 * 1024;

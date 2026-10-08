@@ -7,11 +7,16 @@
 //! with no dependency on `AppState`, so they sit here and the root only
 //! composes.
 
-use crate::proxy::ZionBody;
 use crate::security;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{Response, StatusCode};
+
+/// BoxBody used throughout Zion — erases concrete body types. It lives here, with the
+/// helpers that build it, so that the modules that only shape responses (`security`,
+/// `static_files`, `bulkhead`) do not depend on the upstream client in `proxy` for a type
+/// (ZION-ARCH-07, #532).
+pub type ZionBody = BoxBody<Bytes, hyper::Error>;
 
 /// Atomic request counter for generating unique request IDs.
 /// Format: {timestamp_hex}-{counter_hex} — unique, sortable.

@@ -8,7 +8,7 @@ use hyper::header::HeaderValue;
 use hyper::Response;
 use std::borrow::Cow;
 
-use crate::proxy::ZionBody;
+use crate::http_util::ZionBody;
 
 // ── Security response headers (pre-compiled, zero alloc at runtime) ──
 

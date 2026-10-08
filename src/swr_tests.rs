@@ -4,7 +4,7 @@
 
 use crate::config::ZionConfig;
 use crate::dispatch::process_request;
-use crate::proxy::ZionBody;
+use crate::http_util::ZionBody;
 use crate::state::AppState;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
