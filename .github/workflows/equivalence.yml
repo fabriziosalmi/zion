@@ -12,12 +12,9 @@ on:
       - "src/config.rs"
       - "tests/equivalence/**"
       - ".github/workflows/equivalence.yml"
+  # No `paths` here: this is a required check, and a required check that never starts blocks
+  # the merge. The `scope` job below decides whether the real job runs (scripts/pr-touches.sh).
   pull_request:
-    paths:
-      - "src/import/**"
-      - "src/config.rs"
-      - "tests/equivalence/**"
-      - ".github/workflows/equivalence.yml"
   workflow_dispatch:
 
 concurrency:
@@ -28,7 +25,25 @@ permissions:
   contents: read
 
 jobs:
+  scope:
+    name: equivalence scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          echo "run=$(scripts/pr-touches.sh 'src/import' 'src/config.rs' 'tests/equivalence' '.github/workflows/equivalence.yml' 'scripts/pr-touches.sh')" >> "$GITHUB_OUTPUT"
+
   equivalence:
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
