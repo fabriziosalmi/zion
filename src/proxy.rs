@@ -11,7 +11,7 @@
 //! of the connection pool happens at boot in `build_http_client`.
 
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::header::HeaderValue;
 use hyper::{Request, Response, StatusCode, Version};
 use hyper_util::client::legacy::Client;
@@ -63,8 +63,7 @@ impl XffMode {
 static PROTO_HTTPS: HeaderValue = HeaderValue::from_static("https");
 static PROTO_HTTP: HeaderValue = HeaderValue::from_static("http");
 
-/// BoxBody used throughout Zion — erases concrete body types.
-pub type ZionBody = BoxBody<Bytes, hyper::Error>;
+use crate::http_util::ZionBody;
 
 /// Shared HTTP client type — supports both HTTP/1.1 and HTTP/2 to upstreams.
 /// Plain HTTP upstreams use HttpConnector; HTTPS upstreams negotiate H2 via ALPN.

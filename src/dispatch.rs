@@ -31,12 +31,12 @@
 use crate::audit;
 use crate::audit::AuditEvent;
 use crate::bulkhead;
+use crate::http_util::ZionBody;
 use crate::http_util::{
     empty_response, generate_request_id, inject_security_headers, text_response, HEX_DIGITS,
     REQUEST_COUNTER,
 };
 use crate::pool;
-use crate::proxy::ZionBody;
 use crate::state::AppState;
 use crate::state::ResolvedAppConfig;
 use crate::{

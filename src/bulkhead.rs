@@ -79,7 +79,7 @@ impl Drop for Permit {
 
 /// A response body that keeps its slot until it ends or is dropped.
 pub struct PermitBody {
-    inner: crate::proxy::ZionBody,
+    inner: crate::http_util::ZionBody,
     permit: Option<Permit>,
 }
 
@@ -109,9 +109,9 @@ impl hyper::body::Body for PermitBody {
 
 /// Make `resp` hold `permit` until its body is finished.
 pub fn attach(
-    resp: hyper::Response<crate::proxy::ZionBody>,
+    resp: hyper::Response<crate::http_util::ZionBody>,
     permit: Permit,
-) -> hyper::Response<crate::proxy::ZionBody> {
+) -> hyper::Response<crate::http_util::ZionBody> {
     use http_body_util::BodyExt as _;
     use hyper::body::Body as _;
     let (parts, inner) = resp.into_parts();
