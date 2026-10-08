@@ -211,14 +211,14 @@ fn warn_feature_config_gaps(config: &config::ZionConfig) {
 pub(crate) fn load_config() -> error::ZionResult<(String, config::ZionConfig)> {
     let config_path = std::env::var("ZION_CONFIG").unwrap_or_else(|_| "zion.toml".to_string());
     let config = config::load_config(&config_path).map_err(error::ZionError::Config)?;
-    logging::init(&config.server.log_format);
+    logging::init(config.server.log_format.as_str());
     // tracing-subscriber init mirrors the log_format choice — JSON for
     // production, pretty for dev. Boot-line output continues to use
     // `logging::*` (those run before the runtime exists, so they cannot
     // depend on tracing's executor-aware machinery); request-path events
     // will go through tracing once the worker pool is up.
     observability::init_subscriber(
-        observability::LogFormat::parse_or_text(&config.server.log_format),
+        observability::LogFormat::parse_or_text(config.server.log_format.as_str()),
         config.server.log_queue_lines,
     );
     logging::info("config", &format!("loaded from {config_path}"));
@@ -586,8 +586,8 @@ pub(crate) fn spawn_admin_api(
         }
         match admin_cfg.listen.parse::<std::net::SocketAddr>() {
             Ok(addr) => {
-                let auth = match admin_cfg.auth.as_str() {
-                    "mtls" => match admin_cfg.client_ca_path.as_deref() {
+                let auth = match admin_cfg.auth {
+                    config::AdminAuthMode::Mtls => match admin_cfg.client_ca_path.as_deref() {
                         Some(ca) => match tls::admin_mtls_acceptor(
                             &config.tls.cert_path,
                             &config.tls.key_path,
@@ -629,7 +629,7 @@ pub(crate) fn spawn_admin_api(
                             None
                         }
                     },
-                    _ => Some(admin::AdminAuth::InternalIp),
+                    config::AdminAuthMode::InternalIp => Some(admin::AdminAuth::InternalIp),
                 };
                 // A configured write token that cannot be loaded must not silently
                 // open writes to every peer that passes `auth`: no admin API at all.

@@ -314,7 +314,6 @@ impl CompiledRedaction {
     /// Currently consumed by the unit tests and reserved for the access-log
     /// integration point; kept on the public surface so callers can ship
     /// their own log layer without forking this module.
-    #[allow(dead_code)]
     pub fn redacts_header(&self, lowercased_name: &str) -> bool {
         self.headers.iter().any(|h| h == lowercased_name)
     }
@@ -328,7 +327,6 @@ impl CompiledRedaction {
     /// no redaction is needed, `Cow::Owned(...)` otherwise. Callers can
     /// pass the result straight into `serde_json::Value::String`.
     /// Same status as `redacts_header` — public for downstream loggers.
-    #[allow(dead_code)]
     pub fn redact_header_value<'a>(
         &self,
         name_lower: &str,

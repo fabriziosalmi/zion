@@ -46,6 +46,8 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+      # Every `allow(dead_code)` says why (the lint is on for the whole crate, see src/main.rs).
+      - run: scripts/check-dead-code-allows.sh
 
   # ── 2. Clippy across the feature matrix. Each combo can fail on its own. ──
   clippy:

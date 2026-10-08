@@ -97,6 +97,169 @@ pub struct ZionConfig {
     pub admin: Option<AdminConfig>,
 }
 
+/// How Zion treats the inbound `X-Forwarded-For` header before forwarding.
+///
+/// * `Append` (default): preserve the inbound chain, append the resolved
+///   client IP. Compatible with the prior behaviour and correct when Zion
+///   sits behind a sanitising edge (Cloudflare, ALB, etc.) AND the
+///   downstream app reads the *rightmost-trusted* hop. Vulnerable to
+///   client-side spoofing of the leftmost entry when Zion is the front
+///   edge — apps that read XFF\[0\] would consume an attacker-controlled IP.
+/// * `Rewrite` (recommended for front-edge): drop any inbound XFF and
+///   replace with a single trusted entry — the IP returned by
+///   `TrustedProxies::resolve_client_ip`. Downstream apps see a clean,
+///   one-hop chain regardless of what the client tried to inject.
+/// * `Drop`: strip inbound XFF and add nothing. Use when upstreams must
+///   not learn the original client IP at all.
+///
+/// `X-Real-IP` is always set to the resolved client IP (no inbound trust).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
+#[serde(try_from = "String")]
+pub enum XffMode {
+    #[default]
+    Append,
+    Rewrite,
+    Drop,
+}
+
+impl TryFrom<String> for XffMode {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, String> {
+        match s.as_str() {
+            "append" => Ok(Self::Append),
+            "rewrite" => Ok(Self::Rewrite),
+            "drop" => Ok(Self::Drop),
+            _ => Err(format!(
+                "server.xff_mode '{s}' is not one of append, rewrite, drop"
+            )),
+        }
+    }
+}
+
+/// `[server] log_format`: how log lines are written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
+#[serde(try_from = "String")]
+pub enum LogFormat {
+    /// Pretty multi-line text, ANSI-colored on a TTY. The default.
+    #[default]
+    Text,
+    /// One JSON object per line. What production sets.
+    Json,
+}
+
+impl LogFormat {
+    /// The spelling in `zion.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
+impl TryFrom<String> for LogFormat {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, String> {
+        match s.as_str() {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            _ => Err(format!("server.log_format '{s}' is not one of text, json")),
+        }
+    }
+}
+
+/// `[tls] client_auth`: whether the HTTPS listener asks clients for a certificate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
+#[serde(try_from = "String")]
+pub enum ClientAuth {
+    /// No client certificate is requested. The default.
+    #[default]
+    None,
+    /// A client certificate is requested and, when presented, must verify.
+    Optional,
+    /// A client without a certificate that verifies is refused at the handshake.
+    Required,
+}
+
+impl TryFrom<String> for ClientAuth {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, String> {
+        match s.as_str() {
+            "none" => Ok(Self::None),
+            "optional" => Ok(Self::Optional),
+            "required" => Ok(Self::Required),
+            _ => Err(format!(
+                "tls.client_auth '{s}' must be \"none\", \"required\", or \"optional\""
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for ClientAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::Optional => "optional",
+            Self::Required => "required",
+        })
+    }
+}
+
+/// `[admin] auth`: how the admin listener decides who may call it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
+#[serde(try_from = "String")]
+pub enum AdminAuthMode {
+    /// The peer address must be loopback or private (the same gate as `/_zion/snapshot.json`).
+    #[default]
+    InternalIp,
+    /// A client certificate chaining to `admin.client_ca_path`.
+    Mtls,
+}
+
+impl TryFrom<String> for AdminAuthMode {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, String> {
+        match s.as_str() {
+            "internal-ip" => Ok(Self::InternalIp),
+            "mtls" => Ok(Self::Mtls),
+            _ => Err(format!(
+                "admin.auth '{s}' must be \"internal-ip\" or \"mtls\""
+            )),
+        }
+    }
+}
+
+/// `[tls] min_version`: the lowest TLS version the listener accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
+#[serde(try_from = "String")]
+pub enum TlsMinVersion {
+    /// TLS 1.2 and 1.3.
+    V1_2,
+    /// TLS 1.3 only. The default.
+    #[default]
+    V1_3,
+}
+
+impl TryFrom<String> for TlsMinVersion {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, String> {
+        match s.as_str() {
+            "1.2" => Ok(Self::V1_2),
+            "1.3" => Ok(Self::V1_3),
+            _ => Err(format!("tls.min_version '{s}' must be \"1.2\" or \"1.3\"")),
+        }
+    }
+}
+
+impl std::fmt::Display for TlsMinVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::V1_2 => "1.2",
+            Self::V1_3 => "1.3",
+        })
+    }
+}
+
 /// `[admin]` block — the runtime admin API listener (#26). Loopback +
 /// internal-ip-gated by default; production turns on mTLS (Phase 4).
 #[derive(Deserialize, Clone, Debug)]
@@ -107,8 +270,8 @@ pub struct AdminConfig {
     pub listen: String,
     /// Auth mode: `"internal-ip"` (default — same gate as `/_zion/snapshot.json`)
     /// or `"mtls"` (opt-in, Phase 4). Unknown values are rejected at validation.
-    #[serde(default = "default_admin_auth")]
-    pub auth: String,
+    #[serde(default)]
+    pub auth: AdminAuthMode,
     /// Global request rate limit (req/s) for the admin listener — defense in
     /// depth that bounds the expensive reload path against loops / abuse. Must
     /// be > 0. Default 10.
@@ -152,9 +315,6 @@ pub struct AdminConfig {
 
 fn default_admin_listen() -> String {
     "127.0.0.1:9180".to_string()
-}
-fn default_admin_auth() -> String {
-    "internal-ip".to_string()
 }
 fn default_admin_rate_limit() -> u32 {
     10
@@ -324,8 +484,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub cache_max_memory_mb: Option<u64>,
     /// Log format: "text" (default) or "json".
-    #[serde(default = "default_log_format")]
-    pub log_format: String,
+    #[serde(default)]
+    pub log_format: LogFormat,
     /// How long (seconds) the last good DNS answer for an upstream host may be served when a
     /// fresh lookup fails, times out or returns nothing (default 3600; `0` = never serve a
     /// stale answer). A fresh lookup is always tried first. Applied on reload.
@@ -366,13 +526,9 @@ pub struct ServerConfig {
     /// * `"drop"`: strip inbound XFF; emit nothing. Use when upstreams
     ///   must not learn the client IP at all.
     ///
-    /// Invalid values fall back to `"append"` with a startup warning.
-    #[serde(default = "default_xff_mode")]
-    pub xff_mode: String,
-}
-
-fn default_xff_mode() -> String {
-    "append".to_string()
+    /// An unknown value is refused when the file is read.
+    #[serde(default)]
+    pub xff_mode: XffMode,
 }
 
 /// The highest `max_connections` accepted: each connection is a file descriptor and at
@@ -400,10 +556,6 @@ fn default_dns_timeout_ms() -> u64 {
 
 fn default_log_queue_lines() -> usize {
     8192
-}
-
-fn default_log_format() -> String {
-    "text".to_string()
 }
 
 fn default_rate_window() -> u64 {
@@ -522,8 +674,8 @@ pub struct TlsConfig {
     pub key_path: String,
     #[serde(default = "default_true")]
     pub hot_reload: bool,
-    #[serde(default = "default_tls_min_version")]
-    pub min_version: String, // "1.2" or "1.3"
+    #[serde(default)]
+    pub min_version: TlsMinVersion,
     #[serde(default = "default_alpn")]
     pub alpn: Vec<String>, // ["h2", "http/1.1"]
     /// Optional SNI-based cert mappings. If empty, single-cert mode (zero overhead).
@@ -554,8 +706,8 @@ pub struct TlsConfig {
     #[serde(default)]
     pub client_crl_enforce_next_update: bool,
     /// Client auth mode: "none" (default), "optional", "required".
-    #[serde(default = "default_client_auth")]
-    pub client_auth: String,
+    #[serde(default)]
+    pub client_auth: ClientAuth,
     /// JA4 TLS client fingerprinting (`--features tls-fingerprint`, issue #27).
     /// Absent or `mode = "off"` → zero overhead, no ClientHello peek.
     #[serde(default)]
@@ -707,7 +859,7 @@ pub struct SniCert {
 /// Always deserialized so users get a clear "unknown ACME field" error
 /// even on builds without `--features acme`. The fields below are only
 /// READ by acme.rs, which is feature-gated; hence the targeted allow.
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "acme"), allow(dead_code))] // read only by acme.rs
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct AcmeConfig {
@@ -743,9 +895,6 @@ fn default_acme_state_dir() -> String {
 
 fn default_true() -> bool {
     true
-}
-fn default_tls_min_version() -> String {
-    "1.3".to_string()
 }
 fn default_alpn() -> Vec<String> {
     vec!["h2".to_string(), "http/1.1".to_string()]
@@ -815,15 +964,6 @@ pub enum LoadBalancing {
     LowestLatency,
 }
 
-impl From<LoadBalancing> for crate::pool::Algorithm {
-    fn from(l: LoadBalancing) -> Self {
-        match l {
-            LoadBalancing::P2c => crate::pool::Algorithm::P2c,
-            LoadBalancing::LowestLatency => crate::pool::Algorithm::LowestLatency,
-        }
-    }
-}
-
 /// `[upstream.<name>] outlier_detection = { ... }`: eject a pool member whose own failure rate
 /// is high while the rest of the pool is fine. See `pool.rs`. Pools of two or more endpoints only.
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -853,16 +993,6 @@ fn default_max_ejected() -> u32 {
 }
 
 impl OutlierDetectionConfig {
-    pub fn to_runtime(&self) -> crate::pool::OutlierCfg {
-        crate::pool::OutlierCfg {
-            error_rate_pct: self.error_rate_pct,
-            min_requests: self.min_requests,
-            window_secs: self.window_secs,
-            eject_secs: self.eject_secs,
-            max_ejected_pct: self.max_ejected_pct,
-        }
-    }
-
     fn errors(&self, name: &str) -> Vec<String> {
         let mut e = Vec::new();
         let p = format!("upstream.{name}.outlier_detection");
@@ -922,16 +1052,11 @@ fn default_cb_open() -> u32 {
     30
 }
 
-impl CircuitBreakerConfig {
-    pub fn to_runtime(&self) -> crate::breaker::BreakerCfg {
-        crate::breaker::BreakerCfg {
-            error_rate_pct: self.error_rate_pct,
-            min_requests: self.min_requests,
-            window_secs: self.window_secs,
-            open_secs: self.open_secs,
-        }
-    }
+/// Longest sliding window a circuit breaker can use, in seconds. `breaker.rs` sizes its bucket
+/// ring from it, so the schema owns the limit and the runtime follows.
+pub const MAX_BREAKER_WINDOW_SECS: u32 = 60;
 
+impl CircuitBreakerConfig {
     fn errors(&self, name: &str) -> Vec<String> {
         let mut e = Vec::new();
         if !(1..=100).contains(&self.error_rate_pct) {
@@ -944,10 +1069,9 @@ impl CircuitBreakerConfig {
                 "upstream.{name}.circuit_breaker.min_requests must be >= 1"
             ));
         }
-        if !(1..=crate::breaker::MAX_WINDOW_SECS).contains(&self.window_secs) {
+        if !(1..=MAX_BREAKER_WINDOW_SECS).contains(&self.window_secs) {
             e.push(format!(
-                "upstream.{name}.circuit_breaker.window_secs must be 1..={}",
-                crate::breaker::MAX_WINDOW_SECS
+                "upstream.{name}.circuit_breaker.window_secs must be 1..={MAX_BREAKER_WINDOW_SECS}"
             ));
         }
         if !(1..=3600).contains(&self.open_secs) {
@@ -1077,7 +1201,7 @@ impl TryFrom<RawUpstream> for UpstreamConfig {
 
 impl UpstreamConfig {
     /// The endpoints, in failover order. Never empty.
-    #[allow(dead_code)]
+    #[cfg(test)] // used by tests; the runtime goes through `get_urls`
     pub fn urls(&self) -> &[String] {
         &self.urls
     }
@@ -1097,9 +1221,6 @@ pub(crate) fn default_connect_timeout() -> u64 {
 }
 fn default_keepalive() -> usize {
     crate::proxy::DEFAULT_KEEPALIVE
-}
-pub(crate) fn default_client_auth() -> String {
-    "none".to_string()
 }
 
 // ============================================================================
@@ -1121,7 +1242,7 @@ pub use crate::waf::{WafMode, WafProfile};
 // ============================================================================
 
 #[derive(Deserialize, Clone, Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // `mode` is parsed and not yet read (#636)
 #[serde(deny_unknown_fields)]
 pub struct CacheProfile {
     #[serde(default = "default_cache_mode")]
@@ -1765,20 +1886,27 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     let mut errors: Vec<String> = Vec::new();
 
     errors.extend(config.redact.errors());
-    // Closed sets that used to fall back silently: an unknown xff_mode ran as `append`
-    // (the most permissive), an unknown log_format as `text`.
-    if crate::proxy::XffMode::parse(&config.server.xff_mode).is_none() {
-        errors.push(format!(
-            "server.xff_mode '{}' is not one of append, rewrite, drop",
-            config.server.xff_mode
-        ));
-    }
-    if !matches!(config.server.log_format.as_str(), "text" | "json") {
-        errors.push(format!(
-            "server.log_format '{}' is not one of text, json",
-            config.server.log_format
-        ));
-    }
+    check_auth_profiles(config, &mut errors);
+    check_upstream_tables(config, &mut errors);
+    check_shared_upstream_urls(config, &mut errors);
+    check_profiles_and_limits(config, &mut errors);
+    check_listen_addresses(config, &mut errors);
+    #[cfg(feature = "tls-fingerprint")]
+    check_tls_fingerprint(config, &mut errors);
+    check_tls_names(config, &mut errors);
+    check_routes(config, &mut errors);
+    check_upstream_urls(config, &mut errors);
+    check_internal_networks_and_admin(config, &mut errors);
+    check_tls_client_auth(config, &mut errors);
+    #[cfg(any(feature = "geo-ita", feature = "geo-eu", feature = "sovereign-aimp"))]
+    check_sovereign(config, &mut errors);
+    check_upstream_name_collision(config, &mut errors);
+
+    errors
+}
+
+/// Auth profiles: where their keys come from, and that this build can enforce them.
+fn check_auth_profiles(config: &ZionConfig, errors: &mut Vec<String>) {
     // Signing keys fetched over plain http can be swapped by anyone on the path, who can
     // then mint tokens the gateway accepts. Only a loopback JWKS may use http.
     for (name, p) in &config.auth_profile {
@@ -1805,6 +1933,10 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             route.path
         ));
     }
+}
+
+/// Each `[upstream.<name>]` table on its own.
+fn check_upstream_tables(config: &ZionConfig, errors: &mut Vec<String>) {
     for (name, up) in &config.upstream {
         // Documented, parsed, and used by nothing: a config that sets them believed its
         // upstream connections were authenticated. Refuse until it exists (#503).
@@ -1902,6 +2034,10 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             }
         }
     }
+}
+
+/// Tables that name the same URL share one health entry: they must agree on breaker and TLS.
+fn check_shared_upstream_urls(config: &ZionConfig, errors: &mut Vec<String>) {
     // One URL, one breaker: the health entry (and its breaker) is shared by every upstream
     // that names the URL, so two single-endpoint definitions of it must agree on whether it
     // has a breaker and on its thresholds. Pools and the `[upstreams]` shorthand are listed
@@ -1981,6 +2117,10 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             }
         }
     }
+}
+
+/// WAF and cache profiles, and the numeric limits of `[server]`.
+fn check_profiles_and_limits(config: &ZionConfig, errors: &mut Vec<String>) {
     for (name, wp) in &config.waf_profile {
         for problem in wp.scan_headers_errors() {
             errors.push(format!("waf_profile.{name}: {problem}"));
@@ -2022,7 +2162,10 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                 .to_string(),
         );
     }
+}
 
+/// Server addresses must parse.
+fn check_listen_addresses(config: &ZionConfig, errors: &mut Vec<String>) {
     // Server addresses must parse
     if config
         .server
@@ -2046,7 +2189,11 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             config.server.listen_https
         ));
     }
+}
 
+/// `[tls.fingerprint]`.
+#[cfg(feature = "tls-fingerprint")]
+fn check_tls_fingerprint(config: &ZionConfig, errors: &mut Vec<String>) {
     // [tls.fingerprint]: an allowlist that drops every unknown but lists no
     // allowed entries would deny ALL traffic — refuse to boot into a total
     // outage. Only enforced where it would actually bite (feature on); a
@@ -2156,7 +2303,10 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             ));
         }
     }
+}
 
+/// SNI entries and the ACME block.
+fn check_tls_names(config: &ZionConfig, errors: &mut Vec<String>) {
     // SNI entries need a subject to match on (file existence is deploy-time)
     for (i, sni) in config.tls.sni.iter().enumerate() {
         if sni.server_name.is_empty() {
@@ -2174,7 +2324,10 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             errors.push("[tls.acme] email must not be empty".to_string());
         }
     }
+}
 
+/// Routes, and the references they hold to the rest of the config.
+fn check_routes(config: &ZionConfig, errors: &mut Vec<String>) {
     // Must have at least one route
     if config.route.is_empty() {
         errors.push("no [[route]] defined — at least one route is required".to_string());
@@ -2267,7 +2420,10 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             }
         }
     }
+}
 
+/// Upstream URLs must be valid.
+fn check_upstream_urls(config: &ZionConfig, errors: &mut Vec<String>) {
     // Upstream URLs must be valid
     for (name, up) in &config.upstream {
         // (an upstream with no endpoint is refused at parse time, see UpstreamConfig)
@@ -2290,7 +2446,10 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             }
         }
     }
+}
 
+/// `[server] internal_networks` and `[admin]`.
+fn check_internal_networks_and_admin(config: &ZionConfig, errors: &mut Vec<String>) {
     // [server] internal_networks — a bad entry must be an error: dropping it would
     // leave the list shorter, or empty, and an empty list means the permissive
     // built-in "any private address" rule.
@@ -2310,8 +2469,8 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                 admin.listen
             ));
         }
-        match admin.auth.as_str() {
-            "internal-ip" => {
+        match admin.auth {
+            AdminAuthMode::InternalIp => {
                 // `internal-ip` authorizes any loopback/private-range *peer*, and the
                 // authorized peer can replace the whole running config. Bound to a
                 // routable address (or published from a container, where a bridge
@@ -2328,17 +2487,14 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                     }
                 }
             }
-            "mtls" => {}
-            other => errors.push(format!(
-                "admin.auth '{other}' must be \"internal-ip\" or \"mtls\""
-            )),
+            AdminAuthMode::Mtls => {}
         }
         if admin.rate_limit_rps == 0 {
             errors.push("admin.rate_limit_rps must be > 0".to_string());
         }
         // mTLS needs its own CA: with the data-plane one, every client certificate
         // issued to call the gateway would also authorize config pushes.
-        if admin.auth == "mtls" && admin.client_ca_path.is_none() {
+        if admin.auth == AdminAuthMode::Mtls && admin.client_ca_path.is_none() {
             errors.push(
                 "admin.auth = \"mtls\" requires admin.client_ca_path: the CA that signs ADMIN \
                  client certificates (not tls.client_ca_path, whose data-plane client \
@@ -2347,26 +2503,16 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             );
         }
     }
+}
 
-    // `client_auth` is a closed set; a typo would silently coerce to "none"
-    // (no client auth) — reject an unknown value so it fails closed at boot.
-    if !matches!(
-        config.tls.client_auth.as_str(),
-        "none" | "required" | "optional"
-    ) {
-        errors.push(format!(
-            "tls.client_auth '{}' must be \"none\", \"required\", or \"optional\"",
-            config.tls.client_auth
-        ));
-    }
+/// The CA and CRL `client_auth` needs, and the admin listener's share of them.
+fn check_tls_client_auth(config: &ZionConfig, errors: &mut Vec<String>) {
     // Data-plane mTLS: `client_auth = required|optional` needs a CA to verify
     // presented client certs against. Without `tls.client_ca_path` the listener
     // silently builds with NO client auth (fail-open) — the enforcement the
     // operator asked for would be off with no signal. Reject it at boot.
     // A CRL nobody consults is a revocation the operator believes in and Zion ignores.
-    if config.tls.client_crl_path.is_some()
-        && !matches!(config.tls.client_auth.as_str(), "required" | "optional")
-    {
+    if config.tls.client_crl_path.is_some() && config.tls.client_auth == ClientAuth::None {
         errors.push(
             "tls.client_crl_path is set but tls.client_auth is \"none\": no client certificate \
              is verified, so nothing would be checked against the CRL"
@@ -2388,7 +2534,7 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
                     .to_string(),
             );
         }
-        if admin.client_crl_path.is_some() && admin.auth != "mtls" {
+        if admin.client_crl_path.is_some() && admin.auth != AdminAuthMode::Mtls {
             errors.push(
                 "admin.client_crl_path is set but admin.auth is not \"mtls\": no client \
                  certificate is verified, so nothing would be checked against the CRL"
@@ -2396,16 +2542,18 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             );
         }
     }
-    if matches!(config.tls.client_auth.as_str(), "required" | "optional")
-        && config.tls.client_ca_path.is_none()
-    {
+    if config.tls.client_auth != ClientAuth::None && config.tls.client_ca_path.is_none() {
         errors.push(format!(
             "tls.client_auth = \"{}\" requires tls.client_ca_path (the CA that verifies \
              presented client certificates); without it client-cert enforcement is silently off",
             config.tls.client_auth
         ));
     }
+}
 
+/// `[sovereign_aimp]` and `[sovereign.overrides]`.
+#[cfg(any(feature = "geo-ita", feature = "geo-eu", feature = "sovereign-aimp"))]
+fn check_sovereign(config: &ZionConfig, errors: &mut Vec<String>) {
     // [sovereign_aimp] — when the mesh is enabled and a listen address is set
     // in TOML, it MUST parse. Previously a malformed value silently fell back
     // to `0.0.0.0:9443` at boot, binding the gossip control plane to every
@@ -2450,7 +2598,10 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             ));
         }
     }
+}
 
+/// An upstream name defined in both upstream maps.
+fn check_upstream_name_collision(config: &ZionConfig, errors: &mut Vec<String>) {
     // An upstream name defined in BOTH the structured `[upstream.<name>]` map
     // and the legacy flat `[upstreams]` map is ambiguous: resolve_upstream
     // silently prefers the structured one and drops the legacy URL, so two
@@ -2464,8 +2615,6 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
             ));
         }
     }
-
-    errors
 }
 
 /// If `path` is a matchit catch-all (`<prefix>/{*name}`), return the bare
@@ -2712,6 +2861,59 @@ mod tests {
         assert!(e.contains("at least 16 bytes"), "{e}");
     }
 
+    /// The closed sets are types, not strings: a value outside the set cannot reach a use site,
+    /// and the message that names the key and the allowed values is the one an operator reads.
+    #[test]
+    fn closed_sets_are_refused_when_the_file_is_read() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n{S}\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n{T}\
+             [upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*r}\"\nupstream=\"be\"\n{A}";
+        let read = |s: &str, t: &str, a: &str| {
+            let text = base.replace("{S}", s).replace("{T}", t).replace("{A}", a);
+            toml::from_str::<ZionConfig>(&text).map_err(|e| e.to_string())
+        };
+        // The defaults.
+        let c = read("", "", "").unwrap();
+        assert_eq!(c.server.xff_mode, XffMode::Append);
+        assert_eq!(c.server.log_format, LogFormat::Text);
+        assert_eq!(c.tls.min_version, TlsMinVersion::V1_3);
+        assert_eq!(c.tls.client_auth, ClientAuth::None);
+        // Every spelling in the set.
+        let c = read(
+            "xff_mode=\"drop\"\nlog_format=\"json\"\n",
+            "min_version=\"1.2\"\nclient_auth=\"optional\"\n",
+            "[admin]\nauth=\"mtls\"\nclient_ca_path=\"/ca\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.server.xff_mode, XffMode::Drop);
+        assert_eq!(c.server.log_format, LogFormat::Json);
+        assert_eq!(c.tls.min_version, TlsMinVersion::V1_2);
+        assert_eq!(c.tls.client_auth, ClientAuth::Optional);
+        assert_eq!(c.admin.unwrap().auth, AdminAuthMode::Mtls);
+        // One outside it, per key; the case matters.
+        assert!(read("xff_mode=\"Drop\"\n", "", "")
+            .err()
+            .expect("refused")
+            .contains("server.xff_mode 'Drop' is not one of append, rewrite, drop"));
+        assert!(read("log_format=\"yaml\"\n", "", "")
+            .err()
+            .expect("refused")
+            .contains("server.log_format 'yaml' is not one of text, json"));
+        assert!(read("", "min_version=\"1.1\"\n", "")
+            .err()
+            .expect("refused")
+            .contains("tls.min_version '1.1' must be \"1.2\" or \"1.3\""));
+        assert!(read("", "client_auth=\"requird\"\n", "")
+            .err()
+            .expect("refused")
+            .contains("tls.client_auth 'requird' must be \"none\", \"required\", or \"optional\""));
+        assert!(read("", "", "[admin]\nauth=\"bogus\"\n")
+            .err()
+            .expect("refused")
+            .contains("admin.auth 'bogus' must be \"internal-ip\" or \"mtls\""));
+    }
+
     #[test]
     fn closed_sets_and_jwks_urls_are_validated() {
         let cfg = |server: &str, profile: &str| {
@@ -2721,10 +2923,13 @@ mod tests {
                  {profile}\n[[route]]\npath=\"/{{*r}}\"\nupstream=\"be\"\n"
             )
         };
-        let errs = |server: &str, profile: &str| {
-            let c: ZionConfig = toml::from_str(&cfg(server, profile)).unwrap();
-            semantic_errors(&c).join("\n")
-        };
+        // A closed set is refused when the file is read; the rest is checked after.
+        let errs =
+            |server: &str, profile: &str| match toml::from_str::<ZionConfig>(&cfg(server, profile))
+            {
+                Ok(c) => semantic_errors(&c).join("\n"),
+                Err(e) => e.to_string(),
+            };
         for ok in ["append", "rewrite", "drop"] {
             assert!(
                 !errs(&format!("xff_mode=\"{ok}\""), "").contains("xff_mode"),
@@ -3737,7 +3942,7 @@ upstream = "frontend"
         assert_eq!(config.server.listen_https, "0.0.0.0:443");
         assert_eq!(config.tls.cert_path, "/tmp/cert.pem");
         assert!(config.tls.hot_reload); // default true
-        assert_eq!(config.tls.min_version, "1.3"); // default
+        assert_eq!(config.tls.min_version, TlsMinVersion::V1_3); // default
         assert_eq!(config.route.len(), 1);
     }
 
@@ -4061,7 +4266,7 @@ enabledd = true
         .unwrap();
         let admin = cfg.admin.expect("[admin] present → Some");
         assert_eq!(admin.listen, "127.0.0.1:9180");
-        assert_eq!(admin.auth, "internal-ip");
+        assert_eq!(admin.auth, AdminAuthMode::InternalIp);
         assert_eq!(admin.rate_limit_rps, 10);
 
         // A bogus auth mode is rejected by validate_str (semantic validation).
@@ -4684,7 +4889,7 @@ mode = "sse_stream"
     #[test]
     fn tls_defaults() {
         let config: ZionConfig = toml::from_str(minimal_toml()).unwrap();
-        assert_eq!(config.tls.min_version, "1.3");
+        assert_eq!(config.tls.min_version, TlsMinVersion::V1_3);
         assert_eq!(config.tls.alpn, vec!["h2", "http/1.1"]);
         assert!(config.tls.hot_reload);
     }
@@ -4709,7 +4914,7 @@ be = "http://127.0.0.1:8000"
 "#;
         let config: ZionConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.tls.hot_reload);
-        assert_eq!(config.tls.min_version, "1.2");
+        assert_eq!(config.tls.min_version, TlsMinVersion::V1_2);
         assert_eq!(config.tls.alpn, vec!["http/1.1"]);
     }
 
