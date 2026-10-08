@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Serving files from disk (`mode = "static"`, no `precompressed`) is about a quarter cheaper per request, and steadier.** The route made seven calls to the blocking thread pool per request (canonicalize the root, canonicalize the file, stat, stat, open, read, close), and every hand-off costs more than the page-cache read it serves. It now resolves, opens and, for a plain GET of a small file, reads in one. On a single core a 28 KB page went from 114-155 µs to 88 µs of CPU per request and from 6.4-8.8k to 11.3k req/s (the old path varied 31% between two identical runs, the new one 0.3%); nginx with `open_file_cache` does the same file in 49 µs. No behaviour changes: the same checks run in the same order (inside the root, regular files only, no FIFO opened), and a request carrying `If-None-Match`, `If-Modified-Since` or `Range` still reads nothing before the validators are checked. Routes with `precompressed = true` keep their previous path.
+
 ### Fixed
 
 - **`[cache_profile.x] mode = "none"` now stores nothing.** The key was documented (`"memory"` or `"none"`) and parsed, but nothing read it: a route that pointed at a `none` profile cached exactly like a `memory` one. It is now an uncached, plain proxied route (every request goes to the upstream, no `X-Zion-Cache` header), even if its mode is `static_cache`. **A config that set `mode = "none"` and was being cached anyway stops caching on upgrade**, which is what it asked for. (#636)
