@@ -75,7 +75,7 @@ impl CachedMeta {
 #[derive(Clone)]
 pub struct CacheHit {
     pub body: Bytes,
-    pub meta: CachedMeta,
+    pub meta: Arc<CachedMeta>,
     /// Seconds since the origin generated this response — the value to emit as
     /// the `Age` header. Seeded from the upstream `Age` at insert (so time
     /// spent in the shield Varnish counts) plus the time the entry has lived in
@@ -115,7 +115,7 @@ impl CacheLookup {
 /// L1 entry — with TTL from L2 (prevents stale data after expiry).
 struct L1Entry {
     body: Bytes,
-    meta: CachedMeta,
+    meta: Arc<CachedMeta>,
     inserted_at: Instant,
     expires_at: Instant,
     /// Age the object already carried on arrival (upstream `Age` header).
@@ -133,7 +133,7 @@ struct L1Entry {
 /// L2 entry — with TTL.
 struct L2Entry {
     body: Bytes,
-    meta: CachedMeta,
+    meta: Arc<CachedMeta>,
     inserted_at: Instant,
     expires_at: Instant,
     /// Age the object already carried on arrival (upstream `Age` header).
@@ -257,7 +257,9 @@ impl L1Cache {
         stripes: &[std::sync::atomic::AtomicU64],
     ) -> Option<CacheHit> {
         let (entry, node_idx) = self.map.get(path)?;
-        if Instant::now() >= entry.expires_at
+        // One clock read serves both the expiry check and the `Age` the hit reports.
+        let now = Instant::now();
+        if now >= entry.expires_at
             || entry.generation < current_gen
             || stripes[entry.stripe as usize].load(std::sync::atomic::Ordering::Acquire)
                 != entry.stripe_gen
@@ -271,7 +273,8 @@ impl L1Cache {
         }
         let body = entry.body.clone();
         let meta = entry.meta.clone();
-        let age_secs = entry.initial_age_secs + entry.inserted_at.elapsed().as_secs();
+        let age_secs =
+            entry.initial_age_secs + now.saturating_duration_since(entry.inserted_at).as_secs();
         let max_age_secs = entry.freshness_secs;
         let idx = *node_idx;
         self.touch(idx);
@@ -290,7 +293,7 @@ impl L1Cache {
         &mut self,
         path: Arc<str>,
         body: Bytes,
-        meta: CachedMeta,
+        meta: Arc<CachedMeta>,
         inserted_at: Instant,
         expires_at: Instant,
         initial_age_secs: u64,
@@ -513,6 +516,15 @@ fn entry_cost(key: &str, entry: &L2Entry) -> u64 {
 /// thread could stay alive long after the store dropped them. Larger bodies are served
 /// from the shared store on every hit.
 const L1_MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// The largest body promoted to L1 as a copy of its own. A hit clones the body and the
+/// header values it carries; when those are shared with the shared store and with every
+/// other thread's copy, each clone and drop is an atomic read-modify-write on a cache line
+/// the other cores are hitting too, and a hot key costs eight threads ten times what it
+/// costs one (#577). A copy owned by this thread makes them uncontended. Larger bodies stay
+/// shared (a copy per thread would hold up to `l1_hot_entries` times this per thread, outside
+/// the byte budget, as L1_MAX_BODY_BYTES describes) and pay the contention.
+const L1_PRIVATE_BODY_BYTES: usize = 16 * 1024;
 
 /// Queue entries one eviction round looks at.
 const EVICT_SAMPLE: usize = 64;
@@ -996,13 +1008,21 @@ impl StaticCache {
         // Promote to L1 preserving the original birth time, TTL and generation. Small
         // bodies only: see L1_MAX_BODY_BYTES.
         if body.len() <= L1_MAX_BODY_BYTES {
+            let (l1_body, l1_meta) = if body.len() <= L1_PRIVATE_BODY_BYTES {
+                (
+                    Bytes::copy_from_slice(&body),
+                    Arc::new(CachedMeta::clone(&meta).detached()),
+                )
+            } else {
+                (body.clone(), meta.clone())
+            };
             L1.with(|l1| {
                 let mut l1 = l1.borrow_mut();
                 let l1 = l1.get_or_insert_with(|| L1Cache::new(l1_max));
                 l1.insert(
                     key,
-                    body.clone(),
-                    meta.clone(),
+                    l1_body,
+                    l1_meta,
                     inserted_at,
                     expires_at,
                     initial_age_secs,
@@ -1068,7 +1088,7 @@ impl StaticCache {
         max_entries: usize,
     ) {
         // Every store goes through here: nothing kept may reference the upstream's buffer.
-        let meta = meta.detached();
+        let meta = Arc::new(meta.detached());
         let key: Arc<str> = Arc::from(path);
         let now = Instant::now();
         let entry = L2Entry {
@@ -1325,6 +1345,64 @@ mod tests {
         }
     }
 
+    /// Cost of a hit from a worker's own copy (the L1 tier), per lookup, one thread and eight
+    /// on the same hot key (#577). Measures, asserts nothing:
+    /// `cargo test --release --bin zion l1_hit_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn l1_hit_cost() {
+        fn owned_meta() -> CachedMeta {
+            // Header values that own their bytes, as `insert` stores them (`detached`).
+            CachedMeta {
+                content_type: Some(HeaderValue::from_bytes(b"text/css; charset=utf-8").unwrap()),
+                content_encoding: Some(HeaderValue::from_bytes(b"br").unwrap()),
+                status: StatusCode::OK,
+                etag: Some(HeaderValue::from_bytes(b"\"abcdef0123456789\"").unwrap()),
+                last_modified: Some(
+                    HeaderValue::from_bytes(b"Wed, 07 Oct 2026 12:00:00 GMT").unwrap(),
+                ),
+                stale_while_revalidate_secs: 0,
+                must_revalidate: false,
+            }
+        }
+        const N: u64 = 2_000_000;
+        for kib in [1usize, 16] {
+            let cache = Arc::new(StaticCache::new());
+            cache.insert(
+                "/_next/static/hot.css",
+                Bytes::from(vec![b'x'; kib * 1024]),
+                owned_meta(),
+                3600,
+                0,
+                10_000,
+            );
+            for threads in [1usize, 4, 8] {
+                let start = std::sync::Arc::new(std::sync::Barrier::new(threads));
+                let handles: Vec<_> = (0..threads)
+                    .map(|_| {
+                        let (cache, start) = (cache.clone(), start.clone());
+                        std::thread::spawn(move || {
+                            // The first lookup promotes the entry to this thread's L1.
+                            assert!(cache.get("/_next/static/hot.css").fresh().is_some());
+                            start.wait();
+                            let t = Instant::now();
+                            for _ in 0..N {
+                                let hit = cache.get("/_next/static/hot.css").fresh().unwrap();
+                                std::hint::black_box(&hit);
+                            }
+                            t.elapsed().as_nanos() as f64 / N as f64
+                        })
+                    })
+                    .collect();
+                let ns: Vec<f64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                let mean = ns.iter().sum::<f64>() / ns.len() as f64;
+                println!(
+                    "L1 hit, {kib:>2} KiB body, {threads} thread(s): {mean:6.0} ns per lookup"
+                );
+            }
+        }
+    }
+
     #[test]
     fn insert_and_get() {
         let cache = StaticCache::new();
@@ -1338,7 +1416,7 @@ mod tests {
         );
         let hit = cache.get("/style.css").fresh().unwrap();
         assert_eq!(hit.body, Bytes::from("body{}"));
-        assert_eq!(hit.meta.content_type.unwrap(), "text/css");
+        assert_eq!(hit.meta.content_type.clone().unwrap(), "text/css");
         assert_eq!(hit.meta.status, StatusCode::OK);
     }
 
@@ -1364,7 +1442,10 @@ mod tests {
         cache.insert("/a.js", Bytes::from("v2"), meta2, 3600, 0, 100);
         let hit = cache.get("/a.js").fresh().unwrap();
         assert_eq!(hit.body, Bytes::from("v2"));
-        assert_eq!(hit.meta.content_type.unwrap(), "application/javascript");
+        assert_eq!(
+            hit.meta.content_type.clone().unwrap(),
+            "application/javascript"
+        );
         assert_eq!(cache.len(), 1);
     }
 
@@ -1401,7 +1482,7 @@ mod tests {
         cache.refresh(
             "/r.js",
             stale.body.clone(),
-            stale.meta.clone(),
+            (*stale.meta).clone(),
             3600,
             0,
             100,
@@ -1998,13 +2079,19 @@ mod tests {
         let CacheLookup::Fresh(hit) = cache.get("/pinned") else {
             panic!("stored entry is fresh");
         };
-        assert_eq!(hit.meta.content_type.unwrap().as_bytes(), &[b'a'; 9][..]);
         assert_eq!(
-            hit.meta.content_encoding.unwrap().as_bytes(),
+            hit.meta.content_type.clone().unwrap().as_bytes(),
+            &[b'a'; 9][..]
+        );
+        assert_eq!(
+            hit.meta.content_encoding.clone().unwrap().as_bytes(),
             &[b'a'; 4][..]
         );
-        assert_eq!(hit.meta.etag.unwrap().as_bytes(), &[b'a'; 10][..]);
-        assert_eq!(hit.meta.last_modified.unwrap().as_bytes(), &[b'a'; 29][..]);
+        assert_eq!(hit.meta.etag.clone().unwrap().as_bytes(), &[b'a'; 10][..]);
+        assert_eq!(
+            hit.meta.last_modified.clone().unwrap().as_bytes(),
+            &[b'a'; 29][..]
+        );
     }
     // ── L1 invalidation by stripe (#525) ─────────────────────────────────────
 
@@ -2501,7 +2588,7 @@ mod tests {
             let now = Instant::now();
             let entry = L2Entry {
                 body: Bytes::from(vec![7u8; 1_050]),
-                meta: default_meta(),
+                meta: Arc::new(default_meta()),
                 inserted_at: now,
                 expires_at: expiry_from(now, 400, 0),
                 initial_age_secs: 0,
@@ -2542,7 +2629,7 @@ mod tests {
             let now = Instant::now();
             let entry = L2Entry {
                 body: Bytes::from(vec![7u8; big]),
-                meta: default_meta(),
+                meta: Arc::new(default_meta()),
                 inserted_at: now,
                 expires_at: expiry_from(now, 1_000, 0),
                 initial_age_secs: 0,
@@ -2722,6 +2809,59 @@ mod tests {
         let most = most_seen.load(std::sync::atomic::Ordering::Relaxed);
         let slack = THREADS as u64 * cost("/t0/0000", BODY);
         assert!(most <= budget + slack, "{most} > {budget} + {slack}");
+    }
+
+    /// A hit from a worker's own copy shares nothing with the shared store or with other threads
+    /// (#577): the body bytes and the header values are copies, so cloning them on every hit is
+    /// not an atomic operation on a cache line the other cores are using. Bodies above
+    /// `L1_PRIVATE_BODY_BYTES` are shared instead, so that a copy per thread cannot hold much
+    /// outside the budget.
+    #[test]
+    fn a_small_hit_from_l1_shares_no_memory_with_the_shared_store_and_a_larger_one_does() {
+        let cache = StaticCache::new();
+        let Some(l2) = &cache.l2 else {
+            return; // a single-core machine has no L1 tier
+        };
+        let meta = || {
+            let mut m = default_meta();
+            m.etag = Some(HeaderValue::from_bytes(b"\"v1\"").unwrap());
+            m
+        };
+        for (len, shared) in [
+            (1, false),
+            (L1_PRIVATE_BODY_BYTES, false),
+            (L1_PRIVATE_BODY_BYTES + 1, true),
+            (L1_MAX_BODY_BYTES, true),
+        ] {
+            let path = format!("/b{len}");
+            cache.insert(&path, Bytes::from(vec![7u8; len]), meta(), 3600, 0, 100);
+            // The first lookup promotes; the second is served from this thread's L1.
+            assert!(cache.get(&path).fresh().is_some());
+            let hit = cache.get(&path).fresh().expect("hit");
+            let stored = l2.get(path.as_str()).expect("stored");
+            assert_eq!(hit.body, stored.body, "same bytes");
+            assert_eq!(
+                hit.body.as_ptr() == stored.body.as_ptr(),
+                shared,
+                "{len} bytes: the body is {} with the shared store",
+                if shared {
+                    "expected shared"
+                } else {
+                    "expected a copy"
+                }
+            );
+            assert_eq!(
+                Arc::ptr_eq(&hit.meta, &stored.meta),
+                shared,
+                "{len} bytes: the metadata is {}",
+                if shared {
+                    "expected shared"
+                } else {
+                    "expected a copy"
+                }
+            );
+            assert_eq!(hit.meta.etag, stored.meta.etag, "and equal");
+        }
     }
 
     /// A worker thread's own L1 cache is outside the budget, so it only takes small bodies.

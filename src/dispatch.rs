@@ -1616,7 +1616,7 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
         let ttl = origin_freshness(resp.headers())
             .map(|o| o.min(job.cache_ttl))
             .unwrap_or(job.cache_ttl);
-        let mut meta = job.stale.meta.clone();
+        let mut meta = (*job.stale.meta).clone();
         if resp.headers().contains_key(hyper::header::CACHE_CONTROL) {
             meta.stale_while_revalidate_secs = origin_swr(resp.headers());
             meta.must_revalidate = forbids_stale(resp.headers());
@@ -2684,7 +2684,7 @@ async fn handle_static_cache(
             let effective_ttl = origin_freshness(resp.headers())
                 .map(|o| o.min(cache_ttl))
                 .unwrap_or(cache_ttl);
-            let mut refreshed_meta = hit.meta.clone();
+            let mut refreshed_meta = (*hit.meta).clone();
             if resp.headers().contains_key(hyper::header::CACHE_CONTROL) {
                 refreshed_meta.stale_while_revalidate_secs = origin_swr(resp.headers());
                 refreshed_meta.must_revalidate = forbids_stale(resp.headers());
