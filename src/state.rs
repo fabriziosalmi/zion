@@ -199,14 +199,14 @@ impl ResolvedAppConfig {
                 .get(name)
                 .and_then(|u| u.circuit_breaker.as_ref())
                 .filter(|_| urls.len() == 1)
-                .map(|cb| cb.to_runtime());
+                .map(crate::breaker::BreakerCfg::from);
             // Pool members (two or more endpoints) get passive health and load stats.
             let outlier_cfg = config
                 .upstream
                 .get(name)
                 .and_then(|u| u.outlier_detection.as_ref())
                 .filter(|_| urls.len() > 1)
-                .map(|o| o.to_runtime());
+                .map(crate::pool::OutlierCfg::from);
             let is_pool = urls.len() > 1;
             let detailed = config.upstream.get(name);
             let probe_host = detailed
@@ -298,7 +298,7 @@ impl ResolvedAppConfig {
         // The boot path in async_main already emits a structured warning
         // when it sees an unknown value, so a second log here would be
         // redundant — we just take the parsed value.
-        let xff_mode = proxy::XffMode::parse(&config.server.xff_mode).unwrap_or_default();
+        let xff_mode = config.server.xff_mode;
 
         // Parse listen addresses once at build time. A malformed string
         // logs a structured warning and yields `None`; the listener

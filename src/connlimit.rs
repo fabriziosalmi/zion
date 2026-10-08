@@ -54,8 +54,8 @@ impl PerIpConnLimiter {
     }
 
     /// Current number of distinct source IPs with at least one live
-    /// connection. For metrics / introspection.
-    #[allow(dead_code)]
+    /// connection. Used by tests.
+    #[cfg(test)]
     pub fn tracked_ips(&self) -> usize {
         self.counts.len()
     }

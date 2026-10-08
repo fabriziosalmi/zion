@@ -78,7 +78,6 @@ pub fn info(event: &str, msg: &str) {
 
 /// Log a warning-level event. In text+TTY mode the line is prefixed with
 /// a bold amber `⚠ warning:` so operators spot it amid the boot stream.
-#[allow(dead_code)]
 pub fn warn(event: &str, msg: &str) {
     if !is_json() && is_stamped() {
         emit(&format_stamped(&now(), "WARN", event, msg));
@@ -89,7 +88,6 @@ pub fn warn(event: &str, msg: &str) {
 
 /// Log an error-level event. In text+TTY mode prefixed with a bold red
 /// `✖ error:` for maximum salience.
-#[allow(dead_code)]
 pub fn error(event: &str, msg: &str) {
     if !is_json() && is_stamped() {
         emit(&format_stamped(&now(), "ERROR", event, msg));

@@ -21,43 +21,7 @@ use std::fmt::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// How Zion treats the inbound `X-Forwarded-For` header before forwarding.
-///
-/// * `Append` (default): preserve the inbound chain, append the resolved
-///   client IP. Compatible with the prior behaviour and correct when Zion
-///   sits behind a sanitising edge (Cloudflare, ALB, etc.) AND the
-///   downstream app reads the *rightmost-trusted* hop. Vulnerable to
-///   client-side spoofing of the leftmost entry when Zion is the front
-///   edge — apps that read XFF\[0\] would consume an attacker-controlled IP.
-/// * `Rewrite` (recommended for front-edge): drop any inbound XFF and
-///   replace with a single trusted entry — the IP returned by
-///   `TrustedProxies::resolve_client_ip`. Downstream apps see a clean,
-///   one-hop chain regardless of what the client tried to inject.
-/// * `Drop`: strip inbound XFF and add nothing. Use when upstreams must
-///   not learn the original client IP at all.
-///
-/// `X-Real-IP` is always set to the resolved client IP (no inbound trust).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum XffMode {
-    #[default]
-    Append,
-    Rewrite,
-    Drop,
-}
-
-impl XffMode {
-    /// Parse from config string (lowercase). Unknown values fall back to
-    /// `Append` so a typo doesn't degrade security silently — but the
-    /// caller is expected to validate and warn.
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "append" => Some(Self::Append),
-            "rewrite" => Some(Self::Rewrite),
-            "drop" => Some(Self::Drop),
-            _ => None,
-        }
-    }
-}
+pub use crate::config::XffMode;
 
 // Pre-parsed static header values — zero cost at runtime.
 static PROTO_HTTPS: HeaderValue = HeaderValue::from_static("https");
@@ -1867,16 +1831,18 @@ mod tests {
 
     #[test]
     fn xff_mode_parse_known_values() {
-        assert_eq!(XffMode::parse("append"), Some(XffMode::Append));
-        assert_eq!(XffMode::parse("rewrite"), Some(XffMode::Rewrite));
-        assert_eq!(XffMode::parse("drop"), Some(XffMode::Drop));
+        let parse = |s: &str| XffMode::try_from(s.to_string()).ok();
+        assert_eq!(parse("append"), Some(XffMode::Append));
+        assert_eq!(parse("rewrite"), Some(XffMode::Rewrite));
+        assert_eq!(parse("drop"), Some(XffMode::Drop));
     }
 
     #[test]
     fn xff_mode_parse_rejects_unknown() {
-        assert_eq!(XffMode::parse("APPEND"), None); // case-sensitive
-        assert_eq!(XffMode::parse("strip"), None);
-        assert_eq!(XffMode::parse(""), None);
+        let parse = |s: &str| XffMode::try_from(s.to_string()).ok();
+        assert_eq!(parse("APPEND"), None); // case-sensitive
+        assert_eq!(parse("strip"), None);
+        assert_eq!(parse(""), None);
     }
 
     #[test]

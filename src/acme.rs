@@ -670,14 +670,14 @@ pub async fn run_soak() -> i32 {
         cert_path: cert_path.clone(),
         key_path: key_path.clone(),
         hot_reload: true,
-        min_version: "1.2".into(),
+        min_version: crate::config::TlsMinVersion::V1_2,
         alpn: vec!["http/1.1".into()],
         sni: vec![],
         acme: None,
         client_ca_path: None,
         client_crl_path: None,
         client_crl_enforce_next_update: false,
-        client_auth: "none".into(),
+        client_auth: crate::config::ClientAuth::None,
         fingerprint: None,
     };
 
