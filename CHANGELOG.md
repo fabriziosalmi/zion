@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`zion_upstream_connections_opened_total`** counts the TCP connections zion establishes to upstreams. A rate far above the request rate to the same upstreams means connections are not being reused, and each one closed leaves a local port in TIME_WAIT: this is how the churn is seen before the ports run out and requests fail with `502` (#571). An alert on its rate is the early warning. (The failure #571 reported did not reproduce on 0.10.0 or on 0.9.11: 300,000 requests walking 18,750 URLs through a 10,000-entry cache, three runs, no `5xx`, on macOS and on Linux.)
+
 ### Fixed
 
 - **A cached megabyte now costs the process about a megabyte on Linux.** mimalloc, the global allocator, commits its arena eagerly by default; with that, the process held 1.7 to 2.1 times what `zion_cache_bytes` counts (bodies of 64 KiB, 300 KiB and 1 MiB alike), so a `cache_max_memory_mb` of N MiB held about 2N. zion now turns eager arena commit off at start-up (an operator's own `MIMALLOC_ARENA_EAGER_COMMIT` still wins). Measured: 1.03 to 1.07 times, the same as glibc's malloc. Idle and light-load resident memory also fell by about half (36 to 18 MiB serving one cached object), with no change in CPU per request or throughput on the regression harness. (#590)

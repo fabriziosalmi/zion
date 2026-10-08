@@ -463,6 +463,8 @@ pub struct Metrics {
     /// (the eager HA failover in `proxy::proxy_pass`). Rate > 0 with no upstream
     /// marked down means members are flapping.
     pub upstream_failovers_total: AtomicU64,
+    /// TCP connections established to upstreams (all of them; see `proxy::CountingConnector`).
+    pub upstream_connections_opened: AtomicU64,
     /// Upstream responses cut off after their headers: the upstream closed its TLS session
     /// without a `close_notify` (`tls_truncated`), or the body failed some other way (`other`).
     pub upstream_body_errors_tls_truncated: AtomicU64,
@@ -632,6 +634,7 @@ impl Metrics {
             connections_rejected_per_ip: AtomicU64::new(0),
             connections_rejected_global: AtomicU64::new(0),
             upstream_failovers_total: AtomicU64::new(0),
+            upstream_connections_opened: AtomicU64::new(0),
             upstream_body_errors_tls_truncated: AtomicU64::new(0),
             upstream_body_errors_other: AtomicU64::new(0),
             enforcement_denied_class: AtomicU64::new(0),
@@ -1584,6 +1587,17 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.health_probe_last_round_timestamp_seconds.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+        out.extend_from_slice(
+            b"# HELP zion_upstream_connections_opened_total TCP connections established to upstreams (the pool, health probes and cache fetches). A rate far above the request rate to the same upstreams means connections are not being reused: each one closed leaves a local port in TIME_WAIT.\n\
+                                # TYPE zion_upstream_connections_opened_total counter\n\
+                                zion_upstream_connections_opened_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.upstream_connections_opened.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");

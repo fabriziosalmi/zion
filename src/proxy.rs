@@ -70,10 +70,66 @@ pub type ZionBody = BoxBody<Bytes, hyper::Error>;
 /// Plain HTTP upstreams use HttpConnector; HTTPS upstreams negotiate H2 via ALPN.
 pub type HttpClient = Client<
     hyper_rustls::HttpsConnector<
-        hyper_util::client::legacy::connect::HttpConnector<crate::dns::StaleOnErrorResolver>,
+        CountingConnector<
+            hyper_util::client::legacy::connect::HttpConnector<crate::dns::StaleOnErrorResolver>,
+        >,
     >,
     ZionBody,
 >;
+
+fn counting<C>(inner: C) -> CountingConnector<C> {
+    CountingConnector {
+        inner,
+        opened: &crate::metrics::METRICS.upstream_connections_opened,
+    }
+}
+
+/// A connector that counts the connections it establishes (`zion_upstream_connections_opened_total`).
+///
+/// A burst of requests the pool cannot serve from idle connections opens one connection each,
+/// closes the surplus as they come back, and does it again for the next burst; every close
+/// leaves a local port in TIME_WAIT, and a sustained rate runs the ports out (#571). The rate
+/// of this counter is how that is seen before the `502`s are. It counts TCP connects that
+/// succeeded (the TLS handshake on top of them is not part of it).
+#[derive(Clone)]
+pub struct CountingConnector<C> {
+    inner: C,
+    /// Where the successes are counted: `METRICS.upstream_connections_opened` in the proxy.
+    opened: &'static std::sync::atomic::AtomicU64,
+}
+
+impl<C> tower_service::Service<hyper::Uri> for CountingConnector<C>
+where
+    C: tower_service::Service<hyper::Uri>,
+    C::Future: Send + 'static,
+    C::Response: Send + 'static,
+    C::Error: Send + 'static,
+{
+    type Response = C::Response;
+    type Error = C::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<C::Response, C::Error>> + Send + 'static>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, dst: hyper::Uri) -> Self::Future {
+        let connecting = self.inner.call(dst);
+        let opened = self.opened;
+        Box::pin(async move {
+            let connected = connecting.await;
+            if connected.is_ok() {
+                opened.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            connected
+        })
+    }
+}
 
 /// Default per-upstream TCP connect deadline (`connect_timeout_ms`).
 pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 3000;
@@ -299,9 +355,9 @@ pub fn build_client(spec: &ClientSpec) -> HttpClient {
     .https_or_http()
     .enable_http1();
     let https = if http1_only {
-        builder.wrap_connector(http)
+        builder.wrap_connector(counting(http))
     } else {
-        builder.enable_http2().wrap_connector(http)
+        builder.enable_http2().wrap_connector(counting(http))
     };
 
     Client::builder(TokioExecutor::new())
@@ -1295,6 +1351,50 @@ async fn send_ws_upgrade(
 
 #[cfg(test)]
 mod tests {
+    /// What the counter counts: connections that were established, not attempts that failed.
+    #[tokio::test]
+    async fn the_connector_counts_connections_that_succeeded() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        use tower_service::Service;
+        static OPENED: AtomicU64 = AtomicU64::new(0);
+        #[derive(Clone)]
+        struct Fake(bool);
+        impl Service<hyper::Uri> for Fake {
+            type Response = ();
+            type Error = std::io::Error;
+            type Future = std::future::Ready<Result<(), std::io::Error>>;
+            fn poll_ready(
+                &mut self,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _: hyper::Uri) -> Self::Future {
+                std::future::ready(if self.0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other("refused"))
+                })
+            }
+        }
+        let uri: hyper::Uri = "http://upstream:1/".parse().unwrap();
+        let mut up = CountingConnector {
+            inner: Fake(true),
+            opened: &OPENED,
+        };
+        let mut down = CountingConnector {
+            inner: Fake(false),
+            opened: &OPENED,
+        };
+        for _ in 0..3 {
+            up.call(uri.clone()).await.unwrap();
+        }
+        for _ in 0..5 {
+            down.call(uri.clone()).await.unwrap_err();
+        }
+        assert_eq!(OPENED.load(Relaxed), 3, "three connected, five refused");
+    }
+
     /// The error as hyper hands it over: the I/O error is a link in a chain, not the top.
     #[derive(Debug)]
     struct Wrapped(Box<dyn std::error::Error + Send + Sync>);
