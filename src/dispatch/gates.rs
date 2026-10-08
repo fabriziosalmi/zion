@@ -19,6 +19,8 @@ use crate::http_util::{
 use crate::metrics;
 use crate::routing::ResolvedRoute;
 use crate::state::{AppState, ResolvedAppConfig};
+#[cfg(feature = "auth")]
+use crate::{auth, http_util::unauthorized};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
@@ -145,6 +147,66 @@ pub(crate) fn uri_too_long<B>(req: &Request<B>) -> bool {
 /// Gate: URI length (reject oversized URIs before routing).
 fn uri_length(req: &Request<ZionBody>) -> Option<Response<ZionBody>> {
     uri_too_long(req).then(|| empty_response(StatusCode::URI_TOO_LONG))
+}
+
+/// Gate: auth (JWT/OIDC). `Some` is the 401/403 that ends the request; on success the claims the
+/// profile forwards are set as `X-Auth-*` headers.
+#[cfg(feature = "auth")]
+pub(super) fn bearer_auth(
+    rule: &ResolvedRoute,
+    req: &mut Request<ZionBody>,
+) -> Option<Response<ZionBody>> {
+    if let Some(ref auth_profile) = rule.auth {
+        let auth_header = req
+            .headers()
+            .get(hyper::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+
+        match auth_header {
+            Some(header_val) => {
+                match auth::extract_bearer(header_val) {
+                    Some(token) => {
+                        match auth::validate_token(token, auth_profile) {
+                            Ok(claims) => {
+                                // Inject decoded claims as headers for upstream
+                                if auth_profile.forward_claims {
+                                    if let Some(ref sub) = claims.sub {
+                                        if let Ok(v) = hyper::header::HeaderValue::from_str(sub) {
+                                            req.headers_mut().insert("X-Auth-Subject", v);
+                                        }
+                                    }
+                                    if let Some(ref email) = claims.email {
+                                        if let Ok(v) = hyper::header::HeaderValue::from_str(email) {
+                                            req.headers_mut().insert("X-Auth-Email", v);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(auth::AuthError::Expired) => {
+                                return Some(unauthorized(
+                                    "token expired",
+                                    "Bearer error=\"invalid_token\", error_description=\"token expired\"",
+                                ));
+                            }
+                            Err(_) => {
+                                return Some(empty_response(StatusCode::FORBIDDEN));
+                            }
+                        }
+                    }
+                    None => {
+                        return Some(unauthorized(
+                            "invalid authorization",
+                            "Bearer error=\"invalid_token\"",
+                        ));
+                    }
+                }
+            }
+            None => {
+                return Some(unauthorized("authorization required", "Bearer"));
+            }
+        }
+    }
+    None
 }
 
 /// Gate: normalize the request path (RFC 3986 §6.2.2) before anything decides from it.

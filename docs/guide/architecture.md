@@ -13,6 +13,7 @@ src/
 ├── state.rs       # AppState, ResolvedAppConfig (ArcSwap snapshot) and the per-source limiters shared by every handler
 ├── http_util.rs   # Request-ID generation and the small response builders (empty/text/405/401, security headers)
 ├── dispatch.rs    # Request pipeline: routing (LRU + radix), WAF gates, cache, CORS, metrics; thread-local route LRU lives here
+├── dispatch/      # The pipeline's stages as modules: `gates` (pre-routing, CORS, auth), `route` (route lookup, upstream choice), `waf_gate` (URI, headers, body), `telemetry` (trace context, access log)
 ├── config.rs      # TOML schema (serde types), parsing and validation
 ├── routing.rs     # Resolves the parsed routes into ResolvedRoute + the host-aware radix HostRouter
 ├── tls.rs         # TLS config, SNI resolution, session tickets, 0-RTT, hot-reload, predictive prewarming

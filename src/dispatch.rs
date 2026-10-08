@@ -43,23 +43,20 @@ use crate::{
     breaker, cache, config, health, logging, metrics, observability, proxy, security, uri_norm,
     vary, waf,
 };
-use std::borrow::Cow;
-// `unauthorized` is only referenced from the JWT/OIDC auth gate.
-#[cfg(feature = "auth")]
-use crate::http_util::unauthorized;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::sync::Arc;
-
-#[cfg(feature = "auth")]
-use crate::auth;
 
 use crate::routing::ResolvedRoute;
 use http_body_util::Limited;
 
 mod gates;
+mod route;
+mod telemetry;
+mod waf_gate;
 pub(crate) use gates::uri_too_long;
 
 /// Issue #151: turn an enforcement *deny* into a bounded held (tarpit)
@@ -294,6 +291,7 @@ pub(crate) fn scrub_reserved_identity_headers(headers: &mut hyper::HeaderMap) {
     crate::reserved_headers::scrub(headers, crate::reserved_headers::Asserter::Pipeline);
 }
 
+/// Run the whole pipeline for one request. See [`process_request`] for what wraps it.
 async fn process_request_inner(
     mut req: Request<ZionBody>,
     state: Arc<AppState>,
@@ -346,72 +344,8 @@ async fn process_request_inner(
         return Ok(resp);
     }
 
-    // ── Route lookup (thread-local LRU + radix tree fallback) ──
-    // Hot routes hit the thread-local cache in ~5ns. Cache misses fall through
-    // to the radix tree (~30ns) and are promoted to MRU. The cache is a true
-    // O(1) LRU bounded at ROUTE_CACHE_CAP entries: when full, the LRU entry is
-    // evicted on insert. The earlier "if len < 256 { insert }" stopped
-    // promoting any new path once the cap was reached, so a client hitting
-    // 256 distinct paths first (cache-busted CDN paths, scanners) permanently
-    // locked out subsequent hot routes for the worker thread.
-    thread_local! {
-        static ROUTE_CACHE: std::cell::RefCell<route_cache::RouteCache<Arc<ResolvedRoute>>> =
-            std::cell::RefCell::new(route_cache::RouteCache::new(route_cache::ROUTE_CACHE_CAP));
-        // The configuration the cache above was filled from. Held (not just compared by
-        // address) so that address cannot be reused by a later config while we compare.
-        static ROUTE_CACHE_CONFIG: std::cell::RefCell<Option<Arc<ResolvedAppConfig>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    // A cached route carries the policy of the configuration it was resolved under
-    // (`internal_only`, WAF and auth profiles, upstream). After a hot reload the next
-    // request must see the NEW policy, so a cache filled under a previous snapshot is
-    // dropped on first use. Cost on the hot path: one pointer comparison.
-    ROUTE_CACHE_CONFIG.with(|owner| {
-        let mut owner = owner.borrow_mut();
-        if !owner.as_ref().is_some_and(|c| Arc::ptr_eq(c, &cfg)) {
-            ROUTE_CACHE.with(|cache| cache.borrow_mut().clear());
-            *owner = Some(cfg.clone());
-        }
-    });
-
-    let rule = {
-        let path = req.uri().path();
-
-        // Host-based routing (ADR-0010): extract the normalized authority only
-        // when a route is host-bound — hostless deployments skip this entirely.
-        // The URI :authority (HTTP/2 / absolute-form) wins over the Host header
-        // (HTTP/1 origin-form).
-        let host_cow = if cfg.router.host_routing_active() {
-            crate::security::request_host(&req)
-        } else {
-            None
-        };
-        let host = host_cow.as_deref();
-
-        // Cache key folds the host in when present, so two authorities sharing a
-        // path never collide (ADR-0010 cache invariant); with no host it is the
-        // bare path hash — byte-identical to the pre-host-routing key.
-        let cache_key = route_cache_key(host, path);
-
-        // Thread-local cache hit (~5ns) — touch promotes to MRU
-        let cached = ROUTE_CACHE.with(|cache| cache.borrow_mut().get(cache_key));
-
-        if let Some(route) = cached {
-            route
-        } else {
-            // Radix tree fallback (~30ns)
-            match cfg.router.at(host, path) {
-                Some(matched) => {
-                    let route = matched.clone();
-                    ROUTE_CACHE.with(|cache| {
-                        cache.borrow_mut().insert(cache_key, route.clone());
-                    });
-                    route
-                }
-                None => return Ok(empty_response(StatusCode::NOT_FOUND)),
-            }
-        }
+    let Some(rule) = route::resolve(&cfg, &req) else {
+        return Ok(empty_response(StatusCode::NOT_FOUND));
     };
 
     // ── CORS (per-route): a preflight or a refused origin answers here ──
@@ -425,477 +359,104 @@ async fn process_request_inner(
         return Ok(resp);
     }
 
-    // --- Gate: Upstream health check + Latency Routing (B-04) ---
-    // Select the healthy upstream with the lowest latency. A `mode="static"`
-    // route serves from disk and has NO upstream, so it must skip this gate —
-    // otherwise `select_best_upstream` sees an empty list and 503s before the
-    // `RouteMode::Static` arm can run. The placeholder is only parsed into
-    // dyn_scheme/authority, which that arm never reads (WAF/auth/CSP/security
-    // headers still apply on the way down).
-    static EMPTY_UPSTREAM: String = String::new();
-    // A pool picks by its configured algorithm in every proxy mode, so ejected and
-    // overloaded members are avoided by SSE, WebSocket and cached routes too (in-flight and
-    // outlier accounting happen on `Standard` routes only). A single endpoint keeps the plain
-    // lookup, whose "everything gray is 503" behaviour is unchanged.
-    let selected = if rule.upstream_url.len() > 1 {
-        pool::pick(
-            &cfg.health_map,
-            &rule.upstream_url,
-            rule.load_balancing,
-            breaker::now_ms(),
-            &mut |n| fastrand::usize(..n),
-        )
-    } else {
-        health::select_best_upstream(&cfg.health_map, &rule.upstream_url)
-    };
-    let target_upstream_url = match selected {
-        Some(url) => url,
-        None if rule.mode == config::RouteMode::Static => &EMPTY_UPSTREAM,
-        None => {
-            return Ok(text_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "upstream unavailable",
-            ));
-        }
-    };
-
-    // Resolve scheme + authority for the selected upstream. Fast path: a
-    // single-upstream (or static, empty) route always resolves to
-    // `upstream_url[0]`, whose scheme+authority were parsed ONCE at
-    // config-build time into `rule.upstream_scheme` / `rule.upstream_authority`
-    // — so skip the per-request `hyper::Uri` parse entirely (the common case).
-    // Only a multi-upstream HA/latency pool, where the selected member varies
-    // per request, needs to parse the chosen URL.
-    //
-    // SAFETY (inner unwrap on the slow path): "/" is a compile-time-constant
-    // single-char URI that always parses. Used as a defensive fallback if a
-    // hot-reload sneaks in a bad URL (config validation should have caught it).
-    let (dyn_scheme, dyn_authority) = if rule.upstream_url.len() <= 1 {
-        (
-            rule.upstream_scheme.clone(),
-            rule.upstream_authority.clone(),
-        )
-    } else {
-        let target_uri: hyper::Uri = target_upstream_url
-            .parse()
-            .unwrap_or_else(|_| "/".parse().unwrap());
-        (
-            target_uri
-                .scheme()
-                .cloned()
-                .unwrap_or_else(|| rule.upstream_scheme.clone()),
-            target_uri
-                .authority()
-                .cloned()
-                .unwrap_or_else(|| rule.upstream_authority.clone()),
-        )
+    // --- Upstream: health check + latency routing (B-04) ---
+    let (dyn_scheme, dyn_authority) = match route::select_upstream(&cfg, &rule) {
+        Ok(target) => target,
+        Err(resp) => return Ok(resp),
     };
 
     // --- Gate: Auth (JWT/OIDC) ---
     #[cfg(feature = "auth")]
-    if let Some(ref auth_profile) = rule.auth {
-        let auth_header = req
-            .headers()
-            .get(hyper::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok());
-
-        match auth_header {
-            Some(header_val) => {
-                match auth::extract_bearer(header_val) {
-                    Some(token) => {
-                        match auth::validate_token(token, auth_profile) {
-                            Ok(claims) => {
-                                // Inject decoded claims as headers for upstream
-                                if auth_profile.forward_claims {
-                                    if let Some(ref sub) = claims.sub {
-                                        if let Ok(v) = hyper::header::HeaderValue::from_str(sub) {
-                                            req.headers_mut().insert("X-Auth-Subject", v);
-                                        }
-                                    }
-                                    if let Some(ref email) = claims.email {
-                                        if let Ok(v) = hyper::header::HeaderValue::from_str(email) {
-                                            req.headers_mut().insert("X-Auth-Email", v);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(auth::AuthError::Expired) => {
-                                return Ok(unauthorized(
-                                    "token expired",
-                                    "Bearer error=\"invalid_token\", error_description=\"token expired\"",
-                                ));
-                            }
-                            Err(_) => {
-                                return Ok(empty_response(StatusCode::FORBIDDEN));
-                            }
-                        }
-                    }
-                    None => {
-                        return Ok(unauthorized(
-                            "invalid authorization",
-                            "Bearer error=\"invalid_token\"",
-                        ));
-                    }
-                }
-            }
-            None => {
-                return Ok(unauthorized("authorization required", "Bearer"));
-            }
-        }
+    if let Some(resp) = gates::bearer_auth(&rule, &mut req) {
+        return Ok(resp);
     }
 
     // --- Gate: WAF ---
-    if let Some(ref waf_profile) = rule.waf {
-        // Map method to a static str to avoid allocation and lifetime issues
-        let method: &'static str = match *req.method() {
-            hyper::Method::GET => "GET",
-            hyper::Method::POST => "POST",
-            hyper::Method::PUT => "PUT",
-            hyper::Method::PATCH => "PATCH",
-            hyper::Method::DELETE => "DELETE",
-            hyper::Method::HEAD => "HEAD",
-            hyper::Method::OPTIONS => "OPTIONS",
-            _ => "OTHER",
-        };
+    req = match waf_gate::run(&rule, &state, remote_addr, req).await {
+        Ok(req) => req,
+        Err(resp) => return Ok(resp),
+    };
 
-        // Gate: WAF URI scan (catches SQLi/XSS in query parameters for ALL methods)
-        let uri_str = req
-            .uri()
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or_else(|| req.uri().path());
-        if let waf::WafVerdict::Deny(reason) = waf::validate_uri(uri_str, waf_profile.mode) {
-            if rule.waf_shadow {
-                metrics::METRICS
-                    .waf_shadow_would_block
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                logging::warn(
-                    "waf_shadow",
-                    &format!("would_block=true source=uri reason={reason} path={uri_str}"),
-                );
-                // Fall through — shadow mode never denies the request.
-            } else {
-                metrics::METRICS
-                    .waf_denied
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                logging::info("waf", &format!("URI denied: {reason} ({uri_str})"));
-                emit_waf_block(&state, &remote_addr, method, uri_str, "uri", &reason);
-                return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
-            }
-        }
+    mark_request_for_forwarding(&mut req, &rule);
 
-        // Gate: WAF header scan (opt-in per profile: `scan_headers`). The URI and the body
-        // are not the only places a payload travels: Log4Shell arrived in `User-Agent`.
-        if let Some((header, reason)) = waf::validate_headers(req.headers(), waf_profile) {
-            if rule.waf_shadow {
-                metrics::METRICS
-                    .waf_shadow_would_block
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                logging::warn(
-                    "waf_shadow",
-                    &format!(
-                        "would_block=true source=header reason={reason} header={header} path={uri_str}"
-                    ),
-                );
-                // Fall through — shadow mode never denies the request.
-            } else {
-                metrics::METRICS
-                    .waf_denied
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // The header's name, never its value: it may be a cookie or a token.
-                logging::info("waf", &format!("header denied: {reason} ({header})"));
-                emit_waf_block(&state, &remote_addr, method, uri_str, "header", reason);
-                return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
-            }
-        }
+    // --- Gate: WebSocket upgrade detection ---
+    // Check for Upgrade: websocket on ANY route (or explicit websocket mode)
+    let is_websocket = rule.mode == config::RouteMode::Websocket
+        || req
+            .headers()
+            .get(hyper::header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false);
 
-        // ── Gate: ML scorer (Track C, --features ml-waf) ─────────────
-        // Anomaly score over URI + headers. Cheap (~50µs p50, 200µs p99
-        // budget enforced via metrics, not active cancel). Returns None
-        // when the model is disabled or failed to load — fall through.
-        #[cfg(feature = "ml-waf")]
-        if let Some(verdict) = crate::waf_ml::evaluate(method, uri_str, req.headers()) {
-            if verdict.over_budget {
-                logging::warn(
-                    "waf_ml",
-                    &format!(
-                        "score over budget: elapsed_us={} score={:.3} path={}",
-                        verdict.elapsed_us, verdict.score, uri_str
-                    ),
-                );
-            }
-            if verdict.denies {
-                let reason = "ml score above threshold";
-                if rule.waf_shadow {
-                    metrics::METRICS
-                        .waf_shadow_would_block
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    logging::warn(
-                        "waf_shadow",
-                        &format!(
-                            "would_block=true source=ml score={:.3} path={uri_str}",
-                            verdict.score
-                        ),
-                    );
-                } else {
-                    metrics::METRICS
-                        .waf_denied
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    logging::info(
-                        "waf_ml",
-                        &format!(
-                            "denied: score={:.3} elapsed_us={} path={}",
-                            verdict.score, verdict.elapsed_us, uri_str
-                        ),
-                    );
-                    emit_waf_block(&state, &remote_addr, method, uri_str, "ml", reason);
-                    return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
-                }
-            }
-        }
+    let mut admission = match admit(&cfg, &rule, is_websocket) {
+        Ok(admission) => admission,
+        Err(resp) => return Ok(resp),
+    };
 
-        // Read and scan the body of the methods that carry one, and of any other request
-        // that actually has one (Content-Length / chunked on HTTP/1, an open stream on
-        // HTTP/2): a GET body is forwarded to the upstream, so it is scanned like the rest.
-        let has_body = !hyper::body::Body::is_end_stream(req.body());
-        if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") || has_body {
-            let (parts, body) = req.into_parts();
-
-            // Borrow content-type from parts.headers — no String allocation needed.
-            // The header lives in `parts` which is alive through this scope.
-            let ct: Option<&str> = parts
-                .headers
-                .get(hyper::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok());
-
-            let max_body_bytes = (waf_profile.max_body_mb * 1_048_576) as usize;
-
-            // ── Body collection: streaming (#49) vs buffered ──────────────
-            // When `[waf_profile.X] streaming = true`, the dispatcher feeds
-            // each frame to a StreamingScanner as it arrives off the wire.
-            // An injection pattern in the first chunk denies before the
-            // rest of the upload is read. The frames are tee'd into a
-            // BytesMut and reassembled on Allow so the regular
-            // `validate_request` pipeline still runs the encoded-payload
-            // pass + entropy + JSON gates that the streamer does not cover.
-            //
-            // On the buffered path (default) `Limited::new` enforces the
-            // size cap; on the streaming path the StreamingScanner does
-            // the same incrementally and emits its own size-exceeded deny.
-            let body_bytes = if waf_profile.streaming {
-                let mut scanner =
-                    waf::StreamingScanner::new(waf_profile.mode, max_body_bytes as u64);
-                let mut chunks: Vec<Bytes> = Vec::new();
-                let mut total: usize = 0;
-                let mut body = body;
-                let mut early_deny: Option<&'static str> = None;
-                loop {
-                    match tokio::time::timeout(BODY_FRAME_IDLE_TIMEOUT, BodyExt::frame(&mut body))
-                        .await
-                    {
-                        Ok(Some(Ok(frame))) => match frame.into_data() {
-                            Ok(data) => {
-                                match scanner.feed(&data) {
-                                    waf::StreamVerdict::Allow => {}
-                                    waf::StreamVerdict::Deny(reason) => {
-                                        early_deny = Some(reason);
-                                        break;
-                                    }
-                                }
-                                total += data.len();
-                                chunks.push(data);
-                            }
-                            // Trailers / non-data frames: ignore (no body bytes).
-                            Err(_other) => continue,
-                        },
-                        Ok(Some(Err(e))) => {
-                            log_body_failure(
-                                &remote_addr,
-                                method,
-                                parts.uri.path(),
-                                &e.to_string(),
-                            );
-                            return Ok(text_response(
-                                StatusCode::BAD_REQUEST,
-                                "request body read error",
-                            ));
-                        }
-                        Ok(None) => break, // EOF
-                        Err(_elapsed) => {
-                            log_body_failure(
-                                &remote_addr,
-                                method,
-                                parts.uri.path(),
-                                "no data for 30 s",
-                            );
-                            return Ok(text_response(
-                                StatusCode::REQUEST_TIMEOUT,
-                                "request body read timeout",
-                            ));
-                        }
-                    }
-                }
-
-                if let Some(reason) = early_deny {
-                    if rule.waf_shadow {
-                        metrics::METRICS
-                            .waf_shadow_would_block
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        logging::warn(
-                            "waf_shadow",
-                            &format!(
-                                "would_block=true source=body_streaming method={} reason={} path={}",
-                                method,
-                                reason,
-                                parts.uri.path()
-                            ),
-                        );
-                        // Shadow mode: don't deny. We did NOT read the rest
-                        // of the body off the wire; reconstruct from what
-                        // we have and forward — this produces a truncated
-                        // request to upstream, which is the correct shadow-
-                        // mode trade-off (we never silently buffer attacks
-                        // for the upstream after a streaming match).
-                    } else {
-                        metrics::METRICS
-                            .waf_denied
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        emit_waf_block(
-                            &state,
-                            &remote_addr,
-                            method,
-                            parts.uri.path(),
-                            "body",
-                            reason,
-                        );
-                        return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
-                    }
-                }
-
-                // Reassemble Bytes from the frame Vec for the buffered
-                // re-validation + upstream forward.
-                let mut buf = bytes::BytesMut::with_capacity(total);
-                for c in &chunks {
-                    buf.extend_from_slice(c);
-                }
-                buf.freeze()
-            } else {
-                let limited = Limited::new(body, max_body_bytes);
-                match tokio::time::timeout(BODY_COLLECT_TIMEOUT, BodyExt::collect(limited)).await {
-                    Ok(Ok(collected)) => collected.to_bytes(),
-                    Ok(Err(e)) => {
-                        let (status, msg) = body_read_failure(e.as_ref());
-                        if status != StatusCode::PAYLOAD_TOO_LARGE {
-                            log_body_failure(
-                                &remote_addr,
-                                method,
-                                parts.uri.path(),
-                                &e.to_string(),
-                            );
-                        }
-                        return Ok(text_response(status, msg));
-                    }
-                    Err(_elapsed) => {
-                        log_body_failure(
-                            &remote_addr,
-                            method,
-                            parts.uri.path(),
-                            "not complete after 60 s",
-                        );
-                        return Ok(text_response(
-                            StatusCode::REQUEST_TIMEOUT,
-                            "request body read timeout",
-                        ));
-                    }
-                }
-            };
-
-            // On the streaming path the raw Aho-Corasick pass already ran
-            // incrementally over these bytes, so skip the redundant buffered
-            // raw scan; the encoded/entropy/JSON gates still run.
-            let verdict = if waf_profile.streaming {
-                waf::validate_request_prescanned(method, ct, &body_bytes, waf_profile)
-            } else {
-                waf::validate_request(method, ct, &body_bytes, waf_profile)
-            };
-            if let waf::WafVerdict::Deny(reason) = verdict {
-                if rule.waf_shadow {
-                    metrics::METRICS
-                        .waf_shadow_would_block
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    logging::warn(
-                        "waf_shadow",
-                        &format!(
-                            "would_block=true source=body method={} reason={} path={}",
-                            method,
-                            reason,
-                            parts.uri.path()
-                        ),
-                    );
-                    // Fall through — request body is reassembled below.
-                } else {
-                    metrics::METRICS
-                        .waf_denied
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    emit_waf_block(
-                        &state,
-                        &remote_addr,
-                        method,
-                        parts.uri.path(),
-                        "body",
-                        &reason,
-                    );
-                    return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
-                }
-            }
-
-            // Re-assemble request with validated body for dispatch below.
-            // Do NOT return early — fall through to post-response processing
-            // (CORS, metrics, request-ID, security headers).
-            let body: ZionBody = Full::new(body_bytes)
-                .map_err(|never| match never {})
-                .boxed();
-            req = Request::from_parts(parts, body);
-        } else {
-            // GET/HEAD/DELETE/OPTIONS — no body to validate
-            let ct = req
-                .headers()
-                .get(hyper::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok());
-            let verdict = waf::validate_request(method, ct, &[], waf_profile);
-            if let waf::WafVerdict::Deny(reason) = verdict {
-                if rule.waf_shadow {
-                    metrics::METRICS
-                        .waf_shadow_would_block
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    logging::warn(
-                        "waf_shadow",
-                        &format!(
-                            "would_block=true source=headers method={} reason={} path={}",
-                            method,
-                            reason,
-                            req.uri().path()
-                        ),
-                    );
-                    // Fall through — shadow mode never denies the request.
-                } else {
-                    metrics::METRICS
-                        .waf_denied
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    emit_waf_block(
-                        &state,
-                        &remote_addr,
-                        method,
-                        req.uri().path(),
-                        "headers",
-                        &reason,
-                    );
-                    return Ok(text_response(StatusCode::BAD_REQUEST, "request rejected"));
-                }
-            }
-        }
+    if is_websocket {
+        return websocket_upgrade(
+            req,
+            &cfg,
+            &dyn_scheme,
+            &dyn_authority,
+            forward_addr,
+            &admission.breaker_up,
+            admission.breaker_probe.take(),
+        )
+        .await;
     }
 
+    let trace = telemetry::stamp(&mut req);
+    let access = telemetry::capture(&cfg, &state, &req);
+
+    // --- Dispatch by mode ---
+    let resp = dispatch_by_mode(
+        req,
+        &state,
+        &cfg,
+        &rule,
+        remote_addr,
+        forward_addr,
+        &dyn_scheme,
+        &dyn_authority,
+        admission.breaker_up.clone(),
+    )
+    .await?;
+    let mut resp = finish_response(resp, &rule, admission);
+
+    let request_elapsed = request_start.elapsed();
+    telemetry::record(
+        &state,
+        &cfg,
+        remote_addr,
+        &resp,
+        request_elapsed,
+        &trace,
+        &access,
+    );
+
+    // CORS: add Access-Control-Allow-Origin on actual requests
+    if let Some(allow) = cors_allow_origin {
+        resp.headers_mut()
+            .insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, allow);
+    }
+
+    // X-Request-ID on response (echo from request for client correlation)
+    if let Some(rid) = trace.request_id {
+        resp.headers_mut().insert("X-Request-ID", rid);
+    }
+
+    // Alt-Svc: advertise HTTP/3 to clients (zero cost if feature disabled)
+    #[cfg(feature = "http3")]
+    resp.headers_mut()
+        .insert("Alt-Svc", crate::quic::ALT_SVC_H3.clone());
+
+    Ok(resp)
+}
+
+/// Mark the request with what the forwarding paths need to know about its route.
+fn mark_request_for_forwarding(req: &mut Request<ZionBody>, rule: &ResolvedRoute) {
     // `[upstream.x] preserve_host` (ADR-0024): mark the request once here, where the route
     // is known; the forwarding hygiene every proxy path shares reads the mark.
     if rule.preserve_host {
@@ -911,17 +472,25 @@ async fn process_request_inner(
     if let Some(t) = rule.request_timeout() {
         req.extensions_mut().insert(t);
     }
+}
 
-    // --- Gate: WebSocket upgrade detection ---
-    // Check for Upgrade: websocket on ANY route (or explicit websocket mode)
-    let is_websocket = rule.mode == config::RouteMode::Websocket
-        || req
-            .headers()
-            .get(hyper::header::UPGRADE)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.eq_ignore_ascii_case("websocket"))
-            .unwrap_or(false);
+/// What a request holds while it is being served: the bulkhead slot, the circuit breaker (when the
+/// route has one) and the half-open probe token, if this request is the probe.
+struct Admission {
+    bulkhead_permit: Option<bulkhead::Permit>,
+    breaker_up: Option<Arc<health::UpstreamHealth>>,
+    breaker_probe: Option<breaker::ProbeToken>,
+}
 
+/// Take the bulkhead slot and ask the circuit breaker. `Err` is the 503 that ends the request.
+// The Err is the response itself, built once on a rejection: boxing it would add an allocation to
+// every shed request for nothing.
+#[allow(clippy::result_large_err)]
+fn admit(
+    cfg: &ResolvedAppConfig,
+    rule: &ResolvedRoute,
+    is_websocket: bool,
+) -> Result<Admission, Response<ZionBody>> {
     // --- Circuit breaker (opt-in, `[upstream.x] circuit_breaker`) ---
     // After auth and the WAF, so an unauthenticated or hostile request can neither learn that
     // the circuit is open nor use up its probe. Resolved from THIS request's config snapshot
@@ -946,7 +515,7 @@ async fn process_request_inner(
         if let Some(name) = &rule.upstream_name {
             match bulkhead::counter(name).try_acquire(rule.max_in_flight) {
                 Some(p) => bulkhead_permit = Some(p),
-                None => return Ok(upstream_busy_response()),
+                None => return Err(upstream_busy_response()),
             }
         }
     }
@@ -963,173 +532,63 @@ async fn process_request_inner(
         if gated_here {
             match breaker_admit(entry) {
                 Ok(probe) => breaker_probe = probe,
-                Err(ms) => return Ok(circuit_open_response(ms)),
+                Err(ms) => return Err(circuit_open_response(ms)),
             }
         }
     }
 
-    if is_websocket {
-        metrics::METRICS
-            .websocket_upgrades
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let on_upgrade = hyper::upgrade::on(&mut req);
-        let mut resp = proxy::proxy_websocket(
-            req,
-            on_upgrade,
-            &dyn_scheme,
-            &dyn_authority,
-            Some(forward_addr),
-            "https",
-            cfg.xff_mode,
-        )
-        .await?;
-        if let Some(entry) = &breaker_up {
-            breaker_record(entry, resp.status(), breaker_probe.take());
-        }
-        inject_security_headers(&mut resp);
-        return Ok(resp);
+    Ok(Admission {
+        bulkhead_permit,
+        breaker_up,
+        breaker_probe,
+    })
+}
+
+/// The WebSocket upgrade: the handshake goes to the upstream and the connection is then tunnelled.
+async fn websocket_upgrade(
+    mut req: Request<ZionBody>,
+    cfg: &ResolvedAppConfig,
+    dyn_scheme: &hyper::http::uri::Scheme,
+    dyn_authority: &hyper::http::uri::Authority,
+    forward_addr: SocketAddr,
+    breaker_up: &Option<Arc<health::UpstreamHealth>>,
+    breaker_probe: Option<breaker::ProbeToken>,
+) -> Result<Response<ZionBody>, hyper::Error> {
+    metrics::METRICS
+        .websocket_upgrades
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    let mut resp = proxy::proxy_websocket(
+        req,
+        on_upgrade,
+        &dyn_scheme,
+        &dyn_authority,
+        Some(forward_addr),
+        "https",
+        cfg.xff_mode,
+    )
+    .await?;
+    if let Some(entry) = &breaker_up {
+        breaker_record(entry, resp.status(), breaker_probe);
     }
+    inject_security_headers(&mut resp);
+    Ok(resp)
+}
 
-    // ── Request ID (preserve client's or generate new) ──
-    let has_client_id = req.headers().contains_key("X-Request-ID");
-    let generated_id: [u8; 21];
-    if !has_client_id {
-        generated_id = generate_request_id();
-        // SAFETY: all bytes are ASCII hex digits or '-'
-        if let Ok(val) = hyper::header::HeaderValue::from_bytes(&generated_id) {
-            req.headers_mut().insert("X-Request-ID", val);
-        }
-    }
-
-    // ── W3C Trace Context propagation ──
-    // 1. If the client sent `traceparent`, validate it. A valid header is
-    //    propagated unchanged so end-to-end traces stitch in Tempo/Jaeger.
-    //    A malformed header is dropped (we replace with a freshly-generated
-    //    one) and `zion_traces_invalid_total` is bumped — we never forward
-    //    junk to upstreams.
-    // 2. If absent (or invalid), generate one with the same zero-alloc
-    //    stack-buffer scheme used historically.
-    //
-    // The 16-byte trace ID is captured into `trace_id_bytes` regardless,
-    // so the latency histogram can attach it as an OpenMetrics exemplar.
-    let trace_id_bytes: [u8; 16];
-    let inbound_valid = req
-        .headers()
-        .get("traceparent")
-        .and_then(|v| observability::parse_traceparent(v.as_bytes()));
-
-    if let Some(ctx) = inbound_valid {
-        trace_id_bytes = ctx.trace_id;
-    } else {
-        // Either no header, or the value was malformed. Bump the invalid
-        // counter only when a header was actually present.
-        if req.headers().contains_key("traceparent") {
-            observability::TRACES_INVALID_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // Generate: 00-{32hex trace_id}-{16hex span_id}-01
-        // Zero-alloc: stack buffer + hex lookup table (no format! calls).
-        let ts_us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
-        let seq = REQUEST_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
-
-        // Build the trace ID once, in raw bytes — we both stringify it for
-        // the header and keep it for the exemplar.
-        let mut tid = [0u8; 16];
-        tid[0..8].copy_from_slice(&ts_us.to_be_bytes());
-        tid[8..16].copy_from_slice(&seq.to_be_bytes());
-        trace_id_bytes = tid;
-
-        let mut buf = [0u8; 55]; // "00-" + 32hex + "-" + 16hex + "-01"
-        buf[0..3].copy_from_slice(b"00-");
-        for (i, &byte) in tid.iter().enumerate() {
-            buf[3 + i * 2] = HEX_DIGITS[(byte >> 4) as usize];
-            buf[3 + i * 2 + 1] = HEX_DIGITS[(byte & 0xF) as usize];
-        }
-        buf[35] = b'-';
-        // span_id: same 8 trailing bytes — sequence is unique within a process
-        // for the lifetime of `REQUEST_COUNTER`. A future change can split
-        // span IDs from request IDs; for now they coincide.
-        for i in 0..8 {
-            buf[36 + i * 2] = HEX_DIGITS[(tid[8 + i] >> 4) as usize];
-            buf[36 + i * 2 + 1] = HEX_DIGITS[(tid[8 + i] & 0xF) as usize];
-        }
-        buf[52..55].copy_from_slice(b"-01");
-        // SAFETY: all bytes are ASCII hex, '-', or '0'/'1'
-        if let Ok(val) = hyper::header::HeaderValue::from_bytes(&buf) {
-            req.headers_mut().insert("traceparent", val);
-        }
-    }
-    observability::TRACES_EMITTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    // Stringify the trace ID once (32 lowercase hex) so BOTH the access-log
-    // line and the audit record can carry it. Without this an operator can see
-    // a request in the logs, or a signed audit event, but has no key to join
-    // it to the distributed trace in Tempo/Jaeger — the histogram exemplar was
-    // the only place the id surfaced.
-    let trace_hex: String = trace_id_to_hex(&trace_id_bytes);
-
-    // Pre-extract X-Request-ID for response echo (before req is consumed)
-    let request_id_val = req.headers().get("X-Request-ID").cloned();
-
-    // Capture method + path-and-query *before* the request is consumed by
-    // the proxy / cache pipeline. Used by the access-log emission below.
-    // `Method` and `String` are cheap to materialise once per request.
-    let log_method = req.method().clone();
-    let log_path_query: String = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| req.uri().path().to_string());
-
-    // Issue #60: snapshot configured headers (redacted) BEFORE the
-    // request is consumed by the proxy / cache pipeline. Emitted
-    // below as a single `headers` field carrying a JSON object —
-    // tracing's macro requires field names to be string literals,
-    // so dynamic header lists go through one structured value.
-    //
-    // mTLS fingerprint is captured separately so the access-log
-    // event can put it on a dedicated `mtls_fp` field (the value is
-    // a SHA-256 hash, never redacted).
-    //
-    // Empty/absent by default — the operator opts in via
-    // `[access_log] include_headers = [...]`.
-    let log_headers_json: Option<String> = if cfg.access_log.include_headers.is_empty() {
-        None
-    } else {
-        let pairs: std::collections::BTreeMap<&str, String> = cfg
-            .access_log
-            .include_headers
-            .iter()
-            .filter_map(|name_lc| {
-                let value = req
-                    .headers()
-                    .get(name_lc.as_str())
-                    .and_then(|v| v.to_str().ok())?;
-                let redacted = state.redact.redact_header_value(name_lc, value);
-                Some((name_lc.as_str(), redacted.into_owned()))
-            })
-            .collect();
-        if pairs.is_empty() {
-            None
-        } else {
-            // serde_json on a BTreeMap of plain types can't fail.
-            serde_json::to_string(&pairs).ok()
-        }
-    };
-    let log_mtls_fp: Option<String> = if cfg.access_log.mtls_fingerprint {
-        req.headers()
-            .get("x-client-cert-fingerprint")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-    } else {
-        None
-    };
-
-    // --- Dispatch by mode ---
-    let mut resp = if rule.cache.is_some() {
+/// Hand the request to the handler its route calls for.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_by_mode(
+    req: Request<ZionBody>,
+    state: &Arc<AppState>,
+    cfg: &ResolvedAppConfig,
+    rule: &ResolvedRoute,
+    remote_addr: SocketAddr,
+    forward_addr: SocketAddr,
+    dyn_scheme: &hyper::http::uri::Scheme,
+    dyn_authority: &hyper::http::uri::Authority,
+    breaker_up: Option<Arc<health::UpstreamHealth>>,
+) -> Result<Response<ZionBody>, hyper::Error> {
+    let resp = if rule.cache.is_some() {
         handle_static_cache(
             req,
             state.clone(),
@@ -1218,6 +677,21 @@ async fn process_request_inner(
             },
         }
     };
+    Ok(resp)
+}
+
+/// Everything done to a response before it leaves: the bulkhead slot rides with the body, the
+/// breaker hears what the upstream answered, and the headers Zion owns are set.
+fn finish_response(
+    mut resp: Response<ZionBody>,
+    rule: &ResolvedRoute,
+    admission: Admission,
+) -> Response<ZionBody> {
+    let Admission {
+        mut bulkhead_permit,
+        breaker_up,
+        mut breaker_probe,
+    } = admission;
 
     if let Some(permit) = bulkhead_permit.take() {
         resp = bulkhead::attach(resp, permit);
@@ -1248,112 +722,7 @@ async fn process_request_inner(
             .insert(hyper::header::CONTENT_SECURITY_POLICY, csp_val.clone());
     }
 
-    // Status is recorded once, centrally, in `process_request` (the wrapper),
-    // so every outcome — this completion path and every early security reject —
-    // is counted exactly once.
-
-    let request_elapsed = request_start.elapsed();
-
-    // Record request duration histogram, attaching the request's trace ID
-    // as an OpenMetrics exemplar so /metrics consumers can jump straight
-    // from a slow-bucket count to the matching trace in Tempo/Jaeger.
-    metrics::METRICS
-        .request_duration
-        .observe_with_trace(request_elapsed, trace_id_bytes);
-
-    // GDPR-aware access log (Track E). One structured event per request:
-    //   * status, method, latency_us — per-request metric data, no PII;
-    //   * path with the query string redacted via state.redact (the same
-    //     compiled policy used by audit::emit_waf_block);
-    //   * remote_ip — necessary for forensics, classified under GDPR
-    //     Art. 6(1)(f) "legitimate interest" of operating the service.
-    //
-    // The event is a no-op when no tracing subscriber consumes it. With
-    // the JSON subscriber attached, fields are written directly to the
-    // subscriber's buffer — no `format!` allocation, redaction is the
-    // only owned-`String` produced.
-    if cfg.access_log.enabled {
-        // Redact the query string per the operator's [redact] policy.
-        // Path itself is rarely sensitive and the auditor needs it; we
-        // only rewrite the part after the first `?`.
-        let path_safe: std::borrow::Cow<'_, str> = match log_path_query.split_once('?') {
-            Some((p, q)) => {
-                let q_redacted = state.redact.redact_query_string(q);
-                std::borrow::Cow::Owned(format!("{p}?{q_redacted}"))
-            }
-            None => std::borrow::Cow::Borrowed(log_path_query.as_str()),
-        };
-        tracing::info!(
-            target: "access",
-            status = resp.status().as_u16(),
-            latency_us = request_elapsed.as_micros() as u64,
-            method = %log_method,
-            path = %path_safe,
-            remote_ip = %state.redact.ip_label(remote_addr.ip()),
-            // 32-hex W3C trace id — the join key from this log line to the
-            // distributed trace (and to the matching audit record).
-            trace_id = %trace_hex,
-            // Issue #60: configured request headers, redacted via the
-            // [redact.headers] policy, packed into one JSON object so
-            // dynamic field names don't fight the tracing macro.
-            // `tracing::field::Empty` collapses absent fields to no-op.
-            headers = log_headers_json.as_deref().unwrap_or(""),
-            // mTLS fingerprint (SHA-256 hex; never redacted — already a hash).
-            mtls_fp = log_mtls_fp.as_deref().unwrap_or(""),
-            "request",
-        );
-
-        // Issue #60: when the audit log is enabled, emit a parallel
-        // `request_completed` event so compliance reviewers have a
-        // signed, HMAC-chained record alongside the unsigned tracing
-        // line. Same field set; the audit handle's `try_send` is
-        // non-blocking, so a saturated audit queue silently drops
-        // (counted via `zion_audit_events_dropped_total`).
-        if !cfg.access_log.include_headers.is_empty() || cfg.access_log.mtls_fingerprint {
-            // Compose the detail string out-of-band — keeps the audit
-            // event small and lets the operator filter by kind.
-            let mut detail_parts: Vec<String> = Vec::with_capacity(3);
-            detail_parts.push(format!(
-                "status={} latency_us={}",
-                resp.status().as_u16(),
-                request_elapsed.as_micros()
-            ));
-            if let Some(ref h) = log_headers_json {
-                detail_parts.push(format!("headers={h}"));
-            }
-            if let Some(ref fp) = log_mtls_fp {
-                detail_parts.push(format!("mtls_fp={fp}"));
-            }
-            let _ = state.audit.emit(audit::AuditEvent {
-                seq: 0,
-                ts: String::new(),
-                kind: audit::kind::REQUEST_COMPLETED,
-                trace_id: Some(trace_hex.clone()),
-                remote_ip: Some(state.redact.ip_label(remote_addr.ip()).to_string()),
-                method: Some(log_method.to_string()),
-                path: Some(path_safe.to_string()),
-                detail: Some(detail_parts.join(" ")),
-            });
-        }
-    }
-
-    // CORS: add Access-Control-Allow-Origin on actual requests
-    if let Some(allow) = cors_allow_origin {
-        resp.headers_mut()
-            .insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, allow);
-    }
-
-    // X-Request-ID on response (echo from request for client correlation)
-    if let Some(rid) = request_id_val {
-        resp.headers_mut().insert("X-Request-ID", rid);
-    }
-
-    // Alt-Svc: advertise HTTP/3 to clients (zero cost if feature disabled)
-    #[cfg(feature = "http3")]
-    resp.headers_mut()
-        .insert("Alt-Svc", crate::quic::ALT_SVC_H3.clone());
-
-    Ok(resp)
+    resp
 }
 
 /// The health entry whose circuit breaker guards this route, if it has one: the route's
