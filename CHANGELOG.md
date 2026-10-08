@@ -10,6 +10,7 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Changed
 
+- **Internal: `main.rs` no longer holds the request path.** The accept loops, the per-connection HTTPS service and the :80 handler moved to a new `accept` module (`listener` imported them from the crate root, a cycle). The :80 handler now asks the HTTPS pipeline's own function whether the target is too long, instead of a hand copy of the rule that had drifted once; the client-certificate header (strip, then set what TLS verified) is one function in `security`. The :80 length cap, which no test covered, has one now. No behaviour change. (#530)
 - **Internal: `ZionBody` lives in `http_util`, and the metrics' global scope is written down.** The body type every handler returns was defined in `proxy` (the upstream client), so the security primitives, the static file server and the bulkhead depended on the client for a type; they no longer do. The architecture guide now says why the metrics stay a process-global static and what that means for tests. No behaviour change. (#532)
 
 ### Fixed

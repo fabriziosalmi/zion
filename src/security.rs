@@ -596,6 +596,18 @@ pub fn strip_transport_attestations(headers: &mut hyper::HeaderMap) {
     crate::reserved_headers::scrub(headers, crate::reserved_headers::Asserter::Transport);
 }
 
+/// Make `X-Client-Cert-Fingerprint` say what the TLS layer verified and nothing else: drop
+/// every inbound attestation, then set the fingerprint only when the peer presented a
+/// certificate. A forged value therefore never survives to the upstream or the access log as
+/// a fake mTLS identity. The HTTPS listener calls this per request; a listener with no
+/// client certificate to report calls [`strip_transport_attestations`] alone.
+pub fn attest_client_cert(headers: &mut hyper::HeaderMap, fingerprint: Option<&str>) {
+    strip_transport_attestations(headers);
+    if let Some(value) = fingerprint.and_then(|fp| hyper::header::HeaderValue::from_str(fp).ok()) {
+        headers.insert("X-Client-Cert-Fingerprint", value);
+    }
+}
+
 /// Drop the headers only a trusted proxy may set (every copy): the caller checks the peer.
 pub fn scrub_client_override_headers(headers: &mut hyper::HeaderMap) {
     crate::reserved_headers::scrub(headers, crate::reserved_headers::Asserter::TrustedProxy);
@@ -682,6 +694,25 @@ mod proxy_tests {
         strip_transport_attestations(&mut h);
         assert_eq!(h.len(), 1, "only the forged attestations go: {h:?}");
         assert!(h.contains_key("authorization"));
+    }
+
+    #[test]
+    fn a_forged_fingerprint_is_replaced_by_the_verified_one_or_dropped() {
+        let forged = || {
+            let mut h = hyper::HeaderMap::new();
+            h.insert("x-client-cert-fingerprint", "forged".parse().unwrap());
+            h.insert("x-client-cert-dn", "forged".parse().unwrap());
+            h
+        };
+        let mut h = forged();
+        attest_client_cert(&mut h, Some("abc123"));
+        assert_eq!(h.get("X-Client-Cert-Fingerprint").unwrap(), "abc123");
+        assert!(!h.contains_key("x-client-cert-dn"));
+        assert_eq!(h.get_all("X-Client-Cert-Fingerprint").iter().count(), 1);
+
+        let mut h = forged();
+        attest_client_cert(&mut h, None);
+        assert!(h.is_empty(), "no client cert, no identity: {h:?}");
     }
 
     fn proxies(cidrs: &[&str]) -> TrustedProxies {

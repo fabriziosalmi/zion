@@ -7,7 +7,8 @@ Zion is a single async Rust binary built on Tokio, Hyper, and rustls. <!-- zion-
 
 ```text
 src/
-├── main.rs        # Composition root: boot, HTTPS/HTTP accept loops, connection handling, mTLS fingerprint extraction
+├── main.rs        # Composition root: boot, then the listeners and background tasks, then drain on shutdown
+├── accept.rs      # Accept loops, the per-connection HTTPS service (mTLS/JA4 identity headers, health fast path) and the :80 handler
 ├── state.rs       # AppState, ResolvedAppConfig (ArcSwap snapshot) and the per-source limiters shared by every handler
 ├── http_util.rs   # Request-ID generation and the small response builders (empty/text/405/401, security headers)
 ├── dispatch.rs    # Request pipeline: routing (LRU + radix), WAF gates, cache, CORS, metrics; thread-local route LRU lives here
@@ -42,6 +43,7 @@ src/
 ├── auth.rs        # JWT/OIDC validation gate (feature: --features auth)
 ├── acme.rs        # ACME HTTP-01 auto-renewal (feature: --features acme)
 ├── quic.rs        # HTTP/3 QUIC listener (feature: --features http3)
+├── listener.rs    # Listener supervisor: re-binds :80/:443 when `[server.listen_*]` changes in a hot reload
 ├── uring.rs       # io_uring single-shot accept (feature: --features io-uring-accept)
 ├── bootstrap.rs   # Platform detection (CPU, RAM, L1d cache, AES-NI/NEON, kernel features) + AES-GCM calibration
 ├── net.rs         # Socket tuning (SO_REUSEPORT, TCP_FASTOPEN, TCP_QUICKACK, TCP_DEFER_ACCEPT, TCP_CORK, SO_BUSY_POLL)

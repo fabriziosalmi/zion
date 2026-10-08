@@ -257,8 +257,8 @@ where
 /// the real peer address, as for HTTP/1 and HTTP/2.
 pub(crate) fn bridge_request(
     req: hyper::Request<()>,
-    body: crate::ZionBody,
-) -> hyper::Request<crate::ZionBody> {
+    body: crate::http_util::ZionBody,
+) -> hyper::Request<crate::http_util::ZionBody> {
     let (mut parts, ()) = req.into_parts();
     crate::security::strip_transport_attestations(&mut parts.headers);
     hyper::Request::from_parts(parts, body)
@@ -341,10 +341,10 @@ where
 
     // Dispatch the bridged request through the single source of truth HTTP processing engine
     // (This automatically executes all Gates: WAF, CORS, Auth, Rate Limits, and Routes).
-    let resp_result = crate::process_request(uni_req, state, remote_addr, false).await;
+    let resp_result = crate::dispatch::process_request(uni_req, state, remote_addr, false).await;
 
     // Transform upstream pipeline output to stream HTTP/3 responses back to the client natively
-    let resp: hyper::Response<crate::ZionBody> = match resp_result {
+    let resp: hyper::Response<crate::http_util::ZionBody> = match resp_result {
         Ok(r) => r,
         Err(e) => {
             // Fail safe on generic HTTP internal pipeline errors
@@ -418,7 +418,7 @@ where
 mod tests {
     use super::*;
 
-    fn empty() -> crate::ZionBody {
+    fn empty() -> crate::http_util::ZionBody {
         use http_body_util::BodyExt;
         http_body_util::Full::new(Bytes::new())
             .map_err(|n| match n {})

@@ -60,6 +60,7 @@ use crate::routing::ResolvedRoute;
 use http_body_util::Limited;
 
 mod gates;
+pub(crate) use gates::uri_too_long;
 
 /// Issue #151: turn an enforcement *deny* into a bounded held (tarpit)
 /// response when the operator enabled it, otherwise the plain immediate
@@ -89,6 +90,8 @@ async fn deny_or_tarpit(
     empty_response(status)
 }
 
+/// Maximum allowed URI length (bytes). Requests exceeding this are dropped before routing —
+/// prevents buffer overflow probes and log pollution.
 const MAX_URI_LEN: usize = 8192;
 /// Largest cacheable body for a route with no cache profile of its own; profiles set
 /// theirs with `max_object_mb`.
