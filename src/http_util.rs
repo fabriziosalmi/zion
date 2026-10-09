@@ -152,6 +152,113 @@ mod response_header_tests {
     }
 }
 
+/// RFC 9110 §7.6.1: an intermediary MUST remove, before forwarding, every header field named in
+/// the `Connection` header (they are hop-by-hop for the sender and the intermediary, not for the
+/// next recipient). `Connection: keep-alive, X-Remove-Me` makes `X-Remove-Me` ours to drop.
+///
+/// The connection options `close`, `keep-alive` and `upgrade` name no field and are skipped
+/// (`Upgrade` stays what the WebSocket handshake needs). Run it where the request comes in, before
+/// anything of ours is added: a client that lists `X-Client-Cert-Fingerprint` or `X-Auth-Subject`
+/// must not be able to make us drop the value we set after this point.
+pub(crate) fn strip_connection_listed(headers: &mut hyper::HeaderMap) {
+    if !headers.contains_key(hyper::header::CONNECTION) {
+        return;
+    }
+    let mut named: Vec<hyper::header::HeaderName> = Vec::new();
+    for value in headers.get_all(hyper::header::CONNECTION) {
+        let Ok(value) = value.to_str() else { continue };
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty()
+                || token.eq_ignore_ascii_case("close")
+                || token.eq_ignore_ascii_case("keep-alive")
+                || token.eq_ignore_ascii_case("upgrade")
+            {
+                continue;
+            }
+            if let Ok(name) = hyper::header::HeaderName::from_bytes(token.as_bytes()) {
+                named.push(name);
+            }
+        }
+    }
+    for name in named {
+        headers.remove(name);
+    }
+}
+
+#[cfg(test)]
+mod connection_listed_tests {
+    use super::strip_connection_listed;
+    use hyper::HeaderMap;
+
+    fn map(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn the_headers_connection_names_are_removed_and_the_rest_is_kept() {
+        let mut h = map(&[
+            ("connection", "keep-alive, X-Remove-Me"),
+            ("x-remove-me", "1"),
+            ("x-remove-me", "2"),
+            ("x-keep", "yes"),
+            ("host", "a.example"),
+        ]);
+        strip_connection_listed(&mut h);
+        assert!(!h.contains_key("x-remove-me"), "every copy goes");
+        assert!(h.contains_key("x-keep") && h.contains_key("host"));
+    }
+
+    #[test]
+    fn several_connection_lines_empty_elements_and_any_case_are_read() {
+        let mut h = map(&[
+            ("connection", "close"),
+            ("connection", " , X-A ,,x-B"),
+            ("x-a", "1"),
+            ("x-b", "2"),
+            ("x-c", "3"),
+        ]);
+        strip_connection_listed(&mut h);
+        assert!(!h.contains_key("x-a") && !h.contains_key("x-b"));
+        assert!(h.contains_key("x-c"));
+    }
+
+    #[test]
+    fn connection_options_name_no_field_and_upgrade_survives_for_websockets() {
+        let mut h = map(&[
+            ("connection", "Upgrade, keep-alive, close"),
+            ("upgrade", "websocket"),
+        ]);
+        strip_connection_listed(&mut h);
+        assert!(h.contains_key("upgrade"), "the handshake needs it");
+        assert!(
+            h.contains_key("connection"),
+            "the caller decides about Connection itself"
+        );
+    }
+
+    #[test]
+    fn a_token_that_is_not_a_header_name_is_ignored_and_no_connection_header_is_a_no_op() {
+        let mut h = map(&[
+            ("connection", "not a header, X-A"),
+            ("x-a", "1"),
+            ("x-b", "2"),
+        ]);
+        strip_connection_listed(&mut h);
+        assert!(!h.contains_key("x-a") && h.contains_key("x-b"));
+        let mut none = map(&[("x-a", "1")]);
+        strip_connection_listed(&mut none);
+        assert!(none.contains_key("x-a"));
+    }
+}
+
 /// A URL without the `user:pass@` of its authority. Upstream URLs may carry basic-auth
 /// credentials, and they are written to metric labels, the JSON snapshot, the logs and
 /// config error messages: none of those may show them.

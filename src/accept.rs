@@ -480,6 +480,14 @@ fn spawn_https_handler(
                         return Ok(text_response(StatusCode::OK, "ready"));
                     }
 
+                    // RFC 9112 §3.2: an HTTP/1.1 request without exactly one valid Host is a 400.
+                    if http1_host_is_wrong(&req) {
+                        return Ok(bad_request_and_close());
+                    }
+                    // RFC 9110 §7.6.1: headers named in `Connection` are not for the next hop.
+                    // Before the attestations below, so nothing zion sets can be named away.
+                    crate::http_util::strip_connection_listed(req.headers_mut());
+
                     // Consume early_data flag on first request.
                     let was_early = early_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
                     // The client-cert fingerprint is Zion's attestation of what TLS verified:
@@ -509,6 +517,80 @@ fn spawn_https_handler(
         .await;
         log_h2_flood(&h2_verdict, &flood_log_state, remote_addr);
     });
+}
+
+/// Whether an HTTP/1.1 request breaks RFC 9112 §3.2 on `Host`: none, more than one, or a value
+/// that is not a host. HTTP/1.0 may omit it and HTTP/2 and HTTP/3 carry the authority in the
+/// request target, so only `Version::HTTP_11` is checked.
+fn http1_host_is_wrong<B>(req: &Request<B>) -> bool {
+    if req.version() != hyper::Version::HTTP_11 {
+        return false;
+    }
+    let mut hosts = req.headers().get_all(hyper::header::HOST).iter();
+    match (hosts.next(), hosts.next()) {
+        (Some(only), None) => !only.to_str().is_ok_and(security::is_valid_host),
+        _ => true,
+    }
+}
+
+/// A 400 that also ends the connection: a client that sends a request the protocol forbids is not
+/// one whose next request on the same connection is worth parsing.
+fn bad_request_and_close() -> Response<ZionBody> {
+    let mut resp = text_response(StatusCode::BAD_REQUEST, "bad request");
+    resp.headers_mut().insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("close"),
+    );
+    resp
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::http1_host_is_wrong;
+    use hyper::{Request, Version};
+
+    fn req(version: Version, hosts: &[&str]) -> Request<()> {
+        let mut b = Request::builder().version(version).uri("/p");
+        for h in hosts {
+            b = b.header("host", *h);
+        }
+        b.body(()).unwrap()
+    }
+
+    #[test]
+    fn an_http11_request_needs_exactly_one_valid_host() {
+        assert!(!http1_host_is_wrong(&req(Version::HTTP_11, &["a.example"])));
+        assert!(!http1_host_is_wrong(&req(
+            Version::HTTP_11,
+            &["a.example:8443"]
+        )));
+        assert!(!http1_host_is_wrong(&req(
+            Version::HTTP_11,
+            &["[::1]:8443"]
+        )));
+        assert!(http1_host_is_wrong(&req(Version::HTTP_11, &[])), "none");
+        assert!(
+            http1_host_is_wrong(&req(Version::HTTP_11, &["a.example", "b.example"])),
+            "two"
+        );
+        assert!(
+            http1_host_is_wrong(&req(Version::HTTP_11, &["a.example", "a.example"])),
+            "two, even equal"
+        );
+        for bad in ["exa mple.com", "", "user@a.example", "a/b", "a\\b"] {
+            assert!(
+                http1_host_is_wrong(&req(Version::HTTP_11, &[bad])),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn http10_and_http2_may_have_no_host() {
+        assert!(!http1_host_is_wrong(&req(Version::HTTP_10, &[])));
+        assert!(!http1_host_is_wrong(&req(Version::HTTP_2, &[])));
+        assert!(!http1_host_is_wrong(&req(Version::HTTP_3, &[])));
+    }
 }
 
 /// Validate Host header to prevent header injection in redirects.
