@@ -66,6 +66,7 @@ refused.
 | `key_path` | string | **required** | Path to PEM private key |
 | `hot_reload` | bool | `true` | Watch cert directory for changes |
 | `min_version` | string | `"1.3"` | Minimum TLS version (`"1.2"` or `"1.3"`); any other value is a config error |
+| `session_tickets` | u8 | `2` | TLS 1.3 session tickets sent after each full handshake (`0`–`16`; more is a config error). Each ticket lets a client resume one later connection; a client that opens several connections at once can use more of them. Each costs the server about 25 µs of CPU per full handshake and the client its own parsing: on one core, 4 tickets cost 309 µs a handshake, 2 cost 257 µs, 1 costs 233 µs. The default was 4 up to v0.12.0. `0` sends none (stateful TLS 1.2 resumption is unaffected). Read at start-up |
 | `alpn` | string[] | `["h2", "http/1.1"]` | ALPN protocol negotiation list |
 | `sni` | SniCert[] | `[]` | Per-domain certificate mappings |
 | `acme` | table | none | Automatic HTTPS via Let's Encrypt — see [ACME](./acme) |

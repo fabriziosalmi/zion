@@ -81,7 +81,7 @@ If the reload fails (bad cert, missing file), the previous configuration is reta
 Zion configures aggressive session resumption by default:
 
 - **Session cache**: 16,384 entries (vs rustls default of 256)
-- **Session tickets**: Enabled via `Ticketer` — stateless resumption, no server-side storage
+- **Session tickets**: Enabled via `Ticketer` — stateless resumption, no server-side storage. `[tls] session_tickets` (default `2`) sets how many are sent after a full handshake; each costs about 25 µs of server CPU per handshake, so raise it only for clients that open many connections at once
 - **0-RTT early data**: Enabled (`max_early_data_size = 16384`) with **method gating** — see below
 - **Server cipher order**: Enforced — server selects the strongest cipher
 - **Half-RTT data**: Enabled — server sends data before client `Finished` message on resumed sessions
