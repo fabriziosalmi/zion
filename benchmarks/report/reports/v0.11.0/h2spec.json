@@ -1,0 +1,52 @@
+{
+ "nginx": {
+  "failed": 27,
+  "failures": [
+   "[generic/4] Sends a POST request with trailers \u2014 HEADERS Frame (stream_id:1)",
+   "[http2/4.2] Sends a large size DATA frame that exceeds the SETTINGS_MAX_FRAME_SIZE \u2014 GOAWAY Frame (Error Code: FRAME_SIZE_ERROR)",
+   "[http2/4.2] Sends a large size HEADERS frame that exceeds the SETTINGS_MAX_FRAME_SIZE \u2014 GOAWAY Frame (Error Code: FRAME_SIZE_ERROR)",
+   "[http2/5.1] idle: Sends a DATA frame \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/5.1] idle: Sends a RST_STREAM frame \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/5.1] idle: Sends a WINDOW_UPDATE frame \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/5.1] half closed (remote): Sends a DATA frame \u2014 GOAWAY Frame (Error Code: STREAM_CLOSED)",
+   "[http2/5.1] closed: Sends a DATA frame after sending RST_STREAM frame \u2014 GOAWAY Frame (Error Code: STREAM_CLOSED)",
+   "[http2/5.1] closed: Sends a DATA frame \u2014 GOAWAY Frame (Error Code: STREAM_CLOSED)",
+   "[http2/6.4] Sends a RST_STREAM frame on a idle stream \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2] Sends a HEADERS frame that contains the header field name in uppercase letters \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2.1] Sends a HEADERS frame that contains a unknown pseudo-header field \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2.1] Sends a HEADERS frame that contains the pseudo-header field defined for response \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2.1] Sends a HEADERS frame that contains a pseudo-header field that appears in a header block after a regular header field \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2.2] Sends a HEADERS frame that contains the connection-specific header field \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2.2] Sends a HEADERS frame that contains the TE header field with any value other than \"trailers\" \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2.3] Sends a HEADERS frame with empty \":path\" pseudo-header field \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2.3] Sends a HEADERS frame that omits \":method\" pseudo-header field \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2.3] Sends a HEADERS frame that omits \":scheme\" pseudo-header field \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2.3] Sends a HEADERS frame that omits \":path\" pseudo-header field \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2.3] Sends a HEADERS frame with duplicated \":method\" pseudo-header field \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2.3] Sends a HEADERS frame with duplicated \":scheme\" pseudo-header field \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2.3] Sends a HEADERS frame with duplicated \":path\" pseudo-header field \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2.6] Sends a HEADERS frame with the \"content-length\" header field which does not equal the DATA frame payload length \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2.6] Sends a HEADERS frame with the \"content-length\" header field which does not equal the sum of the multiple DATA frames payload length \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[hpack/4.2] Sends a dynamic table size update at the end of header block \u2014 GOAWAY Frame (Error Code: COMPRESSION_ERROR)",
+   "[hpack/5.2] Sends a Huffman-encoded string literal representation with padding longer than 7 bits \u2014 GOAWAY Frame (Error Code: COMPRESSION_ERROR)"
+  ],
+  "passed": 119,
+  "skipped": 0,
+  "tests": 146
+ },
+ "zion": {
+  "failed": 7,
+  "failures": [
+   "[generic/2] Sends a WINDOW_UPDATE frame on half-closed (remote) stream \u2014 DATA frame",
+   "[generic/2] Sends a PRIORITY frame on half-closed (remote) stream \u2014 DATA frame",
+   "[http2/3.5] Sends invalid connection preface \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/5.1] closed: Sends a DATA frame after sending RST_STREAM frame \u2014 GOAWAY Frame (Error Code: STREAM_CLOSED)",
+   "[http2/5.1.2] Sends HEADERS frames that causes their advertised concurrent stream limit to be exceeded \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1] Sends a second HEADERS frame without the END_STREAM flag \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)",
+   "[http2/8.1.2.1] Sends a HEADERS frame that contains a pseudo-header field as trailers \u2014 GOAWAY Frame (Error Code: PROTOCOL_ERROR)"
+  ],
+  "passed": 135,
+  "skipped": 4,
+  "tests": 146
+ }
+}

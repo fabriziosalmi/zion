@@ -1,0 +1,17 @@
+[1/16] cache_hit_small: GET a 5 KB cached JSON document, TLS, HTTP/1.1, 64 keep-alive connections
+[2/16] cache_hit_h2: the same document over HTTP/2, 16 connections x 10 streams
+[3/16] cache_hit_image: GET a ~200 KB cached image: copy and TLS cost, not request cost
+[4/16] site_mix: the whole example site, Zipf-popular paths, hot cache
+[5/16] proxy_nocache: no cache: every request goes to the origin (origin: no-store)
+[6/16] static_files: zion `static` mode and nginx `alias` serving the files from disk
+[7/16] tls_handshake: Connection: close, so every request is a new TLS handshake
+[8/16] download_10m: a 10 MiB body streamed through the proxy, 8 connections
+[9/16] latency_5k: a fixed 5000 req/s on the cached document, latency corrected for coordinated omission
+[10/16] latency_15k: a fixed 15000 req/s on the cached document, latency corrected for coordinated omission
+[11/16] cache_hit_small_logs: cache_hit_small with the access log on in both: zion's default, nginx's combined format
+[12/16] site_mix_logs: site_mix with the access log on in both
+[13/16] sweep_c1: the cached document at 1 connections
+[14/16] sweep_c8: the cached document at 8 connections
+[15/16] sweep_c256: the cached document at 256 connections
+[16/16] sweep_c1024: the cached document at 1024 connections
+canary drift 4.71% (NOISY); wrote /home/ci/zion-reports/v0.11.0/result.json

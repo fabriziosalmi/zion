@@ -1,0 +1,375 @@
+{
+ "nginx": {
+  "failed": 36,
+  "failed_ids": [
+   "Cache-Control Freshness: HTTP cache must not reuse a response when the `Age` header is greater than its `Cache-Control: max-age` freshness lifetime [freshness-max-age-age]",
+   "Age Parsing: HTTP cache should consider a response with a `Age` value of 2147483647 to be stale [age-parse-large-minus-one]",
+   "Age Parsing: HTTP cache should consider a response with a `Age` value of 2147483648 to be stale [age-parse-large]",
+   "Age Parsing: HTTP cache should consider a response with a `Age` value of 2147483649 to be stale [age-parse-larger]",
+   "Age Parsing: HTTP cache should consider a response with a single `Age` header line `old, 0` to be stale [age-parse-suffix]",
+   "Age Parsing: HTTP cache should use the first line in a response with multiple `Age` header lines: `old`, `0` [age-parse-suffix-twoline]",
+   "Expires Freshness: HTTP cache must not reuse a response with a present `Expires` [freshness-expires-present]",
+   "Expires Freshness: HTTP cache must not reuse a response with an `Expires` older than `Date`, both fast [freshness-expires-old-date]",
+   "Expires Freshness: HTTP cache must not reuse a response when the `Age` header is greater than its `Expires` minus `Date`, and `Date` is slow [freshness-expires-age-slow-date]",
+   "Expires Freshness: HTTP cache must not reuse a response when the `Age` header is greater than its `Expires` minus `Date`, and `Date` is fast [freshness-expires-age-fast-date]",
+   "Expires Parsing: HTTP cache must not reuse a response with an invalid `Expires` (UTC) [freshness-expires-invalid-utc]",
+   "Expires Parsing: HTTP cache must not reuse a response with an invalid `Expires` (other tz) [freshness-expires-invalid-aest]",
+   "Cache-Control Response Directives: HTTP cache must revalidate a stale response with positive `Cache-Control: max-age, must-revalidate` [cc-resp-must-revalidate-stale]",
+   "Vary Parsing: HTTP cache must not reuse `Vary` response with a value of `*, *` [vary-syntax-star-star]",
+   "Vary Parsing: HTTP cache must not reuse `Vary` response with a value of `, *` [vary-syntax-empty-star]",
+   "Vary Parsing: HTTP cache must not reuse `Vary` response with a value of `*, Foo` [vary-syntax-star-foo]",
+   "Vary Parsing: HTTP cache must not reuse `Vary` response with a value of `Foo, *` [vary-syntax-foo-star]",
+   "Conditional Requests: If-None-Match and ETag: HTTP cache must give precedence to `If-None-Match` over `If-Modified-Since` [conditional-etag-precedence]",
+   "Storing Header Fields: `Connection` header must inhibit a HTTP cache from storing listed headers [headers-omit-headers-listed-in-Connection]",
+   "Cache Invalidation: HTTP cache must invalidate the URL after a successful response to a `POST` request [invalidate-POST]",
+   "Cache Invalidation: HTTP cache must invalidate the URL after a successful response to a `PUT` request [invalidate-PUT]",
+   "Cache Invalidation: HTTP cache must invalidate the URL after a successful response to a `DELETE` request [invalidate-DELETE]",
+   "Cache Invalidation: HTTP cache must invalidate the URL after a successful response to a `M-SEARCH` request [invalidate-M-SEARCH]",
+   "Storing Responses to Authenticated Requests: HTTP shared cache must not reuse a response to a request that contained `Authorization`, even with explicit freshness [other-authorization]",
+   "Other Caching Requirements: HTTP cache must generate an `Age` header field when using a stored response. [other-age-gen]",
+   "Other Caching Requirements: HTTP cache must update the `Age` header field when freshness is based upon `Expires` [other-age-update-expires]",
+   "Other Caching Requirements: HTTP cache must update the `Age` header field when freshness is based upon `CC: max-age` [other-age-update-max-age]",
+   "Other Caching Requirements: HTTP cache must not update the `Date` header field [other-date-update]",
+   "Other Caching Requirements: HTTP cache must not update the `Date` header field when `Expires` is present [other-date-update-expires]",
+   "CDN-Cache-Control: CDN must not reuse a response with a `CDN-Cache-Control: max-age=0` and a future `Expires` [cdn-max-age-0-expires]",
+   "CDN-Cache-Control: CDN must prefer a short `CDN-Cache-Control: max-age` over a long `Cache-Control: max-age` [cdn-max-age-long-cc-max-age]",
+   "CDN-Cache-Control: CDN must not reuse a cached response with `CDN-Cache-Control: private`, even with `Cache-Control: max-age` and `Expires` [cdn-private]",
+   "CDN-Cache-Control: CDN must not reuse a cached response with `CDN-Cache-Control: no-cache`, even with `Cache-Control: max-age` and `Expires` [cdn-no-cache]",
+   "CDN-Cache-Control: CDN must not store a response with `CDN-Cache-Control: no-store`, even with `Cache-Control: max-age` and `Expires` [cdn-no-store-cc-fresh]",
+   "CDN-Cache-Control: An optimal CDN stores a response with a fresh `CDN-Cache-Control: max-age`, even with `Cache-Control: no-store` [cdn-fresh-cc-nostore]",
+   "Interim Response Handling: An HTTP cache should not cache non-final responses [interim-not-cached]"
+  ],
+  "outcomes": {
+   "fail": 36,
+   "no": 60,
+   "optional_fail": 40,
+   "pass": 174,
+   "setup_fail": 34,
+   "untested": 5,
+   "yes": 21
+  },
+  "passed": 195,
+  "suites": {
+   "Age Parsing": {
+    "failed": 5,
+    "passed": 8,
+    "tests": 15
+   },
+   "CDN-Cache-Control": {
+    "failed": 6,
+    "passed": 8,
+    "tests": 24
+   },
+   "Cache Invalidation": {
+    "failed": 4,
+    "passed": 4,
+    "tests": 16
+   },
+   "Cache-Control Freshness": {
+    "failed": 1,
+    "passed": 20,
+    "tests": 24
+   },
+   "Cache-Control Parsing": {
+    "failed": 0,
+    "passed": 8,
+    "tests": 15
+   },
+   "Cache-Control Request Directives": {
+    "failed": 0,
+    "passed": 1,
+    "tests": 12
+   },
+   "Cache-Control Response Directives": {
+    "failed": 1,
+    "passed": 9,
+    "tests": 17
+   },
+   "Combining Partial Content": {
+    "failed": 0,
+    "passed": 0,
+    "tests": 10
+   },
+   "Conditional Requests: If-Modified-Since and Last-Modified": {
+    "failed": 0,
+    "passed": 2,
+    "tests": 5
+   },
+   "Conditional Requests: If-None-Match and ETag": {
+    "failed": 1,
+    "passed": 10,
+    "tests": 21
+   },
+   "Expires Freshness": {
+    "failed": 4,
+    "passed": 4,
+    "tests": 8
+   },
+   "Expires Parsing": {
+    "failed": 2,
+    "passed": 14,
+    "tests": 16
+   },
+   "HEAD updates": {
+    "failed": 0,
+    "passed": 0,
+    "tests": 5
+   },
+   "Heuristic Freshness": {
+    "failed": 0,
+    "passed": 7,
+    "tests": 27
+   },
+   "Interim Response Handling": {
+    "failed": 1,
+    "passed": 0,
+    "tests": 4
+   },
+   "Method-related Caching Requirements": {
+    "failed": 0,
+    "passed": 0,
+    "tests": 1
+   },
+   "Other Caching Requirements": {
+    "failed": 5,
+    "passed": 5,
+    "tests": 13
+   },
+   "Pragma": {
+    "failed": 0,
+    "passed": 4,
+    "tests": 5
+   },
+   "Serving Stale": {
+    "failed": 0,
+    "passed": 5,
+    "tests": 12
+   },
+   "Status Code Cacheability": {
+    "failed": 0,
+    "passed": 37,
+    "tests": 38
+   },
+   "Storing Header Fields": {
+    "failed": 1,
+    "passed": 27,
+    "tests": 30
+   },
+   "Storing Responses to Authenticated Requests": {
+    "failed": 1,
+    "passed": 3,
+    "tests": 4
+   },
+   "Update Headers Upon a 304": {
+    "failed": 0,
+    "passed": 0,
+    "tests": 21
+   },
+   "Vary Parsing": {
+    "failed": 4,
+    "passed": 3,
+    "tests": 7
+   },
+   "Vary and Cache Keys": {
+    "failed": 0,
+    "passed": 16,
+    "tests": 20
+   }
+  },
+  "tests": 370
+ },
+ "zion": {
+  "failed": 51,
+  "failed_ids": [
+   "Cache-Control Freshness: HTTP cache must not reuse a response with negative `Cache-Control: max-age` [freshness-max-age-negative]",
+   "Cache-Control Freshness: An optimal shared HTTP cache reuses a response with positive `Cache-Control: s-maxage` [freshness-s-maxage-shared]",
+   "Cache-Control Freshness: Shared HTTP cache must prefer short `Cache-Control: s-maxage` over a longer `Cache-Control: max-age` (multiple headers) [freshness-max-age-s-maxage-shared-longer-multiple]",
+   "Cache-Control Parsing: An optimal HTTP cache reuses max-age with the value `003600` [freshness-max-age-leading-zero]",
+   "Cache-Control Parsing: HTTP cache must not reuse a response with a single-quoted `Cache-Control: max-age` [freshness-max-age-single-quoted]",
+   "Age Parsing: HTTP cache should ignore an `Age` header with a non-numeric value [age-parse-nonnumeric]",
+   "Age Parsing: HTTP cache should ignore an `Age` header with a negative value [age-parse-negative]",
+   "Age Parsing: HTTP cache should ignore an `Age` header with a float value [age-parse-float]",
+   "Age Parsing: HTTP cache should consider a response with a single `Age` header line `old, 0` to be stale [age-parse-suffix]",
+   "Age Parsing: HTTP cache should consider a response with a single `Age` header line `0, old` to be fresh [age-parse-prefix]",
+   "Age Parsing: HTTP cache should use the first line in a response with multiple `Age` header lines: `0`, `old` [age-parse-prefix-twoline]",
+   "Age Parsing: HTTP cache should consider a response with a single line `Age: 0, 0` to be fresh [age-parse-dup-0]",
+   "Age Parsing: HTTP cache should consider a response with two `Age: 0` header lines to be fresh [age-parse-dup-0-twoline]",
+   "Age Parsing: HTTP cache should consider a response with two `Age: not_old` header lines to be fresh [age-parse-dup-old]",
+   "Expires Freshness: HTTP cache must not reuse a response with a past `Expires` [freshness-expires-past]",
+   "Expires Freshness: HTTP cache must not reuse a response with a present `Expires` [freshness-expires-present]",
+   "Expires Freshness: HTTP cache must not reuse a response with an `Expires` older than `Date`, both fast [freshness-expires-old-date]",
+   "Expires Freshness: HTTP cache must not reuse a response with an invalid `Expires` (0) [freshness-expires-invalid]",
+   "Expires Freshness: HTTP cache must not reuse a response when the `Age` header is greater than its `Expires` minus `Date`, and `Date` is slow [freshness-expires-age-slow-date]",
+   "Expires Freshness: HTTP cache must not reuse a response when the `Age` header is greater than its `Expires` minus `Date`, and `Date` is fast [freshness-expires-age-fast-date]",
+   "Expires Parsing: HTTP cache must not reuse a response with an invalid `Expires` (UTC) [freshness-expires-invalid-utc]",
+   "Expires Parsing: HTTP cache must not reuse a response with an invalid `Expires` (other tz) [freshness-expires-invalid-aest]",
+   "Expires Parsing: HTTP cache must not reuse a response with an invalid `Expires` (two-digit year) [freshness-expires-invalid-2-digit-year]",
+   "Expires Parsing: HTTP cache must not reuse a response with an invalid `Expires` (missing comma) [freshness-expires-invalid-no-comma]",
+   "Expires Parsing: HTTP cache must not reuse a response with an invalid `Expires` (multiple spaces) [freshness-expires-invalid-multiple-spaces]",
+   "Expires Parsing: HTTP cache must not reuse a response with an invalid `Expires` (date dashes) [freshness-expires-invalid-date-dashes]",
+   "Expires Parsing: HTTP cache must not reuse a response with an invalid `Expires` (time periods) [freshness-expires-invalid-time-periods]",
+   "Expires Parsing: HTTP cache must not reuse a response with an invalid `Expires` (1-digit hour) [freshness-expires-invalid-1-digit-hour]",
+   "Expires Parsing: HTTP cache must not reuse a response with an invalid `Expires` (multiple lines) [freshness-expires-invalid-multiple-lines]",
+   "Cache-Control Response Directives: Does HTTP cache use older stored response when newer one came with `Cache-Control: no-store`? [cc-resp-no-store-old-new]",
+   "Cache-Control Response Directives: Does HTTP cache use older stored response when newer one came with `Cache-Control: no-store, max-age=0`? [cc-resp-no-store-old-max-age]",
+   "Status Code Cacheability: HTTP cache must not reuse a stale `200` response with explicit freshness [status-200-stale]",
+   "Update Headers Upon a 304: HTTP cache must return stored `Test-Header` from a `304` that omits it [304-lm-use-stored-Test-Header]",
+   "Update Headers Upon a 304: HTTP cache must update and return `Test-Header` from a `304` [304-etag-update-response-Test-Header]",
+   "Update Headers Upon a 304: HTTP cache must update and return `X-Test-Header` from a `304` [304-etag-update-response-X-Test-Header]",
+   "Update Headers Upon a 304: HTTP cache must update and return `Content-Foo` from a `304` [304-etag-update-response-Content-Foo]",
+   "Update Headers Upon a 304: HTTP cache must update and return `X-Content-Foo` from a `304` [304-etag-update-response-X-Content-Foo]",
+   "Update Headers Upon a 304: HTTP cache must update and return `Cache-Control` from a `304` [304-etag-update-response-Cache-Control]",
+   "Other Caching Requirements: HTTP cache must generate an `Age` header field when using a stored response. [other-age-gen]",
+   "Other Caching Requirements: HTTP cache must update the `Age` header field when freshness is based upon `Expires` [other-age-update-expires]",
+   "Other Caching Requirements: HTTP cache must update the `Age` header field when freshness is based upon `CC: max-age` [other-age-update-max-age]",
+   "Other Caching Requirements: HTTP cache must not update the `Date` header field [other-date-update]",
+   "Other Caching Requirements: HTTP cache must not update the `Date` header field when `Expires` is present [other-date-update-expires]",
+   "CDN-Cache-Control: CDN must not reuse a response with `CDN-Cache-Control: max-age=0` [cdn-max-age-0]",
+   "CDN-Cache-Control: CDN must not reuse a response with a `CDN-Cache-Control: max-age=0` and a future `Expires` [cdn-max-age-0-expires]",
+   "CDN-Cache-Control: CDN must prefer a short `CDN-Cache-Control: max-age` over a long `Cache-Control: max-age` [cdn-max-age-long-cc-max-age]",
+   "CDN-Cache-Control: CDN must not reuse a cached response with `CDN-Cache-Control: private`, even with `Cache-Control: max-age` and `Expires` [cdn-private]",
+   "CDN-Cache-Control: CDN must not reuse a cached response with `CDN-Cache-Control: no-cache`, even with `Cache-Control: max-age` and `Expires` [cdn-no-cache]",
+   "CDN-Cache-Control: CDN must not store a response with `CDN-Cache-Control: no-store`, even with `Cache-Control: max-age` and `Expires` [cdn-no-store-cc-fresh]",
+   "CDN-Cache-Control: An optimal CDN stores a response with a fresh `CDN-Cache-Control: max-age`, even with `Cache-Control: no-store` [cdn-fresh-cc-nostore]",
+   "Interim Response Handling: An HTTP cache should not cache non-final responses [interim-not-cached]"
+  ],
+  "outcomes": {
+   "fail": 51,
+   "no": 70,
+   "optional_fail": 94,
+   "pass": 80,
+   "setup_fail": 50,
+   "untested": 5,
+   "yes": 20
+  },
+  "passed": 100,
+  "suites": {
+   "Age Parsing": {
+    "failed": 9,
+    "passed": 4,
+    "tests": 15
+   },
+   "CDN-Cache-Control": {
+    "failed": 7,
+    "passed": 7,
+    "tests": 24
+   },
+   "Cache Invalidation": {
+    "failed": 0,
+    "passed": 9,
+    "tests": 16
+   },
+   "Cache-Control Freshness": {
+    "failed": 3,
+    "passed": 6,
+    "tests": 24
+   },
+   "Cache-Control Parsing": {
+    "failed": 2,
+    "passed": 2,
+    "tests": 15
+   },
+   "Cache-Control Request Directives": {
+    "failed": 0,
+    "passed": 4,
+    "tests": 12
+   },
+   "Cache-Control Response Directives": {
+    "failed": 2,
+    "passed": 6,
+    "tests": 17
+   },
+   "Combining Partial Content": {
+    "failed": 0,
+    "passed": 0,
+    "tests": 10
+   },
+   "Conditional Requests: If-Modified-Since and Last-Modified": {
+    "failed": 0,
+    "passed": 1,
+    "tests": 5
+   },
+   "Conditional Requests: If-None-Match and ETag": {
+    "failed": 0,
+    "passed": 14,
+    "tests": 21
+   },
+   "Expires Freshness": {
+    "failed": 6,
+    "passed": 0,
+    "tests": 8
+   },
+   "Expires Parsing": {
+    "failed": 9,
+    "passed": 0,
+    "tests": 16
+   },
+   "HEAD updates": {
+    "failed": 0,
+    "passed": 1,
+    "tests": 5
+   },
+   "Heuristic Freshness": {
+    "failed": 0,
+    "passed": 7,
+    "tests": 27
+   },
+   "Interim Response Handling": {
+    "failed": 1,
+    "passed": 0,
+    "tests": 4
+   },
+   "Method-related Caching Requirements": {
+    "failed": 0,
+    "passed": 0,
+    "tests": 1
+   },
+   "Other Caching Requirements": {
+    "failed": 5,
+    "passed": 1,
+    "tests": 13
+   },
+   "Pragma": {
+    "failed": 0,
+    "passed": 0,
+    "tests": 5
+   },
+   "Serving Stale": {
+    "failed": 0,
+    "passed": 4,
+    "tests": 12
+   },
+   "Status Code Cacheability": {
+    "failed": 1,
+    "passed": 18,
+    "tests": 38
+   },
+   "Storing Header Fields": {
+    "failed": 0,
+    "passed": 0,
+    "tests": 30
+   },
+   "Storing Responses to Authenticated Requests": {
+    "failed": 0,
+    "passed": 1,
+    "tests": 4
+   },
+   "Update Headers Upon a 304": {
+    "failed": 6,
+    "passed": 0,
+    "tests": 21
+   },
+   "Vary Parsing": {
+    "failed": 0,
+    "passed": 7,
+    "tests": 7
+   },
+   "Vary and Cache Keys": {
+    "failed": 0,
+    "passed": 8,
+    "tests": 20
+   }
+  },
+  "tests": 370
+ }
+}

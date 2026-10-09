@@ -1,0 +1,886 @@
+{
+ "checks": {
+  "abs-form": {
+   "group": "Framing",
+   "level": "INFO",
+   "results": {
+    "nginx": {
+     "detail": "status 200; origin saw Host '127.0.0.1:14491'",
+     "verdict": "info"
+    },
+    "zion": {
+     "detail": "status 200; origin saw Host '127.0.0.1:14491'",
+     "verdict": "info"
+    }
+   },
+   "rfc": "RFC 9112 \u00a73.2.2",
+   "title": "Absolute-form target with a different Host header"
+  },
+  "accept-ranges": {
+   "group": "Representations",
+   "level": "SHOULD",
+   "results": {
+    "nginx": {
+     "detail": "status 200, Accept-Ranges bytes",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 200, Accept-Ranges bytes",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a714.3",
+   "title": "Static files advertise Accept-Ranges: bytes"
+  },
+  "age-on-hit": {
+   "group": "Representations",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "Age: None",
+     "verdict": "fail"
+    },
+    "zion": {
+     "detail": "Age: 0",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9111 \u00a74",
+   "title": "A response served from cache carries Age"
+  },
+  "alpn": {
+   "group": "TLS",
+   "level": "INFO",
+   "results": {
+    "nginx": {
+     "detail": "selected h2",
+     "verdict": "info"
+    },
+    "zion": {
+     "detail": "selected h2",
+     "verdict": "info"
+    }
+   },
+   "rfc": "RFC 7301",
+   "title": "ALPN selection when the client offers h2 and http/1.1"
+  },
+  "bad-host": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 400",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 200",
+     "verdict": "fail"
+    }
+   },
+   "rfc": "RFC 9112 \u00a73.2",
+   "title": "Host with a space in it: 400"
+  },
+  "bare-cr": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "rejected with 400",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "rejected with 400",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9112 \u00a72.2",
+   "title": "Bare CR in a field value: rejected or replaced"
+  },
+  "chunk-bad-size": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 400",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 502",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9112 \u00a77.1",
+   "title": "Malformed chunk size: not accepted"
+  },
+  "chunked-forward": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 200",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 200",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9112 \u00a77.1",
+   "title": "A chunked request body arrives at the origin byte for byte"
+  },
+  "cl-invalid": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "all five rejected",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "all five rejected",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a78.6",
+   "title": "Malformed Content-Length (+5, '5 5', 0x5, -1, 5abc): rejected, not forwarded"
+  },
+  "cl-te": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "rejected with 400",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "answered and closed",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9112 \u00a76.1",
+   "title": "Content-Length and Transfer-Encoding together: not forwarded as both, and the connection is closed"
+  },
+  "conn-close": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 200, closed True",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 200, closed True",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9112 \u00a79.6",
+   "title": "Connection: close is honoured"
+  },
+  "connect": {
+   "group": "Hardening",
+   "level": "SECURITY",
+   "results": {
+    "nginx": {
+     "detail": "status 400",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 405",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a79.3.6",
+   "title": "CONNECT does not open a tunnel"
+  },
+  "content-type": {
+   "group": "Representations",
+   "level": "SHOULD",
+   "results": {
+    "nginx": {
+     "detail": "Content-Type: application/json",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "Content-Type: application/json",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a78.3",
+   "title": "The origin's Content-Type is preserved"
+  },
+  "dup-cl": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 400, forwarded 0",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 400, forwarded 0",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a78.6",
+   "title": "Two different Content-Length values: rejected, not forwarded"
+  },
+  "etag-304": {
+   "group": "Representations",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 304, ETag \"6ac80882-c23\"",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 304, ETag \"6ac80882-c23\"",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a713.1.2",
+   "title": "If-None-Match with the current ETag: 304, no body, validator kept"
+  },
+  "expect-100": {
+   "group": "Framing",
+   "level": "SHOULD",
+   "results": {
+    "nginx": {
+     "detail": "status 200, interim [100]",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 200, interim [100]",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a710.1.1",
+   "title": "Expect: 100-continue: the body is delivered and answered"
+  },
+  "head": {
+   "group": "Representations",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "HEAD 200 CL 3107 vs GET 200 CL 3107",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "HEAD 200 CL 3107 vs GET 200 CL 3107",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a79.3.2",
+   "title": "HEAD: same status and Content-Length as GET, no body"
+  },
+  "headers-huge": {
+   "group": "Framing",
+   "level": "SHOULD",
+   "results": {
+    "nginx": {
+     "detail": "status 400",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 431",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a715.5.32",
+   "title": "200 KB of request headers: 431 (or another 4xx), not a 5xx or a hang"
+  },
+  "hop-request": {
+   "group": "Proxy",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "leaked: x-remove-me, proxy-connection",
+     "verdict": "fail"
+    },
+    "zion": {
+     "detail": "leaked: x-remove-me",
+     "verdict": "fail"
+    }
+   },
+   "rfc": "RFC 9110 \u00a77.6.1",
+   "title": "Hop-by-hop request headers (Connection-listed, Keep-Alive, Proxy-Connection) are not forwarded"
+  },
+  "hop-response": {
+   "group": "Proxy",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "leaked: x-resp-hop",
+     "verdict": "fail"
+    },
+    "zion": {
+     "detail": "status 200, none leaked",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a77.6.1",
+   "title": "Hop-by-hop response headers (Connection-listed, Keep-Alive) are not passed on"
+  },
+  "http10": {
+   "group": "Framing",
+   "level": "INFO",
+   "results": {
+    "nginx": {
+     "detail": "status 200",
+     "verdict": "info"
+    },
+    "zion": {
+     "detail": "status 200",
+     "verdict": "info"
+    }
+   },
+   "rfc": "RFC 9112 \u00a73.2",
+   "title": "HTTP/1.0 request without Host"
+  },
+  "ims-304": {
+   "group": "Representations",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 304",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 304",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a713.1.3",
+   "title": "If-Modified-Since with Last-Modified: 304"
+  },
+  "inm-mismatch": {
+   "group": "Representations",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 200",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 200",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a713.1.2",
+   "title": "If-None-Match with a different ETag: full 200"
+  },
+  "max-forwards": {
+   "group": "Proxy",
+   "level": "INFO",
+   "results": {
+    "nginx": {
+     "detail": "status 200; forwarded 1",
+     "verdict": "info"
+    },
+    "zion": {
+     "detail": "status 200; forwarded 1",
+     "verdict": "info"
+    }
+   },
+   "rfc": "RFC 9110 \u00a77.6.2",
+   "title": "OPTIONS with Max-Forwards: 0"
+  },
+  "method-case": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 400",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 405",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a79.1",
+   "title": "Lower-case method name is not a method: not served"
+  },
+  "no-host": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 400",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 200",
+     "verdict": "fail"
+    }
+   },
+   "rfc": "RFC 9112 \u00a73.2",
+   "title": "HTTP/1.1 request without Host: 400"
+  },
+  "nul-value": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "rejected with 400",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "rejected with 400",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a75.5",
+   "title": "NUL in a field value: rejected or replaced"
+  },
+  "obs-fold": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "rejected with 400",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "rejected with 400",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9112 \u00a75.2",
+   "title": "Obsolete line folding: rejected or replaced by a space"
+  },
+  "options-star": {
+   "group": "Framing",
+   "level": "INFO",
+   "results": {
+    "nginx": {
+     "detail": "status 400",
+     "verdict": "info"
+    },
+    "zion": {
+     "detail": "status 404",
+     "verdict": "info"
+    }
+   },
+   "rfc": "RFC 9110 \u00a79.3.7",
+   "title": "OPTIONS *"
+  },
+  "pipelining": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "2 responses",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "2 responses",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9112 \u00a79.3.2",
+   "title": "Two pipelined requests are answered in order"
+  },
+  "range-206": {
+   "group": "Representations",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 206, Content-Range bytes 0-99/29266, 100 bytes",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 206, Content-Range bytes 0-99/29266, 100 bytes",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a714",
+   "title": "Range: bytes=0-99: a correct 206, or the whole 200 (both allowed)"
+  },
+  "range-416": {
+   "group": "Representations",
+   "level": "SHOULD",
+   "results": {
+    "nginx": {
+     "detail": "status 416, Content-Range bytes */29266",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 416, Content-Range bytes */29266",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a715.5.17",
+   "title": "An unsatisfiable range: 416 with Content-Range: bytes */N"
+  },
+  "resp-100": {
+   "group": "Proxy",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 200, body b'ok'",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 200, body b'ok'",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a715.2",
+   "title": "A 100 Continue before the final response does not confuse the client"
+  },
+  "resp-bighdr": {
+   "group": "Proxy",
+   "level": "INFO",
+   "results": {
+    "nginx": {
+     "detail": "status 502",
+     "verdict": "info"
+    },
+    "zion": {
+     "detail": "status 200",
+     "verdict": "info"
+    }
+   },
+   "rfc": "RFC 9110 \u00a75.4",
+   "title": "A 60 KB response header"
+  },
+  "resp-cl-te": {
+   "group": "Proxy",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 502, both headers False, body b'<html>\\r\\n<hea'",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 200, both headers False, body b'hello'",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9112 \u00a76.1",
+   "title": "An origin response with both Content-Length and Transfer-Encoding is not relayed as both"
+  },
+  "resp-garbage": {
+   "group": "Proxy",
+   "level": "SHOULD",
+   "results": {
+    "nginx": {
+     "detail": "status 200, relayed True",
+     "verdict": "fail"
+    },
+    "zion": {
+     "detail": "status 502, relayed False",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a75.5",
+   "title": "A response header line without a colon is not relayed"
+  },
+  "resp-truncated": {
+   "group": "Proxy",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 200, complete False, body 10 bytes",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 200, complete False, body 10 bytes",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9112 \u00a78",
+   "title": "A response cut short by the origin is not delivered as complete"
+  },
+  "resumption": {
+   "group": "TLS",
+   "level": "SHOULD",
+   "results": {
+    "nginx": {
+     "detail": "session_reused=True",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "session_reused=True",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 8446 \u00a74.6.1",
+   "title": "A session is resumed with a ticket"
+  },
+  "static-conditional": {
+   "group": "Representations",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 304",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 304",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a713",
+   "title": "Static files answer If-None-Match with 304"
+  },
+  "static-methods": {
+   "group": "Hardening",
+   "level": "SECURITY",
+   "results": {
+    "nginx": {
+     "detail": "all refused",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "all refused",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a79.3",
+   "title": "PUT and DELETE on the static directory do not succeed"
+  },
+  "static-range": {
+   "group": "Representations",
+   "level": "SHOULD",
+   "results": {
+    "nginx": {
+     "detail": "status 206, 10 bytes",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 206, 10 bytes",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a714",
+   "title": "Static files honour Range"
+  },
+  "target-70000": {
+   "group": "Framing",
+   "level": "SHOULD",
+   "results": {
+    "nginx": {
+     "detail": "status 414",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 431",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a715.5.15",
+   "title": "A 70,000-octet request target gets 414 (or another 4xx), not a crash"
+  },
+  "target-8000": {
+   "group": "Framing",
+   "level": "SHOULD",
+   "results": {
+    "nginx": {
+     "detail": "status 200",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 200",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9112 \u00a73",
+   "title": "A request line of 8000 octets is accepted"
+  },
+  "te-not-final": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 501, forwarded 0",
+     "verdict": "fail"
+    },
+    "zion": {
+     "detail": "status 400, forwarded 0",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9112 \u00a76.3",
+   "title": "Transfer-Encoding: chunked, gzip (chunked not last): 400"
+  },
+  "te-unknown": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 501, forwarded 0",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 400, forwarded 0",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9112 \u00a76.1",
+   "title": "Unknown transfer coding (xchunked): 400 or 501, not forwarded"
+  },
+  "tls12": {
+   "group": "TLS",
+   "level": "INFO",
+   "results": {
+    "nginx": {
+     "detail": "accepted, TLSv1.2",
+     "verdict": "info"
+    },
+    "zion": {
+     "detail": "refused (tlsv1 alert protocol version (_ssl.c:1000))",
+     "verdict": "info"
+    }
+   },
+   "rfc": "RFC 5246",
+   "title": "Whether TLS 1.2 is still accepted (a configured floor, not a requirement)"
+  },
+  "tls13": {
+   "group": "TLS",
+   "level": "SHOULD",
+   "results": {
+    "nginx": {
+     "detail": "TLSv1.3",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "TLSv1.3",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 8446",
+   "title": "TLS 1.3 is negotiated"
+  },
+  "trace": {
+   "group": "Hardening",
+   "level": "SECURITY",
+   "results": {
+    "nginx": {
+     "detail": "status 405, forwarded 0",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 405, forwarded 0",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a79.3.8",
+   "title": "TRACE is not forwarded to the origin"
+  },
+  "traversal": {
+   "group": "Hardening",
+   "level": "SECURITY",
+   "results": {
+    "nginx": {
+     "detail": "12 encodings, none reached the file",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "12 encodings, none reached the file",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 3986 \u00a76",
+   "title": "Path traversal out of the static directory never reaches a file outside it"
+  },
+  "two-hosts": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 400",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 200",
+     "verdict": "fail"
+    }
+   },
+   "rfc": "RFC 9112 \u00a73.2",
+   "title": "Two Host header lines: 400"
+  },
+  "unsafe-method": {
+   "group": "Representations",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 405 (origin says 405), Age None",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 405 (origin says 405), Age None",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9111 \u00a74.4",
+   "title": "POST to a cached URL is not answered from the cache"
+  },
+  "upstream-down": {
+   "group": "Proxy",
+   "level": "SHOULD",
+   "results": {
+    "nginx": {
+     "detail": "status 502 after 0.0s",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 503 after 0.0s",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a715.6.3",
+   "title": "An unreachable origin gives 502/503/504 promptly"
+  },
+  "via-request": {
+   "group": "Proxy",
+   "level": "SHOULD",
+   "results": {
+    "nginx": {
+     "detail": "no Via",
+     "verdict": "fail"
+    },
+    "zion": {
+     "detail": "Via: 1.1 zion-5b11d3a5",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9110 \u00a77.6.3",
+   "title": "A Via header is added to the forwarded request"
+  },
+  "ws-colon": {
+   "group": "Framing",
+   "level": "MUST",
+   "results": {
+    "nginx": {
+     "detail": "status 400, forwarded 0",
+     "verdict": "pass"
+    },
+    "zion": {
+     "detail": "status 400, forwarded 0",
+     "verdict": "pass"
+    }
+   },
+   "rfc": "RFC 9112 \u00a75.1",
+   "title": "Whitespace before the colon in a field name: 400"
+  },
+  "xff": {
+   "group": "Proxy",
+   "level": "INFO",
+   "results": {
+    "nginx": {
+     "detail": "origin saw X-Forwarded-For: '6.6.6.6'",
+     "verdict": "info"
+    },
+    "zion": {
+     "detail": "origin saw X-Forwarded-For: '127.0.0.1'",
+     "verdict": "info"
+    }
+   },
+   "rfc": "(not an RFC)",
+   "title": "X-Forwarded-For from the client: what the origin sees"
+  }
+ },
+ "schema": 1,
+ "zion_version": "zion 0.11.0 (unknown unknown)"
+}

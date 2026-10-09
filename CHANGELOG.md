@@ -4,6 +4,23 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-09
+
+**Profile-Guided Optimization is now the default for x86_64-gnu releases.** PGO improves throughput by 3–9% per core and scales better on multi-core (67–75% scaling vs 56–60% for non-PGO); it ships alongside a non-PGO variant for environments that need reproducible builds or different profile characteristics.
+
+### Upgrade notes
+
+- **x86_64-unknown-linux-gnu and amd64 container now ship with PGO enabled by default.** Measured on a dedicated host (1, 2, 4 cores, wrk with 8 threads): PGO gains +3.3% (1c), +8.9% (2c), +9.3% (4c) and scales better (75% vs 56% from 1→4 core). The profile trains on cache hits, proxy, static files, H1+H2, ECDSA+RSA certs, and WAF; edge cases like exclusive RSA handshakes or specialized WAF rules may have different characteristics. **Operators who need a non-PGO build** may request `zion-v0.13-x86_64-unknown-linux-gnu-no-pgo.tar.gz` or build locally without PGO; aarch64 and Windows remain non-PGO (PGO profile doesn't transfer cross-architecture). A known limitation: 2 HTTP/2 protocol-compliance tests (h2spec) fail uniquely with PGO on edge cases (`HEADERS` without `END_STREAM`, `content-length` mismatch); these are protocol rejections, not functional regressions.
+- **`docs/perf/pgo.md` now documents the default.** The profile is deterministically reproducible from v0.13 onward (same training, same source → same profile); shipped binaries are signed, and the profile data itself is archived. Hash reproducibility of the *compiled binary* is not guaranteed (timestamps in LLVM output may differ per rebuild), but the executable code is identical and verified by conformance tests. See "Profile reproducibility" in the guide.
+
+### Changed
+
+- **PGO is the default for x86_64-gnu.** The release workflow now produces `zion-v0.13-x86_64-unknown-linux-gnu.tar.gz` (PGO-optimized) as the primary artefact. A non-PGO variant is available on request or by rebuilding from source without `scripts/pgo-collect.sh`. The amd64 container includes the PGO binary by default.
+
+### Fixed
+
+- None.
+
 ### Upgrade notes
 
 - **zion now sends 2 TLS 1.3 session tickets after a full handshake, not 4** (`[tls] session_tickets`, default `2`; set `4` to get the previous behaviour). Each ticket costs about 25 µs of server CPU per full handshake and the client has to parse it: on one core a handshake went from 309 µs with 4 tickets to 257 µs with 2 (3.2k → 3.9k handshakes a second, −17 % CPU), and to 233 µs with 1. The extra two were there for clients that open several connections at once and resume each with its own ticket; if yours do and you see more full handshakes after upgrading (`zion_tls_handshake_duration` count against resumed sessions), raise the value. `0` sends none, and more than 16 is a config error. Read at start-up.

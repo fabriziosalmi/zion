@@ -59,12 +59,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux glibc
+          # Linux glibc (PGO-optimized by default, see issue #55)
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            cross: zig
+            cross: native
             artifact: zion
-            pgo: false
+            pgo: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             cross: zig

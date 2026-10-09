@@ -1,0 +1,55 @@
+cl-te              MUST     zion ok   nginx ok    answered and closed
+dup-cl             MUST     zion ok   nginx ok    status 400, forwarded 0
+cl-invalid         MUST     zion ok   nginx ok    all five rejected
+te-unknown         MUST     zion ok   nginx ok    status 400, forwarded 0
+te-not-final       MUST     zion ok   nginx FAIL  status 400, forwarded 0
+ws-colon           MUST     zion ok   nginx ok    status 400, forwarded 0
+obs-fold           MUST     zion ok   nginx ok    rejected with 400
+bare-cr            MUST     zion ok   nginx ok    rejected with 400
+nul-value          MUST     zion ok   nginx ok    rejected with 400
+no-host            MUST     zion FAIL nginx ok    status 200
+two-hosts          MUST     zion FAIL nginx ok    status 200
+bad-host           MUST     zion FAIL nginx ok    status 200
+method-case        MUST     zion ok   nginx ok    status 405
+target-8000        SHOULD   zion ok   nginx ok    status 200
+target-70000       SHOULD   zion ok   nginx ok    status 431
+headers-huge       SHOULD   zion ok   nginx ok    status 431
+chunk-bad-size     MUST     zion ok   nginx ok    status 502
+chunked-forward    MUST     zion ok   nginx ok    status 200
+pipelining         MUST     zion ok   nginx ok    2 responses
+conn-close         MUST     zion ok   nginx ok    status 200, closed True
+expect-100         SHOULD   zion ok   nginx ok    status 200, interim [100]
+http10             INFO     zion info nginx info  status 200
+abs-form           INFO     zion info nginx info  status 200; origin saw Host '127.0.0.1:14491'
+options-star       INFO     zion info nginx info  status 404
+trace              SECURITY zion ok   nginx ok    status 405, forwarded 0
+connect            SECURITY zion ok   nginx ok    status 405
+hop-request        MUST     zion FAIL nginx FAIL  leaked: x-remove-me
+hop-response       MUST     zion ok   nginx FAIL  status 200, none leaked
+via-request        SHOULD   zion ok   nginx FAIL  Via: 1.1 zion-5b11d3a5
+xff                INFO     zion info nginx info  origin saw X-Forwarded-For: '127.0.0.1'
+max-forwards       INFO     zion info nginx info  status 200; forwarded 1
+resp-cl-te         MUST     zion ok   nginx ok    status 200, both headers False, body b'hello'
+resp-truncated     MUST     zion ok   nginx ok    status 200, complete False, body 10 bytes
+resp-garbage       SHOULD   zion ok   nginx FAIL  status 502, relayed False
+resp-100           MUST     zion ok   nginx ok    status 200, body b'ok'
+resp-bighdr        INFO     zion info nginx info  status 200
+upstream-down      SHOULD   zion ok   nginx ok    status 503 after 0.0s
+age-on-hit         MUST     zion ok   nginx FAIL  Age: 0
+etag-304           MUST     zion ok   nginx ok    status 304, ETag "6ac80882-c23"
+ims-304            MUST     zion ok   nginx ok    status 304
+inm-mismatch       MUST     zion ok   nginx ok    status 200
+head               MUST     zion ok   nginx ok    HEAD 200 CL 3107 vs GET 200 CL 3107
+range-206          MUST     zion ok   nginx ok    status 206, Content-Range bytes 0-99/29266, 100 bytes
+range-416          SHOULD   zion ok   nginx ok    status 416, Content-Range bytes */29266
+content-type       SHOULD   zion ok   nginx ok    Content-Type: application/json
+unsafe-method      MUST     zion ok   nginx ok    status 405 (origin says 405), Age None
+accept-ranges      SHOULD   zion ok   nginx ok    status 200, Accept-Ranges bytes
+static-range       SHOULD   zion ok   nginx ok    status 206, 10 bytes
+static-conditional MUST     zion ok   nginx ok    status 304
+traversal          SECURITY zion ok   nginx ok    12 encodings, none reached the file
+static-methods     SECURITY zion ok   nginx ok    all refused
+tls13              SHOULD   zion ok   nginx ok    TLSv1.3
+tls12              INFO     zion info nginx info  refused (tlsv1 alert protocol version (_ssl.c:1000))
+alpn               INFO     zion info nginx info  selected h2
+resumption         SHOULD   zion ok   nginx ok    session_reused=True

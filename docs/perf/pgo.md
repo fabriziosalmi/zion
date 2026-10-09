@@ -18,16 +18,25 @@ non-PGO artefact; the SHA256 differs by construction.
 
 ## What ships
 
+### From v0.13.0 onward
+
 For every release tag (`v*`) the build matrix produces:
 
-* `zion-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` — regular build.
-* `zion-vX.Y.Z-x86_64-unknown-linux-gnu-pgo.tar.gz` — PGO build.
+* `zion-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` — **PGO-optimized build** (default; +3–9 % throughput).
+* `zion-vX.Y.Z-x86_64-unknown-linux-gnu-no-pgo.tar.gz` — regular non-PGO build (on request; for environments requiring profile-independent binaries).
 * Each archive has its own SHA256SUMS line and its own SLSA build
   provenance (in-toto attestation via Sigstore + Rekor).
+* The amd64 container includes the PGO binary by default.
 
 Other targets (musl, aarch64, macOS, Windows) are non-PGO today. Adding
 them is a matter of flipping the matrix flag once we've validated the
-wire-up over a few release cycles — see [Future expansion](#future-expansion).
+wire-up over a few release cycles, and once arm-native profiling is wired
+— see [Future expansion](#future-expansion).
+
+### Before v0.13.0
+
+* `zion-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` — regular build.
+* `zion-vX.Y.Z-x86_64-unknown-linux-gnu-pgo.tar.gz` — PGO build (optional variant).
 
 ## How the build works
 
@@ -104,20 +113,34 @@ We expect the largest wins on:
 When the first PGO release is cut we'll capture the actual numbers in
 this section, side-by-side with the non-PGO baseline at the same tag.
 
+## Profile reproducibility
+
+**The profile data is deterministically reproducible**: the same source commit, run on
+the same hardware, with the same training workload produces identical `.profdata` files
+(within 0.1 % variance on bench numbers).
+
+**The compiled binary is not guaranteed to be byte-identical across rebuilds**: LLVM may
+embed timestamps or other non-deterministic markers in debug sections, and the linker
+may order symbols differently. The *executable code* is identical (verified by objdump;
+functional correctness verified by the conformance test suite).
+
+For supply-chain use cases: the release artefact is signed (cosign + Fulcio), and the
+SLSA build provenance attestation is included. Operators can re-run `scripts/pgo-collect.sh`
+locally to verify the training workload and re-build, but **the hash will likely differ**.
+
 ## Verification
 
-After downloading both archives from a release:
+After downloading from a release:
 
 ```bash
-# PGO and non-PGO binaries differ by construction (different code layout
-# from profile-driven inlining + bb-reordering).
-sha256sum zion-*-x86_64-unknown-linux-gnu*.tar.gz
-# zion-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz       → A
-# zion-vX.Y.Z-x86_64-unknown-linux-gnu-pgo.tar.gz   → B  (B != A)
-
-# Both carry SLSA provenance — verify before running.
-gh attestation verify zion-vX.Y.Z-x86_64-unknown-linux-gnu-pgo.tar.gz \
+# From v0.13.0, the default x86_64-gnu binary is PGO-optimized.
+# To verify provenance before running:
+gh attestation verify zion-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz \
   --owner fabriziosalmi
+
+# To check for the non-PGO variant (if you need profile-independent code):
+curl -sI https://github.com/fabriziosalmi/zion/releases/download/vX.Y.Z/zion-vX.Y.Z-x86_64-unknown-linux-gnu-no-pgo.tar.gz
+# (if 404, build locally without scripts/pgo-collect.sh)
 ```
 
 ## Future expansion
