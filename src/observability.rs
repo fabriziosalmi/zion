@@ -20,6 +20,7 @@
 //! still lives in `dispatch.rs` — it uses a stack buffer + hex lookup
 //! and we don't want to interpose any allocation here.
 
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -312,6 +313,14 @@ impl LogFormat {
 /// silently dropped them: the access log needed `RUST_LOG` to appear at all.
 pub const DEFAULT_FILTER: &str = "zion=info,access=info,sovereign=info,warn";
 
+/// Colour the text log only when a person is reading it: stderr is a terminal and `NO_COLOR` is
+/// unset (<https://no-color.org>). `tracing-subscriber` colours by default whatever stderr is,
+/// so a log read by `docker logs`, journald or a file carried `\e[2m…\e[0m` around every field,
+/// and the formatting of those escapes was about half of what the access log cost per request.
+fn use_ansi(stderr_is_terminal: bool, no_color: bool) -> bool {
+    stderr_is_terminal && !no_color
+}
+
 pub fn init_subscriber(format: LogFormat, log_queue_lines: usize) {
     crate::logq::install(log_queue_lines, matches!(format, LogFormat::Json));
     let filter =
@@ -351,6 +360,10 @@ pub fn init_subscriber(format: LogFormat, log_queue_lines: usize) {
         }
         LogFormat::Text => {
             let fmt_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(use_ansi(
+                    std::io::stderr().is_terminal(),
+                    std::env::var_os("NO_COLOR").is_some(),
+                ))
                 .with_target(true)
                 .with_thread_ids(false)
                 .with_thread_names(false)
@@ -719,6 +732,22 @@ mod tests {
 // Property-based tests: the W3C parser must never panic on arbitrary bytes,
 // and a generate→parse roundtrip must be the identity for any valid input.
 // ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod ansi_tests {
+    use super::use_ansi;
+
+    #[test]
+    fn colour_only_for_a_person_on_a_terminal() {
+        assert!(use_ansi(true, false));
+        assert!(!use_ansi(true, true), "NO_COLOR wins");
+        assert!(
+            !use_ansi(false, false),
+            "a file, a pipe, docker logs, journald"
+        );
+        assert!(!use_ansi(false, true));
+    }
+}
+
 #[cfg(test)]
 mod proptests {
     use super::*;
