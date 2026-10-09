@@ -671,6 +671,7 @@ pub async fn run_soak() -> i32 {
         key_path: key_path.clone(),
         hot_reload: true,
         min_version: crate::config::TlsMinVersion::V1_2,
+        session_tickets: 2,
         alpn: vec!["http/1.1".into()],
         sni: vec![],
         acme: None,

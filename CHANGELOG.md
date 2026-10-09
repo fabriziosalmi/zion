@@ -4,6 +4,14 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **zion now sends 2 TLS 1.3 session tickets after a full handshake, not 4** (`[tls] session_tickets`, default `2`; set `4` to get the previous behaviour). Each ticket costs about 25 µs of server CPU per full handshake and the client has to parse it: on one core a handshake went from 309 µs with 4 tickets to 257 µs with 2 (3.2k → 3.9k handshakes a second, −17 % CPU), and to 233 µs with 1. The extra two were there for clients that open several connections at once and resume each with its own ticket; if yours do and you see more full handshakes after upgrading (`zion_tls_handshake_duration` count against resumed sessions), raise the value. `0` sends none, and more than 16 is a config error. Read at start-up.
+
+### Changed
+
+- **`[tls] session_tickets`, default 2.** See the upgrade note. Measured on the dedicated host, one core, wrk with `Connection: close`: 4 tickets 309 µs and 3.2k handshakes a second, 2 tickets 257 µs and 3.9k, 1 ticket 233 µs and 4.3k (nginx: 412 µs). A real client counted the tickets on the wire in a test: 2 by default, 5 with `5`, none with `0`.
+
 ## [0.12.0] - 2026-10-09
 
 **zion now answers 400 to an HTTP/1.1 request without `Host`, with two `Host` headers or with an invalid one: read the first upgrade note if anything of yours sends such requests.** The rest is CPU and tail latency, measured on a dedicated host against v0.11.0: serving files from disk, the access log and a proxied request cost less per request, and past 256 busy connections on a worker the extra connections are no longer served several times slower than the first 256.

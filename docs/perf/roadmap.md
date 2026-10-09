@@ -50,8 +50,8 @@ streaming costs.
 [`tls.rs`](../../src/tls.rs) previously panicked at boot when the
 platform CSPRNG refused to deliver entropy for the session ticketer.
 That's now a `ZionError::Tls` with a clean exit code. The rest of the
-resumption stack (`ServerSessionMemoryCache::new(16384)`, 4 TLS-1.3
-tickets per connection, 0-RTT with 425-Too-Early gating, half-RTT
+resumption stack (`ServerSessionMemoryCache::new(16384)`, TLS-1.3
+tickets per connection (4 up to v0.12.0; now `[tls] session_tickets`, default 2), 0-RTT with 425-Too-Early gating, half-RTT
 data, `ignore_client_order`) was already in place from v0.1.7 and is
 documented inline in the source.
 

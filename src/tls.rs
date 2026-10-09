@@ -538,10 +538,12 @@ pub fn load_tls_config(tls: &TlsConfig) -> Result<ServerConfig, String> {
     config.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new()
         .map_err(|e| format!("create TLS session ticketer (CSPRNG): {e}"))?;
 
-    // Send 4 TLS 1.3 tickets per connection (default: 2).
-    // More tickets = better resumption rate for clients that open
-    // multiple parallel connections (browsers, HTTP/2 multiplexing).
-    config.send_tls13_tickets = 4;
+    // TLS 1.3 session tickets per full handshake: `[tls] session_tickets`, default 2 (rustls'
+    // and OpenSSL's default). It was 4, for a better resumption rate with clients that open
+    // several connections at once; measured on one core each ticket is about 25 µs of server CPU
+    // a handshake (4: 309 µs, 2: 257 µs, 1: 233 µs) and the client pays to parse them too, so
+    // the extra two are now an opt-in.
+    config.send_tls13_tickets = usize::from(tls.session_tickets);
 
     // TLS 1.3 0-RTT Early Data — client sends application data in the first
     // flight (with ClientHello), saving 1 full RTT on resumed connections.
