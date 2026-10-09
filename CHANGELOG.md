@@ -4,6 +4,18 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-09
+
+**zion now answers 400 to an HTTP/1.1 request without `Host`, with two `Host` headers or with an invalid one: read the first upgrade note if anything of yours sends such requests.** The rest is CPU and tail latency, measured on a dedicated host against v0.11.0: serving files from disk, the access log and a proxied request cost less per request, and past 256 busy connections on a worker the extra connections are no longer served several times slower than the first 256.
+
+### Upgrade notes
+
+- **An HTTP/1.1 request without `Host`, with more than one, or with an invalid value now gets a 400 and the connection is closed** (RFC 9112 §3.2). A hand-written health probe or an old script that sends HTTP/1.1 without `Host` must add one. HTTP/1.0 may still omit it, and HTTP/2 and HTTP/3 are not affected.
+- **Headers named in a request's `Connection` header are no longer forwarded to the upstream** (RFC 9110 §7.6.1): `Connection: keep-alive, X-Remove-Me` now removes `X-Remove-Me`. If an upstream relied on receiving a header the client listed there, send it another way.
+- **Log lines reach stderr in batches, up to about 2 ms after they are logged.** A process killed outright (SIGKILL, power loss) can lose the last few lines; a clean shutdown and a panic still flush the queue first. `log_queue_lines` now bounds the lines not yet written, the batch being written included.
+- **The text log is no longer coloured when stderr is not a terminal** (or `NO_COLOR` is set). It was coloured whatever stderr was, so `docker logs`, journald and files carried escape sequences around every field; a parser that stripped them keeps working, one that matched on them needs updating. JSON logs were never coloured.
+- No setting was removed or renamed.
+
 ### Changed
 
 - **Serving files from disk (`mode = "static"`, no `precompressed`) is about a quarter cheaper per request, and steadier.** The route made seven calls to the blocking thread pool per request (canonicalize the root, canonicalize the file, stat, stat, open, read, close), and every hand-off costs more than the page-cache read it serves. It now resolves, opens and, for a plain GET of a small file, reads in one. On a single core a 28 KB page went from 114-155 µs to 88 µs of CPU per request and from 6.4-8.8k to 11.3k req/s (the old path varied 31% between two identical runs, the new one 0.3%); nginx with `open_file_cache` does the same file in 49 µs. No behaviour changes: the same checks run in the same order (inside the root, regular files only, no FIFO opened), and a request carrying `If-None-Match`, `If-Modified-Since` or `Range` still reads nothing before the validators are checked. Routes with `precompressed = true` keep their previous path.
