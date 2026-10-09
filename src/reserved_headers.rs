@@ -63,7 +63,22 @@ pub fn reserved(asserter: Asserter) -> impl Iterator<Item = &'static str> {
 
 /// Drop every copy of the headers `asserter` owns (hyper lower-cases names, so one `remove`
 /// per name clears repeated and mixed-case copies).
+///
+/// A request almost never carries one, and a `remove` by string name costs a lower-casing, a
+/// validation and a hash for each of the sixteen names, on every request and for each of three
+/// classes. So the names the request *does* carry are looked at first (a handful, and all but the
+/// `x-…` ones are dismissed by their first two bytes), and the removals run only for a hit.
 pub fn scrub(headers: &mut hyper::HeaderMap, asserter: Asserter) {
+    let any = headers.keys().any(|k| {
+        let name = k.as_str();
+        (name.starts_with("x-") || name == "forwarded")
+            && RESERVED_HEADERS
+                .iter()
+                .any(|(reserved, a)| *a == asserter && *reserved == name)
+    });
+    if !any {
+        return;
+    }
     for name in reserved(asserter) {
         headers.remove(name);
     }
@@ -95,6 +110,33 @@ mod tests {
         ] {
             assert!(reserved(asserter).count() > 0, "{asserter:?} owns nothing");
         }
+    }
+
+    #[test]
+    fn a_request_with_none_of_them_is_left_exactly_as_it_was() {
+        // the common case, taken on the fast path: nothing to find, nothing touched
+        let mut h = hyper::HeaderMap::new();
+        for (k, v) in [
+            ("host", "a.example"),
+            ("user-agent", "t"),
+            ("x-request-id", "1"),
+            ("x-custom", "kept"),
+            ("accept", "*/*"),
+        ] {
+            h.insert(
+                hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        let before = h.clone();
+        for asserter in [
+            Asserter::Transport,
+            Asserter::Pipeline,
+            Asserter::TrustedProxy,
+        ] {
+            scrub(&mut h, asserter);
+        }
+        assert_eq!(h, before);
     }
 
     #[test]

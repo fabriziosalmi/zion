@@ -97,8 +97,16 @@ impl CorsHeaders {
 static CSP_NAME: hyper::header::HeaderName =
     hyper::header::HeaderName::from_static("content-security-policy");
 
+const REFERRER_POLICY: hyper::header::HeaderName =
+    hyper::header::HeaderName::from_static("referrer-policy");
+const PERMISSIONS_POLICY: hyper::header::HeaderName =
+    hyper::header::HeaderName::from_static("permissions-policy");
+const KEEP_ALIVE: hyper::header::HeaderName = hyper::header::HeaderName::from_static("keep-alive");
+
 /// Inject security headers and strip hop-by-hop headers.
-/// All values are pre-compiled statics — zero allocation per response.
+/// All values are pre-compiled statics — zero allocation per response, and every name is a
+/// `HeaderName` built at compile time: a string key is lower-cased, validated and hashed on each
+/// call, which for these thirteen was a tenth of the instructions of a cache hit.
 #[inline]
 pub fn inject_security_headers(resp: &mut Response<ZionBody>) {
     let h = resp.headers_mut();
@@ -106,23 +114,17 @@ pub fn inject_security_headers(resp: &mut Response<ZionBody>) {
     h.insert(hyper::header::STRICT_TRANSPORT_SECURITY, HSTS.clone());
     h.insert(hyper::header::X_CONTENT_TYPE_OPTIONS, XCTO.clone());
     h.insert(hyper::header::X_FRAME_OPTIONS, XFO.clone());
-    h.insert(
-        hyper::header::HeaderName::from_static("referrer-policy"),
-        REFERRER.clone(),
-    );
-    h.insert(
-        hyper::header::HeaderName::from_static("permissions-policy"),
-        PERMISSIONS.clone(),
-    );
+    h.insert(REFERRER_POLICY, REFERRER.clone());
+    h.insert(PERMISSIONS_POLICY, PERMISSIONS.clone());
     // Strip server identity + hop-by-hop (RFC 7230 §6.1)
     h.remove(hyper::header::SERVER);
     h.remove(hyper::header::CONNECTION);
     h.remove(hyper::header::TRANSFER_ENCODING);
-    h.remove("Keep-Alive");
-    h.remove("Proxy-Authenticate");
-    h.remove("Proxy-Authorization");
-    h.remove("TE");
-    h.remove("Trailer");
+    h.remove(KEEP_ALIVE);
+    h.remove(hyper::header::PROXY_AUTHENTICATE);
+    h.remove(hyper::header::PROXY_AUTHORIZATION);
+    h.remove(hyper::header::TE);
+    h.remove(hyper::header::TRAILER);
 }
 
 // ============================================================================
