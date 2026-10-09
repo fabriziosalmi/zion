@@ -316,6 +316,15 @@ fn run() -> error::ZionResult<()> {
     // operator gets a clean exit code instead of an `expect` panic.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(platform.worker_threads)
+        // Poll the global queue on every scheduler tick. A worker's local run queue holds 256
+        // tasks; when more are runnable (more than ~256 busy connections on one worker) the
+        // overflow goes to the global queue, which the default (tuned, ~31+ ticks) polls far
+        // less often than the local one. The connections that landed there were served at a
+        // fraction of the rate of the others: at 1024 connections the median request took
+        // 9.5 ms and the 90th percentile 157 ms, with the same total throughput (nginx: 34 and
+        // 35 ms). Polling it every tick serves both queues at the same rate; measured, the
+        // 90th percentile at 1024 connections fell to 29 ms and throughput rose 8 %.
+        .global_queue_interval(1)
         .on_thread_start(move || {
             if !core_ids.is_empty() {
                 // Sequentially pin each worker thread to a physical core
