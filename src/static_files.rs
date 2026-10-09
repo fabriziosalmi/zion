@@ -220,6 +220,9 @@ pub async fn serve(
     if method != Method::GET && method != Method::HEAD {
         return resp(StatusCode::METHOD_NOT_ALLOWED);
     }
+    if !precompressed {
+        return serve_plain(root, tail, spa_fallback, method, req_headers).await;
+    }
     // The root itself must resolve; a missing serve_dir is a 404, not a leak.
     let canon_root = match tokio::fs::canonicalize(root).await {
         Ok(r) => r,
@@ -238,6 +241,110 @@ pub async fn serve(
         }
     }
     resp(StatusCode::NOT_FOUND)
+}
+
+/// A file found under the root, opened, with what `fstat` said about *that handle* (so the
+/// length and validators describe the bytes that will be read, whatever happens to the path
+/// afterwards) and, when the request needed the whole small body, the body itself.
+struct Opened {
+    path: PathBuf,
+    file: std::fs::File,
+    meta: std::fs::Metadata,
+    body: Option<Vec<u8>>,
+}
+
+/// Resolve `rel` under `canon_root` the way [`resolve_file`] does (canonicalize, stay inside the
+/// tree, a directory maps to its `index.html`, only regular files), then open it and `fstat` the
+/// handle. With `preload`, a file up to [`BUFFER_WHOLE_MAX_BYTES`] is read here too.
+///
+/// Blocking: run it on the blocking pool, once. Doing the same work as `tokio::fs` calls costs one
+/// hand-off to a blocking thread per call (canonicalize, canonicalize, stat, stat, open, read, close),
+/// and a hand-off is far dearer than the page-cache read it serves.
+fn open_in(canon_root: &Path, rel: &Path, preload: bool) -> Option<Opened> {
+    let mut path = std::fs::canonicalize(canon_root.join(rel)).ok()?;
+    if !path.starts_with(canon_root) {
+        return None; // a symlink (or a race) escaped the tree
+    }
+    let mut meta = std::fs::metadata(&path).ok()?;
+    if meta.is_dir() {
+        path = std::fs::canonicalize(path.join("index.html")).ok()?;
+        if !path.starts_with(canon_root) {
+            return None;
+        }
+        meta = std::fs::metadata(&path).ok()?;
+    }
+    if !meta.is_file() {
+        return None; // device / socket / fifo — never opened, never served (opening a fifo blocks)
+    }
+    let mut file = std::fs::File::open(&path).ok()?;
+    let meta = file.metadata().ok()?;
+    let body = if preload && meta.len() <= BUFFER_WHOLE_MAX_BYTES {
+        use std::io::Read;
+        let mut buf = Vec::with_capacity(meta.len() as usize);
+        file.read_to_end(&mut buf).ok()?;
+        Some(buf)
+    } else {
+        None
+    };
+    Some(Opened {
+        path,
+        file,
+        meta,
+        body,
+    })
+}
+
+/// The route without precompressed sidecars (the common one): the whole file-system side of the
+/// request, root included, is a single trip through the blocking pool.
+async fn serve_plain(
+    root: &Path,
+    tail: &str,
+    spa_fallback: bool,
+    method: &Method,
+    req_headers: &HeaderMap,
+) -> Response<ZionBody> {
+    let Some(rel) = sanitize(tail) else {
+        return resp(StatusCode::FORBIDDEN);
+    };
+    // Read the body in the same trip only when this request will certainly want it: a GET with
+    // no validator and no Range. A revalidating client (304) or a ranged one reads nothing here.
+    let preload = method == Method::GET
+        && ![
+            hyper::header::IF_NONE_MATCH,
+            hyper::header::IF_MODIFIED_SINCE,
+            hyper::header::RANGE,
+        ]
+        .iter()
+        .any(|h| req_headers.contains_key(h));
+    let root = root.to_path_buf();
+    let found = tokio::task::spawn_blocking(move || {
+        // The root itself must resolve; a missing serve_dir is a 404, not a leak.
+        let canon_root = std::fs::canonicalize(&root).ok()?;
+        open_in(&canon_root, &rel, preload).or_else(|| {
+            spa_fallback
+                .then(|| open_in(&canon_root, Path::new("index.html"), preload))
+                .flatten()
+        })
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(o) = found else {
+        return resp(StatusCode::NOT_FOUND);
+    };
+    let mime = mime_for(&o.path);
+    respond(
+        &o.path,
+        Source {
+            meta: o.meta,
+            file: Some(o.file),
+            body: o.body,
+        },
+        mime,
+        method,
+        req_headers,
+    )
+    .await
 }
 
 /// Serve an already-resolved file, applying precompressed-sidecar negotiation
@@ -384,6 +491,33 @@ async fn read_file(
         Ok(m) => m,
         Err(_) => return resp(StatusCode::NOT_FOUND),
     };
+    let source = Source {
+        meta,
+        file: None,
+        body: None,
+    };
+    respond(path, source, mime, method, req_headers).await
+}
+
+/// What the file system has already told us about the file being served. A caller that has
+/// opened it (and maybe read it) passes that on, so [`respond`] does not do it again; one that has
+/// only a path passes `file: None, body: None` and `respond` opens it when, and only when, it needs
+/// the bytes.
+struct Source {
+    meta: std::fs::Metadata,
+    file: Option<std::fs::File>,
+    body: Option<Vec<u8>>,
+}
+
+/// Build the response for `path` (see [`read_file`]): conditional, then range, then the full body.
+async fn respond(
+    path: &Path,
+    source: Source,
+    mime: &'static str,
+    method: &Method,
+    req_headers: &HeaderMap,
+) -> Response<ZionBody> {
+    let Source { meta, file, body } = source;
     let (etag, last_modified) = validators(&meta);
     let total = meta.len();
 
@@ -430,15 +564,34 @@ async fn read_file(
     // A large file streams frame-by-frame instead of buffering whole; a small one
     // takes the low-latency one-shot read.
     if total > BUFFER_WHOLE_MAX_BYTES {
-        let file = match tokio::fs::File::open(path).await {
-            Ok(f) => f,
-            Err(_) => return resp(StatusCode::NOT_FOUND),
+        let file = match file {
+            Some(f) => tokio::fs::File::from_std(f),
+            None => match tokio::fs::File::open(path).await {
+                Ok(f) => f,
+                Err(_) => return resp(StatusCode::NOT_FOUND),
+            },
         };
         return file_response(mime, total, etag, last_modified, stream_file(file, None));
     }
-    let data = match tokio::fs::read(path).await {
-        Ok(d) => d,
-        Err(_) => return resp(StatusCode::NOT_FOUND),
+    let data = match (body, file) {
+        (Some(d), _) => d,
+        (None, Some(mut f)) => {
+            // opened by the caller, body not wanted until the validators were checked
+            let read = tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                let mut buf = Vec::with_capacity(total as usize);
+                f.read_to_end(&mut buf).map(|_| buf)
+            })
+            .await;
+            match read {
+                Ok(Ok(d)) => d,
+                _ => return resp(StatusCode::NOT_FOUND),
+            }
+        }
+        (None, None) => match tokio::fs::read(path).await {
+            Ok(d) => d,
+            Err(_) => return resp(StatusCode::NOT_FOUND),
+        },
     };
     let len = data.len() as u64;
     file_response(mime, len, etag, last_modified, full_body(Bytes::from(data)))
@@ -1084,6 +1237,46 @@ mod serve_tests {
         // Following the symlink must not escape the canonical root.
         assert_eq!(get(&root.0, "leak", false).await.0, StatusCode::NOT_FOUND);
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[tokio::test]
+    async fn a_fifo_is_never_opened() {
+        // Opening a FIFO blocks until a writer shows up: on the blocking pool that is a stuck
+        // thread per request. The type is checked before the open, so this answers at once.
+        let root = root("fifo");
+        let fifo = std::ffi::CString::new(root.0.join("pipe").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            get(&root.0, "pipe", false),
+        )
+        .await
+        .expect("a FIFO under the root must not hang the request");
+        assert_eq!(got.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_root_that_is_itself_a_symlink_serves() {
+        // blue/green deploys point `current -> releases/N`; the root is canonicalized per
+        // request, so a flip is seen at once and a file under the new target is served.
+        let root = root("rootlink");
+        let link = std::env::temp_dir().join(format!("zion-static-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&root.0, &link).unwrap();
+        let got = get(&link, "css/main.css", false).await;
+        let _ = std::fs::remove_file(&link);
+        assert_eq!(got, (StatusCode::OK, "body{}".into()));
+    }
+
+    #[tokio::test]
+    async fn a_directory_without_an_index_is_not_found() {
+        let root = root("noindex");
+        std::fs::create_dir_all(root.0.join("empty")).unwrap();
+        assert_eq!(get(&root.0, "empty", false).await.0, StatusCode::NOT_FOUND);
+        // …and with the SPA fallback it is the root index that answers, not the directory.
+        let (status, body) = get(&root.0, "empty", true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("home"));
     }
 
     #[tokio::test]
