@@ -11,12 +11,23 @@
 //! queue is full the *new* line is dropped and counted ([`DROPPED`](crate::logq::DROPPED), `zion_log_lines_dropped_total`),
 //! and the writer thread says so on the sink the next time it can write, so loss is never silent.
 //! [`flush`](crate::logq::flush) waits (bounded) for the queue to drain, for shutdown and for the panic hook.
+//!
+//! The writer thread writes in batches: after the first line it waits `LINGER` and then writes
+//! everything that has gathered in one `write`. Waking it for every line cost two `futex` calls,
+//! two context switches and a `write` a line, and on a server pinned to few cores that is the
+//! server's own time: an access log line cost ~22 µs of CPU, of which formatting was a third.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// How long the writer thread lets lines gather before writing them together. A line reaches
+/// stderr at most this much (plus the write) after it was logged.
+const LINGER: Duration = Duration::from_millis(2);
+/// A batch stops growing at this many bytes, so one write stays a sensible size.
+const BATCH_MAX_BYTES: usize = 256 * 1024;
 
 /// Lines dropped because the queue was full (or the writer thread had died).
 pub static DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -38,14 +49,18 @@ fn drop_notice(json: bool, ts: &str, n: u64) -> String {
 /// A bounded, lossy, order-preserving line queue in front of a sink.
 pub struct LogQueue {
     tx: SyncSender<Vec<u8>>,
+    /// Lines accepted and not yet written: queued, or in the batch the writer is writing. This
+    /// is what `capacity` bounds.
     pending: std::sync::Arc<AtomicUsize>,
+    capacity: usize,
     dropped: std::sync::Arc<AtomicU64>,
 }
 
 impl LogQueue {
     /// Start the writer thread over `sink`. `capacity` is the number of lines that can wait.
     pub fn spawn(capacity: usize, mut sink: Box<dyn Write + Send>) -> Self {
-        let (tx, rx) = sync_channel::<Vec<u8>>(capacity.max(1));
+        let capacity = capacity.max(1);
+        let (tx, rx) = sync_channel::<Vec<u8>>(capacity);
         let pending = std::sync::Arc::new(AtomicUsize::new(0));
         let dropped = std::sync::Arc::new(AtomicU64::new(0));
         let (p, d) = (pending.clone(), dropped.clone());
@@ -53,7 +68,23 @@ impl LogQueue {
             .name("zion-log".into())
             .spawn(move || {
                 let mut reported = 0u64;
-                for line in rx {
+                let mut batch: Vec<u8> = Vec::with_capacity(16 * 1024);
+                // Block for the first line; then let the rest of the burst gather, so the
+                // producers never have to wake this thread for each of them.
+                while let Ok(first) = rx.recv() {
+                    batch.clear();
+                    batch.extend_from_slice(&first);
+                    let mut lines = 1usize;
+                    std::thread::sleep(LINGER);
+                    while batch.len() < BATCH_MAX_BYTES {
+                        match rx.try_recv() {
+                            Ok(line) => {
+                                batch.extend_from_slice(&line);
+                                lines += 1;
+                            }
+                            Err(_) => break,
+                        }
+                    }
                     let lost = d.load(Relaxed);
                     if lost > reported {
                         let note = drop_notice(
@@ -66,13 +97,13 @@ impl LogQueue {
                             reported = lost;
                         }
                     }
-                    // A record the sink refuses (its reader went away) is a lost line like
-                    // any other: counted, so the metric never under-reports.
-                    if sink.write_all(&line).and_then(|()| sink.flush()).is_err() {
-                        d.fetch_add(1, Relaxed);
-                        DROPPED.fetch_add(1, Relaxed);
+                    // Lines the sink refuses (its reader went away) are lost lines like any
+                    // other: counted, so the metric never under-reports.
+                    if sink.write_all(&batch).and_then(|()| sink.flush()).is_err() {
+                        d.fetch_add(lines as u64, Relaxed);
+                        DROPPED.fetch_add(lines as u64, Relaxed);
                     }
-                    p.fetch_sub(1, Relaxed);
+                    p.fetch_sub(lines, Relaxed);
                 }
             });
         if spawned.is_err() {
@@ -82,13 +113,21 @@ impl LogQueue {
         Self {
             tx,
             pending,
+            capacity,
             dropped,
         }
     }
 
     /// Queue one line; never blocks. Returns false when it was dropped.
     pub fn push(&self, line: &[u8]) -> bool {
-        self.pending.fetch_add(1, Relaxed);
+        // `capacity` bounds the lines not yet written, whether queued or already taken by the
+        // writer into its batch (which, with the batch in hand, the channel alone would not).
+        if self.pending.fetch_add(1, Relaxed) >= self.capacity {
+            self.pending.fetch_sub(1, Relaxed);
+            self.dropped.fetch_add(1, Relaxed);
+            DROPPED.fetch_add(1, Relaxed);
+            return false;
+        }
         match self.tx.try_send(line.to_vec()) {
             Ok(()) => true,
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
@@ -267,8 +306,8 @@ mod tests {
             t.elapsed() < Duration::from_secs(1),
             "producers must not wait on a stalled sink"
         );
-        // 8 queued + the one the writer thread already holds
-        assert!((8..=9).contains(&accepted), "accepted {accepted}");
+        // exactly `capacity` lines not yet written, whoever holds them
+        assert_eq!(accepted, 8, "accepted {accepted}");
         assert_eq!(q.dropped() as usize, 1_000 - accepted);
         // the sink recovers: queued lines are written, and the loss is announced
         *gate.0.lock().unwrap() = true;
@@ -286,6 +325,56 @@ mod tests {
             .sum();
         assert_eq!(announced, q.dropped(), "{text}");
         assert!(text.ends_with("after\n"));
+    }
+
+    /// Counts the `write` calls it receives.
+    #[derive(Clone, Default)]
+    struct CountingSink {
+        out: Collect,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Write for CountingSink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.writes.fetch_add(1, Relaxed);
+            self.out.write(b)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_burst_is_written_together_not_a_write_per_line() {
+        let sink = CountingSink::default();
+        let q = LogQueue::spawn(10_000, Box::new(sink.clone()));
+        for i in 0..2_000 {
+            assert!(q.push(format!("line {i}\n").as_bytes()));
+        }
+        assert!(q.flush(Duration::from_secs(5)));
+        let text = String::from_utf8(sink.out.0.lock().unwrap().clone()).unwrap();
+        let want: String = (0..2_000).map(|i| format!("line {i}\n")).collect();
+        assert_eq!(text, want, "every line, whole and in order");
+        let writes = sink.writes.load(Relaxed);
+        assert!(
+            writes < 50,
+            "2000 lines logged in a burst took {writes} writes; one per line is what batching removes"
+        );
+    }
+
+    #[test]
+    fn a_lone_line_is_written_promptly() {
+        // batching must not turn a quiet log into a slow one
+        let out = Collect::default();
+        let q = LogQueue::spawn(16, Box::new(out.clone()));
+        let t = Instant::now();
+        q.push(b"only\n");
+        assert!(q.flush(Duration::from_secs(5)));
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(out.0.lock().unwrap().as_slice(), b"only\n");
     }
 
     #[test]
