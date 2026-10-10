@@ -16,11 +16,13 @@
 //!
 //! The second is transparent huge pages. Where `/sys/kernel/mm/transparent_hugepage/enabled`
 //! is `always`, the kernel backs mimalloc's arena with 2 MiB pages and a page touched brings
-//! in two megabytes. Measured on such a machine (#657), 150 MiB of cached 1 MiB bodies: the
-//! process grew by 220 to 243 MiB in a release build (1.5 to 1.6 times what the cache counts,
-//! steadily) and by 164 to 167 MiB with huge pages off for the process; 200 MiB cached held
-//! 38 to 68 MiB in huge pages. CPU per request did not move, for a 5 KB cached document (34.9
-//! against 34.8 µs, eight alternated runs) or for a cached megabyte (843 against 818 µs). So
+//! in two megabytes. Measured on such machines (#657), 150 MiB of cached 1 MiB bodies: the
+//! process grew by 200 to 260 MiB in a release build, and by 330 to 360 on two of them (1.3
+//! to 2.4 times what the cache counts, steadily: how much depends on the huge pages the
+//! machine has to give), and by 161 to 171 MiB with huge pages off for the process; 200 MiB
+//! cached held 38 to 68 MiB in huge pages. CPU per request did not move, for a 5 KB cached
+//! document (34.9 against 34.8 µs, eight alternated runs) or for a cached megabyte (843
+//! against 818 µs). So
 //! zion turns them off for its own process (`prctl(PR_SET_THP_DISABLE)`: this process and the
 //! ones it would start, nothing system-wide). Where the setting is `madvise` nothing changes:
 //! mimalloc never asked for them.

@@ -231,9 +231,20 @@ fn metric(zion: &Zion, name: &str) -> u64 {
 /// to 1.9 here, macOS 1.1).
 #[test]
 fn a_cached_megabyte_costs_the_process_about_a_megabyte() {
+    a_cached_megabyte_costs_about_a_megabyte(&[]);
+}
+
+/// The same with `MIMALLOC_ALLOW_THP` in the environment, which zion reads at start-up to leave
+/// transparent huge pages to mimalloc: reading it must not undo the other setting.
+#[test]
+fn a_cached_megabyte_costs_about_a_megabyte_with_the_thp_variable_set() {
+    a_cached_megabyte_costs_about_a_megabyte(&[("MIMALLOC_ALLOW_THP", "0")]);
+}
+
+fn a_cached_megabyte_costs_about_a_megabyte(env: &[(&str, &str)]) {
     const N: usize = 150;
     let origin = origin();
-    let Some(zion) = start(origin, "cache_max_memory_mb = 0") else {
+    let Some(zion) = start_with(origin, "cache_max_memory_mb = 0", env) else {
         return;
     };
     // The first requests pay for connections, TLS state and the page's own buffers.
@@ -253,7 +264,9 @@ fn a_cached_megabyte_costs_the_process_about_a_megabyte() {
     let after = process_memory_mib(zion.child.id());
     let counted = (metric(&zion, "zion_cache_bytes") - counted_before) / MIB as u64;
     let grew = after.saturating_sub(before);
-    eprintln!("cached {counted} MiB (as counted); the process grew by {grew} MiB");
+    eprintln!(
+        "cached {counted} MiB (as counted); the process grew by {grew} MiB (environment: {env:?})"
+    );
     assert!(
         counted >= N as u64,
         "the cache holds what was offered: {counted} MiB"
