@@ -58,6 +58,13 @@ Only the access-log row is on the same side of zero in every trial of both runs.
 library and the byte-search code choose their AES-NI and AVX2 paths when the process
 starts, whatever the build flags say.
 
+The pieces of the request path have their own benchmarks (`cargo bench`: WAF body scan,
+cache lookup, address classification, trace-header parsing, audit HMAC). Of 41, run twice
+per build on one pinned core, none was faster with `x86-64-v3` by more than twice its
+pass-to-pass noise (the largest difference that way: 4.2 % with 2.6 % of noise), and 15
+were faster **without** it by more than twice theirs: the WAF scan of a clean body by 5
+to 11 %, trace-header parsing by 13 to 22 %.
+
 To build for the machine you are on:
 
 ```bash

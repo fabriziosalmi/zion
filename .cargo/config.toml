@@ -6,8 +6,9 @@
 # without AVX2, before it prints a word: older Xeons, and the Atom-class Celeron and Pentium
 # boxes common as home servers and edge appliances. What the flag bought was measured on
 # v0.12.0 (issue #662, docs/deploy/index.md): nothing outside the noise on six workloads of
-# seven, one to three percent of CPU on the seventh. The ciphers, the hashes and the byte
-# searches pick their AVX2 / AES-NI code when the process starts, whatever this file says.
+# seven, one to three percent of CPU on the seventh, and no microbenchmark faster with it
+# beyond noise (the WAF body scan was 10 % slower). The TLS library and the byte searches pick their
+# AES-NI / AVX2 code when the process starts, whatever this file says.
 #
 # To build for the machine you are on:
 #
