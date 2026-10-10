@@ -110,6 +110,11 @@ fn origin() -> u16 {
 /// Start zion with a cached route in front of `origin` and `server` appended to `[server]`;
 /// `None` when a tool the test needs is missing.
 fn start(origin: u16, server: &str) -> Option<Zion> {
+    start_with(origin, server, &[])
+}
+
+/// [`start`], with more environment variables for zion.
+fn start_with(origin: u16, server: &str, env: &[(&str, &str)]) -> Option<Zion> {
     let has = |tool: &str| {
         Command::new(tool)
             .arg("--version")
@@ -162,6 +167,7 @@ fn start(origin: u16, server: &str) -> Option<Zion> {
         .env("ZION_CONFIG", &cfg)
         .env("ZION_BOOT_FAST", "1")
         .env("ZION_LAST_GASP_PATH", dir.join("gasp.jsonl"))
+        .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(dir.join("zion.log")).unwrap())
         .spawn()
@@ -225,9 +231,20 @@ fn metric(zion: &Zion, name: &str) -> u64 {
 /// to 1.9 here, macOS 1.1).
 #[test]
 fn a_cached_megabyte_costs_the_process_about_a_megabyte() {
+    a_cached_megabyte_costs_about_a_megabyte(&[]);
+}
+
+/// The same with `MIMALLOC_ALLOW_THP` in the environment, which zion reads at start-up to leave
+/// transparent huge pages to mimalloc: reading it must not undo the other setting.
+#[test]
+fn a_cached_megabyte_costs_about_a_megabyte_with_the_thp_variable_set() {
+    a_cached_megabyte_costs_about_a_megabyte(&[("MIMALLOC_ALLOW_THP", "0")]);
+}
+
+fn a_cached_megabyte_costs_about_a_megabyte(env: &[(&str, &str)]) {
     const N: usize = 150;
     let origin = origin();
-    let Some(zion) = start(origin, "cache_max_memory_mb = 0") else {
+    let Some(zion) = start_with(origin, "cache_max_memory_mb = 0", env) else {
         return;
     };
     // The first requests pay for connections, TLS state and the page's own buffers.
@@ -247,7 +264,9 @@ fn a_cached_megabyte_costs_the_process_about_a_megabyte() {
     let after = process_memory_mib(zion.child.id());
     let counted = (metric(&zion, "zion_cache_bytes") - counted_before) / MIB as u64;
     let grew = after.saturating_sub(before);
-    eprintln!("cached {counted} MiB (as counted); the process grew by {grew} MiB");
+    eprintln!(
+        "cached {counted} MiB (as counted); the process grew by {grew} MiB (environment: {env:?})"
+    );
     assert!(
         counted >= N as u64,
         "the cache holds what was offered: {counted} MiB"
@@ -255,6 +274,41 @@ fn a_cached_megabyte_costs_the_process_about_a_megabyte() {
     assert!(
         grew * 2 < counted * 3,
         "the process grew by {grew} MiB for {counted} MiB the cache counts: more than 1.5 times"
+    );
+}
+
+/// zion runs with transparent huge pages off for its own process, and an operator can keep them.
+///
+/// The test above only sees the cost where the machine has `transparent_hugepage/enabled` set
+/// to `always`, and then only in a release build (#657: 1.5 to 1.6 instead of 1.1). This one
+/// reads the switch itself, which the kernel shows in `/proc/<pid>/status`, so it says the same
+/// on every Linux machine.
+#[cfg(target_os = "linux")]
+#[test]
+fn transparent_huge_pages_are_off_for_the_process_unless_asked_for() {
+    fn thp_enabled(zion: &Zion) -> Option<String> {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", zion.child.id())).ok()?;
+        let line = status.lines().find(|l| l.starts_with("THP_enabled:"))?;
+        Some(line["THP_enabled:".len()..].trim().to_string())
+    }
+    let Some(zion) = start(origin(), "") else {
+        return;
+    };
+    // `THP_enabled` is in /proc/<pid>/status from Linux 5.0.
+    let Some(by_default) = thp_enabled(&zion) else {
+        eprintln!("SKIP: this kernel does not show THP_enabled");
+        return;
+    };
+    assert_eq!(
+        by_default, "0",
+        "transparent huge pages are on for zion's process"
+    );
+    drop(zion);
+    let zion = start_with(origin(), "", &[("MIMALLOC_ALLOW_THP", "1")]).expect("zion starts");
+    assert_eq!(
+        thp_enabled(&zion).as_deref(),
+        Some("1"),
+        "MIMALLOC_ALLOW_THP=1 keeps transparent huge pages"
     );
 }
 
