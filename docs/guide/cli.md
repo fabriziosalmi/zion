@@ -183,6 +183,13 @@ coverage gaps). See [Observability](/deploy/observability).
 Prints the detected platform (cores, CPU features, tier, kernel capabilities) as
 JSON — for CI gating and automation.
 
+Two fields describe the binary, not the machine: `build_target` (the target triple)
+and `build_target_features` (the CPU features the compiler was allowed to assume
+everywhere in it). A processor that lacks one of those stops the binary with an
+illegal instruction; `has_avx2` and its neighbours say what the machine it is running
+on has. A release binary lists its target's defaults and nothing else
+([which processors a build runs on](/deploy/#which-processors-a-build-runs-on)).
+
 ## Environment variables
 
 | Variable | Meaning |

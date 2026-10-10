@@ -7,9 +7,10 @@
 #   ATTACKER = node2 (i7-3770, 8 cores) — LXC 9101, all 8 cores. wrk/vegeta/h2load.
 #   OBSERVER = Prometheus(:9090) + Grafana(:3000) on .223 (LXC 9003).
 #
-# The Zion binary is built with AVX2/BMI2 (Skylake target) so it CANNOT run on
-# the 2012 Ivy-Bridge attacker node — which is exactly why node2 is the load
-# generator and node1 is the SUT. Document this in the paper.
+# When this rig was set up the Zion binary was built with AVX2/BMI2 (Skylake
+# target) and could not run on the 2012 Ivy-Bridge attacker node — which is why
+# node2 is the load generator and node1 is the SUT. (Since #662 a default build
+# is baseline x86-64 and runs on both.)
 #
 # Orchestration model: run these scripts from a control host (laptop) that has
 # SSH to BOTH Proxmox hosts and direct LAN reachability to the container IPs.

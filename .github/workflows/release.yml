@@ -201,10 +201,15 @@ jobs:
         if: matrix.target == 'aarch64-apple-darwin'
         shell: bash
         run: echo "RUSTFLAGS=-C target-cpu=apple-m1" >> "$GITHUB_ENV"
+      # Intel macOS: the compiler's own default for this target (SSE4.1; every Intel Mac
+      # since 2008), said explicitly because .cargo/config.toml says `native` for the Mac
+      # triples. It was x86-64-v3 until v0.12.0, which a Mac without AVX2 (before 2013)
+      # cannot run; see #662 for what that flag bought. The "CPU baseline" step below fails
+      # if this is ever more than the target's default.
       - name: Pin RUSTFLAGS for redistributable Intel macOS binary
         if: matrix.target == 'x86_64-apple-darwin'
         shell: bash
-        run: echo "RUSTFLAGS=-C target-cpu=x86-64-v3" >> "$GITHUB_ENV"
+        run: echo "RUSTFLAGS=-C target-cpu=penryn" >> "$GITHUB_ENV"
 
       # ── Cross-compile path: zigbuild handles musl + aarch64 + aws-lc-rs ──
       - name: Setup zigbuild
@@ -324,6 +329,28 @@ jobs:
           # gaps before they bite.
           RUSTFLAGS="-Cprofile-use=${PGO_DIR}/merged.profdata -Cllvm-args=-pgo-warn-missing-function" \
             cargo build --release --locked --features dist --target ${{ matrix.target }}
+
+      # ── CPU baseline (#662) ──
+      # A binary compiled for a newer processor than its target's baseline stops with an
+      # illegal instruction on an older one. Before anything is staged or attested:
+      # every binary must say it was built with the compiler's defaults for its target, and
+      # the Linux x86_64 ones must serve under an emulated processor that has SSE2 and
+      # nothing later (scripts/cpu-baseline-smoke.sh). macOS and Windows binaries cannot be
+      # run on an emulated old processor here, so for them it is the declaration only.
+      - name: CPU baseline (declared; executed under an emulated baseline CPU on Linux x86_64)
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && matrix.target != 'aarch64-unknown-linux-musl'
+        shell: bash
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+          MATRIX_ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          if [[ "$MATRIX_TARGET" == x86_64-unknown-linux-* ]]; then
+            sudo apt-get install -y qemu-user >/dev/null
+            export SMOKE_MODE=emulate
+          else
+            export SMOKE_MODE=declare
+          fi
+          bash scripts/cpu-baseline-smoke.sh "target/${MATRIX_TARGET}/release/${MATRIX_ARTIFACT}"
 
       # ── Strip + stage artifact ──
       - name: Stage artifact
@@ -592,6 +619,20 @@ jobs:
             *"${{ matrix.want }}"*) ;;
             *) echo "::error::${{ matrix.platform }} image binary is not ${{ matrix.want }}"; exit 1 ;;
           esac
+
+      # The same question as for the tarballs (#662): does the binary in the image run on a
+      # processor with the architecture's baseline and nothing later? A failure here stops
+      # the manifest: no tag ever points at this digest.
+      - name: The image's binary serves under an emulated baseline CPU
+        if: matrix.arch == 'amd64'
+        run: |
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y qemu-user >/dev/null
+          # rust-toolchain.toml is in this checkout: `rustc` is the compiler the image was
+          # built with, and the script asks it for the target's default features.
+          rustup toolchain install >/dev/null 2>&1 || true
+          rustc --version
+          bash scripts/cpu-baseline-smoke.sh /tmp/zion
 
       - name: Export digest
         run: |

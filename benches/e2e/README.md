@@ -27,9 +27,10 @@ load-generator's ceiling as Zion's.
  demo.italiacdn.net → .221 (/etc/hosts)        SUT pinned, isolated         scrape 2s
 ```
 
-The Skylake node is the SUT specifically because Zion's release binary is built
-with AVX2/BMI2 and **cannot run** on the 2012 Ivy-Bridge node — which therefore
-makes the perfect load generator (stock `wrk`/`vegeta` run fine on it).
+The Skylake node is the SUT because, when this rig was set up, Zion's release
+binary was built with AVX2/BMI2 and **could not run** on the 2012 Ivy-Bridge node —
+which therefore makes the perfect load generator (stock `wrk`/`vegeta` run fine on
+it). Since #662 a default build is baseline x86-64 and runs on both.
 
 ## Layout
 
