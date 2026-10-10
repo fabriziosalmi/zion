@@ -192,6 +192,9 @@ git checkout vX.Y.Z
 export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
 export ZION_GIT_SHA=$(git rev-parse --short=12 HEAD)
 export ZION_COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y-%m-%d HEAD)
+# as the release: the machine's paths remapped, an empty zig cache
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="$(bash scripts/remap-rustflags.sh)"
+export ZIG_GLOBAL_CACHE_DIR=$(mktemp -d)
 PGO_PROFDATA=zion-vX.Y.Z-x86_64-unknown-linux-gnu-pgo.profdata \
 PGO_TARGET=x86_64-unknown-linux-gnu PGO_CARGO="cargo zigbuild" \
   bash scripts/pgo-build.sh
@@ -200,7 +203,10 @@ sha256sum target/x86_64-unknown-linux-gnu/release/zion
 ```
 
 `SOURCE_DATE_EPOCH` matters here as it does for the plain build: the allocator's C code
-embeds its compile time, and without it two builds differ in those bytes. The script
+embeds its compile time, and without it two builds differ in those bytes. So do the two
+lines before the build, for the reasons given where the plain build's recipe is
+([Reproducing a build](/security/supply-chain#reproducing-a-build)); the PGO binary has
+been rebuilt in the runner that made it, not yet somewhere else. The script
 puts the profile where the release's build read it (the path depends on the profile's
 content only), so nothing has to be said about that.
 

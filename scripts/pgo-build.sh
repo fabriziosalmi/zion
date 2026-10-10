@@ -87,7 +87,11 @@ BIN=target/$TARGET/release/zion
 FLAGS_VAR=CARGO_TARGET_$(tr 'a-z.-' 'A-Z__' <<<"$TARGET")_RUSTFLAGS
 [ -z "${RUSTFLAGS:-}" ] || fail "RUSTFLAGS is set ('$RUSTFLAGS'): it would replace the rustflags of .cargo/config.toml. Unset it."
 [ -z "${CARGO_ENCODED_RUSTFLAGS:-}" ] || fail "CARGO_ENCODED_RUSTFLAGS is set: it would replace the rustflags of .cargo/config.toml. Unset it."
-[ -z "${!FLAGS_VAR:-}" ] || fail "$FLAGS_VAR is already set ('${!FLAGS_VAR}'): this script owns it."
+# What the caller already has in that variable goes on every rustc command line of this
+# script, before the profile flags (the release passes scripts/remap-rustflags.sh's this
+# way). Profile flags there would be this script's own job done twice.
+BASE_FLAGS=${!FLAGS_VAR:-}
+case $BASE_FLAGS in *profile-generate* | *profile-use*) fail "$FLAGS_VAR already has profile flags ('$BASE_FLAGS'): this script sets them." ;; esac
 
 # rustc's own llvm-profdata (the llvm-tools component): its raw-profile format
 # is the one this rustc writes. A system llvm-profdata of another LLVM refuses
@@ -98,7 +102,7 @@ PROFDATA=$(rustc --print sysroot)/lib/rustlib/$HOST/bin/llvm-profdata
 # The logs are read by the checks below: no colour codes in them, whatever CARGO_TERM_COLOR says.
 build() { # log file, extra rustflags
   # shellcheck disable=SC2086  # $CARGO is a command with arguments
-  env "$FLAGS_VAR=$2" CARGO_TERM_COLOR=never $CARGO -v --release --locked --features "$FEATURES" --target "$TARGET" >"$1" 2>&1 ||
+  env "$FLAGS_VAR=${BASE_FLAGS:+$BASE_FLAGS }$2" CARGO_TERM_COLOR=never $CARGO -v --release --locked --features "$FEATURES" --target "$TARGET" >"$1" 2>&1 ||
     { tail -40 "$1" >&2; fail "the build failed, full log in $1"; }
 }
 
@@ -216,7 +220,7 @@ fi
 if [ "${PGO_TEST:-0}" = 1 ]; then
   echo "[+] the test suite, compiled with the profile"
   # shellcheck disable=SC2086  # the test command has arguments
-  env "$FLAGS_VAR=-Cprofile-use=$USE" CARGO_TARGET_DIR="$OUT/test-target" CARGO_TERM_COLOR=never \
+  env "$FLAGS_VAR=${BASE_FLAGS:+$BASE_FLAGS }-Cprofile-use=$USE" CARGO_TARGET_DIR="$OUT/test-target" CARGO_TERM_COLOR=never \
     ${PGO_CARGO_TEST:-cargo test} --release --locked --no-fail-fast --target "$TARGET" >"$OUT/test.log" 2>&1 || {
     grep -E 'FAILED|panicked|^error|^test result' "$OUT/test.log" | tail -30 >&2
     fail "the tests fail when compiled with the profile, full log in $OUT/test.log"

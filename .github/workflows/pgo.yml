@@ -18,6 +18,7 @@ on:
       - "scripts/pgo-build.sh"
       - "scripts/pgo-train.sh"
       - "scripts/cpu-baseline-smoke.sh"
+      - "scripts/remap-rustflags.sh"
       - "benchmarks/backend/**"
       - ".cargo/config.toml"
       - "rust-toolchain.toml"
@@ -96,6 +97,13 @@ jobs:
         run: |
           sudo ip link set dev lo mtu 1500
           ip link show lo | head -1
+
+      # As release.yml: the runner's paths out of the binary, and an empty zig cache (#669).
+      - name: Keep this runner's paths out of the binary
+        run: |
+          var="CARGO_TARGET_$(tr 'a-z.-' 'A-Z__' <<<"$TARGET")_RUSTFLAGS"
+          echo "${var}=$(bash scripts/remap-rustflags.sh)" | tee -a "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=${RUNNER_TEMP}/zig-cache" | tee -a "$GITHUB_ENV"
 
       - name: PGO build (instrumented build, training, optimised build, checks, tests)
         env:
