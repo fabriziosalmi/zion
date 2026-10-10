@@ -219,6 +219,7 @@ load() { # ok|any, label, requests, h2load arguments...
   local expect=$1 label=$2 n=$3 out done_ codes good
   shift 3
   # In the background, so that a phase that stalls can be looked at while it is stalled.
+  local started=$SECONDS
   h2load -n "$n" "$@" >"$W/load.out" 2>&1 &
   local lp=$! ticks=0
   while kill -0 "$lp" 2>/dev/null; do
@@ -239,7 +240,7 @@ load() { # ok|any, label, requests, h2load arguments...
   done_=$(sed -n 's/^requests: .* \([0-9][0-9]*\) done, .*/\1/p' <<<"$out")
   codes=$(sed -n 's/^status codes: //p' <<<"$out")
   good=$(awk '{print $1 + $3}' <<<"$codes")
-  printf '  %-34s %7s requests  %7s done  %s\n' "$label" "$n" "${done_:-?}" "$codes"
+  printf '  %-34s %7s requests  %7s done  %-34s %3d s\n' "$label" "$n" "${done_:-?}" "$codes" $((SECONDS - started))
   if [ -z "$done_" ] || [ "$done_" -lt $((n * 99 / 100)) ]; then
     echo "pgo-train: phase '$label' completed ${done_:-0} of $n requests"
     tail -8 <<<"$out"

@@ -59,11 +59,18 @@ no profile of the Rust code reaches.
 The third column is there because the two effects were mixed up until v0.12.0: the
 `target-cpu` alone moves these workloads by a point or two at most, in either direction.
 
+Those are native builds. The two binaries built the way the release builds them
+(cargo-zigbuild, the 2.28 glibc floor) compare the same, in two more runs: −34 % and
+−33 % on the cached document, −18 % and −18 % over HTTP/2, −24 % and −25 % proxied,
+−13 % and −13 % on the site mix, −8.5 % and −9.1 % for files from disk, −4.0 % and
+−3.9 % for a full handshake.
+
 The host was a shared one and the harness's canary (a fixed SHA-256 loop on the server's
-core) drifted by 9.4 % and 3.6 % over the two runs, above its 3 % tolerance. Interleaving
-the builds puts that drift on all of them alike, and a third run earlier the same day
-gave the same figures within two points; still, read the table as "about a third on a
-cache hit, about a tenth on a real mix", not to the decimal.
+core) drifted by 9.4 % and 3.6 % over the two runs of the table, and by 5 % and 24 % over
+the two of the release-style builds: all above its 3 % tolerance. Interleaving the builds
+puts that drift on all of them alike, and the five runs of that day agree within two
+points; still, read the table as "about a third on a cache hit, about a tenth on a real
+mix", not to the decimal.
 
 ## How the build works
 
@@ -134,9 +141,10 @@ when:
   1.2 million requests, each phase checked);
 * with `PGO_TEST=1`, the test suite compiled with the same profile does not pass.
 
-The release sets all of them. `pgo.yml` runs the same on every pull request that touches
-the scripts, the workflows, the training backend, `.cargo/config.toml` or the toolchain
-pin, then builds a second time from the profile alone and compares the binaries.
+The release sets all of them but the last. `pgo.yml` sets all of them, on every pull
+request that touches the scripts, the workflows, the training backend,
+`.cargo/config.toml` or the toolchain pin, then builds a second time from the profile
+alone and compares the binaries.
 
 ## Rebuilding the PGO binary of a release
 
