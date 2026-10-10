@@ -84,9 +84,10 @@ FLAGS_VAR=CARGO_TARGET_$(tr 'a-z.-' 'A-Z__' <<<"$TARGET")_RUSTFLAGS
 PROFDATA=$(rustc --print sysroot)/lib/rustlib/$HOST/bin/llvm-profdata
 [ -x "$PROFDATA" ] || fail "no llvm-profdata in the toolchain: rustup component add llvm-tools"
 
+# The logs are read by the checks below: no colour codes in them, whatever CARGO_TERM_COLOR says.
 build() { # log file, extra rustflags
   # shellcheck disable=SC2086  # $CARGO is a command with arguments
-  env "$FLAGS_VAR=$2" $CARGO -v --release --locked --features "$FEATURES" --target "$TARGET" >"$1" 2>&1 ||
+  env "$FLAGS_VAR=$2" CARGO_TERM_COLOR=never $CARGO -v --release --locked --features "$FEATURES" --target "$TARGET" >"$1" 2>&1 ||
     { tail -40 "$1" >&2; fail "the build failed, full log in $1"; }
 }
 
@@ -184,7 +185,7 @@ fi
 if [ "${PGO_TEST:-0}" = 1 ]; then
   echo "[+] the test suite, compiled with the profile"
   # shellcheck disable=SC2086  # the test command has arguments
-  env "$FLAGS_VAR=-Cprofile-use=$OUT/zion.profdata" CARGO_TARGET_DIR="$OUT/test-target" \
+  env "$FLAGS_VAR=-Cprofile-use=$OUT/zion.profdata" CARGO_TARGET_DIR="$OUT/test-target" CARGO_TERM_COLOR=never \
     ${PGO_CARGO_TEST:-cargo test} --release --locked --no-fail-fast --target "$TARGET" >"$OUT/test.log" 2>&1 || {
     grep -E 'FAILED|panicked|^error|^test result' "$OUT/test.log" | tail -30 >&2
     fail "the tests fail when compiled with the profile, full log in $OUT/test.log"

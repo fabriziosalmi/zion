@@ -7,6 +7,9 @@
 #
 #   ZION_BIN          the instrumented binary (required)
 #   PGO_PROFILE_DIR   where the profraw files go (required)
+#   PGO_TRAIN_PHASE_SECONDS      the longest one load phase may take (default
+#                     300; a phase takes seconds). A phase that runs out of
+#                     time fails the script, after printing where it is stuck.
 #   PGO_TRAIN_EXPECT_PROFILE=0   the binary is not instrumented: run the same
 #                     workload with the same checks and expect no profile
 #                     (scripts/pgo-build.sh does this to the optimised binary)
@@ -37,6 +40,7 @@ ZION_BIN=$(cd "$(dirname "$ZION_BIN")" && pwd)/$(basename "$ZION_BIN")
 mkdir -p "$PGO_PROFILE_DIR"
 PGO_PROFILE_DIR=$(cd "$PGO_PROFILE_DIR" && pwd)
 
+PHASE_SECONDS=${PGO_TRAIN_PHASE_SECONDS:-300}
 HTTPS=4431
 HTTP=8081
 BACK=9090 # benchmarks/backend/test-server.go listens here
@@ -188,13 +192,48 @@ stop_zion() {
 
 U="https://127.0.0.1:$HTTPS"
 
+# A phase ran out of time: say where the bytes are and what zion is doing, while it is still
+# doing it. Everything here is best effort.
+stuck() {
+  set +e
+  echo "---- sockets, zion's side (sport $HTTPS) then the load generator's (dport $HTTPS)"
+  ss -tinmH "sport = :$HTTPS" 2>/dev/null | head -40
+  ss -tinmH "dport = :$HTTPS" 2>/dev/null | head -40
+  echo "---- zion's threads: state, CPU ticks (user, system), the system call each is in"
+  for t in /proc/"$ZP"/task/*; do
+    printf '  %-8s %-18s %s  syscall %s\n' "${t##*/}" "$(cat "$t/comm" 2>/dev/null)" \
+      "$(awk '{print $3, $14, $15}' "$t/stat" 2>/dev/null)" "$(cut -d' ' -f1 "$t/syscall" 2>/dev/null)"
+  done
+  echo "---- does zion answer a new connection? (health, then its HTTP/2 counters)"
+  curl -sk -m 5 -o /dev/null -w '  /healthz: %{http_code} in %{time_total} s\n' "$U/healthz"
+  curl -sk -m 5 "$U/metrics" 2>/dev/null | grep -E '^zion_(h2|http2|connections|active|inflight|flood)' | head -30
+  echo "---- zion's log, last lines"
+  tail -30 "$W/zion.log" 2>/dev/null | cut -c1-300
+  echo "----"
+}
+
 # One h2load phase. `ok`: at least 99 % of the requests must get a 2xx or 3xx.
 # `any`: they must all complete, whatever the status (the phase is about an
 # error path). Either way a phase that stalls or cannot connect fails the run.
 load() { # ok|any, label, requests, h2load arguments...
   local expect=$1 label=$2 n=$3 out done_ codes good
   shift 3
-  out=$(h2load -n "$n" "$@" 2>&1) || true
+  # In the background, so that a phase that stalls can be looked at while it is stalled.
+  h2load -n "$n" "$@" >"$W/load.out" 2>&1 &
+  local lp=$! ticks=0
+  while kill -0 "$lp" 2>/dev/null; do
+    if [ "$ticks" -ge $((PHASE_SECONDS * 5)) ]; then
+      echo "pgo-train: phase '$label' did not finish in $PHASE_SECONDS s; the load generator got to:"
+      tail -3 "$W/load.out"
+      stuck
+      kill "$lp" 2>/dev/null
+      exit 1
+    fi
+    sleep 0.2
+    ticks=$((ticks + 1))
+  done
+  wait "$lp" 2>/dev/null || true
+  out=$(cat "$W/load.out")
   # requests: N total, N started, N done, N succeeded, N failed, N errored, N timeout
   # status codes: N 2xx, N 3xx, N 4xx, N 5xx
   done_=$(sed -n 's/^requests: .* \([0-9][0-9]*\) done, .*/\1/p' <<<"$out")
