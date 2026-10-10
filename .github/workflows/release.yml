@@ -98,20 +98,20 @@ jobs:
             cross: native
             artifact: zion.exe
             pgo: false
-          # ── PGO variants (issue #55) ──────────────────────────────
-          # Profile-Guided Optimization: a two-pass build trains the
-          # release binary on a deterministic 10s workload via
-          # scripts/pgo-collect.sh. Ships alongside the regular binary
-          # with a `-pgo` archive suffix so operators can pick it
-          # explicitly. Currently only x86_64-unknown-linux-gnu is
-          # PGO'd — it's the most common server target and the
-          # ubuntu-latest runner can natively execute the
-          # instrumented binary to collect profiles. musl + aarch64
-          # variants will follow once the wire-up has run a few
-          # release cycles cleanly.
+          # ── PGO variant (issue #55) ───────────────────────────────
+          # Profile-guided build of the same target: scripts/pgo-build.sh
+          # builds an instrumented binary, trains it (scripts/pgo-train.sh),
+          # and rebuilds with the profile. Same toolchain as the plain row
+          # above (cargo-zigbuild, so the same glibc floor) and the same
+          # rustflags (.cargo/config.toml's target-cpu): the profile is the
+          # only difference between the two artefacts. Ships next to the
+          # plain binary with a `-pgo` suffix, and its profile next to it,
+          # so the build can be repeated. Only x86_64-unknown-linux-gnu: the
+          # runner must execute the instrumented binary, and a profile made
+          # on one architecture does not apply to another.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            cross: native
+            cross: zig
             artifact: zion
             pgo: true
     runs-on: ${{ matrix.os }}
@@ -252,78 +252,35 @@ jobs:
           cargo build --release --locked --features dist --target ${{ matrix.target }}
 
       # ── PGO build (issue #55) ─────────────────────────────────────────
-      # Two-pass profile-guided build:
-      #   Phase 1 — instrumented binary written with `-Cprofile-generate`.
-      #   Workload — scripts/pgo-collect.sh runs the binary against an
-      #              in-process Go backend for ~30s (3 endpoints × 10s)
-      #              with deterministic wrk parameters.
-      #   Phase 2 — re-build with `-Cprofile-use` after llvm-profdata merge.
-      #
-      # Restricted to native x86_64 ubuntu-latest entries: the ubuntu
-      # runner can execute the instrumented binary directly. Cross-PGO
-      # (musl, aarch64) requires QEMU and is deferred.
-      - name: Install PGO tooling (LLVM + Go + wrk)
+      # scripts/pgo-build.sh does all of it and fails closed: the training
+      # must complete every phase, the profile must cover the code, the
+      # binary must be compiled with the profile AND with the target-cpu of
+      # the plain build, must need no newer glibc than the plain build, must
+      # get through the training workload itself, and the test suite
+      # compiled with the same profile must pass. Both builds are zigbuild
+      # (one cargo configuration, or the profile's function names would not
+      # match); only the instrumented LINK goes to the system cc, because
+      # zig's driver does not take the flag an instrumented link needs.
+      # h2load (nghttp2-client) drives the training; Go builds its backend.
+      - name: Install PGO tooling (h2load, Go)
         if: matrix.pgo
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm wrk
-          # Go is preinstalled on ubuntu-latest; sanity-check.
+          sudo apt-get install -y nghttp2-client
           go version
 
-      - name: PGO Phase 1 — instrumented build
+      - name: PGO build (instrumented build, training, optimised build, checks)
         if: matrix.pgo
         shell: bash
         env:
-          PGO_DIR: ${{ runner.temp }}/pgo-data
-        run: |
-          mkdir -p "$PGO_DIR"
-          # `-Cprofile-generate=$PGO_DIR` instruments every function;
-          # the runtime writes one .profraw per process / module on
-          # exit (LLVM_PROFILE_FILE controls the filename pattern,
-          # set in pgo-collect.sh).
-          RUSTFLAGS="-Cprofile-generate=${PGO_DIR}" \
-            cargo build --release --locked --features dist --target ${{ matrix.target }}
-
-      - name: PGO workload — collect profraws
-        if: matrix.pgo
-        shell: bash
-        env:
-          ZION_BIN: target/${{ matrix.target }}/release/${{ matrix.artifact }}
-          PGO_PROFILE_DIR: ${{ runner.temp }}/pgo-data
-        run: bash scripts/pgo-collect.sh
-
-      - name: PGO Phase 2 — merge profiles + optimised build
-        if: matrix.pgo
-        shell: bash
-        env:
-          PGO_DIR: ${{ runner.temp }}/pgo-data
-        run: |
-          # Prefer rustc's bundled llvm-profdata (from the `llvm-tools`
-          # component) — its raw-profile format always matches the rustc
-          # that produced the .profraw files. Fall back to a system one
-          # only if that's somehow missing.
-          PROFDATA=$(ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-profdata 2>/dev/null | head -1 || true)
-          [[ -n "$PROFDATA" ]] || PROFDATA=$(command -v llvm-profdata 2>/dev/null \
-            || command -v llvm-profdata-14 2>/dev/null \
-            || command -v llvm-profdata-15 2>/dev/null \
-            || command -v llvm-profdata-16 2>/dev/null \
-            || command -v llvm-profdata-17 2>/dev/null \
-            || command -v llvm-profdata-18 2>/dev/null \
-            || true)
-          if [[ -z "$PROFDATA" ]]; then
-            echo "::error::llvm-profdata not found (install the llvm-tools component)"
-            exit 1
-          fi
-          echo "using llvm-profdata: $PROFDATA"
-          "$PROFDATA" merge -o "${PGO_DIR}/merged.profdata" "${PGO_DIR}"/*.profraw
-          # No `cargo clean` needed: Cargo's fingerprint includes
-          # RUSTFLAGS, so swapping `-Cprofile-generate` → `-Cprofile-use`
-          # triggers a fresh rebuild of every item the flag touches.
-          # `-Cllvm-args=-pgo-warn-missing-function`: surface functions
-          # that have no profile data so future workload tweaks can fix
-          # gaps before they bite.
-          RUSTFLAGS="-Cprofile-use=${PGO_DIR}/merged.profdata -Cllvm-args=-pgo-warn-missing-function" \
-            cargo build --release --locked --features dist --target ${{ matrix.target }}
+          PGO_TARGET: ${{ matrix.target }}
+          PGO_CARGO: cargo zigbuild
+          PGO_GENERATE_LINKER: cc
+          PGO_CARGO_TEST: cargo-zigbuild test
+          PGO_EXPECT_CPU: x86-64-v3
+          PGO_MAX_GLIBC: "2.28"
+          PGO_TEST: "1"
+        run: PGO_OUT="${RUNNER_TEMP}/pgo" bash scripts/pgo-build.sh
 
       # ── Strip + stage artifact ──
       - name: Stage artifact
@@ -380,12 +337,26 @@ jobs:
           ( cd dist && sha256sum "${archive}" > "${archive}.sha256" )
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
 
+          # The profile the PGO binary was built from: with it, the commit and
+          # SOURCE_DATE_EPOCH, scripts/pgo-build.sh rebuilds the same binary.
+          if [[ "${MATRIX_PGO}" == "true" ]]; then
+            cp "${RUNNER_TEMP}/pgo/zion.profdata" "dist/${name}.profdata"
+            ( cd dist && sha256sum "${name}.profdata" > "${name}.profdata.sha256" )
+            echo "profile=${name}.profdata" >> "$GITHUB_OUTPUT"
+          fi
+
       # ── Provenance: bind the cryptographic hash of every archive to the
       # workflow run identity (GitHub OIDC -> Fulcio -> Rekor). SLSA v1.0 L3.
       - name: Generate SLSA build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: "dist/${{ steps.stage.outputs.archive }}"
+
+      - name: Generate SLSA build provenance (PGO profile)
+        if: matrix.pgo
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "dist/${{ steps.stage.outputs.profile }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
