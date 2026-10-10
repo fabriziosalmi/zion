@@ -1,102 +1,12 @@
 #!/usr/bin/env bash
-# Zion PGO (Profile-Guided Optimization) Build Pipeline
+# Profile-guided build of zion for local measurements.
 #
-# Two-phase build:
-#   Phase 1: Build instrumented binary, run benchmark to collect profiles
-#   Phase 2: Rebuild with profiles → 10-20% throughput improvement
+# This used to be a second implementation of the PGO pipeline. It is now the
+# one the release uses: scripts/pgo-build.sh (instrumented build, the training
+# of scripts/pgo-train.sh, merge, optimised build, checks). See docs/perf/pgo.md.
 #
-# Requirements: Rust nightly or stable with PGO support, llvm-profdata
-# Usage: bash benchmarks/bench-pgo.sh
+# Usage: bash benchmarks/bench-pgo.sh        (takes the PGO_* variables of pgo-build.sh)
+# The optimised binary is target/<host triple>/release/zion.
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
-
-PGO_DIR="/tmp/zion-pgo"
-MERGED_PROF="${PGO_DIR}/merged.profdata"
-
-# Cleanup function for backgrounded processes
-cleanup() {
-  # Kill backgrounded processes if still running
-  [[ -n "${ZION_PID:-}" ]] && kill "$ZION_PID" 2>/dev/null || true
-  [[ -n "${BACKEND_PID:-}" ]] && kill "$BACKEND_PID" 2>/dev/null || true
-  wait "$ZION_PID" 2>/dev/null || true
-  wait "$BACKEND_PID" 2>/dev/null || true
-}
-
-# Ensure cleanup runs on exit (including errors)
-trap cleanup EXIT
-
-echo "┌─────────────────────────────────────────┐"
-echo "│  ZION PGO BUILD PIPELINE                │"
-echo "└─────────────────────────────────────────┘"
-
-# Clean previous profiles
-rm -rf "$PGO_DIR"
-mkdir -p "$PGO_DIR"
-
-# Phase 1: Instrumented build
-echo ""
-echo "Phase 1: Building instrumented binary..."
-RUSTFLAGS="-Cprofile-generate=${PGO_DIR}" cargo build --release 2>&1 | tail -3
-
-echo "Phase 1: Running benchmark workload to collect profiles..."
-# Start backend (Rust preferred, Go fallback)
-RUST_BACKEND="benchmarks/backend/target/release/zion-bench-backend"
-if [[ -f "$RUST_BACKEND" ]]; then
-    "$RUST_BACKEND" &
-else
-    cd benchmarks/backend && go run test-server.go &
-    cd "$OLDPWD"
-fi
-BACKEND_PID=$!
-sleep 1
-
-# Start instrumented Zion
-ZION_CONFIG=benchmarks/zion-bench-tls.toml ./target/release/zion &
-ZION_PID=$!
-sleep 2
-
-# Generate representative traffic (30s across multiple endpoints)
-echo "  Generating traffic (30s)..."
-wrk -c 50 -d 10s -t 4 --timeout 5s -H "Host: bench.local" \
-    "https://127.0.0.1:4430/api/v1/data" 2>/dev/null | tail -2
-wrk -c 50 -d 10s -t 4 --timeout 5s -H "Host: bench.local" \
-    "https://127.0.0.1:4430/_next/static/js/app.js" 2>/dev/null | tail -2
-wrk -c 50 -d 10s -t 4 --timeout 5s -H "Host: bench.local" \
-    "https://127.0.0.1:4430/page" 2>/dev/null | tail -2
-
-# Stop servers (cleanup trap will handle this, but explicit kill is safer and faster)
-kill "$ZION_PID" 2>/dev/null || true
-kill "$BACKEND_PID" 2>/dev/null || true
-sleep 1
-
-# Merge profiles
-echo ""
-echo "Phase 1: Merging profiles..."
-PROFDATA=$(which llvm-profdata 2>/dev/null || xcrun -f llvm-profdata 2>/dev/null || echo "")
-if [[ -z "$PROFDATA" ]]; then
-    echo "ERROR: llvm-profdata not found. Install LLVM tools or Xcode."
-    echo "  macOS: xcode-select --install"
-    echo "  Linux: apt install llvm"
-    exit 1
-fi
-
-"$PROFDATA" merge -o "$MERGED_PROF" "${PGO_DIR}"/*.profraw
-PROF_COUNT=$(ls "${PGO_DIR}"/*.profraw 2>/dev/null | wc -l | tr -d ' ')
-echo "  Merged ${PROF_COUNT} profile files → ${MERGED_PROF}"
-
-# Phase 2: Optimized build
-echo ""
-echo "Phase 2: Building PGO-optimized binary..."
-RUSTFLAGS="-Cprofile-use=${MERGED_PROF} -Cllvm-args=-pgo-warn-missing-function" \
-    cargo build --release 2>&1 | tail -3
-
-BINARY_SIZE=$(ls -lh target/release/zion | awk '{print $5}')
-echo ""
-echo "┌─────────────────────────────────────────┐"
-echo "│  PGO BUILD COMPLETE                     │"
-echo "│  Binary: target/release/zion (${BINARY_SIZE})    │"
-echo "│  Profile: ${MERGED_PROF}                │"
-echo "│                                         │"
-echo "│  Run bench-native.sh to measure delta   │"
-echo "└─────────────────────────────────────────┘"
+exec bash "$(dirname "$0")/../scripts/pgo-build.sh" "$@"
