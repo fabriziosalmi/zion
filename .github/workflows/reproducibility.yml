@@ -23,6 +23,10 @@ on:
   pull_request:
     paths:
       - ".github/workflows/reproducibility.yml"
+      - ".github/workflows/release.yml"
+      - "scripts/remap-rustflags.sh"
+      - ".cargo/config.toml"
+      - "build.rs"
 
 permissions:
   contents: read
@@ -97,9 +101,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake pkg-config build-essential
 
+      # A release that has scripts/remap-rustflags.sh was built with this runner's paths
+      # remapped (#669), and its bytes must not depend on them. So it is rebuilt somewhere
+      # else on purpose: cargo's home in another directory, the toolchain with the rust-src
+      # component the release did not have, and an empty zig cache. An older release is
+      # rebuilt as it was built, where this runner happens to match the release's.
       - name: Build
         working-directory: src
-        run: cargo zigbuild --release --locked --features dist --target "${TARGET}"
+        run: |
+          if [[ -f scripts/remap-rustflags.sh ]]; then
+            rustup component add rust-src
+            export CARGO_HOME="${RUNNER_TEMP}/another-cargo-home"
+            var="CARGO_TARGET_$(tr 'a-z.-' 'A-Z__' <<<"$TARGET")_RUSTFLAGS"
+            export "${var}=$(bash scripts/remap-rustflags.sh)" ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-cache"
+            echo "rebuilding elsewhere: CARGO_HOME=${CARGO_HOME}, rust-src installed, ${var}=${!var}"
+          fi
+          cargo zigbuild --release --locked --features dist --target "${TARGET}"
 
       - name: Strip and compare
         working-directory: src
@@ -138,3 +155,130 @@ jobs:
             published/zion
             rebuilt/zion
           retention-days: 30
+
+  # The property the weekly job relies on, checked on the tree of a pull request before
+  # there is a release to rebuild: two builds that differ in everything a machine can
+  # differ in give the same binary, and a third, without the flags, does not (if it did,
+  # the two environments would not be different enough for the first result to mean
+  # anything).
+  two-places:
+    name: the same binary from two places (x86_64-unknown-linux-musl)
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: here
+
+      - name: Build environment (commit time and stamp)
+        working-directory: here
+        run: |
+          {
+            echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)"
+            echo "ZION_GIT_SHA=$(git rev-parse --short=12 HEAD)"
+            echo "ZION_COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y-%m-%d HEAD)"
+          } >> "$GITHUB_ENV"
+          rm -f rust-toolchain.toml
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: 1.88.0
+          targets: x86_64-unknown-linux-musl
+
+      - name: Setup zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild --version 0.23.4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config build-essential
+
+      - name: Build here, as the release does
+        working-directory: here
+        run: |
+          var="CARGO_TARGET_$(tr 'a-z.-' 'A-Z__' <<<"$TARGET")_RUSTFLAGS"
+          export "${var}=$(bash scripts/remap-rustflags.sh)" ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-cache-1"
+          echo "${var}=${!var}"
+          cargo zigbuild --release --locked --features dist --target "${TARGET}"
+          strip "target/${TARGET}/release/zion"
+          cp "target/${TARGET}/release/zion" "${RUNNER_TEMP}/zion-here"
+
+      # Everything a machine can differ in: the checkout directory, cargo's home, and a
+      # toolchain that has the standard library's sources.
+      - name: Build elsewhere
+        run: |
+          cp -a here "${RUNNER_TEMP}/a-different-directory"
+          cd "${RUNNER_TEMP}/a-different-directory"
+          rm -rf target
+          rustup component add rust-src
+          export CARGO_HOME="${RUNNER_TEMP}/another-cargo-home"
+          var="CARGO_TARGET_$(tr 'a-z.-' 'A-Z__' <<<"$TARGET")_RUSTFLAGS"
+          export "${var}=$(bash scripts/remap-rustflags.sh)" ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-cache-2"
+          echo "${var}=${!var}"
+          cargo zigbuild --release --locked --features dist --target "${TARGET}"
+          strip "target/${TARGET}/release/zion"
+          cp "target/${TARGET}/release/zion" "${RUNNER_TEMP}/zion-elsewhere"
+
+      - name: Control, elsewhere without the flags
+        run: |
+          cd "${RUNNER_TEMP}/a-different-directory"
+          rm -rf target
+          export CARGO_HOME="${RUNNER_TEMP}/another-cargo-home" ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-cache-3"
+          cargo zigbuild --release --locked --features dist --target "${TARGET}"
+          strip "target/${TARGET}/release/zion"
+          cp "target/${TARGET}/release/zion" "${RUNNER_TEMP}/zion-control"
+
+      - name: Compare
+        run: |
+          cd "${RUNNER_TEMP}"
+          here="$(sha256sum zion-here | cut -d' ' -f1)"
+          elsewhere="$(sha256sum zion-elsewhere | cut -d' ' -f1)"
+          control="$(sha256sum zion-control | cut -d' ' -f1)"
+          {
+            echo "### One tree, built in two places (${TARGET})"
+            echo
+            echo "| | sha256 of the binary |"
+            echo "|---|---|"
+            echo "| here | \`${here}\` |"
+            echo "| another directory, another cargo home, a toolchain with rust-src | \`${elsewhere}\` |"
+            echo "| the same without the flags (must differ) | \`${control}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "here      ${here}"
+          echo "elsewhere ${elsewhere}"
+          echo "control   ${control}"
+          paths() { strings -n 8 "$1" | grep -cE "${RUNNER_TEMP}|/home/runner|rustlib/src/rust" || true; }
+          echo "strings with a path of this runner: here $(paths zion-here), elsewhere $(paths zion-elsewhere), control $(paths zion-control)"
+          status=0
+          if [[ "$here" != "$elsewhere" ]]; then
+            echo "::error::The two builds differ: the binary depends on where it was built"
+            echo "differing bytes: $(cmp -l zion-here zion-elsewhere | wc -l)"
+            diff <(strings -n 8 zion-here | sort -u) <(strings -n 8 zion-elsewhere | sort -u) | grep '^[<>]' | cut -c1-200 | head -20 || true
+            status=1
+          fi
+          if [[ "$control" == "$here" ]]; then
+            echo "::error::The control is identical too: the two places do not differ in anything that reaches the binary, so the comparison above proves nothing"
+            status=1
+          fi
+          if [[ "$(paths zion-here)" != 0 ]]; then
+            echo "::error::The binary still carries a path of this runner"
+            strings -n 8 zion-here | grep -E "${RUNNER_TEMP}|/home/runner|rustlib/src/rust" | cut -c1-200 | head -5
+            status=1
+          fi
+          exit "$status"
+
+      - name: Keep the binaries when the comparison fails
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: two-places
+          path: |
+            ${{ runner.temp }}/zion-here
+            ${{ runner.temp }}/zion-elsewhere
+            ${{ runner.temp }}/zion-control
+          retention-days: 14

@@ -121,20 +121,18 @@ commit stamped into the version string (`ZION_GIT_SHA`, `ZION_COMMIT_DATE`),
 `SOURCE_DATE_EPOCH` set to the commit time, then `strip` and a deterministic
 `tar` (owner 0, `--mtime=@$SOURCE_DATE_EPOCH`, `--sort=name`).
 
-Two things about the machine are part of the bytes as well, and a rebuild has to
-match them:
-
-* **Where cargo's home is.** The binary carries the source paths of its
-  dependencies (the locations of their panics, several hundred strings), and the
-  release's runner has cargo's home at `/home/runner/.cargo`.
-* **A toolchain without the `rust-src` component.** Without it, the paths of the
-  standard library in the binary are the compiler's fixed `/rustc/<commit>/…`; with
-  it, rustc writes where the sources are on your disk instead. This repository's
-  `rust-toolchain.toml` asks for `rust-src`, so a 1.88.0 toolchain that was ever
-  used in a checkout has it: install one for the purpose.
-
-The directory the source is checked out in does not matter. To rebuild the Linux
-musl artifact:
+A binary also carries the source paths of its dependencies (the locations of
+their panics), and those are the build machine's. From the release after 0.12 on,
+the workflow remaps them to fixed names
+([`scripts/remap-rustflags.sh`](https://github.com/fabriziosalmi/zion/blob/master/scripts/remap-rustflags.sh)):
+cargo's home becomes `/cargo`, and the standard library's sources, which a toolchain
+with the `rust-src` component reads from its own directory, become the compiler's
+`/rustc/<commit>`. It also builds with an empty zig cache: zig keeps compiled C
+objects by path and flags, not by `SOURCE_DATE_EPOCH`, and the allocator's C code
+contains the date and time of its compilation, so an object left by another day's
+build of the same source would be reused with that day in it. With those, the bytes
+do not depend on the directory, on where cargo's home is, or on the toolchain's
+components. To rebuild the Linux musl artifact:
 
 ```bash
 git clone --depth 1 --branch v0.12.0 https://github.com/fabriziosalmi/zion && cd zion
@@ -143,11 +141,12 @@ export ZION_GIT_SHA=$(git rev-parse --short=12 HEAD)
 export ZION_COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y-%m-%d HEAD)
 # needs zig 0.13.0 and cargo-zigbuild 0.23.4 on PATH
 #   (cargo install --locked cargo-zigbuild --version 0.23.4)
-export RUSTUP_HOME=$(mktemp -d)        # a toolchain of its own: no rust-src
-rustup toolchain install 1.88.0 --profile minimal --target x86_64-unknown-linux-musl
-sudo mkdir -p /home/runner && sudo chown "$(id -u):$(id -g)" /home/runner
-CARGO_HOME=/home/runner/.cargo \
-  cargo +1.88.0 zigbuild --release --locked --features dist --target x86_64-unknown-linux-musl
+rustup toolchain install 1.88.0 --target x86_64-unknown-linux-musl
+export ZIG_GLOBAL_CACHE_DIR=$(mktemp -d)
+if [ -f scripts/remap-rustflags.sh ]; then   # the releases after 0.12
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="$(bash scripts/remap-rustflags.sh +1.88.0)"
+fi
+cargo +1.88.0 zigbuild --release --locked --features dist --target x86_64-unknown-linux-musl
 strip target/x86_64-unknown-linux-musl/release/zion
 sha256sum target/x86_64-unknown-linux-musl/release/zion
 ```
@@ -164,20 +163,36 @@ or recreate the archive with the same `tar` flags and compare it against
 `cargo-zigbuild` 0.23.4 (the versions that built v0.12.0; the workflow installs
 exactly these).
 
-These steps were run on 2026-10-10 on a machine that is not a GitHub runner, on the
-release current that day, and gave the published binary byte for byte. With cargo's
-home in the user's own directory the result had other bytes, and so it had with a
-toolchain that carries `rust-src`; from two different checkout directories it was
-the same binary.
+**Releases up to 0.12** were built without the remapping, and have no such script.
+Their bytes contain the paths of the runner that built them, so a rebuild has to
+match two things about that machine as well:
+
+* cargo's home at `/home/runner/.cargo`
+  (`sudo mkdir -p /home/runner && sudo chown "$(id -u):$(id -g)" /home/runner`, then
+  `CARGO_HOME=/home/runner/.cargo` on the `cargo` command);
+* a toolchain **without** the `rust-src` component, which this repository's
+  `rust-toolchain.toml` adds to any toolchain used in a checkout: install one for the
+  purpose (`export RUSTUP_HOME=$(mktemp -d)` before the `rustup toolchain install`,
+  with `--profile minimal`).
+
+Checked on 2026-10-10 on a machine that is not a GitHub runner. The 0.12 release
+rebuilt with those two conditions is the published binary byte for byte; with cargo's
+home elsewhere, or with a toolchain that has `rust-src`, it is not. With the remapping
+flags, two builds of that source that differed in the directory, in cargo's home and in
+the toolchain's components were identical to each other; and one of them made again on
+a zig cache that had served another day's build was not, by the date and the time in
+the allocator's object.
 
 A scheduled job, [`reproducibility.yml`](https://github.com/fabriziosalmi/zion/blob/master/.github/workflows/reproducibility.yml),
 does this every Monday for the latest release: it rebuilds the Linux musl binary
 from the tag and compares it with the published one, failing (and keeping both
-binaries) on a difference. It runs on the same kind of runner as the release, where
-cargo's home and the toolchain are as above without anyone arranging it, so it
-checks the toolchain pins and the build, not those two conditions. It covers
-`x86_64-unknown-linux-musl` only; the other targets are built by the same workflow
-but are not rebuilt and compared.
+binaries) on a difference. A release built with the remapping is rebuilt somewhere
+else on purpose (another cargo home, a toolchain with `rust-src`), so that the job
+checks what the recipe promises; an older one is rebuilt where the runner happens
+to match the release's. On pull requests that touch the build, the same workflow
+builds the tree in two such places and requires one binary, and a third time without
+the flags, which must differ. It covers `x86_64-unknown-linux-musl` only; the other
+targets are built by the same workflow but are not rebuilt and compared.
 A difference you can explain is worth an issue (with your toolchain versions).
 Provenance does not depend on any of this: every artifact carries a SLSA build
 attestation (`gh attestation verify`) and the commit in its version string.

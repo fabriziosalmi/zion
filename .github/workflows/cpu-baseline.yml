@@ -95,7 +95,10 @@ jobs:
       - name: Build as the release does
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo zigbuild --release --locked --features dist --target "${TARGET}"
+        run: |
+          var="CARGO_TARGET_$(tr 'a-z.-' 'A-Z__' <<<"$TARGET")_RUSTFLAGS"
+          export "${var}=$(bash scripts/remap-rustflags.sh)" ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-cache"
+          cargo zigbuild --release --locked --features dist --target "${TARGET}"
 
       - name: Declared, and served under an emulated baseline CPU
         env:

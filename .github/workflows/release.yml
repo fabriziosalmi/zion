@@ -241,6 +241,22 @@ jobs:
         # `--mtime=@<epoch>` (GNU syntax) or `--sort=name`.
         run: brew install cmake gnu-tar
 
+      # ── Paths out of the binary (#669) ──
+      # A binary carries the source paths of its dependencies, and they were this runner's:
+      # cargo's home, and with the rust-src component the toolchain's own directory. Remapped
+      # to fixed names, the bytes are the same wherever the build runs
+      # (scripts/remap-rustflags.sh). And an empty zig cache: zig reuses a compiled C object
+      # whatever SOURCE_DATE_EPOCH is, and the allocator's has its compile time in it.
+      - name: Keep this runner's paths out of the binary
+        if: matrix.cross == 'zig'
+        shell: bash
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: |
+          var="CARGO_TARGET_$(tr 'a-z.-' 'A-Z__' <<<"$MATRIX_TARGET")_RUSTFLAGS"
+          echo "${var}=$(bash scripts/remap-rustflags.sh)" | tee -a "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=${RUNNER_TEMP}/zig-cache" | tee -a "$GITHUB_ENV"
+
       # ── Build ──
       # --features dist (acme + init): the redistributable bundle so the
       # release artifacts ship automatic HTTPS and the init wizard.
