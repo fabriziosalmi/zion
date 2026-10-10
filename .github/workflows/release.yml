@@ -271,6 +271,19 @@ jobs:
           sudo apt-get install -y nghttp2-client
           go version
 
+      # The training sends megabytes a second over the loopback interface, whose MTU is
+      # 65536. On these runners (ubuntu-24.04, kernel 6.17 azure) a receiving socket's buffer
+      # now and then ends up smaller than one such segment: the segments are dropped, the
+      # sender retransmits on its timer, and one connection crawls for minutes. Measured on
+      # the phase "files over HTTP/2": late in 10 runs of 58 with zion and in 19 of 166 with
+      # nginx serving the same files (so it is not the server), in none of 250 with the
+      # loopback at a network's MTU. The profile is the same either way (99.8 % overlap).
+      - name: Loopback at a network's MTU for the training
+        if: matrix.pgo
+        run: |
+          sudo ip link set dev lo mtu 1500
+          ip link show lo | head -1
+
       - name: PGO build (instrumented build, training, optimised build, checks)
         if: matrix.pgo
         shell: bash

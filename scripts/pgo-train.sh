@@ -194,8 +194,16 @@ U="https://127.0.0.1:$HTTPS"
 
 # A phase ran out of time: say where the bytes are and what zion is doing, while it is still
 # doing it. Everything here is best effort.
+#
+# The one cause seen so far is not zion's: on a loopback with its usual 64 KB MTU some kernels
+# shrink a receiving socket's buffer below one segment, drop the segments, and the connection
+# crawls on the sender's retransmission timer (nginx does the same under the same load). It
+# shows below as a load generator's socket with `rb` under 65483 and a `d` (drops) above zero,
+# and zion's side with `bytes_retrans` in the megabytes and a `cwnd` of a few. The remedy is
+# `ip link set dev lo mtu 1500` for the run, which is what the workflows do.
 stuck() {
   set +e
+  echo "---- loopback MTU $(cat /sys/class/net/lo/mtu 2>/dev/null), kernel $(uname -r)"
   echo "---- sockets, zion's side (sport $HTTPS) then the load generator's (dport $HTTPS)"
   ss -tinmH "sport = :$HTTPS" 2>/dev/null | head -40
   ss -tinmH "dport = :$HTTPS" 2>/dev/null | head -40

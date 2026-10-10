@@ -122,6 +122,17 @@ library's C code are instrumented as well and the profile lists some 650 more fu
 the merged profile, the `cc` crate then leaves the flag out, and the C code of the PGO
 binary is compiled exactly as in the plain one.
 
+The workflows run it with the loopback interface at a network's MTU (1500 instead of
+65536). On GitHub's runners a connection that receives megabytes a second over the 64 KB
+loopback now and then crawls for minutes: the receiving socket's buffer ends up smaller
+than one segment, the segments are dropped and the sender retransmits on its timer. It
+happened in 10 runs of 58 of the "files over HTTP/2" phase, in 19 of 166 with nginx
+serving the same files, and in none of 250 with the loopback at 1500; on another
+machine with the same kernel series it did not happen in 188. The profile does not
+depend on it (the same functions executed, 99.8 % of the edge counts in common). The
+script gives each phase five minutes and, when one runs out, prints both ends' sockets
+before failing, so this is recognisable if it happens to you.
+
 ### What makes it fail
 
 A PGO binary that is silently not what it claims is worse than none, so the build stops
