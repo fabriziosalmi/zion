@@ -12,6 +12,11 @@
 # The optimised binary is left where cargo puts it, target/<target>/release/zion,
 # and the merged profile in $PGO_OUT/zion.profdata.
 #
+# The compiler reads the profile from $PGO_PROFILE_STORE/<sha256 of the profile>.profdata,
+# not from $PGO_OUT: the path of the profile is on every rustc command line, and it must
+# be the same wherever and whenever the same profile is built from, and another one for
+# another profile (see "where the optimised build reads the profile" below).
+#
 #   PGO_TARGET        target triple (default: the host)
 #   PGO_CARGO         the build command of both phases (default "cargo build";
 #                     the release uses "cargo zigbuild", the toolchain of the
@@ -23,6 +28,9 @@
 #                     that binary only runs here, for the training.
 #   PGO_FEATURES      cargo features (default "dist")
 #   PGO_OUT           work directory (default target/pgo)
+#   PGO_PROFILE_STORE where the profile is put for the compiler, under the name of
+#                     its sha256 (default /tmp/zion-pgo). Part of the build: with
+#                     another directory the same profile gives other bytes.
 #   PGO_PROFDATA      a merged profile to build from: no instrumented build, no
 #                     training. This is how a release is rebuilt from the
 #                     profile published with it.
@@ -132,11 +140,34 @@ FUNCTIONS=$("$PROFDATA" show --value-cutoff=1 "$OUT/zion.profdata" | sed -n 's/^
 echo "      profile: $(wc -c <"$OUT/zion.profdata" | tr -d ' ') bytes, ${FUNCTIONS:-?} functions executed in training (at least $MIN_FUNCTIONS required)"
 [ "${FUNCTIONS:-0}" -ge "$MIN_FUNCTIONS" ] || fail "the training executed ${FUNCTIONS:-0} functions, fewer than $MIN_FUNCTIONS: it did not run as intended"
 
+# ── where the optimised build reads the profile ──────────────────────────────
+# The path is on rustc's command line, and Cargo hashes the command line into the file
+# names of everything it builds; the order of code and data in the binary follows.
+# Measured with one profile and two fresh builds each: at one path the two binaries are
+# identical, at two paths they have the same size and differ in 7,015 bytes. And Cargo
+# does not look inside the file: a new profile at an old path leaves the dependencies
+# "fresh", compiled with the old one.
+# So the path is made a function of the profile and of nothing else: a fixed directory,
+# the sha256 of the content as the name. The same profile is the same command line on any
+# machine, in any work directory; another profile is another command line, and Cargo
+# rebuilds everything.
+STORE=${PGO_PROFILE_STORE:-/tmp/zion-pgo}
+case $STORE in /*) ;; *) fail "PGO_PROFILE_STORE ('$STORE') must be an absolute path: rustc runs in other directories" ;; esac
+case $STORE in *[[:space:]]*) fail "PGO_PROFILE_STORE ('$STORE') contains whitespace" ;; esac
+SUM=$(sha256sum "$OUT/zion.profdata" | cut -d' ' -f1)
+[ ${#SUM} -eq 64 ] || fail "could not take the sha256 of $OUT/zion.profdata"
+mkdir -p "$STORE"
+[ -O "$STORE" ] || fail "$STORE belongs to another user: set PGO_PROFILE_STORE (it changes the bytes of the build)"
+USE=$STORE/$SUM.profdata
+[ -e "$USE" ] || cp "$OUT/zion.profdata" "$USE"
+[ "$(sha256sum "$USE" | cut -d' ' -f1)" = "$SUM" ] || fail "$USE is not the profile its name says"
+echo "      the compiler reads it from $USE"
+
 echo "[4/4] optimised build"
 # The zion crate is always compiled anew, so that its command line is in the log
 # for the checks below even when cargo would find the last build still fresh.
 cargo clean --release --target "$TARGET" -p zion >/dev/null 2>&1 || true
-build "$OUT/build-use.log" "-Cprofile-use=$OUT/zion.profdata -Cllvm-args=-pgo-warn-missing-function"
+build "$OUT/build-use.log" "-Cprofile-use=$USE -Cllvm-args=-pgo-warn-missing-function"
 
 # ── checks ───────────────────────────────────────────────────────────────────
 RUSTC_LINE=$(rustc_line "$OUT/build-use.log")
@@ -147,7 +178,7 @@ if [ -s "$OUT/build-generate.log" ] && [ -z "${PGO_PROFDATA:-}" ]; then
   [ -n "$ID_USE" ] && [ "$ID_USE" = "$ID_GENERATE" ] ||
     fail "the instrumented and the optimised build give the zion crate two identities ('$ID_GENERATE', '$ID_USE'): the profile names functions the optimised build does not have"
 fi
-grep -qF -- "-Cprofile-use=$OUT/zion.profdata" <<<"$RUSTC_LINE" || fail "the zion binary was not compiled with the profile"
+grep -qF -- "-Cprofile-use=$USE" <<<"$RUSTC_LINE" || fail "the zion binary was not compiled with the profile"
 CPU=$(grep -o -E -- '-C ?target-cpu=[A-Za-z0-9_.-]+' <<<"$RUSTC_LINE" | tail -1 | sed 's/.*=//' || true)
 echo "      target-cpu of the zion crate: ${CPU:-<none: the compiler default>}"
 if [ -n "${PGO_EXPECT_CPU:-}" ]; then
@@ -185,7 +216,7 @@ fi
 if [ "${PGO_TEST:-0}" = 1 ]; then
   echo "[+] the test suite, compiled with the profile"
   # shellcheck disable=SC2086  # the test command has arguments
-  env "$FLAGS_VAR=-Cprofile-use=$OUT/zion.profdata" CARGO_TARGET_DIR="$OUT/test-target" CARGO_TERM_COLOR=never \
+  env "$FLAGS_VAR=-Cprofile-use=$USE" CARGO_TARGET_DIR="$OUT/test-target" CARGO_TERM_COLOR=never \
     ${PGO_CARGO_TEST:-cargo test} --release --locked --no-fail-fast --target "$TARGET" >"$OUT/test.log" 2>&1 || {
     grep -E 'FAILED|panicked|^error|^test result' "$OUT/test.log" | tail -30 >&2
     fail "the tests fail when compiled with the profile, full log in $OUT/test.log"
@@ -193,4 +224,5 @@ if [ "${PGO_TEST:-0}" = 1 ]; then
   awk '/^test result/ {p += $4; f += $6} END {printf "      tests: %d passed, %d failed\n", p, f}' "$OUT/test.log"
 fi
 
-echo "ok: $BIN ($(wc -c <"$BIN" | tr -d ' ') bytes), profile in $OUT/zion.profdata"
+[ "$(sha256sum "$USE" | cut -d' ' -f1)" = "$SUM" ] || fail "$USE changed while the build was reading it"
+echo "ok: $BIN ($(wc -c <"$BIN" | tr -d ' ') bytes), profile in $OUT/zion.profdata (sha256 $SUM)"

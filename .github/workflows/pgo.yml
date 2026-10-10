@@ -104,9 +104,12 @@ jobs:
           PGO_OUT="${RUNNER_TEMP}/pgo" bash scripts/pgo-build.sh
           cp "target/${TARGET}/release/zion" "${RUNNER_TEMP}/zion-first"
 
-      # A release is rebuilt from the profile published with it, kept somewhere else.
+      # A release is rebuilt from the profile published with it, kept somewhere else, by
+      # someone who has nothing of the first build: the target directory goes first, or
+      # cargo would find every dependency fresh and this would compare one build with itself.
       - name: Build again from the profile alone
         run: |
+          rm -rf "target/${TARGET}"
           mkdir -p "${RUNNER_TEMP}/elsewhere"
           cp "${RUNNER_TEMP}/pgo/zion.profdata" "${RUNNER_TEMP}/elsewhere/published.profdata"
           PGO_PROFDATA="${RUNNER_TEMP}/elsewhere/published.profdata" PGO_OUT="${RUNNER_TEMP}/pgo-again" bash scripts/pgo-build.sh

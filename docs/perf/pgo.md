@@ -92,6 +92,19 @@ The profile flags go in `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`, never in `RUSTFLAGS`.
 joins the per-target variable with the rustflags of `.cargo/config.toml` and replaces
 them when `RUSTFLAGS` is set; the script refuses to run with `RUSTFLAGS` set.
 
+The optimised build reads the profile from
+`/tmp/zion-pgo/<sha256 of the profile>.profdata` (`PGO_PROFILE_STORE` names another
+directory), not from the work directory. The path is on every rustc command line, Cargo
+hashes the command line into the file names of what it builds, and the order of code in
+the binary follows those names: one profile read from two paths gave two binaries of
+the same size that differ in 7,015 bytes, read from one path two identical ones. Cargo
+also does not look inside the file, so a new profile at an old path would leave every
+dependency "fresh", compiled with the old one. A path made of the profile's hash is the
+same wherever that profile is used and another one for another profile. Tried: two work
+directories gave the same binary; another profile on the same target directory
+recompiled every crate of the target; the first profile again reused them and gave the
+first binary.
+
 Both builds must be made by the same cargo command. A profile names functions by their
 mangled names, which contain a hash of the crate's identity, and that identity depends
 on cargo's configuration: `cargo zigbuild` runs cargo with `target-applies-to-host =
@@ -148,6 +161,8 @@ when:
 * the zion crate was not compiled with the profile, or not with the expected
   `target-cpu` (`PGO_EXPECT_CPU`);
 * the binary needs a newer glibc than the plain artefact (`PGO_MAX_GLIBC`);
+* the file the compiler reads is not the profile its name says, before or after the
+  build;
 * the optimised binary does not get through the training workload itself (the same
   1.2 million requests, each phase checked);
 * with `PGO_TEST=1`, the test suite compiled with the same profile does not pass.
@@ -177,7 +192,9 @@ sha256sum target/x86_64-unknown-linux-gnu/release/zion
 ```
 
 `SOURCE_DATE_EPOCH` matters here as it does for the plain build: the allocator's C code
-embeds its compile time, and without it two builds differ in those bytes.
+embeds its compile time, and without it two builds differ in those bytes. The script
+puts the profile where the release's build read it (the path depends on the profile's
+content only), so nothing has to be said about that.
 
 ## Building one yourself
 
