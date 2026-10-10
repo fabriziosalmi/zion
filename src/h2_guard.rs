@@ -50,6 +50,15 @@ const GOAWAY_ENHANCE_YOUR_CALM: [u8; 17] = [
     0, 0, 8, 0x7, 0, 0, 0, 0, 0, 0x7f, 0xff, 0xff, 0xff, 0, 0, 0, 0x0b,
 ];
 
+/// What a client is sent when it negotiated `h2` in the TLS handshake and then does not open
+/// with the HTTP/2 preface (RFC 9113 §3.4: a connection error of type `PROTOCOL_ERROR`): the
+/// server's own preface, an empty `SETTINGS` frame, which must be the first frame a server
+/// sends, then `GOAWAY` with last stream id 0 (nothing was acted on) and error code 1.
+const SETTINGS_THEN_GOAWAY_PROTOCOL_ERROR: [u8; 26] = [
+    0, 0, 0, 0x4, 0, 0, 0, 0, 0, // SETTINGS, no payload, stream 0
+    0, 0, 8, 0x7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, // GOAWAY(0, PROTOCOL_ERROR)
+];
+
 /// Frames seen in some bytes, by what they cost the server.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Tally {
@@ -353,7 +362,15 @@ impl Verdict {
             _ => None,
         }
     }
+
+    /// The connection had negotiated `h2` and did not open with the HTTP/2 preface.
+    pub fn refused_preface(&self) -> bool {
+        self.0.load(Relaxed) == 3
+    }
 }
+
+/// The error a refused connection ends with, for whoever reads the guard after it.
+const NOT_THE_PREFACE: &str = "h2 was negotiated and the client did not send the HTTP/2 preface";
 
 /// The accepted stream, with the control-frame bound on what it reads. It passes every byte
 /// through unchanged; on a connection that is not HTTP/2 it stops looking after the first
@@ -369,6 +386,12 @@ pub struct H2Guard<S> {
     verdict: Verdict,
     /// The guard closed the connection: nothing more is read from it.
     closed: Option<Flood>,
+    /// The TLS handshake selected `h2` (ALPN): the client's first bytes must be the HTTP/2
+    /// preface. Without this, hyper takes anything else for HTTP/1.1 and answers it as such,
+    /// in text, on a connection both ends agreed is HTTP/2.
+    must_be_http2: bool,
+    /// ... and they were not: the connection is refused.
+    refused_preface: bool,
     /// `Instant::now`, except in tests that must not depend on how fast they run.
     clock: fn() -> Instant,
 }
@@ -386,8 +409,18 @@ impl<S> H2Guard<S> {
             budget: Budget::new(limits, clock()),
             verdict: Verdict::default(),
             closed: None,
+            must_be_http2: false,
+            refused_preface: false,
             clock,
         }
+    }
+
+    /// The connection is HTTP/2 by agreement (ALPN selected `h2`): one that does not open
+    /// with the client preface is told `GOAWAY(PROTOCOL_ERROR)` and closed, and none of its
+    /// bytes reach the server (RFC 9113 §3.4).
+    pub fn http2_was_negotiated(mut self, negotiated: bool) -> Self {
+        self.must_be_http2 = negotiated;
+        self
     }
 
     /// A handle that says, once the connection is over, whether the guard closed it.
@@ -422,12 +455,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for H2Guard<S> {
         if let Some(flood) = this.closed {
             return Poll::Ready(Err(std::io::Error::other(flood.as_str())));
         }
+        if this.refused_preface {
+            return Poll::Ready(Err(std::io::Error::other(NOT_THE_PREFACE)));
+        }
         let before = buf.filled().len();
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {}
             other => return other,
         }
         let tally = this.reads.feed(&buf.filled()[before..]);
+        if this.must_be_http2 && this.reads.not_http2() {
+            this.refused_preface = true;
+            this.verdict.0.store(3, Relaxed);
+            // The caller gets an error and none of the bytes: what was read is taken back.
+            buf.set_filled(before);
+            // Nothing has been written yet (the server speaks after the client's preface),
+            // so the two frames start at a frame boundary. They are offered once: a socket
+            // that does not take them now is closed without (the RFC allows the GOAWAY to
+            // be left out here). Then the close, with the transport's own goodbye (TLS
+            // close_notify) if it has one.
+            if this.writes.at_frame_boundary() {
+                let frames = &SETTINGS_THEN_GOAWAY_PROTOCOL_ERROR;
+                if let Poll::Ready(Ok(n)) = Pin::new(&mut this.inner).poll_write(cx, frames) {
+                    let _ = this.writes.feed(&frames[..n]);
+                    let _ = Pin::new(&mut this.inner).poll_flush(cx);
+                }
+            }
+            let _ = Pin::new(&mut this.inner).poll_shutdown(cx);
+            return Poll::Ready(Err(std::io::Error::other(NOT_THE_PREFACE)));
+        }
         if tally.is_empty() {
             return Poll::Ready(Ok(()));
         }
@@ -852,6 +908,71 @@ mod tests {
             assert_eq!(guard.verdict().get(), None);
         }
 
+        /// #663: ALPN selected `h2`, so both ends agreed the connection is HTTP/2. hyper looks
+        /// at the first bytes instead, takes anything but the preface for HTTP/1.1 and
+        /// answers `HTTP/1.1 400 Bad Request` in text, which an HTTP/2 client reads as a
+        /// frame 4.7 MB long that never ends (h2spec http2/3.5: "unexpected EOF"). The guard
+        /// answers in HTTP/2 and lets none of it through.
+        #[tokio::test]
+        async fn a_connection_that_negotiated_h2_and_opens_with_something_else_is_refused() {
+            let openings: [&[u8]; 4] = [
+                b"INVALID CONNECTION PREFACE\r\n\r\n", // what h2spec sends
+                b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",  // a valid request of the other protocol
+                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\rX",    // the preface but for its last byte
+                b"X",
+            ];
+            for opening in openings {
+                let (mut client, server) = tokio::io::duplex(1 << 20);
+                let mut guard = guarded(server, LIMIT).http2_was_negotiated(true);
+                let verdict = guard.verdict();
+                client.write_all(opening).await.unwrap();
+                let err = read_all(&mut guard, 1).await.unwrap_err();
+                assert_eq!(err.to_string(), NOT_THE_PREFACE);
+                assert!(verdict.refused_preface());
+                assert_eq!(verdict.get(), None, "not a flood");
+                // Nothing more is read from it, however the caller insists.
+                client.write_all(PREFACE).await.unwrap();
+                assert!(read_all(&mut guard, 1).await.is_err());
+
+                // The client was told in HTTP/2: the server's preface (an empty SETTINGS),
+                // GOAWAY with last stream id 0 and error code 1 (PROTOCOL_ERROR), and the end.
+                drop(guard);
+                let mut seen = Vec::new();
+                client.read_to_end(&mut seen).await.unwrap();
+                let mut want = frame(SETTINGS, 0, 0, &[]);
+                want.extend(frame(GOAWAY, 0, 0, &[0, 0, 0, 0, 0, 0, 0, 1]));
+                assert_eq!(seen, want, "opening {:?}", String::from_utf8_lossy(opening));
+            }
+        }
+
+        #[tokio::test]
+        async fn a_preface_that_goes_wrong_in_a_later_read_is_refused_there() {
+            let (mut client, server) = tokio::io::duplex(1 << 20);
+            let mut guard = guarded(server, LIMIT).http2_was_negotiated(true);
+            // The first bytes are the preface's: they pass, nothing can be said yet.
+            client.write_all(&PREFACE[..8]).await.unwrap();
+            assert_eq!(read_all(&mut guard, 8).await.unwrap(), PREFACE[..8]);
+            assert!(!guard.verdict().refused_preface());
+            client.write_all(b"TP/1.1\r\n").await.unwrap();
+            let err = read_all(&mut guard, 1).await.unwrap_err();
+            assert_eq!(err.to_string(), NOT_THE_PREFACE);
+            assert!(guard.verdict().refused_preface());
+        }
+
+        #[tokio::test]
+        async fn a_connection_that_negotiated_h2_and_sends_the_preface_is_left_alone() {
+            let (mut client, server) = tokio::io::duplex(1 << 20);
+            let mut guard = guarded(server, LIMIT).http2_was_negotiated(true);
+            let sent = stream_of(&[frame(SETTINGS, 0, 0, &[]), frame(PING, 0, 0, &[1; 8])]);
+            // One byte at a time: the worst chunking for a parser that matches a prefix.
+            for byte in &sent {
+                client.write_all(&[*byte]).await.unwrap();
+                assert_eq!(read_all(&mut guard, 1).await.unwrap(), [*byte]);
+            }
+            assert!(!guard.verdict().refused_preface());
+            assert_eq!(guard.verdict().get(), None);
+        }
+
         #[tokio::test]
         async fn a_connection_that_is_not_http2_is_left_alone() {
             // HTTP/1.1, then a WebSocket-like stream whose bytes happen to look like frames.
@@ -863,6 +984,9 @@ mod tests {
             client.write_all(&sent).await.unwrap();
             assert_eq!(read_all(&mut guard, sent.len()).await.unwrap(), sent);
             assert_eq!(guard.verdict().get(), None);
+            // Nothing was negotiated here (the plaintext listener, or TLS without ALPN), so
+            // not opening with the HTTP/2 preface is no offence.
+            assert!(!guard.verdict().refused_preface());
             // And what the server writes is not followed as frames.
             guard
                 .write_all(b"HTTP/1.1 101 Switching\r\n\r\n")
