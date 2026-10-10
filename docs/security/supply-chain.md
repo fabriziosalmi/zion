@@ -119,17 +119,35 @@ The release workflow builds every Linux target with `cargo zigbuild`, on Rust
 is not used for releases), with **`--features dist`** (acme + init + auth), the
 commit stamped into the version string (`ZION_GIT_SHA`, `ZION_COMMIT_DATE`),
 `SOURCE_DATE_EPOCH` set to the commit time, then `strip` and a deterministic
-`tar` (owner 0, `--mtime=@$SOURCE_DATE_EPOCH`, `--sort=name`). To rebuild the
-Linux musl artifact the same way:
+`tar` (owner 0, `--mtime=@$SOURCE_DATE_EPOCH`, `--sort=name`).
+
+Two things about the machine are part of the bytes as well, and a rebuild has to
+match them:
+
+* **Where cargo's home is.** The binary carries the source paths of its
+  dependencies (the locations of their panics, several hundred strings), and the
+  release's runner has cargo's home at `/home/runner/.cargo`.
+* **A toolchain without the `rust-src` component.** Without it, the paths of the
+  standard library in the binary are the compiler's fixed `/rustc/<commit>/…`; with
+  it, rustc writes where the sources are on your disk instead. This repository's
+  `rust-toolchain.toml` asks for `rust-src`, so a 1.88.0 toolchain that was ever
+  used in a checkout has it: install one for the purpose.
+
+The directory the source is checked out in does not matter. To rebuild the Linux
+musl artifact:
 
 ```bash
-git checkout v0.12.0
+git clone --depth 1 --branch v0.12.0 https://github.com/fabriziosalmi/zion && cd zion
 export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
 export ZION_GIT_SHA=$(git rev-parse --short=12 HEAD)
 export ZION_COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y-%m-%d HEAD)
-rustup toolchain install 1.88.0 --target x86_64-unknown-linux-musl
-cargo install --locked cargo-zigbuild --version 0.23.4   # needs zig 0.13.0 on PATH
-cargo +1.88.0 zigbuild --release --locked --features dist --target x86_64-unknown-linux-musl
+# needs zig 0.13.0 and cargo-zigbuild 0.23.4 on PATH
+#   (cargo install --locked cargo-zigbuild --version 0.23.4)
+export RUSTUP_HOME=$(mktemp -d)        # a toolchain of its own: no rust-src
+rustup toolchain install 1.88.0 --profile minimal --target x86_64-unknown-linux-musl
+sudo mkdir -p /home/runner && sudo chown "$(id -u):$(id -g)" /home/runner
+CARGO_HOME=/home/runner/.cargo \
+  cargo +1.88.0 zigbuild --release --locked --features dist --target x86_64-unknown-linux-musl
 strip target/x86_64-unknown-linux-musl/release/zion
 sha256sum target/x86_64-unknown-linux-musl/release/zion
 ```
@@ -144,13 +162,22 @@ tar -xzOf zion-v0.12.0-x86_64-unknown-linux-musl.tar.gz zion | sha256sum
 or recreate the archive with the same `tar` flags and compare it against
 `SHA256SUMS`. The toolchain is pinned end to end: Rust 1.88.0, `zig` 0.13.0 and
 `cargo-zigbuild` 0.23.4 (the versions that built v0.12.0; the workflow installs
-exactly these), so a rebuild with the same versions should give the same bytes.
+exactly these).
+
+These steps were run on 2026-10-10 on a machine that is not a GitHub runner, on the
+release current that day, and gave the published binary byte for byte. With cargo's
+home in the user's own directory the result had other bytes, and so it had with a
+toolchain that carries `rust-src`; from two different checkout directories it was
+the same binary.
 
 A scheduled job, [`reproducibility.yml`](https://github.com/fabriziosalmi/zion/blob/master/.github/workflows/reproducibility.yml),
 does this every Monday for the latest release: it rebuilds the Linux musl binary
-from the tag exactly as above and compares it with the published one, failing (and
-keeping both binaries) on a difference. It covers `x86_64-unknown-linux-musl` only;
-the other targets are built by the same workflow but are not rebuilt and compared.
+from the tag and compares it with the published one, failing (and keeping both
+binaries) on a difference. It runs on the same kind of runner as the release, where
+cargo's home and the toolchain are as above without anyone arranging it, so it
+checks the toolchain pins and the build, not those two conditions. It covers
+`x86_64-unknown-linux-musl` only; the other targets are built by the same workflow
+but are not rebuilt and compared.
 A difference you can explain is worth an issue (with your toolchain versions).
 Provenance does not depend on any of this: every artifact carries a SLSA build
 attestation (`gh attestation verify`) and the commit in its version string.

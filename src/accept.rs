@@ -231,15 +231,17 @@ pub(crate) async fn run_https_accept_loop(
     }
 }
 
-/// Say that a connection was closed by the HTTP/2 control-frame bound (#475). The metric
-/// counts every one; the line is throttled to about one a second, process-wide, so the
+/// Say that a connection was closed by the HTTP/2 guard: the control-frame bound (#475), or
+/// a client that negotiated h2 and did not open with the preface (#663). The flood metric
+/// counts every flood; the line is throttled to about one a second, process-wide, so the
 /// client that floods frames cannot flood the log by reconnecting.
 fn log_h2_flood(verdict: &h2_guard::Verdict, state: &AppState, peer: SocketAddr) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
-    let Some(flood) = verdict.get() else {
+    let flood = verdict.get();
+    if flood.is_none() && !verdict.refused_preface() {
         return;
-    };
+    }
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -248,6 +250,17 @@ fn log_h2_flood(verdict: &h2_guard::Verdict, state: &AppState, peer: SocketAddr)
         return;
     }
     LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+    let Some(flood) = flood else {
+        // #663: not a flood, a client that negotiated h2 and then spoke something else.
+        logging::warn(
+            "h2_preface",
+            &format!(
+                "{} negotiated h2 and did not send the HTTP/2 preface: connection closed with GOAWAY(PROTOCOL_ERROR)",
+                state.redact.ip_label(peer.ip())
+            ),
+        );
+        return;
+    };
     logging::warn(
         "h2_flood",
         &format!(
@@ -448,16 +461,22 @@ fn spawn_https_handler(
         let h2_limits = h2_guard::Limits {
             control_per_sec: state.cfg().h2_control_frames_per_sec,
         };
+        // ALPN selected `h2`: the connection is HTTP/2 by agreement, and the guard refuses
+        // one that does not open with the client preface (#663). Read before any kTLS
+        // upgrade, for the reason the client certificate is.
+        let negotiated_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
         #[cfg(all(target_os = "linux", feature = "ktls"))]
         let io = match crate::ktls::try_upgrade(tls_stream).await {
-            Ok(ktls_stream) => h2_guard::H2Guard::new(ktls_stream, h2_limits),
+            Ok(ktls_stream) => {
+                h2_guard::H2Guard::new(ktls_stream, h2_limits).http2_was_negotiated(negotiated_h2)
+            }
             Err(e) => {
                 logq::line(&format!("  kTLS upgrade failed, closing connection: {e}"));
                 return;
             }
         };
         #[cfg(not(all(target_os = "linux", feature = "ktls")))]
-        let io = h2_guard::H2Guard::new(tls_stream, h2_limits);
+        let io = h2_guard::H2Guard::new(tls_stream, h2_limits).http2_was_negotiated(negotiated_h2);
         let (h2_verdict, flood_log_state) = (io.verdict(), state.clone());
         let io = TokioIo::new(io);
         // Connection-level idle timeout. 1h to cover long-lived HTTP/2

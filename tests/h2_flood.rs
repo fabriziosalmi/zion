@@ -681,3 +681,79 @@ fn cancelling_every_stream_in_flight_is_not_a_flood() {
     assert_eq!(zion.closed_for("control_frames", |_| true), 0);
     assert_eq!(zion.closed_for("window_update", |_| true), 0);
 }
+
+/// #663: a client that negotiated `h2` in the TLS handshake and then does not open with the
+/// HTTP/2 preface was answered `HTTP/1.1 400 Bad Request`, in text (hyper chooses the
+/// protocol from the first bytes, whatever ALPN said). h2spec http2/3.5 reads that as a frame
+/// that never ends. It is now told in HTTP/2 and closed, and the three ways of speaking
+/// HTTP/1.1 or HTTP/2 that negotiate nothing work as before.
+#[test]
+fn h2_negotiated_and_no_preface_is_goaway_protocol_error_not_an_http1_answer() {
+    let Some(zion) = Zion::start(Some(LIMIT)) else {
+        return;
+    };
+    let openings: [&[u8]; 3] = [
+        b"INVALID CONNECTION PREFACE\r\n\r\n", // what h2spec sends
+        b"GET /files/small.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        b"PRI * HTTP/2.0\r\n\r\nSM\r\n\rX",
+    ];
+    for opening in openings {
+        let what = String::from_utf8_lossy(opening);
+        let mut conn = connect(zion.https, Transport::TlsAlpnH2);
+        conn.write_all(opening).unwrap();
+        conn.flush().unwrap();
+        // The server's preface, an empty SETTINGS that is not an ack ...
+        let (ty, flags, stream, payload) = read_frame(&mut *conn).expect("a first frame");
+        assert_eq!(
+            (ty, flags, stream, payload.len()),
+            (SETTINGS, 0, 0, 0),
+            "{what:?}"
+        );
+        // ... then GOAWAY: last stream id 0, error code 1 (PROTOCOL_ERROR) ...
+        let (ty, _, stream, payload) = read_frame(&mut *conn).expect("a second frame");
+        assert_eq!((ty, stream), (GOAWAY, 0), "{what:?}");
+        assert_eq!(payload, [0, 0, 0, 0, 0, 0, 0, 1], "{what:?}");
+        // ... and the end of the TLS connection, said (close_notify), with nothing after:
+        // a connection cut without it is an error for this client, as it is for h2spec.
+        let mut rest = Vec::new();
+        conn.read_to_end(&mut rest)
+            .unwrap_or_else(|e| panic!("{what:?}: the connection did not end cleanly: {e}"));
+        assert!(
+            rest.is_empty(),
+            "{what:?}: {} bytes after GOAWAY",
+            rest.len()
+        );
+    }
+    assert!(zion.logged("did not send the HTTP/2 preface", 1) >= 1);
+
+    // Controls. The same client with the preface is served HTTP/2 ...
+    let mut conn = connect(zion.https, Transport::TlsAlpnH2);
+    let mut hello = PREFACE.to_vec();
+    hello.extend(frame(SETTINGS, 0, 0, &[]));
+    hello.extend(frame(PING, 0, 0, &[5; 8]));
+    conn.write_all(&hello).unwrap();
+    conn.flush().unwrap();
+    assert_eq!(pong(&mut *conn).as_deref(), Some(&[5u8; 8][..]));
+    // ... HTTP/1.1 where nothing was negotiated is HTTP/1.1, on TLS and on the plaintext port ...
+    for how in [Transport::TlsNoAlpn, Transport::Plaintext] {
+        let mut conn = connect_port(&zion, how);
+        conn.write_all(
+            b"GET /files/small.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        let mut answer = Vec::new();
+        let _ = conn.read_to_end(&mut answer);
+        assert!(
+            answer.starts_with(b"HTTP/1.1 "),
+            "{how:?}: {:?}",
+            String::from_utf8_lossy(&answer[..answer.len().min(40)])
+        );
+    }
+    // ... and garbage where nothing was negotiated still gets hyper's HTTP/1.1 answer.
+    let mut conn = connect(zion.https, Transport::TlsNoAlpn);
+    conn.write_all(b"INVALID CONNECTION PREFACE\r\n\r\n")
+        .unwrap();
+    let mut answer = Vec::new();
+    let _ = conn.read_to_end(&mut answer);
+    assert!(answer.starts_with(b"HTTP/1.1 400"));
+}
