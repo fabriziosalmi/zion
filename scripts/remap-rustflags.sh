@@ -4,7 +4,7 @@
 # The rustc flags that keep this machine's paths out of the binary (#669).
 #
 #   export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="$(scripts/remap-rustflags.sh +1.88.0)"
-#   export ZIG_GLOBAL_CACHE_DIR="$(mktemp -d)"
+#   export ZIG_GLOBAL_CACHE_DIR="$(mktemp -d)" ZIG_LOCAL_CACHE_DIR="$ZIG_GLOBAL_CACHE_DIR"
 #   cargo +1.88.0 zigbuild --release --locked --features dist --target x86_64-unknown-linux-musl
 #
 # A release binary carries the source paths of its dependencies (the locations of
@@ -25,11 +25,12 @@
 # --remap-path-prefix out of the hashes it names files with, so the flags do not change
 # anything else about the build.
 #
-# The third thing a rebuild needs is not a flag: an empty zig cache
-# (ZIG_GLOBAL_CACHE_DIR). zig keeps compiled C objects by path and flags, not by
-# SOURCE_DATE_EPOCH, and the allocator's C code contains the date and time of its
-# compilation: an object from another day's build of the same source is reused, with
-# that day in it.
+# The third thing a rebuild needs is not a flag: an empty zig cache, both
+# ZIG_GLOBAL_CACHE_DIR and ZIG_LOCAL_CACHE_DIR (where the second is set, the objects go
+# there). zig keeps compiled C objects by path and flags, not by SOURCE_DATE_EPOCH, and
+# the allocator's C code contains the date and time of its compilation: an object from
+# another day's build of the same source is reused, with that day in it.
+# scripts/check-build-date.sh reads the date back from a binary.
 #
 # Argument: the toolchain, as cargo takes it (+1.88.0). Default: whatever `rustc` is.
 

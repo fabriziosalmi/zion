@@ -82,6 +82,9 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.13.0
+          # No cache of zig's cache: the action restores compiled C objects of an earlier
+          # run, and one of them has its compile time in it (scripts/check-build-date.sh).
+          use-cache: false
 
       - name: Install cargo-zigbuild
         run: cargo install --locked cargo-zigbuild --version 0.23.4
@@ -97,7 +100,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           var="CARGO_TARGET_$(tr 'a-z.-' 'A-Z__' <<<"$TARGET")_RUSTFLAGS"
-          export "${var}=$(bash scripts/remap-rustflags.sh)" ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-cache"
+          export "${var}=$(bash scripts/remap-rustflags.sh)" ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-cache" ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/zig-cache"
           cargo zigbuild --release --locked --features dist --target "${TARGET}"
 
       - name: Declared, and served under an emulated baseline CPU

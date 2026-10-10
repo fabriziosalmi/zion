@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The "empty zig cache" of the release build was empty by luck, not by the step that said so.** 0.13.0 set `ZIG_GLOBAL_CACHE_DIR` to a new directory so that no C object of another build could be reused (the allocator's has its compile date in it). But the action that installs zig points `ZIG_LOCAL_CACHE_DIR` into the workspace too, which is where the objects go, and restores that directory from an earlier run of the same job. The 0.13.0 release found no earlier cache and its binaries are right (the date in each is the commit's; the musl and the PGO binary were rebuilt to the byte on another machine). A check run after the release was not so lucky: the job that builds one tree in two places restored the cache of its previous run, and both of its builds carried that run's date and differed from the published binary. The workflows now disable that cache, set both directories, and `scripts/check-build-date.sh` reads the date back from the binary: the release stages nothing whose date is not the commit's, and the two-places job fails on it.
+
 ## [0.13.0] - 2026-10-10
 
 **The release binaries now run on any x86-64 and any 64-bit ARM processor. Up to 0.12 the x86_64 ones needed AVX2 and the aarch64 ones ARMv8.2, stopped with an illegal instruction without, and nothing said so; on aarch64 the change costs a few percent of CPU on a recent core (third and fourth upgrade notes).** Two changes of behaviour to read first: zion sends 2 TLS session tickets where it sent 4, and a connection that negotiated `h2` has to speak HTTP/2. The rest is how a release is built and checked: every binary is run on an emulated baseline processor before it is signed, the `-pgo` tarball is the plain build plus a profile again and is rebuilt from that profile to the byte, and a release can be rebuilt on any machine.

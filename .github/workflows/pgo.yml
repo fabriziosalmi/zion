@@ -19,6 +19,7 @@ on:
       - "scripts/pgo-train.sh"
       - "scripts/cpu-baseline-smoke.sh"
       - "scripts/remap-rustflags.sh"
+      - "scripts/check-build-date.sh"
       - "benchmarks/backend/**"
       - ".cargo/config.toml"
       - "rust-toolchain.toml"
@@ -76,6 +77,9 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.13.0
+          # No cache of zig's cache: the action restores compiled C objects of an earlier
+          # run, and one of them has its compile time in it (scripts/check-build-date.sh).
+          use-cache: false
 
       - name: Install cargo-zigbuild
         run: cargo install --locked cargo-zigbuild --version 0.23.4
@@ -104,6 +108,7 @@ jobs:
           var="CARGO_TARGET_$(tr 'a-z.-' 'A-Z__' <<<"$TARGET")_RUSTFLAGS"
           echo "${var}=$(bash scripts/remap-rustflags.sh)" | tee -a "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=${RUNNER_TEMP}/zig-cache" | tee -a "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=${RUNNER_TEMP}/zig-cache" | tee -a "$GITHUB_ENV"
 
       - name: PGO build (instrumented build, training, optimised build, checks, tests)
         env:
@@ -120,6 +125,7 @@ jobs:
         run: |
           sudo apt-get install -y qemu-user >/dev/null
           bash scripts/cpu-baseline-smoke.sh "${RUNNER_TEMP}/zion-first"
+          bash scripts/check-build-date.sh "${RUNNER_TEMP}/zion-first"
 
       # A release is rebuilt from the profile published with it, kept somewhere else, by
       # someone who has nothing of the first build: the target directory goes first, or

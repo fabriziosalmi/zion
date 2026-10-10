@@ -25,6 +25,7 @@ on:
       - ".github/workflows/reproducibility.yml"
       - ".github/workflows/release.yml"
       - "scripts/remap-rustflags.sh"
+      - "scripts/check-build-date.sh"
       - ".cargo/config.toml"
       - "build.rs"
 
@@ -92,6 +93,9 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.13.0
+          # No cache of zig's cache: the action restores compiled C objects of an earlier
+          # run, and one of them has its compile time in it (scripts/check-build-date.sh).
+          use-cache: false
 
       - name: Install cargo-zigbuild
         run: cargo install --locked cargo-zigbuild --version 0.23.4
@@ -113,7 +117,7 @@ jobs:
             rustup component add rust-src
             export CARGO_HOME="${RUNNER_TEMP}/another-cargo-home"
             var="CARGO_TARGET_$(tr 'a-z.-' 'A-Z__' <<<"$TARGET")_RUSTFLAGS"
-            export "${var}=$(bash scripts/remap-rustflags.sh)" ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-cache"
+            export "${var}=$(bash scripts/remap-rustflags.sh)" ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-cache" ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/zig-cache"
             echo "rebuilding elsewhere: CARGO_HOME=${CARGO_HOME}, rust-src installed, ${var}=${!var}"
           fi
           cargo zigbuild --release --locked --features dist --target "${TARGET}"
@@ -255,6 +259,11 @@ jobs:
           paths() { strings -n 8 "$1" | grep -cE "${RUNNER_TEMP}|/home/runner|rustlib/src/rust" || true; }
           echo "strings with a path of this runner: here $(paths zion-here), elsewhere $(paths zion-elsewhere), control $(paths zion-control)"
           status=0
+          # Two builds that share a stale zig cache agree with each other and are both wrong:
+          # on the day of v0.13.0 this job gave one binary twice that was not the release's,
+          # with a C object of the previous run in both. The date in the binary says so.
+          bash "${GITHUB_WORKSPACE}/here/scripts/check-build-date.sh" zion-here || status=1
+          bash "${GITHUB_WORKSPACE}/here/scripts/check-build-date.sh" zion-elsewhere || status=1
           if [[ "$here" != "$elsewhere" ]]; then
             echo "::error::The two builds differ: the binary depends on where it was built"
             echo "differing bytes: $(cmp -l zion-here zion-elsewhere | wc -l)"
