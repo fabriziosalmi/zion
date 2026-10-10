@@ -84,6 +84,7 @@ if [ "$MODE" = emulate ]; then
     EMU+=(-L "$SYSROOT")
   fi
   RUN=("${EMU[@]}" -cpu "$CPU")
+  ulimit -c 0 # an illegal instruction is an outcome here, not something to keep a core file of
   echo "cpu-baseline-smoke: $BIN ($ARCH) under $("$QEMU" --version | head -1), -cpu $CPU"
 elif [ "$MODE" = declare ] || [ "$MODE" = native ]; then
   echo "cpu-baseline-smoke: $BIN, run natively (SMOKE_MODE=$MODE)"
@@ -127,10 +128,12 @@ C
   fi
   "${CC[@]}" -static -O0 "${CFLAGS[@]}" -o "$W/control" "$W/control.c" 2>"$W/control.err" ||
     { cat "$W/control.err" >&2; fail "could not compile the control program with '${CC[*]}'"; }
+  # In subshells: the shell that waits for a process killed by a signal says so on its
+  # stderr, and here that death is the expected outcome.
   set +e
-  "${EMU[@]}" -cpu "$CPU" "$W/control" >/dev/null 2>&1
+  ("${EMU[@]}" -cpu "$CPU" "$W/control"; exit $?) >/dev/null 2>&1
   OLD=$?
-  "${EMU[@]}" -cpu "$NEWER" "$W/control" >/dev/null 2>&1
+  ("${EMU[@]}" -cpu "$NEWER" "$W/control"; exit $?) >/dev/null 2>&1
   NEW=$?
   set -e
   # 132 = 128 + SIGILL.
@@ -143,7 +146,7 @@ fi
 # `bootstrap` also times AES-GCM for a moment: without AES instructions that is the
 # portable implementation, which the daemon below would otherwise not run for long.
 set +e
-${RUN[@]+"${RUN[@]}"} "$BIN" bootstrap >"$W/bootstrap.json" 2>"$W/bootstrap.err"
+(${RUN[@]+"${RUN[@]}"} "$BIN" bootstrap >"$W/bootstrap.json" 2>"$W/bootstrap.err"; exit $?) 2>/dev/null
 RC=$?
 set -e
 [ "$RC" -eq 0 ] || {
@@ -151,11 +154,11 @@ set -e
   fail "\`zion bootstrap\` ended with status $RC$([ "$RC" -eq 132 ] && echo " (illegal instruction): the binary needs a newer processor than ${CPU:-this one}")"
 }
 TARGET=$(sed -n 's/.*"build_target":"\([^"]*\)".*/\1/p' "$W/bootstrap.json")
-DECLARED=$(sed -n 's/.*"build_target_features":\[\([^]]*\)\].*/\1/p' "$W/bootstrap.json" | tr -d '" ' | tr ',' '\n' |
+DECLARED=$(sed -n 's/.*"build_target_features":\[\([^]]*\)\].*/\1/p' "$W/bootstrap.json" | tr -d '" \r' | tr ',' '\n' |
   grep -vx -e crt-static -e '' | LC_ALL=C sort | paste -sd, -) || true
 [ -n "$TARGET" ] && [ -n "$DECLARED" ] ||
   fail "\`zion bootstrap\` printed no build_target / build_target_features (a build older than this check?)"
-DEFAULTS=$("$RUSTC" --print cfg --target "$TARGET" 2>"$W/rustc.err" | sed -n 's/^target_feature="\(.*\)"$/\1/p' |
+DEFAULTS=$("$RUSTC" --print cfg --target "$TARGET" 2>"$W/rustc.err" | tr -d '\r' | sed -n 's/^target_feature="\(.*\)"$/\1/p' |
   grep -vx crt-static | LC_ALL=C sort | paste -sd, -) || true
 [ -n "$DEFAULTS" ] || {
   cat "$W/rustc.err" >&2
