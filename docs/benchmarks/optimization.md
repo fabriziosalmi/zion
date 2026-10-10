@@ -16,7 +16,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 
 | Change | Rationale |
 |---|---|
-| `target-cpu=native` (.cargo/config.toml) | Unlocks NEON/AES-CE on Apple Silicon, AVX2/AES-NI on x86_64 |
+| No build-wide `target-cpu` on x86_64 (.cargo/config.toml) | `x86-64-v3` was measured at nothing outside the noise on six workloads of seven, 1–3 % on the seventh and no microbenchmark faster beyond noise (the WAF body scan 10 % slower), and it stopped the binary on a CPU without AVX2 ([details](/deploy/#which-processors-a-build-runs-on)); AES-NI / AVX2 code in the dependencies is chosen at run time |
 | PGO build script (`bench-pgo.sh`) | Two-phase profile-guided optimization for 10-20% additional throughput |
 
 ## Hot path allocation elimination

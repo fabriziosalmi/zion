@@ -18,22 +18,26 @@ For every release tag the Linux x86_64 glibc target is built twice:
 
 Each has its line in `SHA256SUMS` and its own SLSA build provenance. The profile is the
 only difference between the two binaries: both are linked by cargo-zigbuild against the
-same glibc floor (2.28) and both are compiled for `x86-64-v3`, the `target-cpu` that
-`.cargo/config.toml` sets for Linux x86_64. The other targets (musl, aarch64, macOS,
-Windows) and the container image have no PGO build.
+same glibc floor (2.28) and both are compiled for baseline x86-64
+([which processors a build runs on](/deploy/#which-processors-a-build-runs-on)), and the
+release runs both under an emulated baseline processor before it signs them. The other
+targets (musl, aarch64, macOS, Windows) and the container image have no PGO build.
 
 Up to v0.12.0 the `-pgo` artefact differed from the plain one in two more ways, neither
-intended. It was compiled for baseline x86-64, because the profile flags were passed in
-`RUSTFLAGS` and Cargo drops the rustflags of `.cargo/config.toml` when that variable is
-set. And it was linked natively on the build runner, so it needed glibc 2.38 and did not
-start on Debian 12, Ubuntu 22.04 or RHEL 9, where the plain artefact does.
+intended. It was compiled for baseline x86-64 while the plain one was `x86-64-v3`,
+because the profile flags were passed in `RUSTFLAGS` and Cargo drops the rustflags of
+`.cargo/config.toml` when that variable is set. (The plain build has since dropped that
+flag too, for its own reasons.) And it was linked natively on the build runner, so it
+needed glibc 2.38 and did not start on Debian 12, Ubuntu 22.04 or RHEL 9, where the
+plain artefact does.
 
 ## What it is worth
 
 Measured on the v0.12.0 tree, one server core, CPU time per request (the server's
 user + system time divided by the requests it answered), five trials of 8 s per
 scenario, the builds interleaved trial by trial, twice (2026-10-09). Difference from the
-plain build:
+plain build of that tree, which was compiled for `x86-64-v3`. What ships from this
+release on is the second column for the PGO binary and the third for the plain one:
 
 | scenario | profile | profile, without `x86-64-v3` | `x86-64-v3` removed, no profile |
 |---|---|---|---|
@@ -56,11 +60,13 @@ request is all zion's own code (a cache hit) and smallest where the time is in t
 kernel or in the TLS library's hand-written assembly (a handshake, a large body), which
 no profile of the Rust code reaches.
 
-The third column is there because the two effects were mixed up until v0.12.0: the
-`target-cpu` alone moves these workloads by a point or two at most, in either direction.
+The second and third columns are there because the two effects were mixed up until
+v0.12.0: the `target-cpu` alone moves these workloads by a point or two at most, in
+either direction, which is one reason it is no longer set.
 
-Those are native builds. The two binaries built the way the release builds them
-(cargo-zigbuild, the 2.28 glibc floor) compare the same, in two more runs: −34 % and
+Those are native builds. The two binaries built the way the release then built them
+(cargo-zigbuild, the 2.28 glibc floor, both `x86-64-v3`) compare the same, in two more
+runs: −34 % and
 −33 % on the cached document, −18 % and −18 % over HTTP/2, −24 % and −25 % proxied,
 −13 % and −13 % on the site mix, −8.5 % and −9.1 % for files from disk, −4.0 % and
 −3.9 % for a full handshake.
@@ -158,8 +164,7 @@ when:
   another source or compiler), or more functions without profile data than
   `PGO_MAX_MISSING`;
 * the instrumented and the optimised build disagree on the zion crate's identity;
-* the zion crate was not compiled with the profile, or not with the expected
-  `target-cpu` (`PGO_EXPECT_CPU`);
+* the zion crate was not compiled with the profile;
 * the binary needs a newer glibc than the plain artefact (`PGO_MAX_GLIBC`);
 * the file the compiler reads is not the profile its name says, before or after the
   build;
@@ -170,7 +175,10 @@ when:
 The release sets all of them but the last. `pgo.yml` sets all of them, on every pull
 request that touches the scripts, the workflows, the training backend,
 `.cargo/config.toml` or the toolchain pin, then builds a second time from the profile
-alone and compares the binaries.
+alone and compares the binaries. Both workflows then run
+`scripts/cpu-baseline-smoke.sh` on the binary, as the release does on every binary: it
+must declare the compiler's defaults for its target and serve under an emulated
+processor that has SSE2 and nothing later.
 
 ## Rebuilding the PGO binary of a release
 

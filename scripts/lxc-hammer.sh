@@ -6,7 +6,7 @@ set -euo pipefail
 # Run on any Linux box (kernel >= 5.10). Builds zion with the experimental /
 # mesh feature set and drives the AIMP gossip smoke test against a real kernel:
 #
-#   1. installs a stable rust toolchain if missing (+ AVX2 build fix on old CPUs)
+#   1. installs a stable rust toolchain if missing
 #   2. builds zion in release mode with the mesh + ml-waf features
 #   3. runs the AIMP 2-node gossip smoke test (no privileges needed)
 #
@@ -41,25 +41,6 @@ if [[ "$(uname -s)" != "Linux" ]]; then
     exit 2
 fi
 echo "  kernel: $(uname -r)"
-
-# CPU ISA compatibility — zion's `.cargo/config.toml` defaults the
-# x86_64-non-macos target to `target-cpu=x86-64-v3`, which requires
-# AVX2/BMI2/FMA. Older Xeon/Core CPUs (Ivy Bridge and prior) only
-# have v2 (SSE4.2/POPCNT). Without this fix, the *build scripts* of
-# crates like aws-lc-sys SIGILL when cargo runs them.
-#
-# We can't use `CARGO_TARGET_..._RUSTFLAGS` here — cargo *concatenates*
-# that env var with the file value (last `-C target-cpu=` wins, so v3
-# would still win). The only reliable fix is to rewrite the file in
-# place. Idempotent: the sed is a no-op if v3 is already absent.
-if grep -qE '^flags\b.*\bavx2\b' /proc/cpuinfo; then
-    echo "  ✓ CPU has AVX2 — leaving zion's x86-64-v3 default in place"
-else
-    yellow "  ! CPU lacks AVX2; downgrading .cargo/config.toml to x86-64-v2"
-    sed -i 's/target-cpu=x86-64-v3/target-cpu=x86-64-v2/g' .cargo/config.toml
-    echo "  ! purging cached build artifacts compiled under v3 flags…"
-    cargo clean 2>/dev/null || true
-fi
 
 need() { command -v "$1" >/dev/null 2>&1; }
 if ! need cargo; then

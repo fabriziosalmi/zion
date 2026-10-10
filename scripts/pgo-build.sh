@@ -42,7 +42,6 @@
 #                     too and the count is some 650 higher)
 #   PGO_MAX_MISSING   most "no profile data" warnings the optimised build may
 #                     print (default 1000; 814 at v0.12.0)
-#   PGO_EXPECT_CPU    the -C target-cpu the zion crate must be compiled with
 #   PGO_MAX_GLIBC     highest glibc symbol version the binary may need (ELF only)
 #   PGO_VERIFY        1: replay the training workload against the optimised
 #                     binary, every phase checked (default when this run did
@@ -56,8 +55,12 @@
 # The profile flags go in CARGO_TARGET_<TRIPLE>_RUSTFLAGS and never in RUSTFLAGS.
 # Cargo joins the per-target variable with the rustflags of .cargo/config.toml,
 # and DROPS the config's rustflags when RUSTFLAGS is set: a PGO build made with
-# RUSTFLAGS silently loses the target-cpu baseline (x86-64-v3 on Linux x86_64)
-# that every other build of the same tree has.
+# RUSTFLAGS silently loses whatever the config sets for the target, and is then
+# not the plain build plus a profile. (Up to v0.12.0 that was x86-64-v3 on Linux
+# x86_64, and the -pgo tarball was the one build without it.)
+#
+# Which processors the binary runs on is not checked here: the workflows run
+# scripts/cpu-baseline-smoke.sh on it, as on every other binary.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -181,9 +184,6 @@ fi
 grep -qF -- "-Cprofile-use=$USE" <<<"$RUSTC_LINE" || fail "the zion binary was not compiled with the profile"
 CPU=$(grep -o -E -- '-C ?target-cpu=[A-Za-z0-9_.-]+' <<<"$RUSTC_LINE" | tail -1 | sed 's/.*=//' || true)
 echo "      target-cpu of the zion crate: ${CPU:-<none: the compiler default>}"
-if [ -n "${PGO_EXPECT_CPU:-}" ]; then
-  [ "$CPU" = "$PGO_EXPECT_CPU" ] || fail "the zion crate was compiled with target-cpu '${CPU:-none}', expected '$PGO_EXPECT_CPU'"
-fi
 
 MISSING=$(grep -c 'no profile data available for function' "$OUT/build-use.log" || true)
 MISMATCH=$(grep -c -i -E 'hash mismatch|profile data may be out of date|control flow change detected' "$OUT/build-use.log" || true)

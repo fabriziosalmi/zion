@@ -57,6 +57,26 @@ fn main() {
 
     println!("cargo:rustc-env=ZION_GIT_SHA={sha}");
     println!("cargo:rustc-env=ZION_COMMIT_DATE={date}");
+
+    // What the binary may assume about the processor: the target, and the CPU features the
+    // compiler was allowed to use everywhere (`-C target-cpu`, `-C target-feature`), as Cargo
+    // reports them to build scripts. `zion bootstrap` prints both, so a check can ask the
+    // binary itself which processors it was built for (scripts/cpu-baseline-smoke.sh does).
+    let mut features: Vec<String> = std::env::var("CARGO_CFG_TARGET_FEATURE")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .collect();
+    features.sort();
+    println!(
+        "cargo:rustc-env=ZION_BUILD_TARGET={}",
+        std::env::var("TARGET").unwrap_or_else(|_| "unknown".into())
+    );
+    println!(
+        "cargo:rustc-env=ZION_BUILD_TARGET_FEATURES={}",
+        features.join(",")
+    );
 }
 
 fn env_nonempty(key: &str) -> Option<String> {
