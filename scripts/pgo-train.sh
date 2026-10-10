@@ -286,7 +286,7 @@ phase_full() { # everything, access log on
     done
   done
   load ok "large proxied body" 400 -c 8 --h1 "$U/api/v1/large"
-  load ok "cache fill, 1 MB objects" 2500 -c 8 --h1 "$U/_next/static/blob?bytes=1048576"
+  load ok "cache hit, 100 KB object" 2500 -c 8 --h1 "$U/_next/static/blob?size=102400"
   load any "upstream 404" 15000 -c 16 --h1 "$U/api/v1/status/404"
   load any "upstream down (502)" 5000 -c 16 --h1 "$U/dead/x"
   local long
