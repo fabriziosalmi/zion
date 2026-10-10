@@ -244,17 +244,34 @@ fn a_cached_megabyte_costs_the_process_about_a_megabyte() {
         assert_eq!((status, size), (200, MIB), "object {n}");
     }
     std::thread::sleep(Duration::from_millis(3000));
-    let after = process_memory_mib(zion.child.id());
     let counted = (metric(&zion, "zion_cache_bytes") - counted_before) / MIB as u64;
-    let grew = after.saturating_sub(before);
-    eprintln!("cached {counted} MiB (as counted); the process grew by {grew} MiB");
     assert!(
         counted >= N as u64,
         "the cache holds what was offered: {counted} MiB"
     );
+    // The claim is about what the cache keeps, not about one moment after the traffic. A single
+    // reading at 3 s is usually 1.1 to 1.3 and came out at 1.52 and 1.57 on CI runners (#657),
+    // past the 1.5 line. So read for up to ten seconds and keep the lowest, and print them all:
+    // what the process holds only for a moment settles, and the bug this guards against does
+    // not (an eagerly committed arena stays at 1.7 to 2.1 for as long as the entries are cached).
+    let mut readings = Vec::new();
+    for _ in 0..10 {
+        let grew = process_memory_mib(zion.child.id()).saturating_sub(before);
+        readings.push(grew);
+        if grew * 2 < counted * 3 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1000));
+    }
+    let grew = readings.iter().copied().min().unwrap_or(u64::MAX);
+    eprintln!(
+        "cached {counted} MiB (as counted); the process grew by {grew} MiB (readings, 1 s apart: {readings:?})"
+    );
     assert!(
         grew * 2 < counted * 3,
-        "the process grew by {grew} MiB for {counted} MiB the cache counts: more than 1.5 times"
+        "the process grew by {grew} MiB for {counted} MiB the cache counts: more than 1.5 times, \
+         for {} s after the traffic ({readings:?})",
+        2 + readings.len()
     );
 }
 
