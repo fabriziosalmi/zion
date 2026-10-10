@@ -5183,7 +5183,7 @@ dependencies = [
 
 [[package]]
 name = "zion"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "aho-corasick",
  "aimp_node",

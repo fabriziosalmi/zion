@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-10
+
+**The release binaries now run on any x86-64 and any 64-bit ARM processor. Up to 0.12 the x86_64 ones needed AVX2 and the aarch64 ones ARMv8.2, stopped with an illegal instruction without, and nothing said so; on aarch64 the change costs a few percent of CPU on a recent core (third and fourth upgrade notes).** Two changes of behaviour to read first: zion sends 2 TLS session tickets where it sent 4, and a connection that negotiated `h2` has to speak HTTP/2. The rest is how a release is built and checked: every binary is run on an emulated baseline processor before it is signed, the `-pgo` tarball is the plain build plus a profile again and is rebuilt from that profile to the byte, and a release can be rebuilt on any machine.
+
 ### Upgrade notes
 
 - **zion now sends 2 TLS 1.3 session tickets after a full handshake, not 4** (`[tls] session_tickets`, default `2`; set `4` to get the previous behaviour). Each ticket costs about 25 µs of server CPU per full handshake and the client has to parse it: on one core a handshake went from 309 µs with 4 tickets to 257 µs with 2 (3.2k → 3.9k handshakes a second, −17 % CPU), and to 233 µs with 1. The extra two were there for clients that open several connections at once and resume each with its own ticket; if yours do and you see more full handshakes after upgrading (`zion_tls_handshake_duration` count against resumed sessions), raise the value. `0` sends none, and more than 16 is a config error. Read at start-up.
@@ -11,6 +15,8 @@ All notable changes to Zion Edge Gateway are documented here.
 - **The Linux x86_64 binaries, the Windows binary, the Intel macOS binary and the amd64 image no longer need AVX2.** Up to v0.12.0 they were compiled for `x86-64-v3` (AVX2, BMI2, FMA: Haswell, 2013, or newer) and stopped with an illegal instruction on anything older, before printing a word. They are now compiled for the baseline of their target (SSE2 on Linux; the compiler's defaults on Windows and macOS). Nothing to do on upgrade. What the flag bought is in Fixed; to build for the machine you are on, `RUSTFLAGS="-C target-cpu=native" cargo build --release`. The Linux aarch64 ones are the next note.
 - **The Linux aarch64 binaries and the arm64 image now run on any 64-bit ARM processor, and cost a few percent more CPU on a recent one.** Up to v0.12.0 they were compiled for `neoverse-n1` (ARMv8.2) and stopped with an illegal instruction on a Cortex-A53 or a Cortex-A72: Raspberry Pi 3 and 4, Graviton 1. They are now compiled for the compiler's default (ARMv8.0). On a Neoverse N2 that costs 1 to 7 % of CPU per request on cached responses with the gnu build, and up to 6 % on cached, proxied and WAF requests with the musl build; a TLS handshake costs the same (see Fixed). To get the previous build, `RUSTFLAGS="-C target-cpu=neoverse-n1" cargo build --release`.
 - **The `-pgo` Linux tarball (`…-x86_64-unknown-linux-gnu-pgo.tar.gz`) now runs on glibc 2.28 and newer**, as the plain tarball does: up to v0.12.0 it needed glibc 2.38, so it did not start on Debian 12, Ubuntu 22.04 or RHEL 9. It is now built like the plain one, with the profile as the only difference. Its processor requirement does not change: like every Linux x86_64 binary from this release on (the x86_64 note above) it is built for baseline x86-64, which up to v0.12.0 it was by mistake.
+- **A connection that negotiated `h2` in the TLS handshake has to open with the HTTP/2 preface.** One that sends anything else, a well-formed HTTP/1.1 request included, used to be answered in HTTP/1.1 and is now sent `GOAWAY(PROTOCOL_ERROR)` and closed (see Fixed). No client that offers `h2` and is given it speaks anything else; connections that negotiated `http/1.1` or nothing, and the plaintext listener, are as before.
+- No setting was removed or renamed. `[tls] session_tickets` is new.
 
 ### Changed
 
