@@ -390,6 +390,23 @@ pub fn print_report(p: &Platform) {
     let _ = render(p, &style, &mut w);
 }
 
+/// The target triple this binary was compiled for (stamped by build.rs).
+pub fn build_target() -> &'static str {
+    option_env!("ZION_BUILD_TARGET").unwrap_or("unknown")
+}
+
+/// The CPU features the compiler was allowed to assume in all of this binary (stamped by
+/// build.rs from Cargo's `CARGO_CFG_TARGET_FEATURE`), sorted. A processor without one of them
+/// stops the binary with an illegal instruction; `has_avx2` and its neighbours, by contrast,
+/// describe the machine it is running on. Empty when build.rs did not run.
+pub fn build_target_features() -> Vec<&'static str> {
+    option_env!("ZION_BUILD_TARGET_FEATURES")
+        .unwrap_or("")
+        .split(',')
+        .filter(|f| !f.is_empty())
+        .collect()
+}
+
 /// Serialize the detected platform as pretty-printed JSON.
 ///
 /// Schema mirrors the `platform` field of `/_zion/snapshot.json` so a
@@ -403,6 +420,8 @@ pub fn print_report(p: &Platform) {
 pub fn dump_platform_json(p: &Platform) -> String {
     serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "build_target": build_target(),
+        "build_target_features": build_target_features(),
         "os": p.os,
         "arch": p.arch,
         "cores": p.cpu_cores,
@@ -2050,6 +2069,62 @@ mod tests {
         assert!(v["projected_kreqs_cached"].as_u64().unwrap() > 0);
         // `version` is the package version — always non-empty.
         assert!(!v["version"].as_str().unwrap().is_empty());
+    }
+
+    /// The build's CPU features come from build.rs; the compiler knows them too, as `cfg`.
+    /// The two must agree, or a check that asks the binary would be told something else than
+    /// what the code was compiled with.
+    #[test]
+    fn the_build_target_features_are_the_ones_the_code_was_compiled_with() {
+        let stamped = build_target_features();
+        let compiled: &[(&str, bool)] = &[
+            ("sse2", cfg!(target_feature = "sse2")),
+            ("sse3", cfg!(target_feature = "sse3")),
+            ("ssse3", cfg!(target_feature = "ssse3")),
+            ("sse4.1", cfg!(target_feature = "sse4.1")),
+            ("sse4.2", cfg!(target_feature = "sse4.2")),
+            ("popcnt", cfg!(target_feature = "popcnt")),
+            ("avx", cfg!(target_feature = "avx")),
+            ("avx2", cfg!(target_feature = "avx2")),
+            ("bmi1", cfg!(target_feature = "bmi1")),
+            ("bmi2", cfg!(target_feature = "bmi2")),
+            ("fma", cfg!(target_feature = "fma")),
+            ("lzcnt", cfg!(target_feature = "lzcnt")),
+            ("movbe", cfg!(target_feature = "movbe")),
+            ("avx512f", cfg!(target_feature = "avx512f")),
+            ("neon", cfg!(target_feature = "neon")),
+            ("lse", cfg!(target_feature = "lse")),
+            ("aes", cfg!(target_feature = "aes")),
+            ("sha2", cfg!(target_feature = "sha2")),
+            ("crc", cfg!(target_feature = "crc")),
+            ("dotprod", cfg!(target_feature = "dotprod")),
+            ("rcpc", cfg!(target_feature = "rcpc")),
+        ];
+        for (name, on) in compiled {
+            assert_eq!(
+                stamped.contains(name),
+                *on,
+                "{name}: build.rs stamped {stamped:?}, the compiler says {on}"
+            );
+        }
+        assert!(
+            stamped.windows(2).all(|w| w[0] < w[1]),
+            "sorted, no duplicates: {stamped:?}"
+        );
+        // Every target zion is built for has at least its baseline SIMD.
+        assert!(!stamped.is_empty());
+        assert_ne!(build_target(), "unknown");
+
+        let p = synthetic(8, 16_000, true, "linux");
+        let v: serde_json::Value = serde_json::from_str(&dump_platform_json(&p)).unwrap();
+        assert_eq!(v["build_target"], build_target());
+        let listed: Vec<&str> = v["build_target_features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str().unwrap())
+            .collect();
+        assert_eq!(listed, stamped);
     }
 
     #[test]

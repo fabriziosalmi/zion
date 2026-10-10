@@ -173,7 +173,7 @@ Client
 |---|---|
 | `mimalloc` global allocator | 2-3x faster than system malloc on small allocations |
 | `ArcSwap` for TLS acceptor + metrics cache | Atomic pointer swap without mutex on hot path |
-| `target-cpu=native` build | Unlocks NEON/AES-CE/AVX2 for auto-vectorization |
+| Baseline-CPU build, SIMD chosen at run time | A binary runs on any processor of its architecture; ciphers, hashes and byte searches pick AES-NI / AVX2 / NEON code when the process starts ([measured](/deploy/#which-processors-a-build-runs-on)) |
 | Pre-parsed upstream URIs | Scheme + authority parsed once at boot, only path set at runtime |
 | `DashMap` for cache + rate limiter | Sharded concurrent map, avoids single-mutex bottleneck |
 | `FnvHashSet` for CORS origins | O(1) origin lookup vs O(n) linear scan |

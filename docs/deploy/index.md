@@ -16,6 +16,56 @@ The release profile is optimized for maximum performance:
 | `strip` | true | Strip debug symbols (~5 MB binary) |
 | `panic` | abort | No unwinding overhead |
 
+### Which processors a build runs on
+
+A binary compiled for a newer processor than the one it meets stops with an illegal
+instruction before it prints a word. So a default build, the release tarballs and the
+image assume the baseline of their target and nothing later:
+
+| Binary | Assumes | Checked at every release |
+|---|---|---|
+| Linux x86_64 tarballs (gnu, musl, `-pgo`), the amd64 image | x86-64 baseline (SSE2): any 64-bit Intel or AMD processor | declared by the binary, and run under an emulated SSE2-only processor |
+| Windows x86_64 | the compiler's default (SSE3) | declared by the binary |
+| macOS, Intel | the compiler's default (SSE4.1): any Intel Mac since 2008 | declared by the binary |
+| macOS, Apple Silicon | Apple M1 | declared by the binary |
+| Linux aarch64 tarballs (gnu, musl), the arm64 image | ARMv8.2 (`neoverse-n1`): under emulation they run on Cortex-A76 and Neoverse N1 (Graviton 2) and stop with an illegal instruction on Cortex-A53 and Cortex-A72 (Raspberry Pi 3 and 4, Graviton 1), [#666](https://github.com/fabriziosalmi/zion/issues/666) | not checked |
+
+"Declared" is `zion bootstrap`: `build_target_features` lists what the compiler was
+allowed to assume, and the release fails if that is more than the compiler's default for
+the target. "Run under an emulated processor" is
+[`scripts/cpu-baseline-smoke.sh`](https://github.com/fabriziosalmi/zion/blob/master/scripts/cpu-baseline-smoke.sh):
+the binary serves TLS, HTTP/1.1 and HTTP/2, files, proxied and cached responses and WAF
+verdicts under `qemu` with a processor model that has SSE2 and nothing later. macOS and
+Windows binaries cannot be run that way, so for them it is the declaration alone.
+
+Up to v0.12.0 the Linux x86_64 builds, the Windows build and the amd64 image were compiled
+for `x86-64-v3` (AVX2, BMI2, FMA: Haswell, 2013, or newer) and did not start on an older
+Xeon or on an Atom-class Celeron or Pentium. What that flag bought, measured on v0.12.0 as
+CPU per request of a baseline build against the `x86-64-v3` one (two runs of five
+interleaved trials each; positive = the baseline build costs more):
+
+| Workload | Baseline against `x86-64-v3` |
+|---|---|
+| cached 5 KB document | −1.3 % / +3.6 % |
+| the same, access log on | +1.7 % / +3.3 % |
+| the same over HTTP/2 | +1.1 % / +0.7 % |
+| proxied, no cache | −0.3 % / +1.8 % |
+| example-site mix | +0.3 % / +0.7 % |
+| files from disk | −1.0 % / −0.8 % |
+| full TLS handshake | +0.2 % / +0.2 % |
+
+Only the access-log row is on the same side of zero in every trial of both runs. The TLS
+library and the byte-search code choose their AES-NI and AVX2 paths when the process
+starts, whatever the build flags say.
+
+To build for the machine you are on:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+That binary runs on that processor family and newer, and `zion bootstrap` says so.
+
 ## systemd
 
 Copy the binary and config:

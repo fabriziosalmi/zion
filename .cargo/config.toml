@@ -1,32 +1,37 @@
-# Zion build optimization — per-target CPU tuning.
+# Which processor the compiler may assume, per target.
 #
-# The historical `[build] rustflags = ["-C", "target-cpu=native"]` global
-# default crashed rustc with SIGILL on the GitHub Actions Ubuntu runner
-# while expanding the `displaydoc` proc-macro (transitive via icu/idna).
-# That global was applied to *all* targets including the proc-macro host,
-# producing a binary that used CPU instructions the runner CPU couldn't
-# decode at expansion time.
+# x86_64 (Linux, the BSDs, Windows): nothing here, so the compiler's default, the x86-64
+# baseline (SSE2). This file used to say `target-cpu=x86-64-v3` (AVX2, BMI2, FMA: Haswell,
+# 2013) for them. A binary built that way stops with an illegal instruction on a processor
+# without AVX2, before it prints a word: older Xeons, and the Atom-class Celeron and Pentium
+# boxes common as home servers and edge appliances. What the flag bought was measured on
+# v0.12.0 (issue #662, docs/deploy/index.md): nothing outside the noise on six workloads of
+# seven, one to three percent of CPU on the seventh. The ciphers, the hashes and the byte
+# searches pick their AVX2 / AES-NI code when the process starts, whatever this file says.
 #
-# Fix: scope `native` to the developer host triples (Apple Silicon and
-# Intel macOS), and use the portable x86-64-v3 micro-architecture
-# baseline (Haswell+, 2013) elsewhere — that level still gives us AVX2,
-# AES-NI, BMI1/2, FMA, so the WAF / TLS / cache hot paths stay accelerated
-# while CI runners and Docker images stay portable.
+# To build for the machine you are on:
 #
-# Override at build time with `RUSTFLAGS=-C target-cpu=...` if you want
-# something different for a specific deployment.
+#     RUSTFLAGS="-C target-cpu=native" cargo build --release
+#
+# That binary runs on that processor family and newer. `zion bootstrap` lists what a binary
+# assumes (build_target_features), and scripts/cpu-baseline-smoke.sh refuses one that assumes
+# more than its target's baseline: the release and .github/workflows/cpu-baseline.yml run it
+# on every Linux artefact, under an emulated baseline processor.
+#
+# A function that is measurably faster with AVX2 gets a `#[target_feature]` version chosen
+# with `is_x86_feature_detected!`, not a build-wide flag.
 
+# macOS: the developer hosts. `native` is for local builds only; the released macOS binaries
+# are built with an explicit `-C target-cpu` (release.yml), which replaces these.
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=native"]
 
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "target-cpu=native"]
 
-# Linux / *BSD / Windows x86_64 — portable but still hardware-accelerated.
-[target.'cfg(all(target_arch = "x86_64", not(target_os = "macos")))']
-rustflags = ["-C", "target-cpu=x86-64-v3"]
-
-# Linux / *BSD aarch64 — Graviton, RPi 4+, modern ARM servers all support
-# armv8.2-a (NEON, AES, SHA2, CRC32). Same baseline as Apple Silicon.
+# Linux / *BSD aarch64: ARMv8.2 (Neoverse N1). Under emulation this build runs on a
+# Cortex-A76 and a Neoverse N1 (Graviton 2) and stops with an illegal instruction on a
+# Cortex-A53 and a Cortex-A72 (Raspberry Pi 3 and 4, Graviton 1): issue #666, the same
+# question as above, not settled by this change.
 [target.'cfg(all(target_arch = "aarch64", not(target_os = "macos")))']
 rustflags = ["-C", "target-cpu=neoverse-n1"]
