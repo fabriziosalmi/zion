@@ -84,8 +84,8 @@ The last column is the method's own noise. The two targets differ in how atomic
 operations are compiled without the flag: on gnu through a helper that uses the LSE
 instructions where the processor has them (seen under emulation: LSE instructions run on
 a Neoverse N1, none on a Cortex-A53), on musl, with the release's compiler (Rust 1.88),
-as load-/store-exclusive pairs. Rust 1.98 gives musl the helper too; on these workloads
-that is worth 2 to 4 % on proxied and WAF requests.
+as load-/store-exclusive pairs. Newer compilers (1.98 does) give musl the helper too; on
+these workloads that is worth 2 to 4 % on proxied and WAF requests.
 
 With four workers on the same four cores as the load generator (a noisier setup: the two
 copies of one binary differ by up to 2 % in the median) the picture is the same: musl
