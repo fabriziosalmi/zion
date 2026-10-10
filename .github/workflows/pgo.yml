@@ -129,10 +129,23 @@ jobs:
             echo "Reproduced: ${again}"
           else
             echo "::error::The binary rebuilt from the profile differs from the first one"
+            # Where they differ, so that the cause can be read from the log: the count of differing
+            # bytes, the sections they fall in, and the text that is in one binary only.
+            a="${RUNNER_TEMP}/zion-first"
+            b="target/${TARGET}/release/zion"
+            cp "$b" "${RUNNER_TEMP}/zion-again"
+            echo "sizes: $(stat -c %s "$a") and $(stat -c %s "$b") bytes; differing bytes: $(cmp -l "$a" "$b" | wc -l)"
+            for sec in $(readelf -SW "$a" | sed -n 's/^ *\[ *[0-9]*\] \(\.[^ ]*\) .*/\1/p'); do
+              objcopy -O binary --only-section="$sec" "$a" /tmp/sec-a 2>/dev/null || continue
+              objcopy -O binary --only-section="$sec" "$b" /tmp/sec-b 2>/dev/null || continue
+              cmp -s /tmp/sec-a /tmp/sec-b || echo "  section $sec: $(cmp -l /tmp/sec-a /tmp/sec-b | wc -l) differing bytes of $(stat -c %s /tmp/sec-a)"
+            done
+            echo "text in one binary only (first 40 lines):"
+            diff <(strings -n 8 "$a") <(strings -n 8 "$b") | grep '^[<>]' | cut -c1-240 | head -40 || true
             exit 1
           fi
 
-      - name: Keep the logs when it fails
+      - name: Keep the logs and the binaries when it fails
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -140,4 +153,6 @@ jobs:
           path: |
             ${{ runner.temp }}/pgo/*.log
             ${{ runner.temp }}/pgo-again/*.log
+            ${{ runner.temp }}/zion-first
+            ${{ runner.temp }}/zion-again
           retention-days: 14
