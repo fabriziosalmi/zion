@@ -7,10 +7,15 @@ All notable changes to Zion Edge Gateway are documented here.
 ### Upgrade notes
 
 - **zion now sends 2 TLS 1.3 session tickets after a full handshake, not 4** (`[tls] session_tickets`, default `2`; set `4` to get the previous behaviour). Each ticket costs about 25 µs of server CPU per full handshake and the client has to parse it: on one core a handshake went from 309 µs with 4 tickets to 257 µs with 2 (3.2k → 3.9k handshakes a second, −17 % CPU), and to 233 µs with 1. The extra two were there for clients that open several connections at once and resume each with its own ticket; if yours do and you see more full handshakes after upgrading (`zion_tls_handshake_duration` count against resumed sessions), raise the value. `0` sends none, and more than 16 is a config error. Read at start-up.
+- **zion now turns transparent huge pages off for its own process** (`prctl(PR_SET_THP_DISABLE)` at start-up; nothing system-wide). It matters only where `/sys/kernel/mm/transparent_hugepage/enabled` is `always`: there the process held 1.3 to 2.4 times what the response cache counts, depending on the machine, and now holds 1.1. CPU per request did not change in the measurements (see Fixed). To keep huge pages, start zion with `MIMALLOC_ALLOW_THP=1` in its environment.
 
 ### Changed
 
 - **`[tls] session_tickets`, default 2.** See the upgrade note. Measured on the dedicated host, one core, wrk with `Connection: close`: 4 tickets 309 µs and 3.2k handshakes a second, 2 tickets 257 µs and 3.9k, 1 ticket 233 µs and 4.3k (nginx: 412 µs). A real client counted the tickets on the wire in a test: 2 by default, 5 with `5`, none with `0`.
+
+### Fixed
+
+- **A cached megabyte cost the process a megabyte and a half, or more, where transparent huge pages are always on.** `cache_max_memory_mb` is a budget on what the cache counts, and #590 made the process hold about 1.1 times that by stopping mimalloc from committing its arena eagerly. That held where the kernel's setting is `madvise`. Where it is `always` (the GitHub runners, for one), the kernel backs the arena with 2 MiB pages and a page touched brings in two megabytes: with 150 MiB of cached 1 MiB bodies a release build grew by 200 to 260 MiB on most runners (the same built as the release artefacts are) and by 330 to 360 on two, steadily, and by 161 to 171 MiB with huge pages off; with 200 MiB cached, 38 to 68 MiB of the process were huge pages. zion now turns them off for its own process. Eight alternated runs of one binary found no cost in CPU per request: 34.9 against 34.8 µs for a 5 KB cached document, 843 against 818 µs for a cached megabyte. The test that guards the ratio saw this only in release builds, which CI does not run, and once in a debug run (#657, 1.52); a new test reads the switch itself from `/proc/<pid>/status`, which says the same on every Linux machine, and another repeats the ratio with `MIMALLOC_ALLOW_THP` set. (#657)
 
 ## [0.12.0] - 2026-10-09
 
