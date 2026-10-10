@@ -856,12 +856,26 @@ mod proxy_tests {
             let ip = std::net::IpAddr::from(n.to_be_bytes());
             map.insert(ip, RateEntry::new(current - 1));
         }
-        // Whatever order the map iterates in, its first entries are the ones probed.
-        let head: Vec<std::net::IpAddr> = map.iter().take(64).map(|e| *e.key()).collect();
-        for ip in head {
-            map.insert(ip, RateEntry::new(current));
-        }
+        mark_head_current(&map, current);
         (map, current)
+    }
+
+    /// Makes the first entries the map iterates over, which are the ones the probe at the
+    /// cap looks at, entries of this window. In place: inserting a key that is already
+    /// there can still grow its shard (the table reserves room for one more before it
+    /// looks the key up), which reorders the shard, and the probe then meets a stale entry
+    /// that this was meant to keep out of its way. With 16 shards and 2,000 addresses that
+    /// was 20 runs in 4,000, and `the_full_sweep_runs_once_per_window` failed on them
+    /// (seen on a Windows runner: 2,000 entries left where 65 were expected).
+    fn mark_head_current(
+        map: &crate::numa::NumaAwareMap<std::net::IpAddr, RateEntry>,
+        current: u32,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let fresh = RateEntry::new(current).packed.load(Relaxed);
+        for entry in map.iter().take(64) {
+            entry.value().packed.store(fresh, Relaxed);
+        }
     }
 
     /// #528: the probe at the cap looks at the first few entries, always the same ones. With
@@ -910,10 +924,7 @@ mod proxy_tests {
             let stale = std::net::IpAddr::from((0x0a00_0000u32 + n).to_be_bytes());
             map.insert(stale, RateEntry::new(current - 1));
         }
-        let head: Vec<std::net::IpAddr> = map.iter().take(64).map(|e| *e.key()).collect();
-        for addr in head {
-            map.insert(addr, RateEntry::new(current));
-        }
+        mark_head_current(&map, current);
         let before = map.len();
         assert!(
             !check_rate_limit(100, WINDOW, before, &map, &sweep, ip(2)),
