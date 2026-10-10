@@ -220,6 +220,9 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.13.0
+          # No cache of zig's cache: the action restores compiled C objects of an earlier
+          # run, and one of them has its compile time in it (scripts/check-build-date.sh).
+          use-cache: false
 
       - name: Install cargo-zigbuild
         if: matrix.cross == 'zig'
@@ -246,7 +249,9 @@ jobs:
       # cargo's home, and with the rust-src component the toolchain's own directory. Remapped
       # to fixed names, the bytes are the same wherever the build runs
       # (scripts/remap-rustflags.sh). And an empty zig cache: zig reuses a compiled C object
-      # whatever SOURCE_DATE_EPOCH is, and the allocator's has its compile time in it.
+      # whatever SOURCE_DATE_EPOCH is, and the allocator's has its compile time in it. Both
+      # of zig's cache directories: setup-zig points the two of them into the workspace, and
+      # the objects go to the local one.
       - name: Keep this runner's paths out of the binary
         if: matrix.cross == 'zig'
         shell: bash
@@ -256,6 +261,7 @@ jobs:
           var="CARGO_TARGET_$(tr 'a-z.-' 'A-Z__' <<<"$MATRIX_TARGET")_RUSTFLAGS"
           echo "${var}=$(bash scripts/remap-rustflags.sh)" | tee -a "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=${RUNNER_TEMP}/zig-cache" | tee -a "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=${RUNNER_TEMP}/zig-cache" | tee -a "$GITHUB_ENV"
 
       # ── Build ──
       # --features dist (acme + init): the redistributable bundle so the
@@ -345,6 +351,16 @@ jobs:
               ;;
           esac
           bash scripts/cpu-baseline-smoke.sh "target/${MATRIX_TARGET}/release/${MATRIX_ARTIFACT}"
+
+      # A C object that came from a cache has another build's date in it, and the binary is
+      # then not what this commit gives (and cannot be rebuilt). Nothing is staged without
+      # the commit's own.
+      - name: Every C object is of this build
+        if: matrix.cross == 'zig'
+        shell: bash
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: bash scripts/check-build-date.sh "target/${MATRIX_TARGET}/release/zion"
 
       # ── Strip + stage artifact ──
       - name: Stage artifact

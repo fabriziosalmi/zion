@@ -130,7 +130,10 @@ with the `rust-src` component reads from its own directory, become the compiler'
 `/rustc/<commit>`. It also builds with an empty zig cache: zig keeps compiled C
 objects by path and flags, not by `SOURCE_DATE_EPOCH`, and the allocator's C code
 contains the date and time of its compilation, so an object left by another day's
-build of the same source would be reused with that day in it. With those, the bytes
+build of the same source would be reused with that day in it
+([`scripts/check-build-date.sh`](https://github.com/fabriziosalmi/zion/blob/master/scripts/check-build-date.sh)
+reads the date back from a binary; the release stages nothing whose date is not the
+commit's). With those, the bytes
 do not depend on the directory, on where cargo's home is, or on the toolchain's
 components. To rebuild the Linux musl artifact:
 
@@ -142,7 +145,7 @@ export ZION_COMMIT_DATE=$(git show -s --format=%cd --date=format:%Y-%m-%d HEAD)
 # needs zig 0.13.0 and cargo-zigbuild 0.23.4 on PATH
 #   (cargo install --locked cargo-zigbuild --version 0.23.4)
 rustup toolchain install 1.88.0 --target x86_64-unknown-linux-musl
-export ZIG_GLOBAL_CACHE_DIR=$(mktemp -d)
+export ZIG_GLOBAL_CACHE_DIR=$(mktemp -d) ZIG_LOCAL_CACHE_DIR=$ZIG_GLOBAL_CACHE_DIR
 if [ -f scripts/remap-rustflags.sh ]; then   # 0.13 and later
   export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="$(bash scripts/remap-rustflags.sh +1.88.0)"
 fi
