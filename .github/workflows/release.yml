@@ -330,26 +330,34 @@ jobs:
           RUSTFLAGS="-Cprofile-use=${PGO_DIR}/merged.profdata -Cllvm-args=-pgo-warn-missing-function" \
             cargo build --release --locked --features dist --target ${{ matrix.target }}
 
-      # ── CPU baseline (#662) ──
+      # ── CPU baseline (#662, #666) ──
       # A binary compiled for a newer processor than its target's baseline stops with an
       # illegal instruction on an older one. Before anything is staged or attested:
       # every binary must say it was built with the compiler's defaults for its target, and
-      # the Linux x86_64 ones must serve under an emulated processor that has SSE2 and
-      # nothing later (scripts/cpu-baseline-smoke.sh). macOS and Windows binaries cannot be
-      # run on an emulated old processor here, so for them it is the declaration only.
-      - name: CPU baseline (declared; executed under an emulated baseline CPU on Linux x86_64)
-        if: matrix.target != 'aarch64-unknown-linux-gnu' && matrix.target != 'aarch64-unknown-linux-musl'
+      # the Linux ones must serve under an emulated processor that has the architecture's
+      # baseline and nothing later: SSE2 for x86_64, a Cortex-A53 for aarch64
+      # (scripts/cpu-baseline-smoke.sh). macOS and Windows binaries cannot be run on an
+      # emulated old processor here, so for them it is the declaration only.
+      - name: CPU baseline (declared; executed under an emulated baseline CPU on Linux)
         shell: bash
         env:
           MATRIX_TARGET: ${{ matrix.target }}
           MATRIX_ARTIFACT: ${{ matrix.artifact }}
         run: |
-          if [[ "$MATRIX_TARGET" == x86_64-unknown-linux-* ]]; then
-            sudo apt-get install -y qemu-user >/dev/null
-            export SMOKE_MODE=emulate
-          else
-            export SMOKE_MODE=declare
-          fi
+          case "$MATRIX_TARGET" in
+            x86_64-unknown-linux-*)
+              sudo apt-get install -y qemu-user >/dev/null
+              export SMOKE_MODE=emulate
+              ;;
+            aarch64-unknown-linux-*)
+              # The libraries a dynamically linked aarch64 binary needs on this x86_64 runner.
+              sudo apt-get install -y qemu-user libc6-arm64-cross >/dev/null
+              export SMOKE_MODE=emulate
+              ;;
+            *)
+              export SMOKE_MODE=declare
+              ;;
+          esac
           bash scripts/cpu-baseline-smoke.sh "target/${MATRIX_TARGET}/release/${MATRIX_ARTIFACT}"
 
       # ── Strip + stage artifact ──
@@ -624,7 +632,6 @@ jobs:
       # processor with the architecture's baseline and nothing later? A failure here stops
       # the manifest: no tag ever points at this digest.
       - name: The image's binary serves under an emulated baseline CPU
-        if: matrix.arch == 'amd64'
         run: |
           sudo apt-get update >/dev/null
           sudo apt-get install -y qemu-user >/dev/null
