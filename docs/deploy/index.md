@@ -28,15 +28,16 @@ image assume the baseline of their target and nothing later:
 | Windows x86_64 | the compiler's default (SSE3) | declared by the binary |
 | macOS, Intel | the compiler's default (SSE4.1): any Intel Mac since 2008 | declared by the binary |
 | macOS, Apple Silicon | Apple M1 | declared by the binary |
-| Linux aarch64 tarballs (gnu, musl), the arm64 image | ARMv8.2 (`neoverse-n1`): under emulation they run on Cortex-A76 and Neoverse N1 (Graviton 2) and stop with an illegal instruction on Cortex-A53 and Cortex-A72 (Raspberry Pi 3 and 4, Graviton 1), [#666](https://github.com/fabriziosalmi/zion/issues/666) | not checked |
+| Linux aarch64 tarballs (gnu, musl), the arm64 image | ARMv8.0 (NEON): any 64-bit ARM processor | declared by the binary, and run under an emulated Cortex-A53 |
 
 "Declared" is `zion bootstrap`: `build_target_features` lists what the compiler was
 allowed to assume, and the release fails if that is more than the compiler's default for
 the target. "Run under an emulated processor" is
 [`scripts/cpu-baseline-smoke.sh`](https://github.com/fabriziosalmi/zion/blob/master/scripts/cpu-baseline-smoke.sh):
 the binary serves TLS, HTTP/1.1 and HTTP/2, files, proxied and cached responses and WAF
-verdicts under `qemu` with a processor model that has SSE2 and nothing later. macOS and
-Windows binaries cannot be run that way, so for them it is the declaration alone.
+verdicts under `qemu` with a processor model that has the architecture's baseline and
+nothing later (a first-generation Opteron; a Cortex-A53). macOS and Windows binaries
+cannot be run that way, so for them it is the declaration alone.
 
 Up to v0.12.0 the Linux x86_64 builds, the Windows build and the amd64 image were compiled
 for `x86-64-v3` (AVX2, BMI2, FMA: Haswell, 2013, or newer) and did not start on an older
@@ -65,10 +66,31 @@ pass-to-pass noise (the largest difference that way: 4.2 % with 2.6 % of noise),
 were faster **without** it by more than twice theirs: the WAF scan of a clean body by 5
 to 11 %, trace-header parsing by 13 to 22 %.
 
-To build for the machine you are on:
+Up to v0.12.0 the Linux aarch64 builds and the arm64 image were compiled for
+`neoverse-n1` (ARMv8.2) and did not start on a Cortex-A53 or a Cortex-A72: Raspberry Pi 3
+and 4, Graviton 1. There the flag does buy something. On a Neoverse N2 (two workers,
+eight paired trials, two independent runs), CPU per request of the default build
+against the `neoverse-n1` one:
+
+| Workload | gnu | musl | two copies of one binary |
+|---|---|---|---|
+| cached, HTTP/1.1 | +1.1 % / +3.8 % | +3.4 % / +3.8 % | +1.3 % / +1.3 % |
+| cached, HTTP/2 | +4.7 % / +6.9 % | −0.5 % / +4.3 % | +0.9 % / +0.7 % |
+| proxied | −0.8 % / +0.1 % | +5.6 % / +3.7 % | 0.0 % / +0.4 % |
+| POST through the WAF | −0.3 % / +0.3 % | +4.6 % / +2.1 % | +0.3 % / +1.2 % |
+| full TLS handshake | −0.9 % / +1.0 % | +0.8 % / +0.8 % | −0.4 % / −0.4 % |
+
+The last column is the method's own noise. The two targets differ in how atomic
+operations are compiled without the flag: on gnu through a helper that uses the LSE
+instructions where the processor has them, on musl (with the release's compiler, Rust
+1.88) as load-/store-exclusive pairs everywhere. More than two workers were not
+measured; exclusive pairs are known to do worse under contention on many cores.
+
+To build for the machine you are on, or for one family:
 
 ```bash
 RUSTFLAGS="-C target-cpu=native" cargo build --release
+RUSTFLAGS="-C target-cpu=neoverse-n1" cargo build --release   # what the aarch64 release was
 ```
 
 That binary runs on that processor family and newer, and `zion bootstrap` says so.

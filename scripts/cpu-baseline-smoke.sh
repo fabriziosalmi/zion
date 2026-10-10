@@ -105,11 +105,11 @@ int main(void) {
 C
   else
     WHAT="an LSE instruction"
-    CFLAGS=(-march=armv8.1-a)
+    CFLAGS=() # the extension is switched on in the assembly: no -march, which not every driver takes
     cat >"$W/control.c" <<'C'
 int main(void) {
   unsigned cell = 0, expected = 0, wanted = 1;
-  __asm__ volatile("casal %w[e], %w[n], [%[p]]"
+  __asm__ volatile(".arch_extension lse\n\tcasal %w[e], %w[n], [%[p]]"
                    : [e] "+r"(expected)
                    : [n] "r"(wanted), [p] "r"(&cell)
                    : "memory");
@@ -126,7 +126,7 @@ C
   else
     CC=("$ARCH-linux-gnu-gcc")
   fi
-  "${CC[@]}" -static -O0 "${CFLAGS[@]}" -o "$W/control" "$W/control.c" 2>"$W/control.err" ||
+  "${CC[@]}" -static -O0 ${CFLAGS[@]+"${CFLAGS[@]}"} -o "$W/control" "$W/control.c" 2>"$W/control.err" ||
     { cat "$W/control.err" >&2; fail "could not compile the control program with '${CC[*]}'"; }
   # In subshells: the shell that waits for a process killed by a signal says so on its
   # stderr, and here that death is the expected outcome.

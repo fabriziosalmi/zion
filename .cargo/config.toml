@@ -1,5 +1,17 @@
 # Which processor the compiler may assume, per target.
 #
+# aarch64 (Linux, the BSDs): nothing here, so the compiler's default, ARMv8.0 with NEON.
+# This file used to say `target-cpu=neoverse-n1` (ARMv8.2) for them, and such a binary
+# stops with an illegal instruction on a Cortex-A53 or a Cortex-A72: Raspberry Pi 3 and
+# 4, Graviton 1 (issue #666). On a Neoverse N2 the default gnu build costs 1 to 7 % more
+# CPU on cached responses and nothing measurable on proxied requests, WAF bodies and TLS
+# handshakes; the default musl build up to 6 % on all but the handshake
+# (docs/deploy/index.md). The difference between the two: on gnu, atomics go through a
+# helper that uses the LSE instructions where the processor has them (`outline-atomics`,
+# the compiler's default there); on musl, rustc 1.88 has no such default and they are
+# exclusive pairs everywhere, until the toolchain pin moves to a compiler that has it
+# (1.98 does).
+#
 # x86_64 (Linux, the BSDs, Windows): nothing here, so the compiler's default, the x86-64
 # baseline (SSE2). This file used to say `target-cpu=x86-64-v3` (AVX2, BMI2, FMA: Haswell,
 # 2013) for them. A binary built that way stops with an illegal instruction on a processor
@@ -29,10 +41,3 @@ rustflags = ["-C", "target-cpu=native"]
 
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "target-cpu=native"]
-
-# Linux / *BSD aarch64: ARMv8.2 (Neoverse N1). Under emulation this build runs on a
-# Cortex-A76 and a Neoverse N1 (Graviton 2) and stops with an illegal instruction on a
-# Cortex-A53 and a Cortex-A72 (Raspberry Pi 3 and 4, Graviton 1): issue #666, the same
-# question as above, not settled by this change.
-[target.'cfg(all(target_arch = "aarch64", not(target_os = "macos")))']
-rustflags = ["-C", "target-cpu=neoverse-n1"]

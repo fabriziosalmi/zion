@@ -2,20 +2,22 @@
 #
 # Until v0.12.0 the Linux x86_64 tarballs and the amd64 image were compiled with
 # `-C target-cpu=x86-64-v3` and stopped with an illegal instruction on a processor without
-# AVX2, before printing a word. Nothing checked it and nothing documented it.
+# AVX2, before printing a word; the aarch64 ones with `neoverse-n1`, and stopped on a
+# Cortex-A53 or A72 (#666). Nothing checked it and nothing documented it.
 #
 # The release runs scripts/cpu-baseline-smoke.sh on every artefact it builds. This workflow
 # runs the same script on a pull request that touches what decides the answer, so that a
 # flag which narrows the processors is found before a tag, not by the release:
 #
 #   artefact  a tarball's binary, built as release.yml builds it, served under an emulated
-#             processor with SSE2 and nothing later.
+#             processor with the architecture's baseline and nothing later (SSE2; a
+#             Cortex-A53).
 #   image     the binary of the image the Dockerfile builds, the same way.
 #   declared  macOS and Windows binaries cannot be run on an emulated old processor here:
 #             for them the check is what the binary declares. This job makes the same
 #             check on a pull request, with the compiler flags of the release.
-#   control   the script must refuse a binary known to need AVX2: the published v0.12.0
-#             one. A script that accepts everything would pass the jobs above too.
+#   control   the script must refuse a binary known to need more: the published v0.12.0
+#             ones. A script that accepts everything would pass the jobs above too.
 #
 # If the toolchain pins below change, change them in release.yml in the same commit: the
 # artefact job is only meaningful while it builds the way the release does.
@@ -57,6 +59,8 @@ jobs:
         target:
           - x86_64-unknown-linux-gnu
           - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -85,7 +89,8 @@ jobs:
       - name: Install build deps and the emulator
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake pkg-config build-essential qemu-user
+          # libc6-arm64-cross: what a dynamically linked aarch64 binary loads on this runner.
+          sudo apt-get install -y cmake pkg-config build-essential qemu-user libc6-arm64-cross
 
       - name: Build as the release does
         env:
@@ -107,6 +112,8 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -197,17 +204,30 @@ jobs:
         run: bash scripts/cpu-baseline-smoke.sh "target/${TARGET}/debug/${ARTIFACT}"
 
   control:
-    name: control (the script refuses a build that needs AVX2)
+    name: control (the script refuses the v0.12.0 ${{ matrix.arch }} build)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # v0.12.0's Linux binaries were compiled with -C target-cpu=x86-64-v3 and
+          # -C target-cpu=neoverse-n1.
+          - arch: x86_64
+            archive: zion-v0.12.0-x86_64-unknown-linux-musl.tar.gz
+            refusal: "control: an AVX2 instruction stops under -cpu Opteron_G1"
+            packages: qemu-user
+          - arch: aarch64
+            archive: zion-v0.12.0-aarch64-unknown-linux-musl.tar.gz
+            refusal: "control: an LSE instruction stops under -cpu cortex-a53"
+            packages: qemu-user gcc-aarch64-linux-gnu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # v0.12.0's Linux x86_64 binaries were compiled with -C target-cpu=x86-64-v3.
       - name: Download the published v0.12.0 binary
         env:
           GH_TOKEN: ${{ github.token }}
-          ARCHIVE: zion-v0.12.0-x86_64-unknown-linux-musl.tar.gz
+          ARCHIVE: ${{ matrix.archive }}
         run: |
           mkdir -p "${RUNNER_TEMP}/v0.12.0"
           cd "${RUNNER_TEMP}/v0.12.0"
@@ -216,19 +236,23 @@ jobs:
           tar -xzf "${ARCHIVE}"
 
       - name: The script must refuse it, for the right reason
+        env:
+          PACKAGES: ${{ matrix.packages }}
+          REFUSAL: ${{ matrix.refusal }}
         run: |
           sudo apt-get update >/dev/null
-          sudo apt-get install -y qemu-user >/dev/null
+          # shellcheck disable=SC2086  # a list of package names
+          sudo apt-get install -y $PACKAGES >/dev/null
           set +e
           bash scripts/cpu-baseline-smoke.sh "${RUNNER_TEMP}/v0.12.0/zion" 2>&1 | tee "${RUNNER_TEMP}/control.log"
           status=${PIPESTATUS[0]}
           set -e
           if [[ "$status" -eq 0 ]]; then
-            echo "::error::The script accepted a binary compiled for x86-64-v3"
+            echo "::error::The script accepted a binary compiled for a newer processor"
             exit 1
           fi
           # Refused, and because the binary met an instruction the emulated CPU lacks: not
           # because a tool was missing or the control program did not compile.
-          grep -q "control: an AVX2 instruction stops under -cpu Opteron_G1" "${RUNNER_TEMP}/control.log"
+          grep -qF "$REFUSAL" "${RUNNER_TEMP}/control.log"
           grep -q "illegal instruction" "${RUNNER_TEMP}/control.log"
           echo "Refused as expected (status ${status})"
