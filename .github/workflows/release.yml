@@ -172,7 +172,7 @@ jobs:
         shell: bash
         run: rm -f rust-toolchain.toml
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: 1.88.0
           # `llvm-tools` ships rustc's *own* `llvm-profdata`, whose raw
@@ -471,7 +471,7 @@ jobs:
 
       # Pinned to match rust-toolchain.toml (1.88.0) — this job resolves crate
       # metadata for the SBOM, so keep it on the same toolchain as the build.
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: 1.88.0
 
