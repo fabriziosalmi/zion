@@ -1696,13 +1696,26 @@ mod tests {
     #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
     #[test]
     fn a_table_is_stale_past_forty_five_days_and_not_before() {
-        let (region, date) = snapshots()[0];
-        let day0 = (days_from_civil(date).unwrap() * 86_400) as u64;
-        assert!(stale_tables(day0).is_empty());
-        assert!(stale_tables(day0 + 45 * 86_400).is_empty());
-        let stale = stale_tables(day0 + 46 * 86_400);
-        assert_eq!(stale.len(), snapshots().len());
-        assert_eq!(stale[0], (region, date, 46));
+        // Each table is judged by its own date: the refresh workflow opens one
+        // pull request per region, so the tables routinely differ by days.
+        let days = |date: &str| days_from_civil(date).unwrap();
+        let at = |day: i64| (day * 86_400) as u64;
+        let oldest = snapshots().iter().map(|s| days(s.1)).min().unwrap();
+        let newest = snapshots().iter().map(|s| days(s.1)).max().unwrap();
+        // At 45 days the oldest table is not yet stale, so none is.
+        assert!(stale_tables(at(oldest)).is_empty());
+        assert!(stale_tables(at(oldest + 45)).is_empty());
+        // One day later exactly the tables past 45 days are, with their own age.
+        for now in [oldest + 46, newest + 46] {
+            let stale = stale_tables(at(now));
+            let want: Vec<_> = snapshots()
+                .iter()
+                .filter(|s| now - days(s.1) > 45)
+                .map(|&(region, date)| (region, date, now - days(date)))
+                .collect();
+            assert_eq!(stale, want);
+        }
+        assert_eq!(stale_tables(at(newest + 46)).len(), snapshots().len());
         // A clock set before the snapshot is not staleness.
         assert!(stale_tables(0).is_empty());
     }
