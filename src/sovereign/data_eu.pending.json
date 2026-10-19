@@ -1,7 +1,7 @@
 {
   "version": 1,
   "region": "eu",
-  "snapshot": "2026-10-17",
+  "snapshot": "2026-10-19",
   "rule": "a run enters a class after 2 weekly snapshots, leaves or changes class after 3",
   "curated": {
     "137": "GovEu",
@@ -102,6 +102,7 @@
     {"family": "v4", "block": "202.170.75.0/24", "observed": "Eu", "seen": 1, "first": "2026-10-17", "last": "2026-10-17"},
     {"family": "v4", "block": "209.161.104.0/22", "observed": "Eu", "seen": 1, "first": "2026-10-17", "last": "2026-10-17"},
     {"family": "v4", "block": "212.80.195.0/24", "observed": "DatacenterEu", "seen": 1, "first": "2026-10-17", "last": "2026-10-17"},
+    {"family": "v4", "block": "212.183.24.0-212.183.26.255", "observed": "Eu", "seen": 1, "first": "2026-10-19", "last": "2026-10-19"},
     {"family": "v4", "block": "213.187.224.0/20", "observed": null, "seen": 1, "first": "2026-10-17", "last": "2026-10-17"},
     {"family": "v4", "block": "217.216.169.0/24", "observed": "DatacenterEu", "seen": 1, "first": "2026-10-17", "last": "2026-10-17"},
     {"family": "v6", "block": "2001:678:314::/48", "observed": null, "seen": 1, "first": "2026-10-17", "last": "2026-10-17"},
