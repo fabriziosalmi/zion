@@ -79,6 +79,8 @@ pub(crate) struct ResolvedAppConfig {
     /// so a rejected reload leaves the running policy alone.
     pub(crate) dns_stale_secs: u64,
     pub(crate) dns_timeout_ms: u64,
+    /// `[server] websocket_idle_secs` / `websocket_max_session_secs`.
+    pub(crate) ws_limits: proxy::WsLimits,
     /// Resolved tag-driven enforcement policy (`[sovereign.enforce]`, #150).
     /// Lives under the geo-gated `[sovereign]` block (class deny needs the
     /// dataset). Disabled by default. Mesh-score deny additionally needs
@@ -140,6 +142,10 @@ impl ResolvedAppConfig {
             cache_budget_bytes: 0,
             dns_stale_secs: crate::dns::DEFAULT_STALE_SECS,
             dns_timeout_ms: crate::dns::DEFAULT_TIMEOUT_MS,
+            ws_limits: proxy::WsLimits::from_secs(
+                proxy::DEFAULT_WS_IDLE_SECS,
+                proxy::DEFAULT_WS_MAX_SESSION_SECS,
+            ),
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             enforce: sovereign::EnforcePolicy::default(),
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
@@ -496,6 +502,10 @@ impl ResolvedAppConfig {
                 .saturating_mul(1024 * 1024),
             dns_stale_secs: config.server.dns_stale_secs,
             dns_timeout_ms: config.server.dns_timeout_ms,
+            ws_limits: proxy::WsLimits::from_secs(
+                config.server.websocket_idle_secs,
+                config.server.websocket_max_session_secs,
+            ),
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
             enforce,
             #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]

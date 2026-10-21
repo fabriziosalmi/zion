@@ -495,6 +495,15 @@ pub struct ServerConfig {
     /// (default 2000; `0` = wait as long as the system resolver does). Applied on reload.
     #[serde(default = "default_dns_timeout_ms")]
     pub dns_timeout_ms: u64,
+    /// Seconds a proxied WebSocket may stay silent in both directions before zion closes
+    /// it (default 300; `0` = no idle limit). Any byte read from either side restarts the
+    /// count. Applied on reload to sessions opened after it.
+    #[serde(default = "default_websocket_idle_secs")]
+    pub websocket_idle_secs: u64,
+    /// Seconds a proxied WebSocket may last in all, traffic or not (default 86400, one
+    /// day; `0` = no limit). Applied on reload to sessions opened after it.
+    #[serde(default = "default_websocket_max_session_secs")]
+    pub websocket_max_session_secs: u64,
     /// Log lines that can wait for stderr (default 8192). Logging never blocks a request: when
     /// the sink is slower than the log rate the newest lines are dropped and counted in
     /// `zion_log_lines_dropped_total`. `0` writes synchronously (a stalled stderr then stalls
@@ -552,6 +561,14 @@ fn default_dns_stale_secs() -> u64 {
 
 fn default_dns_timeout_ms() -> u64 {
     crate::dns::DEFAULT_TIMEOUT_MS
+}
+
+fn default_websocket_idle_secs() -> u64 {
+    crate::proxy::DEFAULT_WS_IDLE_SECS
+}
+
+fn default_websocket_max_session_secs() -> u64 {
+    crate::proxy::DEFAULT_WS_MAX_SESSION_SECS
 }
 
 fn default_log_queue_lines() -> usize {

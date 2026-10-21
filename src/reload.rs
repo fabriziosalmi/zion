@@ -666,6 +666,40 @@ mod tests {
         assert_eq!(build("h2_control_frames_per_sec = 750"), 750);
     }
 
+    /// The WebSocket limits are read from the live snapshot when an upgrade starts, so a
+    /// reload that sets, changes or removes them must reach the snapshot.
+    #[test]
+    fn the_websocket_limits_are_carried_in_the_snapshot() {
+        let build = |line: &str| {
+            let cfg = parse_inline(&format!(
+                r#"
+            [server]
+            listen_http = "0.0.0.0:8080"
+            listen_https = "0.0.0.0:8443"
+            {line}
+            [tls]
+            cert_path = "/tmp/zion-test.crt"
+            key_path  = "/tmp/zion-test.key"
+            [upstreams]
+            api = "http://api:8000"
+            [[route]]
+            path = "/api/{{*rest}}"
+            upstream = "api"
+        "#
+            ));
+            ResolvedAppConfig::try_build(&cfg, TEST_CONN_LIMIT_MAX)
+                .expect("test config builds")
+                .ws_limits
+        };
+        let secs = |s: u64| Some(std::time::Duration::from_secs(s));
+        let d = build("");
+        assert_eq!((d.idle, d.max_session), (secs(300), secs(86_400)));
+        let c = build("websocket_idle_secs = 3600\nwebsocket_max_session_secs = 600");
+        assert_eq!((c.idle, c.max_session), (secs(3600), secs(600)));
+        let off = build("websocket_idle_secs = 0\nwebsocket_max_session_secs = 0");
+        assert_eq!((off.idle, off.max_session), (None, None));
+    }
+
     /// The response cache's byte budget (#524) is applied from the snapshot when a reload is
     /// published: set, it is that many MiB; `0` is no budget; unset, an eighth of the memory.
     #[test]
