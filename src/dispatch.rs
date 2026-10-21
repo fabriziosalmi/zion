@@ -567,6 +567,7 @@ async fn websocket_upgrade(
         Some(forward_addr),
         "https",
         cfg.xff_mode,
+        cfg.ws_limits,
     )
     .await?;
     if let Some(entry) = &breaker_up {

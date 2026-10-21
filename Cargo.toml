@@ -272,6 +272,9 @@ tls-fingerprint = ["dep:sha2"]
 
 # Track C — property-based testing (proptest) only used by `cargo test`.
 [dev-dependencies]
+# Paused virtual time for the timeout tests (the WebSocket session limits). Same
+# crate as the runtime dependency: no new code in the build.
+tokio = { version = "1", features = ["test-util"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 # Criterion microbench harness (issue #54). Pinned to 0.5; the `html_reports`
 # default feature is dropped — we publish a JSON baseline (target/criterion/
