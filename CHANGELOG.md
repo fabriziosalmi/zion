@@ -4,6 +4,21 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-10-22
+
+**Security release: a trailing slash could carry a request out of a catch-all route, bypassing per-route policy.** If a route written as `/prefix/{*rest}` carries `internal_only`, `auth_profile` or a stricter WAF profile, and a broader route such as `/{*rest}` sits next to it, upgrade. Advisory: GHSA-x2gm-m42w-6px8.
+
+### Upgrade notes
+
+- **Upgrade if you use per-route policy on a catch-all route.** Nothing to configure.
+- **`/prefix/` and `/prefix//` are now served by the `/prefix/{*rest}` route**, under its policy, where a broader route used to take them. A route written explicitly for `/prefix/` keeps precedence.
+- **A proxied WebSocket is no longer closed after five minutes while it carries traffic** (see Fixed); `[server] websocket_idle_secs` and `websocket_max_session_secs` are new. No setting was removed or renamed.
+
+### Security
+
+- **A catch-all route also owns its prefix with a trailing slash.** zion applies per-route policy to the route a request matches. A route written as `/admin/{*rest}` did not match `/admin/` (nor `/admin//`, which normalization turns into `/admin/`): the router's catch-all needs a non-empty rest, and zion registered only the bare `/admin` as an alias. With a broader route such as `/{*rest}` in the same config, `/admin/` was matched by that route and forwarded under its policy, so a client outside `internal_networks` reached the upstream at `/admin/` past `internal_only`, an `auth_profile` or a stricter WAF profile, while `/admin` and `/admin/x` were refused. Without a broader route the request got `404`. Affected: every release up to 0.13.0. The prefix with a trailing slash is now an alias of the catch-all route, in the request router and in the path sets that use the same syntax (`[tls.fingerprint] allowed_routes`). A test through the real gate pipeline asserts `403` for `/admin`, `/admin/`, `/admin//` and `/admin/x` from an external address, and that a WAF route refuses a SQL injection body at `/api`, `/api/` and `/api/x`. Found by the maintainers while building per-route `deny_paths` (#693).
+- **The crates that verify upstream TLS certificates distrust the emSign intermediates**: rustls-webpki 0.103.16, webpki-roots 1.0.10 and webpki-root-certs 1.0.10 (RUSTSEC-2026-0382, RUSTSEC-2026-0381, RUSTSEC-2026-0383). webpki-roots is the root store zion uses for an upstream with no `ca_path`. (#701)
+
 ### Fixed
 
 - **A proxied WebSocket is no longer closed after five minutes while it carries traffic.** The five-minute idle limit was a deadline on the whole session: zion closed every WebSocket 300 s after the upgrade, busy or not, and the one-day session cap never applied. A chat, a live dashboard or a development server's hot reload behind zion was cut every five minutes and had to reconnect. The limit now counts silence: any byte read from either side restarts it. Tests with paused time hold the close instant: a session with a byte every 60 s, from the client or from the upstream alone, is open after 20 minutes and closes 300 s after its last byte; a silent one closes at 300 s; a busy one closes at the session cap. Put the old pipe back and those three fail (the session cap one with `lasted 300s, expected 600s`).
