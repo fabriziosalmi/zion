@@ -10,7 +10,7 @@
 //! `config`, never the reverse.
 
 use crate::config::{
-    catchall_bare_prefix, default_max_entries, default_ttl, trailing_slash_variant, CacheMode,
+    catchall_aliases, default_max_entries, default_ttl, trailing_slash_variant, CacheMode,
     CacheProfile, RouteConfig, RouteMode, RouteTarget, WafPolicy, WafProfile, ZionConfig,
 };
 use matchit::Router;
@@ -217,16 +217,19 @@ impl RouterBuilder {
     /// alias for the deferred second pass.
     fn insert(&mut self, path: &str, resolved: Arc<ResolvedRoute>) -> Result<(), String> {
         // A matchit catch-all "<prefix>/{*name}" does NOT match the bare
-        // "<prefix>" (nor the root "/" when the prefix is empty), so a
-        // "/{*rest}" route silently 404s on "/" even though it is meant to be
-        // the fallback for everything. Record the bare prefix so we can also
-        // map it to this route in a second pass (after all explicit routes).
-        match catchall_bare_prefix(path) {
-            Some(bare) => {
+        // "<prefix>" nor "<prefix>/" (nor the root "/" when the prefix is empty):
+        // "/{*rest}" would 404 on "/", and "/admin/" would fall through from
+        // "/admin/{*rest}" to a broader route, under that route's policy
+        // (internal_only, auth, WAF profile). Record both so a second pass (after
+        // all explicit routes) maps them to this route.
+        match catchall_aliases(path) {
+            Some(aliases) => {
                 self.router
                     .insert(path.to_string(), resolved.clone())
                     .map_err(|e| format!("Bad route pattern '{path}': {e}"))?;
-                self.aliases.push((bare, resolved));
+                for alias in aliases {
+                    self.aliases.push((alias, resolved.clone()));
+                }
             }
             None => {
                 // Non-catch-all: also alias the trailing-slash-toggled variant
@@ -962,6 +965,55 @@ upstream = "fallback"
             router.at(None, "/x").unwrap().upstream_url[0],
             "http://127.0.0.1:9000"
         );
+    }
+
+    #[test]
+    fn a_catch_all_route_owns_its_prefix_with_and_without_the_slash() {
+        let toml = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstreams]
+admin = "http://127.0.0.1:1001"
+admin_index = "http://127.0.0.1:1002"
+fallback = "http://127.0.0.1:1003"
+docs = "http://127.0.0.1:1004"
+[[route]]
+path = "/admin/{*rest}"
+upstream = "admin"
+[[route]]
+path = "/docs/{*rest}"
+upstream = "docs"
+[[route]]
+path = "/docs/"
+upstream = "admin_index"
+[[route]]
+path = "/{*rest}"
+upstream = "fallback"
+"#;
+        let config: ZionConfig = toml::from_str(toml).unwrap();
+        let router = build_router_quiet(&config).unwrap();
+        let url = |p: &str| router.at(None, p).unwrap().upstream_url[0].clone();
+        for p in ["/admin", "/admin/", "/admin/x"] {
+            assert_eq!(url(p), "http://127.0.0.1:1001", "{p}");
+        }
+        // An explicit route still owns its slot: the aliases are best-effort.
+        assert_eq!(url("/docs/"), "http://127.0.0.1:1002");
+        assert_eq!(url("/docs/x"), "http://127.0.0.1:1004");
+        assert_eq!(url("/"), "http://127.0.0.1:1003");
+        assert_eq!(url("/administrator"), "http://127.0.0.1:1003");
+    }
+
+    #[test]
+    fn a_path_set_matches_a_catch_all_prefix_with_and_without_the_slash() {
+        let set = crate::config::compile_path_set(&["/x/{*rest}".to_string()]).unwrap();
+        for p in ["/x", "/x/", "/x/y"] {
+            assert!(set.at(p).is_ok(), "{p}");
+        }
+        assert!(set.at("/xy").is_err());
     }
 
     #[test]

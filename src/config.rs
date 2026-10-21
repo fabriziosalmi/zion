@@ -2656,11 +2656,24 @@ fn check_upstream_name_collision(config: &ZionConfig, errors: &mut Vec<String>) 
     }
 }
 
-/// If `path` is a matchit catch-all (`<prefix>/{*name}`), return the bare
-/// prefix the catch-all should also serve (`/` for a root catch-all). matchit's
-/// catch-all does not match the bare prefix, so without registering it a
-/// `/{*rest}` route returns 404 on `/` — surprising for a "match everything"
-/// fallback. Returns `None` for non-catch-all paths.
+/// If `path` is a matchit catch-all (`<prefix>/{*name}`), the paths the catch-all must also
+/// serve and matchit does not give it: the bare `<prefix>` and `<prefix>/` (only `/` for a root
+/// catch-all). matchit's catch-all needs a non-empty rest, so without these a `/{*rest}` route
+/// returns 404 on `/`, and `/admin/` escapes an `/admin/{*rest}` route to a broader one such as
+/// `/{*rest}`, with that route's policy instead of its own. Returns `None` for non-catch-all
+/// paths.
+pub(crate) fn catchall_aliases(path: &str) -> Option<Vec<String>> {
+    let bare = catchall_bare_prefix(path)?;
+    Some(if bare == "/" {
+        vec![bare]
+    } else {
+        let slashed = format!("{bare}/");
+        vec![bare, slashed]
+    })
+}
+
+/// If `path` is a matchit catch-all (`<prefix>/{*name}`), its bare prefix (`/` for a root
+/// catch-all); `None` otherwise. See [`catchall_aliases`].
 pub(crate) fn catchall_bare_prefix(path: &str) -> Option<String> {
     let slash = path.rfind('/')?;
     let seg = &path[slash + 1..];
@@ -2705,8 +2718,8 @@ pub(crate) fn compile_path_set(patterns: &[String]) -> Result<matchit::Router<()
         router
             .insert(p.clone(), ())
             .map_err(|e| format!("bad route pattern '{p}': {e}"))?;
-        match catchall_bare_prefix(p) {
-            Some(bare) => aliases.push(bare),
+        match catchall_aliases(p) {
+            Some(more) => aliases.extend(more),
             None => {
                 if let Some(v) = trailing_slash_variant(p) {
                     aliases.push(v);

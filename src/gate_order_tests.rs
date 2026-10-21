@@ -273,6 +273,74 @@ async fn dot_segments_and_duplicate_slashes_cannot_dodge_a_route() {
     }
 }
 
+/// A catch-all route also owns its prefix with a trailing slash. matchit's catch-all needs a
+/// non-empty rest, so `/admin/` (and `/admin//`, normalized to it) used to fall through from
+/// `/admin/{*rest}` to a broader `/{*rest}` route and be served under that route's policy:
+/// past `internal_only`, past a WAF profile.
+#[tokio::test]
+async fn a_trailing_slash_cannot_carry_a_request_out_of_a_catch_all_route() {
+    let toml = r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstreams]
+live = "http://127.0.0.1:9"
+[[route]]
+path = "/admin/{*rest}"
+upstream = "live"
+internal_only = true
+[[route]]
+path = "/api/{*rest}"
+upstream = "live"
+waf = true
+[[route]]
+path = "/{*rest}"
+upstream = "live"
+"#;
+    let cfg: ZionConfig = toml::from_str(toml).expect("test config parses");
+    let st = AppState::for_tests(&cfg);
+
+    for p in ["/admin", "/admin/", "/admin//", "/admin/x"] {
+        assert_eq!(
+            get(&st, EXTERNAL, p).await,
+            403,
+            "{p} is the internal route"
+        );
+        assert_ne!(
+            get(&st, INTERNAL, p).await,
+            403,
+            "{p}: an internal client passes"
+        );
+    }
+    // control: the fallback route is not internal-only
+    assert_ne!(get(&st, EXTERNAL, "/administrator").await, 403);
+
+    let injection = |path: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(
+                Full::new(Bytes::from_static(
+                    b"q=1' UNION SELECT username,password FROM users--",
+                ))
+                .map_err(|n| match n {})
+                .boxed(),
+            )
+            .unwrap()
+    };
+    for p in ["/api", "/api/", "/api/x"] {
+        assert_eq!(
+            status(&st, EXTERNAL, injection(p), false).await,
+            400,
+            "{p} is scanned by the WAF route"
+        );
+    }
+}
+
 /// A path that one pass of normalization does not bring to a canonical form is refused
 /// outright (400): zion would route one reading and the upstream decode another. Nothing an
 /// honest client writes is affected (see `uri_norm`'s property tests).
