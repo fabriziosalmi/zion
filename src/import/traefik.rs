@@ -238,7 +238,6 @@ fn build(
         tls_min12: false,
         sni: Vec::new(),
         acme: None,
-        waf_body_mb: None,
         upstreams: Vec::new(),
         routes: Vec::new(),
     };
@@ -625,7 +624,7 @@ fn build_route(
         upstream: up_name,
         websocket: false,
         csp: None,
-        waf: false,
+        max_body_mb: None,
         serve_dir: None,
         spa_fallback: false,
         internal_only: false,

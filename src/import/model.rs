@@ -15,6 +15,9 @@ pub struct NginxModel {
     pub req_zones: Vec<ReqZone>,
     /// `limit_conn_zone` definitions: name → key.
     pub conn_zones: Vec<ConnZone>,
+    /// `client_max_body_size` at `http{}` level (or at the top of a conf.d fragment), which
+    /// every server and location inherits unless it sets its own.
+    pub http_body_size: Option<Directive>,
 }
 
 #[derive(Debug)]
@@ -147,12 +150,14 @@ fn walk_top(items: Vec<Directive>, model: &mut NginxModel, findings: &mut Vec<Fi
                     "nginx process management — Zion manages its own runtime",
                 ));
             }
+            // Inherited by every server and location that does not set its own; the mapper
+            // applies it and files the finding.
+            "client_max_body_size" => model.http_body_size = Some(d),
             // Directives the mapper DOES support inside server{}/location{} —
             // nginx inherits them from http{} downward, but v0 does not model
             // that inheritance, so be truthful about why they're dropped
             // instead of claiming they have no Zion equivalent.
-            "client_max_body_size"
-            | "proxy_connect_timeout"
+            "proxy_connect_timeout"
             | "proxy_set_header"
             | "add_header"
             | "limit_req"

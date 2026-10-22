@@ -14,7 +14,7 @@ auto / unsupported):
 | Fixture | Scenario | Must convert | Must flag |
 |---|---|---|---|
 | `01-nextjs.conf` | Next.js behind proxy, websocket HMR | `server_name` → hosts; `proxy_pass` (no URI part); Upgrade idiom → `mode = "websocket"` | XFF/X-Real-IP/XFP set_headers → auto; `Host $host` → unsupported; `proxy_cache_bypass` → unsupported |
-| `02-wordpress.conf` | Container WP, uploads, timeouts | hosts (2 names); `client_max_body_size 64m` → waf_profile partial; `proxy_connect_timeout` → `connect_timeout_ms` | `proxy_read_timeout`/`proxy_buffering` → unsupported; regex dotfile-deny location → unsupported (skipped) |
+| `02-wordpress.conf` | Container WP, uploads, timeouts | hosts (2 names); `client_max_body_size 64m` → route `max_body_mb = 64`; `proxy_connect_timeout` → `connect_timeout_ms` | `proxy_read_timeout`/`proxy_buffering` → unsupported; regex dotfile-deny location → unsupported (skipped) |
 | `03-api-gateway.conf` | One vhost, many locations, one limit_req zone | exact + prefix locations → distinct routes/upstreams; single `limit_req` policy → global `rate_limit_rps` partial | `add_header X-Gateway` → unsupported |
 | `04-static-plus-proxy.conf` | SPA static + `/api` proxied | `location /` (inherited `root` + `try_files … /index.html`) → `mode = "static"` + `serve_dir` + `spa_fallback` (ADR-0016); `/api/` route (`proxy_pass` URI part dropped, authority-only) | `expires` → unsupported; `/assets/` (only `expires`/`access_log off`, no static signal) → skipped, served by the catch-all |
 | `05-multi-vhost.conf` | 3 server blocks incl. `default_server _` | per-host routes on the same path; `_` catch-all → hostless shared route | partial: default-vhost scope widening (Zion's shared layer is also the path-miss fallback under named hosts) |
