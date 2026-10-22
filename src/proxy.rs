@@ -28,6 +28,7 @@ static PROTO_HTTPS: HeaderValue = HeaderValue::from_static("https");
 static PROTO_HTTP: HeaderValue = HeaderValue::from_static("http");
 
 use crate::http_util::ZionBody;
+use crate::upstream_body::{BodyCap, Overflow, UpstreamBody};
 
 /// Shared HTTP client type — supports both HTTP/1.1 and HTTP/2 to upstreams.
 /// Plain HTTP upstreams use HttpConnector; HTTPS upstreams negotiate H2 via ALPN.
@@ -37,7 +38,7 @@ pub type HttpClient = Client<
             hyper_util::client::legacy::connect::HttpConnector<crate::dns::StaleOnErrorResolver>,
         >,
     >,
-    ZionBody,
+    UpstreamBody,
 >;
 
 fn counting<C>(inner: C) -> CountingConnector<C> {
@@ -652,7 +653,7 @@ async fn send_request_try(
 ) -> Result<Response<ZionBody>, hyper_util::client::legacy::Error> {
     let upstream = req.uri().authority().cloned();
     let upstream_start = std::time::Instant::now();
-    let result = client.request(req).await;
+    let result = client.request(req.map(UpstreamBody::plain)).await;
     crate::metrics::METRICS
         .upstream_duration
         .observe(upstream_start.elapsed());
@@ -711,7 +712,14 @@ pub async fn proxy_pass_ha(
     // bounds apply before failover, so a rejected body never becomes N upstream
     // attempts either.
     let (parts, body) = req.into_parts();
-    let limited = Limited::new(body, MAX_HA_REPLAY_BODY);
+    // A route's `max_body_mb` lower than the replay ceiling bounds the buffer too.
+    let limit = parts
+        .extensions
+        .get::<BodyCap>()
+        .map_or(MAX_HA_REPLAY_BODY, |c| {
+            usize::try_from(c.0).map_or(MAX_HA_REPLAY_BODY, |c| c.min(MAX_HA_REPLAY_BODY))
+        });
+    let limited = Limited::new(body, limit);
     let body_bytes = match tokio::time::timeout(HA_BODY_COLLECT_TIMEOUT, limited.collect()).await {
         Ok(Ok(c)) => c.to_bytes(),
         // `Limited` surfaces overflow as a boxed `LengthLimitError`; any other
@@ -930,9 +938,8 @@ pub async fn proxy_pass_stream(
     let Some(req) = prepare_request(req, scheme, authority, remote_addr, proto, xff_mode) else {
         return Ok(bad_gateway());
     };
-    let (parts, body) = req.into_parts();
-    let req = Request::from_parts(parts, body);
     let upstream = req.uri().authority().cloned();
+    let (req, overflow) = upstream_request(req);
 
     match client.request(req).await {
         Ok(resp) => {
@@ -951,6 +958,7 @@ pub async fn proxy_pass_stream(
                 watch_upstream_body(body, upstream),
             ))
         }
+        Err(_) if overflow.as_ref().is_some_and(Overflow::happened) => Ok(body_too_large()),
         Err(e) => {
             crate::logging::warn("proxy", &format!("stream proxy error: {e}"));
             Ok(Response::builder()
@@ -991,6 +999,24 @@ const MAX_HA_REPLAY_BODY: usize = 16 * 1024 * 1024;
 /// reaching `MAX_HA_REPLAY_BODY`.
 const HA_BODY_COLLECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The request as the upstream client takes it. A body the body gate marked with a
+/// [`BodyCap`] is counted against it, and the [`Overflow`] says afterwards whether it went past.
+fn upstream_request(req: Request<ZionBody>) -> (Request<UpstreamBody>, Option<Overflow>) {
+    let (parts, body) = req.into_parts();
+    match parts.extensions.get::<BodyCap>() {
+        Some(&BodyCap(limit)) => {
+            let (body, overflow) = UpstreamBody::capped(body, limit);
+            (Request::from_parts(parts, body), Some(overflow))
+        }
+        None => (Request::from_parts(parts, UpstreamBody::plain(body)), None),
+    }
+}
+
+/// The answer to a body that went past the route's `max_body_mb` while it was streamed.
+fn body_too_large() -> Response<ZionBody> {
+    simple_status(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large")
+}
+
 /// Internal: send a prepared request through the shared client.
 #[inline]
 /// `upstream=<scheme://authority> trace_id=<32 hex>` for a log line about this upstream
@@ -1027,6 +1053,7 @@ async fn send_request(
     let context = || upstream_context_of(&ctx_uri, ctx_trace.as_ref());
     let upstream = req.uri().authority().cloned();
     let deadline = request_timeout(&req);
+    let (req, overflow) = upstream_request(req);
     let upstream_start = std::time::Instant::now();
     match tokio::time::timeout(deadline, client.request(req)).await {
         Ok(Ok(resp)) => {
@@ -1040,6 +1067,8 @@ async fn send_request(
                 watch_upstream_body(body, upstream),
             ))
         }
+        // The client's body went past the route's cap: the client's fault, not the upstream's.
+        Ok(Err(_)) if overflow.as_ref().is_some_and(Overflow::happened) => Ok(body_too_large()),
         Ok(Err(e)) => {
             crate::metrics::METRICS
                 .upstream_duration
@@ -1552,7 +1581,7 @@ mod tests {
             )
             .unwrap();
         let started = std::time::Instant::now();
-        let _ = tokio::time::timeout(cap, client.request(req)).await;
+        let _ = tokio::time::timeout(cap, client.request(req.map(UpstreamBody::plain))).await;
         started.elapsed()
     }
 

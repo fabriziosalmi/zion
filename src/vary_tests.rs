@@ -3670,7 +3670,11 @@ async fn alpn_offered_by(client: crate::proxy::HttpClient) -> Vec<String> {
         .uri(format!("https://localhost:{port}/"))
         .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
         .unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(2), client.request(req)).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.request(req.map(crate::upstream_body::UpstreamBody::plain)),
+    )
+    .await;
     server.await.unwrap()
 }
 

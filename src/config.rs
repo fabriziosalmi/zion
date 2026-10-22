@@ -1363,6 +1363,8 @@ struct RawRoute {
     methods: Option<Vec<String>>,
     content_types: Option<Vec<String>>,
     deny_paths: Option<Vec<String>>,
+    #[serde(default)]
+    require_content_length: bool,
 }
 
 /// What a route serves. The two arms carry disjoint data, so a static route cannot
@@ -1407,9 +1409,9 @@ impl From<UpstreamMode> for RouteMode {
 /// decision in the TOML, three sibling keys; here it is one value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WafPolicy {
-    /// No WAF on this route. `ignored_max_body_mb` keeps a `max_body_mb` that was
-    /// written anyway, only so the boot warning ("not enforced") can name it.
-    Off { ignored_max_body_mb: Option<u64> },
+    /// No WAF on this route. A `max_body_mb` caps the body without inspecting it
+    /// (see `dispatch::body_gate`).
+    Off { max_body_mb: Option<u64> },
     /// Legacy `waf = true`: an inline default profile with an optional body cap
     /// (default 10 MiB).
     Inline { max_body_mb: Option<u64> },
@@ -1474,6 +1476,11 @@ pub struct RouteConfig {
 
     /// `methods`, `content_types` and `deny_paths`: what the route refuses without a WAF.
     pub restrictions: crate::route_restrict::RouteRestrictions,
+
+    /// Read a body that comes without a declared length (chunked, or HTTP/2 and HTTP/3 without
+    /// `Content-Length`) whole, within the route's body cap, and send it to the upstream with
+    /// `Content-Length`.
+    pub require_content_length: bool,
 }
 
 impl RouteConfig {
@@ -1581,7 +1588,7 @@ impl TryFrom<RawRoute> for RouteConfig {
                 max_body_mb: r.max_body_mb,
             },
             (None, false) => WafPolicy::Off {
-                ignored_max_body_mb: r.max_body_mb,
+                max_body_mb: r.max_body_mb,
             },
         };
 
@@ -1605,6 +1612,7 @@ impl TryFrom<RawRoute> for RouteConfig {
             public: r.public,
             cors: r.cors,
             restrictions,
+            require_content_length: r.require_content_length,
         })
     }
 }
@@ -3813,20 +3821,17 @@ mod tests {
         );
         assert_eq!(
             policy("upstream=\"be\"\n"),
-            WafPolicy::Off {
-                ignored_max_body_mb: None
-            }
+            WafPolicy::Off { max_body_mb: None }
         );
-        // a max_body_mb on a WAF-off route stays a boot WARNING (kept for
-        // compatibility), not an error
+        // a max_body_mb on a WAF-off route is the body cap of that route (#693)
         assert_eq!(
             policy("upstream=\"be\"\nmax_body_mb=50\n"),
             WafPolicy::Off {
-                ignored_max_body_mb: Some(50)
+                max_body_mb: Some(50)
             }
         );
         assert!(!WafPolicy::Off {
-            ignored_max_body_mb: Some(1)
+            max_body_mb: Some(1)
         }
         .is_enabled());
         assert!(WafPolicy::Inline { max_body_mb: None }.is_enabled());

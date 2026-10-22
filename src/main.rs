@@ -91,6 +91,7 @@ mod tarpit;
 mod tls;
 #[cfg(feature = "tui")]
 mod tui;
+mod upstream_body;
 mod uri_norm;
 mod vary;
 mod via;
@@ -135,6 +136,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::sync::Arc;
 
+#[cfg(test)]
+mod body_limit_tests;
 mod dispatch;
 #[cfg(test)]
 mod gate_order_tests;

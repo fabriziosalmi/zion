@@ -268,7 +268,8 @@ circuit, its failure re-opens it. Values shown are the defaults.
 | `waf_profile` | string | none | Name of WAF profile to apply |
 | `cache_profile` | string | none | Name of cache profile to apply |
 | `waf` | bool | `false` | Legacy: enable WAF with defaults |
-| `max_body_mb` | u64 | `10` | Legacy: override body limit when `waf = true` |
+| `max_body_mb` | u64 | none (`10` with `waf = true`) | Body cap in MB: `413` past it. Without a WAF the body is still streamed; with `waf = true` it is the WAF's cap. See [request body](./routing#request-body-per-route) |
+| `require_content_length` | bool | `false` | Send every body upstream with `Content-Length`: one without a declared length is read whole first, within `max_body_mb` (10 MB if unset) |
 
 ## `[[route]]` → `cors`
 
