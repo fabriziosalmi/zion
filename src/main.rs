@@ -80,6 +80,7 @@ mod proxy;
 mod quic;
 mod reload;
 mod reserved_headers;
+mod route_restrict;
 mod routing;
 mod security;
 #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]

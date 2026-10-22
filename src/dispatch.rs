@@ -360,6 +360,11 @@ async fn process_request_inner(
         return Ok(resp);
     }
 
+    // --- Gate: the route's own restrictions (deny_paths, methods, content_types) ---
+    if let Some(resp) = rule.restrictions.as_ref().and_then(|r| r.check(&req)) {
+        return Ok(resp);
+    }
+
     // --- Upstream: health check + latency routing (B-04) ---
     let (dyn_scheme, dyn_authority) = match route::select_upstream(&cfg, &rule) {
         Ok(target) => target,

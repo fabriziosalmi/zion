@@ -1360,6 +1360,9 @@ struct RawRoute {
     #[serde(default)]
     waf_shadow: bool,
     cors: Option<CorsConfig>,
+    methods: Option<Vec<String>>,
+    content_types: Option<Vec<String>>,
+    deny_paths: Option<Vec<String>>,
 }
 
 /// What a route serves. The two arms carry disjoint data, so a static route cannot
@@ -1468,6 +1471,9 @@ pub struct RouteConfig {
 
     /// Per-route CORS configuration. If unset, no CORS headers are injected.
     pub cors: Option<CorsConfig>,
+
+    /// `methods`, `content_types` and `deny_paths`: what the route refuses without a WAF.
+    pub restrictions: crate::route_restrict::RouteRestrictions,
 }
 
 impl RouteConfig {
@@ -1579,6 +1585,13 @@ impl TryFrom<RawRoute> for RouteConfig {
             },
         };
 
+        let restrictions = crate::route_restrict::RouteRestrictions::build(
+            &path,
+            r.methods,
+            r.content_types,
+            r.deny_paths,
+        )?;
+
         Ok(Self {
             path,
             hosts: r.hosts,
@@ -1591,6 +1604,7 @@ impl TryFrom<RawRoute> for RouteConfig {
             auth_profile: r.auth_profile,
             public: r.public,
             cors: r.cors,
+            restrictions,
         })
     }
 }
