@@ -29,7 +29,6 @@ pub struct ZionDoc {
     /// in `tls_cert`/`tls_key`; populated by the Traefik/Caddy front-ends when
     /// the source uses ACME and a contact e-mail is known.
     pub acme: Option<AcmeOut>,
-    pub waf_body_mb: Option<u64>,
     pub upstreams: Vec<UpstreamOut>,
     pub routes: Vec<RouteOut>,
 }
@@ -69,8 +68,8 @@ pub struct RouteOut {
     pub upstream: String,
     pub websocket: bool,
     pub csp: Option<String>,
-    /// Attach the shared `imported` WAF profile (body cap) in shadow mode.
-    pub waf: bool,
+    /// `max_body_mb`, from nginx `client_max_body_size` (none: no cap).
+    pub max_body_mb: Option<u64>,
     /// `mode = "static"` serve directory (ADR-0015). When `Some`, the route
     /// serves files from disk instead of proxying and `upstream` is ignored.
     pub serve_dir: Option<String>,
@@ -104,7 +103,6 @@ pub fn map_model(model: &NginxModel, findings: &mut Vec<Finding>) -> ZionDoc {
         tls_min12: false,
         sni: Vec::new(),
         acme: None,
-        waf_body_mb: None,
         upstreams: Vec::new(),
         routes: Vec::new(),
     };
@@ -234,6 +232,9 @@ pub fn map_model(model: &NginxModel, findings: &mut Vec<Finding>) -> ZionDoc {
 
     // 4. Servers → routes, collecting global aggregates on the way.
     let mut agg = Aggregates::default();
+    if let Some(d) = &model.http_body_size {
+        map_body_size(d, &mut agg.http_body_cap, findings);
+    }
     for (server, hosts) in &kept {
         map_server(
             server,
@@ -246,6 +247,18 @@ pub fn map_model(model: &NginxModel, findings: &mut Vec<Finding>) -> ZionDoc {
         );
     }
 
+    if let Some(&line) = agg.default_body_cap_lines.first() {
+        findings.push(Finding::new(
+            Status::Convert,
+            line,
+            "client_max_body_size",
+            format!(
+                "not set for {} location(s): nginx's default 1m applies there → \
+                 max_body_mb = 1 on those routes",
+                agg.default_body_cap_lines.len()
+            ),
+        ));
+    }
     finish_aggregates(&agg, model, &mut doc, findings);
     doc.upstreams = reg.finish(model, findings);
     settle_preserve_host(&mut doc, findings);
@@ -1114,6 +1127,10 @@ struct Aggregates {
     conns: Vec<(u32, u32)>,
     /// req/conn zone names actually referenced.
     used_zones: Vec<String>,
+    /// `client_max_body_size` at `http{}` level: MB, `Some(0)` for unlimited.
+    http_body_cap: Option<u64>,
+    /// Lines of the locations that got nginx's default body cap, none being in scope.
+    default_body_cap_lines: Vec<u32>,
 }
 
 /// Server-level state locations may inherit. nginx inheritance for the
@@ -1128,7 +1145,8 @@ struct ServerCtx {
     preserve_host: bool,
     has_set_header: bool,
     hdr_annotations: Vec<String>,
-    waf: bool,
+    /// `client_max_body_size` at server level: MB, `Some(0)` for unlimited.
+    body_cap: Option<u64>,
     connect_ms: Option<u64>,
     /// `proxy_read_timeout` at server level, inherited by its locations.
     read_ms: Option<u64>,
@@ -1409,7 +1427,7 @@ fn map_server(
         preserve_host: false,
         has_set_header: false,
         hdr_annotations: Vec::new(),
-        waf: false,
+        body_cap: None,
         connect_ms: None,
         read_ms: None,
         root: None,
@@ -1422,7 +1440,7 @@ fn map_server(
         match d.name.as_str() {
             // Consumed by map_tls / redirect_server_kind.
             "ssl_certificate" | "ssl_certificate_key" | "ssl_protocols" => {}
-            "client_max_body_size" => map_body_size(d, doc, &mut ctx.waf, findings),
+            "client_max_body_size" => map_body_size(d, &mut ctx.body_cap, findings),
             "set_real_ip_from" => match d.args.first() {
                 Some(cidr) if valid_cidr(cidr) => {
                     if !doc.trusted_proxies.contains(cidr) {
@@ -1638,7 +1656,7 @@ fn map_location(
     let mut loc_has_add_header = false;
     let mut loc_connect: Option<u64> = None;
     let mut loc_read: Option<u64> = None;
-    let mut route_waf = ctx.waf;
+    let mut loc_body_cap: Option<u64> = None;
     let mut static_only = Vec::new();
     // Static-serving state (ADR-0015): a location with one of these and no
     // proxy_pass becomes a mode=static route.
@@ -1729,10 +1747,7 @@ fn map_location(
             }
             "limit_req" => map_limit_req(d, agg, model, findings),
             "limit_conn" => map_limit_conn(d, agg, model, findings),
-            "client_max_body_size" => {
-                // Location-scoped cap: contributes to the shared imported profile.
-                map_body_size(d, doc, &mut route_waf, findings);
-            }
+            "client_max_body_size" => map_body_size(d, &mut loc_body_cap, findings),
             // Static-serving directives: parsed into locals and resolved after
             // the loop (a mode=static route if there is no proxy target).
             "root" => {
@@ -1968,13 +1983,14 @@ fn map_location(
         if report_built_in_collision(&path, loc.line, findings) {
             return;
         }
+        let max_body_mb = route_body_cap(loc_body_cap, ctx, agg, loc.line);
         doc.routes.push(RouteOut {
             path,
             hosts: route_hosts,
             upstream: String::new(),
             websocket: false,
             csp,
-            waf: false,
+            max_body_mb,
             serve_dir: Some(serve_dir),
             spa_fallback,
             internal_only,
@@ -2112,13 +2128,14 @@ fn map_location(
     if report_built_in_collision(&path, loc.line, findings) {
         return;
     }
+    let max_body_mb = route_body_cap(loc_body_cap, ctx, agg, loc.line);
     doc.routes.push(RouteOut {
         path,
         hosts: route_hosts,
         upstream,
         websocket,
         csp,
-        waf: route_waf,
+        max_body_mb,
         serve_dir: None,
         spa_fallback: false,
         internal_only,
@@ -2236,48 +2253,71 @@ fn split_proxy_pass(url: &str) -> Option<(String, String, Option<String>)> {
 
 // ── Shared directive mappers ────────────────────────────────────────────
 
-fn map_body_size(d: &Directive, doc: &mut ZionDoc, waf: &mut bool, findings: &mut Vec<Finding>) {
+/// `client_max_body_size` at one level (`http`, `server` or `location`): sets that level's cap
+/// in MB, `Some(0)` for unlimited, and files the finding. An unparsable size leaves the level
+/// unset, so the one above applies.
+fn map_body_size(d: &Directive, cap: &mut Option<u64>, findings: &mut Vec<Finding>) {
     let raw = match d.args.first() {
         Some(a) => a,
         None => return,
     };
-    match parse_size_mb(raw) {
-        Some(0) => findings.push(Finding::new(
-            Status::Auto,
-            d.line,
-            "client_max_body_size",
-            "0 = unlimited — Zion has no body cap unless a WAF profile sets one",
-        )),
-        Some(mb) => {
-            *waf = true;
-            let prev = doc.waf_body_mb;
-            doc.waf_body_mb = Some(prev.map_or(mb, |p| p.max(mb)));
-            let mut detail = format!(
-                "{raw} → [waf_profile.imported] max_body_mb = {mb}, attached in shadow \
-                 mode (logs, doesn't block) — the cap is enforced by the WAF path, \
-                 which nginx didn't run; flip waf_shadow to false to enforce"
-            );
-            if let Some(p) = prev {
-                if p != mb {
-                    detail.push_str(&format!(
-                        " (differs from an earlier cap of {p} MB — the larger value wins)"
-                    ));
-                }
-            }
-            findings.push(Finding::new(
-                Status::Partial,
-                d.line,
-                "client_max_body_size",
-                detail,
-            ));
-        }
-        None => findings.push(Finding::new(
+    let Some(bytes) = parse_size_bytes(raw) else {
+        findings.push(Finding::new(
             Status::Unsupported,
             d.line,
             "client_max_body_size",
             format!("cannot parse size '{raw}'"),
-        )),
+        ));
+        return;
+    };
+    if bytes == 0 {
+        *cap = Some(0);
+        findings.push(Finding::new(
+            Status::Convert,
+            d.line,
+            "client_max_body_size",
+            "0 = unlimited → no max_body_mb on the routes it covers",
+        ));
+        return;
     }
+    let mb = bytes.div_ceil(1024 * 1024);
+    *cap = Some(mb);
+    if bytes % (1024 * 1024) == 0 {
+        findings.push(Finding::new(
+            Status::Convert,
+            d.line,
+            "client_max_body_size",
+            format!("{raw} → max_body_mb = {mb} on the routes it covers (413 past it)"),
+        ));
+    } else {
+        findings.push(Finding::new(
+            Status::Partial,
+            d.line,
+            "client_max_body_size",
+            format!(
+                "{raw} → max_body_mb = {mb}: zion caps in whole MB, so a body larger than \
+                 {raw} and up to {mb} MB, which nginx refuses with 413, goes through"
+            ),
+        ));
+    }
+}
+
+/// The `max_body_mb` of a route: the location's `client_max_body_size`, else the server's,
+/// else the `http{}` one, else nginx's default of 1m (noted for a single finding). `0` is no cap.
+fn route_body_cap(
+    location: Option<u64>,
+    ctx: &ServerCtx,
+    agg: &mut Aggregates,
+    line: u32,
+) -> Option<u64> {
+    let cap = location
+        .or(ctx.body_cap)
+        .or(agg.http_body_cap)
+        .unwrap_or_else(|| {
+            agg.default_body_cap_lines.push(line);
+            1
+        });
+    (cap != 0).then_some(cap)
 }
 
 fn map_limit_req(
@@ -2678,8 +2718,8 @@ fn valid_cidr(s: &str) -> bool {
     }
 }
 
-/// nginx size → megabytes, rounding up. `0` means unlimited (caller decides).
-fn parse_size_mb(raw: &str) -> Option<u64> {
+/// nginx size (`512k`, `64m`, `1g`, bare bytes) → bytes. `0` means unlimited (caller decides).
+fn parse_size_bytes(raw: &str) -> Option<u64> {
     let raw = raw.trim();
     let (num, mult_to_bytes): (&str, u64) = match raw.chars().last() {
         Some('k') | Some('K') => (&raw[..raw.len() - 1], 1024),
@@ -2689,11 +2729,7 @@ fn parse_size_mb(raw: &str) -> Option<u64> {
         _ => return None,
     };
     let n: u64 = num.parse().ok()?;
-    if n == 0 {
-        return Some(0);
-    }
-    let bytes = n.checked_mul(mult_to_bytes)?;
-    Some(bytes.div_ceil(1024 * 1024).max(1))
+    n.checked_mul(mult_to_bytes)
 }
 
 /// nginx time → milliseconds. Single unit only (`75s`, `500ms`, `2m`); a bare
@@ -2742,12 +2778,12 @@ mod tests {
 
     #[test]
     fn size_parsing() {
-        assert_eq!(parse_size_mb("64m"), Some(64));
-        assert_eq!(parse_size_mb("1g"), Some(1024));
-        assert_eq!(parse_size_mb("512k"), Some(1));
-        assert_eq!(parse_size_mb("100"), Some(1));
-        assert_eq!(parse_size_mb("0"), Some(0));
-        assert_eq!(parse_size_mb("abc"), None);
+        assert_eq!(parse_size_bytes("64m"), Some(64 << 20));
+        assert_eq!(parse_size_bytes("1g"), Some(1 << 30));
+        assert_eq!(parse_size_bytes("512k"), Some(512 << 10));
+        assert_eq!(parse_size_bytes("100"), Some(100));
+        assert_eq!(parse_size_bytes("0"), Some(0));
+        assert_eq!(parse_size_bytes("abc"), None);
     }
 
     #[test]
