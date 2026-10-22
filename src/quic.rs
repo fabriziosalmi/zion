@@ -318,7 +318,9 @@ where
             let mut buf = match recv_stream.recv_data().await {
                 Ok(Some(buf)) => buf,
                 Ok(None) => break,
-                // The stream broke: the pipeline sees the body end where it did.
+                // The stream broke: the body ends with the error, so whatever reads it (the
+                // WAF, a buffer, the upstream request) sees a broken body. Ending it cleanly
+                // would hand on what had arrived as the whole body.
                 Err(e) => {
                     log_h3_failure(
                         &body_log.0,
@@ -326,6 +328,7 @@ where
                         &body_log.2,
                         &format!("request body stream broke: {e}"),
                     );
+                    let _ = tx.send(Err(Box::new(e))).await;
                     break;
                 }
             };
