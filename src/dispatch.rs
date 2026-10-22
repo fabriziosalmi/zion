@@ -31,11 +31,11 @@
 use crate::audit;
 use crate::audit::AuditEvent;
 use crate::bulkhead;
-use crate::http_util::ZionBody;
 use crate::http_util::{
     empty_response, generate_request_id, inject_security_headers, text_response, HEX_DIGITS,
     REQUEST_COUNTER,
 };
+use crate::http_util::{ReqBody, ZionBody};
 use crate::pool;
 use crate::state::AppState;
 use crate::state::ResolvedAppConfig;
@@ -51,7 +51,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::routing::ResolvedRoute;
-use http_body_util::Limited;
+use crate::upstream_body::read_capped;
 
 mod body_gate;
 mod cached;
@@ -108,17 +108,15 @@ const BODY_FRAME_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// upload near `max_body_mb` would.
 const BODY_COLLECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// What a failed read of the request body means. `Limited` reports overflow as a
-/// `LengthLimitError`; anything else is the client's stream breaking (reset,
+/// What a failed read of the request body means. `read_capped` reports overflow as a
+/// `BodyTooLarge`; anything else is the client's stream breaking (reset,
 /// malformed chunked framing, a connection that dropped). Telling them apart keeps
 /// `413` meaning "too large", and the cause goes to the log because the response
 /// only says what the client needs to know.
 fn body_read_failure(
     e: &(dyn std::error::Error + Send + Sync + 'static),
 ) -> (StatusCode, &'static str) {
-    if e.downcast_ref::<http_body_util::LengthLimitError>()
-        .is_some()
-    {
+    if e.is::<crate::upstream_body::BodyTooLarge>() {
         (StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
     } else {
         (StatusCode::BAD_REQUEST, "request body read error")
@@ -218,7 +216,7 @@ fn emit_waf_block(
 /// are harmless. Also echoes the client's X-Request-ID on error responses for
 /// correlation.
 pub(crate) async fn process_request(
-    req: Request<ZionBody>,
+    req: Request<ReqBody>,
     state: Arc<AppState>,
     remote_addr: SocketAddr,
     is_early_data: bool,
@@ -295,7 +293,7 @@ pub(crate) fn scrub_reserved_identity_headers(headers: &mut hyper::HeaderMap) {
 
 /// Run the whole pipeline for one request. See [`process_request`] for what wraps it.
 async fn process_request_inner(
-    mut req: Request<ZionBody>,
+    mut req: Request<ReqBody>,
     state: Arc<AppState>,
     remote_addr: SocketAddr,
     is_early_data: bool,
@@ -469,7 +467,7 @@ async fn process_request_inner(
 }
 
 /// Mark the request with what the forwarding paths need to know about its route.
-fn mark_request_for_forwarding(req: &mut Request<ZionBody>, rule: &ResolvedRoute) {
+fn mark_request_for_forwarding(req: &mut Request<ReqBody>, rule: &ResolvedRoute) {
     // `[upstream.x] preserve_host` (ADR-0024): mark the request once here, where the route
     // is known; the forwarding hygiene every proxy path shares reads the mark.
     if rule.preserve_host {
@@ -559,7 +557,7 @@ fn admit(
 
 /// The WebSocket upgrade: the handshake goes to the upstream and the connection is then tunnelled.
 async fn websocket_upgrade(
-    mut req: Request<ZionBody>,
+    mut req: Request<ReqBody>,
     cfg: &ResolvedAppConfig,
     dyn_scheme: &hyper::http::uri::Scheme,
     dyn_authority: &hyper::http::uri::Authority,
@@ -592,7 +590,7 @@ async fn websocket_upgrade(
 /// Hand the request to the handler its route calls for.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_by_mode(
-    req: Request<ZionBody>,
+    req: Request<ReqBody>,
     state: &Arc<AppState>,
     cfg: &ResolvedAppConfig,
     rule: &ResolvedRoute,
@@ -850,7 +848,7 @@ struct SwrRefresh {
     /// The primary key `key` was derived from (they are equal unless the key varies).
     primary_key: Arc<str>,
     stale: cache::CacheHit,
-    request: Request<ZionBody>,
+    request: Request<ReqBody>,
     /// The upstream's HTTP client (connect deadline, HTTP/1-only, keepalive).
     client_spec: crate::proxy::ClientSpec,
     scheme: hyper::http::uri::Scheme,
@@ -871,7 +869,7 @@ struct SwrRefresh {
 /// credentials. The refresh is on behalf of the cache, not of that client, so
 /// `Authorization` / `Cookie` / `Proxy-Authorization` and any conditional or range
 /// header are dropped (the stored validators are added when it is sent).
-fn swr_request(req: &Request<ZionBody>) -> Request<ZionBody> {
+fn swr_request(req: &Request<ReqBody>) -> Request<ReqBody> {
     let mut out = Request::builder()
         .method(hyper::Method::GET)
         .uri(req.uri().clone())
@@ -1836,10 +1834,11 @@ mod tests {
     /// An oversize body is `413`; a body that broke on the way is `400`, not `413`.
     #[tokio::test]
     async fn a_broken_body_is_not_reported_as_too_large() {
-        use http_body_util::{BodyExt, Full, Limited};
-        let over = Limited::new(Full::new(bytes::Bytes::from(vec![0u8; 100])), 10);
-        let e = over
-            .collect()
+        use http_body_util::{BodyExt, Full};
+        let over: crate::http_util::ReqBody = Full::new(bytes::Bytes::from(vec![0u8; 100]))
+            .map_err(|never| match never {})
+            .boxed();
+        let e = crate::upstream_body::read_capped(over, 10)
             .await
             .expect_err("100 bytes over a cap of 10");
         assert_eq!(

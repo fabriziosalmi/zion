@@ -69,7 +69,7 @@ struct TeeEntry {
 /// Serve a request on a cached route.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle(
-    mut req: Request<ZionBody>,
+    mut req: Request<ReqBody>,
     state: Arc<AppState>,
     rule: &ResolvedRoute,
     remote_addr: SocketAddr,
@@ -204,7 +204,7 @@ pub(super) async fn handle(
 }
 
 /// The primary cache key, the shared identity key and whether this client can take an identity body.
-fn derive_keys(req: &Request<ZionBody>, normalize_query: bool) -> (String, String, bool) {
+fn derive_keys(req: &Request<ReqBody>, normalize_query: bool) -> (String, String, bool) {
     // Cache key = full path+query (so /api?user=alice and /api?user=bob never
     // share an entry — cache-poisoning guard) PLUS the canonical Accept-Encoding
     // set, so encoding variants don't cross-contaminate (RFC 9111 §4.1). The
@@ -260,7 +260,7 @@ fn derive_keys(req: &Request<ZionBody>, normalize_query: bool) -> (String, Strin
 /// successful unsafe one invalidates what it names (RFC 9111 §4.4).
 #[allow(clippy::too_many_arguments)]
 async fn unsafe_method(
-    req: Request<ZionBody>,
+    req: Request<ReqBody>,
     state: &Arc<AppState>,
     rule: &ResolvedRoute,
     remote_addr: SocketAddr,
@@ -318,7 +318,7 @@ async fn unsafe_method(
 /// the origin fetch (there is no stale entry to fall back on).
 #[allow(clippy::too_many_arguments)]
 async fn bypass_unkeyable(
-    req: Request<ZionBody>,
+    req: Request<ReqBody>,
     state: &Arc<AppState>,
     rule: &ResolvedRoute,
     remote_addr: SocketAddr,
@@ -373,7 +373,7 @@ impl Cx<'_> {
     /// The RAM lookup. `Err` is an answer: a fresh hit, or a stale one served inside its
     /// stale-while-revalidate window (the refresh runs in the background). `Ok` is a stale entry to
     /// revalidate, or nothing.
-    fn ram_lookup(&self, req: &mut Request<ZionBody>) -> Result<Lookup, Response<ZionBody>> {
+    fn ram_lookup(&self, req: &mut Request<ReqBody>) -> Result<Lookup, Response<ZionBody>> {
         let state = self.state;
         let rule = self.rule;
         let dyn_scheme = self.dyn_scheme;
@@ -448,7 +448,7 @@ impl Cx<'_> {
 
     /// Become the one fetcher for this request's key, or wait for the one already running.
     /// `Err` is an answer: a fresh entry the fetcher stored while this request waited.
-    async fn join_flight(&self, req: &Request<ZionBody>) -> Result<Fetching, Response<ZionBody>> {
+    async fn join_flight(&self, req: &Request<ReqBody>) -> Result<Fetching, Response<ZionBody>> {
         let state = self.state;
         let (primary_key, identity_primary) = (&self.primary_key, &self.identity_primary);
         let (takes_identity, cache_key) = (self.takes_identity, &self.cache_key);
@@ -548,7 +548,7 @@ impl Cx<'_> {
     /// when the origin allowed one; a failed fetch falls back on the entry being revalidated.
     async fn fetch(
         &self,
-        req: Request<ZionBody>,
+        req: Request<ReqBody>,
         fetching: Fetching,
         lookup: Lookup,
     ) -> Result<Response<ZionBody>, hyper::Error> {

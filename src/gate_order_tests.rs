@@ -12,7 +12,7 @@
 
 use crate::config::ZionConfig;
 use crate::dispatch::process_request;
-use crate::http_util::ZionBody;
+use crate::http_util::ReqBody;
 use crate::state::AppState;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -103,7 +103,7 @@ fn state(rate_limit_rps: u32) -> Arc<AppState> {
     st
 }
 
-fn req(method: Method, uri: &str, headers: &[(&str, &str)]) -> Request<ZionBody> {
+fn req(method: Method, uri: &str, headers: &[(&str, &str)]) -> Request<ReqBody> {
     let mut b = Request::builder().method(method).uri(uri);
     for (k, v) in headers {
         b = b.header(*k, *v);
@@ -113,7 +113,7 @@ fn req(method: Method, uri: &str, headers: &[(&str, &str)]) -> Request<ZionBody>
 }
 
 /// Status the pipeline answers with.
-async fn status(st: &Arc<AppState>, from: &str, r: Request<ZionBody>, early: bool) -> u16 {
+async fn status(st: &Arc<AppState>, from: &str, r: Request<ReqBody>, early: bool) -> u16 {
     let addr: SocketAddr = from.parse().unwrap();
     process_request(r, st.clone(), addr, early)
         .await
@@ -615,7 +615,7 @@ fn with_body(
     uri: &str,
     content_type: &str,
     body: &'static [u8],
-) -> Request<ZionBody> {
+) -> Request<ReqBody> {
     Request::builder()
         .method(method)
         .uri(uri)

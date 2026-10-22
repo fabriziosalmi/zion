@@ -10,7 +10,7 @@
 
 use crate::config::ZionConfig;
 use crate::dispatch::process_request;
-use crate::http_util::ZionBody;
+use crate::http_util::ReqBody;
 use crate::state::AppState;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -240,7 +240,7 @@ async fn rig_with(vary: &str, cc: &str, profile_extra: &str) -> (Arc<Origin>, Ar
     (o, state_for_with(port, profile_extra))
 }
 
-fn get(uri: &str, headers: &[(&str, &str)]) -> Request<ZionBody> {
+fn get(uri: &str, headers: &[(&str, &str)]) -> Request<ReqBody> {
     let mut b = Request::builder().method(Method::GET).uri(uri);
     for (k, v) in headers {
         b = b.header(*k, *v);
@@ -778,7 +778,10 @@ async fn an_upstream_that_points_back_at_the_proxy_is_cut_after_one_bounce() {
                                 passes.fetch_add(1, Ordering::Relaxed);
                                 // the "upstream" hands the request straight back to the proxy
                                 process_request(
-                                    req.map(|b| b.boxed()),
+                                    req.map(|b| {
+                                        b.map_err(|e| -> crate::http_util::BoxError { Box::new(e) })
+                                            .boxed()
+                                    }),
                                     st,
                                     "127.0.0.1:1".parse::<SocketAddr>().unwrap(),
                                     false,
@@ -1478,7 +1481,7 @@ async fn two_upstreams_sharing_a_url_must_agree_about_its_breaker() {
     assert!(!err("", "").contains("disagree"), "neither has one: fine");
 }
 
-fn ws_request(uri: &str) -> Request<ZionBody> {
+fn ws_request(uri: &str) -> Request<ReqBody> {
     get(
         uri,
         &[

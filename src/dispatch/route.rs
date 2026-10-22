@@ -13,7 +13,7 @@ use super::*;
 /// `None` is a 404.
 pub(super) fn resolve(
     cfg: &Arc<ResolvedAppConfig>,
-    req: &Request<ZionBody>,
+    req: &Request<ReqBody>,
 ) -> Option<Arc<ResolvedRoute>> {
     // Hot routes hit the thread-local cache in ~5ns. Cache misses fall through
     // to the radix tree (~30ns) and are promoted to MRU. The cache is a true

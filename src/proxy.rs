@@ -11,7 +11,7 @@
 //! of the connection pool happens at boot in `build_http_client`.
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Request, Response, StatusCode, Version};
 use hyper_util::client::legacy::Client;
@@ -27,7 +27,7 @@ pub use crate::config::XffMode;
 static PROTO_HTTPS: HeaderValue = HeaderValue::from_static("https");
 static PROTO_HTTP: HeaderValue = HeaderValue::from_static("http");
 
-use crate::http_util::ZionBody;
+use crate::http_util::{ReqBody, ZionBody};
 use crate::upstream_body::{BodyCap, Overflow, UpstreamBody};
 
 /// Shared HTTP client type — supports both HTTP/1.1 and HTTP/2 to upstreams.
@@ -522,7 +522,7 @@ fn apply_forwarding_hygiene<B>(
 #[inline]
 pub async fn proxy_pass(
     client: &HttpClient,
-    req: Request<ZionBody>,
+    req: Request<ReqBody>,
     scheme: &hyper::http::uri::Scheme,
     authority: &hyper::http::uri::Authority,
     remote_addr: Option<SocketAddr>,
@@ -649,7 +649,7 @@ fn scrub_response_hop_by_hop(headers: &mut hyper::HeaderMap) {
 #[inline]
 async fn send_request_try(
     client: &HttpClient,
-    req: Request<ZionBody>,
+    req: Request<ReqBody>,
 ) -> Result<Response<ZionBody>, hyper_util::client::legacy::Error> {
     let upstream = req.uri().authority().cloned();
     let upstream_start = std::time::Instant::now();
@@ -679,7 +679,7 @@ async fn send_request_try(
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_pass_ha(
     client: &HttpClient,
-    req: Request<ZionBody>,
+    req: Request<ReqBody>,
     pool: &[String],
     default_scheme: &hyper::http::uri::Scheme,
     default_authority: &hyper::http::uri::Authority,
@@ -719,16 +719,13 @@ pub async fn proxy_pass_ha(
         .map_or(MAX_HA_REPLAY_BODY, |c| {
             usize::try_from(c.0).map_or(MAX_HA_REPLAY_BODY, |c| c.min(MAX_HA_REPLAY_BODY))
         });
-    let limited = Limited::new(body, limit);
-    let body_bytes = match tokio::time::timeout(HA_BODY_COLLECT_TIMEOUT, limited.collect()).await {
-        Ok(Ok(c)) => c.to_bytes(),
-        // `Limited` surfaces overflow as a boxed `LengthLimitError`; any other
-        // collect error is a broken client stream → 400. Distinguish so an
-        // operator sees "too large" separately from "client hung up".
-        Ok(Err(e))
-            if e.downcast_ref::<http_body_util::LengthLimitError>()
-                .is_some() =>
-        {
+    let read = crate::upstream_body::read_capped(body, limit as u64);
+    let body_bytes = match tokio::time::timeout(HA_BODY_COLLECT_TIMEOUT, read).await {
+        Ok(Ok(b)) => b,
+        // Overflow is a `BodyTooLarge`; any other read error is a broken client
+        // stream → 400. Distinguish so an operator sees "too large" separately
+        // from "client hung up".
+        Ok(Err(e)) if e.is::<crate::upstream_body::BodyTooLarge>() => {
             return Ok(simple_status(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "413 Payload Too Large",
@@ -790,7 +787,7 @@ pub async fn proxy_pass_ha(
             Err(_) => (default_scheme.clone(), default_authority.clone()),
         };
 
-        let mut attempt: Request<ZionBody> = Request::new(
+        let mut attempt: Request<ReqBody> = Request::new(
             Full::new(body_bytes.clone())
                 .map_err(|never| match never {})
                 .boxed(),
@@ -913,7 +910,7 @@ pub async fn proxy_pass_bytes(
     proto: &str,
     xff_mode: XffMode,
 ) -> Result<Response<ZionBody>, hyper::Error> {
-    let body: ZionBody = Full::new(body_bytes)
+    let body: ReqBody = Full::new(body_bytes)
         .map_err(|never| match never {})
         .boxed();
     let req = Request::from_parts(parts, body);
@@ -928,7 +925,7 @@ pub async fn proxy_pass_bytes(
 #[inline]
 pub async fn proxy_pass_stream(
     client: &HttpClient,
-    req: Request<ZionBody>,
+    req: Request<ReqBody>,
     scheme: &hyper::http::uri::Scheme,
     authority: &hyper::http::uri::Authority,
     remote_addr: Option<SocketAddr>,
@@ -1001,7 +998,7 @@ const HA_BODY_COLLECT_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 /// The request as the upstream client takes it. A body the body gate marked with a
 /// [`BodyCap`] is counted against it, and the [`Overflow`] says afterwards whether it went past.
-fn upstream_request(req: Request<ZionBody>) -> (Request<UpstreamBody>, Option<Overflow>) {
+fn upstream_request(req: Request<ReqBody>) -> (Request<UpstreamBody>, Option<Overflow>) {
     let (parts, body) = req.into_parts();
     match parts.extensions.get::<BodyCap>() {
         Some(&BodyCap(limit)) => {
@@ -1045,7 +1042,7 @@ fn upstream_context_of(uri: &hyper::Uri, traceparent: Option<&HeaderValue>) -> S
 
 async fn send_request(
     client: &HttpClient,
-    req: Request<ZionBody>,
+    req: Request<ReqBody>,
 ) -> Result<Response<ZionBody>, hyper::Error> {
     // The text is only for the error and timeout log lines: keep what it is made of (cheap
     // reference-counted clones) and build it there, not on every request.
@@ -1093,7 +1090,7 @@ async fn send_request(
 /// handshake, returns 101 to client, and spawns a bidirectional byte pipe.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_websocket(
-    mut req: Request<ZionBody>,
+    mut req: Request<ReqBody>,
     on_client_upgrade: hyper::upgrade::OnUpgrade,
     scheme: &hyper::http::uri::Scheme,
     authority: &hyper::http::uri::Authority,
@@ -1251,8 +1248,8 @@ pub async fn proxy_websocket(
 /// Common WebSocket upgrade exchange — send the upgrade request, check for 101,
 /// spawn bidirectional pipe. Shared between plain TCP and TLS upstream paths.
 async fn send_ws_upgrade(
-    sender: &mut hyper::client::conn::http1::SendRequest<ZionBody>,
-    req: Request<ZionBody>,
+    sender: &mut hyper::client::conn::http1::SendRequest<ReqBody>,
+    req: Request<ReqBody>,
     on_client_upgrade: hyper::upgrade::OnUpgrade,
     limits: WsLimits,
 ) -> Result<Response<ZionBody>, hyper::Error> {
@@ -1815,7 +1812,7 @@ mod tests {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let oversized = vec![0u8; MAX_HA_REPLAY_BODY + 1];
-        let body: ZionBody = Full::new(Bytes::from(oversized))
+        let body: ReqBody = Full::new(Bytes::from(oversized))
             .map_err(|never| match never {})
             .boxed();
         let req = Request::builder()
