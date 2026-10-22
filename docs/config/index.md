@@ -262,6 +262,9 @@ circuit, its failure re-opens it. Values shown are the defaults.
 | `mode` | string | `"standard"` | `standard`, `sse_stream`, `static_cache`, `websocket` |
 | `internal_only` | bool | `false` | Restrict to private/loopback IPs |
 | `public` | bool | `false` | Declare the route deliberately unauthenticated; the explicit opt-out under `require_route_auth`. Cannot be combined with `auth_profile` |
+| `methods` | string[] | none | Methods the route serves; any other is `405` with `Allow`. `GET` brings `HEAD`. See [request restrictions](./routing#request-restrictions-per-route) |
+| `content_types` | string[] | none | Media types a request body may have; any other is `415` |
+| `deny_paths` | string[] | none | Path patterns (route syntax) inside the route that are refused with `403` |
 | `waf_profile` | string | none | Name of WAF profile to apply |
 | `cache_profile` | string | none | Name of cache profile to apply |
 | `waf` | bool | `false` | Legacy: enable WAF with defaults |

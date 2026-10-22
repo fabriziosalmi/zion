@@ -66,6 +66,8 @@ pub struct ResolvedRoute {
     pub auth: Option<crate::auth::ResolvedAuthProfile>,
     /// Pre-compiled CORS headers for lightning-fast matching per-route.
     pub cors: Option<std::sync::Arc<crate::security::CorsHeaders>>,
+    /// `methods`, `content_types`, `deny_paths`; `None` when the route sets none of them.
+    pub restrictions: Option<Arc<crate::route_restrict::RouteRestrictions>>,
 }
 
 impl ResolvedRoute {
@@ -598,6 +600,8 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
         #[cfg(feature = "auth")]
         auth,
         cors,
+        restrictions: (!route.restrictions.is_empty())
+            .then(|| Arc::new(route.restrictions.clone())),
     }))
 }
 
@@ -752,6 +756,7 @@ waf = true
             auth_profile: None,
             public: false,
             cors: None,
+            restrictions: Default::default(),
         }
     }
 

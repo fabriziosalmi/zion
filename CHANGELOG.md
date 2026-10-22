@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **A route can refuse methods, request body types and sub-paths without a WAF profile** (#693). `methods = ["GET", "POST"]` answers any other method with `405` and an `Allow` header (`GET` brings `HEAD`); `content_types = ["application/json"]` answers a request body of any other type with `415`; `deny_paths = ["/wp-json/batch/{*rest}"]` answers those paths inside the route with `403`. Until now the method allowlist was global and the only per-route content-type check sat inside a WAF profile. The checks run once the route is known, after CORS (a preflight is still answered) and `internal_only`, and before an upstream is chosen, so a refused request costs no upstream work. They answer request shapes of exploited CVEs at the edge: `text/x-component` to a React Server Function (CVE-2025-55182) and a `multipart/form-data` body on a route that takes JSON are `415`, the WordPress REST batch route is a `deny_paths` entry. Tests through the real request pipeline pin each status and the gate order, and fail when the gate is removed or moved before CORS or `internal_only`, or when any one of the three checks is disabled. Applied on reload, to the next request.
+
 ## [0.13.1] - 2026-10-22
 
 **Security release: a trailing slash could carry a request out of a catch-all route, bypassing per-route policy.** If a route written as `/prefix/{*rest}` carries `internal_only`, `auth_profile` or a stricter WAF profile, and a broader route such as `/{*rest}` sits next to it, upgrade. Advisory: GHSA-x2gm-m42w-6px8.
