@@ -4,7 +4,7 @@
 
 use crate::config::ZionConfig;
 use crate::dispatch::process_request;
-use crate::http_util::ZionBody;
+use crate::http_util::ReqBody;
 use crate::state::AppState;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -129,7 +129,7 @@ cache_profile = "c"
     AppState::for_tests(&cfg)
 }
 
-fn get(uri: &str, headers: &[(&str, &str)]) -> Request<ZionBody> {
+fn get(uri: &str, headers: &[(&str, &str)]) -> Request<ReqBody> {
     let mut b = Request::builder().method(Method::GET).uri(uri);
     for (k, v) in headers {
         b = b.header(*k, *v);

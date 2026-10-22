@@ -28,8 +28,8 @@ const DEFAULT_BUFFER_CAP: u64 = 10 * 1_048_576;
 pub(super) async fn run(
     rule: &ResolvedRoute,
     remote_addr: SocketAddr,
-    mut req: Request<ZionBody>,
-) -> Result<Request<ZionBody>, Response<ZionBody>> {
+    mut req: Request<ReqBody>,
+) -> Result<Request<ReqBody>, Response<ZionBody>> {
     if rule.body_cap.is_none() && !rule.require_content_length {
         return Ok(req);
     }
@@ -74,13 +74,12 @@ fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
 async fn read_whole(
     rule: &ResolvedRoute,
     remote_addr: SocketAddr,
-    req: Request<ZionBody>,
-) -> Result<Request<ZionBody>, Response<ZionBody>> {
+    req: Request<ReqBody>,
+) -> Result<Request<ReqBody>, Response<ZionBody>> {
     let cap = rule.body_cap.unwrap_or(DEFAULT_BUFFER_CAP);
     let (mut parts, body) = req.into_parts();
-    let limited = Limited::new(body, usize::try_from(cap).unwrap_or(usize::MAX));
-    let bytes = match tokio::time::timeout(BODY_COLLECT_TIMEOUT, limited.collect()).await {
-        Ok(Ok(collected)) => collected.to_bytes(),
+    let bytes = match tokio::time::timeout(BODY_COLLECT_TIMEOUT, read_capped(body, cap)).await {
+        Ok(Ok(bytes)) => bytes,
         Ok(Err(e)) => {
             let (status, msg) = body_read_failure(e.as_ref());
             if status != StatusCode::PAYLOAD_TOO_LARGE {
@@ -113,6 +112,6 @@ async fn read_whole(
             .headers
             .insert(CONTENT_LENGTH, HeaderValue::from(bytes.len()));
     }
-    let body: ZionBody = Full::new(bytes).map_err(|never| match never {}).boxed();
+    let body: ReqBody = Full::new(bytes).map_err(|never| match never {}).boxed();
     Ok(Request::from_parts(parts, body))
 }

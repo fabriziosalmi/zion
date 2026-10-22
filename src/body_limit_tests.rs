@@ -5,7 +5,7 @@
 
 use crate::config::ZionConfig;
 use crate::dispatch::process_request;
-use crate::http_util::ZionBody;
+use crate::http_util::{BoxError, ReqBody};
 use crate::state::AppState;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -186,8 +186,8 @@ async fn rig() -> (Arc<Origin>, Arc<AppState>) {
 
 /// A body of `len` bytes in 64 KiB frames with no declared length: what a chunked HTTP/1.1
 /// upload, or an HTTP/2 one without `Content-Length`, looks like to the pipeline.
-fn chunked(len: usize) -> ZionBody {
-    let frames: Vec<Result<Frame<Bytes>, hyper::Error>> = (0..len.div_ceil(65536))
+fn chunked(len: usize) -> ReqBody {
+    let frames: Vec<Result<Frame<Bytes>, BoxError>> = (0..len.div_ceil(65536))
         .map(|i| {
             Ok(Frame::data(Bytes::from(vec![
                 b'x';
@@ -199,13 +199,13 @@ fn chunked(len: usize) -> ZionBody {
 }
 
 /// A body of `len` bytes whose length is known, as with `Content-Length`.
-fn sized(len: usize) -> ZionBody {
+fn sized(len: usize) -> ReqBody {
     Full::new(Bytes::from(vec![b'x'; len]))
         .map_err(|never| match never {})
         .boxed()
 }
 
-async fn post(st: &Arc<AppState>, path: &str, headers: &[(&str, &str)], body: ZionBody) -> u16 {
+async fn post(st: &Arc<AppState>, path: &str, headers: &[(&str, &str)], body: ReqBody) -> u16 {
     let mut b = Request::post(format!("https://zion.test{path}")).header("host", "zion.test");
     if !headers.iter().any(|(k, _)| *k == "content-type") {
         b = b.header("content-type", "application/octet-stream");
@@ -355,7 +355,7 @@ async fn reading_a_body_whole_is_bounded_by_the_cap() {
 async fn a_body_the_waf_has_read_goes_on_with_its_length() {
     let (o, st) = rig().await;
     let json = br#"{"name":"zion"}"#;
-    let frames: Vec<Result<Frame<Bytes>, hyper::Error>> = vec![
+    let frames: Vec<Result<Frame<Bytes>, BoxError>> = vec![
         Ok(Frame::data(Bytes::from_static(&json[..6]))),
         Ok(Frame::data(Bytes::from_static(&json[6..]))),
     ];

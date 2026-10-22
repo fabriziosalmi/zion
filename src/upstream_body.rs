@@ -10,19 +10,17 @@
 //! that looks complete. Ending it cleanly instead would close the chunked framing and hand the
 //! upstream a truncated body as a whole one.
 //!
-//! The error needs a type of its own, since a `hyper::Error` cannot be built outside hyper; that
-//! is why the upstream client takes an [`UpstreamBody`] and not a `ZionBody`.
+//! The error is a [`BodyTooLarge`], which a request body can carry because its error type is
+//! zion's (`http_util::ReqBody`), not hyper's.
 
-use crate::http_util::ZionBody;
+use crate::http_util::{BoxError, ReqBody};
 use bytes::Bytes;
+use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, SizeHint};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-
-/// The error type of [`UpstreamBody`].
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The route's body cap, in bytes, for a request whose body has no declared length. The
 /// request carries it as an extension from the body gate to the proxy, which applies it when
@@ -57,7 +55,7 @@ impl Overflow {
 /// A request body on its way to the upstream: the body as it came, or the same body counted
 /// against a cap.
 pub struct UpstreamBody {
-    inner: ZionBody,
+    inner: ReqBody,
     cap: Option<Cap>,
 }
 
@@ -69,13 +67,13 @@ struct Cap {
 
 impl UpstreamBody {
     /// The body with no cap: every route without `max_body_mb`, and every body of known length.
-    pub fn plain(inner: ZionBody) -> Self {
+    pub fn plain(inner: ReqBody) -> Self {
         Self { inner, cap: None }
     }
 
     /// The body counted against `limit` bytes. The returned [`Overflow`] reports whether it went
     /// past them.
-    pub fn capped(inner: ZionBody, limit: u64) -> (Self, Overflow) {
+    pub fn capped(inner: ReqBody, limit: u64) -> (Self, Overflow) {
         let overflow = Overflow::default();
         let body = Self {
             inner,
@@ -88,8 +86,18 @@ impl UpstreamBody {
     }
 }
 
-impl From<ZionBody> for UpstreamBody {
-    fn from(inner: ZionBody) -> Self {
+/// Read a request body whole, at most `limit` bytes; past them the error is [`BodyTooLarge`].
+///
+/// `http_body_util::Limited` does the same, but over a body whose error is already a boxed
+/// `dyn Error` rustc cannot prove its `collect` future `Send` (a limit of its higher-ranked
+/// lifetime inference), and every future of the request pipeline must be `Send`.
+pub async fn read_capped(body: ReqBody, limit: u64) -> Result<Bytes, BoxError> {
+    let (body, _) = UpstreamBody::capped(body, limit);
+    Ok(body.collect().await?.to_bytes())
+}
+
+impl From<ReqBody> for UpstreamBody {
+    fn from(inner: ReqBody) -> Self {
         Self::plain(inner)
     }
 }
@@ -106,7 +114,7 @@ impl Body for UpstreamBody {
         let frame = match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(None) => return Poll::Ready(None),
-            Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(Box::new(e)))),
+            Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
             Poll::Ready(Some(Ok(frame))) => frame,
         };
         if let (Some(cap), Some(data)) = (this.cap.as_mut(), frame.data_ref()) {
@@ -135,8 +143,8 @@ mod tests {
     use http_body_util::{BodyExt, Full, StreamBody};
 
     /// A body of unknown length made of these frames, like a chunked upload.
-    fn chunked(frames: &[&'static [u8]]) -> ZionBody {
-        let frames: Vec<Result<Frame<Bytes>, hyper::Error>> = frames
+    fn chunked(frames: &[&'static [u8]]) -> ReqBody {
+        let frames: Vec<Result<Frame<Bytes>, BoxError>> = frames
             .iter()
             .map(|f| Ok(Frame::data(Bytes::from_static(f))))
             .collect();
@@ -182,12 +190,12 @@ mod tests {
 
     #[test]
     fn the_length_and_the_end_of_the_inner_body_are_kept() {
-        let full: ZionBody = Full::new(Bytes::from_static(b"abc"))
+        let full: ReqBody = Full::new(Bytes::from_static(b"abc"))
             .map_err(|never| match never {})
             .boxed();
         let (body, _) = UpstreamBody::capped(full, 10);
         assert_eq!(body.size_hint().exact(), Some(3));
-        let empty: ZionBody = Full::new(Bytes::new())
+        let empty: ReqBody = Full::new(Bytes::new())
             .map_err(|never| match never {})
             .boxed();
         assert!(UpstreamBody::plain(empty).is_end_stream());

@@ -257,8 +257,8 @@ where
 /// the real peer address, as for HTTP/1 and HTTP/2.
 pub(crate) fn bridge_request(
     req: hyper::Request<()>,
-    body: crate::http_util::ZionBody,
-) -> hyper::Request<crate::http_util::ZionBody> {
+    body: crate::http_util::ReqBody,
+) -> hyper::Request<crate::http_util::ReqBody> {
     let (mut parts, ()) = req.into_parts();
     crate::security::strip_transport_attestations(&mut parts.headers);
     hyper::Request::from_parts(parts, body)
@@ -302,8 +302,9 @@ where
 {
     // Bridge HTTP/3 QUIC connection directly into the universal pipeline
     let (mut send_stream, mut recv_stream) = stream.split();
-    let (tx, rx) =
-        tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, hyper::Error>>(16);
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        Result<hyper::body::Frame<Bytes>, crate::http_util::BoxError>,
+    >(16);
     let stream_body =
         http_body_util::StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
 
@@ -418,7 +419,7 @@ where
 mod tests {
     use super::*;
 
-    fn empty() -> crate::http_util::ZionBody {
+    fn empty() -> crate::http_util::ReqBody {
         use http_body_util::BodyExt;
         http_body_util::Full::new(Bytes::new())
             .map_err(|n| match n {})

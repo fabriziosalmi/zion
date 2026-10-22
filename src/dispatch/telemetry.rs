@@ -15,7 +15,7 @@ pub(super) struct Trace {
 }
 
 /// Give the request an `X-Request-ID` and a valid `traceparent` (the client's, or a fresh one).
-pub(super) fn stamp(req: &mut Request<ZionBody>) -> Trace {
+pub(super) fn stamp(req: &mut Request<ReqBody>) -> Trace {
     // ── Request ID (preserve client's or generate new) ──
     let has_client_id = req.headers().contains_key("X-Request-ID");
     let generated_id: [u8; 21];
@@ -116,7 +116,7 @@ pub(super) struct AccessCapture {
 pub(super) fn capture(
     cfg: &ResolvedAppConfig,
     state: &AppState,
-    req: &Request<ZionBody>,
+    req: &Request<ReqBody>,
 ) -> AccessCapture {
     // Capture method + path-and-query *before* the request is consumed by
     // the proxy / cache pipeline. Used by the access-log emission below.

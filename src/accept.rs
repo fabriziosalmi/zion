@@ -7,7 +7,7 @@
 //! changes.
 
 use crate::dispatch::{self, process_request};
-use crate::http_util::{empty_response, text_response, ZionBody, HEX_DIGITS};
+use crate::http_util::{empty_response, text_response, BoxError, ReqBody, ZionBody, HEX_DIGITS};
 use crate::state::AppState;
 #[cfg(feature = "tls-fingerprint")]
 use crate::tls_fp;
@@ -146,7 +146,8 @@ async fn handle_http_connection(
         io,
         service_fn(move |req| {
             use http_body_util::BodyExt;
-            let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
+            let req_boxed = req
+                .map(|b: hyper::body::Incoming| b.map_err(|e| -> BoxError { Box::new(e) }).boxed());
             handle_http(req_boxed, state.clone(), addr)
         }),
     );
@@ -523,7 +524,9 @@ fn spawn_https_handler(
                     #[cfg(feature = "tls-fingerprint")]
                     tls_fp::apply_headers(&mut req, tls_fp_identity.as_deref());
                     use http_body_util::BodyExt;
-                    let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
+                    let req_boxed = req.map(|b: hyper::body::Incoming| {
+                        b.map_err(|e| -> BoxError { Box::new(e) }).boxed()
+                    });
                     process_request(req_boxed, state, remote_addr, was_early).await
                 }
             }),
@@ -649,7 +652,7 @@ fn https_authority(host: &str, http_port: Option<u16>, https_port: Option<u16>) 
 
 /// HTTP (port 80) handler — ACME challenge proxy or 301 redirect to HTTPS.
 pub(crate) async fn handle_http(
-    mut req: Request<ZionBody>,
+    mut req: Request<ReqBody>,
     state: Arc<AppState>,
     remote_addr: SocketAddr,
 ) -> Result<Response<ZionBody>, hyper::Error> {
