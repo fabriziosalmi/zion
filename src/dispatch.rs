@@ -53,6 +53,7 @@ use std::sync::Arc;
 use crate::routing::ResolvedRoute;
 use http_body_util::Limited;
 
+mod body_gate;
 mod cached;
 mod gates;
 mod route;
@@ -379,6 +380,12 @@ async fn process_request_inner(
 
     // --- Gate: WAF ---
     req = match waf_gate::run(&rule, &state, remote_addr, req).await {
+        Ok(req) => req,
+        Err(resp) => return Ok(resp),
+    };
+
+    // --- Gate: the body (max_body_mb without a WAF, require_content_length) ---
+    req = match body_gate::run(&rule, remote_addr, req).await {
         Ok(req) => req,
         Err(resp) => return Ok(resp),
     };

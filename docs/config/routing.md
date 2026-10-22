@@ -225,6 +225,37 @@ upstream is chosen, authentication and the WAF. A refused request costs no upstr
 An empty list (`methods = []`) is a config error, as is an unknown method or a malformed media
 type or pattern. The keys apply on reload, to the next request.
 
+## Request body (per-route)
+
+Two keys bound the request body on a route without a WAF. A route that sets neither streams the
+body to the upstream as it arrives, at any size.
+
+```toml
+[[route]]
+path = "/upload/{*rest}"
+upstream = "app"
+max_body_mb = 50
+require_content_length = true
+```
+
+- **`max_body_mb`** caps the body. A body that declares a larger length (`Content-Length`) is
+  answered `413 Payload Too Large` before any of it is read, and nothing reaches the upstream. A
+  body without a declared length (chunked HTTP/1.1, HTTP/2 or HTTP/3 without `Content-Length`) is
+  streamed to the upstream and counted: at the byte that goes past the cap, zion aborts the
+  request to the upstream, which sees a broken body and never a short one that looks complete,
+  and answers `413`. On a route with a WAF, the cap is the WAF's (`max_body_mb` with `waf = true`,
+  or the profile's own); `max_body_mb` next to a `waf_profile` is a config error.
+- **`require_content_length`** sends every body to the upstream with `Content-Length`, never
+  chunked. A body without a declared length is read whole first, within `max_body_mb` (10 MB when
+  the route sets none) and 60 seconds, then forwarded with the length it turned out to have:
+  `413` past the cap, `408` past the time. A body that declares its length is streamed as it is.
+  It is for an upstream that mishandles chunked bodies. Each body it reads is held in memory, up to
+  the cap, while the request lasts.
+
+Over HTTP/1.1, a client that is still sending when zion answers `413` can lose the answer: zion
+closes the connection and the client may only see it closed. Over HTTP/2 only that request's
+stream is closed and the `413` arrives.
+
 ## Content-Security-Policy (per-route)
 
 You can set a per-route `Content-Security-Policy` header:

@@ -526,11 +526,11 @@ mod tests {
         let client = crate::proxy::build_http_client(2000, false);
         let req = || {
             hyper::Request::get(&uri)
-                .body(
+                .body(crate::upstream_body::UpstreamBody::plain(
                     Full::new(bytes::Bytes::new())
                         .map_err(|n| match n {})
                         .boxed(),
-                )
+                ))
                 .unwrap()
         };
         // nothing cached yet: the failure is real
