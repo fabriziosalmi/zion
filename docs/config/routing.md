@@ -252,9 +252,11 @@ require_content_length = true
   It is for an upstream that mishandles chunked bodies. Each body it reads is held in memory, up to
   the cap, while the request lasts.
 
-Over HTTP/1.1, a client that is still sending when zion answers `413` can lose the answer: zion
-closes the connection and the client may only see it closed. Over HTTP/2 only that request's
-stream is closed and the `413` arrives.
+A client that is still sending when zion answers `413` gets the answer. Over HTTP/1.1, after
+answering a request whose body it did not read to the end, zion reads and drops what the client
+still sends until the client closes, for at most 10 seconds (2 seconds without a byte), then
+closes the connection; nginx calls this a lingering close. Over HTTP/2 only that request's stream
+is closed.
 
 ## Content-Security-Policy (per-route)
 
