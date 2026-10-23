@@ -438,6 +438,11 @@ async fn a_body_the_client_breaks_is_the_clients_fault_not_a_502() {
 
 /// A route whose single upstream has a circuit breaker that opens on 5 failures in 10 s.
 fn guarded_state(port: u16) -> Arc<AppState> {
+    guarded_state_with(port, "")
+}
+
+/// [`guarded_state`] with more settings for the upstream, such as `request_timeout_ms`.
+fn guarded_state_with(port: u16, upstream_extra: &str) -> Arc<AppState> {
     let toml = format!(
         r#"
 [server]
@@ -451,6 +456,7 @@ key_path = "/k"
 [upstream.g]
 url = "http://127.0.0.1:{port}"
 circuit_breaker = {{ error_rate_pct = 50, min_requests = 5, window_secs = 10, open_secs = 30 }}
+{upstream_extra}
 
 [[route]]
 path = "/{{*rest}}"
@@ -509,4 +515,86 @@ async fn a_dead_upstream_still_opens_its_circuit() {
         assert!(crate::breaker::is_failure(status), "{status}");
     }
     assert_eq!(get(&st, "/").await, 503, "five refused connections open it");
+}
+
+// ── a client too slow to send its body ───────────────────────────────────
+
+/// A body sent at the client's pace: `frames` frames of 16 KiB, `gap` apart, then its end.
+fn paced(frames: usize, gap: Duration) -> ReqBody {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, BoxError>>(1);
+    tokio::spawn(async move {
+        for _ in 0..frames {
+            tokio::time::sleep(gap).await;
+            if tx
+                .send(Ok(Frame::data(Bytes::from(vec![b'x'; 16 * 1024]))))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx)).boxed()
+}
+
+#[tokio::test]
+async fn a_client_too_slow_to_send_its_body_is_a_408_and_does_not_open_the_circuit() {
+    let o = Arc::new(Origin::default());
+    let st = guarded_state_with(start_origin(o.clone()).await, "request_timeout_ms = 300");
+    // 1 s of body against a 300 ms deadline, to an upstream that reads it as it comes
+    let uploads: Vec<_> = (0..6)
+        .map(|_| {
+            let st = st.clone();
+            tokio::spawn(async move {
+                post(&st, "/upload", &[], paced(10, Duration::from_millis(100))).await
+            })
+        })
+        .collect();
+    for (i, u) in uploads.into_iter().enumerate() {
+        assert_eq!(u.await.unwrap(), 408, "slow upload {}", i + 1);
+    }
+    assert_eq!(
+        get(&st, "/").await,
+        200,
+        "the upstream is healthy: its circuit must still be closed"
+    );
+}
+
+/// An upstream that reads the whole request and then never answers.
+async fn start_silent_origin() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let svc =
+                    hyper::service::service_fn(|req: Request<hyper::body::Incoming>| async move {
+                        let _ = req.into_body().collect().await;
+                        std::future::pending::<()>().await;
+                        Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::new())))
+                    });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn an_upstream_too_slow_to_answer_a_whole_body_is_still_a_504_and_opens_the_circuit() {
+    // The control: once the client has sent everything, the time is the upstream's.
+    let st = guarded_state_with(start_silent_origin().await, "request_timeout_ms = 300");
+    for i in 1..=5 {
+        assert_eq!(
+            post(&st, "/upload", &[], chunked(64 * 1024)).await,
+            504,
+            "upload {i}"
+        );
+    }
+    assert_eq!(get(&st, "/").await, 503, "five timeouts open it");
 }
