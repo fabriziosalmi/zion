@@ -46,6 +46,12 @@ listen_https = "0.0.0.0:443"
 # Invalid values fall back to "append" with a startup warning.
 # xff_mode = "append"
 
+# Proxied WebSockets: closed after this many seconds of silence in both
+# directions (any byte restarts the count), and after this many seconds in
+# all. 0 = no limit. Applied on reload to sessions opened after it.
+# websocket_idle_secs = 300
+# websocket_max_session_secs = 86400
+
 # ── Sovereign edge: IT/EU origin tagging (build with --features geo-ita
 # / geo-eu). Classifies the client IP (IPv4+IPv6) and exposes
 # `zion_sovereign_classifications_total{class}` → "% EU vs non-EU".

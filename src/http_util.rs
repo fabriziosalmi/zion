@@ -18,6 +18,15 @@ use hyper::{Response, StatusCode};
 /// (ZION-ARCH-07, #532).
 pub type ZionBody = BoxBody<Bytes, hyper::Error>;
 
+/// The error of a request body: hyper's, or one zion raises itself.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The body of a request on its way through the pipeline. Its error is not a `hyper::Error`,
+/// which only hyper can build: a body zion reads from somewhere else (an HTTP/3 stream) or
+/// counts against a cap must be able to end with an error of its own, so that a reader can tell
+/// a broken body from a complete one.
+pub type ReqBody = BoxBody<Bytes, BoxError>;
+
 /// Atomic request counter for generating unique request IDs.
 /// Format: {timestamp_hex}-{counter_hex} — unique, sortable.
 pub(crate) static REQUEST_COUNTER: std::sync::atomic::AtomicU64 =

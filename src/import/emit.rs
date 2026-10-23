@@ -70,14 +70,6 @@ pub fn render(doc: &ZionDoc, source: &str) -> String {
         out.push('\n');
     }
 
-    if let Some(mb) = doc.waf_body_mb {
-        out.push_str("# Body cap imported from client_max_body_size. Shadow mode logs\n");
-        out.push_str("# would-be blocks without enforcing; set waf_shadow = false on the\n");
-        out.push_str("# routes below to enforce.\n");
-        out.push_str("[waf_profile.imported]\n");
-        out.push_str(&format!("max_body_mb = {mb}\n\n"));
-    }
-
     for up in &doc.upstreams {
         render_upstream(&mut out, up);
     }
@@ -155,9 +147,8 @@ fn render_route(out: &mut String, route: &RouteOut) {
     if let Some(csp) = &route.csp {
         kv(out, "csp", csp);
     }
-    if route.waf {
-        kv(out, "waf_profile", "imported");
-        out.push_str("waf_shadow = true\n");
+    if let Some(mb) = route.max_body_mb {
+        out.push_str(&format!("max_body_mb = {mb}\n"));
     }
     out.push('\n');
 }
@@ -230,7 +221,6 @@ mod tests {
             tls_min12: false,
             sni: Vec::new(),
             acme: None,
-            waf_body_mb: None,
             upstreams: vec![super::super::map::UpstreamOut {
                 name: "b".into(),
                 urls: vec!["http://127.0.0.1:1".into()],
@@ -246,7 +236,7 @@ mod tests {
                 upstream: "b".into(),
                 websocket: false,
                 csp: None,
-                waf: false,
+                max_body_mb: None,
                 serve_dir: None,
                 spa_fallback: false,
                 internal_only: false,
@@ -285,7 +275,6 @@ mod tests {
             tls_min12: false,
             sni: Vec::new(),
             acme: None,
-            waf_body_mb: None,
             upstreams: vec![super::super::map::UpstreamOut {
                 name: "backend".into(),
                 urls: vec!["http://127.0.0.1:8080".into()],
@@ -301,7 +290,7 @@ mod tests {
                 upstream: "backend".into(),
                 websocket: false,
                 csp: None,
-                waf: false,
+                max_body_mb: None,
                 serve_dir: None,
                 spa_fallback: false,
                 internal_only: false,
@@ -331,7 +320,6 @@ mod tests {
                 key: "/etc/ssl/b.key".into(),
             }],
             acme: None,
-            waf_body_mb: Some(64),
             upstreams: vec![super::super::map::UpstreamOut {
                 name: "pool".into(),
                 urls: vec!["http://10.0.0.1:80".into(), "http://10.0.0.2:80".into()],
@@ -347,7 +335,7 @@ mod tests {
                 upstream: "pool".into(),
                 websocket: true,
                 csp: Some("default-src 'self'".into()),
-                waf: true,
+                max_body_mb: Some(64),
                 serve_dir: None,
                 spa_fallback: false,
                 internal_only: false,
@@ -359,8 +347,8 @@ mod tests {
         self_validate(&toml).expect("emitted TOML must self-validate");
         assert!(toml.contains("min_version = \"1.2\""));
         assert!(toml.contains("[[tls.sni]]"));
-        assert!(toml.contains("waf_profile = \"imported\""));
-        assert!(toml.contains("waf_shadow = true"));
+        assert!(toml.contains("max_body_mb = 64"));
+        assert!(!toml.contains("waf_profile"), "a body cap needs no WAF");
         assert!(toml.contains("mode = \"websocket\""));
     }
 
@@ -380,7 +368,6 @@ mod tests {
                 email: "ops@example.com".into(),
                 domains: vec!["app.example.com".into(), "www.app.example.com".into()],
             }),
-            waf_body_mb: None,
             upstreams: vec![super::super::map::UpstreamOut {
                 name: "backend".into(),
                 urls: vec!["http://127.0.0.1:8080".into()],
@@ -396,7 +383,7 @@ mod tests {
                 upstream: "backend".into(),
                 websocket: false,
                 csp: None,
-                waf: false,
+                max_body_mb: None,
                 serve_dir: None,
                 spa_fallback: false,
                 internal_only: false,

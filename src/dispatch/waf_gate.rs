@@ -17,8 +17,8 @@ pub(super) async fn run(
     rule: &ResolvedRoute,
     state: &AppState,
     remote_addr: SocketAddr,
-    req: Request<ZionBody>,
-) -> Result<Request<ZionBody>, Response<ZionBody>> {
+    req: Request<ReqBody>,
+) -> Result<Request<ReqBody>, Response<ZionBody>> {
     let Some(ref waf_profile) = rule.waf else {
         return Ok(req);
     };
@@ -49,7 +49,7 @@ fn scan_target_and_headers(
     remote_addr: SocketAddr,
     method: &'static str,
     waf_profile: &WafProfile,
-    req: &Request<ZionBody>,
+    req: &Request<ReqBody>,
 ) -> Option<Response<ZionBody>> {
     // Gate: WAF URI scan (catches SQLi/XSS in query parameters for ALL methods)
     let uri_str = req
@@ -158,8 +158,8 @@ async fn scan_body(
     remote_addr: SocketAddr,
     method: &'static str,
     waf_profile: &WafProfile,
-    mut req: Request<ZionBody>,
-) -> Result<Request<ZionBody>, Response<ZionBody>> {
+    mut req: Request<ReqBody>,
+) -> Result<Request<ReqBody>, Response<ZionBody>> {
     // Read and scan the body of the methods that carry one, and of any other request
     // that actually has one (Content-Length / chunked on HTTP/1, an open stream on
     // HTTP/2): a GET body is forwarded to the upstream, so it is scanned like the rest.
@@ -229,7 +229,7 @@ async fn scan_body(
         // Re-assemble request with validated body for dispatch below.
         // Do NOT return early — fall through to post-response processing
         // (CORS, metrics, request-ID, security headers).
-        let body: ZionBody = Full::new(body_bytes)
+        let body: ReqBody = Full::new(body_bytes)
             .map_err(|never| match never {})
             .boxed();
         req = Request::from_parts(parts, body);
@@ -285,7 +285,7 @@ async fn collect_body(
     method: &'static str,
     waf_profile: &WafProfile,
     parts: &hyper::http::request::Parts,
-    body: ZionBody,
+    body: ReqBody,
     max_body_bytes: usize,
 ) -> Result<Bytes, Response<ZionBody>> {
     let body_bytes = if waf_profile.streaming {
@@ -373,9 +373,9 @@ async fn collect_body(
         }
         buf.freeze()
     } else {
-        let limited = Limited::new(body, max_body_bytes);
-        match tokio::time::timeout(BODY_COLLECT_TIMEOUT, BodyExt::collect(limited)).await {
-            Ok(Ok(collected)) => collected.to_bytes(),
+        let read = read_capped(body, max_body_bytes as u64);
+        match tokio::time::timeout(BODY_COLLECT_TIMEOUT, read).await {
+            Ok(Ok(bytes)) => bytes,
             Ok(Err(e)) => {
                 let (status, msg) = body_read_failure(e.as_ref());
                 if status != StatusCode::PAYLOAD_TOO_LARGE {

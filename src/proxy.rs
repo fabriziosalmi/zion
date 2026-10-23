@@ -11,7 +11,7 @@
 //! of the connection pool happens at boot in `build_http_client`.
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Request, Response, StatusCode, Version};
 use hyper_util::client::legacy::Client;
@@ -27,7 +27,8 @@ pub use crate::config::XffMode;
 static PROTO_HTTPS: HeaderValue = HeaderValue::from_static("https");
 static PROTO_HTTP: HeaderValue = HeaderValue::from_static("http");
 
-use crate::http_util::ZionBody;
+use crate::http_util::{ReqBody, ZionBody};
+use crate::upstream_body::{BodyCap, Overflow, UpstreamBody};
 
 /// Shared HTTP client type — supports both HTTP/1.1 and HTTP/2 to upstreams.
 /// Plain HTTP upstreams use HttpConnector; HTTPS upstreams negotiate H2 via ALPN.
@@ -37,7 +38,7 @@ pub type HttpClient = Client<
             hyper_util::client::legacy::connect::HttpConnector<crate::dns::StaleOnErrorResolver>,
         >,
     >,
-    ZionBody,
+    UpstreamBody,
 >;
 
 fn counting<C>(inner: C) -> CountingConnector<C> {
@@ -521,7 +522,7 @@ fn apply_forwarding_hygiene<B>(
 #[inline]
 pub async fn proxy_pass(
     client: &HttpClient,
-    req: Request<ZionBody>,
+    req: Request<ReqBody>,
     scheme: &hyper::http::uri::Scheme,
     authority: &hyper::http::uri::Authority,
     remote_addr: Option<SocketAddr>,
@@ -648,11 +649,11 @@ fn scrub_response_hop_by_hop(headers: &mut hyper::HeaderMap) {
 #[inline]
 async fn send_request_try(
     client: &HttpClient,
-    req: Request<ZionBody>,
+    req: Request<ReqBody>,
 ) -> Result<Response<ZionBody>, hyper_util::client::legacy::Error> {
     let upstream = req.uri().authority().cloned();
     let upstream_start = std::time::Instant::now();
-    let result = client.request(req).await;
+    let result = client.request(req.map(UpstreamBody::plain)).await;
     crate::metrics::METRICS
         .upstream_duration
         .observe(upstream_start.elapsed());
@@ -678,7 +679,7 @@ async fn send_request_try(
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_pass_ha(
     client: &HttpClient,
-    req: Request<ZionBody>,
+    req: Request<ReqBody>,
     pool: &[String],
     default_scheme: &hyper::http::uri::Scheme,
     default_authority: &hyper::http::uri::Authority,
@@ -711,16 +712,20 @@ pub async fn proxy_pass_ha(
     // bounds apply before failover, so a rejected body never becomes N upstream
     // attempts either.
     let (parts, body) = req.into_parts();
-    let limited = Limited::new(body, MAX_HA_REPLAY_BODY);
-    let body_bytes = match tokio::time::timeout(HA_BODY_COLLECT_TIMEOUT, limited.collect()).await {
-        Ok(Ok(c)) => c.to_bytes(),
-        // `Limited` surfaces overflow as a boxed `LengthLimitError`; any other
-        // collect error is a broken client stream → 400. Distinguish so an
-        // operator sees "too large" separately from "client hung up".
-        Ok(Err(e))
-            if e.downcast_ref::<http_body_util::LengthLimitError>()
-                .is_some() =>
-        {
+    // A route's `max_body_mb` lower than the replay ceiling bounds the buffer too.
+    let limit = parts
+        .extensions
+        .get::<BodyCap>()
+        .map_or(MAX_HA_REPLAY_BODY, |c| {
+            usize::try_from(c.0).map_or(MAX_HA_REPLAY_BODY, |c| c.min(MAX_HA_REPLAY_BODY))
+        });
+    let read = crate::upstream_body::read_capped(body, limit as u64);
+    let body_bytes = match tokio::time::timeout(HA_BODY_COLLECT_TIMEOUT, read).await {
+        Ok(Ok(b)) => b,
+        // Overflow is a `BodyTooLarge`; any other read error is a broken client
+        // stream → 400. Distinguish so an operator sees "too large" separately
+        // from "client hung up".
+        Ok(Err(e)) if e.is::<crate::upstream_body::BodyTooLarge>() => {
             return Ok(simple_status(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "413 Payload Too Large",
@@ -782,7 +787,7 @@ pub async fn proxy_pass_ha(
             Err(_) => (default_scheme.clone(), default_authority.clone()),
         };
 
-        let mut attempt: Request<ZionBody> = Request::new(
+        let mut attempt: Request<ReqBody> = Request::new(
             Full::new(body_bytes.clone())
                 .map_err(|never| match never {})
                 .boxed(),
@@ -905,7 +910,7 @@ pub async fn proxy_pass_bytes(
     proto: &str,
     xff_mode: XffMode,
 ) -> Result<Response<ZionBody>, hyper::Error> {
-    let body: ZionBody = Full::new(body_bytes)
+    let body: ReqBody = Full::new(body_bytes)
         .map_err(|never| match never {})
         .boxed();
     let req = Request::from_parts(parts, body);
@@ -920,7 +925,7 @@ pub async fn proxy_pass_bytes(
 #[inline]
 pub async fn proxy_pass_stream(
     client: &HttpClient,
-    req: Request<ZionBody>,
+    req: Request<ReqBody>,
     scheme: &hyper::http::uri::Scheme,
     authority: &hyper::http::uri::Authority,
     remote_addr: Option<SocketAddr>,
@@ -930,9 +935,8 @@ pub async fn proxy_pass_stream(
     let Some(req) = prepare_request(req, scheme, authority, remote_addr, proto, xff_mode) else {
         return Ok(bad_gateway());
     };
-    let (parts, body) = req.into_parts();
-    let req = Request::from_parts(parts, body);
     let upstream = req.uri().authority().cloned();
+    let (req, overflow) = upstream_request(req);
 
     match client.request(req).await {
         Ok(resp) => {
@@ -951,6 +955,7 @@ pub async fn proxy_pass_stream(
                 watch_upstream_body(body, upstream),
             ))
         }
+        Err(_) if overflow.as_ref().is_some_and(Overflow::happened) => Ok(body_too_large()),
         Err(e) => {
             crate::logging::warn("proxy", &format!("stream proxy error: {e}"));
             Ok(Response::builder()
@@ -991,6 +996,24 @@ const MAX_HA_REPLAY_BODY: usize = 16 * 1024 * 1024;
 /// reaching `MAX_HA_REPLAY_BODY`.
 const HA_BODY_COLLECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The request as the upstream client takes it. A body the body gate marked with a
+/// [`BodyCap`] is counted against it, and the [`Overflow`] says afterwards whether it went past.
+fn upstream_request(req: Request<ReqBody>) -> (Request<UpstreamBody>, Option<Overflow>) {
+    let (parts, body) = req.into_parts();
+    match parts.extensions.get::<BodyCap>() {
+        Some(&BodyCap(limit)) => {
+            let (body, overflow) = UpstreamBody::capped(body, limit);
+            (Request::from_parts(parts, body), Some(overflow))
+        }
+        None => (Request::from_parts(parts, UpstreamBody::plain(body)), None),
+    }
+}
+
+/// The answer to a body that went past the route's `max_body_mb` while it was streamed.
+fn body_too_large() -> Response<ZionBody> {
+    simple_status(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large")
+}
+
 /// Internal: send a prepared request through the shared client.
 #[inline]
 /// `upstream=<scheme://authority> trace_id=<32 hex>` for a log line about this upstream
@@ -1019,7 +1042,7 @@ fn upstream_context_of(uri: &hyper::Uri, traceparent: Option<&HeaderValue>) -> S
 
 async fn send_request(
     client: &HttpClient,
-    req: Request<ZionBody>,
+    req: Request<ReqBody>,
 ) -> Result<Response<ZionBody>, hyper::Error> {
     // The text is only for the error and timeout log lines: keep what it is made of (cheap
     // reference-counted clones) and build it there, not on every request.
@@ -1027,6 +1050,7 @@ async fn send_request(
     let context = || upstream_context_of(&ctx_uri, ctx_trace.as_ref());
     let upstream = req.uri().authority().cloned();
     let deadline = request_timeout(&req);
+    let (req, overflow) = upstream_request(req);
     let upstream_start = std::time::Instant::now();
     match tokio::time::timeout(deadline, client.request(req)).await {
         Ok(Ok(resp)) => {
@@ -1040,6 +1064,8 @@ async fn send_request(
                 watch_upstream_body(body, upstream),
             ))
         }
+        // The client's body went past the route's cap: the client's fault, not the upstream's.
+        Ok(Err(_)) if overflow.as_ref().is_some_and(Overflow::happened) => Ok(body_too_large()),
         Ok(Err(e)) => {
             crate::metrics::METRICS
                 .upstream_duration
@@ -1062,14 +1088,16 @@ async fn send_request(
 
 /// Proxy a WebSocket upgrade. Connects to upstream, performs the HTTP Upgrade
 /// handshake, returns 101 to client, and spawns a bidirectional byte pipe.
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_websocket(
-    mut req: Request<ZionBody>,
+    mut req: Request<ReqBody>,
     on_client_upgrade: hyper::upgrade::OnUpgrade,
     scheme: &hyper::http::uri::Scheme,
     authority: &hyper::http::uri::Authority,
     remote_addr: Option<SocketAddr>,
     proto: &str,
     xff_mode: XffMode,
+    limits: WsLimits,
 ) -> Result<Response<ZionBody>, hyper::Error> {
     // The handshake goes over a bare HTTP/1.1 connection (below), which sends the request
     // as given: it adds no `Host` and writes an absolute URI as is. So the request target
@@ -1196,7 +1224,7 @@ pub async fn proxy_websocket(
             let _ = conn.with_upgrades().await;
         });
 
-        return send_ws_upgrade(&mut sender, req, on_client_upgrade).await;
+        return send_ws_upgrade(&mut sender, req, on_client_upgrade, limits).await;
     }
 
     // Plain TCP path (non-TLS upstreams)
@@ -1214,15 +1242,16 @@ pub async fn proxy_websocket(
         let _ = conn.with_upgrades().await;
     });
 
-    send_ws_upgrade(&mut sender, req, on_client_upgrade).await
+    send_ws_upgrade(&mut sender, req, on_client_upgrade, limits).await
 }
 
 /// Common WebSocket upgrade exchange — send the upgrade request, check for 101,
 /// spawn bidirectional pipe. Shared between plain TCP and TLS upstream paths.
 async fn send_ws_upgrade(
-    sender: &mut hyper::client::conn::http1::SendRequest<ZionBody>,
-    req: Request<ZionBody>,
+    sender: &mut hyper::client::conn::http1::SendRequest<ReqBody>,
+    req: Request<ReqBody>,
     on_client_upgrade: hyper::upgrade::OnUpgrade,
+    limits: WsLimits,
 ) -> Result<Response<ZionBody>, hyper::Error> {
     // Send the upgrade request to upstream
     let upstream_resp = match sender.send_request(req).await {
@@ -1287,11 +1316,7 @@ async fn send_ws_upgrade(
         )
         .unwrap();
 
-    // Spawn bidirectional pipe with activity-aware idle timeout.
-    // - Idle timeout: 5 minutes of zero traffic in either direction.
-    // - Max session:  24 hours wall-clock as a safety valve.
-    // The previous implementation only had the 24h cap, allowing idle
-    // connections to hold resources indefinitely (Slowloris-style exhaustion).
+    // Spawn the bidirectional pipe, bounded by `limits` (see `ws_pipe`).
     tokio::spawn(async move {
         // Bound the upgrade handoff itself. `on_client_upgrade` normally
         // resolves near-instantly (right after the 101 is written), but a
@@ -1308,27 +1333,142 @@ async fn send_ws_upgrade(
                 // `upstream_upgraded` and freeing its FD.
                 _ => return,
             };
-        let mut c = hyper_util::rt::TokioIo::new(client_upgraded);
-        let mut u = hyper_util::rt::TokioIo::new(upstream_upgraded);
-
-        let max_session = std::time::Duration::from_secs(24 * 60 * 60);
-        let idle_timeout = std::time::Duration::from_secs(5 * 60);
-
-        let session_deadline = tokio::time::Instant::now() + max_session;
-
-        let ws_pipe = async {
-            // copy_bidirectional runs until either side closes or errors.
-            // The idle timeout tears down completely silent sessions.
-            let _ =
-                tokio::time::timeout(idle_timeout, tokio::io::copy_bidirectional(&mut c, &mut u))
-                    .await;
-        };
-
-        // Cap total session at the absolute deadline.
-        let _ = tokio::time::timeout_at(session_deadline, ws_pipe).await;
+        let c = hyper_util::rt::TokioIo::new(client_upgraded);
+        let u = hyper_util::rt::TokioIo::new(upstream_upgraded);
+        ws_pipe(c, u, limits).await;
     });
 
     Ok(resp)
+}
+
+/// `[server] websocket_idle_secs` default: five minutes of silence.
+pub const DEFAULT_WS_IDLE_SECS: u64 = 5 * 60;
+/// `[server] websocket_max_session_secs` default: one day.
+pub const DEFAULT_WS_MAX_SESSION_SECS: u64 = 24 * 60 * 60;
+
+/// How long a proxied WebSocket session may stay open, from `[server]
+/// websocket_idle_secs` / `websocket_max_session_secs`. `None` = no limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WsLimits {
+    /// Silence in both directions after which the session is closed.
+    pub idle: Option<std::time::Duration>,
+    /// Total lifetime of the session, traffic or not.
+    pub max_session: Option<std::time::Duration>,
+}
+
+impl WsLimits {
+    /// From the config's seconds, where `0` = no limit.
+    pub fn from_secs(idle_secs: u64, max_session_secs: u64) -> Self {
+        let limit = |secs: u64| (secs > 0).then(|| std::time::Duration::from_secs(secs));
+        Self {
+            idle: limit(idle_secs),
+            max_session: limit(max_session_secs),
+        }
+    }
+}
+
+/// Copy bytes both ways between the client and the upstream until one side
+/// closes, the session has been silent for `limits.idle`, or it has lasted
+/// `limits.max_session`. Silence is measured from the last byte read from either
+/// side, so a session that carries traffic is never cut by the idle limit.
+async fn ws_pipe<C, U>(client: C, upstream: U, limits: WsLimits)
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let epoch = tokio::time::Instant::now();
+    let last_read_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut c = ActivityIo {
+        io: client,
+        epoch,
+        last_read_ms: last_read_ms.clone(),
+    };
+    let mut u = ActivityIo {
+        io: upstream,
+        epoch,
+        last_read_ms: last_read_ms.clone(),
+    };
+
+    let idle_watch = async {
+        let Some(idle) = limits.idle else {
+            return std::future::pending().await;
+        };
+        loop {
+            let last = std::time::Duration::from_millis(
+                last_read_ms.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            // A deadline past what `Instant` can hold never comes.
+            let Some(deadline) = epoch.checked_add(last).and_then(|t| t.checked_add(idle)) else {
+                return std::future::pending().await;
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep_until(deadline).await;
+        }
+    };
+
+    let pipe = async {
+        tokio::select! {
+            _ = tokio::io::copy_bidirectional(&mut c, &mut u) => {}
+            _ = idle_watch => {}
+        }
+    };
+
+    match limits.max_session {
+        Some(max) => {
+            let _ = tokio::time::timeout(max, pipe).await;
+        }
+        None => pipe.await,
+    }
+}
+
+/// An IO that records, in `last_read_ms` (ms since `epoch`), when it last read a byte.
+struct ActivityIo<T> {
+    io: T,
+    epoch: tokio::time::Instant,
+    last_read_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ActivityIo<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.io).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            let now = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.last_read_ms
+                .store(now, std::sync::atomic::Ordering::Relaxed);
+        }
+        poll
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ActivityIo<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+    }
 }
 
 #[cfg(test)]
@@ -1438,7 +1578,7 @@ mod tests {
             )
             .unwrap();
         let started = std::time::Instant::now();
-        let _ = tokio::time::timeout(cap, client.request(req)).await;
+        let _ = tokio::time::timeout(cap, client.request(req.map(UpstreamBody::plain))).await;
         started.elapsed()
     }
 
@@ -1672,7 +1812,7 @@ mod tests {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let oversized = vec![0u8; MAX_HA_REPLAY_BODY + 1];
-        let body: ZionBody = Full::new(Bytes::from(oversized))
+        let body: ReqBody = Full::new(Bytes::from(oversized))
             .map_err(|never| match never {})
             .boxed();
         let req = Request::builder()
@@ -1951,5 +2091,107 @@ mod tests {
         let e = UpstreamTls::load(None, Some("/no/c.pem"), Some("/no/k.pem")).unwrap_err();
         assert!(e.contains("client certificate"), "{e}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ── WebSocket session limits ──
+    //
+    // Paused time: each test runs hours of virtual time in milliseconds, and the
+    // close instant is exact. `client` / `upstream` are the peers' ends of the pipe.
+
+    mod ws_limits {
+        use super::super::{ws_pipe, WsLimits};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+        use tokio::task::JoinHandle;
+        use tokio::time::{sleep, Instant};
+
+        fn start(limits: WsLimits) -> (DuplexStream, DuplexStream, JoinHandle<Duration>) {
+            let (c, client) = tokio::io::duplex(64);
+            let (u, upstream) = tokio::io::duplex(64);
+            let t0 = Instant::now();
+            let pipe = tokio::spawn(async move {
+                ws_pipe(c, u, limits).await;
+                t0.elapsed()
+            });
+            (client, upstream, pipe)
+        }
+
+        /// One byte from `from`, read at `to`, through the pipe.
+        async fn one_byte(from: &mut DuplexStream, to: &mut DuplexStream) {
+            from.write_all(b"x").await.expect("pipe still open");
+            let mut b = [0u8; 1];
+            to.read_exact(&mut b).await.expect("byte crosses the pipe");
+        }
+
+        fn assert_closed_at(lasted: Duration, secs: u64) {
+            let want = Duration::from_secs(secs);
+            assert!(
+                lasted >= want && lasted < want + Duration::from_millis(10),
+                "session lasted {lasted:?}, expected {want:?}"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_session_with_client_traffic_outlives_the_idle_limit() {
+            let (mut client, mut upstream, pipe) = start(WsLimits::from_secs(300, 86_400));
+            for _ in 0..20 {
+                sleep(Duration::from_secs(60)).await;
+                one_byte(&mut client, &mut upstream).await;
+            }
+            // 20 minutes in, four times the idle limit, and still open.
+            assert!(!pipe.is_finished());
+            // Then silence: closed 300 s after the last byte.
+            assert_closed_at(pipe.await.unwrap(), 20 * 60 + 300);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn traffic_from_the_upstream_alone_also_keeps_it_open() {
+            let (mut client, mut upstream, pipe) = start(WsLimits::from_secs(300, 86_400));
+            for _ in 0..20 {
+                sleep(Duration::from_secs(60)).await;
+                one_byte(&mut upstream, &mut client).await;
+            }
+            assert!(!pipe.is_finished());
+            assert_closed_at(pipe.await.unwrap(), 20 * 60 + 300);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_silent_session_is_closed_at_the_idle_limit() {
+            let (_client, _upstream, pipe) = start(WsLimits::from_secs(300, 86_400));
+            assert_closed_at(pipe.await.unwrap(), 300);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_session_cap_closes_a_busy_session() {
+            let (mut client, mut upstream, pipe) = start(WsLimits::from_secs(300, 600));
+            let feeder = tokio::spawn(async move {
+                loop {
+                    sleep(Duration::from_secs(60)).await;
+                    if client.write_all(b"x").await.is_err() {
+                        break;
+                    }
+                    let mut b = [0u8; 1];
+                    if upstream.read_exact(&mut b).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            assert_closed_at(pipe.await.unwrap(), 600);
+            feeder.await.unwrap();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn with_both_limits_off_only_a_peer_ends_the_session() {
+            let (client, mut upstream, pipe) = start(WsLimits::from_secs(0, 0));
+            sleep(Duration::from_secs(30 * 24 * 60 * 60)).await;
+            assert!(!pipe.is_finished());
+            // The client goes away; the upstream reads the end and closes too, as a
+            // server does (the pipe keeps a half-closed session open until both have).
+            drop(client);
+            let mut rest = Vec::new();
+            upstream.read_to_end(&mut rest).await.unwrap();
+            drop(upstream);
+            assert_closed_at(pipe.await.unwrap(), 30 * 24 * 60 * 60);
+        }
     }
 }

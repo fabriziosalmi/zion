@@ -104,7 +104,7 @@ annotation, no emission).
 | `add_header Content-Security-Policy ...` | convert | `route.csp` |
 | `add_header Strict-Transport-Security ...` | auto | Zion injects HSTS (+XCTO, XFO, Referrer-Policy, Permissions-Policy) on every response; differing values cannot be honored → finding |
 | `set_real_ip_from` / `real_ip_header` | convert | `server.trusted_proxies` CIDRs / `xff_mode` (non-XFF headers like `CF-Connecting-IP`: unsupported finding) |
-| `client_max_body_size 64m` | partial | `[waf_profile.imported]` `max_body_mb = 64` + attach to routes; footgun stated: the cap is enforced only via the WAF path, which adds inspection the nginx config didn't have (`waf_shadow = true` is the migration-safe stance) |
+| `client_max_body_size 64m` | convert (since route-level `max_body_mb`, #693) | `max_body_mb = 64` on each route it covers, inherited `http{}` → `server{}` → `location{}`; none in scope → nginx's default, `max_body_mb = 1`; `0` → no cap. A size that is not whole MB is rounded up: partial, with the range that now passes. Before, every cap went to one shared `[waf_profile.imported]` (the largest won) attached in shadow mode, and an `http{}`-level cap was dropped |
 | `limit_req` / `limit_conn` | partial | exactly one distinct policy in the file → `server.rate_limit_rps`/`window` / `max_connections_per_ip` with a scope-widening note (global in Zion, per-location in nginx); multiple distinct policies → unsupported findings, none applied |
 | `return 301 https://$host$request_uri` (port-80 server) | auto | Zion's `:80` handler is exactly this; the redirect server is dropped |
 | other `return` / `rewrite` / `if` / `map` / `set` | unsupported | no rewrite engine by design |

@@ -1,6 +1,6 @@
 [package]
 name = "zion"
-version = "0.13.0"
+version = "0.13.1"
 edition = "2021"
 # MSRV is the *core* default-features build (TLS proxy + WAF + cache + metrics).
 # Opt-in features (acme, auth, init, http3) pull crypto/i18n crates that have
@@ -272,6 +272,9 @@ tls-fingerprint = ["dep:sha2"]
 
 # Track C — property-based testing (proptest) only used by `cargo test`.
 [dev-dependencies]
+# Paused virtual time for the timeout tests (the WebSocket session limits). Same
+# crate as the runtime dependency: no new code in the build.
+tokio = { version = "1", features = ["test-util"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 # Criterion microbench harness (issue #54). Pinned to 0.5; the `html_reports`
 # default feature is dropped — we publish a JSON baseline (target/criterion/

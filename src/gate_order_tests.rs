@@ -12,7 +12,7 @@
 
 use crate::config::ZionConfig;
 use crate::dispatch::process_request;
-use crate::http_util::ZionBody;
+use crate::http_util::ReqBody;
 use crate::state::AppState;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -103,7 +103,7 @@ fn state(rate_limit_rps: u32) -> Arc<AppState> {
     st
 }
 
-fn req(method: Method, uri: &str, headers: &[(&str, &str)]) -> Request<ZionBody> {
+fn req(method: Method, uri: &str, headers: &[(&str, &str)]) -> Request<ReqBody> {
     let mut b = Request::builder().method(method).uri(uri);
     for (k, v) in headers {
         b = b.header(*k, *v);
@@ -113,7 +113,7 @@ fn req(method: Method, uri: &str, headers: &[(&str, &str)]) -> Request<ZionBody>
 }
 
 /// Status the pipeline answers with.
-async fn status(st: &Arc<AppState>, from: &str, r: Request<ZionBody>, early: bool) -> u16 {
+async fn status(st: &Arc<AppState>, from: &str, r: Request<ReqBody>, early: bool) -> u16 {
     let addr: SocketAddr = from.parse().unwrap();
     process_request(r, st.clone(), addr, early)
         .await
@@ -270,6 +270,74 @@ async fn dot_segments_and_duplicate_slashes_cannot_dodge_a_route() {
     // an internal client is not blocked by any of them (it reaches the, dead, upstream)
     for p in ["/open/../internal/x", "//internal/x"] {
         assert_ne!(get(&st, INTERNAL, p).await, 403, "{p}");
+    }
+}
+
+/// A catch-all route also owns its prefix with a trailing slash. matchit's catch-all needs a
+/// non-empty rest, so `/admin/` (and `/admin//`, normalized to it) used to fall through from
+/// `/admin/{*rest}` to a broader `/{*rest}` route and be served under that route's policy:
+/// past `internal_only`, past a WAF profile.
+#[tokio::test]
+async fn a_trailing_slash_cannot_carry_a_request_out_of_a_catch_all_route() {
+    let toml = r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstreams]
+live = "http://127.0.0.1:9"
+[[route]]
+path = "/admin/{*rest}"
+upstream = "live"
+internal_only = true
+[[route]]
+path = "/api/{*rest}"
+upstream = "live"
+waf = true
+[[route]]
+path = "/{*rest}"
+upstream = "live"
+"#;
+    let cfg: ZionConfig = toml::from_str(toml).expect("test config parses");
+    let st = AppState::for_tests(&cfg);
+
+    for p in ["/admin", "/admin/", "/admin//", "/admin/x"] {
+        assert_eq!(
+            get(&st, EXTERNAL, p).await,
+            403,
+            "{p} is the internal route"
+        );
+        assert_ne!(
+            get(&st, INTERNAL, p).await,
+            403,
+            "{p}: an internal client passes"
+        );
+    }
+    // control: the fallback route is not internal-only
+    assert_ne!(get(&st, EXTERNAL, "/administrator").await, 403);
+
+    let injection = |path: &str| {
+        Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(
+                Full::new(Bytes::from_static(
+                    b"q=1' UNION SELECT username,password FROM users--",
+                ))
+                .map_err(|n| match n {})
+                .boxed(),
+            )
+            .unwrap()
+    };
+    for p in ["/api", "/api/", "/api/x"] {
+        assert_eq!(
+            status(&st, EXTERNAL, injection(p), false).await,
+            400,
+            "{p} is scanned by the WAF route"
+        );
     }
 }
 
@@ -492,6 +560,180 @@ async fn upstream_availability_answers_before_auth() {
     // a route with an auth profile and a dead upstream: no token, yet 503 not 401
     assert_eq!(get(&st, EXTERNAL, "/down-authed/x").await, 503);
     assert_eq!(get(&st, EXTERNAL, "/down/x").await, 503);
+}
+
+// ── a route's own restrictions: methods, content_types, deny_paths (#693) ───
+
+fn restricted_state() -> Arc<AppState> {
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstreams]
+live = "http://127.0.0.1:9"
+dead = "{DEAD}"
+[[route]]
+path = "/restricted/{{*rest}}"
+upstream = "live"
+methods = ["GET", "POST"]
+content_types = ["application/json"]
+deny_paths = ["/restricted/batch/{{*rest}}"]
+[[route]]
+path = "/restricted-internal/{{*rest}}"
+upstream = "live"
+internal_only = true
+methods = ["GET"]
+[[route]]
+path = "/restricted-down/{{*rest}}"
+upstream = "dead"
+methods = ["GET"]
+[[route]]
+path = "/restricted-cors/{{*rest}}"
+upstream = "live"
+methods = ["GET"]
+[route.cors]
+allowed_origins = ["https://app.example"]
+"#
+    );
+    let cfg: ZionConfig = toml::from_str(&toml).expect("test config parses");
+    let st = AppState::for_tests(&cfg);
+    st.cfg()
+        .health_map
+        .get(DEAD)
+        .expect("dead upstream is in the health map")
+        .healthy
+        .store(false, Ordering::Relaxed);
+    st
+}
+
+fn with_body(
+    method: Method,
+    uri: &str,
+    content_type: &str,
+    body: &'static [u8],
+) -> Request<ReqBody> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", content_type)
+        .body(
+            Full::new(Bytes::from_static(body))
+                .map_err(|n| match n {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_route_restrictions_refuse_through_the_pipeline() {
+    let st = restricted_state();
+    let json = || with_body(Method::POST, "/restricted/x", "application/json", b"{}");
+    // what the route allows goes on to the upstream (127.0.0.1:9 refuses: a 5xx, not a 4xx)
+    let passed = status(&st, EXTERNAL, json(), false).await;
+    assert!(
+        passed >= 500,
+        "an allowed request is not refused by the route: {passed}"
+    );
+    assert!(get(&st, EXTERNAL, "/restricted/x").await >= 500);
+
+    // deny_paths: 403, with and without the trailing slash, whatever the method
+    for p in [
+        "/restricted/batch",
+        "/restricted/batch/",
+        "/restricted/batch//",
+        "/restricted/batch/v1",
+    ] {
+        let r = with_body(Method::POST, p, "application/json", b"{}");
+        assert_eq!(status(&st, EXTERNAL, r, false).await, 403, "{p}");
+    }
+
+    // methods: 405 with the Allow header (GET brings HEAD)
+    let resp = process_request(
+        req(Method::DELETE, "/restricted/x", &[]),
+        st.clone(),
+        EXTERNAL.parse().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 405);
+    assert_eq!(resp.headers()["allow"], "GET, HEAD, POST");
+
+    // content_types: 415 for a body of another type, the PHP2Shell and React2Shell shapes included
+    for ct in [
+        "multipart/form-data; boundary=x",
+        "text/x-component",
+        "application/x-www-form-urlencoded",
+    ] {
+        let r = with_body(Method::POST, "/restricted/x", ct, b"--x");
+        assert_eq!(status(&st, EXTERNAL, r, false).await, 415, "{ct}");
+    }
+}
+
+#[tokio::test]
+async fn internal_only_answers_before_the_route_restrictions() {
+    let st = restricted_state();
+    let delete = || req(Method::DELETE, "/restricted-internal/x", &[]);
+    assert_eq!(status(&st, EXTERNAL, delete(), false).await, 403);
+    assert_eq!(status(&st, INTERNAL, delete(), false).await, 405);
+}
+
+#[tokio::test]
+async fn the_route_restrictions_answer_before_upstream_selection() {
+    let st = restricted_state();
+    // the upstream is down (would be 503) but the method is not one the route serves: 405
+    let delete = req(Method::DELETE, "/restricted-down/x", &[]);
+    assert_eq!(status(&st, EXTERNAL, delete, false).await, 405);
+    assert_eq!(get(&st, EXTERNAL, "/restricted-down/x").await, 503);
+}
+
+#[tokio::test]
+async fn a_cors_preflight_is_answered_on_a_route_that_does_not_list_options() {
+    let st = restricted_state();
+    let pre = req(
+        Method::OPTIONS,
+        "/restricted-cors/x",
+        &[("origin", "https://app.example")],
+    );
+    assert_eq!(status(&st, EXTERNAL, pre, false).await, 204);
+    // without an Origin it is a plain OPTIONS, and the route does not serve it
+    let plain = req(Method::OPTIONS, "/restricted-cors/x", &[]);
+    assert_eq!(status(&st, EXTERNAL, plain, false).await, 405);
+}
+
+#[tokio::test]
+async fn a_reload_that_adds_route_restrictions_applies_to_the_next_request() {
+    use crate::state::ResolvedAppConfig;
+    let st = state(0);
+    let delete = || req(Method::DELETE, "/open/x", &[]);
+    assert_ne!(status(&st, EXTERNAL, delete(), false).await, 405, "control");
+
+    let restricted = config_toml(0).replace(
+        "[[route]]\npath = \"/open/{*rest}\"\nupstream = \"live\"\n",
+        "[[route]]\npath = \"/open/{*rest}\"\nupstream = \"live\"\nmethods = [\"GET\"]\n",
+    );
+    assert_ne!(
+        restricted,
+        config_toml(0),
+        "the replacement must have applied"
+    );
+    let cfg: ZionConfig = toml::from_str(&restricted).unwrap();
+    st.config
+        .store(Arc::new(ResolvedAppConfig::try_build(&cfg, 1024).unwrap()));
+    assert_eq!(status(&st, EXTERNAL, delete(), false).await, 405);
+
+    let cfg: ZionConfig = toml::from_str(&config_toml(0)).unwrap();
+    st.config
+        .store(Arc::new(ResolvedAppConfig::try_build(&cfg, 1024).unwrap()));
+    assert_ne!(
+        status(&st, EXTERNAL, delete(), false).await,
+        405,
+        "gone again"
+    );
 }
 
 #[cfg(feature = "auth")]

@@ -188,6 +188,76 @@ When `internal_only = true`, requests from non-private IPs receive `403 Forbidde
 - `169.254.0.0/16` (link-local)
 - `::1` (IPv6 loopback)
 
+## Request restrictions (per-route)
+
+Three keys narrow what a route accepts. None needs a WAF profile, and a route that sets none of
+them is unchanged.
+
+```toml
+[[route]]
+path = "/wp-json/{*rest}"
+upstream = "wordpress"
+methods = ["GET", "POST"]
+content_types = ["application/json"]
+deny_paths = ["/wp-json/batch/{*rest}"]
+```
+
+| Key | Refuses | With |
+|---|---|---|
+| `deny_paths` | a request whose path matches one of these patterns | `403 Forbidden` |
+| `methods` | a method not in the list | `405 Method Not Allowed`, with an `Allow` header |
+| `content_types` | a request body whose `Content-Type` is not one of these media types | `415 Unsupported Media Type` |
+
+- **`deny_paths`** uses the `path` syntax above, written in full from the root: `"/wp-json/batch/{*rest}"`
+  denies `/wp-json/batch`, `/wp-json/batch/` and everything under it. The pattern is matched
+  against the normalized path, like the route itself.
+- **`methods`** lists methods in capitals, from those zion accepts at all: `GET`, `HEAD`, `POST`,
+  `PUT`, `PATCH`, `DELETE`, `OPTIONS`. `GET` brings `HEAD` with it (RFC 9110 §9.3.2). A CORS
+  preflight is answered before this check, so a route with `cors` does not need to list `OPTIONS`.
+- **`content_types`** lists bare media types (`"application/json"`, no parameters, no wildcards).
+  The match ignores case and parameters (`application/json; charset=utf-8` is
+  `application/json`), and `application/jsonp` is not `application/json`. Only a request that
+  carries a body is checked: a `GET`, or a `POST` with an empty body, needs no `Content-Type`. A
+  body with no `Content-Type` is refused.
+
+The checks run in that order, once the route is known: after CORS and `internal_only`, before an
+upstream is chosen, authentication and the WAF. A refused request costs no upstream work.
+An empty list (`methods = []`) is a config error, as is an unknown method or a malformed media
+type or pattern. The keys apply on reload, to the next request.
+
+## Request body (per-route)
+
+Two keys bound the request body on a route without a WAF. A route that sets neither streams the
+body to the upstream as it arrives, at any size.
+
+```toml
+[[route]]
+path = "/upload/{*rest}"
+upstream = "app"
+max_body_mb = 50
+require_content_length = true
+```
+
+- **`max_body_mb`** caps the body. A body that declares a larger length (`Content-Length`) is
+  answered `413 Payload Too Large` before any of it is read, and nothing reaches the upstream. A
+  body without a declared length (chunked HTTP/1.1, HTTP/2 or HTTP/3 without `Content-Length`) is
+  streamed to the upstream and counted: at the byte that goes past the cap, zion aborts the
+  request to the upstream, which sees a broken body and never a short one that looks complete,
+  and answers `413`. On a route with a WAF, the cap is the WAF's (`max_body_mb` with `waf = true`,
+  or the profile's own); `max_body_mb` next to a `waf_profile` is a config error.
+- **`require_content_length`** sends every body to the upstream with `Content-Length`, never
+  chunked. A body without a declared length is read whole first, within `max_body_mb` (10 MB when
+  the route sets none) and 60 seconds, then forwarded with the length it turned out to have:
+  `413` past the cap, `408` past the time. A body that declares its length is streamed as it is.
+  It is for an upstream that mishandles chunked bodies. Each body it reads is held in memory, up to
+  the cap, while the request lasts.
+
+A client that is still sending when zion answers `413` gets the answer. Over HTTP/1.1, after
+answering a request whose body it did not read to the end, zion reads and drops what the client
+still sends until the client closes, for at most 10 seconds (2 seconds without a byte), then
+closes the connection; nginx calls this a lingering close. Over HTTP/2 only that request's stream
+is closed.
+
 ## Content-Security-Policy (per-route)
 
 You can set a per-route `Content-Security-Policy` header:
