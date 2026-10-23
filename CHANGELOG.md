@@ -4,6 +4,18 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-23
+
+**Per-route request hardening, and three defaults that change what reaches your upstreams.** A route can now refuse methods, body types, sub-paths, oversized bodies, path shapes and named headers or cookies without a WAF profile. Read the upgrade notes before you upgrade: a body cap that used to be ignored now applies, a `;` in the path is refused, and some request headers are no longer forwarded.
+
+### Upgrade notes
+
+- **`max_body_mb` on a route without a WAF now caps the body** (#693). It used to be ignored there, with a boot warning. A route that sets it and receives larger bodies starts answering `413`: raise the value or remove it.
+- **A `;` in the path is answered `400`** (#696). An application that puts `;jsessionid=` or other path parameters in its URLs needs `allow_path_params = true` on its route. A backslash (`\`, `%5C`) or `%00` in the path is always `400`.
+- **`Upgrade` (outside a WebSocket handshake), `HTTP2-Settings` and `X-Middleware-Subrequest` are no longer forwarded, and a request header named `__proto__` or `constructor` is answered `400`** (#695). No setting turns these off.
+- **`request_timeout_ms` still counts the time a client takes to send its body**, but a timeout while zion waits for that body is now answered `408` and no longer opens the upstream's circuit. Large uploads over slow links may still need a higher `request_timeout_ms`; #714 tracks separate timeouts.
+- New keys, all optional: `methods`, `content_types`, `deny_paths`, `require_content_length`, `allow_path_params`, `refuse_encoded_slash` on a route; `strip_headers`, `deny_headers`, `deny_cookies` in `[server]` and on a route. No setting was removed or renamed.
+
 ### Added
 
 - **A route can refuse methods, request body types and sub-paths without a WAF profile** (#693). `methods = ["GET", "POST"]` answers any other method with `405` and an `Allow` header (`GET` brings `HEAD`); `content_types = ["application/json"]` answers a request body of any other type with `415`; `deny_paths = ["/wp-json/batch/{*rest}"]` answers those paths inside the route with `403`. Until now the method allowlist was global and the only per-route content-type check sat inside a WAF profile. The checks run once the route is known, after CORS (a preflight is still answered) and `internal_only`, and before an upstream is chosen, so a refused request costs no upstream work. They answer request shapes of exploited CVEs at the edge: `text/x-component` to a React Server Function (CVE-2025-55182) and a `multipart/form-data` body on a route that takes JSON are `415`, the WordPress REST batch route is a `deny_paths` entry. Tests through the real request pipeline pin each status and the gate order, and fail when the gate is removed or moved before CORS or `internal_only`, or when any one of the three checks is disabled. Applied on reload, to the next request.
