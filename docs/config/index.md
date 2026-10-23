@@ -208,6 +208,8 @@ circuit, its failure re-opens it. Values shown are the defaults.
 - A failure is a `502`, `503` or `504` (what a refused connection, a timeout or an overloaded
   origin become). A `500` is the application's own error on one endpoint, and 4xx are the
   client's: neither counts.
+  A client that breaks its own upload on the way (it resets mid-body) is answered `400`, not
+  `502`, so it does not count either.
 - It applies to a route whose upstream has a **single** endpoint. A pool of several already
   fails over between its members.
 - It is consulted after auth and the WAF, so an unauthenticated or hostile request can neither
