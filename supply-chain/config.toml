@@ -62,6 +62,10 @@ criteria = "safe-to-deploy"
 version = "1.9.2"
 criteria = "safe-to-deploy"
 
+[[exemptions.arc-swap]]
+version = "1.9.3"
+criteria = "safe-to-deploy"
+
 [[exemptions.asn1-rs]]
 version = "0.7.1"
 criteria = "safe-to-deploy"
@@ -610,6 +614,10 @@ criteria = "safe-to-deploy"
 version = "0.2.190"
 criteria = "safe-to-deploy"
 
+[[exemptions.libc]]
+version = "0.2.191"
+criteria = "safe-to-deploy"
+
 [[exemptions.libloading]]
 version = "0.8.9"
 criteria = "safe-to-deploy"
@@ -770,20 +778,40 @@ criteria = "safe-to-deploy"
 version = "0.33.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.opentelemetry]]
+version = "0.33.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.opentelemetry-otlp]]
 version = "0.33.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.opentelemetry-otlp]]
+version = "0.33.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry-proto]]
 version = "0.33.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.opentelemetry-proto]]
+version = "0.33.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.opentelemetry-semantic-conventions]]
 version = "0.33.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.opentelemetry-semantic-conventions]]
+version = "0.33.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.opentelemetry_sdk]]
 version = "0.33.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.opentelemetry_sdk]]
+version = "0.33.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.palette]]
@@ -1122,6 +1150,10 @@ criteria = "safe-to-deploy"
 version = "1.0.151"
 criteria = "safe-to-deploy"
 
+[[exemptions.serde_json]]
+version = "1.0.154"
+criteria = "safe-to-deploy"
+
 [[exemptions.serde_repr]]
 version = "0.1.20"
 criteria = "safe-to-deploy"
@@ -1254,6 +1286,10 @@ criteria = "safe-to-deploy"
 version = "1.53.2"
 criteria = "safe-to-deploy"
 
+[[exemptions.tokio]]
+version = "1.53.3"
+criteria = "safe-to-deploy"
+
 [[exemptions.tokio-macros]]
 version = "2.7.0"
 criteria = "safe-to-deploy"
@@ -1346,28 +1382,56 @@ criteria = "safe-to-deploy"
 version = "0.22.4"
 criteria = "safe-to-deploy"
 
+[[exemptions.tract-core]]
+version = "0.22.5"
+criteria = "safe-to-deploy"
+
 [[exemptions.tract-data]]
 version = "0.22.4"
+criteria = "safe-to-deploy"
+
+[[exemptions.tract-data]]
+version = "0.22.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.tract-hir]]
 version = "0.22.4"
 criteria = "safe-to-deploy"
 
+[[exemptions.tract-hir]]
+version = "0.22.5"
+criteria = "safe-to-deploy"
+
 [[exemptions.tract-linalg]]
 version = "0.22.4"
+criteria = "safe-to-deploy"
+
+[[exemptions.tract-linalg]]
+version = "0.22.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.tract-nnef]]
 version = "0.22.4"
 criteria = "safe-to-deploy"
 
+[[exemptions.tract-nnef]]
+version = "0.22.5"
+criteria = "safe-to-deploy"
+
 [[exemptions.tract-onnx]]
 version = "0.22.4"
 criteria = "safe-to-deploy"
 
+[[exemptions.tract-onnx]]
+version = "0.22.5"
+criteria = "safe-to-deploy"
+
 [[exemptions.tract-onnx-opl]]
 version = "0.22.4"
+criteria = "safe-to-deploy"
+
+[[exemptions.tract-onnx-opl]]
+version = "0.22.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.transpose]]
