@@ -538,6 +538,16 @@ pub struct ServerConfig {
     /// An unknown value is refused when the file is read.
     #[serde(default)]
     pub xff_mode: XffMode,
+    /// Request headers removed before any request is forwarded, on every route (a route's
+    /// own `strip_headers` adds to them). See [`crate::header_policy`].
+    #[serde(default)]
+    pub strip_headers: Vec<String>,
+    /// Request headers that get a request refused with `400`, on every route.
+    #[serde(default)]
+    pub deny_headers: Vec<String>,
+    /// Cookie names that get a request refused with `400`, on every route.
+    #[serde(default)]
+    pub deny_cookies: Vec<String>,
 }
 
 /// The highest `max_connections` accepted: each connection is a file descriptor and at
@@ -1369,6 +1379,12 @@ struct RawRoute {
     allow_path_params: bool,
     #[serde(default)]
     refuse_encoded_slash: bool,
+    #[serde(default)]
+    strip_headers: Vec<String>,
+    #[serde(default)]
+    deny_headers: Vec<String>,
+    #[serde(default)]
+    deny_cookies: Vec<String>,
 }
 
 /// What a route serves. The two arms carry disjoint data, so a static route cannot
@@ -1493,6 +1509,10 @@ pub struct RouteConfig {
 
     /// Refuse (400) a path that carries an encoded slash (`%2F`).
     pub refuse_encoded_slash: bool,
+
+    /// `strip_headers`, `deny_headers` and `deny_cookies` of this route (they add to the
+    /// `[server]` ones).
+    pub headers: crate::header_policy::HeaderLists,
 }
 
 impl RouteConfig {
@@ -1610,6 +1630,12 @@ impl TryFrom<RawRoute> for RouteConfig {
             r.content_types,
             r.deny_paths,
         )?;
+        let headers = crate::header_policy::HeaderLists::build(
+            &format!("route '{path}'"),
+            r.strip_headers,
+            r.deny_headers,
+            r.deny_cookies,
+        )?;
 
         Ok(Self {
             path,
@@ -1627,6 +1653,7 @@ impl TryFrom<RawRoute> for RouteConfig {
             require_content_length: r.require_content_length,
             allow_path_params: r.allow_path_params,
             refuse_encoded_slash: r.refuse_encoded_slash,
+            headers,
         })
     }
 }
@@ -1965,6 +1992,9 @@ fn semantic_errors(config: &ZionConfig) -> Vec<String> {
     check_routes(config, &mut errors);
     check_upstream_urls(config, &mut errors);
     check_internal_networks_and_admin(config, &mut errors);
+    if let Err(e) = global_header_lists(config) {
+        errors.push(e);
+    }
     check_tls_client_auth(config, &mut errors);
     #[cfg(any(feature = "geo-ita", feature = "geo-eu", feature = "sovereign-aimp"))]
     check_sovereign(config, &mut errors);
@@ -2514,6 +2544,18 @@ fn check_upstream_urls(config: &ZionConfig, errors: &mut Vec<String>) {
             }
         }
     }
+}
+
+/// `[server] strip_headers`, `deny_headers` and `deny_cookies`, validated.
+pub fn global_header_lists(
+    config: &ZionConfig,
+) -> Result<crate::header_policy::HeaderLists, String> {
+    crate::header_policy::HeaderLists::build(
+        "[server]",
+        config.server.strip_headers.clone(),
+        config.server.deny_headers.clone(),
+        config.server.deny_cookies.clone(),
+    )
 }
 
 /// `[server] internal_networks` and `[admin]`.

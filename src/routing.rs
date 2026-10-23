@@ -77,6 +77,8 @@ pub struct ResolvedRoute {
     pub allow_path_params: bool,
     /// `refuse_encoded_slash`.
     pub refuse_encoded_slash: bool,
+    /// The request headers and cookies the route strips or refuses: built in, `[server]`, its own.
+    pub headers: crate::header_policy::HeaderPolicy,
 }
 
 impl ResolvedRoute {
@@ -607,6 +609,10 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
         require_content_length: route.require_content_length,
         allow_path_params: route.allow_path_params,
         refuse_encoded_slash: route.refuse_encoded_slash,
+        headers: crate::header_policy::HeaderPolicy::merge(
+            &crate::config::global_header_lists(config)?,
+            &route.headers,
+        ),
     }))
 }
 
@@ -763,6 +769,7 @@ waf = true
             require_content_length: false,
             allow_path_params: false,
             refuse_encoded_slash: false,
+            headers: Default::default(),
         }
     }
 

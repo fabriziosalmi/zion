@@ -46,6 +46,9 @@ in the CHANGELOG), together with a reader for the version it replaces.
 | `h2_control_frames_per_sec` | u32 | `0` | HTTP/2 control frames one connection may send in a second before it is closed with `GOAWAY(ENHANCE_YOUR_CALM)`: `PING`, `SETTINGS`, `PRIORITY`, empty `DATA`, frames of a type the server skips, and `RST_STREAM`s beyond the streams the client opened (cancelling requests is free). `WINDOW_UPDATE`s have their own rule, on when this is set: 1,000 a second plus one per 256 bytes of response written to the client in that second. `0` = no limit: the frames are only counted, and `zion_h2_control_frames_peak` shows the highest rate a connection reached, which is what to read before choosing a value (`1000` is over 300 times what curl, nghttp, h2load and Chrome send, but **not** what grpc-go sends on a fast link: with gRPC in front of zion read the peak first, or leave it at `0`). `1`..`9` is a config error. Applies to every way into HTTP/2 (ALPN `h2`, or the preface on either listener). Retuned on reload for new connections. See [Hardening](/security/hardening#http-2-control-frame-floods) |
 | `log_queue_lines` | usize | `8192` | Log lines that can wait for stderr (written or not yet written: the cap counts both the queue and the batch being written). Lines are written in batches, so a line reaches stderr a couple of milliseconds after it is logged, and a process killed outright (SIGKILL, power loss) can lose the last few; a clean shutdown and a panic flush the queue first. Logging never blocks a request: when stderr is slower than the log rate (a stalled journald, a full container log driver) the newest lines are dropped, counted in `zion_log_lines_dropped_total`, and announced on stderr once it moves again. `0` = write synchronously (a stalled stderr then stalls the request that logged). Read at start-up |
 | `xff_mode` | string | `"append"` | Outbound XFF policy: `"append"`, `"rewrite"` (strip inbound, emit one trusted entry), or `"drop"`; any other value is a config error |
+| `strip_headers` | string[] | `[]` | Request headers removed before forwarding, on every route; a route's own list adds to it. `X-Middleware-Subrequest` and `HTTP2-Settings` are always removed, and `Upgrade` except on a WebSocket handshake. See [headers and cookies you strip or refuse](./routing#headers-and-cookies-you-strip-or-refuse) |
+| `deny_headers` | string[] | `[]` | Request headers that get a request refused with `400`, on every route. `__proto__` and `constructor` always are |
+| `deny_cookies` | string[] | `[]` | Cookie names that get a request refused with `400`, on every route |
 | `log_format` | string | `"text"` | `"text"` or `"json"` (structured); any other value is a config error |
 
 ### `Via` and loop detection
@@ -275,6 +278,7 @@ circuit, its failure re-opens it. Values shown are the defaults.
 | `require_content_length` | bool | `false` | Send every body upstream with `Content-Length`: one without a declared length is read whole first, within `max_body_mb` (10 MB if unset) |
 | `allow_path_params` | bool | `false` | Accept a `;` in the path (`;jsessionid=`), refused with `400` otherwise. The path with the parameters stripped must still match this route. See [bytes servers disagree on](./routing#bytes-servers-disagree-on) |
 | `refuse_encoded_slash` | bool | `false` | Refuse a path that carries `%2F` with `400` |
+| `strip_headers`, `deny_headers`, `deny_cookies` | string[] | `[]` | The route's own header and cookie lists; they add to the `[server]` ones |
 
 ## `[[route]]` → `cors`
 
