@@ -219,6 +219,52 @@ fn normalize_path(req: &mut Request<ReqBody>) -> Option<Response<ZionBody>> {
         .map(|()| empty_response(StatusCode::BAD_REQUEST))
 }
 
+/// Gate, once the route is known: what the path may carry on it (#696). The answer, or
+/// `None` to let the request through:
+///   * `400` for an encoded slash (`%2F`) on a route that sets `refuse_encoded_slash`;
+///   * `400` for a `;` on a route that does not set `allow_path_params`;
+///   * with `allow_path_params`, `400` when the path with its parameters stripped matches
+///     another route (or none), and `403` when it is one of the route's `deny_paths`.
+///     Tomcat reads `/app/admin;x/secret` as `/app/admin/secret`: the parameters must not
+///     take a request out of `/app/admin/{*rest}`'s policy and into `/app/{*rest}`'s.
+///
+/// Shared by the HTTPS pipeline and the ACME fallback of the :80 handler, which forwards on
+/// its own. The path is the normalized one, where an escape has upper-case hex.
+pub(crate) fn path_shape<B>(
+    cfg: &ResolvedAppConfig,
+    rule: &Arc<ResolvedRoute>,
+    req: &Request<B>,
+) -> Option<Response<ZionBody>> {
+    let path = req.uri().path();
+    if rule.refuse_encoded_slash && path.contains("%2F") {
+        return Some(empty_response(StatusCode::BAD_REQUEST));
+    }
+    let stripped = crate::uri_norm::without_path_params(path)?;
+    if !rule.allow_path_params {
+        return Some(empty_response(StatusCode::BAD_REQUEST));
+    }
+    let host = if cfg.router.host_routing_active() {
+        crate::security::request_host(req)
+    } else {
+        None
+    };
+    let same_route = cfg
+        .router
+        .at(host.as_deref(), &stripped)
+        .is_some_and(|other| Arc::ptr_eq(other, rule));
+    if !same_route {
+        return Some(empty_response(StatusCode::BAD_REQUEST));
+    }
+    if rule
+        .restrictions
+        .as_ref()
+        .is_some_and(|r| r.denies_path(&stripped))
+    {
+        return Some(empty_response(StatusCode::FORBIDDEN));
+    }
+    None
+}
+
 /// Gate: HTTP method whitelist.
 fn method_whitelist(req: &Request<ReqBody>) -> Option<Response<ZionBody>> {
     // Gate: HTTP method whitelist (block TRACE/CONNECT/exotic methods)

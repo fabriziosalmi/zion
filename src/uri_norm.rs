@@ -18,7 +18,15 @@
 //!   * runs of `/` collapse to one (`//a///b` → `/a/b`).
 //!
 //! A trailing slash is preserved. An encoded slash (`%2F`) is left alone: it is data, not a
-//! separator, and decoding it would change what the request means.
+//! separator, and decoding it would change what the request means (a route can still refuse
+//! it, `refuse_encoded_slash`).
+//!
+//! Some bytes are refused (400) whatever the route, because servers disagree on them and no
+//! honest path needs them: a backslash, raw or encoded (`\`, `%5C`), which Windows servers
+//! read as a separator, and an encoded NUL (`%00`), which ends the path for a C
+//! string. A `;` starts path parameters (`/admin;x`, `..;/`) that Tomcat and Jetty strip
+//! before they read the path: it is refused unless the route sets
+//! `allow_path_params`, see [`without_path_params`].
 
 use std::borrow::Cow;
 
@@ -185,13 +193,46 @@ pub fn sorted_query(query: &str) -> Cow<'_, str> {
 /// differently by zion and by the upstream. Such a path is refused, not iterated on: the
 /// number of passes an adversarial path can demand grows with its length, and a path a
 /// client writes honestly always reaches its canonical form in one.
+///
+/// `None` too when the normalized path carries a byte no route accepts (see
+/// [`has_refused_bytes`]). The check reads the normalized form, where every escape has
+/// upper-case hex, so `%5c` and an escape completed by the pass (`%%35C`) are both seen.
 pub fn try_normalize_path(path: &str) -> Option<Cow<'_, str>> {
     let out = normalize_path(path);
-    if matches!(out, Cow::Borrowed(_)) || is_normal(&out) {
-        Some(out)
-    } else {
-        None
+    if !(matches!(out, Cow::Borrowed(_)) || is_normal(&out)) || has_refused_bytes(&out) {
+        return None;
     }
+    Some(out)
+}
+
+/// A backslash (`\` or `%5C`) or an encoded NUL (`%00`) in a normalized path. A raw NUL never
+/// gets here: the request line parser refuses it.
+fn has_refused_bytes(path: &str) -> bool {
+    let b = path.as_bytes();
+    b.iter().enumerate().any(|(i, &c)| match c {
+        b'\\' => true,
+        b'%' => matches!(b.get(i + 1..i + 3), Some(b"5C" | b"00")),
+        _ => false,
+    })
+}
+
+/// The path as a server that strips path parameters reads it, or `None` when `path` has no
+/// `;`. Each segment loses everything from its first `;` (`/a;x/b;y=1` → `/a/b`), then the
+/// result is normalized, because a segment that was `..;x` or `;x` is now a dot segment or
+/// an empty one: `/app/..;/admin` → `/admin`.
+///
+/// A route that sets `allow_path_params` is still only reached when this path and the path as
+/// written match the same route, so the parameters cannot move a request to another route's
+/// policy.
+pub fn without_path_params(path: &str) -> Option<String> {
+    if !path.contains(';') {
+        return None;
+    }
+    let stripped: Vec<&str> = path
+        .split('/')
+        .map(|seg| seg.split_once(';').map_or(seg, |(name, _)| name))
+        .collect();
+    Some(normalize_slow(&stripped.join("/")))
 }
 
 /// Rewrite `req`'s URI to its normalized path (query untouched). `Ok(())` when the request
@@ -420,6 +461,49 @@ mod tests {
             a.sort();
             b.sort();
             assert_eq!(a, b, "{s}: same parameters, only reordered");
+        }
+    }
+
+    #[test]
+    fn backslashes_and_encoded_nul_are_refused_whatever_their_spelling() {
+        for p in [
+            "/a\\b",
+            "/a%5Cb",
+            "/a%5cb",
+            "/..%5c..%5cwindows",
+            "/a%00",
+            "/a%00.jpg",
+            "/a/%%35C",   // the pass completes the escape: the upstream would read `%5C`
+            "/a/%%30%30", // and here `%00`
+        ] {
+            assert_eq!(try_normalize_path(p), None, "{p}");
+        }
+        // what only looks like them is data
+        for p in ["/a%255C", "/a%2500", "/a%5", "/a%0", "/a%50C", "/a%1000"] {
+            assert!(try_normalize_path(p).is_some(), "{p}");
+        }
+    }
+
+    #[test]
+    fn path_parameters_are_stripped_segment_by_segment_then_normalized() {
+        assert_eq!(
+            without_path_params("/a/b"),
+            None,
+            "no `;`: nothing to compare"
+        );
+        for (i, o) in [
+            ("/admin;x", "/admin"),
+            ("/a;x/b;y=1", "/a/b"),
+            ("/app/..;/admin", "/admin"),
+            ("/app/.;x/admin", "/app/admin"),
+            ("/app/;x/admin", "/app/admin"),
+            ("/app/page.jsp;jsessionid=ABC", "/app/page.jsp"),
+            ("/app/;jsessionid=ABC", "/app/"),
+            ("/;x", "/"),
+            ("/a;x;y/b", "/a/b"),
+            ("/a%3Bx/b;y", "/a%3Bx/b"), // an encoded `;` is data, not a parameter
+        ] {
+            assert_eq!(without_path_params(i).as_deref(), Some(o), "{i}");
         }
     }
 

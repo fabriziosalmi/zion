@@ -1792,6 +1792,28 @@ async fn the_port_80_acme_fallback_strips_them_too() {
     }
 }
 
+/// It forwards only a path the route accepts (#696): a `;` on a route that does not allow path
+/// parameters goes to the HTTPS redirect, not to the upstream.
+#[tokio::test]
+async fn the_port_80_acme_fallback_forwards_no_path_the_route_refuses() {
+    let (o, st) = rig("").await;
+    for p in [
+        "/.well-known/acme-challenge/..;/admin",
+        "/.well-known/acme-challenge/tok;x",
+    ] {
+        let resp = crate::accept::handle_http(
+            get(p, &[]),
+            st.clone(),
+            "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(resp.status().is_redirection(), "{p}: {}", resp.status());
+        let _ = resp.into_body().collect().await;
+    }
+    assert_eq!(hits(&o), 0, "nothing was forwarded");
+}
+
 /// HTTP/2 carries the host in the URI authority and sends no Host header, and a hostless request
 /// has neither: a client-supplied X-Forwarded-Host must not survive in either case.
 #[tokio::test]

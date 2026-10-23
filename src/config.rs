@@ -1365,6 +1365,10 @@ struct RawRoute {
     deny_paths: Option<Vec<String>>,
     #[serde(default)]
     require_content_length: bool,
+    #[serde(default)]
+    allow_path_params: bool,
+    #[serde(default)]
+    refuse_encoded_slash: bool,
 }
 
 /// What a route serves. The two arms carry disjoint data, so a static route cannot
@@ -1481,6 +1485,14 @@ pub struct RouteConfig {
     /// `Content-Length`) whole, within the route's body cap, and send it to the upstream with
     /// `Content-Length`.
     pub require_content_length: bool,
+
+    /// Accept a `;` in the path (path parameters, `;jsessionid=`). Refused (400) otherwise,
+    /// and even with it a request is refused when its path with the parameters stripped
+    /// matches another route (see [`crate::uri_norm::without_path_params`]).
+    pub allow_path_params: bool,
+
+    /// Refuse (400) a path that carries an encoded slash (`%2F`).
+    pub refuse_encoded_slash: bool,
 }
 
 impl RouteConfig {
@@ -1613,6 +1625,8 @@ impl TryFrom<RawRoute> for RouteConfig {
             cors: r.cors,
             restrictions,
             require_content_length: r.require_content_length,
+            allow_path_params: r.allow_path_params,
+            refuse_encoded_slash: r.refuse_encoded_slash,
         })
     }
 }
