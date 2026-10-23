@@ -12,7 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod common;
-use common::free_port;
+use common::{free_port, wait_for_log};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef-write-token";
 
@@ -393,8 +393,11 @@ fn a_revocation_survives_a_restart() {
 
     // Restart: the list comes back from the file before anything is served.
     let run2 = start(&cfg, &dir, port, "run2.log");
-    let log = fs::read_to_string(dir.join("run2.log")).unwrap();
-    assert!(log.contains("1 revoked token id(s) loaded"), "{log}");
+    wait_for_log(
+        &dir.join("run2.log"),
+        "1 revoked token id(s) loaded",
+        Duration::from_secs(10),
+    );
     // The in-memory list already holds the first id: a second one makes two.
     let (st, body) = http(
         port,
