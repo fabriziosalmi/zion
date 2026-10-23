@@ -208,6 +208,8 @@ circuit, its failure re-opens it. Values shown are the defaults.
 - A failure is a `502`, `503` or `504` (what a refused connection, a timeout or an overloaded
   origin become). A `500` is the application's own error on one endpoint, and 4xx are the
   client's: neither counts.
+  A client that breaks its own upload on the way (it resets mid-body) is answered `400`, not
+  `502`, so it does not count either.
 - It applies to a route whose upstream has a **single** endpoint. A pool of several already
   fails over between its members.
 - It is consulted after auth and the WAF, so an unauthenticated or hostile request can neither
@@ -262,10 +264,14 @@ circuit, its failure re-opens it. Values shown are the defaults.
 | `mode` | string | `"standard"` | `standard`, `sse_stream`, `static_cache`, `websocket` |
 | `internal_only` | bool | `false` | Restrict to private/loopback IPs |
 | `public` | bool | `false` | Declare the route deliberately unauthenticated; the explicit opt-out under `require_route_auth`. Cannot be combined with `auth_profile` |
+| `methods` | string[] | none | Methods the route serves; any other is `405` with `Allow`. `GET` brings `HEAD`. See [request restrictions](./routing#request-restrictions-per-route) |
+| `content_types` | string[] | none | Media types a request body may have; any other is `415` |
+| `deny_paths` | string[] | none | Path patterns (route syntax) inside the route that are refused with `403` |
 | `waf_profile` | string | none | Name of WAF profile to apply |
 | `cache_profile` | string | none | Name of cache profile to apply |
 | `waf` | bool | `false` | Legacy: enable WAF with defaults |
-| `max_body_mb` | u64 | `10` | Legacy: override body limit when `waf = true` |
+| `max_body_mb` | u64 | none (`10` with `waf = true`) | Body cap in MB: `413` past it. Without a WAF the body is still streamed; with `waf = true` it is the WAF's cap. See [request body](./routing#request-body-per-route) |
+| `require_content_length` | bool | `false` | Send every body upstream with `Content-Length`: one without a declared length is read whole first, within `max_body_mb` (10 MB if unset) |
 
 ## `[[route]]` → `cors`
 

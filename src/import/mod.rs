@@ -503,8 +503,7 @@ mod tests {
     fn corpus_02_wordpress_body_cap_and_timeouts() {
         let c = convert_fixture("02-wordpress.conf");
         assert!(c.toml.contains("max_body_mb = 64"));
-        assert!(c.toml.contains("waf_profile = \"imported\""));
-        assert!(c.toml.contains("waf_shadow = true"));
+        assert!(!c.toml.contains("waf_profile"), "a body cap needs no WAF");
         assert!(c.toml.contains("connect_timeout_ms = 75000"));
         assert!(c
             .toml
@@ -1253,20 +1252,98 @@ mod tests {
         }
     }
 
+    /// `max_body_mb` of each route of an import, by path and first host.
+    fn body_caps(c: &Conversion) -> Vec<(String, String, Option<i64>)> {
+        let v: toml::Value = toml::from_str(&c.toml).expect("the TOML parses");
+        v["route"]
+            .as_array()
+            .expect("routes")
+            .iter()
+            .map(|r| {
+                let host = r
+                    .get("hosts")
+                    .and_then(|h| h.as_array())
+                    .and_then(|h| h.first())
+                    .and_then(|h| h.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                (
+                    host,
+                    r["path"].as_str().unwrap().to_string(),
+                    r.get("max_body_mb").and_then(|m| m.as_integer()),
+                )
+            })
+            .collect()
+    }
+
     #[test]
-    fn http_level_mappable_directive_gets_truthful_detail() {
-        let c = ok("http { client_max_body_size 64m; \
-             server { listen 80; location / { proxy_pass http://127.0.0.1:1; } } }");
+    fn client_max_body_size_is_each_routes_cap_with_nginx_inheritance() {
+        // http{} → server{} → location{}, each level replacing the one above; 0 is no cap.
+        let c = ok("http { client_max_body_size 2m; \
+             server { listen 80; server_name a.test; \
+               location / { proxy_pass http://127.0.0.1:1; } \
+               location /upload/ { client_max_body_size 10m; proxy_pass http://127.0.0.1:1; } \
+               location /api/ { client_max_body_size 512k; proxy_pass http://127.0.0.1:1; } \
+               location /free/ { client_max_body_size 0; proxy_pass http://127.0.0.1:1; } } \
+             server { listen 80; server_name b.test; client_max_body_size 5m; \
+               location / { proxy_pass http://127.0.0.1:1; } \
+               location /tiny/ { client_max_body_size 1m; proxy_pass http://127.0.0.1:1; } } }");
+        let caps = body_caps(&c);
+        let cap = |host: &str, path: &str| {
+            caps.iter()
+                .find(|(h, p, _)| h == host && p == path)
+                .unwrap_or_else(|| panic!("no route {host} {path}: {caps:?}"))
+                .2
+        };
+        assert_eq!(cap("a.test", "/{*rest}"), Some(2), "from http{{}}");
+        assert_eq!(cap("a.test", "/upload/{*rest}"), Some(10));
+        assert_eq!(cap("a.test", "/api/{*rest}"), Some(1), "512k, rounded up");
+        assert_eq!(cap("a.test", "/free/{*rest}"), None, "0 = unlimited");
+        assert_eq!(cap("b.test", "/{*rest}"), Some(5), "from server{{}}");
+        assert_eq!(cap("b.test", "/tiny/{*rest}"), Some(1));
+        assert!(!c.toml.contains("waf_profile"), "a body cap needs no WAF");
+        // rounding is stated, with the range that now goes through
         assert!(has_finding(
+            &c,
+            Status::Partial,
+            "client_max_body_size",
+            "512k"
+        ));
+        assert!(!has_finding(
             &c,
             Status::Unsupported,
             "client_max_body_size",
-            "move it into the server block"
+            ""
         ));
+        // every level is in scope somewhere: nginx's default is never needed
+        assert!(!has_finding(
+            &c,
+            Status::Convert,
+            "client_max_body_size",
+            "default 1m"
+        ));
+    }
+
+    #[test]
+    fn without_client_max_body_size_a_route_gets_nginxs_default_of_1m() {
+        let c = ok("server { listen 80; server_name a.test; \
+             location / { proxy_pass http://127.0.0.1:1; } \
+             location /big/ { client_max_body_size 50m; proxy_pass http://127.0.0.1:1; } }");
+        let caps = body_caps(&c);
         assert!(
-            !c.toml.contains("max_body_mb"),
-            "http-level cap must not half-apply"
+            caps.contains(&("a.test".into(), "/{*rest}".into(), Some(1))),
+            "{caps:?}"
         );
+        assert!(
+            caps.contains(&("a.test".into(), "/big/{*rest}".into(), Some(50))),
+            "{caps:?}"
+        );
+        assert!(has_finding(
+            &c,
+            Status::Convert,
+            "client_max_body_size",
+            "not set for 1 location(s): nginx's default 1m"
+        ));
     }
 
     #[test]

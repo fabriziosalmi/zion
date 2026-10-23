@@ -7,12 +7,13 @@
 //! changes.
 
 use crate::dispatch::{self, process_request};
-use crate::http_util::{empty_response, text_response, ZionBody, HEX_DIGITS};
+use crate::http_util::{empty_response, text_response, BoxError, ReqBody, ZionBody, HEX_DIGITS};
 use crate::state::AppState;
 #[cfg(feature = "tls-fingerprint")]
 use crate::tls_fp;
 use crate::{
-    acme, bootstrap, drain, h2_guard, logging, logq, metrics, net, proxy, security, uri_norm,
+    acme, bootstrap, drain, h2_guard, linger, logging, logq, metrics, net, proxy, security,
+    uri_norm,
 };
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -146,7 +147,8 @@ async fn handle_http_connection(
         io,
         service_fn(move |req| {
             use http_body_util::BodyExt;
-            let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
+            let req_boxed = req
+                .map(|b: hyper::body::Incoming| b.map_err(|e| -> BoxError { Box::new(e) }).boxed());
             handle_http(req_boxed, state.clone(), addr)
         }),
     );
@@ -478,7 +480,10 @@ fn spawn_https_handler(
         #[cfg(not(all(target_os = "linux", feature = "ktls")))]
         let io = h2_guard::H2Guard::new(tls_stream, h2_limits).http2_was_negotiated(negotiated_h2);
         let (h2_verdict, flood_log_state) = (io.verdict(), state.clone());
-        let io = TokioIo::new(io);
+        // HTTP/1.1: a client still sending a body zion did not read gets the answer (see
+        // `linger`). HTTP/2 ends one stream instead, so its requests never arm it.
+        let armed = linger::Armed::default();
+        let io = TokioIo::new(linger::Linger::new(io, armed.clone()));
         // Connection-level idle timeout. 1h to cover long-lived HTTP/2
         // mux / WebSocket / SSE; per-request timeouts are in process_request.
         let conn = builder.serve_connection_with_upgrades(
@@ -487,6 +492,7 @@ fn spawn_https_handler(
                 let state = state.clone();
                 let early_flag = early_flag.clone();
                 let client_fp = client_fp.clone();
+                let armed = (!negotiated_h2).then(|| armed.clone());
                 #[cfg(feature = "tls-fingerprint")]
                 let tls_fp_identity = tls_fp_identity.clone();
                 async move {
@@ -523,7 +529,12 @@ fn spawn_https_handler(
                     #[cfg(feature = "tls-fingerprint")]
                     tls_fp::apply_headers(&mut req, tls_fp_identity.as_deref());
                     use http_body_util::BodyExt;
-                    let req_boxed = req.map(|b: hyper::body::Incoming| b.boxed());
+                    let req_boxed = req.map(|b: hyper::body::Incoming| match armed {
+                        Some(armed) => linger::ArmOnUnreadBody::new(b, armed)
+                            .map_err(|e| -> BoxError { Box::new(e) })
+                            .boxed(),
+                        None => b.map_err(|e| -> BoxError { Box::new(e) }).boxed(),
+                    });
                     process_request(req_boxed, state, remote_addr, was_early).await
                 }
             }),
@@ -649,7 +660,7 @@ fn https_authority(host: &str, http_port: Option<u16>, https_port: Option<u16>) 
 
 /// HTTP (port 80) handler — ACME challenge proxy or 301 redirect to HTTPS.
 pub(crate) async fn handle_http(
-    mut req: Request<ZionBody>,
+    mut req: Request<ReqBody>,
     state: Arc<AppState>,
     remote_addr: SocketAddr,
 ) -> Result<Response<ZionBody>, hyper::Error> {

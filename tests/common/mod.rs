@@ -27,6 +27,29 @@ pub fn free_port() -> u16 {
     }
 }
 
+/// The daemon's log once it holds `needle`, or panics with the log after `within`.
+///
+/// Log lines reach the file through an asynchronous queue (`src/logq.rs`): a line logged before
+/// a port opens can still be on its way when the port answers, so a test that reads the log once
+/// at that moment fails now and then. Lines printed with `eprintln!` (the boot banner) skip the
+/// queue, which is why the file can already hold later-looking lines.
+#[allow(dead_code)] // not every test binary reads a running daemon's log
+pub fn wait_for_log(path: &std::path::Path, needle: &str, within: std::time::Duration) -> String {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let log = std::fs::read_to_string(path).unwrap_or_default();
+        if log.contains(needle) {
+            return log;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no {needle:?} in {} after {within:?}:\n{log}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// The memory a process holds, in MiB, counting what the system has compressed or swapped
 /// out. The resident size alone will not do: macOS compresses memory that sits idle within
 /// a second, and 3.2 GiB held for a client that does not read showed as 26 MiB resident.

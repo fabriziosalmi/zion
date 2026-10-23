@@ -12,10 +12,10 @@
 //! Changing either without the other fails a test.
 
 use super::{check_rate_limit, early_data_rejected, MAX_URI_LEN};
-use crate::http_util::ZionBody;
 use crate::http_util::{
     empty_response, inject_security_headers, method_not_allowed, text_response,
 };
+use crate::http_util::{ReqBody, ZionBody};
 use crate::metrics;
 use crate::routing::ResolvedRoute;
 use crate::state::{AppState, ResolvedAppConfig};
@@ -97,7 +97,7 @@ pub(super) const PRE_ROUTING: &[Gate] = &[
 pub(super) async fn run_pre_routing(
     ctx: &PreCtx,
     state: &Arc<AppState>,
-    req: &mut Request<ZionBody>,
+    req: &mut Request<ReqBody>,
 ) -> Option<Response<ZionBody>> {
     for gate in PRE_ROUTING {
         let answer = match gate {
@@ -145,7 +145,7 @@ pub(crate) fn uri_too_long<B>(req: &Request<B>) -> bool {
 }
 
 /// Gate: URI length (reject oversized URIs before routing).
-fn uri_length(req: &Request<ZionBody>) -> Option<Response<ZionBody>> {
+fn uri_length(req: &Request<ReqBody>) -> Option<Response<ZionBody>> {
     uri_too_long(req).then(|| empty_response(StatusCode::URI_TOO_LONG))
 }
 
@@ -154,7 +154,7 @@ fn uri_length(req: &Request<ZionBody>) -> Option<Response<ZionBody>> {
 #[cfg(feature = "auth")]
 pub(super) fn bearer_auth(
     rule: &ResolvedRoute,
-    req: &mut Request<ZionBody>,
+    req: &mut Request<ReqBody>,
 ) -> Option<Response<ZionBody>> {
     if let Some(ref auth_profile) = rule.auth {
         let auth_header = req
@@ -213,14 +213,14 @@ pub(super) fn bearer_auth(
 /// Routing, `internal_only`, the WAF and auth profiles, the cache key and the path sent
 /// upstream must all read the same path, or `/open/../internal/x` matches the open route
 /// and still reaches `/internal/x` (see `uri_norm`). The query string is left as written.
-fn normalize_path(req: &mut Request<ZionBody>) -> Option<Response<ZionBody>> {
+fn normalize_path(req: &mut Request<ReqBody>) -> Option<Response<ZionBody>> {
     crate::uri_norm::rewrite_request(req)
         .err()
         .map(|()| empty_response(StatusCode::BAD_REQUEST))
 }
 
 /// Gate: HTTP method whitelist.
-fn method_whitelist(req: &Request<ZionBody>) -> Option<Response<ZionBody>> {
+fn method_whitelist(req: &Request<ReqBody>) -> Option<Response<ZionBody>> {
     // Gate: HTTP method whitelist (block TRACE/CONNECT/exotic methods)
     if !matches!(
         *req.method(),
@@ -240,7 +240,7 @@ fn method_whitelist(req: &Request<ZionBody>) -> Option<Response<ZionBody>> {
 }
 
 /// Gate: 0-RTT replay protection.
-fn early_data(ctx: &PreCtx, req: &Request<ZionBody>) -> Option<Response<ZionBody>> {
+fn early_data(ctx: &PreCtx, req: &Request<ReqBody>) -> Option<Response<ZionBody>> {
     let is_early_data = ctx.is_early_data;
     // Gate: 0-RTT replay protection (RFC 8470 — 425 Too Early).
     // TLS 1.3 early data is inherently replay-vulnerable. Only idempotent
@@ -257,7 +257,7 @@ fn early_data(ctx: &PreCtx, req: &Request<ZionBody>) -> Option<Response<ZionBody
 
 /// Gate: a request that already went through this process is bouncing between hops
 /// (an upstream that points back at us); refuse it instead of feeding the loop.
-fn loop_detection(req: &Request<ZionBody>) -> Option<Response<ZionBody>> {
+fn loop_detection(req: &Request<ReqBody>) -> Option<Response<ZionBody>> {
     if !crate::via::is_loop(req.headers()) {
         return None;
     }
@@ -286,7 +286,7 @@ fn rate_limit(ctx: &PreCtx, state: &Arc<AppState>) -> Option<Response<ZionBody>>
 async fn sovereign_class(
     ctx: &PreCtx,
     state: &Arc<AppState>,
-    req: &mut Request<ZionBody>,
+    req: &mut Request<ReqBody>,
 ) -> Option<Response<ZionBody>> {
     let (cfg, client_ip) = (&ctx.cfg, ctx.client_ip);
     // ── Sovereign Edge: IP classification (zero cost when feature is off or disabled) ──
@@ -336,7 +336,7 @@ async fn sovereign_class(
 
 /// Gate: JA4 per-fingerprint route restriction.
 #[cfg(feature = "tls-fingerprint")]
-fn tls_fingerprint(ctx: &PreCtx, req: &Request<ZionBody>) -> Option<Response<ZionBody>> {
+fn tls_fingerprint(ctx: &PreCtx, req: &Request<ReqBody>) -> Option<Response<ZionBody>> {
     let cfg = &ctx.cfg;
     // ── JA4 per-fingerprint route restriction (#27 follow-up) ──
     //
@@ -374,7 +374,7 @@ fn tls_fingerprint(ctx: &PreCtx, req: &Request<ZionBody>) -> Option<Response<Zio
 async fn mesh_score(
     ctx: &PreCtx,
     state: &Arc<AppState>,
-    req: &mut Request<ZionBody>,
+    req: &mut Request<ReqBody>,
 ) -> Option<Response<ZionBody>> {
     let client_ip = ctx.client_ip;
     #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
@@ -433,7 +433,7 @@ async fn mesh_score(
 pub(super) fn builtin_endpoint(
     ctx: &PreCtx,
     state: &Arc<AppState>,
-    req: &Request<ZionBody>,
+    req: &Request<ReqBody>,
 ) -> Option<Response<ZionBody>> {
     let (cfg, client_ip) = (&ctx.cfg, ctx.client_ip);
     // ── Built-in health endpoints (no routing, no upstream) ──
@@ -603,7 +603,7 @@ pub(super) fn builtin_endpoint(
 /// or a refused origin).
 pub(super) fn cors_gate(
     rule: &ResolvedRoute,
-    req: &Request<ZionBody>,
+    req: &Request<ReqBody>,
 ) -> (
     Option<hyper::header::HeaderValue>,
     Option<Response<ZionBody>>,
