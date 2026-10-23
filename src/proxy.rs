@@ -28,7 +28,7 @@ static PROTO_HTTPS: HeaderValue = HeaderValue::from_static("https");
 static PROTO_HTTP: HeaderValue = HeaderValue::from_static("http");
 
 use crate::http_util::{ReqBody, ZionBody};
-use crate::upstream_body::{BodyCap, Overflow, UpstreamBody};
+use crate::upstream_body::{BodyCap, BodyFault, UpstreamBody};
 
 /// Shared HTTP client type — supports both HTTP/1.1 and HTTP/2 to upstreams.
 /// Plain HTTP upstreams use HttpConnector; HTTPS upstreams negotiate H2 via ALPN.
@@ -936,7 +936,7 @@ pub async fn proxy_pass_stream(
         return Ok(bad_gateway());
     };
     let upstream = req.uri().authority().cloned();
-    let (req, overflow) = upstream_request(req);
+    let (req, fault) = upstream_request(req);
 
     match client.request(req).await {
         Ok(resp) => {
@@ -955,7 +955,8 @@ pub async fn proxy_pass_stream(
                 watch_upstream_body(body, upstream),
             ))
         }
-        Err(_) if overflow.as_ref().is_some_and(Overflow::happened) => Ok(body_too_large()),
+        Err(_) if fault.too_large() => Ok(body_too_large()),
+        Err(_) if fault.broken() => Ok(client_body_broken()),
         Err(e) => {
             crate::logging::warn("proxy", &format!("stream proxy error: {e}"));
             Ok(Response::builder()
@@ -997,21 +998,26 @@ const MAX_HA_REPLAY_BODY: usize = 16 * 1024 * 1024;
 const HA_BODY_COLLECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The request as the upstream client takes it. A body the body gate marked with a
-/// [`BodyCap`] is counted against it, and the [`Overflow`] says afterwards whether it went past.
-fn upstream_request(req: Request<ReqBody>) -> (Request<UpstreamBody>, Option<Overflow>) {
+/// [`BodyCap`] is counted against it, and the [`BodyFault`] says afterwards whether it went past
+/// or the client broke it.
+fn upstream_request(req: Request<ReqBody>) -> (Request<UpstreamBody>, BodyFault) {
     let (parts, body) = req.into_parts();
-    match parts.extensions.get::<BodyCap>() {
-        Some(&BodyCap(limit)) => {
-            let (body, overflow) = UpstreamBody::capped(body, limit);
-            (Request::from_parts(parts, body), Some(overflow))
-        }
-        None => (Request::from_parts(parts, UpstreamBody::plain(body)), None),
-    }
+    let cap = parts.extensions.get::<BodyCap>().map(|c| c.0);
+    let (body, fault) = UpstreamBody::watched(body, cap);
+    (Request::from_parts(parts, body), fault)
 }
 
 /// The answer to a body that went past the route's `max_body_mb` while it was streamed.
 fn body_too_large() -> Response<ZionBody> {
     simple_status(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large")
+}
+
+/// The answer to a body the client broke while it was streamed: a `400`, as when it breaks
+/// while zion reads it whole. The client is usually gone and never reads it; what matters is
+/// that the access log, the metrics and the circuit breaker see the client's fault, not a `502`
+/// from a healthy upstream.
+fn client_body_broken() -> Response<ZionBody> {
+    simple_status(StatusCode::BAD_REQUEST, "400 Bad Request")
 }
 
 /// Internal: send a prepared request through the shared client.
@@ -1050,7 +1056,7 @@ async fn send_request(
     let context = || upstream_context_of(&ctx_uri, ctx_trace.as_ref());
     let upstream = req.uri().authority().cloned();
     let deadline = request_timeout(&req);
-    let (req, overflow) = upstream_request(req);
+    let (req, fault) = upstream_request(req);
     let upstream_start = std::time::Instant::now();
     match tokio::time::timeout(deadline, client.request(req)).await {
         Ok(Ok(resp)) => {
@@ -1064,8 +1070,10 @@ async fn send_request(
                 watch_upstream_body(body, upstream),
             ))
         }
-        // The client's body went past the route's cap: the client's fault, not the upstream's.
-        Ok(Err(_)) if overflow.as_ref().is_some_and(Overflow::happened) => Ok(body_too_large()),
+        // The client's body went past the route's cap, or the client broke it on the way: the
+        // client's fault, not the upstream's.
+        Ok(Err(_)) if fault.too_large() => Ok(body_too_large()),
+        Ok(Err(_)) if fault.broken() => Ok(client_body_broken()),
         Ok(Err(e)) => {
             crate::metrics::METRICS
                 .upstream_duration

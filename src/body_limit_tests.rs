@@ -397,3 +397,113 @@ async fn a_request_without_a_body_is_left_alone() {
     assert_eq!(*o.content_length.lock().unwrap(), None);
     assert_eq!(*o.transfer_encoding.lock().unwrap(), None);
 }
+
+// ── a body the client breaks on the way ──────────────────────────────────
+
+/// `len` bytes in 64 KiB frames, then an error: what the pipeline sees of an upload whose client
+/// reset the stream or the connection mid-body.
+fn broken_after(len: usize) -> ReqBody {
+    let mut frames: Vec<Result<Frame<Bytes>, BoxError>> = (0..len.div_ceil(65536))
+        .map(|i| {
+            Ok(Frame::data(Bytes::from(vec![
+                b'x';
+                65536.min(len - i * 65536)
+            ])))
+        })
+        .collect();
+    frames.push(Err("connection reset by the client".into()));
+    StreamBody::new(tokio_stream::iter(frames)).boxed()
+}
+
+#[tokio::test]
+async fn a_body_the_client_breaks_is_the_clients_fault_not_a_502() {
+    let (o, st) = rig().await;
+    for path in ["/open/a", "/capped/a", "/sse-capped/a"] {
+        *o.complete.lock().unwrap() = None;
+        assert_eq!(
+            post(&st, path, &[], broken_after(256 * 1024)).await,
+            400,
+            "{path}: the client broke its body; the upstream did not fail"
+        );
+        // The request is aborted on its way: the origin may see it break or not see it at all
+        // (the abort can come before it has read the head), never as a whole body.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_ne!(
+            *o.complete.lock().unwrap(),
+            Some(true),
+            "{path}: the upstream must not see a short body that looks whole"
+        );
+    }
+}
+
+/// A route whose single upstream has a circuit breaker that opens on 5 failures in 10 s.
+fn guarded_state(port: u16) -> Arc<AppState> {
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+
+[tls]
+cert_path = "/c"
+key_path = "/k"
+
+[upstream.g]
+url = "http://127.0.0.1:{port}"
+circuit_breaker = {{ error_rate_pct = 50, min_requests = 5, window_secs = 10, open_secs = 30 }}
+
+[[route]]
+path = "/{{*rest}}"
+upstream = "g"
+"#
+    );
+    AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"))
+}
+
+async fn get(st: &Arc<AppState>, path: &str) -> u16 {
+    process_request(
+        Request::get(format!("https://zion.test{path}"))
+            .header("host", "zion.test")
+            .body(sized(0))
+            .unwrap(),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap()
+    .status()
+    .as_u16()
+}
+
+#[tokio::test]
+async fn uploads_the_client_breaks_do_not_open_a_healthy_upstreams_circuit() {
+    let o = Arc::new(Origin::default());
+    let st = guarded_state(start_origin(o.clone()).await);
+    for i in 1..=6 {
+        assert_eq!(
+            post(&st, "/upload", &[], broken_after(128 * 1024)).await,
+            400,
+            "broken upload {i}"
+        );
+    }
+    assert_eq!(
+        get(&st, "/").await,
+        200,
+        "the upstream is healthy: its circuit must still be closed"
+    );
+}
+
+#[tokio::test]
+async fn a_dead_upstream_still_opens_its_circuit() {
+    // The control: the same breaker does open on real upstream failures.
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let st = guarded_state(dead);
+    for _ in 0..5 {
+        assert_eq!(post(&st, "/upload", &[], chunked(1024)).await, 502);
+    }
+    assert_eq!(get(&st, "/").await, 503, "five refused connections open it");
+}
