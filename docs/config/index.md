@@ -273,6 +273,8 @@ circuit, its failure re-opens it. Values shown are the defaults.
 | `waf` | bool | `false` | Legacy: enable WAF with defaults |
 | `max_body_mb` | u64 | none (`10` with `waf = true`) | Body cap in MB: `413` past it. Without a WAF the body is still streamed; with `waf = true` it is the WAF's cap. See [request body](./routing#request-body-per-route) |
 | `require_content_length` | bool | `false` | Send every body upstream with `Content-Length`: one without a declared length is read whole first, within `max_body_mb` (10 MB if unset) |
+| `allow_path_params` | bool | `false` | Accept a `;` in the path (`;jsessionid=`), refused with `400` otherwise. The path with the parameters stripped must still match this route. See [bytes servers disagree on](./routing#bytes-servers-disagree-on) |
+| `refuse_encoded_slash` | bool | `false` | Refuse a path that carries `%2F` with `400` |
 
 ## `[[route]]` → `cors`
 

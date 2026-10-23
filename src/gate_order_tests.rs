@@ -753,6 +753,112 @@ async fn waf_answers_before_the_request_is_dispatched() {
     assert_eq!(get(&st, EXTERNAL, q).await, 400);
 }
 
+// ── what a path may carry: backslashes, NUL, `;`, `%2F` (#696) ───────────────
+
+fn path_shape_state() -> Arc<AppState> {
+    let toml = r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstreams]
+live = "http://127.0.0.1:9"
+[[route]]
+path = "/{*rest}"
+upstream = "live"
+[[route]]
+path = "/app/{*rest}"
+upstream = "live"
+allow_path_params = true
+deny_paths = ["/app/private/{*rest}"]
+[[route]]
+path = "/app/admin/{*rest}"
+upstream = "live"
+internal_only = true
+[[route]]
+path = "/files/{*rest}"
+upstream = "live"
+refuse_encoded_slash = true
+[[route]]
+path = "/hosted/{*rest}"
+hosts = ["a.example"]
+upstream = "live"
+allow_path_params = true
+"#;
+    let cfg: ZionConfig = toml::from_str(toml).expect("test config parses");
+    AppState::for_tests(&cfg)
+}
+
+#[tokio::test]
+async fn a_backslash_or_an_encoded_nul_is_refused_before_routing() {
+    let st = path_shape_state();
+    for p in [
+        "/a\\b",
+        "/a%5Cb",
+        "/a%5cb",
+        "/..%5C..%5Cwin.ini",
+        "/a%00.jpg",
+        "/app/x%00",
+    ] {
+        assert_eq!(get(&st, EXTERNAL, p).await, 400, "{p}");
+    }
+}
+
+#[tokio::test]
+async fn a_semicolon_is_refused_on_a_route_that_does_not_allow_path_params() {
+    let st = path_shape_state();
+    for p in ["/admin;x", "/a/..;/b", "/x;jsessionid=1", "/files/a;b"] {
+        assert_eq!(get(&st, EXTERNAL, p).await, 400, "{p}");
+    }
+    // in the query, or encoded, it is data: the request goes on (127.0.0.1:9 refuses: 5xx)
+    for p in ["/x?a;b", "/x/a%3Bb", "/app/x?a;b"] {
+        assert!(get(&st, EXTERNAL, p).await >= 500, "{p}");
+    }
+}
+
+#[tokio::test]
+async fn path_params_cannot_carry_a_request_into_another_routes_policy() {
+    let st = path_shape_state();
+    // they stay on the route that allows them: the request goes on
+    for p in [
+        "/app/page.jsp;jsessionid=ABC",
+        "/app/;jsessionid=ABC",
+        "/app/a;v=1/b;v=2",
+    ] {
+        assert!(get(&st, EXTERNAL, p).await >= 500, "{p}");
+    }
+    // stripped, they name another route (an internal_only one, the root) or none: 400
+    for p in [
+        "/app/admin;x/secret",
+        "/app/;x/admin/secret",
+        "/app/.;x/admin/secret",
+        "/app/..;/x",
+        "/app/..;/..;/etc/passwd",
+    ] {
+        assert_eq!(get(&st, EXTERNAL, p).await, 400, "{p}");
+    }
+    // stripped, they name one of the route's deny_paths: 403
+    for p in ["/app/private;x/doc", "/app/;x/private/doc"] {
+        assert_eq!(get(&st, EXTERNAL, p).await, 403, "{p}");
+    }
+    // the second lookup reads the same authority as the first
+    let hosted = req(Method::GET, "/hosted/x;v=1", &[("host", "a.example")]);
+    assert!(status(&st, EXTERNAL, hosted, false).await >= 500);
+}
+
+#[tokio::test]
+async fn an_encoded_slash_is_refused_only_where_the_route_says_so() {
+    let st = path_shape_state();
+    for p in ["/files/a%2Fb", "/files/a%2fb", "/files/..%2Fsecret"] {
+        assert_eq!(get(&st, EXTERNAL, p).await, 400, "{p}");
+    }
+    for p in ["/x/a%2Fb", "/app/a%2Fb", "/files/a%252Fb"] {
+        assert!(get(&st, EXTERNAL, p).await >= 500, "{p}");
+    }
+}
+
 // ── the wrapper around all of it ────────────────────────────────────────────
 
 #[tokio::test]

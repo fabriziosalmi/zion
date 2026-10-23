@@ -59,6 +59,39 @@ resolves `..` serves `/internal/x`, and `//admin` or `/%61dmin` slip past a `/ad
 Every spelling of a path now meets the same route and the same policy, on :443 and on the
 plaintext :80 listener (whose ACME-challenge fallback routes on its own).
 
+### Bytes servers disagree on
+
+Some bytes in a path are read one way by zion and another by the upstream, so they are
+refused with `400` instead of being forwarded:
+
+| In the path | Why | Answer |
+|---|---|---|
+| `\`, `%5C` | Windows servers read a backslash as a separator: `/..%5C..%5Cwin.ini` | always `400` |
+| `%00` | a C string ends there: `/shell.php%00.jpg` | always `400` |
+| `;` | Tomcat and Jetty strip path parameters before they read the path: `/admin;x` is `/admin` to them, and `/app/..;/admin` is `/admin` | `400` unless the route sets `allow_path_params` |
+| `%2F` | some upstreams decode it into a separator | `400` only where the route sets `refuse_encoded_slash` |
+
+The query string is not affected, and neither is an encoded `;` (`%3B`), which is data.
+
+A route whose application needs path parameters (`;jsessionid=`) sets
+`allow_path_params = true`. Even then, zion matches the route a second time on the path with
+the parameters stripped (`/app/admin;x/secret` → `/app/admin/secret`) and refuses the
+request with `400` unless both match this same route, and with `403` when the stripped path
+is one of the route's `deny_paths`. The parameters cannot carry a request into another
+route's `internal_only`, auth or WAF policy:
+
+```toml
+[[route]]
+path = "/shop/{*rest}"
+upstream = "tomcat"
+allow_path_params = true     # /shop/cart.jsp;jsessionid=… is passed on as written
+
+[[route]]
+path = "/shop/admin/{*rest}"
+upstream = "tomcat"
+internal_only = true         # /shop/admin;x/users and /shop/..;/shop/admin/users: 400
+```
+
 ## Headers that are not passed on from clients
 
 Some request headers tell an application or a cache where a request "really" goes or came

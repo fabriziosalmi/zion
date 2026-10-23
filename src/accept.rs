@@ -747,9 +747,12 @@ pub(crate) async fn handle_http(
             };
             cfg.router.at(host.as_deref(), path).cloned()
         };
-        // Only a route with nothing to bypass may take this shortcut; otherwise fall
-        // through to the redirect (the HTTPS pipeline then applies auth/WAF).
-        if let Some(rule) = rule.filter(|r| r.serves_acme_fallback()) {
+        // Only a route with nothing to bypass may take this shortcut, with a path the
+        // route accepts (`;`, `%2F`); otherwise fall through to the redirect (the HTTPS
+        // pipeline then applies auth/WAF and answers the path itself).
+        if let Some(rule) = rule
+            .filter(|r| r.serves_acme_fallback() && dispatch::path_shape(&cfg, r, &req).is_none())
+        {
             // This path skips process_request, so drop the identity headers the
             // pipeline would have scrubbed: upstreams trust X-Auth-* as verified.
             dispatch::scrub_reserved_identity_headers(req.headers_mut());

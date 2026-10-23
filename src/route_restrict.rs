@@ -62,13 +62,16 @@ impl RouteRestrictions {
         self.methods.is_none() && self.content_types.is_none() && self.deny_paths.is_none()
     }
 
+    /// Is `path` one of the route's `deny_paths`?
+    pub fn denies_path(&self, path: &str) -> bool {
+        self.deny_paths.as_ref().is_some_and(|d| d.at(path).is_ok())
+    }
+
     /// The answer to a request the route refuses, or `None` to let it through.
     /// `deny_paths` (403), then `methods` (405), then `content_types` (415).
     pub fn check<B: hyper::body::Body>(&self, req: &Request<B>) -> Option<Response<ZionBody>> {
-        if let Some(deny) = &self.deny_paths {
-            if deny.at(req.uri().path()).is_ok() {
-                return Some(empty_response(StatusCode::FORBIDDEN));
-            }
+        if self.denies_path(req.uri().path()) {
+            return Some(empty_response(StatusCode::FORBIDDEN));
         }
         if let Some(methods) = &self.methods {
             if !methods.list.contains(req.method()) {

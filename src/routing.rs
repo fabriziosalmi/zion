@@ -73,6 +73,10 @@ pub struct ResolvedRoute {
     pub body_cap: Option<u64>,
     /// `require_content_length`.
     pub require_content_length: bool,
+    /// `allow_path_params`.
+    pub allow_path_params: bool,
+    /// `refuse_encoded_slash`.
+    pub refuse_encoded_slash: bool,
 }
 
 impl ResolvedRoute {
@@ -601,6 +605,8 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
             .then(|| Arc::new(route.restrictions.clone())),
         body_cap,
         require_content_length: route.require_content_length,
+        allow_path_params: route.allow_path_params,
+        refuse_encoded_slash: route.refuse_encoded_slash,
     }))
 }
 
@@ -755,6 +761,8 @@ waf = true
             cors: None,
             restrictions: Default::default(),
             require_content_length: false,
+            allow_path_params: false,
+            refuse_encoded_slash: false,
         }
     }
 

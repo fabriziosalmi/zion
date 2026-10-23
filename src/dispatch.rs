@@ -59,7 +59,7 @@ mod gates;
 mod route;
 mod telemetry;
 mod waf_gate;
-pub(crate) use gates::uri_too_long;
+pub(crate) use gates::{path_shape, uri_too_long};
 
 /// Issue #151: turn an enforcement *deny* into a bounded held (tarpit)
 /// response when the operator enabled it, otherwise the plain immediate
@@ -356,6 +356,11 @@ async fn process_request_inner(
 
     // --- Gate: internal_only ---
     if let Some(resp) = gates::internal_only(&rule, &cfg, client_ip) {
+        return Ok(resp);
+    }
+
+    // --- Gate: what the path may carry on this route (`;`, `%2F`) ---
+    if let Some(resp) = gates::path_shape(&cfg, &rule, &req) {
         return Ok(resp);
     }
 
