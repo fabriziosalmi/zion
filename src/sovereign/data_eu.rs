@@ -4,7 +4,7 @@
 //! DO NOT EDIT MANUALLY — changes will be overwritten by CI.
 //!
 //! Sources: RIPE NCC delegated stats + IPtoASN (iptoasn.com), v4 + v6.
-//! Snapshot date: 2026-10-17 (curated-ASN holders validated against RIPEstat as-overview on this date — see the generator).
+//! Snapshot date: 2026-10-19 (curated-ASN holders validated against RIPEstat as-overview on this date — see the generator).
 //!
 //! The table follows the weekly snapshots with a delay: a run of addresses enters a
 //! class after 2 snapshots that agree, and leaves or changes class after 3. What is
@@ -15,7 +15,7 @@ use super::{CidrEntry, CidrEntry6, IpClass};
 /// The day of the last weekly snapshot folded into this table. The binary
 /// reports it at boot and on `/metrics`, so the age of the data is visible
 /// where the binary runs.
-pub const SNAPSHOT_DATE: &str = "2026-10-17";
+pub const SNAPSHOT_DATE: &str = "2026-10-19";
 
 /// The curated ASNs this table is built from, with the role each one gives
 /// to what it announces. The tests hold one pinned address for each.
