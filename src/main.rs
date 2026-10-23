@@ -66,6 +66,7 @@ mod health;
 mod http_conditional;
 mod import;
 mod init;
+mod linger;
 mod listener;
 mod logging;
 mod logq;
@@ -80,6 +81,7 @@ mod proxy;
 mod quic;
 mod reload;
 mod reserved_headers;
+mod route_restrict;
 mod routing;
 mod security;
 #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
@@ -90,6 +92,7 @@ mod tarpit;
 mod tls;
 #[cfg(feature = "tui")]
 mod tui;
+mod upstream_body;
 mod uri_norm;
 mod vary;
 mod via;
@@ -134,6 +137,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::sync::Arc;
 
+#[cfg(test)]
+mod body_limit_tests;
 mod dispatch;
 #[cfg(test)]
 mod gate_order_tests;

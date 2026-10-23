@@ -495,6 +495,15 @@ pub struct ServerConfig {
     /// (default 2000; `0` = wait as long as the system resolver does). Applied on reload.
     #[serde(default = "default_dns_timeout_ms")]
     pub dns_timeout_ms: u64,
+    /// Seconds a proxied WebSocket may stay silent in both directions before zion closes
+    /// it (default 300; `0` = no idle limit). Any byte read from either side restarts the
+    /// count. Applied on reload to sessions opened after it.
+    #[serde(default = "default_websocket_idle_secs")]
+    pub websocket_idle_secs: u64,
+    /// Seconds a proxied WebSocket may last in all, traffic or not (default 86400, one
+    /// day; `0` = no limit). Applied on reload to sessions opened after it.
+    #[serde(default = "default_websocket_max_session_secs")]
+    pub websocket_max_session_secs: u64,
     /// Log lines that can wait for stderr (default 8192). Logging never blocks a request: when
     /// the sink is slower than the log rate the newest lines are dropped and counted in
     /// `zion_log_lines_dropped_total`. `0` writes synchronously (a stalled stderr then stalls
@@ -552,6 +561,14 @@ fn default_dns_stale_secs() -> u64 {
 
 fn default_dns_timeout_ms() -> u64 {
     crate::dns::DEFAULT_TIMEOUT_MS
+}
+
+fn default_websocket_idle_secs() -> u64 {
+    crate::proxy::DEFAULT_WS_IDLE_SECS
+}
+
+fn default_websocket_max_session_secs() -> u64 {
+    crate::proxy::DEFAULT_WS_MAX_SESSION_SECS
 }
 
 fn default_log_queue_lines() -> usize {
@@ -1343,6 +1360,11 @@ struct RawRoute {
     #[serde(default)]
     waf_shadow: bool,
     cors: Option<CorsConfig>,
+    methods: Option<Vec<String>>,
+    content_types: Option<Vec<String>>,
+    deny_paths: Option<Vec<String>>,
+    #[serde(default)]
+    require_content_length: bool,
 }
 
 /// What a route serves. The two arms carry disjoint data, so a static route cannot
@@ -1387,9 +1409,9 @@ impl From<UpstreamMode> for RouteMode {
 /// decision in the TOML, three sibling keys; here it is one value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WafPolicy {
-    /// No WAF on this route. `ignored_max_body_mb` keeps a `max_body_mb` that was
-    /// written anyway, only so the boot warning ("not enforced") can name it.
-    Off { ignored_max_body_mb: Option<u64> },
+    /// No WAF on this route. A `max_body_mb` caps the body without inspecting it
+    /// (see `dispatch::body_gate`).
+    Off { max_body_mb: Option<u64> },
     /// Legacy `waf = true`: an inline default profile with an optional body cap
     /// (default 10 MiB).
     Inline { max_body_mb: Option<u64> },
@@ -1451,6 +1473,14 @@ pub struct RouteConfig {
 
     /// Per-route CORS configuration. If unset, no CORS headers are injected.
     pub cors: Option<CorsConfig>,
+
+    /// `methods`, `content_types` and `deny_paths`: what the route refuses without a WAF.
+    pub restrictions: crate::route_restrict::RouteRestrictions,
+
+    /// Read a body that comes without a declared length (chunked, or HTTP/2 and HTTP/3 without
+    /// `Content-Length`) whole, within the route's body cap, and send it to the upstream with
+    /// `Content-Length`.
+    pub require_content_length: bool,
 }
 
 impl RouteConfig {
@@ -1558,9 +1588,16 @@ impl TryFrom<RawRoute> for RouteConfig {
                 max_body_mb: r.max_body_mb,
             },
             (None, false) => WafPolicy::Off {
-                ignored_max_body_mb: r.max_body_mb,
+                max_body_mb: r.max_body_mb,
             },
         };
+
+        let restrictions = crate::route_restrict::RouteRestrictions::build(
+            &path,
+            r.methods,
+            r.content_types,
+            r.deny_paths,
+        )?;
 
         Ok(Self {
             path,
@@ -1574,6 +1611,8 @@ impl TryFrom<RawRoute> for RouteConfig {
             auth_profile: r.auth_profile,
             public: r.public,
             cors: r.cors,
+            restrictions,
+            require_content_length: r.require_content_length,
         })
     }
 }
@@ -2639,11 +2678,24 @@ fn check_upstream_name_collision(config: &ZionConfig, errors: &mut Vec<String>) 
     }
 }
 
-/// If `path` is a matchit catch-all (`<prefix>/{*name}`), return the bare
-/// prefix the catch-all should also serve (`/` for a root catch-all). matchit's
-/// catch-all does not match the bare prefix, so without registering it a
-/// `/{*rest}` route returns 404 on `/` — surprising for a "match everything"
-/// fallback. Returns `None` for non-catch-all paths.
+/// If `path` is a matchit catch-all (`<prefix>/{*name}`), the paths the catch-all must also
+/// serve and matchit does not give it: the bare `<prefix>` and `<prefix>/` (only `/` for a root
+/// catch-all). matchit's catch-all needs a non-empty rest, so without these a `/{*rest}` route
+/// returns 404 on `/`, and `/admin/` escapes an `/admin/{*rest}` route to a broader one such as
+/// `/{*rest}`, with that route's policy instead of its own. Returns `None` for non-catch-all
+/// paths.
+pub(crate) fn catchall_aliases(path: &str) -> Option<Vec<String>> {
+    let bare = catchall_bare_prefix(path)?;
+    Some(if bare == "/" {
+        vec![bare]
+    } else {
+        let slashed = format!("{bare}/");
+        vec![bare, slashed]
+    })
+}
+
+/// If `path` is a matchit catch-all (`<prefix>/{*name}`), its bare prefix (`/` for a root
+/// catch-all); `None` otherwise. See [`catchall_aliases`].
 pub(crate) fn catchall_bare_prefix(path: &str) -> Option<String> {
     let slash = path.rfind('/')?;
     let seg = &path[slash + 1..];
@@ -2688,8 +2740,8 @@ pub(crate) fn compile_path_set(patterns: &[String]) -> Result<matchit::Router<()
         router
             .insert(p.clone(), ())
             .map_err(|e| format!("bad route pattern '{p}': {e}"))?;
-        match catchall_bare_prefix(p) {
-            Some(bare) => aliases.push(bare),
+        match catchall_aliases(p) {
+            Some(more) => aliases.extend(more),
             None => {
                 if let Some(v) = trailing_slash_variant(p) {
                     aliases.push(v);
@@ -3769,20 +3821,17 @@ mod tests {
         );
         assert_eq!(
             policy("upstream=\"be\"\n"),
-            WafPolicy::Off {
-                ignored_max_body_mb: None
-            }
+            WafPolicy::Off { max_body_mb: None }
         );
-        // a max_body_mb on a WAF-off route stays a boot WARNING (kept for
-        // compatibility), not an error
+        // a max_body_mb on a WAF-off route is the body cap of that route (#693)
         assert_eq!(
             policy("upstream=\"be\"\nmax_body_mb=50\n"),
             WafPolicy::Off {
-                ignored_max_body_mb: Some(50)
+                max_body_mb: Some(50)
             }
         );
         assert!(!WafPolicy::Off {
-            ignored_max_body_mb: Some(1)
+            max_body_mb: Some(1)
         }
         .is_enabled());
         assert!(WafPolicy::Inline { max_body_mb: None }.is_enabled());

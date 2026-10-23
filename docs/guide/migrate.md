@@ -54,7 +54,9 @@ Reads a `server { … }` / `location { … }` / `upstream { … }` config, inclu
 - The websocket `Upgrade` idiom → `mode = "websocket"`.
 - `ssl_certificate`/`ssl_certificate_key` → `[tls]`; `listen 80 … return 301
   https://$host` → dropped (Zion's `:80` handler does this built-in).
-- `client_max_body_size` → the imported WAF body cap (shadow mode).
+- `client_max_body_size` → each route's `max_body_mb`, inherited from `http{}` to `server{}`
+  to `location{}` as nginx does; a route with none in scope gets nginx's default of 1 MB, and
+  `0` means no cap. Sizes that are not whole MB (`512k`) are rounded up, and the report says so.
 - **Static serving** (`root` / `try_files` / `index` / `alias`) →
   [`mode = "static"`](#static-sites-and-spas). An SPA build dir served with
   `try_files … /index.html` next to a proxied `/api` converts in one pass.

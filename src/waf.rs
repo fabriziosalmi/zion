@@ -1102,6 +1102,23 @@ pub fn validate_request_prescanned(
     validate_request_impl(method, content_type, body, profile, true)
 }
 
+/// Is the `Content-Type` value `ct` one of the media types in `allowed`? Case-insensitive, and
+/// the parameters (`; charset=...`) are ignored: `application/json` must be followed by the end,
+/// `;` or a space, so `application/jsonFOO` is not `application/json`. Zero-alloc.
+pub fn content_type_allowed(ct: &str, allowed: &[String]) -> bool {
+    allowed.iter().any(|allowed| {
+        if ct.len() < allowed.len() {
+            return false;
+        }
+        if !ct.as_bytes()[..allowed.len()].eq_ignore_ascii_case(allowed.as_bytes()) {
+            return false;
+        }
+        ct.len() == allowed.len()
+            || ct.as_bytes()[allowed.len()] == b';'
+            || ct.as_bytes()[allowed.len()] == b' '
+    })
+}
+
 #[inline]
 fn validate_request_impl(
     _method: &str,
@@ -1131,17 +1148,7 @@ fn validate_request_impl(
     // Prefix match with delimiter check: "application/json" must be followed
     // by EOF, ';' (charset), or ' ' — not arbitrary chars. Without this,
     // "application/jsonFOO" would be treated as allowed.
-    let is_allowed = profile.allowed_content_types.iter().any(|allowed| {
-        if ct.len() < allowed.len() {
-            return false;
-        }
-        if !ct.as_bytes()[..allowed.len()].eq_ignore_ascii_case(allowed.as_bytes()) {
-            return false;
-        }
-        ct.len() == allowed.len()
-            || ct.as_bytes()[allowed.len()] == b';'
-            || ct.as_bytes()[allowed.len()] == b' '
-    });
+    let is_allowed = content_type_allowed(ct, &profile.allowed_content_types);
     // Strict policy denies a disallowed type outright. Lenient policy does NOT
     // trust it either — we fall through to the Gate 3 injection scan before
     // allowing. The previous code returned Allow here, forwarding the body

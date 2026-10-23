@@ -231,11 +231,15 @@ pub async fn probe(
         return (false, 0);
     };
     let start = tokio::time::Instant::now();
-    let healthy =
-        match tokio::time::timeout(std::time::Duration::from_secs(5), client.request(req)).await {
-            Ok(Ok(resp)) => resp.status().is_success() || resp.status().is_redirection(),
-            _ => false,
-        };
+    let healthy = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.request(req.map(crate::upstream_body::UpstreamBody::plain)),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => resp.status().is_success() || resp.status().is_redirection(),
+        _ => false,
+    };
     let lat = if healthy {
         start.elapsed().as_micros() as u64
     } else {

@@ -10,7 +10,7 @@
 //! `config`, never the reverse.
 
 use crate::config::{
-    catchall_bare_prefix, default_max_entries, default_ttl, trailing_slash_variant, CacheMode,
+    catchall_aliases, default_max_entries, default_ttl, trailing_slash_variant, CacheMode,
     CacheProfile, RouteConfig, RouteMode, RouteTarget, WafPolicy, WafProfile, ZionConfig,
 };
 use matchit::Router;
@@ -66,6 +66,13 @@ pub struct ResolvedRoute {
     pub auth: Option<crate::auth::ResolvedAuthProfile>,
     /// Pre-compiled CORS headers for lightning-fast matching per-route.
     pub cors: Option<std::sync::Arc<crate::security::CorsHeaders>>,
+    /// `methods`, `content_types`, `deny_paths`; `None` when the route sets none of them.
+    pub restrictions: Option<Arc<crate::route_restrict::RouteRestrictions>>,
+    /// `max_body_mb` of a route without a WAF, in bytes. A route with a WAF has its cap in
+    /// `waf`, where the body is read whole.
+    pub body_cap: Option<u64>,
+    /// `require_content_length`.
+    pub require_content_length: bool,
 }
 
 impl ResolvedRoute {
@@ -217,16 +224,19 @@ impl RouterBuilder {
     /// alias for the deferred second pass.
     fn insert(&mut self, path: &str, resolved: Arc<ResolvedRoute>) -> Result<(), String> {
         // A matchit catch-all "<prefix>/{*name}" does NOT match the bare
-        // "<prefix>" (nor the root "/" when the prefix is empty), so a
-        // "/{*rest}" route silently 404s on "/" even though it is meant to be
-        // the fallback for everything. Record the bare prefix so we can also
-        // map it to this route in a second pass (after all explicit routes).
-        match catchall_bare_prefix(path) {
-            Some(bare) => {
+        // "<prefix>" nor "<prefix>/" (nor the root "/" when the prefix is empty):
+        // "/{*rest}" would 404 on "/", and "/admin/" would fall through from
+        // "/admin/{*rest}" to a broader route, under that route's policy
+        // (internal_only, auth, WAF profile). Record both so a second pass (after
+        // all explicit routes) maps them to this route.
+        match catchall_aliases(path) {
+            Some(aliases) => {
                 self.router
                     .insert(path.to_string(), resolved.clone())
                     .map_err(|e| format!("Bad route pattern '{path}': {e}"))?;
-                self.aliases.push((bare, resolved));
+                for alias in aliases {
+                    self.aliases.push((alias, resolved.clone()));
+                }
             }
             None => {
                 // Non-catch-all: also alias the trailing-slash-toggled variant
@@ -407,22 +417,14 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
             max_body_mb: max_body_mb.unwrap_or(10),
             ..WafProfile::default()
         }),
+        // Without a WAF the body is not read here: `max_body_mb` becomes `body_cap` below.
+        WafPolicy::Off { .. } => None,
+    };
+    let body_cap = match route.waf {
         WafPolicy::Off {
-            ignored_max_body_mb,
-        } => {
-            // Footgun guard: `max_body_mb` is enforced by the WAF body gate, so
-            // on a WAF-off route it has no effect. Surface it at boot rather
-            // than silently dropping the operator's intended size cap (a no-WAF
-            // route otherwise streams the body to the upstream, hyper-framed).
-            if ignored_max_body_mb.is_some() {
-                eprintln!(
-                    "  ⚠ route '{}': max_body_mb is set but WAF is off (no waf=true / waf_profile) \
-                     — the body-size cap is NOT enforced; enable WAF or remove max_body_mb",
-                    route.path
-                );
-            }
-            None
-        }
+            max_body_mb: Some(mb),
+        } => Some(mb.saturating_mul(1_048_576)),
+        _ => None,
     };
 
     // Resolve cache: named profile > legacy mode=static_cache
@@ -595,6 +597,10 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
         #[cfg(feature = "auth")]
         auth,
         cors,
+        restrictions: (!route.restrictions.is_empty())
+            .then(|| Arc::new(route.restrictions.clone())),
+        body_cap,
+        require_content_length: route.require_content_length,
     }))
 }
 
@@ -740,15 +746,15 @@ waf = true
                 mode: UpstreamMode::Standard,
             },
             internal_only: false,
-            waf: WafPolicy::Off {
-                ignored_max_body_mb: None,
-            },
+            waf: WafPolicy::Off { max_body_mb: None },
             waf_shadow: false,
             cache_profile: None,
             csp: None,
             auth_profile: None,
             public: false,
             cors: None,
+            restrictions: Default::default(),
+            require_content_length: false,
         }
     }
 
@@ -962,6 +968,55 @@ upstream = "fallback"
             router.at(None, "/x").unwrap().upstream_url[0],
             "http://127.0.0.1:9000"
         );
+    }
+
+    #[test]
+    fn a_catch_all_route_owns_its_prefix_with_and_without_the_slash() {
+        let toml = r#"
+[server]
+listen_http = "0.0.0.0:80"
+listen_https = "0.0.0.0:443"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstreams]
+admin = "http://127.0.0.1:1001"
+admin_index = "http://127.0.0.1:1002"
+fallback = "http://127.0.0.1:1003"
+docs = "http://127.0.0.1:1004"
+[[route]]
+path = "/admin/{*rest}"
+upstream = "admin"
+[[route]]
+path = "/docs/{*rest}"
+upstream = "docs"
+[[route]]
+path = "/docs/"
+upstream = "admin_index"
+[[route]]
+path = "/{*rest}"
+upstream = "fallback"
+"#;
+        let config: ZionConfig = toml::from_str(toml).unwrap();
+        let router = build_router_quiet(&config).unwrap();
+        let url = |p: &str| router.at(None, p).unwrap().upstream_url[0].clone();
+        for p in ["/admin", "/admin/", "/admin/x"] {
+            assert_eq!(url(p), "http://127.0.0.1:1001", "{p}");
+        }
+        // An explicit route still owns its slot: the aliases are best-effort.
+        assert_eq!(url("/docs/"), "http://127.0.0.1:1002");
+        assert_eq!(url("/docs/x"), "http://127.0.0.1:1004");
+        assert_eq!(url("/"), "http://127.0.0.1:1003");
+        assert_eq!(url("/administrator"), "http://127.0.0.1:1003");
+    }
+
+    #[test]
+    fn a_path_set_matches_a_catch_all_prefix_with_and_without_the_slash() {
+        let set = crate::config::compile_path_set(&["/x/{*rest}".to_string()]).unwrap();
+        for p in ["/x", "/x/", "/x/y"] {
+            assert!(set.at(p).is_ok(), "{p}");
+        }
+        assert!(set.at("/xy").is_err());
     }
 
     #[test]

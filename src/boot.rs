@@ -807,7 +807,7 @@ pub(crate) fn spawn_upstream_health(state: &Arc<AppState>, health_map: health::H
                 if let Ok(req) = req {
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_secs(3),
-                        client.request(req),
+                        client.request(req.map(crate::upstream_body::UpstreamBody::plain)),
                     )
                     .await;
                 }
