@@ -1020,6 +1020,14 @@ fn client_body_broken() -> Response<ZionBody> {
     simple_status(StatusCode::BAD_REQUEST, "400 Bad Request")
 }
 
+/// The answer to an upstream request whose deadline passed while zion was still waiting for
+/// the client's body: the client was too slow to send it, the upstream did not fail. A `504`
+/// here would let a slow upload, or a client sending slowly on purpose, open the circuit of a
+/// healthy upstream.
+fn client_body_too_slow() -> Response<ZionBody> {
+    simple_status(StatusCode::REQUEST_TIMEOUT, "408 Request Timeout")
+}
+
 /// Internal: send a prepared request through the shared client.
 #[inline]
 /// `upstream=<scheme://authority> trace_id=<32 hex>` for a log line about this upstream
@@ -1081,6 +1089,8 @@ async fn send_request(
             crate::logging::warn("proxy", &format!("upstream error: {e} {}", context()));
             Ok(bad_gateway())
         }
+        // The deadline passed while zion was waiting for the client's next bytes.
+        Err(_elapsed) if fault.waiting_on_client() => Ok(client_body_too_slow()),
         Err(_elapsed) => {
             crate::metrics::METRICS
                 .upstream_duration
