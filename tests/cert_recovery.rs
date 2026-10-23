@@ -16,7 +16,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod common;
-use common::free_port;
+use common::{free_port, wait_for_log};
 
 struct Proc(Child);
 impl Drop for Proc {
@@ -137,7 +137,11 @@ fn a_boot_after_an_interrupted_renewal_restores_the_previous_key() {
     let _z = Proc(command(&dir, port, "boot.log").spawn().expect("spawn zion"));
     wait_port(port);
 
-    let log = fs::read_to_string(dir.join("boot.log")).unwrap();
+    let log = wait_for_log(
+        &dir.join("boot.log"),
+        "Restored the previous key",
+        Duration::from_secs(10),
+    );
     assert!(
         log.contains("renewal was interrupted") && log.contains("Restored the previous key"),
         "the log says what was done:\n{log}"
