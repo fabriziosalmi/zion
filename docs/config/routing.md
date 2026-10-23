@@ -127,6 +127,44 @@ the request's own host (the `Host` header, or the URI authority for HTTP/2), and
 is none. The upstream's `Host` is its own authority, or the client's host when the upstream
 sets [`preserve_host`](/config/#forward-the-client-s-host-preserve-host-opt-in).
 
+### Headers and cookies you strip or refuse
+
+Three lists name request headers and cookies by name, in `[server]` for every route and in a
+`[[route]]` for that route (a route's lists add to the global ones):
+
+| Key | What it does |
+|---|---|
+| `strip_headers` | removes the header before the request is forwarded |
+| `deny_headers` | refuses a request that carries the header, with `400` |
+| `deny_cookies` | refuses a request that carries a cookie of that name, with `400` |
+
+```toml
+[server]
+deny_cookies = ["CacheWarmer"]        # Mirasvit Cache Warmer, CVE-2026-45247
+
+[[route]]
+path = "/{*rest}"
+upstream = "app"
+strip_headers = ["X-Debug"]
+deny_headers = ["X-Forwarded-Debug"]
+```
+
+Header names are compared without case and with `_` and `-` as the same character, because
+a CGI or PHP upstream reads `X_Debug` as `X-Debug`. Cookie names are compared as written
+(they are case-sensitive) and also percent-decoded, because PHP reads `%43acheWarmer` as
+`CacheWarmer`. A name that is not a header name or a cookie name is a config error.
+
+Some are built in, on every route, with no configuration:
+
+| Header | Answer | Why |
+|---|---|---|
+| `X-Middleware-Subrequest` | stripped | Next.js marks its own middleware subrequests with it; a client that sends it skips the middleware (CVE-2025-29927) |
+| `Upgrade` | stripped, except on a WebSocket handshake | zion already removes `Connection`; an upstream that acts on `Upgrade: h2c` anyway would take the connection past zion's routing |
+| `HTTP2-Settings` | stripped | it only means something with an `h2c` upgrade |
+| `__proto__`, `constructor` | `400` | an upstream that copies the headers into a JavaScript object pollutes its prototype |
+
+The `:80` ACME fallback applies the same lists before it forwards.
+
 ## Host-based routing (virtual hosting)
 
 Bind a route to one or more `hosts` to serve different backends for different domains on the same listener — the `Host` header (HTTP/1) or `:authority` (HTTP/2) selects the route. A route **without** `hosts` is *shared*: it matches every host and acts as a fallback.

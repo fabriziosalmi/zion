@@ -364,6 +364,11 @@ async fn process_request_inner(
         return Ok(resp);
     }
 
+    // --- Gate: request headers and cookies the route refuses or strips ---
+    if let Some(resp) = rule.headers.apply(req.headers_mut()) {
+        return Ok(resp);
+    }
+
     // --- Gate: the route's own restrictions (deny_paths, methods, content_types) ---
     if let Some(resp) = rule.restrictions.as_ref().and_then(|r| r.check(&req)) {
         return Ok(resp);

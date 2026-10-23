@@ -1814,6 +1814,157 @@ async fn the_port_80_acme_fallback_forwards_no_path_the_route_refuses() {
     assert_eq!(hits(&o), 0, "nothing was forwarded");
 }
 
+// ── headers and cookies stripped or refused (#695) ──────────────────────────
+
+/// An origin behind two standard routes: `/r/*` with its own lists, `/*` with the global ones.
+async fn header_rig() -> (Arc<Origin>, Arc<AppState>) {
+    let (o, _) = rig("").await;
+    let port = o.port.load(Ordering::Relaxed);
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+strip_headers = ["X-Debug"]
+deny_cookies = ["CacheWarmer"]
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstreams]
+o = "http://127.0.0.1:{port}"
+[[route]]
+path = "/r/{{*rest}}"
+upstream = "o"
+strip_headers = ["X-Route-Only"]
+deny_headers = ["X-Evil"]
+[[route]]
+path = "/{{*rest}}"
+upstream = "o"
+"#
+    );
+    let cfg: ZionConfig = toml::from_str(&toml).expect("config parses");
+    (o, AppState::for_tests(&cfg))
+}
+
+async fn status_of(st: &Arc<AppState>, uri: &str, headers: &[(&str, &str)]) -> u16 {
+    let resp = process_request(
+        get(uri, headers),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    let status = resp.status().as_u16();
+    let _ = resp.into_body().collect().await;
+    status
+}
+
+#[tokio::test]
+async fn an_h2c_upgrade_and_a_nextjs_subrequest_marker_never_reach_the_upstream() {
+    let (o, st) = header_rig().await;
+    let sent = [
+        ("upgrade", "h2c"),
+        ("http2-settings", "AAMAAABkAAQAAP__"),
+        (
+            "x-middleware-subrequest",
+            "middleware:middleware:middleware",
+        ),
+        ("accept", "*/*"),
+    ];
+    assert_eq!(status_of(&st, "/x", &sent).await, 200);
+    assert_eq!(hits(&o), 1);
+    for h in ["upgrade", "http2-settings", "x-middleware-subrequest"] {
+        assert_eq!(seen(&o, h), None, "{h} reached the upstream");
+    }
+    assert_eq!(
+        seen(&o, "accept").as_deref(),
+        Some("*/*"),
+        "the rest is passed on"
+    );
+}
+
+#[tokio::test]
+async fn a_header_named_like_a_prototype_is_refused_before_the_upstream() {
+    let (o, st) = header_rig().await;
+    for name in ["__proto__", "constructor"] {
+        assert_eq!(
+            status_of(&st, "/x", &[(name, "polluted")]).await,
+            400,
+            "{name}"
+        );
+    }
+    assert_eq!(hits(&o), 0);
+}
+
+#[tokio::test]
+async fn the_global_lists_apply_to_every_route_and_a_routes_lists_to_it_alone() {
+    let (o, st) = header_rig().await;
+    // global strip, both spellings, on either route
+    for uri in ["/x", "/r/x"] {
+        let sent = [("x-debug", "1"), ("x_debug", "1"), ("x-route-only", "1")];
+        assert_eq!(status_of(&st, uri, &sent).await, 200, "{uri}");
+        assert_eq!(seen(&o, "x-debug"), None, "{uri}");
+        assert_eq!(seen(&o, "x_debug"), None, "{uri}");
+    }
+    // the route's own strip, on that route only
+    assert_eq!(seen(&o, "x-route-only"), None, "stripped on /r/");
+    assert_eq!(status_of(&st, "/x", &[("x-route-only", "1")]).await, 200);
+    assert_eq!(seen(&o, "x-route-only").as_deref(), Some("1"), "kept on /");
+    // the route's own deny, on that route only
+    let before = hits(&o);
+    assert_eq!(status_of(&st, "/r/x", &[("x-evil", "1")]).await, 400);
+    assert_eq!(hits(&o), before, "refused before the upstream");
+    assert_eq!(status_of(&st, "/x", &[("x-evil", "1")]).await, 200);
+    // the global cookie deny, on either route, however the name is spelled for PHP
+    let before = hits(&o);
+    for (uri, cookie) in [
+        ("/x", "a=1; CacheWarmer=O:8:\"stdClass\":0:{}"),
+        ("/r/x", "CacheWarmer=x"),
+        ("/x", "%43acheWarmer=x"),
+    ] {
+        assert_eq!(
+            status_of(&st, uri, &[("cookie", cookie)]).await,
+            400,
+            "{cookie}"
+        );
+    }
+    assert_eq!(hits(&o), before, "refused before the upstream");
+    assert_eq!(
+        status_of(&st, "/x", &[("cookie", "session=abc")]).await,
+        200
+    );
+    assert_eq!(seen(&o, "cookie").as_deref(), Some("session=abc"));
+}
+
+#[tokio::test]
+async fn the_port_80_acme_fallback_applies_the_header_policy_too() {
+    let (o, st) = header_rig().await;
+    let resp = crate::accept::handle_http(
+        get(
+            "/.well-known/acme-challenge/tok",
+            &[("x-middleware-subrequest", "middleware"), ("x-debug", "1")],
+        ),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+    )
+    .await
+    .unwrap();
+    let _ = resp.into_body().collect().await;
+    assert_eq!(hits(&o), 1, "the challenge path was forwarded");
+    assert_eq!(seen(&o, "x-middleware-subrequest"), None);
+    assert_eq!(seen(&o, "x-debug"), None);
+    let resp = crate::accept::handle_http(
+        get("/.well-known/acme-challenge/tok", &[("__proto__", "x")]),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert_eq!(hits(&o), 1, "refused before the upstream");
+}
+
 /// HTTP/2 carries the host in the URI authority and sends no Host header, and a hostless request
 /// has neither: a client-supplied X-Forwarded-Host must not survive in either case.
 #[tokio::test]

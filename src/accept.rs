@@ -759,6 +759,10 @@ pub(crate) async fn handle_http(
             if !cfg.trusted_proxies.is_trusted(&remote_addr.ip()) {
                 security::scrub_client_override_headers(req.headers_mut());
             }
+            // and the route's header policy, as the pipeline applies it
+            if let Some(resp) = rule.headers.apply(req.headers_mut()) {
+                return Ok(resp);
+            }
             if rule.preserve_host {
                 req.extensions_mut().insert(proxy::PreserveHost);
             }

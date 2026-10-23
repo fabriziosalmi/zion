@@ -412,8 +412,11 @@ fn prepare_request<B>(
     *req.uri_mut() = new_uri;
     *req.version_mut() = Version::HTTP_11;
     // Connection is hop-by-hop (RFC 7230 §6.1); unlike the WebSocket path a
-    // normal proxy request must NOT forward it to the upstream.
+    // normal proxy request must NOT forward it to the upstream. Nor `Upgrade`: without
+    // `Connection` it asks nothing of a well-behaved upstream, and an `Upgrade: h2c` that an
+    // upstream acts on anyway takes the connection past zion's routing (#695).
     req.headers_mut().remove(hyper::header::CONNECTION);
+    req.headers_mut().remove(hyper::header::UPGRADE);
 
     Some(req)
 }
