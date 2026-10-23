@@ -503,7 +503,10 @@ async fn a_dead_upstream_still_opens_its_circuit() {
     };
     let st = guarded_state(dead);
     for _ in 0..5 {
-        assert_eq!(post(&st, "/upload", &[], chunked(1024)).await, 502);
+        // A refused connection is a 502; Windows retries the connect to a closed local port
+        // until the connect timeout, a 504. The breaker counts either.
+        let status = post(&st, "/upload", &[], chunked(1024)).await;
+        assert!(crate::breaker::is_failure(status), "{status}");
     }
     assert_eq!(get(&st, "/").await, 503, "five refused connections open it");
 }
