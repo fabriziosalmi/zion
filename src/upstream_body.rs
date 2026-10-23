@@ -16,14 +16,16 @@
 //! A body the client breaks on the way (it goes away mid-upload) is the client's fault too.
 //! [`BodyFault`] tells either case apart from a failed upstream once the upstream client has
 //! turned the body's error into its own, so neither becomes a `502` that the circuit breaker
-//! counts against a healthy upstream.
+//! counts against a healthy upstream. It also says whether zion was waiting for the client's
+//! next bytes, so an upstream request that times out while a slow client is still sending is
+//! the client's `408`, not the upstream's `504`.
 
 use crate::http_util::{BoxError, ReqBody};
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, SizeHint};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -48,9 +50,19 @@ impl std::error::Error for BodyTooLarge {}
 /// What went wrong with a request body on its way to the upstream, if anything, so the caller
 /// of the upstream client can tell whose fault a failed request was after the client has turned
 /// the body's error into its own: a body past its cap is refused (`413`), a body the client
-/// broke is the client's (`400`), and only otherwise did the upstream fail (`502`).
+/// broke is the client's (`400`), and only otherwise did the upstream fail (`502`). It also
+/// tells a timeout spent waiting for the client's body (`408`) from one spent on the upstream
+/// (`504`).
 #[derive(Clone, Debug, Default)]
-pub struct BodyFault(Arc<AtomicU8>);
+pub struct BodyFault(Arc<FaultState>);
+
+#[derive(Debug, Default)]
+struct FaultState {
+    fault: AtomicU8,
+    /// The last read of the client's body found nothing to hand on yet: zion is waiting for
+    /// the client, not for the upstream.
+    waiting_on_client: AtomicBool,
+}
 
 // 0, the default, is no fault.
 const TOO_LARGE: u8 = 1;
@@ -59,17 +71,24 @@ const BROKEN: u8 = 2;
 impl BodyFault {
     /// The body went past the route's cap.
     pub fn too_large(&self) -> bool {
-        self.0.load(Ordering::Acquire) == TOO_LARGE
+        self.0.fault.load(Ordering::Acquire) == TOO_LARGE
     }
 
     /// The client's body ended with an error of its own: the client reset the stream or the
     /// connection, or stopped mid-body.
     pub fn broken(&self) -> bool {
-        self.0.load(Ordering::Acquire) == BROKEN
+        self.0.fault.load(Ordering::Acquire) == BROKEN
+    }
+
+    /// The upstream client last asked for more of the body and the client had not sent it yet.
+    /// A deadline that passes now passed waiting for the client. Once the body has ended, or
+    /// while the upstream is not taking more of it, this is false.
+    pub fn waiting_on_client(&self) -> bool {
+        self.0.waiting_on_client.load(Ordering::Acquire)
     }
 
     fn set(&self, fault: u8) {
-        self.0.store(fault, Ordering::Release);
+        self.0.fault.store(fault, Ordering::Release);
     }
 }
 
@@ -136,7 +155,14 @@ impl Body for UpstreamBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let this = &mut *self;
-        let frame = match Pin::new(&mut this.inner).poll_frame(cx) {
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        if let Some(fault) = &this.fault {
+            fault
+                .0
+                .waiting_on_client
+                .store(polled.is_pending(), Ordering::Release);
+        }
+        let frame = match polled {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(None) => return Poll::Ready(None),
             Poll::Ready(Some(Err(e))) => {
@@ -246,6 +272,29 @@ mod tests {
         let (body, fault) = UpstreamBody::capped(chunked(&[b"0123456789"]), 4);
         assert!(body.collect().await.is_err());
         assert!(fault.too_large() && !fault.broken());
+    }
+
+    #[tokio::test]
+    async fn waiting_for_the_clients_next_bytes_is_seen_and_ends_with_them() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, BoxError>>(1);
+        let inner: ReqBody =
+            StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx)).boxed();
+        let (mut body, fault) = UpstreamBody::watched(inner, None);
+        assert!(!fault.waiting_on_client(), "not asked for anything yet");
+        // the upstream client asks; the client has sent nothing
+        let asked = tokio::time::timeout(std::time::Duration::from_millis(50), body.frame()).await;
+        assert!(asked.is_err(), "nothing to hand on yet");
+        assert!(fault.waiting_on_client());
+        // the client sends: zion is no longer waiting on it
+        tx.send(Ok(Frame::data(Bytes::from_static(b"abcd"))))
+            .await
+            .unwrap();
+        assert!(body.frame().await.unwrap().is_ok());
+        assert!(!fault.waiting_on_client());
+        // the body ends
+        drop(tx);
+        assert!(body.frame().await.is_none());
+        assert!(!fault.waiting_on_client());
     }
 
     #[tokio::test]
