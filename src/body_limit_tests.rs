@@ -538,20 +538,48 @@ fn paced(frames: usize, gap: Duration) -> ReqBody {
 }
 
 #[tokio::test]
-async fn a_client_too_slow_to_send_its_body_is_a_408_and_does_not_open_the_circuit() {
+async fn a_steady_slow_upload_completes_and_does_not_open_the_circuit() {
+    // #714: `request_timeout_ms` bounds time with NO body progress, not the whole upload. A
+    // body slower than the deadline but always moving is not cut: it completes (200), and a
+    // healthy upstream's circuit stays closed.
     let o = Arc::new(Origin::default());
     let st = guarded_state_with(start_origin(o.clone()).await, "request_timeout_ms = 300");
-    // 1 s of body against a 300 ms deadline, to an upstream that reads it as it comes
+    // ~1 s of body in 50 ms steps against a 300 ms deadline: every step is progress.
     let uploads: Vec<_> = (0..6)
         .map(|_| {
             let st = st.clone();
             tokio::spawn(async move {
-                post(&st, "/upload", &[], paced(10, Duration::from_millis(100))).await
+                post(&st, "/upload", &[], paced(20, Duration::from_millis(50))).await
             })
         })
         .collect();
     for (i, u) in uploads.into_iter().enumerate() {
-        assert_eq!(u.await.unwrap(), 408, "slow upload {}", i + 1);
+        assert_eq!(u.await.unwrap(), 200, "steady upload {}", i + 1);
+    }
+    assert_eq!(
+        get(&st, "/").await,
+        200,
+        "the upstream is healthy: its circuit must still be closed"
+    );
+}
+
+#[tokio::test]
+async fn a_client_that_stalls_past_the_deadline_is_a_408_and_does_not_open_the_circuit() {
+    // A client that makes no progress for a whole `request_timeout_ms` window: the wait is the
+    // client's (408, #713), and a healthy upstream's circuit stays closed — not a 504.
+    let o = Arc::new(Origin::default());
+    let st = guarded_state_with(start_origin(o.clone()).await, "request_timeout_ms = 300");
+    // the first frame only after 600 ms, past the 300 ms deadline: zion is waiting on the client.
+    let uploads: Vec<_> = (0..6)
+        .map(|_| {
+            let st = st.clone();
+            tokio::spawn(async move {
+                post(&st, "/upload", &[], paced(10, Duration::from_millis(600))).await
+            })
+        })
+        .collect();
+    for (i, u) in uploads.into_iter().enumerate() {
+        assert_eq!(u.await.unwrap(), 408, "stalled upload {}", i + 1);
     }
     assert_eq!(
         get(&st, "/").await,

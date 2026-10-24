@@ -87,7 +87,7 @@ refused.
 | `url` | string | `url` **or** `urls` required | Single upstream URL (e.g. `"http://127.0.0.1:8000"`). An upstream with neither is a load-time error. If both are written they are merged, `urls` first then `url` |
 | `urls` | string[] | `[]` | Multiple upstream URLs (latency-routed); use instead of `url` |
 | `connect_timeout_ms` | u64 | `3000` | TCP connect deadline in milliseconds, applied to the connector of the client that serves this upstream: a black-holed member (packets dropped, no RST) is abandoned after this long and the next HA member is tried. `0` = none. Covers the TCP connect only; the TLS handshake and the response are bounded by `request_timeout_ms` |
-| `request_timeout_ms` | u64 | `30000` | How long one attempt may take from sending the request to receiving the upstream's **response headers**, in milliseconds. On expiry the client gets `504`, or `408` when zion was still waiting for the client's own body (a client too slow to send it, which the circuit breaker does not count); in a pool the next member is tried (idempotent requests only), each attempt with its own deadline. Sending the request body counts, so raise it for uploads slower than this, for long-polling and for slow report endpoints; lower it for an API that should fail fast. It does not bound the response body once it is streaming, nor `sse_stream` and `websocket` routes. `1`..`3600000`; there is no "0 = none" (a request with no deadline would hold its connection slot until the 1 h connection cap) |
+| `request_timeout_ms` | u64 | `30000` | How long one attempt may wait with **no progress**, in milliseconds. While the request body is still being handed to the upstream the deadline resets on each body frame, so a steady upload slower than this is **not** cut (#714); once the body is in, it bounds the wait for the upstream's **response headers**. On expiry the client gets `504`, or `408` when zion was waiting for the client's own next bytes (a slow or stalled client, which the circuit breaker does not count); in a pool the next member is tried (idempotent requests only), each attempt with its own deadline. Raise it for long-polling and slow report endpoints; lower it for an API that should fail fast. It does not bound the response body once it is streaming, nor `sse_stream` and `websocket` routes. `1`..`3600000`; there is no "0 = none" (a request with no deadline would hold its connection slot until the 1 h connection cap) |
 | `keepalive` | usize | `128` | Idle pooled connections kept per upstream host (`0` = a new connection per request; max 10000). Before 0.9.8 this was parsed but ignored (always 128) |
 | `tls` | bool | `false` | Redundant: the URL scheme decides (`https://` = TLS to the upstream). `tls = true` with an `http://` URL is a config error (it used to connect in plaintext) |
 | `ca_path` | string? | none | The CA (PEM, one or more certificates) that signs this upstream's TLS certificate. It **replaces** the public roots for this upstream, so a backend behind a private CA is not also trusted through every public one. Omit it for a publicly trusted upstream. `https://` endpoints only |
@@ -212,8 +212,9 @@ circuit, its failure re-opens it. Values shown are the defaults.
   origin become). A `500` is the application's own error on one endpoint, and 4xx are the
   client's: neither counts.
   A client that breaks its own upload on the way (it resets mid-body) is answered `400`, not
-  `502`, and one too slow to send its body within `request_timeout_ms` is answered `408`, not
-  `504`, so neither counts.
+  `502`, and one that stalls (no body progress for a whole `request_timeout_ms` window) is
+  answered `408`, not `504`, so neither counts. A steady upload slower than `request_timeout_ms`
+  is no longer cut: the deadline resets on each body frame (#714).
 - It applies to a route whose upstream has a **single** endpoint. A pool of several already
   fails over between its members.
 - It is consulted after auth and the WAF, so an unauthenticated or hostile request can neither

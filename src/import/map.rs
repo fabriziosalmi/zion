@@ -2568,9 +2568,10 @@ fn map_read_timeout(d: &Directive, slot: &mut Option<u64>, findings: &mut Vec<Fi
                 d.line,
                 "proxy_read_timeout",
                 format!(
-                    "request_timeout_ms = {ms}: Zion bounds the whole exchange up to the \
-                     response headers (sending the request included) and nothing once the \
-                     body is streaming; nginx bounds each gap between two reads"
+                    "request_timeout_ms = {ms}: Zion applies it as a no-progress deadline — \
+                     while the request body is still being sent it resets on each body frame, \
+                     then it bounds the wait for the response headers, and nothing once the \
+                     body is streaming; nginx bounds each gap between two reads of the response"
                 ),
             ));
         }
@@ -2594,9 +2595,10 @@ fn send_timeout_finding(d: &Directive) -> Finding {
         Status::Unsupported,
         d.line,
         "proxy_send_timeout",
-        "no deadline between two writes to the upstream: request_timeout_ms (set from \
-         proxy_read_timeout, default 30 s) bounds sending the request and waiting for the \
-         response headers together — raise it if uploads take longer",
+        "no separate deadline between two writes to the upstream: Zion's request_timeout_ms \
+         (from proxy_read_timeout, default 30 s) is a no-progress deadline, so a steady upload \
+         is not cut by it and a stall with no body progress for a whole window is answered 408 \
+         without opening the circuit",
     )
 }
 
