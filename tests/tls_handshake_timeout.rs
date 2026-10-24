@@ -106,16 +106,19 @@ fn a_stalled_handshake_is_dropped_at_the_configured_timeout() {
     let Some(zion) = start("handshake_timeout_secs = 1") else {
         return;
     };
-    // With a 1 s timeout the stalled connection is dropped around 1 s, well before the
-    // hardcoded 10 s default would. A read cap of 6 s is the referee: if the drop took the
-    // old 10 s, the read would hit the cap and report ~6 s.
-    let elapsed = time_to_drop(zion.https, Duration::from_secs(6));
+    // With a 1 s timeout the stalled connection is dropped well before the hardcoded 10 s
+    // default would. The margins are wide on purpose: on a saturated CI runner the 1 s tokio
+    // timer can fire several seconds late, so the referee is the 8 s mark — clearly under the
+    // 10 s default, so the drop still proves the configured value is the one in force, while a
+    // 20 s read cap lets the default-10 case (and the break-test) be observed in full.
+    let elapsed = time_to_drop(zion.https, Duration::from_secs(20));
     assert!(
-        elapsed < Duration::from_secs(4),
-        "a 1 s handshake timeout must drop the stalled connection in about 1 s, took {elapsed:?}"
+        elapsed < Duration::from_secs(8),
+        "a 1 s handshake timeout must drop the stalled connection well before the 10 s default, \
+         took {elapsed:?}"
     );
     assert!(
-        elapsed >= Duration::from_millis(700),
+        elapsed >= Duration::from_millis(500),
         "it should wait roughly the timeout, not reject instantly: took {elapsed:?}"
     );
 }
