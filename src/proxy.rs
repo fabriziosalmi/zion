@@ -1069,7 +1069,33 @@ async fn send_request(
     let deadline = request_timeout(&req);
     let (req, fault) = upstream_request(req);
     let upstream_start = std::time::Instant::now();
-    match tokio::time::timeout(deadline, client.request(req)).await {
+    // `deadline` (`request_timeout_ms`) bounds time with NO body progress, not the whole
+    // request. A steady upload that keeps handing frames on resets the window, so an upload
+    // slower than the deadline is not cut while it moves (#714); the deadline then bounds the
+    // wait for the response once the body is in, and a stalled client or a silent upstream is
+    // still cut after one full window of no progress (408 vs 504 as before, via `fault`).
+    let deadline_ms = deadline.as_millis() as u64;
+    let outcome = {
+        let fut = client.request(req);
+        tokio::pin!(fut);
+        let sleep = tokio::time::sleep(deadline);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                r = &mut fut => break Ok(r),
+                _ = &mut sleep => {
+                    let idle = fault.idle_ms();
+                    if idle >= deadline_ms {
+                        break Err(());
+                    }
+                    // the body moved within the window: wait the rest of it from that point
+                    let rest = std::time::Duration::from_millis(deadline_ms - idle);
+                    sleep.as_mut().reset(tokio::time::Instant::now() + rest);
+                }
+            }
+        }
+    };
+    match outcome {
         Ok(Ok(resp)) => {
             crate::metrics::METRICS
                 .upstream_duration
@@ -1092,15 +1118,19 @@ async fn send_request(
             crate::logging::warn("proxy", &format!("upstream error: {e} {}", context()));
             Ok(bad_gateway())
         }
-        // The deadline passed while zion was waiting for the client's next bytes.
-        Err(_elapsed) if fault.waiting_on_client() => Ok(client_body_too_slow()),
-        Err(_elapsed) => {
+        // A full window passed with no body progress while zion was waiting for the client's
+        // next bytes: the client is too slow, not the upstream.
+        Err(()) if fault.waiting_on_client() => Ok(client_body_too_slow()),
+        Err(()) => {
             crate::metrics::METRICS
                 .upstream_duration
                 .observe(upstream_start.elapsed());
             crate::logging::warn(
                 "proxy",
-                &format!("upstream timeout after {deadline:?} {}", context()),
+                &format!(
+                    "upstream timeout after {deadline:?} of no progress {}",
+                    context()
+                ),
             );
             Ok(gateway_timeout())
         }
