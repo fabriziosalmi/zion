@@ -1431,7 +1431,10 @@ fn cd_param<'a>(value: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
 /// `multipart/form-data` body (full field-name rules) and for any other content-type carrying a
 /// boundary — the Spring CVE-2026-41853 content-type-smuggling class — where only the structural
 /// limits apply. Runs on a fully buffered body.
-fn multipart_structure(ct: &str, body: &[u8], profile: &WafProfile) -> WafVerdict {
+///
+/// Public so `benches/multipart_parse.rs` can measure the parse cost per MiB in isolation, the
+/// same way the benches reach [`validate_request`] and [`StreamingScanner`].
+pub fn multipart_structure(ct: &str, body: &[u8], profile: &WafProfile) -> WafVerdict {
     let form_data = ct_is_multipart(ct);
     let boundary = match multipart_boundary(ct) {
         Some(b) => b,
