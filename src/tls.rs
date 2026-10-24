@@ -545,14 +545,18 @@ pub fn load_tls_config(tls: &TlsConfig) -> Result<ServerConfig, String> {
     // This also enables horizontal scaling: any server with the same
     // ticket key can resume any session.
     //
-    // **Key rotation**: today the ticket key is generated once at config
-    // load time and lives for the duration of the resulting `ServerConfig`.
-    // Cert hot-reload also rotates the ticket key (each `load_tls_config`
-    // call freshly seeds a new `Ticketer`). For deployments that demand
-    // periodic rotation independent of cert renewal, the operator can
-    // touch the cert file on a cron — `notify` will trigger a reload and
-    // produce a new key. A finer-grained ArcSwap-based ticket-key
-    // rotation is tracked in docs/perf/roadmap.md.
+    // **Key rotation**: `Ticketer::new()` returns rustls' `TicketRotator`,
+    // which rotates the ticket encryption key on its own. The current key
+    // encrypts new tickets for 6 hours; it is then demoted to the previous
+    // key, which no longer encrypts but still decrypts, so a ticket is
+    // accepted for up to twice that interval (12 hours) before it is
+    // refused. Rotation is driven by wall-clock time on each encrypt/decrypt
+    // within the lifetime of a single `ServerConfig`; it does not depend on
+    // a cert reload. Cert hot-reload does seed a fresh `TicketRotator` (each
+    // `load_tls_config` call), which starts a new key family, so tickets
+    // issued before the reload no longer resume and fall back to a full
+    // handshake; that is a side effect of the reload, not the rotation
+    // mechanism.
     //
     // The `Ticketer::new()` call only fails if the platform's CSPRNG
     // refuses to deliver entropy at boot — catastrophic for any TLS
