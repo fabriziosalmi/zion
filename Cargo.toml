@@ -292,6 +292,10 @@ name = "waf_streaming"
 harness = false
 
 [[bench]]
+name = "multipart_parse"
+harness = false
+
+[[bench]]
 name = "sovereign"
 harness = false
 
