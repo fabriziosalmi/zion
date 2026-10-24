@@ -249,6 +249,12 @@ circuit, its failure re-opens it. Values shown are the defaults.
 | `entropy_check` | bool | `true` | Enable the Shannon-entropy gate on request bodies ≥256 bytes (restricted to JSON string values for `application/json`; whole-body for other content types) |
 | `entropy_threshold` | f64 | `6.5` | Bits/byte above which a body's entropy is flagged |
 | `streaming` | bool | `false` | Scan request bodies chunk-by-chunk as they stream (fail-fast on first hit) |
+| `max_parts` | usize | `1000` | Max parts in a `multipart/form-data` body |
+| `max_file_parts` | usize | `256` | Max file parts (a part with a `filename`); `0` refuses every file part |
+| `max_part_headers` | usize | `16` | Max header lines in one part |
+| `max_part_header_bytes` | usize | `8192` | Max total bytes of one part's header block |
+| `deny_field_names` | string[] | `[]` | Form field names refused (Content-Disposition `name`, case-insensitive) |
+| `deny_part_header_names` | string[] | `["__proto__", "constructor"]` | Part header names refused (case-insensitive) |
 
 ## `[cache_profile.<name>]`
 

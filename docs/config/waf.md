@@ -56,6 +56,30 @@ waf_profile = "upload"
 | `entropy_check` | bool | `true` | Enable Gate 4 (Shannon entropy). Disable on routes that legitimately accept high-entropy bodies (binary uploads, encrypted blobs). |
 | `entropy_threshold` | f64 | `6.5` | Bits/byte. Bodies above this are denied. Default sits above pure base64 (theoretical max 6.0); random/encrypted blobs land at 7.5–8.0. |
 | `scan_headers` | string[] | `[]` | Request headers whose values go through the injection scanner (case-insensitive names, optional trailing `*`). Empty scans none. See [Scanning request headers](#scanning-request-headers). |
+| `max_parts` | usize | `1000` | Maximum number of parts in a `multipart/form-data` body. See [Multipart structure](#multipart-structure). |
+| `max_file_parts` | usize | `256` | Maximum number of file parts (a part with a `filename`, empty `filename=""` included). `0` refuses every file part. |
+| `max_part_headers` | usize | `16` | Maximum header lines in one part. |
+| `max_part_header_bytes` | usize | `8192` | Maximum total bytes of one part's header block. |
+| `deny_field_names` | string[] | `[]` | Form field names refused outright (a part whose Content-Disposition `name` matches, case-insensitive). E.g. `PHP_SESSION_UPLOAD_PROGRESS`. |
+| `deny_part_header_names` | string[] | `["__proto__", "constructor"]` | Part header names refused outright (case-insensitive). |
+
+## Multipart structure
+
+When a request body is labelled `multipart/form-data`, the WAF parses it the way
+the origin will read it and holds it to the structure limits above, before the
+injection scan. The parser is strict: a body it cannot parse cleanly is refused
+(`400`), never forwarded, so Zion cannot read a multipart body differently from
+the upstream. That closes the multipart-smuggling class (e.g. the Spring
+CVE-2026-41853 family) and the part/header floods that PHP2Shell and a series of
+parser CVEs rely on.
+
+A body is refused when: the `boundary` parameter is missing, malformed, or
+declared twice; the body does not begin at its boundary (a preamble); the closing
+`--boundary--` is absent; a part has no field `name`; a part's header block is not
+terminated; `max_parts`, `max_file_parts`, `max_part_headers`, or
+`max_part_header_bytes` is exceeded; or a `deny_field_names` / `deny_part_header_names`
+entry matches. The defaults are generous enough for real browser and `curl -F`
+uploads; tighten them per profile for an endpoint that takes only small forms.
 
 ## Detection modes
 

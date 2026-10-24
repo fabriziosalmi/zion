@@ -109,6 +109,35 @@ pub struct WafProfile {
     /// `waf_shadow = true` first and read `zion_waf_shadow_would_block`.
     #[serde(default)]
     pub scan_headers: Vec<String>,
+    /// Strict `multipart/form-data` structure limits (#694). A body labelled
+    /// multipart is parsed the way the origin will read it and held to these
+    /// bounds; a body that does not parse cleanly is denied, never forwarded,
+    /// so zion cannot read it differently from the upstream (the multipart
+    /// smuggling class). Max number of parts. Default 1000: a real form has a
+    /// handful, a part flood (PHP2Shell and a series of parser CVEs) has
+    /// thousands.
+    #[serde(default = "default_max_parts")]
+    pub max_parts: usize,
+    /// Max number of file parts (a part whose Content-Disposition carries a
+    /// `filename`, an empty `filename=""` included). Default 256.
+    #[serde(default = "default_max_file_parts")]
+    pub max_file_parts: usize,
+    /// Max header lines in one part. Default 16: a real part has two or three
+    /// (Content-Disposition, maybe Content-Type).
+    #[serde(default = "default_max_part_headers")]
+    pub max_part_headers: usize,
+    /// Max total bytes of one part's header block. Default 8192.
+    #[serde(default = "default_max_part_header_bytes")]
+    pub max_part_header_bytes: usize,
+    /// Form field names refused outright: a part whose Content-Disposition
+    /// `name` matches (case-insensitive) is denied. Empty by default; set e.g.
+    /// `PHP_SESSION_UPLOAD_PROGRESS`.
+    #[serde(default)]
+    pub deny_field_names: Vec<String>,
+    /// Part header names refused outright (case-insensitive). Default
+    /// `__proto__`, `constructor`, which are never legitimate part header names.
+    #[serde(default = "default_deny_part_header_names")]
+    pub deny_part_header_names: Vec<String>,
 }
 
 fn default_max_body_mb() -> u64 {
@@ -132,6 +161,21 @@ fn default_entropy_threshold() -> f64 {
 fn default_true() -> bool {
     true
 }
+fn default_max_parts() -> usize {
+    1000
+}
+fn default_max_file_parts() -> usize {
+    256
+}
+fn default_max_part_headers() -> usize {
+    16
+}
+fn default_max_part_header_bytes() -> usize {
+    8192
+}
+fn default_deny_part_header_names() -> Vec<String> {
+    vec!["__proto__".to_string(), "constructor".to_string()]
+}
 
 impl Default for WafProfile {
     fn default() -> Self {
@@ -146,6 +190,12 @@ impl Default for WafProfile {
             entropy_threshold: default_entropy_threshold(),
             streaming: false,
             scan_headers: Vec::new(),
+            max_parts: default_max_parts(),
+            max_file_parts: default_max_file_parts(),
+            max_part_headers: default_max_part_headers(),
+            max_part_header_bytes: default_max_part_header_bytes(),
+            deny_field_names: Vec::new(),
+            deny_part_header_names: default_deny_part_header_names(),
         }
     }
 }
@@ -182,6 +232,23 @@ impl WafProfile {
                 )
             })
             .collect()
+    }
+
+    /// Problems in the multipart structure limits, for config validation. A zero
+    /// where at least one is required would deny every multipart body; `max_file_parts`
+    /// is allowed to be zero, which refuses every file part.
+    pub fn multipart_limits_errors(&self) -> Vec<String> {
+        let mut errs = Vec::new();
+        if self.max_parts == 0 {
+            errs.push("max_parts must be >= 1".to_string());
+        }
+        if self.max_part_headers == 0 {
+            errs.push("max_part_headers must be >= 1".to_string());
+        }
+        if self.max_part_header_bytes == 0 {
+            errs.push("max_part_header_bytes must be >= 1".to_string());
+        }
+        errs
     }
 }
 
@@ -1119,6 +1186,258 @@ pub fn content_type_allowed(ct: &str, allowed: &[String]) -> bool {
     })
 }
 
+/// Is the media type of `ct` `multipart/form-data` (parameters ignored)? Zero-alloc,
+/// mirrors [`content_type_allowed`]'s delimiter rule.
+fn ct_is_multipart(ct: &str) -> bool {
+    const M: &[u8] = b"multipart/form-data";
+    let b = ct.as_bytes();
+    b.len() >= M.len()
+        && b[..M.len()].eq_ignore_ascii_case(M)
+        && (b.len() == M.len() || b[M.len()] == b';' || b[M.len()] == b' ')
+}
+
+/// ASCII spaces and tabs trimmed from both ends.
+fn trim_lws(s: &[u8]) -> &[u8] {
+    let start = s
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(s.len());
+    let end = s
+        .iter()
+        .rposition(|&b| b != b' ' && b != b'\t')
+        .map_or(start, |i| i + 1);
+    &s[start..end]
+}
+
+/// The `boundary` parameter of a `multipart/form-data` Content-Type, validated against the
+/// RFC 2046 character set and length (1..=70), or `None` when it is missing, malformed,
+/// declared more than once, or empty. The boundary bytes are returned without the enclosing
+/// quotes.
+fn multipart_boundary(ct: &str) -> Option<Vec<u8>> {
+    // RFC 2046 bcharsnospace, plus space (a boundary may contain spaces but not end in one).
+    fn is_bchar(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'\''
+                    | b'('
+                    | b')'
+                    | b'+'
+                    | b'_'
+                    | b','
+                    | b'-'
+                    | b'.'
+                    | b'/'
+                    | b':'
+                    | b'='
+                    | b'?'
+                    | b' '
+            )
+    }
+    let bytes = ct.as_bytes();
+    let mut found: Option<&[u8]> = None;
+    // Skip the media type (first `;`-separated token); scan the rest for `boundary=`.
+    for (i, raw) in bytes.split(|&b| b == b';').enumerate() {
+        if i == 0 {
+            continue;
+        }
+        let param = trim_lws(raw);
+        let eq = memchr::memchr(b'=', param)?;
+        let (key, val) = (trim_lws(&param[..eq]), trim_lws(&param[eq + 1..]));
+        if !key.eq_ignore_ascii_case(b"boundary") {
+            continue;
+        }
+        if found.is_some() {
+            return None; // a second boundary= is a smuggling surface, refuse it
+        }
+        // Strip one layer of surrounding quotes (RFC 2045 quoted-string), no escapes.
+        let val = if val.len() >= 2 && val.first() == Some(&b'"') && val.last() == Some(&b'"') {
+            &val[1..val.len() - 1]
+        } else {
+            val
+        };
+        found = Some(val);
+    }
+    let b = found?;
+    if b.is_empty() || b.len() > 70 || b.last() == Some(&b' ') || !b.iter().all(|&c| is_bchar(c)) {
+        return None;
+    }
+    Some(b.to_vec())
+}
+
+enum PartHeaders {
+    Ok { is_file: bool },
+    Deny(&'static str),
+}
+
+/// Walk one part's header block (the bytes before its blank line): count the headers, require a
+/// Content-Disposition with a field `name`, apply the field-name and part-header-name denylists,
+/// and report whether the part is a file part (it has a `filename`, empty included).
+fn inspect_part_headers(block: &[u8], profile: &WafProfile) -> PartHeaders {
+    let mut count = 0usize;
+    let mut name: Option<&[u8]> = None;
+    let mut is_file = false;
+    let mut rest = block;
+    loop {
+        let (line, tail) = match memchr::memmem::find(rest, b"\r\n") {
+            Some(i) => (&rest[..i], &rest[i + 2..]),
+            None => (rest, &b""[..]),
+        };
+        if !line.is_empty() {
+            count += 1;
+            if count > profile.max_part_headers {
+                return PartHeaders::Deny("too many multipart part headers");
+            }
+            let colon = match memchr::memchr(b':', line) {
+                Some(i) => i,
+                None => return PartHeaders::Deny("malformed multipart part header"),
+            };
+            let hname = trim_lws(&line[..colon]);
+            if profile
+                .deny_part_header_names
+                .iter()
+                .any(|d| d.as_bytes().eq_ignore_ascii_case(hname))
+            {
+                return PartHeaders::Deny("denied multipart part header name");
+            }
+            if hname.eq_ignore_ascii_case(b"content-disposition") {
+                let value = &line[colon + 1..];
+                if let Some(n) = cd_param(value, b"name") {
+                    name = Some(n);
+                }
+                if cd_param(value, b"filename").is_some() {
+                    is_file = true;
+                }
+            }
+        }
+        if tail.is_empty() {
+            break;
+        }
+        rest = tail;
+    }
+    match name {
+        None => PartHeaders::Deny("multipart part without a field name"),
+        Some(n) => {
+            if profile
+                .deny_field_names
+                .iter()
+                .any(|d| d.as_bytes().eq_ignore_ascii_case(n))
+            {
+                return PartHeaders::Deny("denied multipart field name");
+            }
+            PartHeaders::Ok { is_file }
+        }
+    }
+}
+
+/// The value of a Content-Disposition parameter `key` (case-insensitive), with one layer of
+/// surrounding quotes stripped, or `None` when it is absent. A bare `filename=""` returns an
+/// empty slice (present but empty), so an empty file part still counts.
+fn cd_param<'a>(value: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    for raw in value.split(|&b| b == b';') {
+        let param = trim_lws(raw);
+        let eq = match memchr::memchr(b'=', param) {
+            Some(i) => i,
+            None => continue, // the disposition type ("form-data"), not a parameter
+        };
+        if !trim_lws(&param[..eq]).eq_ignore_ascii_case(key) {
+            continue;
+        }
+        let v = trim_lws(&param[eq + 1..]);
+        return Some(
+            if v.len() >= 2 && v.first() == Some(&b'"') && v.last() == Some(&b'"') {
+                &v[1..v.len() - 1]
+            } else {
+                v
+            },
+        );
+    }
+    None
+}
+
+/// Gate 2b (#694): strict `multipart/form-data` structure. Parses the body the way the origin
+/// will read it and holds it to the profile's limits. A body that does not parse cleanly is
+/// denied, never forwarded, so zion cannot read it differently from the upstream (the multipart
+/// smuggling class, e.g. the Spring CVE-2026-41853 family). Runs on a fully buffered body.
+fn multipart_structure(ct: &str, body: &[u8], profile: &WafProfile) -> WafVerdict {
+    let boundary = match multipart_boundary(ct) {
+        Some(b) => b,
+        None => return WafVerdict::Deny("malformed multipart boundary"),
+    };
+    // dash-boundary = "--" boundary. The body must start with it: a preamble before the first
+    // boundary is a smuggling surface real form clients never use.
+    let mut delim = Vec::with_capacity(2 + boundary.len());
+    delim.extend_from_slice(b"--");
+    delim.extend_from_slice(&boundary);
+    if !body.starts_with(&delim) {
+        return WafVerdict::Deny("multipart body does not start at its boundary");
+    }
+    // CRLF dash-boundary separates parts; a trailing "--" closes the body.
+    let mut crlf_delim = Vec::with_capacity(2 + delim.len());
+    crlf_delim.extend_from_slice(b"\r\n");
+    crlf_delim.extend_from_slice(&delim);
+
+    let mut pos = delim.len();
+    let mut parts = 0usize;
+    let mut file_parts = 0usize;
+    loop {
+        let after = &body[pos..];
+        // "--" right after a dash-boundary is the close-delimiter: the body ends here.
+        if after.starts_with(b"--") {
+            return WafVerdict::Allow;
+        }
+        // Otherwise optional transport-padding (LWSP) then CRLF, then a part.
+        let after = trim_leading_lws(after);
+        if !after.starts_with(b"\r\n") {
+            return WafVerdict::Deny("malformed multipart delimiter");
+        }
+        pos = body.len() - after.len() + 2;
+
+        parts += 1;
+        if parts > profile.max_parts {
+            return WafVerdict::Deny("too many multipart parts");
+        }
+
+        // Part headers end at the first blank line (CRLFCRLF).
+        let hdr_end = match memchr::memmem::find(&body[pos..], b"\r\n\r\n") {
+            Some(i) => pos + i,
+            None => return WafVerdict::Deny("multipart part headers are not terminated"),
+        };
+        let header_block = &body[pos..hdr_end];
+        if header_block.len() > profile.max_part_header_bytes {
+            return WafVerdict::Deny("multipart part headers too large");
+        }
+        match inspect_part_headers(header_block, profile) {
+            PartHeaders::Deny(reason) => return WafVerdict::Deny(reason),
+            PartHeaders::Ok { is_file } => {
+                if is_file {
+                    file_parts += 1;
+                    if file_parts > profile.max_file_parts {
+                        return WafVerdict::Deny("too many multipart file parts");
+                    }
+                }
+            }
+        }
+
+        // Part body runs from after the blank line to the next CRLF dash-boundary.
+        let content_start = hdr_end + 4;
+        let d = match memchr::memmem::find(&body[content_start..], &crlf_delim) {
+            Some(i) => content_start + i,
+            None => return WafVerdict::Deny("unterminated multipart body"),
+        };
+        pos = d + crlf_delim.len();
+    }
+}
+
+/// Leading ASCII spaces and tabs removed (for transport-padding after a delimiter).
+fn trim_leading_lws(s: &[u8]) -> &[u8] {
+    let start = s
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(s.len());
+    &s[start..]
+}
+
 #[inline]
 fn validate_request_impl(
     _method: &str,
@@ -1165,6 +1484,17 @@ fn validate_request_impl(
             .get(..16)
             .map(|b| b.eq_ignore_ascii_case(b"application/json"))
             .unwrap_or(false);
+
+    // ── Gate 2b: multipart/form-data structure (strict, #694) ──
+    // When the body is labelled multipart, parse it the way the origin will and
+    // hold it to the profile's structure limits. A body that does not parse
+    // cleanly is denied here, before the raw scan, so zion never forwards a
+    // multipart body it read differently from the upstream.
+    if ct_is_multipart(ct) {
+        if let v @ WafVerdict::Deny(_) = multipart_structure(ct, body, profile) {
+            return v;
+        }
+    }
 
     // ── Gate 3: Aho-Corasick injection scan (O(N), single pass) ──
     // Profile-driven scanner: balanced (default) or aggressive.
@@ -1717,30 +2047,42 @@ mod tests {
     #[test]
     fn prescanned_skips_raw_scan_but_keeps_encoded_pass() {
         let profile = aggressive_profile();
-        // A plain (un-encoded) injection pattern: caught by the normal raw scan,
-        // but the prescanned variant assumes the streamer already ran that pass
-        // and therefore skips it — so it does NOT re-deny here.
-        let raw = b"id=1 union select password from admin";
+        let c = "multipart/form-data; boundary=B";
+        // A well-formed multipart body carrying a plain (un-encoded) injection
+        // pattern inside a part's content: the structure gate allows it, then the
+        // raw scan catches the pattern — but the prescanned variant assumes the
+        // streamer already ran the raw pass and skips it, so it does NOT re-deny.
+        let raw = mp(
+            "B",
+            &[("q", None, b"id=1 union select password from admin")],
+        );
         assert!(matches!(
-            validate_request("POST", Some("multipart/form-data"), raw, &profile),
+            validate_request("POST", Some(c), &raw, &profile),
             WafVerdict::Deny(_)
         ));
         assert_eq!(
-            validate_request_prescanned("POST", Some("multipart/form-data"), raw, &profile),
+            validate_request_prescanned("POST", Some(c), &raw, &profile),
             WafVerdict::Allow,
             "prescanned must skip the raw scan (the streamer already did it)"
         );
 
         // An ENCODED injection is caught by the normalized pass, which the
         // prescanned variant still runs — both must deny.
-        let encoded = b"a=%27%20union%20select%20password%20from%20admin%20--";
+        let encoded = mp(
+            "B",
+            &[(
+                "q",
+                None,
+                b"a=%27%20union%20select%20password%20from%20admin%20--",
+            )],
+        );
         assert!(matches!(
-            validate_request("POST", Some("multipart/form-data"), encoded, &profile),
+            validate_request("POST", Some(c), &encoded, &profile),
             WafVerdict::Deny(_)
         ));
         assert!(
             matches!(
-                validate_request_prescanned("POST", Some("multipart/form-data"), encoded, &profile),
+                validate_request_prescanned("POST", Some(c), &encoded, &profile),
                 WafVerdict::Deny(_)
             ),
             "prescanned must still run the encoded/normalized pass"
@@ -1835,12 +2177,13 @@ mod tests {
 
     #[test]
     fn allows_multipart() {
-        let body = b"--boundary\r\nContent-Disposition: form-data\r\n\r\ndata";
+        // A well-formed benign multipart body passes the strict structure gate.
+        let body = mp("abc", &[("field", None, b"benign data")]);
         assert_eq!(
             validate_request(
                 "POST",
                 Some("multipart/form-data; boundary=abc"),
-                body,
+                &body,
                 &strict_profile()
             ),
             WafVerdict::Allow
@@ -3287,5 +3630,267 @@ mod tests {
         // Tiny string content under min_sample → None.
         let body = br#"{"k":"hi","n":42}"#;
         assert!(shannon_entropy_json_strings(body, 128).is_none());
+    }
+
+    // ── Multipart structure gate (#694) ─────────────────────────────────
+
+    /// Build a well-formed multipart/form-data body from (field name, optional
+    /// filename, content) parts, exactly as the strict parser expects it.
+    fn mp(boundary: &str, parts: &[(&str, Option<&str>, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"--");
+        out.extend_from_slice(boundary.as_bytes());
+        for (name, filename, content) in parts {
+            out.extend_from_slice(b"\r\nContent-Disposition: form-data; name=\"");
+            out.extend_from_slice(name.as_bytes());
+            out.push(b'"');
+            if let Some(f) = filename {
+                out.extend_from_slice(b"; filename=\"");
+                out.extend_from_slice(f.as_bytes());
+                out.push(b'"');
+            }
+            out.extend_from_slice(b"\r\n\r\n");
+            out.extend_from_slice(content);
+            out.extend_from_slice(b"\r\n--");
+            out.extend_from_slice(boundary.as_bytes());
+        }
+        out.extend_from_slice(b"--");
+        out
+    }
+
+    fn ct(boundary: &str) -> String {
+        format!("multipart/form-data; boundary={boundary}")
+    }
+
+    #[test]
+    fn a_real_looking_form_passes() {
+        let p = WafProfile::default();
+        let body = mp(
+            "----WebKitFormBoundary7MA4YWxkTrZu0gW",
+            &[
+                ("field1", None, b"value one"),
+                ("file1", Some("photo.jpg"), b"\xff\xd8\xff\xe0 jpeg bytes"),
+                ("file2", Some(""), b""), // empty file part still parses
+            ],
+        );
+        assert_eq!(
+            multipart_structure(&ct("----WebKitFormBoundary7MA4YWxkTrZu0gW"), &body, &p),
+            WafVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn a_quoted_boundary_is_accepted() {
+        let p = WafProfile::default();
+        let body = mp("abc", &[("x", None, b"v")]);
+        assert_eq!(
+            multipart_structure("multipart/form-data; boundary=\"abc\"", &body, &p),
+            WafVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn too_many_parts_is_denied() {
+        let parts: Vec<(&str, Option<&str>, &[u8])> =
+            (0..5).map(|_| ("f", None, &b"v"[..])).collect();
+        let body = mp("B", &parts);
+        let under = WafProfile {
+            max_parts: 5,
+            ..WafProfile::default()
+        };
+        let over = WafProfile {
+            max_parts: 4,
+            ..WafProfile::default()
+        };
+        assert_eq!(
+            multipart_structure(&ct("B"), &body, &under),
+            WafVerdict::Allow
+        );
+        assert_eq!(
+            multipart_structure(&ct("B"), &body, &over),
+            WafVerdict::Deny("too many multipart parts")
+        );
+    }
+
+    #[test]
+    fn too_many_file_parts_is_denied() {
+        let parts: Vec<(&str, Option<&str>, &[u8])> =
+            (0..3).map(|_| ("f", Some("x"), &b""[..])).collect();
+        let body = mp("B", &parts);
+        let over = WafProfile {
+            max_file_parts: 2,
+            ..WafProfile::default()
+        };
+        assert_eq!(
+            multipart_structure(&ct("B"), &body, &over),
+            WafVerdict::Deny("too many multipart file parts")
+        );
+    }
+
+    #[test]
+    fn too_many_part_headers_is_denied() {
+        // One part with many extra headers.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"--B\r\nContent-Disposition: form-data; name=\"x\"\r\n");
+        for i in 0..20 {
+            body.extend_from_slice(format!("X-H{i}: v\r\n").as_bytes());
+        }
+        body.extend_from_slice(b"\r\nv\r\n--B--");
+        let p = WafProfile::default(); // max_part_headers = 16
+        assert_eq!(
+            multipart_structure(&ct("B"), &body, &p),
+            WafVerdict::Deny("too many multipart part headers")
+        );
+    }
+
+    #[test]
+    fn oversized_part_headers_are_denied() {
+        let big = "a".repeat(9000);
+        let body =
+            format!("--B\r\nContent-Disposition: form-data; name=\"{big}\"\r\n\r\nv\r\n--B--");
+        let p = WafProfile::default(); // max_part_header_bytes = 8192
+        assert_eq!(
+            multipart_structure(&ct("B"), body.as_bytes(), &p),
+            WafVerdict::Deny("multipart part headers too large")
+        );
+    }
+
+    #[test]
+    fn a_denied_field_name_is_refused_however_it_is_cased() {
+        let p = WafProfile {
+            deny_field_names: vec!["PHP_SESSION_UPLOAD_PROGRESS".to_string()],
+            ..WafProfile::default()
+        };
+        let body = mp("B", &[("php_session_upload_progress", None, b"x")]);
+        assert_eq!(
+            multipart_structure(&ct("B"), &body, &p),
+            WafVerdict::Deny("denied multipart field name")
+        );
+    }
+
+    #[test]
+    fn a_denied_part_header_name_is_refused_by_default() {
+        // __proto__ is in the default deny_part_header_names.
+        let body =
+            b"--B\r\nContent-Disposition: form-data; name=\"x\"\r\n__proto__: y\r\n\r\nv\r\n--B--";
+        let p = WafProfile::default();
+        assert_eq!(
+            multipart_structure(&ct("B"), body, &p),
+            WafVerdict::Deny("denied multipart part header name")
+        );
+    }
+
+    #[test]
+    fn malformed_and_smuggling_shapes_are_refused() {
+        let p = WafProfile::default();
+        // No boundary parameter.
+        assert_eq!(
+            multipart_structure("multipart/form-data", b"--B--", &p),
+            WafVerdict::Deny("malformed multipart boundary")
+        );
+        // A second boundary= is a smuggling surface.
+        assert_eq!(
+            multipart_structure(
+                "multipart/form-data; boundary=a; boundary=b",
+                &mp("a", &[("x", None, b"v")]),
+                &p
+            ),
+            WafVerdict::Deny("malformed multipart boundary")
+        );
+        // Preamble before the first boundary.
+        let mut pre = b"garbage".to_vec();
+        pre.extend_from_slice(&mp("B", &[("x", None, b"v")]));
+        assert_eq!(
+            multipart_structure(&ct("B"), &pre, &p),
+            WafVerdict::Deny("multipart body does not start at its boundary")
+        );
+        // No closing delimiter.
+        let unterminated = b"--B\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\nv\r\n";
+        assert_eq!(
+            multipart_structure(&ct("B"), unterminated, &p),
+            WafVerdict::Deny("unterminated multipart body")
+        );
+        // A part with no field name.
+        let no_name = b"--B\r\nContent-Type: text/plain\r\n\r\nv\r\n--B--";
+        assert_eq!(
+            multipart_structure(&ct("B"), no_name, &p),
+            WafVerdict::Deny("multipart part without a field name")
+        );
+    }
+
+    #[test]
+    fn the_gate_runs_through_validate_request() {
+        let p = WafProfile::default();
+        let good = mp("B", &[("x", None, b"hello")]);
+        assert_eq!(
+            validate_request("POST", Some(&ct("B")), &good, &p),
+            WafVerdict::Allow
+        );
+        let bad = b"garbage--B--";
+        assert_eq!(
+            validate_request("POST", Some(&ct("B")), bad, &p),
+            WafVerdict::Deny("multipart body does not start at its boundary")
+        );
+    }
+
+    use proptest::prelude::*;
+
+    // A boundary over the RFC 2046 charset (no trailing space to keep it simple).
+    fn boundary_str() -> impl Strategy<Value = String> {
+        let c = prop::sample::select("abcXYZ019-_".chars().collect::<Vec<_>>());
+        prop::collection::vec(c, 1..24).prop_map(|cs| cs.into_iter().collect())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1536))]
+
+        // The parser never panics on arbitrary content types and bodies.
+        #[test]
+        fn never_panics(ct in ".{0,48}", body in prop::collection::vec(any::<u8>(), 0..256)) {
+            let p = WafProfile::default();
+            let _ = multipart_structure(&ct, &body, &p);
+            let _ = multipart_boundary(&ct);
+        }
+
+        // A well-formed body with k parts (f of them files) is allowed when the
+        // limits admit it, and each limit denies it exactly one short: no false
+        // positive on a real-shaped body, and the counts are exact.
+        #[test]
+        fn well_formed_bodies_pass_and_limits_are_exact(
+            b in boundary_str(),
+            n_parts in 1usize..8,
+            file_flags in prop::collection::vec(any::<bool>(), 1..8),
+        ) {
+            let k = n_parts.min(file_flags.len());
+            let files = file_flags[..k].iter().filter(|&&f| f).count();
+            let parts: Vec<(&str, Option<&str>, &[u8])> = file_flags[..k]
+                .iter()
+                .map(|&is_file| ("fld", if is_file { Some("f") } else { None }, &b"data"[..]))
+                .collect();
+            let body = mp(&b, &parts);
+            let c = ct(&b);
+
+            let generous = WafProfile::default();
+            prop_assert_eq!(multipart_structure(&c, &body, &generous), WafVerdict::Allow,
+                "well-formed body rejected: boundary={:?} parts={}", b, k);
+
+            // One short of k parts denies (k >= 1 always here).
+            let short_parts = WafProfile { max_parts: k - 1, ..WafProfile::default() };
+            prop_assert_eq!(
+                multipart_structure(&c, &body, &short_parts),
+                WafVerdict::Deny("too many multipart parts"),
+                "max_parts={} should reject k={}", k - 1, k
+            );
+
+            // One below the file-part count denies, when there is at least one file.
+            if files >= 1 {
+                let short_files = WafProfile { max_file_parts: files - 1, ..WafProfile::default() };
+                prop_assert_eq!(
+                    multipart_structure(&c, &body, &short_files),
+                    WafVerdict::Deny("too many multipart file parts"),
+                    "max_file_parts={} should reject files={}", files - 1, files
+                );
+            }
+        }
     }
 }
