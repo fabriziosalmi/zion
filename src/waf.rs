@@ -138,6 +138,12 @@ pub struct WafProfile {
     /// `__proto__`, `constructor`, which are never legitimate part header names.
     #[serde(default = "default_deny_part_header_names")]
     pub deny_part_header_names: Vec<String>,
+    /// Refuse a form field whose Content-Disposition `name` encodes an array with a numeric
+    /// index above this (e.g. `items[4294967295]`), which makes some frameworks allocate a huge
+    /// sparse array (multer CVE-2026-77078). Default 100000; `0` disables the check. Real array
+    /// forms (`items[0]`, `user[addresses][3]`) stay far below it.
+    #[serde(default = "default_max_field_name_index")]
+    pub max_field_name_index: u64,
 }
 
 fn default_max_body_mb() -> u64 {
@@ -176,6 +182,9 @@ fn default_max_part_header_bytes() -> usize {
 fn default_deny_part_header_names() -> Vec<String> {
     vec!["__proto__".to_string(), "constructor".to_string()]
 }
+fn default_max_field_name_index() -> u64 {
+    100_000
+}
 
 impl Default for WafProfile {
     fn default() -> Self {
@@ -196,6 +205,7 @@ impl Default for WafProfile {
             max_part_header_bytes: default_max_part_header_bytes(),
             deny_field_names: Vec::new(),
             deny_part_header_names: default_deny_part_header_names(),
+            max_field_name_index: default_max_field_name_index(),
         }
     }
 }
@@ -1196,6 +1206,18 @@ fn ct_is_multipart(ct: &str) -> bool {
         && (b.len() == M.len() || b[M.len()] == b';' || b[M.len()] == b' ')
 }
 
+/// Does `ct` carry a `boundary` parameter (valid or not)? It is the signal that a lenient
+/// upstream may parse the body as multipart even when the media type is not canonical
+/// `multipart/form-data` — the Spring CVE-2026-41853 content-type-smuggling class. zion then
+/// parses it too, so the two cannot read the body differently.
+fn ct_has_boundary_param(ct: &str) -> bool {
+    ct.as_bytes().split(|&b| b == b';').skip(1).any(|raw| {
+        let param = trim_lws(raw);
+        memchr::memchr(b'=', param)
+            .is_some_and(|eq| trim_lws(&param[..eq]).eq_ignore_ascii_case(b"boundary"))
+    })
+}
+
 /// ASCII spaces and tabs trimmed from both ends.
 fn trim_lws(s: &[u8]) -> &[u8] {
     let start = s
@@ -1270,10 +1292,51 @@ enum PartHeaders {
     Deny(&'static str),
 }
 
-/// Walk one part's header block (the bytes before its blank line): count the headers, require a
-/// Content-Disposition with a field `name`, apply the field-name and part-header-name denylists,
-/// and report whether the part is a file part (it has a `filename`, empty included).
-fn inspect_part_headers(block: &[u8], profile: &WafProfile) -> PartHeaders {
+/// Does a form field `name` encode an array index above `cap` (e.g. `items[4294967295]`)?
+/// `cap == 0` disables the check. A bracketed run of digits that overflows `u64`, or exceeds
+/// `cap`, is a hit; non-numeric keys (`user[name]`) and small indices (`items[3]`) are not.
+fn field_name_index_exceeds(name: &[u8], cap: u64) -> bool {
+    if cap == 0 {
+        return false;
+    }
+    let mut i = 0;
+    while i < name.len() {
+        if name[i] == b'[' {
+            let start = i + 1;
+            let mut j = start;
+            while j < name.len() && name[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > start && name.get(j) == Some(&b']') {
+                let mut val: u64 = 0;
+                for &d in &name[start..j] {
+                    match val
+                        .checked_mul(10)
+                        .and_then(|v| v.checked_add((d - b'0') as u64))
+                    {
+                        Some(v) => val = v,
+                        None => return true, // overflows u64 — far above any cap
+                    }
+                }
+                if val > cap {
+                    return true;
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Walk one part's header block (the bytes before its blank line): count the headers and apply
+/// the part-header-name denylist. In `form_data` mode (a `multipart/form-data` body) it also
+/// requires a Content-Disposition with a field `name`, applies the field-name denylist and the
+/// array-index cap, and reports whether the part is a file part (it has a `filename`, empty
+/// included). In structural mode (another `multipart/*` carrying a boundary — the smuggling
+/// class) the form-data-specific checks do not apply: only the structural limits do.
+fn inspect_part_headers(block: &[u8], profile: &WafProfile, form_data: bool) -> PartHeaders {
     let mut count = 0usize;
     let mut name: Option<&[u8]> = None;
     let mut is_file = false;
@@ -1315,6 +1378,10 @@ fn inspect_part_headers(block: &[u8], profile: &WafProfile) -> PartHeaders {
         }
         rest = tail;
     }
+    if !form_data {
+        // Structural multipart: no field-name semantics apply, only the structural limits above.
+        return PartHeaders::Ok { is_file: false };
+    }
     match name {
         None => PartHeaders::Deny("multipart part without a field name"),
         Some(n) => {
@@ -1324,6 +1391,9 @@ fn inspect_part_headers(block: &[u8], profile: &WafProfile) -> PartHeaders {
                 .any(|d| d.as_bytes().eq_ignore_ascii_case(n))
             {
                 return PartHeaders::Deny("denied multipart field name");
+            }
+            if field_name_index_exceeds(n, profile.max_field_name_index) {
+                return PartHeaders::Deny("multipart field name array index too large");
             }
             PartHeaders::Ok { is_file }
         }
@@ -1355,11 +1425,14 @@ fn cd_param<'a>(value: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-/// Gate 2b (#694): strict `multipart/form-data` structure. Parses the body the way the origin
-/// will read it and holds it to the profile's limits. A body that does not parse cleanly is
-/// denied, never forwarded, so zion cannot read it differently from the upstream (the multipart
-/// smuggling class, e.g. the Spring CVE-2026-41853 family). Runs on a fully buffered body.
+/// Gate 2b (#694): strict multipart structure. Parses the body the way the origin will read it
+/// and holds it to the profile's limits. A body that does not parse cleanly is denied, never
+/// forwarded, so zion cannot read it differently from the upstream. It runs for a canonical
+/// `multipart/form-data` body (full field-name rules) and for any other content-type carrying a
+/// boundary — the Spring CVE-2026-41853 content-type-smuggling class — where only the structural
+/// limits apply. Runs on a fully buffered body.
 fn multipart_structure(ct: &str, body: &[u8], profile: &WafProfile) -> WafVerdict {
+    let form_data = ct_is_multipart(ct);
     let boundary = match multipart_boundary(ct) {
         Some(b) => b,
         None => return WafVerdict::Deny("malformed multipart boundary"),
@@ -1407,7 +1480,7 @@ fn multipart_structure(ct: &str, body: &[u8], profile: &WafProfile) -> WafVerdic
         if header_block.len() > profile.max_part_header_bytes {
             return WafVerdict::Deny("multipart part headers too large");
         }
-        match inspect_part_headers(header_block, profile) {
+        match inspect_part_headers(header_block, profile, form_data) {
             PartHeaders::Deny(reason) => return WafVerdict::Deny(reason),
             PartHeaders::Ok { is_file } => {
                 if is_file {
@@ -1485,12 +1558,13 @@ fn validate_request_impl(
             .map(|b| b.eq_ignore_ascii_case(b"application/json"))
             .unwrap_or(false);
 
-    // ── Gate 2b: multipart/form-data structure (strict, #694) ──
-    // When the body is labelled multipart, parse it the way the origin will and
-    // hold it to the profile's structure limits. A body that does not parse
-    // cleanly is denied here, before the raw scan, so zion never forwards a
-    // multipart body it read differently from the upstream.
-    if ct_is_multipart(ct) {
+    // ── Gate 2b: multipart structure (strict, #694) ──
+    // Any body a lenient upstream might parse as multipart — canonical
+    // multipart/form-data, or any content-type carrying a boundary= parameter
+    // (the Spring CVE-2026-41853 content-type-smuggling class) — is parsed the
+    // way the origin will and denied here, before the raw scan, if it does not
+    // parse cleanly, so zion never forwards a body it read differently.
+    if ct_is_multipart(ct) || ct_has_boundary_param(ct) {
         if let v @ WafVerdict::Deny(_) = multipart_structure(ct, body, profile) {
             return v;
         }
@@ -3831,6 +3905,78 @@ mod tests {
             validate_request("POST", Some(&ct("B")), bad, &p),
             WafVerdict::Deny("multipart body does not start at its boundary")
         );
+    }
+
+    #[test]
+    fn a_boundary_on_a_non_form_data_type_is_still_parsed_strictly() {
+        // Spring CVE-2026-41853: a content-type that is not canonical multipart/form-data but
+        // carries a boundary is parsed too (a lenient upstream would), so a smuggling shape
+        // cannot slip past unparsed. A strict content-type policy already denies these at the
+        // content-type gate; this covers the lenient profile, where the body reaches Gate 2b.
+        let p = WafProfile {
+            deny_unknown_content_types: false,
+            ..WafProfile::default()
+        };
+        let mut smuggle = b"preamble".to_vec();
+        smuggle.extend_from_slice(&mp("B", &[("x", None, b"v")]));
+        assert_eq!(
+            validate_request("POST", Some("multipart/mixed; boundary=B"), &smuggle, &p),
+            WafVerdict::Deny("multipart body does not start at its boundary")
+        );
+        // even a non-multipart media type carrying a boundary is parsed, not forwarded raw.
+        assert_eq!(
+            validate_request(
+                "POST",
+                Some("application/x-smuggle; boundary=B"),
+                &smuggle,
+                &p
+            ),
+            WafVerdict::Deny("multipart body does not start at its boundary")
+        );
+    }
+
+    #[test]
+    fn a_well_formed_non_form_data_multipart_passes_without_the_name_rule() {
+        // A structural multipart/mixed part carries Content-Type, not a form-data name. That is
+        // allowed in structural mode, refused under multipart/form-data.
+        let p = WafProfile::default();
+        let body = b"--B\r\nContent-Type: text/plain\r\n\r\nhello\r\n--B--";
+        assert_eq!(
+            multipart_structure("multipart/mixed; boundary=B", body, &p),
+            WafVerdict::Allow
+        );
+        assert_eq!(
+            multipart_structure("multipart/form-data; boundary=B", body, &p),
+            WafVerdict::Deny("multipart part without a field name")
+        );
+    }
+
+    #[test]
+    fn a_form_field_name_with_a_huge_array_index_is_refused() {
+        // multer CVE-2026-77078: items[4294967295] makes some frameworks allocate a huge array.
+        let p = WafProfile::default(); // max_field_name_index = 100000
+        let evil = mp("B", &[("items[4294967295]", None, b"v")]);
+        assert_eq!(
+            multipart_structure(&ct("B"), &evil, &p),
+            WafVerdict::Deny("multipart field name array index too large")
+        );
+        // real array forms stay well under the cap.
+        let ok = mp("B", &[("items[3]", None, b"a"), ("user[name]", None, b"b")]);
+        assert_eq!(multipart_structure(&ct("B"), &ok, &p), WafVerdict::Allow);
+    }
+
+    #[test]
+    fn field_name_index_helper_catches_overflow_and_respects_the_cap() {
+        assert!(field_name_index_exceeds(b"items[4294967295]", 100_000));
+        assert!(field_name_index_exceeds(
+            b"x[99999999999999999999999]",
+            100_000
+        )); // u64 overflow
+        assert!(field_name_index_exceeds(b"a[200000]", 100_000));
+        assert!(!field_name_index_exceeds(b"a[100000]", 100_000)); // == cap, not over
+        assert!(!field_name_index_exceeds(b"items[3]", 100_000));
+        assert!(!field_name_index_exceeds(b"user[name]", 100_000)); // non-numeric key
+        assert!(!field_name_index_exceeds(b"items[4294967295]", 0)); // 0 disables
     }
 
     use proptest::prelude::*;

@@ -62,6 +62,7 @@ waf_profile = "upload"
 | `max_part_header_bytes` | usize | `8192` | Maximum total bytes of one part's header block. |
 | `deny_field_names` | string[] | `[]` | Form field names refused outright (a part whose Content-Disposition `name` matches, case-insensitive). E.g. `PHP_SESSION_UPLOAD_PROGRESS`. |
 | `deny_part_header_names` | string[] | `["__proto__", "constructor"]` | Part header names refused outright (case-insensitive). |
+| `max_field_name_index` | u64 | `100000` | Refuse a field name that encodes an array index above this (e.g. `items[4294967295]`); `0` disables. |
 
 ## Multipart structure
 
@@ -76,10 +77,21 @@ parser CVEs rely on.
 A body is refused when: the `boundary` parameter is missing, malformed, or
 declared twice; the body does not begin at its boundary (a preamble); the closing
 `--boundary--` is absent; a part has no field `name`; a part's header block is not
-terminated; `max_parts`, `max_file_parts`, `max_part_headers`, or
-`max_part_header_bytes` is exceeded; or a `deny_field_names` / `deny_part_header_names`
-entry matches. The defaults are generous enough for real browser and `curl -F`
-uploads; tighten them per profile for an endpoint that takes only small forms.
+terminated; `max_parts`, `max_file_parts`, `max_part_headers`,
+`max_part_header_bytes`, or `max_field_name_index` is exceeded; or a
+`deny_field_names` / `deny_part_header_names` entry matches. The defaults are
+generous enough for real browser and `curl -F` uploads; tighten them per profile
+for an endpoint that takes only small forms.
+
+The gate also runs on **any other content-type that carries a `boundary`
+parameter** (for example `multipart/mixed`, or a wildcard variant a framework
+maps to multipart). A lenient upstream parses such a body as multipart while a
+front proxy that only recognised `multipart/form-data` would forward it unparsed,
+so the two could split the body on a different boundary — the content-type
+smuggling class (Spring CVE-2026-41853). Zion parses it to the same structural
+limits (without the form-data field-name rules), so they cannot disagree. A strict
+`deny_unknown_content_types` already refuses these at the content-type gate; this
+covers the lenient profiles that accept them.
 
 ## Detection modes
 
