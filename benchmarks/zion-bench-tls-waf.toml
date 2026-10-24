@@ -12,12 +12,25 @@ hot_reload = false
 backend = "http://127.0.0.1:9090"
 frontend = "http://127.0.0.1:9090"
 
+# WAF profile for the corpus route. Balanced mode (the detection baseline), with the
+# multipart structure limits tightened so the #694 CVE request-shapes are caught at a
+# realistic size, and lenient on content-types so a non-form-data multipart smuggle
+# (Spring CVE-2026-41853) reaches the multipart structure gate rather than being stopped
+# earlier by the content-type gate. Non-multipart detection is unchanged.
+[waf_profile.corpus]
+deny_unknown_content_types = false
+max_body_mb = 10
+max_parts = 20
+max_file_parts = 10
+max_part_headers = 6
+max_part_header_bytes = 512
+deny_field_names = ["PHP_SESSION_UPLOAD_PROGRESS"]
+
 [[route]]
 path = "/api/{*rest}"
 upstream = "backend"
 mode = "standard"
-waf = true
-max_body_mb = 10
+waf_profile = "corpus"
 
 [[route]]
 path = "/_next/static/{*rest}"

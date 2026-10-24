@@ -998,5 +998,133 @@
   "category": "benign",
   "kind": "benign",
   "payload": "onclick handlers should be CSP-safe"
+ },
+ {
+  "category": "multipart",
+  "kind": "mal",
+  "vector": "multipart",
+  "content_type": "multipart/form-data; boundary=ZNWAF",
+  "body": "--ZNWAF\r\nContent-Disposition: form-data; name=\"f0\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f1\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f2\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f3\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f4\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f5\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f6\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f7\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f8\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f9\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f10\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f11\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f12\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f13\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f14\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f15\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f16\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f17\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f18\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f19\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f20\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f21\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f22\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f23\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f24\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f25\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f26\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f27\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f28\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f29\"\r\n\r\nv\r\n--ZNWAF--",
+  "note": "CVE-2025-48988 Tomcat part flood"
+ },
+ {
+  "category": "multipart",
+  "kind": "mal",
+  "vector": "multipart",
+  "content_type": "multipart/form-data; boundary=ZNWAF",
+  "body": "--ZNWAF\r\nContent-Disposition: form-data; name=\"f\"\r\nX-Pad: {PAD:600}\r\n\r\nv\r\n--ZNWAF--",
+  "note": "CVE-2025-48976 Commons FileUpload oversized part headers"
+ },
+ {
+  "category": "multipart",
+  "kind": "mal",
+  "vector": "multipart",
+  "content_type": "multipart/form-data; boundary=ZNWAF",
+  "body": "--ZNWAF\r\nContent-Disposition: form-data; name=\"f\"\r\nX-H0: v\r\nX-H1: v\r\nX-H2: v\r\nX-H3: v\r\nX-H4: v\r\nX-H5: v\r\nX-H6: v\r\nX-H7: v\r\nX-H8: v\r\nX-H9: v\r\n\r\nv\r\n--ZNWAF--",
+  "note": "CVE-2026-42561 python-multipart part-header flood"
+ },
+ {
+  "category": "multipart",
+  "kind": "mal",
+  "vector": "multipart",
+  "content_type": "multipart/form-data; boundary=ZNWAF",
+  "body": "--ZNWAF\r\nContent-Disposition: form-data; name=\"f\"\r\nX-Big: {PAD:600}\r\n\r\nv\r\n--ZNWAF--",
+  "note": "CVE-2026-94440 Go huge header line"
+ },
+ {
+  "category": "multipart",
+  "kind": "mal",
+  "vector": "multipart",
+  "content_type": "multipart/form-data; boundary=ZNWAF",
+  "body": "--ZNWAF\r\nContent-Disposition: form-data; name=\"f0\"; filename=\"f0.bin\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f1\"; filename=\"f1.bin\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f2\"; filename=\"f2.bin\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f3\"; filename=\"f3.bin\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f4\"; filename=\"f4.bin\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f5\"; filename=\"f5.bin\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f6\"; filename=\"f6.bin\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f7\"; filename=\"f7.bin\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f8\"; filename=\"f8.bin\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f9\"; filename=\"f9.bin\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f10\"; filename=\"f10.bin\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f11\"; filename=\"f11.bin\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f12\"; filename=\"f12.bin\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f13\"; filename=\"f13.bin\"\r\n\r\nv\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"f14\"; filename=\"f14.bin\"\r\n\r\nv\r\n--ZNWAF--",
+  "note": "CVE-2026-111066 aiohttp file-part flood"
+ },
+ {
+  "category": "multipart",
+  "kind": "mal",
+  "vector": "multipart",
+  "content_type": "multipart/form-data; boundary=ZNWAF",
+  "body": "--ZNWAF\r\nContent-Disposition: form-data; name=\"f\"\r\n__proto__: x\r\n\r\nv\r\n--ZNWAF--",
+  "note": "CVE-2026-19481 busboy __proto__ part header"
+ },
+ {
+  "category": "multipart",
+  "kind": "mal",
+  "vector": "multipart",
+  "content_type": "multipart/form-data; boundary=ZNWAF",
+  "body": "--ZNWAF\r\nContent-Disposition: form-data; name=\"PHP_SESSION_UPLOAD_PROGRESS\"\r\n\r\nx\r\n--ZNWAF--",
+  "note": "PHP2Shell PHP_SESSION_UPLOAD_PROGRESS field"
+ },
+ {
+  "category": "multipart",
+  "kind": "mal",
+  "vector": "multipart",
+  "content_type": "multipart/form-data; boundary=ZNWAF",
+  "body": "{PAD:400}--ZNWAF\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nv\r\n--ZNWAF--",
+  "note": "CVE-2024-53981 python-multipart preamble flood"
+ },
+ {
+  "category": "multipart",
+  "kind": "mal",
+  "vector": "multipart",
+  "content_type": "multipart/mixed; boundary=ZNWAF",
+  "body": "--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF\r\nContent-Type: text/plain\r\n\r\nv\r\n--ZNWAF--",
+  "note": "CVE-2026-41853 Spring content-type smuggle (multipart/mixed)"
+ },
+ {
+  "category": "multipart",
+  "kind": "mal",
+  "vector": "multipart",
+  "content_type": "multipart/form-data; boundary=ZNWAF",
+  "body": "--ZNWAF\r\nContent-Disposition: form-data; name=\"items[4294967295]\"\r\n\r\nx\r\n--ZNWAF--",
+  "note": "CVE-2026-77078 multer field array index"
+ },
+ {
+  "category": "multipart",
+  "kind": "mal",
+  "vector": "multipart",
+  "content_type": "multipart/form-data; boundary=ZNWAF",
+  "body": "--ZNWAF\r\nContent-Disposition: form-data; name=\"f\"; filename=\"{PAD:600}\"\r\n\r\nv\r\n--ZNWAF--",
+  "note": "CVE-2026-109618 PHP OOM trigger, mitigated (oversized filename)"
+ },
+ {
+  "category": "multipart",
+  "kind": "benign",
+  "vector": "multipart",
+  "content_type": "multipart/form-data; boundary=----WebKitFormBoundaryAbC123",
+  "body": "------WebKitFormBoundaryAbC123\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello world\r\n------WebKitFormBoundaryAbC123\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"me.png\"\r\n\r\npngdata-small\r\n------WebKitFormBoundaryAbC123--",
+  "note": "benign browser form (text field + small file)"
+ },
+ {
+  "category": "multipart",
+  "kind": "benign",
+  "vector": "multipart",
+  "content_type": "multipart/form-data; boundary=------------------------abc123def456",
+  "body": "--------------------------abc123def456\r\nContent-Disposition: form-data; name=\"field\"\r\n\r\nvalue\r\n--------------------------abc123def456\r\nContent-Disposition: form-data; name=\"file\"; filename=\"doc.txt\"\r\n\r\nsome document text\r\n--------------------------abc123def456--",
+  "note": "benign curl -F upload"
+ },
+ {
+  "category": "multipart",
+  "kind": "benign",
+  "vector": "multipart",
+  "content_type": "multipart/form-data; boundary=ZNWAF",
+  "body": "--ZNWAF\r\nContent-Disposition: form-data; name=\"items[0]\"\r\n\r\na\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"items[1]\"\r\n\r\nb\r\n--ZNWAF\r\nContent-Disposition: form-data; name=\"user[name]\"\r\n\r\nAlice\r\n--ZNWAF--",
+  "note": "benign array form (small indices)"
+ },
+ {
+  "category": "multipart",
+  "kind": "benign",
+  "vector": "multipart",
+  "content_type": "multipart/form-data; boundary=ZNWAF",
+  "body": "--ZNWAF\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"big.bin\"\r\n\r\n{PAD:262144}\r\n--ZNWAF--",
+  "note": "benign large file upload"
+ },
+ {
+  "category": "multipart",
+  "kind": "benign",
+  "vector": "multipart",
+  "content_type": "multipart/mixed; boundary=ZNWAF",
+  "body": "--ZNWAF\r\nContent-Type: text/plain\r\n\r\nhello\r\n--ZNWAF\r\nContent-Type: application/json\r\n\r\n{}\r\n--ZNWAF--",
+  "note": "benign multipart/mixed well-formed"
  }
 ]

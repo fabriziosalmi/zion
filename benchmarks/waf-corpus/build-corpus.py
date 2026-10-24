@@ -118,12 +118,98 @@ BENIGN = [
  "id: 12345, name: Acme Corp", "onclick handlers should be CSP-safe",
 ]
 
+# ── multipart/form-data structure shapes (#694) ────────────────────────────
+# Full requests, not query/JSON payloads: each carries a Content-Type and a raw
+# body built here so the CRLF framing is exact. `{PAD:N}` expands (in run.py) to
+# N bytes, keeping oversized shapes compact in the committed corpus. The malicious
+# set is the REQUEST SHAPE of each CVE — a part flood, an oversized header, a bad
+# field/part-header name, a preamble, a smuggling content-type — never a weaponized
+# exploit. Detection assumes the corpus WAF profile's tightened limits
+# (see benchmarks/zion-bench-tls-waf.toml): max_parts 20, max_file_parts 10,
+# max_part_headers 6, max_part_header_bytes 512, deny_field_names
+# [PHP_SESSION_UPLOAD_PROGRESS], default deny_part_header_names + max_field_name_index.
+B = "ZNWAF"  # boundary for the well-formed-framing shapes
+
+
+def part(name=None, filename=None, headers=None, content="v"):
+    lines = []
+    if name is not None:
+        cd = f'Content-Disposition: form-data; name="{name}"'
+        if filename is not None:
+            cd += f'; filename="{filename}"'
+        lines.append(cd)
+    lines += headers or []
+    return "\r\n".join(lines) + "\r\n\r\n" + content
+
+
+def mpbody(boundary, parts):
+    out = f"--{boundary}"
+    for p in parts:
+        out += "\r\n" + p + "\r\n--" + boundary
+    return out + "--"
+
+
+def ctf(boundary):
+    return f"multipart/form-data; boundary={boundary}"
+
+
+MULTIPART_MAL = [
+    ("CVE-2025-48988 Tomcat part flood", ctf(B),
+     mpbody(B, [part(name=f"f{i}") for i in range(30)])),
+    ("CVE-2025-48976 Commons FileUpload oversized part headers", ctf(B),
+     mpbody(B, [part(name="f", headers=["X-Pad: {PAD:600}"])])),
+    ("CVE-2026-42561 python-multipart part-header flood", ctf(B),
+     mpbody(B, [part(name="f", headers=[f"X-H{i}: v" for i in range(10)])])),
+    ("CVE-2026-94440 Go huge header line", ctf(B),
+     mpbody(B, [part(name="f", headers=["X-Big: {PAD:600}"])])),
+    ("CVE-2026-111066 aiohttp file-part flood", ctf(B),
+     mpbody(B, [part(name=f"f{i}", filename=f"f{i}.bin") for i in range(15)])),
+    ("CVE-2026-19481 busboy __proto__ part header", ctf(B),
+     mpbody(B, [part(name="f", headers=["__proto__: x"])])),
+    ("PHP2Shell PHP_SESSION_UPLOAD_PROGRESS field", ctf(B),
+     mpbody(B, [part(name="PHP_SESSION_UPLOAD_PROGRESS", content="x")])),
+    ("CVE-2024-53981 python-multipart preamble flood", ctf(B),
+     "{PAD:400}" + mpbody(B, [part(name="f")])),
+    ("CVE-2026-41853 Spring content-type smuggle (multipart/mixed)", f"multipart/mixed; boundary={B}",
+     mpbody(B, [part(headers=["Content-Type: text/plain"]) for _ in range(30)])),
+    ("CVE-2026-77078 multer field array index", ctf(B),
+     mpbody(B, [part(name="items[4294967295]", content="x")])),
+    ("CVE-2026-109618 PHP OOM trigger, mitigated (oversized filename)", ctf(B),
+     mpbody(B, [part(name="f", filename="{PAD:600}")])),
+]
+
+MULTIPART_BENIGN = [
+    ("benign browser form (text field + small file)", ctf("----WebKitFormBoundaryAbC123"),
+     mpbody("----WebKitFormBoundaryAbC123",
+            [part(name="title", content="hello world"),
+             part(name="avatar", filename="me.png", content="pngdata-small")])),
+    ("benign curl -F upload", ctf("------------------------abc123def456"),
+     mpbody("------------------------abc123def456",
+            [part(name="field", content="value"),
+             part(name="file", filename="doc.txt", content="some document text")])),
+    ("benign array form (small indices)", ctf(B),
+     mpbody(B, [part(name="items[0]", content="a"),
+                part(name="items[1]", content="b"),
+                part(name="user[name]", content="Alice")])),
+    ("benign large file upload", ctf(B),
+     mpbody(B, [part(name="upload", filename="big.bin", content="{PAD:262144}")])),
+    ("benign multipart/mixed well-formed", f"multipart/mixed; boundary={B}",
+     mpbody(B, [part(headers=["Content-Type: text/plain"], content="hello"),
+                part(headers=["Content-Type: application/json"], content="{}")])),
+]
+
 corpus = []
 for cat, items in MAL.items():
     for p in items:
         corpus.append({"category": cat, "kind": "mal", "payload": p})
 for p in BENIGN:
     corpus.append({"category": "benign", "kind": "benign", "payload": p})
+for note, ct, body in MULTIPART_MAL:
+    corpus.append({"category": "multipart", "kind": "mal", "vector": "multipart",
+                   "content_type": ct, "body": body, "note": note})
+for note, ct, body in MULTIPART_BENIGN:
+    corpus.append({"category": "multipart", "kind": "benign", "vector": "multipart",
+                   "content_type": ct, "body": body, "note": note})
 
 mal_n = sum(1 for c in corpus if c["kind"] == "mal")
 ben_n = sum(1 for c in corpus if c["kind"] == "benign")

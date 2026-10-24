@@ -52,19 +52,46 @@ def fire(method, payload):
         return f"ERR:{type(e).__name__}"
 
 
+# Multipart entries (vector == "multipart") carry a full request: a `content_type`
+# header and a raw `body`. `{PAD:N}` in the body expands to N 'a' bytes, so a large
+# body (an oversized filename, a long preamble, a legit big upload) stays compact in
+# the committed corpus. The body is sent verbatim, so a malformed shape (bad boundary,
+# part flood, smuggling content-type) is delivered exactly as written.
+import re
+def expand_pad(body):
+    return re.sub(r"\{PAD:(\d+)\}", lambda m: "a" * int(m.group(1)), body)
+
+def fire_multipart(content_type, body):
+    try:
+        req = urllib.request.Request(URL, data=expand_pad(body).encode("latin-1"),
+                                     method="POST", headers={"Content-Type": content_type})
+        with urllib.request.urlopen(req, context=CTX, timeout=10) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception as e:
+        return f"ERR:{type(e).__name__}"
+
+
 by_cat = collections.defaultdict(lambda: [0, 0])
 fn, fp = [], []
 for e in CORPUS:
-    sq, sb = fire("GET", e["payload"]), fire("POST", e["payload"])
-    blocked = (sq == 400) or (sb == 400)
+    if e.get("vector") == "multipart":
+        s = fire_multipart(e["content_type"], e["body"])
+        sq = sb = s
+        blocked = (s == 400)
+    else:
+        sq, sb = fire("GET", e["payload"]), fire("POST", e["payload"])
+        blocked = (sq == 400) or (sb == 400)
+    label = e.get("payload") or e.get("note", "")
     if e["kind"] == "mal":
         by_cat[e["category"]][1] += 1
         if blocked:
             by_cat[e["category"]][0] += 1
         else:
-            fn.append((e["category"], e["payload"], sq, sb))
+            fn.append((e["category"], label, sq, sb))
     elif blocked:
-        fp.append((e["payload"], sq, sb))
+        fp.append((label, sq, sb))
 
 det = sum(v[0] for v in by_cat.values()); tot = sum(v[1] for v in by_cat.values())
 ben = sum(1 for e in CORPUS if e["kind"] == "benign")
