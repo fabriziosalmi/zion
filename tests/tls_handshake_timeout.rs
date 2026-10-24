@@ -18,7 +18,6 @@ use common::free_port;
 
 struct Zion {
     child: Child,
-    http: u16,
     https: u16,
     dir: PathBuf,
 }
@@ -81,7 +80,6 @@ fn start(tls_extra: &str) -> Option<Zion> {
         .expect("spawn zion");
     let zion = Zion {
         child,
-        http,
         https,
         dir,
     };
