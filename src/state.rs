@@ -65,6 +65,9 @@ pub(crate) struct ResolvedAppConfig {
     pub(crate) tcp_keepalive_secs: u64,
     /// `[server] tcp_user_timeout_secs` (0 = kernel default).
     pub(crate) tcp_user_timeout_secs: u64,
+    /// `[tls] handshake_timeout_secs`: a TLS handshake may take this long before the
+    /// connection is dropped (default 10).
+    pub(crate) tls_handshake_timeout_secs: u64,
     /// `[server] h2_control_frames_per_sec` (0 = no limit).
     pub(crate) h2_control_frames_per_sec: u32,
     /// The response cache's byte budget (`[server] cache_max_memory_mb`, or derived from
@@ -137,6 +140,7 @@ impl ResolvedAppConfig {
             max_connections_per_ip: 0,
             tcp_keepalive_secs: crate::net::DEFAULT_TCP_KEEPALIVE_SECS,
             tcp_user_timeout_secs: crate::net::DEFAULT_TCP_USER_TIMEOUT_SECS,
+            tls_handshake_timeout_secs: 10,
             h2_control_frames_per_sec: 0,
             max_connections: None,
             cache_budget_bytes: 0,
@@ -491,6 +495,7 @@ impl ResolvedAppConfig {
             max_connections_per_ip,
             tcp_keepalive_secs: config.server.tcp_keepalive_secs,
             tcp_user_timeout_secs: config.server.tcp_user_timeout_secs,
+            tls_handshake_timeout_secs: config.tls.handshake_timeout_secs,
             h2_control_frames_per_sec: config.server.h2_control_frames_per_sec,
             max_connections: config.server.max_connections,
             cache_budget_bytes: config

@@ -382,8 +382,9 @@ fn spawn_https_handler(
         let inner_for_handshake = tcp_stream;
 
         let tls_start = std::time::Instant::now();
+        let hs_timeout = state.config.load().tls_handshake_timeout_secs;
         let mut tls_stream = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(hs_timeout),
             (*acceptor).accept(inner_for_handshake),
         )
         .await

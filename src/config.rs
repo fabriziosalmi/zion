@@ -701,6 +701,11 @@ pub struct TlsConfig {
     pub key_path: String,
     #[serde(default = "default_true")]
     pub hot_reload: bool,
+    /// Seconds a TLS handshake may take before the connection is dropped (default 10).
+    /// Under a slow-handshake flood an operator can lower it to free connection slots
+    /// sooner; a legitimate handshake completes in well under a second.
+    #[serde(default = "default_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
     #[serde(default)]
     pub min_version: TlsMinVersion,
     /// TLS 1.3 session tickets sent after each full handshake (default 2, at most
@@ -934,6 +939,10 @@ pub const MAX_SESSION_TICKETS: u8 = 16;
 
 fn default_session_tickets() -> u8 {
     2
+}
+
+fn default_handshake_timeout_secs() -> u64 {
+    10
 }
 
 fn default_true() -> bool {
@@ -2643,6 +2652,12 @@ fn check_tls_client_auth(config: &ZionConfig, errors: &mut Vec<String>) {
             config.tls.session_tickets
         ));
     }
+    if config.tls.handshake_timeout_secs == 0 {
+        errors.push(
+            "tls.handshake_timeout_secs must be >= 1 (0 would drop every handshake instantly)"
+                .to_string(),
+        );
+    }
     if config.tls.client_crl_enforce_next_update && config.tls.client_crl_path.is_none() {
         errors.push(
             "tls.client_crl_enforce_next_update is set but tls.client_crl_path is not: there is \
@@ -3027,6 +3042,34 @@ mod tests {
             !r.as_ref().is_err_and(|e| e.contains("tls.session_tickets")),
             "{r:?}"
         );
+    }
+
+    #[test]
+    fn handshake_timeout_defaults_to_ten_and_rejects_zero() {
+        let text = |extra: &str| {
+            format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+                 [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n{extra}\
+                 [upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+                 [[route]]\npath=\"/{{*r}}\"\nupstream=\"be\"\n"
+            )
+        };
+        let read = |extra: &str| toml::from_str::<ZionConfig>(&text(extra)).unwrap();
+        assert_eq!(
+            read("").tls.handshake_timeout_secs,
+            10,
+            "the default is 10 s"
+        );
+        assert_eq!(
+            read("handshake_timeout_secs = 3\n")
+                .tls
+                .handshake_timeout_secs,
+            3
+        );
+        // 0 would drop every handshake instantly — refused at validation, naming the key.
+        let zero = read("handshake_timeout_secs = 0\n");
+        let e = validate_semantics(&zero, "t").expect_err("zero rejected");
+        assert!(e.contains("tls.handshake_timeout_secs"), "{e}");
     }
 
     #[test]
