@@ -321,4 +321,78 @@ mod tests {
             assert!(e.contains("deny_cookies"), "{bad:?}: {e}");
         }
     }
+
+    // ── Adversarial invariants (proptest) ───────────────────────────────
+    //
+    // The name matching is what keeps a denied header or cookie from slipping
+    // through under a different spelling. These hammer it with random names and
+    // assert the equivalences the policy relies on; a counterexample is a real
+    // smuggling hole, not flakiness.
+    use proptest::prelude::*;
+
+    fn name_like() -> impl Strategy<Value = String> {
+        let c = prop::sample::select(vec!['a', 'B', 'x', '-', '_', '9', 'Z', '.']);
+        prop::collection::vec(c, 1..16).prop_map(|cs| cs.into_iter().collect())
+    }
+
+    // A cookie token (RFC 9110 token subset) with no '%', so percent-encoding it
+    // is unambiguous.
+    fn token_no_pct() -> impl Strategy<Value = String> {
+        let c = prop::sample::select("abcXYZ019!#$&'*+-.^_`|~".chars().collect::<Vec<_>>());
+        prop::collection::vec(c, 1..16).prop_map(|cs| cs.into_iter().collect())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        // Case and `_`/`-` never change the folded name; folding is idempotent.
+        #[test]
+        fn fold_erases_case_and_dash_underscore(s in name_like()) {
+            let f = fold(&s);
+            prop_assert_eq!(&f, &fold(&f), "not idempotent: {:?}", s);
+            prop_assert_eq!(&f, &fold(&s.to_ascii_uppercase()), "case leaked: {:?}", s);
+            prop_assert_eq!(&f, &fold(&s.replace('-', "_")), "dash/underscore leaked: {:?}", s);
+        }
+
+        // The strip/deny matcher is exactly fold-equality: a listed name matches a
+        // request header iff they share a canonical form. If this breaks, a denied
+        // header can be smuggled past by respelling its case or `_`/`-`.
+        #[test]
+        fn same_name_is_exactly_fold_equality(a in name_like(), b in name_like()) {
+            let got = same_name(&fold(&a), &b.to_ascii_lowercase());
+            prop_assert_eq!(got, fold(&a) == fold(&b), "a={:?} b={:?}", a, b);
+        }
+
+        // percent_decoded never panics and reports "no escapes" as None.
+        #[test]
+        fn percent_decoded_is_total(s in ".{0,32}") {
+            let d = percent_decoded(&s);
+            if !s.contains('%') {
+                prop_assert!(d.is_none(), "no % but decoded: {:?}", s);
+            }
+        }
+
+        // Percent-encoding any subset of a token's bytes still decodes back to it:
+        // a denied cookie name cannot be hidden behind percent-escapes.
+        #[test]
+        fn encoding_a_cookie_name_round_trips(tok in token_no_pct(), mask in any::<u64>()) {
+            let mut enc = String::new();
+            let mut encoded_any = false;
+            for (i, b) in tok.bytes().enumerate() {
+                if (mask >> (i % 64)) & 1 == 1 {
+                    enc.push('%');
+                    enc.push_str(&format!("{b:02X}"));
+                    encoded_any = true;
+                } else {
+                    enc.push(b as char);
+                }
+            }
+            let decoded = percent_decoded(&enc);
+            if encoded_any {
+                prop_assert_eq!(decoded.as_deref(), Some(tok.as_str()), "enc={:?}", enc);
+            } else {
+                prop_assert!(decoded.is_none());
+            }
+        }
+    }
 }
