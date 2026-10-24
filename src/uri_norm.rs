@@ -512,4 +512,87 @@ mod tests {
         assert_eq!(n("/caf\u{e9}//x"), "/caf\u{e9}/x");
         assert_eq!(n("/caf%C3%A9/./x"), "/caf%C3%A9/x");
     }
+
+    // ── Adversarial invariants (proptest) ───────────────────────────────
+    //
+    // The example tests above pin known cases; these hammer the parser with
+    // random paths over the bytes that decide a path's meaning (`/ % . ; \`,
+    // hex, a NUL) and assert the properties the security model rests on. A
+    // counterexample here is a real finding, not flakiness: it means zion and
+    // an upstream could read the same request line differently.
+    use proptest::prelude::*;
+
+    fn interesting_path() -> impl Strategy<Value = String> {
+        let byte = prop::sample::select(vec![
+            '/', '%', '.', ';', '\\', '2', '5', 'C', 'c', 'e', 'E', 'f', 'F', '0', '1', 'a', 'i',
+            'b', '~', '_', '-', ' ', '\u{0}',
+        ]);
+        prop::collection::vec(byte, 0..48).prop_map(|cs| {
+            let mut s = String::from("/");
+            s.extend(cs);
+            s
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        // No input panics or hangs, path-shaped or not.
+        #[test]
+        fn never_panics(s in ".{0,64}") {
+            let _ = normalize_path(&s);
+            let _ = try_normalize_path(&s);
+            let _ = without_path_params(&s);
+            let _ = sorted_query(&s);
+        }
+
+        // The fast "already canonical" check agrees exactly with the slow
+        // reference it stands in for. A false positive would forward a path
+        // zion never normalized — the desync this module exists to stop.
+        #[test]
+        fn is_normal_agrees_with_the_slow_reference(p in interesting_path()) {
+            prop_assert_eq!(is_normal(&p), normalize_slow(&p) == p, "path={:?}", p);
+        }
+
+        // The normalized form never normalizes further.
+        #[test]
+        fn normalize_path_is_idempotent(p in interesting_path()) {
+            let once = normalize_path(&p).into_owned();
+            let twice = normalize_path(&once).into_owned();
+            prop_assert_eq!(&twice, &once, "path={:?}", p);
+        }
+
+        // What try_normalize_path accepts is canonical, carries no refused
+        // byte (`\`, `%5C`, `%00`), keeps no dot segment, and is a fixed point.
+        #[test]
+        fn accepted_paths_are_canonical_and_safe(p in interesting_path()) {
+            if let Some(out) = try_normalize_path(&p) {
+                let out = out.into_owned();
+                prop_assert!(is_normal(&out), "not canonical: {:?} -> {:?}", p, out);
+                prop_assert!(!has_refused_bytes(&out), "refused byte survived: {:?} -> {:?}", p, out);
+                prop_assert!(!out.contains('\\'), "backslash survived: {:?}", out);
+                prop_assert!(!out.contains("%5C") && !out.contains("%00"), "encoded refused byte: {:?}", out);
+                for seg in out.split('/') {
+                    prop_assert!(seg != "." && seg != "..", "dot segment survived: {:?} -> {:?}", p, out);
+                }
+                prop_assert_eq!(
+                    try_normalize_path(&out).map(|c| c.into_owned()),
+                    Some(out.clone()),
+                    "not a fixed point: {:?}",
+                    out
+                );
+            }
+        }
+
+        // The path-parameter-stripped form drops every ';', is canonical, and
+        // is a fixed point of normalize_path.
+        #[test]
+        fn stripped_path_params_are_clean(p in interesting_path()) {
+            if let Some(s) = without_path_params(&p) {
+                prop_assert!(!s.contains(';'), "semicolon survived: {:?} -> {:?}", p, s);
+                prop_assert!(is_normal(&s), "not canonical: {:?} -> {:?}", p, s);
+                prop_assert_eq!(normalize_path(&s).into_owned(), s.clone(), "not a fixed point: {:?}", s);
+            }
+        }
+    }
 }
