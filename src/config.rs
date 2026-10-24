@@ -1142,13 +1142,17 @@ pub struct UpstreamConfig {
     /// only; the TLS handshake and the response are bounded by `request_timeout_ms`.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_ms: u64,
-    /// How long one attempt may take from sending the request to receiving the upstream's
-    /// response headers, in milliseconds (default 30000). On expiry the client gets `504`
-    /// (or, in a pool, the next member is tried for an idempotent request). It does not
-    /// bound the response body once it is streaming, nor `sse_stream` and `websocket`
-    /// routes. Raise it for long-polling or slow report endpoints, lower it for an API
-    /// that should fail fast; like nginx `proxy_read_timeout` up to the first byte.
-    /// `None` (omitted) is the default, [`crate::proxy::DEFAULT_REQUEST_TIMEOUT_MS`].
+    /// How long one attempt may wait with no progress, in milliseconds (default 30000). While
+    /// the request body is still being handed to the upstream the deadline resets on each body
+    /// frame, so a steady upload slower than this is not cut (#714); once the body is in, the
+    /// deadline bounds the wait for the upstream's response headers. On expiry the client gets
+    /// `504`, or `408` when zion was waiting for the client's own next bytes (a client too slow
+    /// or stalled, which the circuit breaker does not count); in a pool the next member is tried
+    /// for an idempotent request. It does not bound the response body once it is streaming, nor
+    /// `sse_stream` and `websocket` routes. Raise it for long-polling or slow report endpoints,
+    /// lower it for an API that should fail fast; like nginx `proxy_read_timeout`, but measured
+    /// as idle time and also over the body phase. `None` (omitted) is the default,
+    /// [`crate::proxy::DEFAULT_REQUEST_TIMEOUT_MS`].
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
     #[serde(default = "default_keepalive")]

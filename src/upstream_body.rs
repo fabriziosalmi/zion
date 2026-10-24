@@ -25,9 +25,10 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, SizeHint};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 /// The route's body cap, in bytes, for a request whose body has no declared length. The
 /// request carries it as an extension from the body gate to the proxy, which applies it when
@@ -53,15 +54,33 @@ impl std::error::Error for BodyTooLarge {}
 /// broke is the client's (`400`), and only otherwise did the upstream fail (`502`). It also
 /// tells a timeout spent waiting for the client's body (`408`) from one spent on the upstream
 /// (`504`).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct BodyFault(Arc<FaultState>);
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct FaultState {
     fault: AtomicU8,
     /// The last read of the client's body found nothing to hand on yet: zion is waiting for
     /// the client, not for the upstream.
     waiting_on_client: AtomicBool,
+    /// Milliseconds since [`start`](Self::start) at the body's last progress (a frame handed
+    /// on, or the body ending). The request deadline measures idle time from here, so a steady
+    /// upload slower than `request_timeout_ms` is not cut while it keeps moving, and once the
+    /// body is in the deadline bounds only the wait for the response (#714).
+    last_activity_ms: AtomicU64,
+    /// When this body started, the base for `last_activity_ms`.
+    start: Instant,
+}
+
+impl Default for BodyFault {
+    fn default() -> Self {
+        BodyFault(Arc::new(FaultState {
+            fault: AtomicU8::new(0),
+            waiting_on_client: AtomicBool::new(false),
+            last_activity_ms: AtomicU64::new(0),
+            start: Instant::now(),
+        }))
+    }
 }
 
 // 0, the default, is no fault.
@@ -85,6 +104,21 @@ impl BodyFault {
     /// while the upstream is not taking more of it, this is false.
     pub fn waiting_on_client(&self) -> bool {
         self.0.waiting_on_client.load(Ordering::Acquire)
+    }
+
+    /// Milliseconds since the body's last progress. The request deadline reads this: while a
+    /// steady upload keeps moving it stays small, so the deadline is not reached; once the body
+    /// is in (or a client stalls) it grows, and the deadline is a wait of `request_timeout_ms`
+    /// measured from the last progress.
+    pub fn idle_ms(&self) -> u64 {
+        (self.0.start.elapsed().as_millis() as u64)
+            .saturating_sub(self.0.last_activity_ms.load(Ordering::Acquire))
+    }
+
+    fn progressed(&self) {
+        self.0
+            .last_activity_ms
+            .store(self.0.start.elapsed().as_millis() as u64, Ordering::Release);
     }
 
     fn set(&self, fault: u8) {
@@ -164,7 +198,12 @@ impl Body for UpstreamBody {
         }
         let frame = match polled {
             Poll::Pending => return Poll::Pending,
-            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Ready(None) => {
+                if let Some(fault) = &this.fault {
+                    fault.progressed();
+                }
+                return Poll::Ready(None);
+            }
             Poll::Ready(Some(Err(e))) => {
                 if let Some(fault) = &this.fault {
                     fault.set(BROKEN);
@@ -182,6 +221,9 @@ impl Body for UpstreamBody {
                 return Poll::Ready(Some(Err(Box::new(BodyTooLarge))));
             }
             *left -= len;
+        }
+        if let Some(fault) = &this.fault {
+            fault.progressed();
         }
         Poll::Ready(Some(Ok(frame)))
     }
@@ -295,6 +337,37 @@ mod tests {
         drop(tx);
         assert!(body.frame().await.is_none());
         assert!(!fault.waiting_on_client());
+    }
+
+    #[tokio::test]
+    async fn idle_ms_is_small_while_the_body_moves_and_grows_when_it_stops() {
+        use std::time::Duration;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, BoxError>>(1);
+        let inner: ReqBody =
+            StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx)).boxed();
+        let (mut body, fault) = UpstreamBody::watched(inner, None);
+        // No progress yet: idle grows with wall time.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(fault.idle_ms() >= 30, "idle grows while nothing moves");
+        // A frame handed on resets idle.
+        tx.send(Ok(Frame::data(Bytes::from_static(b"abcd"))))
+            .await
+            .unwrap();
+        assert!(body.frame().await.unwrap().is_ok());
+        assert!(
+            fault.idle_ms() < 30,
+            "a frame reset idle, got {}",
+            fault.idle_ms()
+        );
+        // The body ending counts as progress too (so the response wait starts from there).
+        drop(tx);
+        assert!(body.frame().await.is_none());
+        let at_end = fault.idle_ms();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            fault.idle_ms() > at_end,
+            "idle grows again after the body ends"
+        );
     }
 
     #[tokio::test]
