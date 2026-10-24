@@ -180,7 +180,8 @@ fn boot(dir: &std::path::Path, upstream: u16) -> Option<(Daemon, u16)> {
             "[server]\nlisten_http = \"127.0.0.1:{}\"\nlisten_https = \"127.0.0.1:{https}\"\n\
              [tls]\ncert_path = \"{d}/c.pem\"\nkey_path = \"{d}/k.pem\"\nhot_reload = false\n\
              [upstreams]\nbe = \"http://127.0.0.1:{upstream}\"\n\
-             [[route]]\npath = \"/waf/{{*rest}}\"\nupstream = \"be\"\nwaf = true\n\
+             [waf_profile.lenient]\ndeny_unknown_content_types = false\n\
+             [[route]]\npath = \"/waf/{{*rest}}\"\nupstream = \"be\"\nwaf_profile = \"lenient\"\n\
              [[route]]\npath = \"/framed/{{*rest}}\"\nupstream = \"be\"\nrequire_content_length = true\n\
              [[route]]\npath = \"/{{*rest}}\"\nupstream = \"be\"\n",
             free_port()
@@ -231,8 +232,9 @@ async fn h3_post(port: u16, path: &str, reset: bool) -> Option<u16> {
         let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
     });
     let req = hyper::Request::post(format!("https://localhost{path}"))
-        // a type the inline WAF profile accepts without parsing the body
-        .header("content-type", "multipart/form-data; boundary=x")
+        // a content-type the lenient WAF profile lets through without structural
+        // parsing (not multipart/json), so the body itself is what is tested
+        .header("content-type", "application/octet-stream")
         .body(())
         .unwrap();
     let mut stream = send.send_request(req).await.unwrap();
