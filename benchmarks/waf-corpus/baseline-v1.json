@@ -28,6 +28,10 @@
       "detected": 2,
       "total": 5
     },
+    "multipart": {
+      "detected": 11,
+      "total": 11
+    },
     "nosql": {
       "detected": 0,
       "total": 8
@@ -63,7 +67,7 @@
   },
   "corpus": "corpus.json",
   "overall": {
-    "detected": 83,
-    "total": 150
+    "detected": 94,
+    "total": 161
   }
 }
