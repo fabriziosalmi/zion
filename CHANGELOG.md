@@ -2,7 +2,16 @@
 
 All notable changes to Zion Edge Gateway are documented here.
 
-## [Unreleased]
+## [0.15.0] - 2026-10-25
+
+**Multipart uploads are parsed and bounded at the edge.** A `multipart/form-data` body — and any content-type carrying a `boundary` — is now parsed to per-profile structure limits and refused if it does not parse cleanly, closing a family of multipart parser and smuggling CVEs. Two other behaviours change: `request_timeout_ms` now bounds idle time rather than the whole upload, and enabling TLS 1.2 now requires the Extended Master Secret extension.
+
+### Upgrade notes
+
+- **A WAF profile now applies multipart structure limits** (#694). On a route with a WAF, a multipart body is held to `max_parts` (1000), `max_file_parts` (256), `max_part_headers` (16), `max_part_header_bytes` (8192), `max_field_name_index` (100000), and the `deny_field_names` / `deny_part_header_names` denylists; a body that does not parse cleanly is answered `400`. The defaults pass real browser and `curl -F` uploads; an endpoint that takes larger or unusual multipart bodies may need higher limits.
+- **`request_timeout_ms` now bounds idle time, not the whole upload** (#714). A steady slow upload is no longer cut; only a real no-progress stall is. A value raised only to let slow uploads through can be lowered back toward the response wait you actually want.
+- **Enabling TLS 1.2 (`min_version = "1.2"`) now requires the Extended Master Secret extension (RFC 7627)** (#719). A 1.2 handshake without it is refused; a 1.3-only deployment (the default) is unchanged.
+- No setting was removed or renamed.
 
 ### Added
 
