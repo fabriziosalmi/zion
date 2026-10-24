@@ -78,11 +78,7 @@ fn start(tls_extra: &str) -> Option<Zion> {
         .stderr(std::fs::File::create(dir.join("zion.log")).unwrap())
         .spawn()
         .expect("spawn zion");
-    let zion = Zion {
-        child,
-        https,
-        dir,
-    };
+    let zion = Zion { child, https, dir };
     let deadline = Instant::now() + Duration::from_secs(20);
     while TcpStream::connect(("127.0.0.1", http)).is_err() {
         assert!(Instant::now() < deadline, "zion did not start listening");
