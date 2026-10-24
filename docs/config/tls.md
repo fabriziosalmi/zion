@@ -22,6 +22,8 @@ min_version = "1.3"   # Default: TLS 1.3 only (fastest handshake)
 
 TLS 1.3 is the default because it has a shorter handshake (1-RTT vs 2-RTT) and mandatory forward secrecy. Set `"1.2"` only if you need to support older clients.
 
+When `"1.2"` is set, Zion requires the Extended Master Secret extension (RFC 7627) on every TLS 1.2 handshake: a client that omits it is refused with a fatal handshake alert. This closes the triple-handshake (3SHAKE, CVE-2015-6112 family) surface that affects EMS-less TLS 1.2. A 1.3-only deployment is unaffected.
+
 ## ALPN negotiation
 
 ```toml

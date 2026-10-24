@@ -408,6 +408,14 @@ fn protocol_versions(
     }
 }
 
+/// Whether to require the Extended Master Secret extension (RFC 7627) on the TLS 1.2 floor.
+/// True exactly when TLS 1.2 is enabled (`min_version = "1.2"`); rustls consults the flag only
+/// on the 1.2 handshake path, so a 1.3-only deployment is unaffected either way. Pure +
+/// unit-tested. See the EMS block in `load_tls_config` for the 3SHAKE (CVE-2015-6112) rationale.
+fn require_ems_for(min_version: crate::config::TlsMinVersion) -> bool {
+    matches!(min_version, crate::config::TlsMinVersion::V1_2)
+}
+
 /// Build a ServerConfig from TlsConfig.
 /// Automatically selects single-cert or multi-SNI resolver based on config.
 /// Returns Err on cert/key load failure so callers can handle gracefully.
@@ -484,6 +492,21 @@ pub fn load_tls_config(tls: &TlsConfig) -> Result<ServerConfig, String> {
     config.alpn_protocols = tls.alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
 
     // ═══════════════════════════════════════════════════════════════
+    // EXTENDED MASTER SECRET (RFC 7627) on the TLS 1.2 floor (#719)
+    // ═══════════════════════════════════════════════════════════════
+    //
+    // rustls' `ServerConfig.require_ems` defaults to false (true only
+    // under FIPS). When the operator opens the TLS 1.2 floor (`min_version
+    // = "1.2"`, off by default), require EMS so a 1.2 handshake that omits
+    // the extension is refused with a fatal `HandshakeFailure`. This
+    // closes the triple-handshake / 3SHAKE surface (CVE-2015-6112 family),
+    // where a man in the middle splices two sessions that share a master
+    // secret. rustls consults `require_ems` only on the TLS 1.2 path
+    // (`server/tls12.rs`), so a 1.3-only deployment (the default) is
+    // unchanged.
+    config.require_ems = require_ems_for(tls.min_version);
+
+    // ═══════════════════════════════════════════════════════════════
     // kTLS SECRET EXTRACTION (issue #52 acceptance #1)
     // ═══════════════════════════════════════════════════════════════
     //
@@ -522,14 +545,18 @@ pub fn load_tls_config(tls: &TlsConfig) -> Result<ServerConfig, String> {
     // This also enables horizontal scaling: any server with the same
     // ticket key can resume any session.
     //
-    // **Key rotation**: today the ticket key is generated once at config
-    // load time and lives for the duration of the resulting `ServerConfig`.
-    // Cert hot-reload also rotates the ticket key (each `load_tls_config`
-    // call freshly seeds a new `Ticketer`). For deployments that demand
-    // periodic rotation independent of cert renewal, the operator can
-    // touch the cert file on a cron — `notify` will trigger a reload and
-    // produce a new key. A finer-grained ArcSwap-based ticket-key
-    // rotation is tracked in docs/perf/roadmap.md.
+    // **Key rotation**: `Ticketer::new()` returns rustls' `TicketRotator`,
+    // which rotates the ticket encryption key on its own. The current key
+    // encrypts new tickets for 6 hours; it is then demoted to the previous
+    // key, which no longer encrypts but still decrypts, so a ticket is
+    // accepted for up to twice that interval (12 hours) before it is
+    // refused. Rotation is driven by wall-clock time on each encrypt/decrypt
+    // within the lifetime of a single `ServerConfig`; it does not depend on
+    // a cert reload. Cert hot-reload does seed a fresh `TicketRotator` (each
+    // `load_tls_config` call), which starts a new key family, so tickets
+    // issued before the reload no longer resume and fall back to a full
+    // handshake; that is a side effect of the reload, not the rotation
+    // mechanism.
     //
     // The `Ticketer::new()` call only fails if the platform's CSPRNG
     // refuses to deliver entropy at boot — catastrophic for any TLS
@@ -1017,6 +1044,25 @@ mod tests {
         let v = super::protocol_versions(crate::config::TlsMinVersion::default());
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].version, rustls::ProtocolVersion::TLSv1_3);
+    }
+
+    // ── Extended Master Secret on the TLS 1.2 floor (#719) ──
+    #[test]
+    fn require_ems_tracks_the_tls12_floor() {
+        // EMS is required exactly when the 1.2 floor is open: it closes the
+        // 3SHAKE surface on 1.2 and is a no-op on 1.3-only (the default).
+        assert!(
+            super::require_ems_for(crate::config::TlsMinVersion::V1_2),
+            "opening TLS 1.2 must require EMS (RFC 7627) to close 3SHAKE"
+        );
+        assert!(
+            !super::require_ems_for(crate::config::TlsMinVersion::V1_3),
+            "a 1.3-only floor must not flip require_ems"
+        );
+        assert!(
+            !super::require_ems_for(crate::config::TlsMinVersion::default()),
+            "the default floor is 1.3-only"
+        );
     }
 
     // ── Client cert fingerprint (X-Client-Cert-Fingerprint) ──
