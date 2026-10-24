@@ -2227,6 +2227,9 @@ fn check_profiles_and_limits(config: &ZionConfig, errors: &mut Vec<String>) {
         for problem in wp.scan_headers_errors() {
             errors.push(format!("waf_profile.{name}: {problem}"));
         }
+        for problem in wp.multipart_limits_errors() {
+            errors.push(format!("waf_profile.{name}: {problem}"));
+        }
     }
     for (name, cp) in &config.cache_profile {
         if cp.max_object_mb == 0 {
@@ -4869,6 +4872,59 @@ upstream = "backend"
         let streamed = config.waf_profile.get("streamed").unwrap();
         assert!(streamed.streaming);
         assert_eq!(streamed.max_body_mb, 50);
+    }
+
+    fn multipart_cfg(extra: &str) -> String {
+        format!(
+            "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [waf_profile.forms]\n{extra}\n\
+             [[route]]\npath=\"/{{*rest}}\"\nupstream=\"be\"\nwaf_profile=\"forms\"\n"
+        )
+    }
+
+    #[test]
+    fn multipart_structure_limits_parse_and_default() {
+        let config: ZionConfig = toml::from_str(&multipart_cfg(
+            "max_parts = 50\ndeny_field_names = [\"PHP_SESSION_UPLOAD_PROGRESS\"]",
+        ))
+        .unwrap();
+        let p = config.waf_profile.get("forms").unwrap();
+        assert_eq!(p.max_parts, 50);
+        assert_eq!(p.max_file_parts, 256); // default
+        assert_eq!(p.max_part_headers, 16); // default
+        assert_eq!(p.max_part_header_bytes, 8192); // default
+        assert_eq!(
+            p.deny_field_names,
+            vec!["PHP_SESSION_UPLOAD_PROGRESS".to_string()]
+        );
+        // default deny_part_header_names
+        assert_eq!(
+            p.deny_part_header_names,
+            vec!["__proto__".to_string(), "constructor".to_string()]
+        );
+    }
+
+    #[test]
+    fn multipart_limits_reject_a_zero_that_would_deny_every_body() {
+        let e = validate_str(&multipart_cfg("max_parts = 0"), "t")
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("max_parts must be >= 1"), "{e}");
+        let e = validate_str(&multipart_cfg("max_part_headers = 0"), "t")
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("max_part_headers must be >= 1"), "{e}");
+        // max_file_parts = 0 is allowed (refuse every file part): the multipart
+        // validation raises no limit error for it (unrelated cert-path errors in
+        // this fixture aside).
+        let err = validate_str(&multipart_cfg("max_file_parts = 0"), "t")
+            .err()
+            .unwrap_or_default();
+        assert!(
+            !err.contains("max_file_parts"),
+            "max_file_parts=0 should be allowed, got: {err}"
+        );
     }
 
     #[test]

@@ -72,3 +72,7 @@ tmp/
 docs/internal/
 docs/benchmarks/Zion-v0.1.0-Scientific-Report.pdf
 tests/equivalence/.demo.cast
+
+# proptest saves seeds of past failures here; our break-test discipline
+# deliberately produces failures, so these are not committed.
+proptest-regressions/
