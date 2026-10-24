@@ -255,6 +255,7 @@ circuit, its failure re-opens it. Values shown are the defaults.
 | `max_part_header_bytes` | usize | `8192` | Max total bytes of one part's header block |
 | `deny_field_names` | string[] | `[]` | Form field names refused (Content-Disposition `name`, case-insensitive) |
 | `deny_part_header_names` | string[] | `["__proto__", "constructor"]` | Part header names refused (case-insensitive) |
+| `max_field_name_index` | u64 | `100000` | Refuse a field name with an array index above this (`items[4294967295]`); `0` disables |
 
 ## `[cache_profile.<name>]`
 
