@@ -488,6 +488,13 @@ pub struct ServerConfig {
     /// bare IP (`"203.0.113.0/24"`, `"2001:db8::/32"`, `"198.51.100.7"`).
     #[serde(default)]
     pub handshake_rate_allowlist: Vec<String>,
+    /// Maximum number of responses being compressed at once, across all routes
+    /// (ADR-0025). Compression runs inline on the worker threads, so this bounds the
+    /// CPU a flood of compressible responses can take: over the budget a response is
+    /// served as identity rather than compressed (the request is never shed). `0`
+    /// disables the cap. Omitted → `default_max_concurrent_compressions`.
+    #[serde(default)]
+    pub max_concurrent_compressions: Option<u32>,
     /// Seconds of silence before the kernel starts TCP keepalive probes on client
     /// connections (then every 10 s, dead after 3 unanswered). Frees the file
     /// descriptor and connection slot of a peer that vanished without a FIN (power
@@ -658,6 +665,14 @@ pub(crate) fn default_handshake_rate_per_sec() -> u32 {
 /// applied when `handshake_burst_per_ip` is omitted.
 pub(crate) fn default_handshake_burst_per_ip() -> u32 {
     2000
+}
+
+/// Default cap on concurrent response compressions (ADR-0025), applied when
+/// `[server] max_concurrent_compressions` is omitted. Generous: a node serving more
+/// than this many compressible responses at once is under real load, where trading
+/// compression for identity bytes is the right protection.
+pub(crate) fn default_max_concurrent_compressions() -> u32 {
+    1024
 }
 
 // ============================================================================

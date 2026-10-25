@@ -1676,6 +1676,23 @@ impl Metrics {
             crate::bulkhead::render(&mut bulkheads, &escape_label);
             out.extend_from_slice(bulkheads.as_bytes());
         }
+        #[cfg(feature = "compress")]
+        {
+            let b = crate::compress::budget::global();
+            out.extend_from_slice(
+                format!(
+                    "# HELP zion_compress_in_flight Responses being compressed right now (ADR-0025).\n\
+                     # TYPE zion_compress_in_flight gauge\n\
+                     zion_compress_in_flight {}\n\
+                     # HELP zion_compress_shed_total Responses served as identity because the compression budget was full.\n\
+                     # TYPE zion_compress_shed_total counter\n\
+                     zion_compress_shed_total {}\n",
+                    b.in_flight(),
+                    b.shed()
+                )
+                .as_bytes(),
+            );
+        }
         for (name, help, val) in [
             (
                 "zion_dns_lookup_failures_total",

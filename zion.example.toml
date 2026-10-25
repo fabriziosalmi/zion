@@ -31,6 +31,14 @@ listen_https = "0.0.0.0:443"
 #   * N → explicit cap.
 # max_connections_per_ip = 256
 
+# Response compression budget (ADR-0025). Compression is off per-route by default;
+# enable it under a route's `compress` table. This caps how many responses may be
+# compressing at once across all routes (compression runs on the worker threads, so
+# an unbounded flood of compressible responses could take the CPU). Over the cap a
+# response is served uncompressed rather than dropped. 0 disables the cap; omitting
+# this line uses a generous default.
+# max_concurrent_compressions = 1024
+
 # Trusted proxy CIDR ranges. When the TCP peer matches one of these,
 # the real client IP is extracted from X-Forwarded-For using the
 # rightmost-untrusted-hop algorithm. Leave empty when Zion is the front
@@ -242,6 +250,17 @@ mode = "websocket"    # Supports wss:// upstreams (TLS-to-upstream)
 path = "/api/v1/backups"
 upstream = "api"
 waf_profile = "upload"
+
+[[route]]
+path = "/docs"
+upstream = "api"
+# Opt-in response compression (ADR-0025): gzip/brotli for this route's text
+# responses (requires a build with the `compress` feature; it is in `dist`).
+# BREACH: a response that reflects attacker-controlled input AND carries a secret
+# (a Set-Cookie, or Cache-Control: private) is a compression oracle over TLS, so
+# such responses are left uncompressed unless you set allow_cookied = true. Only
+# enable that on a route whose responses carry no secret-bearing reflected content.
+compress = { enabled = true, min_bytes = 1024, allow_cookied = false }
 
 [[route]]
 path = "/api/{*rest}"

@@ -472,6 +472,7 @@ async fn process_request_inner(
             rule.compress.as_ref(),
             method,
             accept_encoding.as_deref(),
+            cfg.compress_max_concurrent,
         );
     }
 
