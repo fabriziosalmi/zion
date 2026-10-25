@@ -35,7 +35,7 @@ defined in [0000-template.md](0000-template.md).
 | 0022  | [Precompressed static sidecars (`.br`/`.gz` via Accept-Encoding)](0022-static-precompressed-sidecars.md) | accepted |
 | 0023  | [ML-WAF training pipeline (reproducible, synthetic-first, review-gated)](0023-ml-waf-training-pipeline.md) | accepted |
 | 0024  | [`preserve_host` — forward the client's Host over HTTP/1.1 only](0024-preserve-host.md) | accepted |
-| 0025  | [Opt-in response compression (gzip + brotli)](0025-response-compression.md) | proposed |
+| 0025  | [Opt-in response compression (gzip + brotli)](0025-response-compression.md) | accepted |
 
 ## When to write a new ADR
 

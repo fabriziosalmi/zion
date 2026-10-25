@@ -54,6 +54,7 @@ mod breaker;
 mod bulkhead;
 mod cache;
 mod cli;
+mod compress;
 mod config;
 mod connlimit;
 mod crl;

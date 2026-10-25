@@ -1,6 +1,6 @@
 # ADR-0025: Opt-in response compression (gzip + brotli)
 
-- **Status**: proposed
+- **Status**: accepted
 - **Date**: 2026-10-25
 - **Deciders**: fabriziosalmi
 - **Tags**: compression, performance, security, breach, cache

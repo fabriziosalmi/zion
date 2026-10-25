@@ -1450,6 +1450,7 @@ struct RawRoute {
     #[serde(default)]
     waf_shadow: bool,
     cors: Option<CorsConfig>,
+    compress: Option<crate::compress::CompressConfig>,
     methods: Option<Vec<String>>,
     content_types: Option<Vec<String>>,
     deny_paths: Option<Vec<String>>,
@@ -1573,6 +1574,10 @@ pub struct RouteConfig {
 
     /// Per-route CORS configuration. If unset, no CORS headers are injected.
     pub cors: Option<CorsConfig>,
+
+    /// Per-route response compression (ADR-0025). If unset or `enabled = false`,
+    /// responses are never compressed by this proxy.
+    pub compress: Option<crate::compress::CompressConfig>,
 
     /// `methods`, `content_types` and `deny_paths`: what the route refuses without a WAF.
     pub restrictions: crate::route_restrict::RouteRestrictions,
@@ -1729,6 +1734,7 @@ impl TryFrom<RawRoute> for RouteConfig {
             auth_profile: r.auth_profile,
             public: r.public,
             cors: r.cors,
+            compress: r.compress,
             restrictions,
             require_content_length: r.require_content_length,
             allow_path_params: r.allow_path_params,
