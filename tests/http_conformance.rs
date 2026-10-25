@@ -131,6 +131,7 @@ fn origin() -> (u16, Arc<Mutex<Vec<String>>>) {
                             chunked = true;
                         }
                     }
+                    let is_ws_upgrade = head.to_ascii_lowercase().contains("upgrade: websocket");
                     log.lock().unwrap().push(head);
                     if chunked {
                         loop {
@@ -156,6 +157,16 @@ fn origin() -> (u16, Arc<Mutex<Vec<String>>>) {
                         let mut body = vec![0u8; content_length];
                         let _ = r.read_exact(&mut body);
                     }
+                    // A WebSocket upgrade: answer 101 and stop parsing (the socket becomes a
+                    // tunnel). The Sec-WebSocket-Accept is the RFC 6455 example value for the key
+                    // the slice-5 client sends.
+                    if is_ws_upgrade {
+                        let _ = w.write_all(
+                            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                              Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                        );
+                        break;
+                    }
                     // Choose the reply from the request path.
                     let reply = if let Some(rest) = req_path.strip_prefix("/status/") {
                         let n: u16 = rest
@@ -165,7 +176,7 @@ fn origin() -> (u16, Arc<Mutex<Vec<String>>>) {
                             .parse()
                             .unwrap_or(200);
                         format!("HTTP/1.1 {n} X\r\nContent-Length: 2\r\n\r\nok")
-                    } else if req_path.starts_with("/vary") {
+                    } else if req_path.contains("vary") {
                         "HTTP/1.1 200 OK\r\nVary: Accept-Encoding\r\nContent-Length: 2\r\n\r\nok"
                             .to_string()
                     } else {
@@ -291,6 +302,9 @@ fn start(dir: &Path, origin_port: u16) -> (Proc, u16) {
              [[route]]\npath = \"/ph/{{*rest}}\"\nupstream = \"ph\"\nmode = \"standard\"\n\n\
              [[route]]\npath = \"/s/{{*rest}}\"\nmode = \"static\"\nserve_dir = \"{www}\"\n\n\
              [[route]]\npath = \"/c/{{*rest}}\"\nmode = \"static\"\nserve_dir = \"{www}\"\ncompress = {{ enabled = true, min_bytes = 100 }}\n\n\
+             [cache_profile.short]\nmode = \"memory\"\nttl_seconds = 60\n\n\
+             [[route]]\npath = \"/cache/{{*rest}}\"\nupstream = \"backend\"\nmode = \"standard\"\ncache_profile = \"short\"\n\n\
+             [[route]]\npath = \"/ws/{{*rest}}\"\nupstream = \"backend\"\nmode = \"websocket\"\n\n\
              [[route]]\npath = \"/{{*rest}}\"\nupstream = \"backend\"\nmode = \"standard\"\n",
             free_port(),
             cert.to_string_lossy(),
@@ -986,6 +1000,79 @@ fn http2_parity_status_and_vary_passthrough() {
     }
 
     eprintln!("\n=== HTTP conformance matrix (slice 4: HTTP/2, status, Vary) ===");
+    for (case, outcome) in &matrix {
+        eprintln!("  {case:30}  {outcome}");
+    }
+    eprintln!("=== end matrix ===\n");
+}
+
+/// How many requests the origin recorded whose start-line begins with `prefix`.
+fn origin_count(seen: &Arc<Mutex<Vec<String>>>, prefix: &str) -> usize {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|h| h.lines().next().is_some_and(|l| l.starts_with(prefix)))
+        .count()
+}
+
+#[test]
+fn http_cache_variants_and_websocket_upgrade() {
+    if !have_openssl() {
+        eprintln!("skipping http_conformance slice 5: openssl not installed");
+        return;
+    }
+    let dir = tempdir();
+    let (origin_port, seen) = origin();
+    let (_zion, port) = start(&dir, origin_port);
+
+    let mut matrix: Vec<(String, String)> = Vec::new();
+    let mut record = |case: &str, outcome: String| matrix.push((case.to_string(), outcome));
+
+    // ---- Cache + Vary by Accept-Encoding ----
+    // A cache_profile route caches a GET 200. The origin marks this path Vary: Accept-Encoding, so
+    // zion keys the cache by the Accept-Encoding variant: two identical gzip requests hit the cache
+    // (the origin is asked once) and a br request is a separate variant (the origin is asked again).
+    // Net: the origin sees /cache/vary exactly twice.
+    let get_cv = |ae: &str| {
+        format!("GET /cache/vary HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: {ae}\r\nConnection: close\r\n\r\n")
+    };
+    assert_eq!(code(&send(port, get_cv("gzip").as_bytes())), 200);
+    std::thread::sleep(Duration::from_millis(200)); // let zion store the entry
+    assert_eq!(code(&send(port, get_cv("gzip").as_bytes())), 200);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(code(&send(port, get_cv("br").as_bytes())), 200);
+    std::thread::sleep(Duration::from_millis(200));
+    let fetches = origin_count(&seen, "GET /cache/vary");
+    record(
+        "cache hit + encoding variant",
+        format!("origin fetched {fetches}x for 3 requests (gzip,gzip,br)"),
+    );
+    assert_eq!(
+        fetches, 2,
+        "expected one origin fetch per Accept-Encoding variant (gzip hit on repeat, br separate), got {fetches}"
+    );
+
+    // ---- WebSocket upgrade: 101 Switching Protocols relayed from the origin ----
+    {
+        // The Sec-WebSocket-Key below is the RFC 6455 example vector, not a secret.
+        let raw = "GET /ws/x HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"; // gitleaks:allow
+        let resp = send(port, raw.as_bytes());
+        let c = code(&resp);
+        let upgraded = resp
+            .head
+            .to_ascii_lowercase()
+            .contains("upgrade: websocket");
+        record(
+            "WebSocket upgrade (101)",
+            format!("zion {c}, Upgrade echoed ({upgraded})"),
+        );
+        assert_eq!(
+            c, 101,
+            "a WebSocket upgrade should relay the origin's 101, got {c}"
+        );
+    }
+
+    eprintln!("\n=== HTTP conformance matrix (slice 5: cache variants, WebSocket 101) ===");
     for (case, outcome) in &matrix {
         eprintln!("  {case:30}  {outcome}");
     }

@@ -198,6 +198,7 @@ export default defineConfig({
           { text: 'Compliance mapping', link: '/security/compliance-mapping' },
           { text: 'FIPS 140-3', link: '/security/fips' },
           { text: 'TLS conformance', link: '/security/tls-conformance' },
+          { text: 'HTTP conformance', link: '/security/http-conformance' },
           { text: 'Supply chain', link: '/security/supply-chain' },
         ]
       },
