@@ -257,6 +257,42 @@ async fn h3_post(port: u16, path: &str, reset: bool) -> Option<u16> {
     Some(resp.status().as_u16())
 }
 
+/// Send an HTTP/3 request whose HEADERS declare `content-length = declared` but whose stream is
+/// finished immediately with no DATA frame (HEADERS carrying FIN). Returns the client-visible
+/// status, or None if the request was rejected at the stream level (#697 form 9).
+async fn h3_headers_fin_with_cl(port: u16, path: &str, declared: usize) -> Option<u16> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let mut tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCert))
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let qc = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(qc)));
+    let conn = ep
+        .connect(format!("127.0.0.1:{port}").parse().unwrap(), "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn))
+        .await
+        .unwrap();
+    let _drive = tokio::spawn(async move {
+        let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+    let req = hyper::Request::post(format!("https://localhost{path}"))
+        .header("content-type", "application/octet-stream")
+        .header("content-length", declared.to_string())
+        .body(())
+        .unwrap();
+    let mut stream = send.send_request(req).await.ok()?;
+    // Finish the stream with no DATA: the headers promised `declared` bytes that never come.
+    stream.finish().await.ok()?;
+    let resp = stream.recv_response().await.ok()?;
+    Some(resp.status().as_u16())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_broken_h3_body_never_reaches_the_upstream_as_a_whole_one() {
     let dir = std::env::temp_dir().join(format!(
@@ -301,5 +337,49 @@ async fn a_broken_h3_body_never_reaches_the_upstream_as_a_whole_one() {
             "{path}: {got:?}"
         );
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_h3_headers_fin_with_content_length_is_not_a_phantom_body() {
+    let dir = std::env::temp_dir().join(format!(
+        "zion-h3-phantom-{}-{}",
+        std::process::id(),
+        free_port()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let Some((_daemon, port)) = boot(&dir, upstream(seen.clone())) else {
+        return;
+    };
+
+    // The headers promise 1000 bytes; the stream ends with none. zion must not forward a request
+    // the upstream would wait on, and must not fabricate a 2xx for a body that never arrived.
+    let status = match tokio::time::timeout(
+        Duration::from_secs(10),
+        h3_headers_fin_with_cl(port, "/open/z", 1000),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(_) => panic!("zion hung on a HEADERS+FIN request that declared a Content-Length"),
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    let recs: Vec<Seen> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.path == "/open/z")
+        .cloned()
+        .collect();
+    assert!(
+        recs.is_empty(),
+        "a HEADERS+FIN request with a non-zero Content-Length reached the upstream: {recs:?}"
+    );
+    assert!(
+        status.is_none_or(|s| s >= 400),
+        "a request whose promised body never arrived must not get a 2xx: {status:?}"
+    );
+
     let _ = std::fs::remove_dir_all(dir);
 }
