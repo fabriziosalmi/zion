@@ -68,9 +68,6 @@ pub struct ResolvedRoute {
     pub cors: Option<std::sync::Arc<crate::security::CorsHeaders>>,
     /// Per-route response compression settings (ADR-0025); `None` when the route
     /// does not enable compression, so the hot path short-circuits on the option.
-    /// Resolved and carried now; read by the response path in the follow-up that
-    /// adds the encoder, which removes this `allow`.
-    #[allow(dead_code)]
     pub compress: Option<crate::compress::ResolvedCompress>,
     /// `methods`, `content_types`, `deny_paths`; `None` when the route sets none of them.
     pub restrictions: Option<Arc<crate::route_restrict::RouteRestrictions>>,
