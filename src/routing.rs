@@ -66,6 +66,12 @@ pub struct ResolvedRoute {
     pub auth: Option<crate::auth::ResolvedAuthProfile>,
     /// Pre-compiled CORS headers for lightning-fast matching per-route.
     pub cors: Option<std::sync::Arc<crate::security::CorsHeaders>>,
+    /// Per-route response compression settings (ADR-0025); `None` when the route
+    /// does not enable compression, so the hot path short-circuits on the option.
+    /// Resolved and carried now; read by the response path in the follow-up that
+    /// adds the encoder, which removes this `allow`.
+    #[allow(dead_code)]
+    pub compress: Option<crate::compress::ResolvedCompress>,
     /// `methods`, `content_types`, `deny_paths`; `None` when the route sets none of them.
     pub restrictions: Option<Arc<crate::route_restrict::RouteRestrictions>>,
     /// `max_body_mb` of a route without a WAF, in bytes. A route with a WAF has its cap in
@@ -530,6 +536,11 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
         .as_ref()
         .map(|c| Arc::new(crate::security::CorsHeaders::from_config(c)));
 
+    let compress = route
+        .compress
+        .as_ref()
+        .and_then(crate::compress::ResolvedCompress::from_config);
+
     // Static file serving (ADR-0015): the serve dir + the literal prefix to
     // strip from the request path. Not canonicalized here — existence is a
     // per-request check so an imported config validates offline.
@@ -603,6 +614,7 @@ fn resolve_route(config: &ZionConfig, route: &RouteConfig) -> Result<Arc<Resolve
         #[cfg(feature = "auth")]
         auth,
         cors,
+        compress,
         restrictions: (!route.restrictions.is_empty())
             .then(|| Arc::new(route.restrictions.clone())),
         body_cap,
@@ -765,6 +777,7 @@ waf = true
             auth_profile: None,
             public: false,
             cors: None,
+            compress: None,
             restrictions: Default::default(),
             require_content_length: false,
             allow_path_params: false,
