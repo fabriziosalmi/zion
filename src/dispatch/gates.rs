@@ -265,6 +265,67 @@ pub(crate) fn path_shape<B>(
     None
 }
 
+/// Gate: virtual-patch CVE shields (#698). Always-on and independent of any `waf_profile`: a rule
+/// whose request-shape match fires blocks the request with `403`, or — in `log`/shadow mode, or
+/// under the global `[virtual_patch] shadow` dry-run — only counts and logs it and lets it through.
+/// Runs after the route's own restrictions and before auth/WAF, where method, path, query, the full
+/// header map and the content-type are all in hand.
+pub(crate) fn virtual_patch(
+    cfg: &ResolvedAppConfig,
+    state: &Arc<AppState>,
+    remote_addr: SocketAddr,
+    req: &Request<ReqBody>,
+) -> Option<Response<ZionBody>> {
+    if !cfg.virtual_patch_enabled {
+        return None;
+    }
+    let rules = state.virtual_patch.load();
+    if rules.is_empty() {
+        return None;
+    }
+    let content_type = req
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    let target = crate::virtual_patch::Target {
+        method: req.method().as_str(),
+        path: req.uri().path(),
+        query: req.uri().query(),
+        headers: req.headers(),
+        content_type,
+    };
+    let ip = state.redact.ip_label(remote_addr.ip());
+    match rules.evaluate(&target, cfg.virtual_patch_shadow) {
+        crate::virtual_patch::Verdict::NoMatch => None,
+        crate::virtual_patch::Verdict::Observed(rule) => {
+            crate::logging::warn(
+                "virtual_patch",
+                &format!(
+                    "would_block=true rule={} cve={} source={} ip={}",
+                    rule.id(),
+                    rule.cve(),
+                    rule.source(),
+                    ip
+                ),
+            );
+            None
+        }
+        crate::virtual_patch::Verdict::Block(rule) => {
+            crate::logging::warn(
+                "virtual_patch",
+                &format!(
+                    "blocked rule={} cve={} source={} ip={}",
+                    rule.id(),
+                    rule.cve(),
+                    rule.source(),
+                    ip
+                ),
+            );
+            Some(empty_response(StatusCode::FORBIDDEN))
+        }
+    }
+}
+
 /// Gate: HTTP method whitelist.
 fn method_whitelist(req: &Request<ReqBody>) -> Option<Response<ZionBody>> {
     // Gate: HTTP method whitelist (block TRACE/CONNECT/exotic methods)
@@ -521,7 +582,14 @@ pub(super) fn builtin_endpoint(
                 state.static_cache.bytes(),
                 std::sync::atomic::Ordering::Relaxed,
             );
-            let body = metrics::METRICS.render_with_upstreams(openmetrics, &state.cfg().health_map);
+            let mut body_vec = metrics::METRICS
+                .render_with_upstreams(openmetrics, &state.cfg().health_map)
+                .to_vec();
+            // Per-rule virtual-patch counters (#698), labelled by rule id and CVE.
+            let mut vp = String::new();
+            state.virtual_patch.load().render_prometheus(&mut vp);
+            body_vec.extend_from_slice(vp.as_bytes());
+            let body = Bytes::from(body_vec);
             return Some(
                 Response::builder()
                     .status(StatusCode::OK)

@@ -226,6 +226,55 @@ pub(crate) fn load_config() -> error::ZionResult<(String, config::ZionConfig)> {
     Ok((config_path, config))
 }
 
+/// Resolve a virtual-patch `rules_file` path: absolute as-is, otherwise relative to the directory
+/// holding `zion.toml` (so the rules travel with the config, like the cert paths).
+pub(crate) fn resolve_rules_path(config_path: &str, rel: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(rel);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    match std::path::Path::new(config_path).parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(p),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// Load the virtual-patch rule file at boot (#698). Returns an empty, swappable set when the
+/// feature is off or no file is named. A missing or malformed file is a boot error: the operator
+/// asked for these CVE shields, so zion must not start silently without them (a later hot-reload
+/// is the fail-safe path that keeps the previous rules on a bad edit).
+pub(crate) fn load_virtual_patch(
+    config: &config::ZionConfig,
+    config_path: &str,
+) -> error::ZionResult<Arc<ArcSwap<crate::virtual_patch::VirtualPatchRules>>> {
+    use crate::virtual_patch::VirtualPatchRules;
+    let empty = || Arc::new(ArcSwap::from_pointee(VirtualPatchRules::default()));
+    if !config.virtual_patch.enabled {
+        return Ok(empty());
+    }
+    let Some(rel) = &config.virtual_patch.rules_file else {
+        return Ok(empty());
+    };
+    let path = resolve_rules_path(config_path, rel);
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        error::ZionError::Config(format!(
+            "virtual_patch.rules_file '{}': {e}",
+            path.display()
+        ))
+    })?;
+    let rules = VirtualPatchRules::from_toml_str(&text).map_err(|e| {
+        error::ZionError::Config(format!(
+            "virtual_patch.rules_file '{}': {e}",
+            path.display()
+        ))
+    })?;
+    logging::info(
+        "virtual_patch",
+        &format!("loaded {} rule(s) from {}", rules.len(), path.display()),
+    );
+    Ok(Arc::new(ArcSwap::from_pointee(rules)))
+}
+
 /// Load the first TLS configuration, and start the watchers that keep it current.
 ///
 /// Returns the acceptor store and the receiver the QUIC listener reloads from.
@@ -522,6 +571,7 @@ pub(crate) fn build_state(
     conn_ceiling: usize,
     audit_handle: audit::AuditHandle,
     compiled_redact: Arc<audit::CompiledRedaction>,
+    virtual_patch: Arc<ArcSwap<crate::virtual_patch::VirtualPatchRules>>,
     #[cfg(feature = "sovereign-aimp")] aimp_cp_handle: Option<aimp_cp::AimpControlPlane>,
 ) -> Arc<AppState> {
     Arc::new(AppState {
@@ -532,6 +582,7 @@ pub(crate) fn build_state(
         static_cache: cache::StaticCache::new(),
         conn_limit: Arc::new(Semaphore::new(conn_ceiling)),
         acme_challenges: acme::new_challenge_store(),
+        virtual_patch,
         limiters: Limiters {
             rate_map: Arc::new(numa::NumaAwareMap::new()),
             rate_sweep: security::RateSweep::default(),

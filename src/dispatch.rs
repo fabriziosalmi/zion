@@ -374,6 +374,11 @@ async fn process_request_inner(
         return Ok(resp);
     }
 
+    // --- Gate: virtual-patch CVE shields (#698), always-on, independent of any WAF profile ---
+    if let Some(resp) = gates::virtual_patch(&cfg, &state, remote_addr, &req) {
+        return Ok(resp);
+    }
+
     // --- Upstream: health check + latency routing (B-04) ---
     let (dyn_scheme, dyn_authority) = match route::select_upstream(&cfg, &rule) {
         Ok(target) => target,

@@ -442,6 +442,75 @@ pub(crate) fn spawn_config_watcher(
     });
 }
 
+/// Watch the virtual-patch rule file (#698) and hot-swap it on change, with no restart. Modeled on
+/// the TLS cert watcher: watch the file's directory, debounce, re-read and re-parse off-thread, and
+/// atomically store the new rules. A parse or read error keeps the PREVIOUS rules and logs — a bad
+/// edit never drops the shields to an empty set.
+pub(crate) fn spawn_virtual_patch_watcher(
+    rules_path: PathBuf,
+    store: Arc<ArcSwap<crate::virtual_patch::VirtualPatchRules>>,
+) -> Result<(), String> {
+    let signal = Arc::new(Notify::new());
+    let signal_clone = signal.clone();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res {
+            if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                signal_clone.notify_one();
+            }
+        }
+    })
+    .map_err(|e| format!("cannot create filesystem watcher: {e}"))?;
+
+    let dir = rules_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    watcher
+        .watch(&dir, RecursiveMode::NonRecursive)
+        .map_err(|e| format!("cannot watch {}: {e}", dir.display()))?;
+
+    // Keep the watcher alive for the process's life; its Drop unregisters the path.
+    let _watcher_handle = tokio::spawn(async move {
+        let _watcher = watcher;
+        std::future::pending::<()>().await;
+    });
+
+    tokio::spawn(async move {
+        loop {
+            signal.notified().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let path = rules_path.clone();
+            let read = tokio::task::spawn_blocking(move || std::fs::read_to_string(&path)).await;
+            match read {
+                Ok(Ok(text)) => {
+                    match crate::virtual_patch::VirtualPatchRules::from_toml_str(&text) {
+                        Ok(rules) => {
+                            let n = rules.len();
+                            store.store(Arc::new(rules));
+                            logging::info("virtual_patch", &format!("reloaded {n} rule(s)"));
+                        }
+                        Err(e) => logging::warn(
+                            "virtual_patch",
+                            &format!("reload FAILED ({e}), keeping previous rules"),
+                        ),
+                    }
+                }
+                Ok(Err(e)) => logging::warn(
+                    "virtual_patch",
+                    &format!("reload read FAILED ({e}), keeping previous rules"),
+                ),
+                Err(e) => logging::warn(
+                    "virtual_patch",
+                    &format!("reload task panicked: {e}, keeping previous rules"),
+                ),
+            }
+        }
+    });
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
