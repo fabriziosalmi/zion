@@ -75,6 +75,10 @@ pub(crate) struct ResolvedAppConfig {
     /// `[tls] handshake_timeout_secs`: a TLS handshake may take this long before the
     /// connection is dropped (default 10).
     pub(crate) tls_handshake_timeout_secs: u64,
+    /// `[virtual_patch] enabled` (#698): whether virtual-patch rules are consulted.
+    pub(crate) virtual_patch_enabled: bool,
+    /// `[virtual_patch] shadow` (#698): force every rule to count-and-log, never block.
+    pub(crate) virtual_patch_shadow: bool,
     /// `[server] h2_control_frames_per_sec` (0 = no limit).
     pub(crate) h2_control_frames_per_sec: u32,
     /// The response cache's byte budget (`[server] cache_max_memory_mb`, or derived from
@@ -151,6 +155,8 @@ impl ResolvedAppConfig {
             tcp_keepalive_secs: crate::net::DEFAULT_TCP_KEEPALIVE_SECS,
             tcp_user_timeout_secs: crate::net::DEFAULT_TCP_USER_TIMEOUT_SECS,
             tls_handshake_timeout_secs: 10,
+            virtual_patch_enabled: true,
+            virtual_patch_shadow: false,
             h2_control_frames_per_sec: 0,
             max_connections: None,
             cache_budget_bytes: 0,
@@ -521,6 +527,8 @@ impl ResolvedAppConfig {
             tcp_keepalive_secs: config.server.tcp_keepalive_secs,
             tcp_user_timeout_secs: config.server.tcp_user_timeout_secs,
             tls_handshake_timeout_secs: config.tls.handshake_timeout_secs,
+            virtual_patch_enabled: config.virtual_patch.enabled,
+            virtual_patch_shadow: config.virtual_patch.shadow,
             h2_control_frames_per_sec: config.server.h2_control_frames_per_sec,
             max_connections: config.server.max_connections,
             cache_budget_bytes: config
@@ -616,6 +624,9 @@ pub(crate) struct AppState {
     pub(crate) http_builder: Arc<AutoBuilder<TokioExecutor>>,
     /// ACME HTTP-01 challenge tokens (empty when no challenge active).
     pub(crate) acme_challenges: acme::ChallengeStore,
+    /// Virtual-patch rules (#698), hot-swapped by the rule-file watcher. Empty when the feature
+    /// is off or no rules file is configured.
+    pub(crate) virtual_patch: Arc<ArcSwap<crate::virtual_patch::VirtualPatchRules>>,
     /// Behaviour-persistent per-source limiters (rate map, per-IP conn cap,
     /// JA4 ban set) — grouped so subsystem churn stays local. See [`Limiters`].
     pub(crate) limiters: Limiters,
@@ -703,6 +714,9 @@ impl AppState {
             conn_limit: Arc::new(Semaphore::new(1024)),
             http_builder: Arc::new(AutoBuilder::new(TokioExecutor::new())),
             acme_challenges: acme::new_challenge_store(),
+            virtual_patch: Arc::new(ArcSwap::from_pointee(
+                crate::virtual_patch::VirtualPatchRules::default(),
+            )),
             limiters: Limiters {
                 rate_map: Arc::new(numa::NumaAwareMap::new()),
                 rate_sweep: security::RateSweep::default(),

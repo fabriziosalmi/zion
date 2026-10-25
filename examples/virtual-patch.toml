@@ -1,0 +1,37 @@
+# Virtual-patch rules (#698): operator-editable CVE shields, loaded and hot-reloaded without a
+# restart. Point zion at this file with:
+#
+#   [virtual_patch]
+#   rules_file = "virtual-patch.toml"   # relative to zion.toml's directory, or absolute
+#   # shadow = true                     # optional: stage the whole pack dry-run (count + log, never block)
+#
+# Each rule names its CVE and a source, matches on request shape, and either denies (403) or only
+# logs. A rule matches when ALL of its criteria match (methods, path_glob, headers, cookies, query,
+# content_types); the first matching rule wins. Edit this file and zion reloads it in a couple of
+# seconds; a parse error keeps the previously loaded rules, never an empty set. Per-rule counters
+# are exported as zion_virtual_patch_matches_total{cve="...",rule="..."}.
+#
+# This starter pack covers CVEs that reach the proxy as a request shape and that zion does not
+# already neutralize earlier in the pipeline. (For example CVE-2025-29927, the Next.js
+# x-middleware-subrequest middleware bypass, needs no rule here: zion already strips that header as
+# a built-in before any route sees it.)
+
+# Spring Cloud Gateway Actuator code injection (SpEL) via the gateway actuator endpoint. An
+# attacker POSTs a crafted route definition to /actuator/gateway/routes/... then refreshes it to
+# execute arbitrary code. Shield: refuse the actuator gateway endpoint outright. CVSS 10.0, CISA KEV.
+[[rule]]
+id = "spring-cloud-gateway-actuator"
+cve = "CVE-2022-22947"
+source = "https://spring.io/security/cve-2022-22947"
+action = "deny"
+path_glob = "/actuator/gateway/*"
+
+# F5 BIG-IP iControl REST unauthenticated remote command execution: the attack drives the iControl
+# REST management API under /mgmt/ (e.g. /mgmt/shared/authn/login then /mgmt/tm/util/bash). Shield:
+# refuse the iControl REST surface. CVSS 9.8, widely exploited in the wild.
+[[rule]]
+id = "f5-icontrol-rest-rce"
+cve = "CVE-2021-22986"
+source = "https://my.f5.com/manage/s/article/K03009991"
+action = "deny"
+path_glob = "/mgmt/*"

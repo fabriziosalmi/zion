@@ -80,6 +80,11 @@ pub struct ZionConfig {
     #[serde(default)]
     pub access_log: AccessLogConfig,
 
+    /// Virtual-patch rules (#698): an operator-editable TOML file of CVE shields, loaded and
+    /// hot-reloaded independently of this file. Absent block ⇒ no rules loaded.
+    #[serde(default)]
+    pub virtual_patch: VirtualPatchConfig,
+
     /// AIMP control-plane / mesh config (feature: sovereign-aimp).
     /// Optional — absent block = mesh disabled.
     #[cfg(feature = "sovereign-aimp")]
@@ -258,6 +263,25 @@ impl std::fmt::Display for TlsMinVersion {
             Self::V1_3 => "1.3",
         })
     }
+}
+
+/// `[virtual_patch]` block (#698) — operator-editable CVE shields in a separate TOML file,
+/// loaded at boot and hot-reloaded on change, independently of `zion.toml`.
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct VirtualPatchConfig {
+    /// Master switch. Default `true`, but with no `rules_file` nothing is loaded, so the feature
+    /// is effectively off until a file is named.
+    #[serde(default = "crate::config::default_true")]
+    pub enabled: bool,
+    /// Path to the rules TOML file, relative to `zion.toml`'s directory (like the cert paths) or
+    /// absolute. Absent ⇒ no rules.
+    #[serde(default)]
+    pub rules_file: Option<String>,
+    /// Force every rule into shadow mode (count and log, never block) regardless of its own
+    /// `action`. A global dry-run switch for staging a new rule pack.
+    #[serde(default)]
+    pub shadow: bool,
 }
 
 /// `[admin]` block — the runtime admin API listener (#26). Loopback +
@@ -4373,7 +4397,10 @@ upstream = "backend"
         ))];
         for entry in std::fs::read_dir(format!("{root}/examples")).expect("read examples/") {
             let p = entry.unwrap().path();
-            if p.extension().and_then(|e| e.to_str()) == Some("toml") {
+            // Virtual-patch rule packs (#698) are a different schema (`[[rule]]`), parsed by
+            // `crate::virtual_patch`, not a `ZionConfig` — skip them here.
+            let is_rules = p.file_name().and_then(|n| n.to_str()) == Some("virtual-patch.toml");
+            if !is_rules && p.extension().and_then(|e| e.to_str()) == Some("toml") {
                 files.push(p);
             }
         }

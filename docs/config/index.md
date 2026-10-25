@@ -260,6 +260,34 @@ circuit, its failure re-opens it. Values shown are the defaults.
 | `deny_part_header_names` | string[] | `["__proto__", "constructor"]` | Part header names refused (case-insensitive) |
 | `max_field_name_index` | u64 | `100000` | Refuse a field name with an array index above this (`items[4294967295]`); `0` disables |
 
+## `[virtual_patch]`
+
+Operator-editable CVE shields loaded from a separate TOML file and hot-reloaded without a restart (#698). Each rule names its CVE and a source link, matches on request shape, and denies (403) or only logs. A rule matches when **all** of its criteria match; the first matching rule wins. The gate runs on every route, independent of any `waf_profile`, after the route's own restrictions and before auth/WAF. Per-rule counters are exported as `zion_virtual_patch_matches_total{cve="...",rule="..."}` and `zion_virtual_patch_would_block_total{...}`. A parse error on reload keeps the previously loaded rules; a malformed file at boot fails the boot.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Consult virtual-patch rules. With no `rules_file`, nothing is loaded, so the feature is effectively off until a file is named |
+| `rules_file` | string? | — | Path to the rules TOML, relative to `zion.toml`'s directory or absolute. Absent ⇒ no rules |
+| `shadow` | bool | `false` | Force every rule to count-and-log, never block — a global dry-run for staging a new rule pack |
+
+Each `[[rule]]` in the rules file:
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `id` | string | — | Stable short id, unique in the file (the metric label and log key) |
+| `cve` | string | — | The CVE this rule shields against |
+| `source` | string | `""` | Link to the advisory |
+| `action` | string | — | `"deny"` (answer 403) or `"log"` (count and log only) |
+| `shadow` | bool | `false` | Run the rule but never block (overrides `deny`) |
+| `methods` | string[] | `[]` | HTTP methods the rule applies to (empty = any) |
+| `path_glob` | string? | — | Glob over the request path; `*` matches any run of characters |
+| `headers` | table[] | `[]` | Each `{ name, equals?, contains? }` must match (presence if neither `equals` nor `contains`) |
+| `cookies` | string[] | `[]` | Cookie names that must be present |
+| `query` | table[] | `[]` | Each `{ name, equals? }` query parameter must be present (and equal `equals` if given) |
+| `content_types` | string[] | `[]` | Content-Type prefixes, any one matching (empty = any) |
+
+A starter pack ships in [`examples/virtual-patch.toml`](https://github.com/fabriziosalmi/zion/blob/master/examples/virtual-patch.toml).
+
 ## `[cache_profile.<name>]`
 
 | Key | Type | Default | Description |

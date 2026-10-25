@@ -103,6 +103,7 @@ mod via;
 // file, so on non-Linux or without `io-uring-accept` this module is
 // simply empty.
 mod uring;
+mod virtual_patch;
 mod waf;
 
 // ── Experimental, feature-gated tracks ───────────────────────────────
@@ -368,12 +369,17 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
     #[cfg(feature = "sovereign-aimp")]
     let aimp_cp_handle = boot::start_aimp_control_plane(&config).await;
 
+    // Load the virtual-patch rule file (#698), if one is configured; a parse error here is a
+    // boot error (the operator asked for these shields — do not start silently without them).
+    let virtual_patch = boot::load_virtual_patch(&config, &config_path)?;
+
     let state = boot::build_state(
         resolved,
         tls_acceptor_store,
         conn_ceiling,
         audit_handle,
         compiled_redact,
+        virtual_patch,
         #[cfg(feature = "sovereign-aimp")]
         aimp_cp_handle,
     );
@@ -397,6 +403,19 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
         Some(config.tls.cert_path.clone()),
         Some(config.tls.key_path.clone()),
     );
+
+    // Hot-reload the virtual-patch rule file (#698) without a restart, when one is configured.
+    if config.virtual_patch.enabled {
+        if let Some(rel) = &config.virtual_patch.rules_file {
+            let path = boot::resolve_rules_path(&config_path, rel);
+            if let Err(e) = reload::spawn_virtual_patch_watcher(path, state.virtual_patch.clone()) {
+                logging::warn(
+                    "virtual_patch",
+                    &format!("rule-file watcher not started ({e}); rules will not hot-reload"),
+                );
+            }
+        }
+    }
 
     boot::spawn_admin_api(
         &config,
