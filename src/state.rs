@@ -61,6 +61,13 @@ pub(crate) struct ResolvedAppConfig {
     /// Max concurrent connections per source IP. 0 = disabled. Read at
     /// accept, so a hot-reload retunes the cap without dropping live conns.
     pub(crate) max_connections_per_ip: u32,
+    /// Max new TLS handshakes per second per source IP (#718), the token-bucket refill rate.
+    /// 0 = disabled. Read at accept, before the handshake.
+    pub(crate) handshake_rate_per_sec: u32,
+    /// Burst allowance (token-bucket capacity) for the per-IP handshake rate limit (#718).
+    pub(crate) handshake_burst: u32,
+    /// IPs/CIDRs exempt from the per-IP handshake rate limit (#718). Empty = nobody exempt.
+    pub(crate) handshake_rate_allowlist: crate::security::IpAllowlist,
     /// TCP keepalive idle seconds for accepted client sockets (0 = off).
     pub(crate) tcp_keepalive_secs: u64,
     /// `[server] tcp_user_timeout_secs` (0 = kernel default).
@@ -138,6 +145,9 @@ impl ResolvedAppConfig {
             rate_limit_window: 1,
             rate_limit_max_tracked_ips: crate::security::MAX_RATE_MAP_ENTRIES,
             max_connections_per_ip: 0,
+            handshake_rate_per_sec: crate::config::default_handshake_rate_per_sec(),
+            handshake_burst: crate::config::default_handshake_burst_per_ip(),
+            handshake_rate_allowlist: crate::security::IpAllowlist::default(),
             tcp_keepalive_secs: crate::net::DEFAULT_TCP_KEEPALIVE_SECS,
             tcp_user_timeout_secs: crate::net::DEFAULT_TCP_USER_TIMEOUT_SECS,
             tls_handshake_timeout_secs: 10,
@@ -483,6 +493,18 @@ impl ResolvedAppConfig {
             Some(explicit) => explicit,
         };
 
+        // Per-IP handshake rate (#718): default ON with a generous threshold; `Some(0)` opts out.
+        let handshake_rate_per_sec = config
+            .server
+            .max_handshakes_per_ip_per_sec
+            .unwrap_or_else(crate::config::default_handshake_rate_per_sec);
+        let handshake_burst = config
+            .server
+            .handshake_burst_per_ip
+            .unwrap_or_else(crate::config::default_handshake_burst_per_ip);
+        let handshake_rate_allowlist =
+            crate::security::IpAllowlist::from_config(&config.server.handshake_rate_allowlist);
+
         Ok(Self {
             router,
             health_map,
@@ -493,6 +515,9 @@ impl ResolvedAppConfig {
             rate_limit_window: config.server.rate_limit_window_secs,
             rate_limit_max_tracked_ips: config.server.rate_limit_max_tracked_ips,
             max_connections_per_ip,
+            handshake_rate_per_sec,
+            handshake_burst,
+            handshake_rate_allowlist,
             tcp_keepalive_secs: config.server.tcp_keepalive_secs,
             tcp_user_timeout_secs: config.server.tcp_user_timeout_secs,
             tls_handshake_timeout_secs: config.tls.handshake_timeout_secs,
@@ -555,6 +580,9 @@ pub(crate) struct Limiters {
     /// snapshot at accept time; the global ceiling stays the `conn_limit`
     /// semaphore on `AppState`.
     pub(crate) conn_per_ip: Arc<connlimit::PerIpConnLimiter>,
+    /// Per-IP new-handshake rate limiter (#718). The rate/burst are read from the config snapshot
+    /// at accept time; this tracks live behaviour so it persists across hot-reloads.
+    pub(crate) handshake_rate: Arc<crate::handshake_rate::PerIpHandshakeRate>,
     /// Rejected-unknown JA4 ban set (#27 commit 4): fingerprint → banned until.
     /// Only ever consulted while the CURRENT config drops unknown fingerprints.
     #[cfg(feature = "tls-fingerprint")]
@@ -679,6 +707,7 @@ impl AppState {
                 rate_map: Arc::new(numa::NumaAwareMap::new()),
                 rate_sweep: security::RateSweep::default(),
                 conn_per_ip: Arc::new(connlimit::PerIpConnLimiter::new()),
+                handshake_rate: Arc::new(crate::handshake_rate::PerIpHandshakeRate::new()),
                 #[cfg(feature = "tls-fingerprint")]
                 tls_fp_bans: tls_fp::BanSet::new(),
             },

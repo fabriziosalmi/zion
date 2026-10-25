@@ -536,6 +536,7 @@ pub(crate) fn build_state(
             rate_map: Arc::new(numa::NumaAwareMap::new()),
             rate_sweep: security::RateSweep::default(),
             conn_per_ip: Arc::new(connlimit::PerIpConnLimiter::new()),
+            handshake_rate: Arc::new(crate::handshake_rate::PerIpHandshakeRate::new()),
             #[cfg(feature = "tls-fingerprint")]
             tls_fp_bans: tls_fp::BanSet::new(),
         },

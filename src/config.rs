@@ -435,6 +435,35 @@ pub struct ServerConfig {
     /// accept, so a hot-reload retunes it without dropping live connections.
     #[serde(default)]
     pub max_connections_per_ip: Option<u32>,
+    /// Max *rate* of new TLS handshakes from a single source IP, per second (#718).
+    ///
+    /// The expensive part of a TLS 1.3 handshake is the server signature; a source that
+    /// connects, handshakes and closes in a loop makes zion pay that signature every time while
+    /// paying almost nothing itself. This caps the rate at accept, before the handshake, so a
+    /// rejected attempt costs one map probe and an immediate close — no crypto, nothing held.
+    ///
+    /// Tri-state, like `max_connections_per_ip`:
+    ///   * omitted → **DEFAULT ON** with a generous threshold (`default_handshake_rate_per_sec`),
+    ///     chosen to clear a thundering herd behind one CGNAT IP while cutting a flood.
+    ///   * `0` → explicitly **DISABLED** (restores pre-#718 behaviour).
+    ///   * `N` → explicit per-IP handshakes/s.
+    ///
+    /// IPv4 is keyed per address; IPv6 per /64 (a subscriber is handed a whole /64). Paired with
+    /// `handshake_burst_per_ip` (the burst allowance) and `handshake_rate_allowlist` (exempt
+    /// sources). Resolved in `ResolvedAppConfig::try_build` and read live at accept.
+    #[serde(default)]
+    pub max_handshakes_per_ip_per_sec: Option<u32>,
+    /// Burst allowance for the per-IP handshake rate limit (#718): the token bucket's capacity,
+    /// i.e. how many handshakes a source may make back-to-back before being held to the sustained
+    /// `max_handshakes_per_ip_per_sec`. Omitted → `default_handshake_burst_per_ip`. Ignored when
+    /// the rate limit is disabled.
+    #[serde(default)]
+    pub handshake_burst_per_ip: Option<u32>,
+    /// IPs/CIDRs exempt from the per-IP handshake rate limit (#718), e.g. a front CDN or a
+    /// monitoring probe. Deny-by-default: an empty list exempts nobody. Each entry is a CIDR or a
+    /// bare IP (`"203.0.113.0/24"`, `"2001:db8::/32"`, `"198.51.100.7"`).
+    #[serde(default)]
+    pub handshake_rate_allowlist: Vec<String>,
     /// Seconds of silence before the kernel starts TCP keepalive probes on client
     /// connections (then every 10 s, dead after 3 unanswered). Frees the file
     /// descriptor and connection slot of a peer that vanished without a FIN (power
@@ -591,6 +620,20 @@ fn default_rate_window() -> u64 {
 
 fn default_rate_map_entries() -> usize {
     crate::security::MAX_RATE_MAP_ENTRIES
+}
+
+/// Default sustained per-IP handshake rate (#718), applied when `max_handshakes_per_ip_per_sec`
+/// is omitted. Generous on purpose: it clears a thundering herd behind one CGNAT IP (low hundreds
+/// of handshakes/s) while cutting a single-IP flood (measured at 7-9k/s). Validated by the
+/// handshake-flood measurement, not guessed.
+pub(crate) fn default_handshake_rate_per_sec() -> u32 {
+    1000
+}
+
+/// Default burst allowance (token-bucket capacity) for the per-IP handshake rate limit (#718),
+/// applied when `handshake_burst_per_ip` is omitted.
+pub(crate) fn default_handshake_burst_per_ip() -> u32 {
+    2000
 }
 
 // ============================================================================
@@ -2587,6 +2630,16 @@ fn check_internal_networks_and_admin(config: &ZionConfig, errors: &mut Vec<Strin
         }
     }
 
+    // [server] handshake_rate_allowlist — a bad entry is an error: silently dropping it would
+    // narrow the allowlist and start rate-limiting a source the operator meant to exempt.
+    for cidr in &config.server.handshake_rate_allowlist {
+        if !crate::security::is_valid_cidr(cidr) {
+            errors.push(format!(
+                "server.handshake_rate_allowlist '{cidr}' is not a valid CIDR (e.g. \"203.0.113.0/24\" or \"198.51.100.7\")"
+            ));
+        }
+    }
+
     // [admin] — listen must be a real socket address; auth a known mode.
     if let Some(ref admin) = config.admin {
         if admin.listen.parse::<std::net::SocketAddr>().is_err() {
@@ -4522,6 +4575,26 @@ enabledd = true
         // a good list raises no internal_networks error (other errors may exist: cert files)
         let e = with("internal_networks=[\"10.20.0.0/24\",\"127.0.0.1\"]\n");
         assert!(!e.contains("internal_networks"), "{e}");
+    }
+
+    #[test]
+    fn handshake_rate_allowlist_entries_are_validated() {
+        let base = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n{NET}\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        let with = |net: &str| {
+            validate_str(&base.replace("{NET}", net), "t")
+                .err()
+                .unwrap_or_default()
+        };
+        let e = with("handshake_rate_allowlist=[\"10.0.0.0/99\"]\n");
+        assert!(
+            e.contains("server.handshake_rate_allowlist '10.0.0.0/99'"),
+            "{e}"
+        );
+        // a good list raises no handshake_rate_allowlist error
+        let e = with("handshake_rate_allowlist=[\"203.0.113.0/24\",\"198.51.100.7\"]\n");
+        assert!(!e.contains("handshake_rate_allowlist"), "{e}");
     }
 
     #[test]

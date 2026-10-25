@@ -101,6 +101,20 @@ container that serves large files), set `max_connections` from the busy figure, 
 `max_connections_per_ip` (an eighth of the ceiling by default) so that one address cannot take
 the whole of it.
 
+## New-handshake floods
+
+The connection caps above bound how many connections a source holds open at once; they do not
+bound how *fast* it opens new ones. The expensive part of a TLS 1.3 handshake is the server
+signature: a source that connects, handshakes and closes in a loop makes zion pay that signature
+every time while paying almost nothing itself (one loopback client drove about 4 cores with an
+RSA-2048 certificate: 7,419 full handshakes/s at 397% of a core; ECDSA P-256 is cheaper, 9,547/s
+at 136%). `max_handshakes_per_ip_per_sec` caps that rate per source IP (per /64 for IPv6),
+enforced at accept before the handshake, so a rejected attempt costs one map probe and an
+immediate close. It is a token bucket: the setting is the sustained rate, `handshake_burst_per_ip`
+the burst. The default (1,000/s, burst 2,000) is a generous threshold between a thundering herd
+behind one CGNAT IP (low hundreds/s) and a flood, on by default; `handshake_rate_allowlist` exempts
+named sources, and `0` disables it. Rejections are counted in `zion_connections_rejected_handshake_rate`.
+
 ## HTTP/2 control-frame floods
 
 HTTP/2 has frames that carry no request and that a server must still read, and often answer:

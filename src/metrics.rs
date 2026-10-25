@@ -454,6 +454,9 @@ pub struct Metrics {
     /// Connections closed at accept because the source IP was already at
     /// its `max_connections_per_ip` concurrent cap (anti-DDoS lever).
     pub connections_rejected_per_ip: AtomicU64,
+    /// Connections closed at accept because the source IP exceeded its new-handshake
+    /// rate limit (`max_handshakes_per_ip_per_sec`, #718), before the TLS handshake.
+    pub connections_rejected_handshake_rate: AtomicU64,
     /// Connections shed at accept because the GLOBAL connection semaphore
     /// (the per-node ceiling, see `compute_conn_limit`) was exhausted. Lets an
     /// operator alert on node-saturation shedding directly instead of inferring
@@ -632,6 +635,7 @@ impl Metrics {
             tls_fp_rate_limited: AtomicU64::new(0),
             tls_fp_route_denied: AtomicU64::new(0),
             connections_rejected_per_ip: AtomicU64::new(0),
+            connections_rejected_handshake_rate: AtomicU64::new(0),
             connections_rejected_global: AtomicU64::new(0),
             upstream_failovers_total: AtomicU64::new(0),
             upstream_connections_opened: AtomicU64::new(0),
@@ -1267,6 +1271,18 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.connections_rejected_per_ip.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_connections_rejected_handshake_rate Connections closed at accept for exceeding max_handshakes_per_ip_per_sec.\n\
+                                # TYPE zion_connections_rejected_handshake_rate counter\n\
+                                zion_connections_rejected_handshake_rate ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.connections_rejected_handshake_rate.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");
