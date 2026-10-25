@@ -42,6 +42,41 @@ fn have_openssl() -> bool {
         .unwrap_or(false)
 }
 
+fn have_curl() -> bool {
+    Command::new("curl")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// One HTTP/2 request via curl over TLS (ALPN h2; `-k` for the self-signed cert). Returns the
+/// status code and the response head block (so the caller can confirm the `HTTP/2` protocol line
+/// and read headers). `body` is sent only when non-empty.
+fn curl_h2(port: u16, method: &str, path: &str, headers: &[&str], body: &str) -> (u16, String) {
+    let url = format!("https://127.0.0.1:{port}{path}");
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sk", "--http2", "-X", method, "-D", "-", "-o", "/dev/null"]);
+    for h in headers {
+        cmd.arg("-H").arg(h);
+    }
+    if !body.is_empty() {
+        cmd.arg("--data-binary").arg(body);
+    }
+    cmd.arg(&url);
+    let out = cmd.output().expect("curl");
+    let head = String::from_utf8_lossy(&out.stdout).to_string();
+    let code = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    (code, head)
+}
+
 /// An origin that parses a keep-alive stream of HTTP/1.1 requests, records the head (start-line and
 /// header lines) of each, consumes its body (Content-Length or chunked) so the next request starts
 /// at a boundary, and answers `ok`.
@@ -70,6 +105,9 @@ fn origin() -> (u16, Arc<Mutex<Vec<String>>>) {
                     if start.is_empty() {
                         continue;
                     }
+                    // The request path drives the origin's reply, so conformance cases can ask the
+                    // origin for a specific status (`/status/NNN`) or a Vary header (`/vary`).
+                    let req_path = start.split_whitespace().nth(1).unwrap_or("/").to_string();
                     let mut head = start;
                     let mut content_length = 0usize;
                     let mut chunked = false;
@@ -118,9 +156,22 @@ fn origin() -> (u16, Arc<Mutex<Vec<String>>>) {
                         let mut body = vec![0u8; content_length];
                         let _ = r.read_exact(&mut body);
                     }
-                    if w.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                        .is_err()
-                    {
+                    // Choose the reply from the request path.
+                    let reply = if let Some(rest) = req_path.strip_prefix("/status/") {
+                        let n: u16 = rest
+                            .split(['/', '?'])
+                            .next()
+                            .unwrap_or("")
+                            .parse()
+                            .unwrap_or(200);
+                        format!("HTTP/1.1 {n} X\r\nContent-Length: 2\r\n\r\nok")
+                    } else if req_path.starts_with("/vary") {
+                        "HTTP/1.1 200 OK\r\nVary: Accept-Encoding\r\nContent-Length: 2\r\n\r\nok"
+                            .to_string()
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_string()
+                    };
+                    if w.write_all(reply.as_bytes()).is_err() {
                         break;
                     }
                 }
@@ -843,6 +894,103 @@ fn http_conditional_range_and_encoding() {
     }
 
     eprintln!("\n=== HTTP conformance matrix (slice 3: conditional, range, encoding) ===");
+    for (case, outcome) in &matrix {
+        eprintln!("  {case:30}  {outcome}");
+    }
+    eprintln!("=== end matrix ===\n");
+}
+
+#[test]
+fn http2_parity_status_and_vary_passthrough() {
+    if !have_openssl() || !have_curl() {
+        eprintln!("skipping http_conformance slice 4: openssl or curl not installed");
+        return;
+    }
+    let dir = tempdir();
+    let (origin_port, seen) = origin();
+    let (_zion, port) = start(&dir, origin_port);
+
+    let mut matrix: Vec<(String, String)> = Vec::new();
+    let mut record = |case: &str, outcome: String| matrix.push((case.to_string(), outcome));
+
+    // ---- HTTP/2 parity: the h2 request path reaches the HTTP/1.1 origin and returns its status ----
+    // curl negotiates h2 via ALPN; the status line reads "HTTP/2" when zion served h2.
+    {
+        let (c, head) = curl_h2(port, "GET", "/h2-get", &[], "");
+        let is_h2 = head.lines().next().unwrap_or("").starts_with("HTTP/2");
+        let saw = origin_saw_method(&seen, "GET", "h2-get");
+        record(
+            "h2 GET",
+            format!("zion {c} over {}", if is_h2 { "h2" } else { "NOT h2" }),
+        );
+        assert!(is_h2, "zion did not serve HTTP/2 to an h2 client:\n{head}");
+        assert_eq!(c, 200, "h2 GET did not return 200");
+        assert!(saw, "h2 GET did not reach the HTTP/1.1 origin");
+    }
+    {
+        let (c, head) = curl_h2(port, "HEAD", "/h2-head", &[], "");
+        let is_h2 = head.lines().next().unwrap_or("").starts_with("HTTP/2");
+        record(
+            "h2 HEAD",
+            format!("zion {c} over {}", if is_h2 { "h2" } else { "NOT h2" }),
+        );
+        assert!(is_h2 && c == 200, "h2 HEAD: h2={is_h2} code={c}");
+    }
+    {
+        let (c, _head) = curl_h2(port, "POST", "/h2-post", &[], "hello");
+        let saw = origin_saw_method(&seen, "POST", "h2-post");
+        record(
+            "h2 POST (body)",
+            format!("zion {c}, origin forwarded ({saw})"),
+        );
+        assert_eq!(c, 200, "h2 POST did not return 200");
+        assert!(saw, "h2 POST did not reach the origin");
+    }
+
+    // ---- Status passthrough on HTTP/1.1 and HTTP/2 ----
+    // The origin returns the status named in the path; zion forwards it unchanged on both protocols
+    // (an origin 5xx is passed through, not rewritten to 502 which is reserved for a dead upstream).
+    for status in [200u16, 301, 404, 500] {
+        let path = format!("/status/{status}");
+        let h1 = code(&send(
+            port,
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        ));
+        let (h2, _) = curl_h2(port, "GET", &path, &[], "");
+        record(
+            &format!("status {status} passthrough"),
+            format!("h1 {h1}, h2 {h2}"),
+        );
+        assert_eq!(
+            h1, status,
+            "HTTP/1.1 did not pass origin status {status} through (got {h1})"
+        );
+        assert_eq!(
+            h2, status,
+            "HTTP/2 did not pass origin status {status} through (got {h2})"
+        );
+    }
+
+    // ---- Vary passthrough ----
+    // The origin sets Vary: Accept-Encoding; zion forwards it to the client.
+    {
+        let resp = send(
+            port,
+            b"GET /vary HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let vary = header_val(&resp.head, "vary").to_ascii_lowercase();
+        record(
+            "Vary passthrough",
+            format!("zion {}, Vary {vary:?}", code(&resp)),
+        );
+        assert!(
+            vary.contains("accept-encoding"),
+            "zion did not forward the origin's Vary header: {vary:?}"
+        );
+    }
+
+    eprintln!("\n=== HTTP conformance matrix (slice 4: HTTP/2, status, Vary) ===");
     for (case, outcome) in &matrix {
         eprintln!("  {case:30}  {outcome}");
     }
