@@ -410,7 +410,7 @@ fn spawn_https_handler(
             Err(_) => {
                 if tls_handshake_log_allowed() {
                     logq::line(&format!(
-                        "  tls handshake timed out (10s) from {remote_addr}"
+                        "  tls handshake timed out ({hs_timeout}s) from {remote_addr}"
                     ));
                 }
                 metrics::METRICS
