@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `[tls] handshake_timeout_secs` (#719), with the real binary: a connection that completes
-//! TCP but never sends its TLS ClientHello is dropped after the configured handshake timeout,
+//! TCP but never sends its TLS ClientHello is dropped at the configured handshake timeout,
 //! not the hardcoded 10 s. An operator under a slow-handshake flood can tighten it to free
 //! connection slots sooner.
+//!
+//! The proof is deterministic, not a wall-clock race: zion logs `tls handshake timed out (Ns)`
+//! with the configured N when the timeout fires, so the test boots with `handshake_timeout_secs
+//! = 1` and asserts the log names `(1s)` (the configured value, not the 10 s default) and that
+//! the stalled socket is then dropped. An earlier version timed the connect-to-drop interval and
+//! was flaky on a saturated 2-core CI runner, where a 1 s tokio timer can fire several seconds
+//! late; the log line fires exactly when the configured timeout elapses regardless of that slack.
 //!
 //! A missing `openssl` (for a throwaway certificate) skips with a message.
 #![cfg(unix)]
@@ -88,17 +95,22 @@ fn start(tls_extra: &str) -> Option<Zion> {
     Some(zion)
 }
 
-/// How long zion keeps a TLS connection that never sends its ClientHello. We connect to the
-/// HTTPS listener, send nothing, and time until zion closes it (read returns EOF or errors).
-fn time_to_drop(https: u16, cap: Duration) -> Duration {
-    let s = TcpStream::connect(("127.0.0.1", https)).expect("connect https");
-    s.set_read_timeout(Some(cap)).unwrap();
-    let start = Instant::now();
-    let mut buf = [0u8; 16];
-    // No ClientHello is ever sent. zion awaits the handshake and drops us at the timeout;
-    // the read then returns Ok(0) (clean EOF) or a reset/timeout error.
-    let _ = (&s).read(&mut buf);
-    start.elapsed()
+/// Poll `log` until it contains `needle`, up to `cap`. Returns whether it appeared. The log is
+/// written through an async queue, so we poll rather than read once.
+fn log_contains_within(log: &std::path::Path, needle: &str, cap: Duration) -> bool {
+    let deadline = Instant::now() + cap;
+    loop {
+        if std::fs::read_to_string(log)
+            .map(|c| c.contains(needle))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]
@@ -106,19 +118,33 @@ fn a_stalled_handshake_is_dropped_at_the_configured_timeout() {
     let Some(zion) = start("handshake_timeout_secs = 1") else {
         return;
     };
-    // With a 1 s timeout the stalled connection is dropped well before the hardcoded 10 s
-    // default would. The margins are wide on purpose: on a saturated CI runner the 1 s tokio
-    // timer can fire several seconds late, so the referee is the 8 s mark — clearly under the
-    // 10 s default, so the drop still proves the configured value is the one in force, while a
-    // 20 s read cap lets the default-10 case (and the break-test) be observed in full.
-    let elapsed = time_to_drop(zion.https, Duration::from_secs(20));
+    // Complete TCP, then send no ClientHello: zion awaits the handshake and times out.
+    let sock = TcpStream::connect(("127.0.0.1", zion.https)).expect("connect https");
+
+    // The configured timeout is the deterministic proof: zion logs `(1s)`, the value we set,
+    // not the 10 s hardcoded default. The 15 s cap is generous so a saturated CI runner that is
+    // slow to even accept the connection (its 1 s timer then starts late) still observes the line.
+    let log = zion.dir.join("zion.log");
     assert!(
-        elapsed < Duration::from_secs(8),
-        "a 1 s handshake timeout must drop the stalled connection well before the 10 s default, \
-         took {elapsed:?}"
+        log_contains_within(
+            &log,
+            "tls handshake timed out (1s)",
+            Duration::from_secs(15)
+        ),
+        "zion must log the configured 1 s handshake timeout; log so far:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
     );
-    assert!(
-        elapsed >= Duration::from_millis(500),
-        "it should wait roughly the timeout, not reject instantly: took {elapsed:?}"
-    );
+
+    // Having timed out, zion drops the connection: the read returns promptly with EOF (clean
+    // close) or a connection error, never WouldBlock-after-the-cap and never live data.
+    sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = [0u8; 16];
+    match (&sock).read(&mut buf) {
+        Ok(0) => {}
+        Ok(n) => panic!("stalled handshake must be dropped, not answered with {n} bytes"),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            panic!("zion did not close the stalled connection within 2 s of logging the timeout")
+        }
+        Err(_) => {} // reset / broken pipe: the peer closed, which is the drop we expect
+    }
 }
