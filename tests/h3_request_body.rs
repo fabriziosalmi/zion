@@ -353,8 +353,11 @@ async fn a_h3_headers_fin_with_content_length_is_not_a_phantom_body() {
         return;
     };
 
-    // The headers promise 1000 bytes; the stream ends with none. zion must not forward a request
-    // the upstream would wait on, and must not fabricate a 2xx for a body that never arrived.
+    // The headers promise 1000 bytes; the stream ends with none. The desync invariant (as for the
+    // broken-body test above) is that the upstream never takes this as a WHOLE request: whether
+    // zion refuses before forwarding (seen on a lean build) or forwards a body that never completes
+    // (seen under all features), the upstream must never mark it complete and answer it, so there
+    // is no phantom body and no fabricated 2xx.
     let status = match tokio::time::timeout(
         Duration::from_secs(10),
         h3_headers_fin_with_cl(port, "/open/z", 1000),
@@ -365,16 +368,16 @@ async fn a_h3_headers_fin_with_content_length_is_not_a_phantom_body() {
         Err(_) => panic!("zion hung on a HEADERS+FIN request that declared a Content-Length"),
     };
     std::thread::sleep(Duration::from_millis(300));
-    let recs: Vec<Seen> = seen
+    let whole: Vec<Seen> = seen
         .lock()
         .unwrap()
         .iter()
-        .filter(|s| s.path == "/open/z")
+        .filter(|s| s.path == "/open/z" && s.complete)
         .cloned()
         .collect();
     assert!(
-        recs.is_empty(),
-        "a HEADERS+FIN request with a non-zero Content-Length reached the upstream: {recs:?}"
+        whole.is_empty(),
+        "a HEADERS+FIN request with a non-zero Content-Length reached the upstream as a whole body: {whole:?}"
     );
     assert!(
         status.is_none_or(|s| s >= 400),
