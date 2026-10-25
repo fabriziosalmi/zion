@@ -115,6 +115,13 @@ quinn = { version = "0.11", optional = true }
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 
+# Response compression backends (opt-in: cargo build --features compress), per
+# ADR-0025. flate2 (gzip, miniz_oxide pure-Rust backend) is already in the tree
+# transitively; brotli (and its pure-Rust family) is the only new supply-chain
+# surface, vetted via cargo-vet.
+flate2 = { version = "1", optional = true }
+brotli = { version = "7", optional = true }
+
 # Live TUI dashboard (opt-in: cargo build --features tui)
 ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.29", optional = true }
@@ -222,8 +229,8 @@ init = ["rcgen", "time"]
 # default per route even when built in; gated as a Cargo feature so the lean
 # core stays free of the compression backends and their supply-chain surface.
 # The config and the negotiation decision are always compiled; the byte-level
-# encoders (flate2, brotli) are pulled only by this feature.
-compress = []
+# encoders (flate2 gzip, brotli) are pulled only by this feature.
+compress = ["dep:flate2", "dep:brotli"]
 # Redistributable bundle: what the official container + release artifacts
 # ship. It is NOT in `default` on purpose — acme/init pull an edition-2024
 # closure (time, rcgen, deranged) that raises the real build MSRV to 1.88,

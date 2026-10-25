@@ -436,6 +436,19 @@ async fn process_request_inner(
     let trace = telemetry::stamp(&mut req);
     let access = telemetry::capture(&cfg, &state, &req);
 
+    // Capture what response compression needs before `req` is moved into the
+    // dispatch, and only for a route that asks for it (ADR-0025). Other routes pay
+    // nothing.
+    let compress_ctx = rule.compress.as_ref().map(|_| {
+        (
+            req.method().clone(),
+            req.headers()
+                .get(hyper::header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_owned()),
+        )
+    });
+
     // --- Dispatch by mode ---
     let resp = dispatch_by_mode(
         req,
@@ -450,6 +463,17 @@ async fn process_request_inner(
     )
     .await?;
     let mut resp = finish_response(resp, &rule, admission);
+
+    // Downstream response compression (ADR-0025): off unless the route enabled it
+    // and the request/response negotiate a coding.
+    if let Some((method, accept_encoding)) = &compress_ctx {
+        resp = crate::compress::apply(
+            resp,
+            rule.compress.as_ref(),
+            method,
+            accept_encoding.as_deref(),
+        );
+    }
 
     let request_elapsed = request_start.elapsed();
     telemetry::record(

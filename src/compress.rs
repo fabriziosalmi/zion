@@ -15,14 +15,16 @@
 //! `allow_cookied` (compressing a secret mixed with attacker-reflected input over
 //! TLS is the BREACH oracle).
 //!
-//! SCAFFOLD (ADR-0025, first step): `negotiate` and its helpers are proven here in
-//! isolation before the response path calls them. The module-level `allow(dead_code)`
-//! covers the decision surface until the encoder and the `finish_response` wiring
-//! land in the follow-up, which removes this attribute.
-#![allow(dead_code)]
+//! [`apply`] is the single entry the response path calls; it runs the decision and,
+//! when the `compress` feature is built, hands the body to the streaming encoder.
+//! Without the feature the decision still runs but the body is left as identity, so
+//! a route that asks for compression on a build without the backend degrades to
+//! no-op rather than failing.
 
+use crate::http_util::ZionBody;
+use hyper::body::Body as _;
 use hyper::header::{HeaderMap, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, SET_COOKIE};
-use hyper::{Method, StatusCode};
+use hyper::{Method, Response, StatusCode};
 use serde::Deserialize;
 
 /// Per-route compression configuration (`[[route]] compress`). Off unless `enabled`.
@@ -76,7 +78,9 @@ pub enum Encoding {
 }
 
 impl Encoding {
-    /// The `Content-Encoding` token.
+    /// The `Content-Encoding` token. Used by the encoder, so it is dead on a build
+    /// without the `compress` feature.
+    #[cfg_attr(not(feature = "compress"), allow(dead_code))]
     pub fn token(self) -> &'static str {
         match self {
             Encoding::Gzip => "gzip",
@@ -229,6 +233,222 @@ pub fn negotiate(
         Some(Encoding::Gzip)
     } else {
         None
+    }
+}
+
+/// The single entry the response path calls. Runs [`negotiate`] against the route's
+/// resolved settings and, when a coding is chosen and the `compress` feature is
+/// built, replaces the body with its compressed form and edits the headers
+/// accordingly. A `None` config, a decision of "do not compress", or a build without
+/// the feature all return the response untouched.
+pub fn apply(
+    resp: Response<ZionBody>,
+    cfg: Option<&ResolvedCompress>,
+    method: &Method,
+    accept_encoding: Option<&str>,
+) -> Response<ZionBody> {
+    let Some(cfg) = cfg else { return resp };
+    let hint = resp.body().size_hint().exact();
+    let Some(enc) = negotiate(
+        accept_encoding,
+        method,
+        resp.status(),
+        resp.headers(),
+        hint,
+        cfg,
+    ) else {
+        return resp;
+    };
+    #[cfg(feature = "compress")]
+    {
+        encode::compress_response(resp, enc)
+    }
+    #[cfg(not(feature = "compress"))]
+    {
+        // The decision stands but the backend was not built: serve identity.
+        let _ = enc;
+        resp
+    }
+}
+
+/// The byte-level encoder and the streaming body adapter. Built only with the
+/// `compress` Cargo feature, which pulls flate2 (gzip) and brotli.
+#[cfg(feature = "compress")]
+mod encode {
+    use super::{Encoding, ZionBody};
+    use bytes::Bytes;
+    use http_body_util::BodyExt;
+    use hyper::body::{Body, Frame};
+    use hyper::header::{CONTENT_ENCODING, CONTENT_LENGTH, ETAG, VARY};
+    use hyper::Response;
+    use std::io::Write;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// Wrap the response body in [`CompressBody`] and set the headers a compressed
+    /// representation requires.
+    pub fn compress_response(resp: Response<ZionBody>, enc: Encoding) -> Response<ZionBody> {
+        let (mut parts, body) = resp.into_parts();
+        parts.headers.insert(
+            CONTENT_ENCODING,
+            hyper::header::HeaderValue::from_static(enc.token()),
+        );
+        // The body length changes; let the framing layer recompute it.
+        parts.headers.remove(CONTENT_LENGTH);
+        // The representation now varies by Accept-Encoding. Append, do not clobber.
+        append_vary_accept_encoding(&mut parts.headers);
+        // A strong ETag no longer identifies these bytes; weaken it to a weak validator.
+        weaken_etag(&mut parts.headers);
+        let body = CompressBody::new(body, enc).boxed();
+        Response::from_parts(parts, body)
+    }
+
+    fn append_vary_accept_encoding(headers: &mut hyper::HeaderMap) {
+        // If Vary already lists accept-encoding (any case) or is `*`, leave it.
+        let already = headers.get_all(VARY).iter().any(|v| {
+            v.to_str().is_ok_and(|s| {
+                s == "*"
+                    || s.split(',')
+                        .any(|t| t.trim().eq_ignore_ascii_case("accept-encoding"))
+            })
+        });
+        if !already {
+            headers.append(
+                VARY,
+                hyper::header::HeaderValue::from_static("accept-encoding"),
+            );
+        }
+    }
+
+    fn weaken_etag(headers: &mut hyper::HeaderMap) {
+        if let Some(etag) = headers.get(ETAG) {
+            if let Ok(s) = etag.to_str() {
+                if !s.starts_with("W/") {
+                    if let Ok(weak) = hyper::header::HeaderValue::from_str(&format!("W/{s}")) {
+                        headers.insert(ETAG, weak);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A streaming body that compresses the frames of an inner body. It writes each
+    /// data frame into a write-based encoder and emits whatever compressed bytes the
+    /// encoder has produced; on the inner body's end it finalizes the stream. Non-data
+    /// frames (trailers) are finalized-then-forwarded so the encoded stream is
+    /// well-formed before the trailers.
+    pub struct CompressBody {
+        inner: ZionBody,
+        enc: Option<EncState>,
+        pending: Vec<u8>,
+        inner_done: bool,
+        trailers: Option<Frame<Bytes>>,
+    }
+
+    enum EncState {
+        Gzip(flate2::write::GzEncoder<Vec<u8>>),
+        Brotli(Box<brotli::CompressorWriter<Vec<u8>>>),
+    }
+
+    impl CompressBody {
+        pub fn new(inner: ZionBody, enc: Encoding) -> Self {
+            let state = match enc {
+                Encoding::Gzip => EncState::Gzip(flate2::write::GzEncoder::new(
+                    Vec::new(),
+                    flate2::Compression::new(6),
+                )),
+                // 4 KiB buffer, quality 4 (fast, good ratio for text), window 22.
+                Encoding::Brotli => EncState::Brotli(Box::new(brotli::CompressorWriter::new(
+                    Vec::new(),
+                    4096,
+                    4,
+                    22,
+                ))),
+            };
+            Self {
+                inner,
+                enc: Some(state),
+                pending: Vec::new(),
+                inner_done: false,
+                trailers: None,
+            }
+        }
+
+        /// Write a chunk into the encoder and move whatever it produced into `pending`.
+        fn write_chunk(&mut self, data: &[u8]) {
+            match self.enc.as_mut() {
+                Some(EncState::Gzip(e)) => {
+                    let _ = e.write_all(data);
+                    self.pending.append(e.get_mut());
+                }
+                Some(EncState::Brotli(e)) => {
+                    let _ = e.write_all(data);
+                    self.pending.append(e.get_mut());
+                }
+                None => {}
+            }
+        }
+
+        /// Finalize the stream, appending the encoder's trailer bytes to `pending`.
+        fn finish(&mut self) {
+            match self.enc.take() {
+                Some(EncState::Gzip(mut e)) => {
+                    if e.try_finish().is_ok() {
+                        self.pending.append(e.get_mut());
+                    }
+                }
+                Some(EncState::Brotli(e)) => {
+                    let mut buf = e.into_inner();
+                    self.pending.append(&mut buf);
+                }
+                None => {}
+            }
+        }
+    }
+
+    impl Body for CompressBody {
+        type Data = Bytes;
+        type Error = hyper::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+            let this = &mut *self;
+            loop {
+                if !this.pending.is_empty() {
+                    let out = std::mem::take(&mut this.pending);
+                    return Poll::Ready(Some(Ok(Frame::data(Bytes::from(out)))));
+                }
+                if this.inner_done {
+                    if this.enc.is_some() {
+                        this.finish();
+                        continue; // emit the final bytes, if any
+                    }
+                    if let Some(trailers) = this.trailers.take() {
+                        return Poll::Ready(Some(Ok(trailers)));
+                    }
+                    return Poll::Ready(None);
+                }
+                match Pin::new(&mut this.inner).poll_frame(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(None) => {
+                        this.inner_done = true;
+                    }
+                    Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                    Poll::Ready(Some(Ok(frame))) => {
+                        if frame.is_data() {
+                            let data = frame.into_data().unwrap_or_default();
+                            this.write_chunk(&data);
+                        } else {
+                            // Trailers: close the encoded stream, then forward them.
+                            this.trailers = Some(frame);
+                            this.inner_done = true;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -452,5 +672,111 @@ mod tests {
         let r = ResolvedCompress::from_config(&c).unwrap();
         assert_eq!(r.min_bytes, 2048);
         assert!(r.allow_cookied);
+    }
+}
+
+#[cfg(all(test, feature = "compress"))]
+mod encode_tests {
+    use super::encode::CompressBody;
+    use super::Encoding;
+    use crate::http_util::ZionBody;
+    use bytes::Bytes;
+    use http_body_util::BodyExt;
+    use hyper::body::{Body, Frame};
+    use std::io::Read;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A body that yields a fixed list of data frames, to exercise the multi-frame
+    /// path of the encoder (write called repeatedly, then finish).
+    struct Chunks(Vec<Bytes>);
+
+    impl Body for Chunks {
+        type Data = Bytes;
+        type Error = hyper::Error;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+            let this = self.get_mut();
+            if this.0.is_empty() {
+                Poll::Ready(None)
+            } else {
+                Poll::Ready(Some(Ok(Frame::data(this.0.remove(0)))))
+            }
+        }
+    }
+
+    fn chunked_body(chunks: Vec<Vec<u8>>) -> ZionBody {
+        Chunks(chunks.into_iter().map(Bytes::from).collect()).boxed()
+    }
+
+    fn compress_all(inner: ZionBody, enc: Encoding) -> Vec<u8> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            CompressBody::new(inner, enc)
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec()
+        })
+    }
+
+    fn sample(n: usize) -> Vec<u8> {
+        // Compressible but not trivial: a repeating-ish byte pattern.
+        (0..n).map(|i| b"the quick brown fox "[i % 20]).collect()
+    }
+
+    #[test]
+    fn gzip_roundtrip_multichunk() {
+        let original = sample(50_000);
+        let chunks = vec![
+            original[..10_000].to_vec(),
+            original[10_000..30_000].to_vec(),
+            original[30_000..].to_vec(),
+        ];
+        let compressed = compress_all(chunked_body(chunks), Encoding::Gzip);
+        assert!(
+            compressed.len() < original.len(),
+            "gzip should shrink the sample"
+        );
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(&compressed[..])
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, original, "gzip round-trip must reproduce the bytes");
+    }
+
+    #[test]
+    fn brotli_roundtrip_multichunk() {
+        let original = sample(50_000);
+        let chunks = vec![
+            original[..1].to_vec(),
+            original[1..25_000].to_vec(),
+            original[25_000..].to_vec(),
+        ];
+        let compressed = compress_all(chunked_body(chunks), Encoding::Brotli);
+        assert!(
+            compressed.len() < original.len(),
+            "brotli should shrink the sample"
+        );
+        let mut out = Vec::new();
+        brotli::Decompressor::new(&compressed[..], 4096)
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, original, "brotli round-trip must reproduce the bytes");
+    }
+
+    #[test]
+    fn empty_body_roundtrips() {
+        let compressed = compress_all(chunked_body(vec![]), Encoding::Gzip);
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(&compressed[..])
+            .read_to_end(&mut out)
+            .unwrap();
+        assert!(out.is_empty());
     }
 }
