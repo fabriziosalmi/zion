@@ -230,7 +230,9 @@ fn start(dir: &Path, origin_port: u16) -> (Proc, u16) {
         format!(
             "[server]\nlisten_http = \"127.0.0.1:{}\"\nlisten_https = \"127.0.0.1:{https_port}\"\n\n\
              [tls]\ncert_path = \"{}\"\nkey_path = \"{}\"\nhot_reload = false\n\n\
-             [upstreams]\nbackend = \"http://127.0.0.1:{origin_port}\"\n\n\
+             [upstream.backend]\nurl = \"http://127.0.0.1:{origin_port}\"\n\n\
+             [upstream.ph]\nurl = \"http://127.0.0.1:{origin_port}\"\npreserve_host = true\n\n\
+             [[route]]\npath = \"/ph/{{*rest}}\"\nupstream = \"ph\"\nmode = \"standard\"\n\n\
              [[route]]\npath = \"/{{*rest}}\"\nupstream = \"backend\"\nmode = \"standard\"\n",
             free_port(),
             cert.to_string_lossy(),
@@ -476,8 +478,186 @@ fn http1_methods_framing_and_hop_by_hop_on_a_proxy_route() {
     eprintln!("=== end matrix ===\n");
 }
 
+/// The lowercased head (start-line + headers) the origin recorded for the first request after
+/// `before` whose start-line begins with `prefix`, waiting briefly for it to arrive; empty if none.
+fn recorded_head(seen: &Arc<Mutex<Vec<String>>>, before: usize, prefix: &str) -> String {
+    let deadline = Instant::now() + Duration::from_millis(800);
+    loop {
+        {
+            let g = seen.lock().unwrap();
+            if let Some(h) = g
+                .iter()
+                .skip(before)
+                .find(|h| h.lines().next().is_some_and(|l| l.starts_with(prefix)))
+            {
+                return h.to_ascii_lowercase();
+            }
+        }
+        if Instant::now() >= deadline {
+            return String::new();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn http1_request_targets_host_and_expect_continue() {
+    if !have_openssl() {
+        eprintln!("skipping http_conformance slice 2: openssl not installed");
+        return;
+    }
+    let dir = tempdir();
+    let (origin_port, seen) = origin();
+    let (_zion, port) = start(&dir, origin_port);
+    let upstream_host = format!("127.0.0.1:{origin_port}");
+
+    let mut matrix: Vec<(String, String)> = Vec::new();
+    let mut record = |case: &str, outcome: String| matrix.push((case.to_string(), outcome));
+
+    // ---- Host rewriting (default) vs preserve_host ----
+    // Default: zion rewrites the upstream Host to the upstream's authority; the client's Host does
+    // not reach the origin.
+    {
+        let before = seen.lock().unwrap().len();
+        let raw = "GET /h-default HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+        let resp = send(port, raw.as_bytes());
+        assert_eq!(code(&resp), 200, "default Host route did not return 200");
+        let head = recorded_head(&seen, before, "GET /h-default");
+        // The Host HEADER is rewritten to the upstream authority; the client's original Host is
+        // preserved out-of-band in X-Forwarded-Host (so it is not "leaked" as the Host).
+        let host_line = head
+            .lines()
+            .find(|l| l.starts_with("host:"))
+            .unwrap_or("")
+            .to_string();
+        let has_xfh = head
+            .lines()
+            .any(|l| l.starts_with("x-forwarded-host:") && l.contains("client.example"));
+        record(
+            "Host rewrite (default)",
+            format!("Host header {host_line:?}, X-Forwarded-Host carries original ({has_xfh})"),
+        );
+        assert!(
+            host_line.contains(&upstream_host),
+            "default route did not rewrite the Host header to the upstream authority:\n{head}"
+        );
+        assert!(
+            !host_line.contains("client.example"),
+            "the Host header forwarded the client's value on the default route:\n{head}"
+        );
+    }
+    // preserve_host: the client's Host is forwarded as the Host header.
+    {
+        let before = seen.lock().unwrap().len();
+        let raw =
+            "GET /ph/h-preserve HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+        let resp = send(port, raw.as_bytes());
+        assert_eq!(code(&resp), 200, "preserve_host route did not return 200");
+        let head = recorded_head(&seen, before, "GET /ph/h-preserve");
+        let host_line = head
+            .lines()
+            .find(|l| l.starts_with("host:"))
+            .unwrap_or("")
+            .to_string();
+        record("Host preserve_host", format!("Host header {host_line:?}"));
+        assert!(
+            host_line.contains("client.example"),
+            "preserve_host did not forward the client's Host:\n{head}"
+        );
+    }
+
+    // ---- Request-target forms ----
+    // absolute-form naming the OWN authority: accepted and re-framed to origin-form upstream (the
+    // absolute URI and its scheme/authority do not reach the origin). The foreign-authority / no-leak
+    // smuggling invariant is pinned in tests/http1_smuggling_corpus.rs (#697); here we document the
+    // normal case.
+    {
+        let before = seen.lock().unwrap().len();
+        let raw =
+            "GET http://localhost/abs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        let resp = send(port, raw.as_bytes());
+        let c = code(&resp);
+        let head = recorded_head(&seen, before, "GET /abs");
+        let reached = !head.is_empty();
+        let leaked_absolute = head.contains("http://");
+        record(
+            "absolute-form (own authority)",
+            format!("zion {c}, origin saw origin-form ({reached}), absolute URI leaked ({leaked_absolute})"),
+        );
+        assert!(c != 0 && c < 500, "absolute-form: zion hung or 5xx ({c})");
+        assert!(
+            reached,
+            "absolute-form was not re-framed to origin-form /abs upstream"
+        );
+        assert!(
+            !leaked_absolute,
+            "the absolute-form URI leaked to the origin:\n{head}"
+        );
+    }
+    // OPTIONS * and CONNECT are refused at the edge (pinned in #697); recorded here for the matrix.
+    {
+        let resp = send(
+            port,
+            b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let c = code(&resp);
+        record("OPTIONS *", format!("zion {c} (refused, see #697)"));
+        assert!(
+            (400..500).contains(&c),
+            "OPTIONS * expected a 4xx refusal, got {c}"
+        );
+    }
+    {
+        let resp = send(
+            port,
+            b"CONNECT example:443 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let c = code(&resp);
+        record("CONNECT", format!("zion {c} (refused, see #697)"));
+        assert_eq!(c, 405, "CONNECT expected 405, got {c}");
+    }
+
+    // ---- Expect: 100-continue ----
+    // Document whether zion emits a 100 Continue interim and whether the Expect header reaches the
+    // origin. s_client sends the body immediately (it does not wait for 100), so zion sees the body
+    // regardless; `send` reads the FIRST response head, which is the 100 block if zion emits one.
+    {
+        let before = seen.lock().unwrap().len();
+        let raw = "POST /exp HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+        let resp = send(port, raw.as_bytes());
+        let first = code(&resp);
+        let head = recorded_head(&seen, before, "POST /exp");
+        let expect_to_origin = head.contains("expect:");
+        record(
+            "Expect: 100-continue",
+            format!("first status {first}, Expect forwarded to origin ({expect_to_origin})"),
+        );
+        // Measured contract: zion answers Expect: 100-continue with a 100 Continue interim and the
+        // request is forwarded to the origin. (That it also forwards the Expect header downstream is
+        // recorded, not pinned: whether to strip it after answering 100 is a separate decision.)
+        assert_eq!(
+            first, 100,
+            "Expect: zion did not send a 100 Continue interim (got {first})"
+        );
+        assert!(
+            !head.is_empty(),
+            "Expect: the request did not reach the origin"
+        );
+    }
+
+    eprintln!("\n=== HTTP/1.1 conformance matrix (slice 2: request targets, Host, Expect) ===");
+    for (case, outcome) in &matrix {
+        eprintln!("  {case:30}  {outcome}");
+    }
+    eprintln!("=== end matrix ===\n");
+}
+
 fn tempdir() -> TempDir {
-    let base = std::env::temp_dir().join(format!("zion-conf-{}", std::process::id()));
+    // Unique per call: several conformance tests run in the same process in parallel, so a
+    // pid-only directory would collide (and one test's cleanup would delete another's config).
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("zion-conf-{}-{n}", std::process::id()));
     fs::create_dir_all(&base).unwrap();
     TempDir(base)
 }
