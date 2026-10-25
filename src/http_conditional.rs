@@ -46,7 +46,15 @@ pub fn is_not_modified(
             .and_then(|v| v.to_str().ok()),
         last_modified.and_then(|v| v.to_str().ok()),
     ) {
-        return ims.trim() == lm.trim();
+        let (ims, lm) = (ims.trim(), lm.trim());
+        // RFC 9110 13.1.3: not modified when the representation's last modification time is at or
+        // before the If-Modified-Since date. Parse both as IMF-fixdate and compare; fall back to an
+        // exact-string match only if either side is not a parseable IMF-fixdate (e.g. one of the
+        // obsolete date formats), which keeps the common echo-back case working (#744).
+        return match (parse_imf_fixdate(ims), parse_imf_fixdate(lm)) {
+            (Some(ims_secs), Some(lm_secs)) => lm_secs <= ims_secs,
+            _ => ims == lm,
+        };
     }
     false
 }
@@ -85,6 +93,57 @@ pub fn fmt_imf_fixdate(unix_secs: u64) -> String {
         "{wkd}, {d:02} {mon} {y:04} {hh:02}:{mm:02}:{ss:02} GMT",
         mon = MON[(m - 1) as usize],
     )
+}
+
+/// Parse an RFC 9110 §5.6.7 `IMF-fixdate` (e.g. `Sun, 06 Nov 1994 08:49:37 GMT`) to a UNIX
+/// timestamp (seconds since the epoch, UTC). Returns `None` for anything that is not an
+/// IMF-fixdate, including the two obsolete HTTP date formats; the caller treats a non-parse as a
+/// reason to fall back to exact-string comparison. Dependency-free (Howard Hinnant's
+/// `days_from_civil`), matching `fmt_imf_fixdate`.
+fn parse_imf_fixdate(s: &str) -> Option<i64> {
+    // "Sun, 06 Nov 1994 08:49:37 GMT" -> ["Sun,","06","Nov","1994","08:49:37","GMT"]
+    let mut it = s.split_whitespace();
+    let _wkd = it.next()?;
+    let day: i64 = it.next()?.parse().ok()?;
+    let month = match it.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = it.next()?.parse().ok()?;
+    let time = it.next()?;
+    if it.next()? != "GMT" {
+        return None;
+    }
+    let mut tp = time.split(':');
+    let hh: i64 = tp.next()?.parse().ok()?;
+    let mm: i64 = tp.next()?.parse().ok()?;
+    let ss: i64 = tp.next()?.parse().ok()?;
+    if tp.next().is_some() || !(1..=31).contains(&day) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hh * 3600 + mm * 60 + ss)
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant). Inverse of the `civil_from_days` used
+/// in [`fmt_imf_fixdate`]. See https://howardhinnant.github.io/date_algorithms.html
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]
@@ -180,9 +239,12 @@ mod tests {
         let lm = hv("Sun, 06 Nov 1994 08:49:37 GMT");
         let h = headers(&[(IF_MODIFIED_SINCE, "Sun, 06 Nov 1994 08:49:37 GMT")]);
         assert!(is_not_modified(&h, None, Some(&lm)));
-        // A non-echo IMS does not (yet) 304 — full date comparison is a follow-up.
-        let h2 = headers(&[(IF_MODIFIED_SINCE, "Mon, 07 Nov 1994 00:00:00 GMT")]);
-        assert!(!is_not_modified(&h2, None, Some(&lm)));
+        // #744: a LATER If-Modified-Since date now 304s (last-modified <= date), per RFC 9110.
+        let later = headers(&[(IF_MODIFIED_SINCE, "Mon, 07 Nov 1994 00:00:00 GMT")]);
+        assert!(is_not_modified(&later, None, Some(&lm)));
+        // An EARLIER date means the resource was modified since: not a 304.
+        let earlier = headers(&[(IF_MODIFIED_SINCE, "Sat, 05 Nov 1994 00:00:00 GMT")]);
+        assert!(!is_not_modified(&earlier, None, Some(&lm)));
 
         // When both are present, INM wins: a matching INM 304s regardless of IMS,
         // and a mismatching INM blocks the 304 even if IMS would have echoed.
@@ -197,6 +259,34 @@ mod tests {
             (IF_MODIFIED_SINCE, "Sun, 06 Nov 1994 08:49:37 GMT"),
         ]);
         assert!(!is_not_modified(&both_inm_miss, Some(&et), Some(&lm)));
+    }
+
+    #[test]
+    fn parse_imf_fixdate_roundtrips_and_orders() {
+        for secs in [0u64, 784_111_777, 951_782_400, 1_700_000_000] {
+            let s = fmt_imf_fixdate(secs);
+            assert_eq!(
+                parse_imf_fixdate(&s),
+                Some(secs as i64),
+                "round-trip of {s}"
+            );
+        }
+        let a = parse_imf_fixdate("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        let b = parse_imf_fixdate("Mon, 07 Nov 1994 00:00:00 GMT").unwrap();
+        assert!(a < b, "later date must compare greater");
+        // The obsolete RFC 850 / asctime formats and garbage are not parsed (None).
+        assert_eq!(parse_imf_fixdate("Sunday, 06-Nov-94 08:49:37 GMT"), None);
+        assert_eq!(parse_imf_fixdate("garbage"), None);
+    }
+
+    #[test]
+    fn ims_unparseable_date_falls_back_to_exact_equality() {
+        let lm = hv("Sun, 06 Nov 1994 08:49:37 GMT");
+        // An IMS we cannot parse falls back to exact-string comparison with Last-Modified.
+        let garbage = headers(&[(IF_MODIFIED_SINCE, "not a date")]);
+        assert!(!is_not_modified(&garbage, None, Some(&lm)));
+        let obsolete_exact = headers(&[(IF_MODIFIED_SINCE, "Sun, 06 Nov 1994 08:49:37 GMT")]);
+        assert!(is_not_modified(&obsolete_exact, None, Some(&lm)));
     }
 
     #[test]

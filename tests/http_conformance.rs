@@ -779,21 +779,16 @@ fn http_conditional_range_and_encoding() {
             "If-Modified-Since equal to Last-Modified must be 304, got {c}"
         );
     }
-    // A strictly LATER If-Modified-Since date. Finding surfaced by this suite (#744): zion compares
-    // If-Modified-Since by exact string equality with Last-Modified (src/http_conditional.rs), not
-    // the RFC 9110 13.1.3 date comparison (last-modified <= date => 304), so a later date gets 200.
-    // Safe (it only serves more than strictly necessary) but not conformant. Pinned as the current
-    // behaviour so the fix (#744) flips it deliberately.
+    // A strictly LATER If-Modified-Since date returns 304 (RFC 9110 13.1.3: not modified when
+    // last-modified <= the date). Fixed in #744; before it, zion compared the date by exact string
+    // equality and returned 200 here.
     {
         let raw = "GET /s/doc.txt HTTP/1.1\r\nHost: localhost\r\nIf-Modified-Since: Sat, 01 Jan 2050 00:00:00 GMT\r\nConnection: close\r\n\r\n";
         let c = code(&send(port, raw.as_bytes()));
-        record(
-            "If-Modified-Since (later)",
-            format!("zion {c} (string-equality only; RFC 9110 would 304 - known deviation)"),
-        );
+        record("If-Modified-Since (later)", format!("zion {c}"));
         assert_eq!(
-            c, 200,
-            "expected the current string-equality behaviour (200) for a later date, got {c}"
+            c, 304,
+            "a later If-Modified-Since date must be 304 (RFC 9110 13.1.3), got {c}"
         );
     }
 

@@ -2329,14 +2329,20 @@ mod tests {
             &req(IF_NONE_MATCH, "\"abc\""),
             &meta(None, None)
         ));
-        // If-Modified-Since: exact echo of stored Last-Modified → 304; differ → not.
+        // If-Modified-Since (RFC 9110 13.1.3, #744): 304 when stored Last-Modified <= the date.
         let d = "Sun, 06 Nov 1994 08:49:37 GMT";
         assert!(client_conditional_hit(
             &req(IF_MODIFIED_SINCE, d),
             &meta(None, Some(d))
         ));
-        assert!(!client_conditional_hit(
+        // A later date still means not modified since → 304.
+        assert!(client_conditional_hit(
             &req(IF_MODIFIED_SINCE, "Mon, 07 Nov 1994 00:00:00 GMT"),
+            &meta(None, Some(d))
+        ));
+        // An earlier date means it was modified since → not 304.
+        assert!(!client_conditional_hit(
+            &req(IF_MODIFIED_SINCE, "Sat, 05 Nov 1994 00:00:00 GMT"),
             &meta(None, Some(d))
         ));
         // No conditional headers → not 304.
