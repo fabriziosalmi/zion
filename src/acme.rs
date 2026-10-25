@@ -670,6 +670,7 @@ pub async fn run_soak() -> i32 {
         cert_path: cert_path.clone(),
         key_path: key_path.clone(),
         hot_reload: true,
+        handshake_timeout_secs: 10,
         min_version: crate::config::TlsMinVersion::V1_2,
         session_tickets: 2,
         alpn: vec!["http/1.1".into()],

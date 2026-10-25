@@ -24,6 +24,15 @@ TLS 1.3 is the default because it has a shorter handshake (1-RTT vs 2-RTT) and m
 
 When `"1.2"` is set, Zion requires the Extended Master Secret extension (RFC 7627) on every TLS 1.2 handshake: a client that omits it is refused with a fatal handshake alert. This closes the triple-handshake (3SHAKE, CVE-2015-6112 family) surface that affects EMS-less TLS 1.2. A 1.3-only deployment is unaffected.
 
+## Handshake timeout
+
+```toml
+[tls]
+handshake_timeout_secs = 10   # Default: a TLS handshake may take this long before the connection is dropped
+```
+
+A connection that completes TCP but does not finish its TLS handshake within `handshake_timeout_secs` is dropped. The default is 10 seconds; a legitimate handshake completes in well under a second. Under a slow-handshake flood an operator can lower it (e.g. `2`) to free connection slots sooner. It must be at least `1`.
+
 ## ALPN negotiation
 
 ```toml

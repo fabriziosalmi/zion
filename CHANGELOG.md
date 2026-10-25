@@ -2,6 +2,12 @@
 
 All notable changes to Zion Edge Gateway are documented here.
 
+## [Unreleased]
+
+### Added
+
+- **`[tls] handshake_timeout_secs` makes the TLS handshake timeout configurable** (#719). It was hardcoded to 10 seconds. A connection that completes TCP but does not finish its TLS handshake within the timeout is dropped; the default stays 10, and under a slow-handshake flood an operator can lower it (e.g. `2`) to free connection slots sooner. `0` is refused (it would drop every handshake instantly). An integration test against the real binary sets it to 1 and proves a stalled handshake is dropped in about a second, not ten; the value is break-tested.
+
 ## [0.15.0] - 2026-10-25
 
 **Multipart uploads are parsed and bounded at the edge.** A `multipart/form-data` body — and any content-type carrying a `boundary` — is now parsed to per-profile structure limits and refused if it does not parse cleanly, closing a family of multipart parser and smuggling CVEs. Two other behaviours change: `request_timeout_ms` now bounds idle time rather than the whole upload, and enabling TLS 1.2 now requires the Extended Master Secret extension.
