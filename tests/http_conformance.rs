@@ -134,9 +134,8 @@ fn origin() -> (u16, Arc<Mutex<Vec<String>>>) {
 /// An empty status means zion hung (a timeout), which is itself a failure for the caller to assert.
 struct Resp {
     status: String,
-    /// The response header block (status line + headers), lowercased by callers as needed. Kept for
-    /// the slices that assert on response headers (encoding, conditional); unused lines are fine.
-    #[allow(dead_code)]
+    /// The response header block (status line + headers); callers read individual headers from it
+    /// via `header_val` (encoding, conditional, range).
     head: String,
 }
 
@@ -224,6 +223,12 @@ fn start(dir: &Path, origin_port: u16) -> (Proc, u16) {
             .unwrap_or(false),
         "openssl cert generation failed"
     );
+    // A static file served by the /s/ (plain) and /c/ (compress-enabled) routes. Compressible text
+    // so Accept-Encoding has an effect; big enough to be above the compress min_bytes.
+    let www = dir.join("www");
+    fs::create_dir_all(&www).unwrap();
+    let doc = "the quick brown fox jumps over the lazy dog\n".repeat(60);
+    fs::write(www.join("doc.txt"), &doc).unwrap();
     let https_port = free_port();
     fs::write(
         dir.join("zion.toml"),
@@ -233,10 +238,13 @@ fn start(dir: &Path, origin_port: u16) -> (Proc, u16) {
              [upstream.backend]\nurl = \"http://127.0.0.1:{origin_port}\"\n\n\
              [upstream.ph]\nurl = \"http://127.0.0.1:{origin_port}\"\npreserve_host = true\n\n\
              [[route]]\npath = \"/ph/{{*rest}}\"\nupstream = \"ph\"\nmode = \"standard\"\n\n\
+             [[route]]\npath = \"/s/{{*rest}}\"\nmode = \"static\"\nserve_dir = \"{www}\"\n\n\
+             [[route]]\npath = \"/c/{{*rest}}\"\nmode = \"static\"\nserve_dir = \"{www}\"\ncompress = {{ enabled = true, min_bytes = 100 }}\n\n\
              [[route]]\npath = \"/{{*rest}}\"\nupstream = \"backend\"\nmode = \"standard\"\n",
             free_port(),
             cert.to_string_lossy(),
-            key.to_string_lossy()
+            key.to_string_lossy(),
+            www = www.to_string_lossy(),
         ),
     )
     .unwrap();
@@ -646,6 +654,195 @@ fn http1_request_targets_host_and_expect_continue() {
     }
 
     eprintln!("\n=== HTTP/1.1 conformance matrix (slice 2: request targets, Host, Expect) ===");
+    for (case, outcome) in &matrix {
+        eprintln!("  {case:30}  {outcome}");
+    }
+    eprintln!("=== end matrix ===\n");
+}
+
+/// The value of response header `name` (case-insensitive) in a head block, or "" if absent.
+fn header_val(head: &str, name: &str) -> String {
+    let p = format!("{}:", name.to_ascii_lowercase());
+    head.lines()
+        .find(|l| l.to_ascii_lowercase().starts_with(&p))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().to_string())
+        .unwrap_or_default()
+}
+
+#[test]
+fn http_conditional_range_and_encoding() {
+    if !have_openssl() {
+        eprintln!("skipping http_conformance slice 3: openssl not installed");
+        return;
+    }
+    let dir = tempdir();
+    let (origin_port, _seen) = origin();
+    let (_zion, port) = start(&dir, origin_port);
+
+    let mut matrix: Vec<(String, String)> = Vec::new();
+    let mut record = |case: &str, outcome: String| matrix.push((case.to_string(), outcome));
+
+    // Base GET of the static file: 200 with a validator (ETag) and a length.
+    let base = send(
+        port,
+        b"GET /s/doc.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(code(&base), 200, "static GET did not return 200");
+    let etag = header_val(&base.head, "etag");
+    record(
+        "static GET",
+        format!(
+            "200, etag {etag:?}, len {}",
+            header_val(&base.head, "content-length")
+        ),
+    );
+    assert!(!etag.is_empty(), "the static file served no ETag validator");
+
+    // ---- Conditional ----
+    {
+        let raw = format!(
+            "GET /s/doc.txt HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: {etag}\r\nConnection: close\r\n\r\n"
+        );
+        let c = code(&send(port, raw.as_bytes()));
+        record("If-None-Match (match)", format!("zion {c}"));
+        assert_eq!(
+            c, 304,
+            "If-None-Match with the current ETag must be 304, got {c}"
+        );
+    }
+    // If-Modified-Since equal to the served Last-Modified -> 304.
+    {
+        let last_mod = header_val(&base.head, "last-modified");
+        assert!(
+            !last_mod.is_empty(),
+            "the static file served no Last-Modified"
+        );
+        let raw = format!(
+            "GET /s/doc.txt HTTP/1.1\r\nHost: localhost\r\nIf-Modified-Since: {last_mod}\r\nConnection: close\r\n\r\n"
+        );
+        let c = code(&send(port, raw.as_bytes()));
+        record("If-Modified-Since (exact)", format!("zion {c}"));
+        assert_eq!(
+            c, 304,
+            "If-Modified-Since equal to Last-Modified must be 304, got {c}"
+        );
+    }
+    // A strictly LATER If-Modified-Since date. Finding surfaced by this suite (#744): zion compares
+    // If-Modified-Since by exact string equality with Last-Modified (src/http_conditional.rs), not
+    // the RFC 9110 13.1.3 date comparison (last-modified <= date => 304), so a later date gets 200.
+    // Safe (it only serves more than strictly necessary) but not conformant. Pinned as the current
+    // behaviour so the fix (#744) flips it deliberately.
+    {
+        let raw = "GET /s/doc.txt HTTP/1.1\r\nHost: localhost\r\nIf-Modified-Since: Sat, 01 Jan 2050 00:00:00 GMT\r\nConnection: close\r\n\r\n";
+        let c = code(&send(port, raw.as_bytes()));
+        record(
+            "If-Modified-Since (later)",
+            format!("zion {c} (string-equality only; RFC 9110 would 304 - known deviation)"),
+        );
+        assert_eq!(
+            c, 200,
+            "expected the current string-equality behaviour (200) for a later date, got {c}"
+        );
+    }
+
+    // ---- Range ----
+    {
+        let resp = send(
+            port,
+            b"GET /s/doc.txt HTTP/1.1\r\nHost: localhost\r\nRange: bytes=0-9\r\nConnection: close\r\n\r\n",
+        );
+        let c = code(&resp);
+        let cr = header_val(&resp.head, "content-range");
+        record("Range bytes=0-9", format!("zion {c}, Content-Range {cr:?}"));
+        assert_eq!(c, 206, "a satisfiable Range must be 206, got {c}");
+        assert!(
+            cr.starts_with("bytes 0-9/"),
+            "Content-Range missing or wrong: {cr:?}"
+        );
+    }
+    {
+        let c = code(&send(
+            port,
+            b"GET /s/doc.txt HTTP/1.1\r\nHost: localhost\r\nRange: bytes=99999999-\r\nConnection: close\r\n\r\n",
+        ));
+        record("Range unsatisfiable", format!("zion {c}"));
+        assert_eq!(c, 416, "an unsatisfiable Range must be 416, got {c}");
+    }
+
+    // ---- Encoding (compression is a build feature; assert it only when built) ----
+    #[cfg(feature = "compress")]
+    {
+        let resp = send(
+            port,
+            b"GET /c/doc.txt HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br\r\nConnection: close\r\n\r\n",
+        );
+        let c = code(&resp);
+        let ce = header_val(&resp.head, "content-encoding");
+        let vary = header_val(&resp.head, "vary").to_ascii_lowercase();
+        record(
+            "Accept-Encoding: br",
+            format!("zion {c}, Content-Encoding {ce:?}, Vary {vary:?}"),
+        );
+        assert_eq!(c, 200);
+        assert_eq!(ce, "br", "brotli was not negotiated on a compress route");
+        assert!(
+            vary.contains("accept-encoding"),
+            "Vary did not list accept-encoding: {vary:?}"
+        );
+
+        let resp = send(
+            port,
+            b"GET /c/doc.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let ce = header_val(&resp.head, "content-encoding");
+        record(
+            "no Accept-Encoding",
+            format!("zion {}, Content-Encoding {ce:?}", code(&resp)),
+        );
+        assert!(
+            ce.is_empty(),
+            "served a Content-Encoding without Accept-Encoding: {ce:?}"
+        );
+
+        let resp = send(
+            port,
+            b"GET /c/doc.txt HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br\r\nRange: bytes=0-9\r\nConnection: close\r\n\r\n",
+        );
+        let c = code(&resp);
+        let ce = header_val(&resp.head, "content-encoding");
+        record(
+            "Range + br (stays identity)",
+            format!("zion {c}, Content-Encoding {ce:?}"),
+        );
+        assert_eq!(c, 206, "a Range on a compress route must be 206, got {c}");
+        assert!(
+            ce.is_empty(),
+            "a 206 was compressed; it must stay identity: {ce:?}"
+        );
+    }
+    #[cfg(not(feature = "compress"))]
+    {
+        // Without the feature the compress route serves identity even with Accept-Encoding.
+        let resp = send(
+            port,
+            b"GET /c/doc.txt HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br\r\nConnection: close\r\n\r\n",
+        );
+        let ce = header_val(&resp.head, "content-encoding");
+        record(
+            "Accept-Encoding: br",
+            format!(
+                "zion {}, Content-Encoding {ce:?} (compress feature not built)",
+                code(&resp)
+            ),
+        );
+        assert!(
+            ce.is_empty(),
+            "compression happened without the compress feature"
+        );
+    }
+
+    eprintln!("\n=== HTTP conformance matrix (slice 3: conditional, range, encoding) ===");
     for (case, outcome) in &matrix {
         eprintln!("  {case:30}  {outcome}");
     }
