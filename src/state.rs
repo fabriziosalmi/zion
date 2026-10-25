@@ -68,6 +68,9 @@ pub(crate) struct ResolvedAppConfig {
     pub(crate) handshake_burst: u32,
     /// IPs/CIDRs exempt from the per-IP handshake rate limit (#718). Empty = nobody exempt.
     pub(crate) handshake_rate_allowlist: crate::security::IpAllowlist,
+    /// Cap on responses being compressed at once (ADR-0025); `0` = no cap. Read at
+    /// response time; over the cap a response is served as identity.
+    pub(crate) compress_max_concurrent: u32,
     /// TCP keepalive idle seconds for accepted client sockets (0 = off).
     pub(crate) tcp_keepalive_secs: u64,
     /// `[server] tcp_user_timeout_secs` (0 = kernel default).
@@ -152,6 +155,7 @@ impl ResolvedAppConfig {
             handshake_rate_per_sec: crate::config::default_handshake_rate_per_sec(),
             handshake_burst: crate::config::default_handshake_burst_per_ip(),
             handshake_rate_allowlist: crate::security::IpAllowlist::default(),
+            compress_max_concurrent: crate::config::default_max_concurrent_compressions(),
             tcp_keepalive_secs: crate::net::DEFAULT_TCP_KEEPALIVE_SECS,
             tcp_user_timeout_secs: crate::net::DEFAULT_TCP_USER_TIMEOUT_SECS,
             tls_handshake_timeout_secs: 10,
@@ -524,6 +528,10 @@ impl ResolvedAppConfig {
             handshake_rate_per_sec,
             handshake_burst,
             handshake_rate_allowlist,
+            compress_max_concurrent: config
+                .server
+                .max_concurrent_compressions
+                .unwrap_or_else(crate::config::default_max_concurrent_compressions),
             tcp_keepalive_secs: config.server.tcp_keepalive_secs,
             tcp_user_timeout_secs: config.server.tcp_user_timeout_secs,
             tls_handshake_timeout_secs: config.tls.handshake_timeout_secs,

@@ -246,6 +246,7 @@ pub fn apply(
     cfg: Option<&ResolvedCompress>,
     method: &Method,
     accept_encoding: Option<&str>,
+    max_concurrent: u32,
 ) -> Response<ZionBody> {
     let Some(cfg) = cfg else { return resp };
     let hint = resp.body().size_hint().exact();
@@ -261,13 +262,85 @@ pub fn apply(
     };
     #[cfg(feature = "compress")]
     {
-        encode::compress_response(resp, enc)
+        // CPU admission: a slot is held by the compressed body until it finishes, so
+        // the number of responses compressing at once is bounded. Over budget, the
+        // body is served as identity rather than shed.
+        match budget::global().try_acquire(max_concurrent) {
+            Some(permit) => encode::compress_response(resp, enc, permit),
+            None => resp,
+        }
     }
     #[cfg(not(feature = "compress"))]
     {
         // The decision stands but the backend was not built: serve identity.
-        let _ = enc;
+        let _ = (enc, max_concurrent);
         resp
+    }
+}
+
+/// Global CPU admission budget for response compression (ADR-0025). A slot is taken
+/// for the lifetime of each compressed body; over the configured cap a response is
+/// served as identity. Built only with the `compress` feature.
+#[cfg(feature = "compress")]
+pub mod budget {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    use std::sync::{Arc, LazyLock};
+
+    #[derive(Default)]
+    pub struct Limiter {
+        in_flight: AtomicU32,
+        shed: AtomicU64,
+    }
+
+    static GLOBAL: LazyLock<Arc<Limiter>> = LazyLock::new(|| Arc::new(Limiter::default()));
+
+    /// The process-wide compression budget.
+    pub fn global() -> &'static Arc<Limiter> {
+        &GLOBAL
+    }
+
+    /// A held compression slot; releases it on drop.
+    pub struct Permit(Arc<Limiter>);
+
+    impl Drop for Permit {
+        fn drop(&mut self) {
+            self.0.in_flight.fetch_sub(1, Relaxed);
+        }
+    }
+
+    impl Limiter {
+        /// Take a slot if fewer than `limit` are in use; `limit == 0` means no cap.
+        /// Never blocks. Returns `None` (and counts a shed) when at the cap.
+        pub fn try_acquire(self: &Arc<Self>, limit: u32) -> Option<Permit> {
+            if limit == 0 {
+                self.in_flight.fetch_add(1, Relaxed);
+                return Some(Permit(self.clone()));
+            }
+            let mut cur = self.in_flight.load(Relaxed);
+            loop {
+                if cur >= limit {
+                    self.shed.fetch_add(1, Relaxed);
+                    return None;
+                }
+                match self
+                    .in_flight
+                    .compare_exchange_weak(cur, cur + 1, Relaxed, Relaxed)
+                {
+                    Ok(_) => return Some(Permit(self.clone())),
+                    Err(actual) => cur = actual,
+                }
+            }
+        }
+
+        /// Responses compressing right now.
+        pub fn in_flight(&self) -> u32 {
+            self.in_flight.load(Relaxed)
+        }
+
+        /// Responses served as identity because the budget was full.
+        pub fn shed(&self) -> u64 {
+            self.shed.load(Relaxed)
+        }
     }
 }
 
@@ -287,7 +360,11 @@ mod encode {
 
     /// Wrap the response body in [`CompressBody`] and set the headers a compressed
     /// representation requires.
-    pub fn compress_response(resp: Response<ZionBody>, enc: Encoding) -> Response<ZionBody> {
+    pub fn compress_response(
+        resp: Response<ZionBody>,
+        enc: Encoding,
+        permit: super::budget::Permit,
+    ) -> Response<ZionBody> {
         let (mut parts, body) = resp.into_parts();
         parts.headers.insert(
             CONTENT_ENCODING,
@@ -299,7 +376,7 @@ mod encode {
         append_vary_accept_encoding(&mut parts.headers);
         // A strong ETag no longer identifies these bytes; weaken it to a weak validator.
         weaken_etag(&mut parts.headers);
-        let body = CompressBody::new(body, enc).boxed();
+        let body = CompressBody::new(body, enc, permit).boxed();
         Response::from_parts(parts, body)
     }
 
@@ -343,6 +420,8 @@ mod encode {
         pending: Vec<u8>,
         inner_done: bool,
         trailers: Option<Frame<Bytes>>,
+        /// The CPU admission slot, released when this body is dropped.
+        _permit: super::budget::Permit,
     }
 
     enum EncState {
@@ -351,7 +430,7 @@ mod encode {
     }
 
     impl CompressBody {
-        pub fn new(inner: ZionBody, enc: Encoding) -> Self {
+        pub fn new(inner: ZionBody, enc: Encoding, permit: super::budget::Permit) -> Self {
             let state = match enc {
                 Encoding::Gzip => EncState::Gzip(flate2::write::GzEncoder::new(
                     Vec::new(),
@@ -371,6 +450,7 @@ mod encode {
                 pending: Vec::new(),
                 inner_done: false,
                 trailers: None,
+                _permit: permit,
             }
         }
 
@@ -716,7 +796,8 @@ mod encode_tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            CompressBody::new(inner, enc)
+            let permit = super::budget::global().try_acquire(0).unwrap();
+            CompressBody::new(inner, enc, permit)
                 .collect()
                 .await
                 .unwrap()
@@ -778,5 +859,37 @@ mod encode_tests {
             .read_to_end(&mut out)
             .unwrap();
         assert!(out.is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "compress"))]
+mod budget_tests {
+    use super::budget::Limiter;
+    use std::sync::Arc;
+
+    #[test]
+    fn caps_concurrent_and_frees_on_drop() {
+        let lim = Arc::new(Limiter::default());
+        let p1 = lim.try_acquire(2);
+        let p2 = lim.try_acquire(2);
+        assert!(p1.is_some() && p2.is_some());
+        assert_eq!(lim.in_flight(), 2);
+        assert!(
+            lim.try_acquire(2).is_none(),
+            "over budget is shed to identity"
+        );
+        assert_eq!(lim.shed(), 1);
+        drop(p1);
+        assert_eq!(lim.in_flight(), 1);
+        assert!(lim.try_acquire(2).is_some(), "a freed slot is reusable");
+    }
+
+    #[test]
+    fn zero_means_no_cap() {
+        let lim = Arc::new(Limiter::default());
+        let _a = lim.try_acquire(0).unwrap();
+        let _b = lim.try_acquire(0).unwrap();
+        assert_eq!(lim.in_flight(), 2);
+        assert_eq!(lim.shed(), 0);
     }
 }
