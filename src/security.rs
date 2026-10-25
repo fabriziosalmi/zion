@@ -674,6 +674,31 @@ impl TrustedProxies {
     }
 }
 
+/// An explicit allowlist of IPs/CIDRs, with deny-by-default semantics: an empty list matches
+/// nothing (unlike [`InternalNetworks`], which falls back to the private-range default when
+/// empty). Used by the per-IP handshake rate limit (#718) to exempt named sources — e.g. a
+/// front CDN or a monitoring probe — from the rate cap.
+#[derive(Clone, Debug, Default)]
+pub struct IpAllowlist {
+    cidrs: Vec<CidrRange>,
+}
+
+impl IpAllowlist {
+    /// Build from a config list. Entries are validated at config load ([`is_valid_cidr`]); one
+    /// that still fails to parse is dropped, which can only make the allowlist smaller.
+    pub fn from_config(cidrs: &[String]) -> Self {
+        Self {
+            cidrs: cidrs.iter().filter_map(|s| CidrRange::parse(s)).collect(),
+        }
+    }
+
+    /// Is `ip` on the allowlist? An empty allowlist matches nothing.
+    #[inline]
+    pub fn contains(&self, ip: &std::net::IpAddr) -> bool {
+        self.cidrs.iter().any(|c| c.contains(ip))
+    }
+}
+
 #[cfg(test)]
 mod proxy_tests {
     use super::*;

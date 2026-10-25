@@ -336,6 +336,29 @@ fn spawn_https_handler(
         }
     };
 
+    // Per-IP new-handshake rate limit (#718). The expensive part of a TLS handshake is the
+    // server signature; a source that handshakes in a loop makes zion pay it every time. Shed a
+    // source over its rate HERE, before the handshake, so a rejected attempt costs one map probe
+    // and an immediate close. `rate == 0` disables; an allowlisted source is never limited. Read
+    // from the live config snapshot so a hot-reload retunes it.
+    {
+        let cfg = state.config.load();
+        let rate = cfg.handshake_rate_per_sec;
+        if rate != 0
+            && !cfg.handshake_rate_allowlist.contains(&remote_addr.ip())
+            && !state
+                .limiters
+                .handshake_rate
+                .admit(remote_addr.ip(), rate, cfg.handshake_burst)
+        {
+            metrics::METRICS
+                .connections_rejected_handshake_rate
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            drop(tcp_stream);
+            return;
+        }
+    }
+
     let acceptor = state.tls_acceptor.load_full();
     let builder = state.http_builder.clone();
 

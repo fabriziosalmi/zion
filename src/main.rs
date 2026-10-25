@@ -62,6 +62,7 @@ mod doctor;
 mod drain;
 mod error;
 mod h2_guard;
+mod handshake_rate;
 mod header_policy;
 mod health;
 mod http_conditional;
