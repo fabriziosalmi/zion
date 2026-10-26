@@ -116,6 +116,10 @@ config() { # access log (true|false), certificate (ecdsa|rsa)
 [server]
 listen_http  = "127.0.0.1:$HTTP"
 listen_https = "127.0.0.1:$HTTPS"
+# The training deliberately floods new TLS handshakes from loopback (the "full TLS
+# handshakes" phase opens a fresh connection per request); disable the per-IP
+# handshake rate limit (#718, default 1000/s) so that synthetic flood is not shed.
+max_handshakes_per_ip_per_sec = 0
 
 [tls]
 cert_path  = "$W/$2.crt"
