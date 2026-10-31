@@ -46,8 +46,16 @@ criteria = "safe-to-deploy"
 version = "2.0.4"
 criteria = "safe-to-deploy"
 
+[[exemptions.alloc-no-stdlib]]
+version = "3.0.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.alloc-stdlib]]
 version = "0.2.4"
+criteria = "safe-to-deploy"
+
+[[exemptions.alloc-stdlib]]
+version = "0.3.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.anstyle]]
@@ -130,8 +138,16 @@ criteria = "safe-to-deploy"
 version = "7.0.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.brotli]]
+version = "9.0.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.brotli-decompressor]]
 version = "4.0.3"
+criteria = "safe-to-deploy"
+
+[[exemptions.brotli-decompressor]]
+version = "6.0.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.by_address]]
@@ -352,6 +368,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.flate2]]
 version = "1.1.9"
+criteria = "safe-to-deploy"
+
+[[exemptions.flate2]]
+version = "1.1.10"
 criteria = "safe-to-deploy"
 
 [[exemptions.float-cmp]]
@@ -724,6 +744,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.minimal-lexical]]
 version = "0.2.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.miniz_oxide]]
+version = "0.9.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.mio]]
@@ -1704,4 +1728,8 @@ criteria = "safe-to-deploy"
 
 [[exemptions.zerovec-derive]]
 version = "0.11.3"
+criteria = "safe-to-deploy"
+
+[[exemptions.zlib-rs]]
+version = "0.6.8"
 criteria = "safe-to-deploy"
