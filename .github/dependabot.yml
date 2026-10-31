@@ -72,6 +72,11 @@ updates:
       # (#611). Hold at 1.8.x until MSRV-core moves to 1.85, as for hyper-util above.
       - dependency-name: "zeroize"
         versions: [">=1.9.0"]
+      # tokio 1.54.0 raised its rust-version from 1.71 to 1.85: the MSRV job
+      # fails with "tokio@1.54.1 requires rustc 1.85" (#750). Hold at 1.53.x
+      # until MSRV-core moves to 1.85. The 1.53.x patch line stays proposable.
+      - dependency-name: "tokio"
+        versions: [">=1.54.0"]
       # criterion 0.8 raised its MSRV to rustc 1.86, well past the 1.82
       # anchor. It's a dev/bench-only dependency with no runtime value, so
       # hold at 0.5.x rather than relitigate MSRV for a benchmark harness.
