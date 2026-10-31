@@ -118,6 +118,13 @@ jobs:
           shared-key: test-${{ matrix.flavor }}
       - name: Install build deps
         uses: ./.github/actions/build-deps
+      # BREAK-TEST (temporary, replaced before merge): unload the kernel TLS
+      # module, the integration tests must fail with "kTLS upgrade failed".
+      - name: Unload the kernel TLS module (break-test)
+        if: matrix.flavor == 'all-features'
+        run: |
+          sudo modprobe -r tls || true
+          if grep -qw '^tls' /proc/modules; then echo "tls still loaded"; exit 1; fi
       - run: cargo test --locked ${{ matrix.features }} --no-fail-fast
       # The address tables are behind the geo-* features, so the default run
       # compiles none of them. Their tests (structure, one pinned address per
