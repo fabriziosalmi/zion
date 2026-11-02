@@ -120,7 +120,7 @@ h3-quinn = { version = "0.0.10", optional = true }
 # transitively; brotli (and its pure-Rust family) is the only new supply-chain
 # surface, vetted via cargo-vet.
 flate2 = { version = "1", optional = true }
-brotli = { version = "7", optional = true }
+brotli = { version = "9", optional = true }
 
 # Live TUI dashboard (opt-in: cargo build --features tui)
 ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm"] }
