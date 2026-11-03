@@ -1,0 +1,15 @@
+# A synthetic stack for testing run.py itself (not a real CVE): a bare HTTP server simulates
+# a middleware-bypass vulnerability closely enough to exercise every path of judge().
+[stack]
+name = "synthetic"
+ready_path = "/"
+guarded_variant = "vulnerable"
+fixed_variant = "fixed"
+
+[[variant]]
+name = "vulnerable"
+upstream = "http://127.0.0.1:19101"
+
+[[variant]]
+name = "fixed"
+upstream = "http://127.0.0.1:19102"

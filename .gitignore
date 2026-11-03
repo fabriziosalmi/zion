@@ -76,3 +76,6 @@ tests/equivalence/.demo.cast
 # proptest saves seeds of past failures here; our break-test discipline
 # deliberately produces failures, so these are not committed.
 proptest-regressions/
+
+# tests/lab (#699): per-run CVE results, machine- and date-stamped.
+tests/lab/results/

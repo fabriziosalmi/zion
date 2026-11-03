@@ -1,0 +1,17 @@
+[stack]
+name = "nextjs"
+ready_path = "/"
+guarded_variant = "vulnerable"   # the one zion is put in front of
+fixed_variant = "fixed"          # the patched build, for the oracle's negative control
+
+[[variant]]
+name = "vulnerable"
+service = "next-vulnerable"
+upstream = "http://127.0.0.1:18101"
+version_cmd = ["node", "-p", "require('next/package.json').version"]
+
+[[variant]]
+name = "fixed"
+service = "next-fixed"
+upstream = "http://127.0.0.1:18102"
+version_cmd = ["node", "-p", "require('next/package.json').version"]
