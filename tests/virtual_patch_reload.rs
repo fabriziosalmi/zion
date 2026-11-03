@@ -111,6 +111,10 @@ fn start(initial_rules: &str) -> Option<Zion> {
 
 /// The HTTP status code curl sees for `GET https://.../{path}` (0 on transport failure).
 fn code(https: u16, path: &str) -> u32 {
+    code_with_method(https, "GET", path)
+}
+
+fn code_with_method(https: u16, method: &str, path: &str) -> u32 {
     let out = Command::new("curl")
         .args([
             "-sk",
@@ -120,6 +124,8 @@ fn code(https: u16, path: &str) -> u32 {
             "%{http_code}",
             "--max-time",
             "8",
+            "-X",
+            method,
         ])
         .arg(format!("https://127.0.0.1:{https}{path}"))
         .output()
@@ -200,18 +206,38 @@ fn the_shipped_pack_blocks_each_cve_shape() {
         return;
     };
 
-    // (CVE, a path the rule must block). One case per rule in examples/virtual-patch.toml.
-    let blocked: &[(&str, &str)] = &[
-        ("CVE-2022-22947", "/actuator/gateway/routes/x"),
-        ("CVE-2021-22986", "/mgmt/tm/util/bash"),
+    // (CVE, method, a path+query the rule must block). One case per rule in
+    // examples/virtual-patch.toml. None of the three sets `methods`: the first two match any
+    // method by having no list; the third is deliberately unscoped too (#773) -- a method
+    // restriction would have missed WordPress's own '_method'/X-HTTP-Method-Override tunnel,
+    // which re-dispatches a GET as a PUT internally, after zion has already seen it as a GET.
+    let blocked: &[(&str, &str, &str)] = &[
+        ("CVE-2022-22947", "GET", "/actuator/gateway/routes/x"),
+        ("CVE-2021-22986", "GET", "/mgmt/tm/util/bash"),
+        ("CVE-2017-1001000", "PUT", "/wp-json/wp/v2/posts/1?id=1z"),
+        // The same rule, exercised as a GET: proves it is NOT scoped to mutating methods,
+        // which is exactly what closes the method-override tunnel above.
+        ("CVE-2017-1001000", "GET", "/wp-json/wp/v2/posts/1?id=1z"),
+        // And with the query parameter NAME itself percent-encoded ('%69' = 'i'): PHP's own
+        // query-string parsing decodes this to 'id' before WordPress ever sees it, so the rule
+        // must too (query_has() in src/virtual_patch.rs).
+        ("CVE-2017-1001000", "PUT", "/wp-json/wp/v2/posts/1?%69d=1z"),
     ];
-    for (cve, path) in blocked {
+    for (cve, method, path) in blocked {
         assert_eq!(
-            code(zion.https, path),
+            code_with_method(zion.https, method, path),
             403,
-            "the pack must block {cve} ({path})"
+            "the pack must block {cve} ({method} {path})"
         );
     }
+    // The 'id' query override is what the rule denies -- a GET using the SAME method-override
+    // convention but WITHOUT it must not be touched (WordPress's own permission check, not this
+    // rule, is what would deny it for real).
+    assert_eq!(
+        code(zion.https, "/wp-json/wp/v2/posts/1?_method=PUT"),
+        503,
+        "method-override tunneling alone, with no id query override, is not this rule's business"
+    );
 
     // A request matching no rule is not blocked (reaches the dead upstream -> 503).
     assert_eq!(

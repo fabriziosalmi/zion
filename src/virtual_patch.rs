@@ -363,11 +363,60 @@ fn cookie_names(headers: &hyper::HeaderMap) -> Vec<String> {
     names
 }
 
-/// Does query string `q` carry a parameter `name` (optionally equal to `value`)?
+/// Decode a query-string component the way PHP's `parse_str` (and so WordPress, and most other
+/// backends behind zion) decodes one: `+` is a space, `%XX` is the byte it names, one pass, and
+/// a malformed `%` sequence (not followed by two hex digits) is left exactly as written rather
+/// than rejected — `parse_str` does not error on it either, it leaves it alone. `rule.query`
+/// compared the RAW query string (`k == name`) until this was added: `?%69d=1z` decodes to
+/// `id=1z` by the time PHP sees it, so a rule naming `id` never matched it and the shield it was
+/// meant to be could be bypassed with any percent-encoding of its parameter name (found by
+/// review on #773, which also promoted the WordPress rule this engine first needed it for).
+fn percent_decode(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains(['%', '+']) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = |b: u8| (b as char).to_digit(16);
+                match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push((hi * 16 + lo) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    // A decoded byte sequence that is not valid UTF-8 cannot equal any rule's (UTF-8) `name` or
+    // `value` anyway, so lossy conversion -- never a panic, never rejecting the request -- is
+    // the right failure mode here: the comparison below just returns false for it.
+    String::from_utf8_lossy(&out).into_owned().into()
+}
+
+/// Does query string `q` carry a parameter `name` (optionally equal to `value`)? Both the
+/// string being searched and `name`/`value` are compared after percent-decoding -- see
+/// [`percent_decode`] -- since `q` is the raw bytes of the URI's query component (hyper does not
+/// decode it) and is compared against a rule's plain-text `name`/`value` in `virtual-patch.toml`.
 fn query_has(q: &str, name: &str, value: Option<&str>) -> bool {
     q.split('&').any(|pair| {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        k == name && value.is_none_or(|want| v == want)
+        percent_decode(k) == name && value.is_none_or(|want| percent_decode(v) == want)
     })
 }
 
@@ -595,6 +644,56 @@ mod tests {
         let hc2 = hm(&[("cookie", "a=1; b=2")]);
         assert!(matches!(
             rules2.evaluate(&target("GET", "/", None, &hc2, None), false),
+            Verdict::NoMatch
+        ));
+    }
+
+    #[test]
+    fn percent_decode_matches_phps_parse_str() {
+        // The exact bypass review found on #773: a query key written with any byte
+        // percent-encoded must still match, since that is what PHP's parse_str (and so
+        // WordPress) decodes it to before the application ever sees the raw bytes.
+        assert_eq!(percent_decode("%69d"), "id");
+        assert_eq!(percent_decode("i%64"), "id");
+        assert_eq!(percent_decode("%69%64"), "id");
+        // '+' is a space in a query string (application/x-www-form-urlencoded), not literal.
+        assert_eq!(percent_decode("a+b"), "a b");
+        // A malformed sequence is left exactly as written -- parse_str does not error on it,
+        // and this must not panic on a byte string that ends mid-escape.
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("100%2"), "100%2");
+        assert_eq!(percent_decode("100%zz"), "100%zz");
+        // No '%' or '+' at all: the common case, must not allocate or alter the string.
+        assert_eq!(percent_decode("plain"), "plain");
+    }
+
+    #[test]
+    fn query_has_sees_through_percent_encoding_of_the_name_or_the_value() {
+        assert!(query_has("%69d=1z", "id", None));
+        assert!(query_has("id=%31z", "id", Some("1z")));
+        assert!(query_has("a=1&%69d=1z&b=2", "id", None));
+        // Still false when the decoded name genuinely differs.
+        assert!(!query_has("%69%64x=1z", "id", None));
+        assert!(!query_has("other=1", "id", None));
+    }
+
+    #[test]
+    fn a_query_rule_catches_the_percent_encoded_bypass_an_unmodified_query_has_would_miss() {
+        let toml = "[[rule]]\nid='q'\ncve='CVE-2099-6'\naction='deny'\n\
+                    [[rule.query]]\nname='id'\n";
+        let rules = VirtualPatchRules::from_toml_str(toml).unwrap();
+        let h = hm(&[]);
+        for q in ["id=1z", "%69d=1z", "i%64=1z", "%69%64=1z"] {
+            assert!(
+                matches!(
+                    rules.evaluate(&target("GET", "/x", Some(q), &h, None), false),
+                    Verdict::Block(_)
+                ),
+                "query {q:?} must be caught"
+            );
+        }
+        assert!(matches!(
+            rules.evaluate(&target("GET", "/x", Some("other=1"), &h, None), false),
             Verdict::NoMatch
         ));
     }
