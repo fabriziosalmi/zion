@@ -2621,6 +2621,7 @@ dependencies = [
  "portable-atomic",
  "rand 0.9.3",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

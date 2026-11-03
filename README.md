@@ -125,7 +125,7 @@ cargo build --release --features dist            # release bundle: acme + init +
 cargo build --release --features acme            # + automatic HTTPS via Let's Encrypt (HTTP-01)
 cargo build --release --features auth            # + JWT/OIDC authentication gate
 cargo build --release --features http3           # + HTTP/3 QUIC listener
-cargo build --release --features otel            # + OTLP exporter (not active yet: zion opens no spans, #640)
+cargo build --release --features otel            # + OTLP exporter, one span per request (#640)
 cargo build --release --features fips            # + FIPS 140-3 build (aws-lc-rs validated backend)
 cargo build --release --features geo-ita         # + Italian / EU sovereign edge classification
 cargo build --release --features io-uring-accept # Linux: single-shot io_uring accept (validated on 5.19+ kernels)
@@ -196,7 +196,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 ```
 
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-86 modules, ~85,400 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+86 modules, ~85,600 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Features
 

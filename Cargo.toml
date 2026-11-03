@@ -242,8 +242,8 @@ compress = ["dep:flate2", "dep:brotli"]
 dist = ["acme", "init", "auth", "compress"]
 # Distributed tracing export to an OTLP collector (Tempo, Jaeger, Honeycomb,
 # Datadog Agent, etc). The base `tracing` integration is always-on; this
-# feature only enables the network exporter. NOT ACTIVE YET: zion opens no span, so nothing is
-# exported (#640).
+# feature additionally exports one span per request, with the trace id and parent span id
+# the request's own `traceparent` already carries (#640).
 otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "opentelemetry-semantic-conventions", "tracing-opentelemetry"]
 # FIPS 140-3 mode (Track E). Switches the aws-lc-rs backend to its
 # FIPS-validated build (aws-lc-fips-sys). Requires:
@@ -288,6 +288,11 @@ tls-fingerprint = ["dep:sha2"]
 # Paused virtual time for the timeout tests (the WebSocket session limits). Same
 # crate as the runtime dependency: no new code in the build.
 tokio = { version = "1", features = ["test-util"] }
+# `InMemorySpanExporter` for #640's otel_span() test (the real OTLP export path is verified
+# against a real collector, not here). Same crate as the runtime dependency (optional, behind
+# `--features otel`): this only adds the `testing` feature to it, used only under
+# `#[cfg(all(test, feature = "otel"))]`, and so is a no-op for the shipped binary.
+opentelemetry_sdk = { version = "0.33", features = ["testing"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 # Criterion microbench harness (issue #54). Pinned to 0.5; the `html_reports`
 # default feature is dropped — we publish a JSON baseline (target/criterion/

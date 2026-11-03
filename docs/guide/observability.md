@@ -7,7 +7,7 @@
 
 Zion's observability stack covers four concerns:
 
-1. **Distributed tracing** — W3C Trace Context propagation and a trace id on every access-log line, audit record and histogram exemplar. An OTLP gRPC exporter exists behind `--features otel`, but it is **not active yet**: see [Optional OTLP export](#optional-otlp-export).
+1. **Distributed tracing** — W3C Trace Context propagation and a trace id on every access-log line, audit record and histogram exemplar. `--features otel` additionally exports one span per request to an OTLP collector: see [Optional OTLP export](#optional-otlp-export).
 2. **Metrics with exemplars** — Prometheus text format upgraded to OpenMetrics so each histogram bucket can carry the trace ID of the latest observation that fell into it.
 3. **Audit log** — HMAC-SHA256-chained JSON-Lines, opt-in.
 4. **Panic hook** — every panic emits one structured JSON record to stderr and to a "last-gasp" file before the process aborts.
@@ -35,7 +35,7 @@ The parsed 16-byte trace ID is attached to the latency histogram as an OpenMetri
 
 ### Optional OTLP export
 
-> **Not active yet.** The exporter is built and wired, but zion opens no `tracing` span (there is no `info_span!` or `#[instrument]` in the request path), and the exporter ships spans, not stand-alone events such as the access log. A build with `--features otel` pointed at a collector connects to nothing and sends nothing: checked on 0.11.0, six requests, no connection from the exporter. What does work without it: `traceparent` is parsed, validated and forwarded to upstreams, and the trace id is in the access log, the audit record and the latency exemplar. A root span per request is tracked in [#640](https://github.com/fabriziosalmi/zion/issues/640); until then use those, or a collector fed from the access log.
+A build with `--features otel` exports one root span per request, named `request`, to the configured collector — the exporter ships `tracing` spans, not stand-alone events such as the access log, so this one span is what makes a request visible to Tempo/Jaeger/Honeycomb/etc. Its trace id and parent span id are the SAME ones already in the `traceparent` this request propagates (the client's own, when it sent a valid one; a freshly generated one otherwise), so the exported trace stitches onto whatever sent the request, and the trace id is the same join key already in the access log, the audit record and the latency exemplar (#640).
 
 ```bash
 cargo build --release --features otel
@@ -43,9 +43,9 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo.observability.svc:4317 \
     ZION_CONFIG=zion.toml ./target/release/zion
 ```
 
-Once zion emits spans, the exporter ships every span emitted by `tracing::info_span!` / `#[instrument]` to the configured collector. Resource attributes are populated from `service.name=zion` and `service.version` (compile-time crate version). No batching parameters are exposed yet; the SDK default (5-second batch, 512-span queue) is in effect.
+Resource attributes are populated from `service.name=zion` and `service.version` (compile-time crate version). No batching parameters are exposed yet; the SDK default (5-second batch, 512-span queue) is in effect — a collector that is down or unreachable does not slow down or block request serving; the batch exporter runs on its own background task.
 
-To check it once spans exist, point `OTEL_EXPORTER_OTLP_ENDPOINT` at `http://127.0.0.1:4317` and run `otel-cli` or the [collector contrib distribution](https://github.com/open-telemetry/opentelemetry-collector-contrib) locally.
+To see it, point `OTEL_EXPORTER_OTLP_ENDPOINT` at `http://127.0.0.1:4317` and run `otel-cli` or the [collector contrib distribution](https://github.com/open-telemetry/opentelemetry-collector-contrib) locally (a `debug` exporter pipeline prints every span it receives).
 
 ## Metrics with exemplars
 
@@ -444,6 +444,6 @@ Threat-model addendum specific to the mesh surface:
 
 ## What's next
 
-- **Span instrumentation** — automatic span creation around `process_request` is wired through the W3C parser; richer per-stage spans (WAF, cache, upstream) will follow in a small follow-up.
+- ~~**Span instrumentation**~~ — landed: one root span per request, exported under `--features otel` ([#640](https://github.com/fabriziosalmi/zion/issues/640), see [Optional OTLP export](#optional-otlp-export)). Richer per-stage spans (WAF, cache, upstream) are a separate follow-up.
 - ~~**PII redaction in access logs**~~ — landed via [`[access_log]`](#access-log) (issue #60). Configured headers pass through the same `[redact.headers]` policy that protects audit events.
 - **OTLP metrics** — the SDK supports it; we have not enabled the export path yet because the lock-free metrics module already covers the use cases. We may add it for parity if a downstream consumer needs an OTLP-only ingest.

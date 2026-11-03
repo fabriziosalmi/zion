@@ -434,76 +434,95 @@ async fn process_request_inner(
     }
 
     let trace = telemetry::stamp(&mut req);
-    let access = telemetry::capture(&cfg, &state, &req);
 
-    // Capture what response compression needs before `req` is moved into the
-    // dispatch, and only for a route that asks for it (ADR-0025). Other routes pay
-    // nothing.
-    let compress_ctx = rule.compress.as_ref().map(|_| {
-        (
-            req.method().clone(),
-            req.headers()
-                .get(hyper::header::ACCEPT_ENCODING)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_owned()),
+    // The root span for this request (#640), built from the trace/span id `stamp()` just
+    // decided -- BEFORE `trace` is moved into the tail below, from a borrow that ends as
+    // soon as this call returns. Everything from here to the response is one `async move`
+    // block so it can be `.instrument()`ed as a whole: a span only covers the future it
+    // wraps, and the dispatch/compression/record steps below are what the span is FOR.
+    #[cfg(feature = "otel")]
+    let span = telemetry::otel_span(&trace);
+
+    let tail = async move {
+        let access = telemetry::capture(&cfg, &state, &req);
+
+        // Capture what response compression needs before `req` is moved into the
+        // dispatch, and only for a route that asks for it (ADR-0025). Other routes pay
+        // nothing.
+        let compress_ctx = rule.compress.as_ref().map(|_| {
+            (
+                req.method().clone(),
+                req.headers()
+                    .get(hyper::header::ACCEPT_ENCODING)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_owned()),
+            )
+        });
+
+        // --- Dispatch by mode ---
+        let resp = dispatch_by_mode(
+            req,
+            &state,
+            &cfg,
+            &rule,
+            remote_addr,
+            forward_addr,
+            &dyn_scheme,
+            &dyn_authority,
+            admission.breaker_up.clone(),
         )
-    });
+        .await?;
+        let mut resp = finish_response(resp, &rule, admission);
 
-    // --- Dispatch by mode ---
-    let resp = dispatch_by_mode(
-        req,
-        &state,
-        &cfg,
-        &rule,
-        remote_addr,
-        forward_addr,
-        &dyn_scheme,
-        &dyn_authority,
-        admission.breaker_up.clone(),
-    )
-    .await?;
-    let mut resp = finish_response(resp, &rule, admission);
+        // Downstream response compression (ADR-0025): off unless the route enabled it
+        // and the request/response negotiate a coding.
+        if let Some((method, accept_encoding)) = &compress_ctx {
+            resp = crate::compress::apply(
+                resp,
+                rule.compress.as_ref(),
+                method,
+                accept_encoding.as_deref(),
+                cfg.compress_max_concurrent,
+            );
+        }
 
-    // Downstream response compression (ADR-0025): off unless the route enabled it
-    // and the request/response negotiate a coding.
-    if let Some((method, accept_encoding)) = &compress_ctx {
-        resp = crate::compress::apply(
-            resp,
-            rule.compress.as_ref(),
-            method,
-            accept_encoding.as_deref(),
-            cfg.compress_max_concurrent,
+        let request_elapsed = request_start.elapsed();
+        telemetry::record(
+            &state,
+            &cfg,
+            remote_addr,
+            &resp,
+            request_elapsed,
+            &trace,
+            &access,
         );
-    }
 
-    let request_elapsed = request_start.elapsed();
-    telemetry::record(
-        &state,
-        &cfg,
-        remote_addr,
-        &resp,
-        request_elapsed,
-        &trace,
-        &access,
-    );
+        // CORS: add Access-Control-Allow-Origin on actual requests
+        if let Some(allow) = cors_allow_origin {
+            resp.headers_mut()
+                .insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, allow);
+        }
 
-    // CORS: add Access-Control-Allow-Origin on actual requests
-    if let Some(allow) = cors_allow_origin {
+        // X-Request-ID on response (echo from request for client correlation)
+        if let Some(rid) = trace.request_id {
+            resp.headers_mut().insert("X-Request-ID", rid);
+        }
+
+        // Alt-Svc: advertise HTTP/3 to clients (zero cost if feature disabled)
+        #[cfg(feature = "http3")]
         resp.headers_mut()
-            .insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, allow);
+            .insert("Alt-Svc", crate::quic::ALT_SVC_H3.clone());
+
+        Ok(resp)
+    };
+
+    #[cfg(feature = "otel")]
+    {
+        use tracing::Instrument;
+        tail.instrument(span).await
     }
-
-    // X-Request-ID on response (echo from request for client correlation)
-    if let Some(rid) = trace.request_id {
-        resp.headers_mut().insert("X-Request-ID", rid);
-    }
-
-    // Alt-Svc: advertise HTTP/3 to clients (zero cost if feature disabled)
-    #[cfg(feature = "http3")]
-    resp.headers_mut()
-        .insert("Alt-Svc", crate::quic::ALT_SVC_H3.clone());
-
-    Ok(resp)
+    #[cfg(not(feature = "otel"))]
+    tail.await
 }
 
 /// Mark the request with what the forwarding paths need to know about its route.
