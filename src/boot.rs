@@ -173,6 +173,20 @@ fn warn_feature_config_gaps(config: &config::ZionConfig) {
                  Rebuild with `--features tls-fingerprint`.",
             );
         }
+        let ua_check_active = config
+            .tls
+            .fingerprint
+            .as_ref()
+            .and_then(|fp| fp.ua_check.as_ref())
+            .is_some_and(|u| u.mode != config::UaCheckMode::Off);
+        if ua_check_active {
+            logging::warn(
+                "config",
+                "[tls.fingerprint.ua_check] is on but this binary was built WITHOUT \
+                 `--features tls-fingerprint` — no JA4 is computed, so no request is \
+                 compared with its User-Agent. Rebuild with `--features tls-fingerprint`.",
+            );
+        }
     }
     // NOTE: the allowlist "open side door" (on_unknown = drop + on_unfingerprintable
     // = allow) is now a HARD config-validation error (see config::semantic_errors),
