@@ -421,7 +421,19 @@ fn query_has(q: &str, name: &str, value: Option<&str>) -> bool {
 }
 
 /// A minimal glob: `*` matches any run of characters (including `/` and the empty run). Every other
-/// character is literal. No `?` or character classes — enough to shield a CVE by path shape.
+/// character is literal, compared ASCII case-insensitively. No `?` or character classes — enough
+/// to shield a CVE by path shape.
+///
+/// Case-insensitive on purpose, not because HTTP paths are (RFC 3986: they are not) -- because
+/// case variation is a textbook WAF-evasion technique, and this engine is used only for narrow,
+/// specific, security-sensitive prefixes (an actuator endpoint, a management API, a REST route)
+/// that nothing legitimate is going to coincidentally share at a different case. The asymmetry
+/// is the point: a missed `/MGMT/tm/util/bash` because the real backend's routing turned out to
+/// be case-insensitive is a remote-code-execution-class miss; a path that happens to collide
+/// case-insensitively with one of these specific prefixes and gets a 403 it didn't need is a
+/// false positive on a shield a route opted into. Found by review-driven audit of the two
+/// pre-existing shipped rules (#773): `path_glob = "/mgmt/*"` let `/MGMT/tm/util/bash` straight
+/// through on the real binary, confirmed before this fix existed.
 #[derive(Debug)]
 pub struct Glob {
     /// Literal segments between `*`s. `leading`/`trailing` say whether the pattern starts/ends
@@ -441,7 +453,7 @@ impl Glob {
         let parts: Vec<String> = pattern
             .split('*')
             .filter(|p| !p.is_empty())
-            .map(String::from)
+            .map(str::to_ascii_lowercase)
             .collect();
         Ok(Glob {
             parts,
@@ -455,26 +467,47 @@ impl Glob {
         if self.parts.is_empty() {
             return true;
         }
-        let mut rest = s;
+        // One lowercase pass of the input, not one per part: parts are already lowercased
+        // at compile() time, so this keeps the comparison itself a plain byte match.
+        let lowered = s.to_ascii_lowercase();
+        let mut rest = lowered.as_str();
+        let last_index = self.parts.len() - 1;
         for (i, part) in self.parts.iter().enumerate() {
             let first = i == 0;
-            let last = i == self.parts.len() - 1;
+            let last = i == last_index;
+            if last {
+                // The final part decides the match by itself, against what the earlier parts
+                // left in `rest`. It must sit at an END, not merely occur somewhere in `rest`
+                // -- `find()`'s first occurrence can be an earlier, coincidental occurrence of
+                // the same literal (`*.php` against "/public.php.bak/index.php" genuinely
+                // ends in ".php", but find() matches the ".php" inside "public.php.bak" first
+                // and then rejects on what trails it; found by review on #774, where a
+                // same-case input alone already triggers it -- case-folding was not what
+                // created this, only what made it easy to reach).
+                return match (first && self.anchored_start, self.anchored_end) {
+                    (true, true) => rest == part.as_str(), // no `*` at all: exact
+                    (true, false) => rest.starts_with(part.as_str()), // "/a/*": prefix
+                    (false, true) => rest.ends_with(part.as_str()), // "*.php": suffix
+                    (false, false) => rest.contains(part.as_str()), // "*x*": substring
+                };
+            }
             if first && self.anchored_start {
                 if !rest.starts_with(part.as_str()) {
                     return false;
                 }
                 rest = &rest[part.len()..];
             } else {
+                // A middle part (between two `*`s, or after a leading `*` with more parts
+                // still to come): any position it occurs at is fine here, since what matters
+                // is whether the LATER parts can still match in what remains -- unlike the
+                // last part above, there is no "nothing may trail it" requirement yet.
                 match rest.find(part.as_str()) {
                     Some(pos) => rest = &rest[pos + part.len()..],
                     None => return false,
                 }
             }
-            if last && self.anchored_end && !rest.is_empty() {
-                return false;
-            }
         }
-        true
+        unreachable!("the loop always returns on its last iteration")
     }
 }
 
@@ -534,6 +567,51 @@ mod tests {
         assert!(Glob::compile("/*/admin/*").unwrap().matches("/v1/admin/x"));
         assert!(Glob::compile("/exact").unwrap().matches("/exact"));
         assert!(!Glob::compile("/exact").unwrap().matches("/exact/more"));
+    }
+
+    #[test]
+    fn glob_matching_is_ascii_case_insensitive() {
+        // Case variation is a textbook evasion technique against a path-based security shield
+        // (found on the two pre-existing shipped rules, #773: `/mgmt/*` let `/MGMT/...` through).
+        // Every combination of pattern case and input case must match the same way.
+        for pattern in ["/mgmt/*", "/MGMT/*", "/Mgmt/*"] {
+            let g = Glob::compile(pattern).unwrap();
+            assert!(g.matches("/mgmt/tm/util/bash"), "{pattern}");
+            assert!(g.matches("/MGMT/tm/util/bash"), "{pattern}");
+            assert!(g.matches("/MgMt/Tm/UTIL/bash"), "{pattern}");
+        }
+        // A middle literal part (between two `*`s), not just the anchored prefix.
+        assert!(Glob::compile("/*/ADMIN/*").unwrap().matches("/v1/admin/x"));
+        // Still anchored correctly: case-folding must not loosen what the pattern excludes.
+        assert!(!Glob::compile("/mgmt/*").unwrap().matches("/not-mgmt/x"));
+        assert!(!Glob::compile("/EXACT").unwrap().matches("/exact/more"));
+    }
+
+    #[test]
+    fn end_anchored_matching_finds_the_true_suffix_not_an_earlier_coincidental_one() {
+        // Review finding on #774: lowercasing the input can turn two previously-distinct
+        // substrings into the same literal text, and matches() used to take `find()`'s FIRST
+        // occurrence even for the end-anchored LAST part, then reject on whatever trailed it
+        // -- so an earlier, coincidental occurrence of the literal could hide a real match at
+        // the true end. This is not actually a case-folding bug: the identical shape, same
+        // case throughout, already demonstrates it.
+        let g = Glob::compile("*.php").unwrap();
+        assert!(
+            g.matches("/public.php.bak/index.php"),
+            "the true suffix is real"
+        );
+        // The exact case from review: mixed case only collides into the same bug via folding.
+        assert!(g.matches("/public.PHP/index.php"));
+        assert!(g.matches("/PUBLIC.PHP/INDEX.PHP"));
+        // And the end-anchor must still correctly REJECT when nothing of the pattern's
+        // literal actually sits at the true end.
+        assert!(!g.matches("/index.php.bak"));
+        assert!(!g.matches("/public.php/index.phps"));
+        // The same end-anchor fix, exercised in a multi-part pattern (a middle part between
+        // two `*`s, then the end-anchored final literal) rather than a single-part one.
+        let g2 = Glob::compile("/a/*/admin/*.conf").unwrap();
+        assert!(g2.matches("/a/admin-looking/admin/real.conf"));
+        assert!(!g2.matches("/a/admin-looking/admin/real.conf.bak"));
     }
 
     #[test]
