@@ -70,20 +70,32 @@ def build_request(req: dict, host_header: str) -> bytes:
 
 
 def _dechunk(raw: bytes) -> bytes:
+    """Decode a chunked body. Raises ValueError if the 0-size terminator chunk is never
+    reached — an incomplete chunked body must not be returned as if it were the whole thing:
+    `judge()` would then compare a partial, truncated body against the oracle."""
     out, i = b"", 0
     while True:
         eol = raw.find(b"\r\n", i)
         if eol < 0:
-            return out
+            raise ValueError("chunked body ends mid-chunk-header: incomplete response")
         size = int(raw[i:eol].split(b";")[0] or b"0", 16)
         if size == 0:
             return out
-        out += raw[eol + 2 : eol + 2 + size]
-        i = eol + 2 + size + 2
+        chunk_end = eol + 2 + size
+        if len(raw) < chunk_end + 2:
+            raise ValueError("chunked body ends mid-chunk: incomplete response")
+        out += raw[eol + 2 : chunk_end]
+        i = chunk_end + 2
 
 
 def parse_response(raw: bytes) -> dict:
+    """Raises ValueError on a response that is not actually complete (truncated by a reset,
+    a timeout, or a server that closed early): `observe()` must see this as a connection
+    error, not as a 200 with a shorter-than-declared or otherwise wrong body that could
+    accidentally satisfy (or fail to satisfy) the oracle."""
     head, _, body = raw.partition(b"\r\n\r\n")
+    if not _:
+        raise ValueError(f"no header/body separator in {raw[:80]!r}: incomplete response")
     lines = head.decode("latin-1").split("\r\n")
     try:
         status = int(lines[0].split()[1])
@@ -91,8 +103,16 @@ def parse_response(raw: bytes) -> dict:
         raise ValueError(f"no status line in {raw[:80]!r}")
     headers = [tuple(line.split(":", 1)) for line in lines[1:] if ":" in line]
     headers = [(k.strip().lower(), v.strip()) for k, v in headers]
-    if any(k == "transfer-encoding" and "chunked" in v.lower() for k, v in headers):
-        body = _dechunk(body)
+    is_chunked = any(k == "transfer-encoding" and "chunked" in v.lower() for k, v in headers)
+    if is_chunked:
+        body = _dechunk(body)  # raises on an incomplete chunked body
+    else:
+        declared = next((v for k, v in headers if k == "content-length"), None)
+        if declared is not None:
+            want = int(declared)
+            if len(body) < want:
+                raise ValueError(f"body is {len(body)} bytes, Content-Length declared {want}: incomplete response")
+            body = body[:want]  # a pipelined/trailing byte past a non-close connection would stay here otherwise
     return {"status": status, "headers": headers, "body": body.decode("utf-8", "replace")}
 
 
@@ -152,12 +172,15 @@ def observe(label: str, addr, tls: bool, req: dict, vulnerable_if: dict, ca: Pat
 
 
 def judge(obs: dict[str, dict]) -> tuple[str, str]:
-    """(verdict, why). `bypass` wins over everything: it is the one that fails the run."""
+    """(verdict, why). `bypass` wins over everything, checked FIRST: a confirmed bypass
+    through zion must stay a `bypass` even if another observation (baseline/vulnerable/fixed)
+    happened to error out -- a demonstrated hole is never allowed to hide behind an unrelated
+    connection problem reported as `error` instead."""
+    if obs["zion"].get("vulnerable") is True:
+        return "bypass", "the vector works through zion"
     if any(o.get("vulnerable") is None for o in obs.values()):
         bad = [k for k, o in obs.items() if o.get("vulnerable") is None]
         return "error", f"no answer at: {', '.join(bad)}"
-    if obs["zion"]["vulnerable"]:
-        return "bypass", "the vector works through zion"
     problems = []
     if obs["baseline"]["vulnerable"]:
         problems.append("the baseline (no vector) already looks vulnerable: the oracle or the stack is wrong")
@@ -232,14 +255,20 @@ class Zion:
             f'[server]\nlisten_http = "127.0.0.1:{self.http}"\nlisten_https = "127.0.0.1:{self.https}"\n'
             f'{extra}\n[tls]\ncert_path = "{crt}"\nkey_path = "{key}"\nhot_reload = false\n'
             f'[upstreams]\nstack = "{upstream}"\n[[route]]\npath = "/{{*rest}}"\nupstream = "stack"\n')
-        self.log = open(self.dir / "zion.log", "w")
+        self.log_path = self.dir / "zion.log"
+        self.log = open(self.log_path, "w")
         self.proc = subprocess.Popen(
             [str(binary)], env={**os.environ, "ZION_CONFIG": str(cfg), "ZION_BOOT_FAST": "1",
                                 "ZION_LAST_GASP_PATH": str(self.dir / "gasp.jsonl")},
             stdout=subprocess.DEVNULL, stderr=self.log)
         if not wait_for(("127.0.0.1", self.https), True, "/healthz", 30, ca=self.ca):
+            # Read the log BEFORE stop(), which deletes self.dir: reading it afterwards would
+            # raise FileNotFoundError and lose the one diagnostic that explains the failure
+            # (a bad config, a port already bound, a crash on startup).
+            self.log.flush()
+            tail = self.log_path.read_text()[-600:] if self.log_path.exists() else "(no log file)"
             self.stop()
-            raise RuntimeError(f"zion did not come up; log: {(self.dir / 'zion.log').read_text()[-600:]}")
+            raise RuntimeError(f"zion did not come up; log: {tail}")
 
     @property
     def addr(self):
@@ -280,10 +309,13 @@ def run_stack(name: str, zion_bin: Path, out_dir: Path, use_compose: bool, stack
     images: dict = {}
     versions: dict = {}
 
-    if use_compose:
-        print(f"[{name}] building and starting the stack", flush=True)
-        compose(stack_dir, project, "up", "-d", "--build", "--wait", "--wait-timeout", "300")
     try:
+        if use_compose:
+            print(f"[{name}] building and starting the stack", flush=True)
+            # Inside the try: a failed/unhealthy `up --wait` (check=True raises) must still
+            # reach the `finally` below, or containers are left running and holding ports and
+            # memory with no KEEP set and nothing telling the operator they are still up.
+            compose(stack_dir, project, "up", "-d", "--build", "--wait", "--wait-timeout", "300")
         for vname, v in variants.items():
             if not wait_for(addr_of(v["upstream"]), False, meta["stack"].get("ready_path", "/"), 120):
                 raise RuntimeError(f"variant {vname} did not answer at {v['upstream']}")
@@ -297,7 +329,13 @@ def run_stack(name: str, zion_bin: Path, out_dir: Path, use_compose: bool, stack
             versions.setdefault(vname, v.get("version", "unknown"))
 
         guarded = variants[meta["stack"]["guarded_variant"]]
-        zion = Zion(zion_bin, guarded["upstream"], meta.get("zion", {}).get("server_extra", ""))
+        # `{stack_dir}` in server_extra expands to this stack's own absolute directory, so a
+        # stack can point zion at a file that lives beside it (e.g. a virtual-patch rules_file,
+        # #698) without baking a checkout-specific absolute path into the committed stack.toml
+        # (zion itself resolves a *relative* rules_file against zion.toml's directory, a throwaway
+        # tmpdir this runner invents per run, not the stack's own directory -- see docs/config).
+        server_extra = meta.get("zion", {}).get("server_extra", "").replace("{stack_dir}", str(stack_dir.resolve()))
+        zion = Zion(zion_bin, guarded["upstream"], server_extra)
         try:
             return finish(name, meta, probes, variants, guarded, zion, zion_bin, images, versions, out_dir)
         finally:

@@ -69,10 +69,15 @@ def main() -> int:
         print(f"no zion binary at {a.zion_bin}", file=sys.stderr)
         return 2
 
-    fake_vuln = start_fake(19101, "vulnerable")
-    fake_fixed = start_fake(19102, "fixed")
-    tmp = Path(tempfile.mkdtemp(prefix="zion-lab-test-"))
+    # Both fixtures are tracked from the moment each one starts, inside the same cleanup
+    # scope: if the second start fails (e.g. a leftover process still bound to its port from
+    # a previous interrupted run), the first must still be terminated, not leaked.
+    started: list[subprocess.Popen] = []
+    tmp: Path | None = None
     try:
+        started.append(start_fake(19101, "vulnerable"))
+        started.append(start_fake(19102, "fixed"))
+        tmp = Path(tempfile.mkdtemp(prefix="zion-lab-test-"))
         # ── case 1: zion protects /protected (deny the bypass header) -----------------------
         stacks_dir = tmp / "case1"
         stacks_dir.mkdir(parents=True)
@@ -120,11 +125,12 @@ def main() -> int:
         print("benign steps all ok: OK")
 
     finally:
-        fake_vuln.terminate()
-        fake_fixed.terminate()
-        fake_vuln.wait()
-        fake_fixed.wait()
-        shutil.rmtree(tmp, ignore_errors=True)
+        for p in started:
+            p.terminate()
+        for p in started:
+            p.wait()
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     print("\nALL CHECKS PASSED")
     return 0
