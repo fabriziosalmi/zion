@@ -111,6 +111,10 @@ fn start(initial_rules: &str) -> Option<Zion> {
 
 /// The HTTP status code curl sees for `GET https://.../{path}` (0 on transport failure).
 fn code(https: u16, path: &str) -> u32 {
+    code_with_method(https, "GET", path)
+}
+
+fn code_with_method(https: u16, method: &str, path: &str) -> u32 {
     let out = Command::new("curl")
         .args([
             "-sk",
@@ -120,6 +124,8 @@ fn code(https: u16, path: &str) -> u32 {
             "%{http_code}",
             "--max-time",
             "8",
+            "-X",
+            method,
         ])
         .arg(format!("https://127.0.0.1:{https}{path}"))
         .output()
@@ -200,18 +206,29 @@ fn the_shipped_pack_blocks_each_cve_shape() {
         return;
     };
 
-    // (CVE, a path the rule must block). One case per rule in examples/virtual-patch.toml.
-    let blocked: &[(&str, &str)] = &[
-        ("CVE-2022-22947", "/actuator/gateway/routes/x"),
-        ("CVE-2021-22986", "/mgmt/tm/util/bash"),
+    // (CVE, method, a path+query the rule must block). One case per rule in
+    // examples/virtual-patch.toml. The first two rules set no `methods` (any method matches),
+    // so GET exercises them same as any other; the third is scoped to mutating methods only.
+    let blocked: &[(&str, &str, &str)] = &[
+        ("CVE-2022-22947", "GET", "/actuator/gateway/routes/x"),
+        ("CVE-2021-22986", "GET", "/mgmt/tm/util/bash"),
+        ("CVE-2017-1001000", "PUT", "/wp-json/wp/v2/posts/1?id=1z"),
     ];
-    for (cve, path) in blocked {
+    for (cve, method, path) in blocked {
         assert_eq!(
-            code(zion.https, path),
+            code_with_method(zion.https, method, path),
             403,
-            "the pack must block {cve} ({path})"
+            "the pack must block {cve} ({method} {path})"
         );
     }
+    // A GET to the same endpoint, with no mutating method, must NOT be blocked by this rule
+    // (it only matches POST/PUT/PATCH): confirms the rule is scoped, not an accidental path-wide
+    // deny of the whole REST endpoint.
+    assert_eq!(
+        code(zion.https, "/wp-json/wp/v2/posts/1?id=1z"),
+        503,
+        "a GET to the posts endpoint must reach the dead upstream, not be blocked"
+    );
 
     // A request matching no rule is not blocked (reaches the dead upstream -> 503).
     assert_eq!(

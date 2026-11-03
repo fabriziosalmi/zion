@@ -35,3 +35,22 @@ cve = "CVE-2021-22986"
 source = "https://my.f5.com/manage/s/article/K03009991"
 action = "deny"
 path_glob = "/mgmt/*"
+
+# WordPress core REST API authorization bypass: WP_REST_Request::get_param() resolves 'id' from
+# the query string before the route's own path-captured {id}, so a PUT/PATCH/POST to
+# /wp-json/wp/v2/posts/<real-id>?id=<non-numeric> makes the permission check's get_post() fail
+# is_numeric() and return null, short-circuiting the deny, while the update itself casts the same
+# value to a real post ID with (int). Shield: refuse any mutating request to the posts endpoint
+# that carries a redundant 'id' query parameter at all -- no legitimate REST client needs to repeat
+# an id already in the path. Fixed upstream in WordPress 4.7.2; this rule is for an unpatched or
+# EOL install. CVSS 7.5 (NVD CVSS 3.0), verified against a real 4.7.1/4.7.2 pair in tests/lab/
+# (see docs/security/cve-coverage.md).
+[[rule]]
+id = "wordpress-rest-posts-id-param-override"
+cve = "CVE-2017-1001000"
+source = "https://github.com/advisories/GHSA-qm68-r9p4-ghhx"
+action = "deny"
+methods = ["POST", "PUT", "PATCH"]
+path_glob = "/wp-json/wp/v2/posts/*"
+[[rule.query]]
+name = "id"
