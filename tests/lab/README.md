@@ -75,6 +75,15 @@ stacks/<name>/
 digest and run `version_cmd` inside it) — informational, written into the result JSON, never
 assumed from a Dockerfile `ARG`.
 
+`stack.toml`'s optional `[zion] server_extra` is spliced into the `[server]` table of the zion
+this runner stands up (e.g. to turn on `strip_headers`, or a whole new top-level table like
+`[virtual_patch]`, since TOML table headers start a new table wherever they appear in the file).
+`{stack_dir}` inside it expands to the stack's own absolute directory, so a rule referenced from
+there (a virtual-patch `rules_file`, #698) can live right beside `stack.toml` without a
+checkout-specific absolute path baked into the committed file — zion itself resolves a *relative*
+`rules_file` against `zion.toml`'s own directory, a throwaway tmpdir this runner invents per run,
+not the stack's.
+
 Read the advisory before writing a probe. [GHSA-f82v-jwr5-mffw](https://github.com/advisories/GHSA-f82v-jwr5-mffw)
 (the `nextjs` stack's CVE-2025-29927) is a case in point: the first version of that probe used
 `X-Middleware-Subrequest: middleware` and came back `inconclusive` — the real vector repeats

@@ -1,0 +1,116 @@
+# Request-shape probe for the wordpress stack (#699). Not a weaponized exploit: the body sets
+# the post's title back to its own, already-current value, so a successful bypass is provably
+# non-destructive (idempotent write), while still reaching the real vulnerable code path.
+
+[[probe]]
+id = "cve-2017-1001000-rest-id-param-override"
+cve = "CVE-2017-1001000"
+advisory = "https://github.com/advisories/GHSA-qm68-r9p4-ghhx"
+# NVD description (fetched from the CVE 2.0 API, quoted verbatim): "The register_routes function
+# in wp-includes/rest-api/endpoints/class-wp-rest-posts-controller.php in the REST API in
+# WordPress 4.7.x before 4.7.2 does not require an integer identifier, which allows remote
+# attackers to modify arbitrary pages via a request for wp-json/wp/v2/posts followed by a
+# numeric value and a non-numeric value, as demonstrated by the wp-json/wp/v2/posts/123?id=
+# 123helloworld URI." CPEs: wordpress 4.7 and 4.7.1 (vulnerable), fixed in 4.7.2. This lab pins
+# the official wordpress:4.7.1-php7.0-fpm-alpine image (vulnerable) and
+# wordpress:4.7.2-php7.0-fpm-alpine (fixed) -- see compose.yml for the exact digests.
+affects = "WordPress 4.7, 4.7.1 (fixed in 4.7.2)"
+# Confirmed by diffing the real source, not just the advisory prose (both fetched from
+# https://github.com/WordPress/WordPress at tags 4.7.1 and 4.7.2):
+#
+# 4.7.1 (vulnerable), class-wp-rest-posts-controller.php update_item_permissions_check():
+#   $post = get_post( $request['id'] );
+#   if ( $post && ! $this->check_update_permission( $post ) ) { return new WP_Error(...); }
+#   ...
+#   return true;
+# $request['id'] is WP_REST_Request::get_param('id') (class-wp-rest-request.php), whose
+# get_parameter_order() checks ['JSON','POST','GET','URL','defaults'] in that order -- a GET
+# query parameter named "id" is read BEFORE the route's own path-captured {id}. Sending
+# ?id=1z makes $request['id'] resolve to the *string* "1z". The global get_post("1z") calls
+# WP_Post::get_instance("1z"), which starts "if ( ! is_numeric( $post_id ) ... ) return false;"
+# -- is_numeric("1z") is false, so get_post() returns null. `$post && ...` short-circuits on
+# that null, the permission check never runs, and update_item_permissions_check() falls through
+# to `return true`: granted, to an anonymous request.
+# update_item() then does `$id = (int) $request['id'];` -- (int)"1z" is 1 (PHP's loose cast
+# stops at the first non-digit, unlike is_numeric's strict check) -- and updates REAL post 1.
+#
+# 4.7.2 (fixed), commit e357195ce303017d517aff944644a7a1232926f7 (WordPress/WordPress, verified
+# against the tagged file): update_item_permissions_check() now calls a new controller method,
+# $this->get_post( $request['id'] ), which does `if ( (int) $id <= 0 ) return $error;` and then
+# `get_post( (int) $id )` -- the SAME (int) cast update_item() uses, applied before the lookup.
+# "1z" becomes 1 either way now, so the permission check receives the real post 1 and correctly
+# denies the anonymous request (401 rest_cannot_edit), instead of silently granting it.
+mechanism = "zion's virtual-patch rule 'wp-rest-posts-id-param-override' (virtual-patch.toml) denies any POST/PUT/PATCH to /wp-json/wp/v2/posts/* that carries an 'id' query parameter at all: no legitimate REST client needs to repeat the id in the query string once it is already in the path, and that redundant parameter is exactly what the 4.7.1 permission check fails to validate."
+mechanism_verified = true
+# Confirmed by a break-test, not only by reading the code: with virtual_patch.rs's
+# `rule_matches()` temporarily forced to always return `false` (so no rule can ever match),
+# this probe's verdict flipped from `covered` to `bypass` (status 200, the post's title echoed
+# back, unauthenticated) -- and back to `covered` once restored. See the PR description for the
+# exact diff used and confirmation that `git diff` on zion's own src/ is clean afterwards.
+
+[probe.request]
+method = "PUT"
+# Post 1 is "Hello world!", WordPress's own default post created at install (see
+# app/install-bootstrap.php). "1z" keeps absint()/(int) resolving to the SAME post (1) as the
+# path -- this probe never targets a post other than the one it is also reading the path ID
+# from, so a successful bypass only ever rewrites post 1's title to its own current value.
+target = "/wp-json/wp/v2/posts/1?id=1z"
+headers = [["Content-Type", "application/json"]]
+body = '{"title":"Hello world!"}'
+# No Cookie, no X-WP-Nonce, no Authorization header: the whole point of this CVE is that the
+# permission check is bypassed for a request with NO credentials at all.
+
+[probe.baseline]
+# Same request, but the path's own id is the only "id" WordPress ever sees: no query override.
+target = "/wp-json/wp/v2/posts/1"
+
+[probe.oracle.vulnerable_if]
+status = 200
+body_contains = "Hello world!"
+
+[[benign]]
+id = "anonymous-homepage"
+[benign.request]
+method = "GET"
+target = "/"
+[benign.expect]
+status = 200
+body_contains = "Hello world!"
+
+[[benign]]
+id = "anonymous-rest-read-of-the-same-post"
+# Reading post 1 (no mutation, no id override) must stay public: the REST API's read path is
+# untouched by the virtual-patch rule, which only matches POST/PUT/PATCH.
+[benign.request]
+method = "GET"
+target = "/wp-json/wp/v2/posts/1"
+[benign.expect]
+status = 200
+body_contains = "Hello world!"
+
+[[benign]]
+id = "anonymous-edit-attempt-without-the-id-override-is-still-just-denied"
+# The ordinary (non-attack) shape of "try to PUT a post anonymously" -- no id query override --
+# must behave identically direct and through zion: correctly denied either way, not by the
+# virtual-patch rule (it does not match: no "id" query parameter present) but by WordPress's own
+# permission check. Proves the rule is not what is carrying normal auth denials.
+[benign.request]
+method = "PUT"
+target = "/wp-json/wp/v2/posts/1"
+headers = [["Content-Type", "application/json"]]
+body = '{"title":"Hello world!"}'
+[benign.expect]
+status = 401
+
+[[benign]]
+id = "wp-login-form-post-is-not-swept-up-by-the-rule"
+# A totally different legitimate POST (the login form) must not be touched: the rule's
+# path_glob is scoped to /wp-json/wp/v2/posts/*, nowhere near /wp-login.php.
+[benign.request]
+method = "POST"
+target = "/wp-login.php"
+headers = [["Content-Type", "application/x-www-form-urlencoded"]]
+body = "log=admin&pwd=wrong-password-on-purpose&wp-submit=Log+In&redirect_to=&testcookie=1"
+[benign.expect]
+status = 200
+body_contains = "ERROR"

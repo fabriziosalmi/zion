@@ -1,0 +1,94 @@
+# Two builds of the same WordPress version pair (#699), CVE-2017-1001000: a PHP-FPM container
+# per variant (app/Dockerfile, built from the official wordpress:*-fpm-alpine image pinned by
+# digest) behind its own nginx (fastcgi only -- see nginx/default.conf.template), each with its
+# own MariaDB. Published on loopback only; the lab puts zion in front of the vulnerable nginx.
+# Every service sets mem_limit; this stack is lighter than the nextjs one's 1g-per-service
+# pattern (WordPress 4.7 + PHP-FPM + a single-request MariaDB need far less).
+services:
+  db-vulnerable:
+    image: mariadb:11.4@sha256:d1891ede5a559f1086f55053bb8cc1569b0298338c4d72d71725a7f74f6ba620
+    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=0"]
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress-lab-pw-2017
+      MARIADB_RANDOM_ROOT_PASSWORD: "1"
+    mem_limit: 300m
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      retries: 40
+
+  fpm-vulnerable:
+    build:
+      context: app
+      args:
+        # wordpress:4.7.1-php7.0-fpm-alpine (vulnerable: CVE-2017-1001000, see probes.toml).
+        BASE_IMAGE: "wordpress:4.7.1-php7.0-fpm-alpine@sha256:bf8e658ae56b443d4c0e2a57718323ec84fd1c95461b14d4076cc8d636986e8a"
+    depends_on:
+      db-vulnerable:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db-vulnerable
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress-lab-pw-2017
+      WORDPRESS_DB_NAME: wordpress
+    mem_limit: 256m
+
+  nginx-vulnerable:
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    depends_on: [fpm-vulnerable]
+    environment:
+      FPM_HOST: fpm-vulnerable
+    volumes:
+      - ./nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    ports: ["127.0.0.1:18201:80"]
+    mem_limit: 64m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:80/"]
+      interval: 3s
+      retries: 40
+
+  db-fixed:
+    image: mariadb:11.4@sha256:d1891ede5a559f1086f55053bb8cc1569b0298338c4d72d71725a7f74f6ba620
+    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=0"]
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress-lab-pw-2017
+      MARIADB_RANDOM_ROOT_PASSWORD: "1"
+    mem_limit: 300m
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      retries: 40
+
+  fpm-fixed:
+    build:
+      context: app
+      args:
+        # wordpress:4.7.2-php7.0-fpm-alpine (fixed: the patched release named by the advisory).
+        BASE_IMAGE: "wordpress:4.7.2-php7.0-fpm-alpine@sha256:c64cdcaff8f9c23b468c9b02d93e46241d91de7dd3619579627e8b6bf8c940b2"
+    depends_on:
+      db-fixed:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db-fixed
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress-lab-pw-2017
+      WORDPRESS_DB_NAME: wordpress
+    mem_limit: 256m
+
+  nginx-fixed:
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    depends_on: [fpm-fixed]
+    environment:
+      FPM_HOST: fpm-fixed
+    volumes:
+      - ./nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    ports: ["127.0.0.1:18202:80"]
+    mem_limit: 64m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:80/"]
+      interval: 3s
+      retries: 40
