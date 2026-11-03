@@ -55,6 +55,12 @@ for d, dirs, files in os.walk(root):
                 os.unlink(p)
                 os.symlink(os.path.relpath(root + t, d), p)
 PY
+# And qemu falls back to the host's file for any path the sysroot lacks. The loader reads
+# /etc/ld.so.cache, which this image does not have, so it read the host's, which names
+# /usr/lib/x86_64-linux-gnu/libc.so.6: not in this sysroot either (Debian 12 keeps its
+# libraries in /lib), so the host's libc was loaded after all. An empty cache is ignored
+# by the loader, which then searches its default directories, and those are in here.
+: >"$DIR/etc/ld.so.cache"
 [ -z "$(find "$DIR" -type l -lname '/*')" ] || fail "an absolute symlink is left in $DIR: qemu would follow it in the host's root"
 [ -e "$DIR/$LOADER" ] || fail "$IMAGE has no /$LOADER for $PLATFORM (or its link does not resolve inside $DIR)"
 [ -e "$DIR/$LIBC" ] || fail "$IMAGE has no /$LIBC for $PLATFORM"
