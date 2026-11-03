@@ -740,9 +740,16 @@ mod tests {
         // this fix: curling two Content-Type headers (text/plain, then multipart/form-data)
         // at a rule with content_types = ["multipart/form-data"] got 503 (not matched), not
         // 403 -- and the same for a [[rule.headers]] equals check on a repeated header.
+        //
+        // Review on #775: the first version of this test only exercised `equals`, so a
+        // regression isolated to `contains`'s own repeated-value handling could have passed
+        // unnoticed -- the fix in rule_matches() treats them identically (both read
+        // get_all()), but the test must say so for each, not assume one proves the other.
         let toml = "[[rule]]\nid='ct'\ncve='CVE-2099-7'\naction='deny'\ncontent_types=['multipart/form-data']\n\
                     [[rule]]\nid='hdr'\ncve='CVE-2099-8'\naction='deny'\n\
-                    [[rule.headers]]\nname='x-probe'\nequals='bad'\n";
+                    [[rule.headers]]\nname='x-probe'\nequals='bad'\n\
+                    [[rule]]\nid='hdr-sub'\ncve='CVE-2099-9'\naction='deny'\n\
+                    [[rule.headers]]\nname='x-sub'\ncontains='evil'\n";
         let rules = VirtualPatchRules::from_toml_str(toml).unwrap();
 
         // The dangerous Content-Type as the SECOND of two values.
@@ -785,6 +792,19 @@ mod tests {
         let h2_absent = hm(&[]);
         assert!(matches!(
             rules.evaluate(&target("GET", "/x", None, &h2_absent), false),
+            Verdict::NoMatch
+        ));
+
+        // The same repeated-value proof, for `contains` specifically: the dangerous substring
+        // as the SECOND of two x-sub occurrences.
+        let h3 = hm(&[("x-sub", "fine"), ("x-sub", "this has evil in it")]);
+        assert!(matches!(
+            rules.evaluate(&target("GET", "/x", None, &h3), false),
+            Verdict::Block(_)
+        ));
+        let h3_safe = hm(&[("x-sub", "fine"), ("x-sub", "still fine")]);
+        assert!(matches!(
+            rules.evaluate(&target("GET", "/x", None, &h3_safe), false),
             Verdict::NoMatch
         ));
     }
