@@ -531,8 +531,8 @@ pub enum UaVerdict {
     /// Nothing to compare: the check is off, the request has no `User-Agent`, or the
     /// `User-Agent` does not claim a browser.
     Skip,
-    /// It claims a browser but carries no JA4 (HTTP/3, plaintext listener, an
-    /// unfingerprintable hello). Never a mismatch: absence proves nothing.
+    /// It claims a browser but carries no JA4 (HTTP/3, an unfingerprintable
+    /// hello). Never a mismatch: absence proves nothing.
     NoJa4,
     /// It claims a browser and its JA4 is not one named as a tool.
     Consistent,
@@ -667,21 +667,25 @@ impl TlsFpRuntime {
     /// The JA4 / User-Agent verdict for one request (#720), without side effects.
     ///
     /// `ja4` is the attested `X-Client-TLS-JA4` value (`None` when the connection has
-    /// none), `user_agent` the request's `User-Agent` bytes. The order matters: a
+    /// none), `user_agents` the bytes of every `User-Agent` value the request carries. The order matters: a
     /// request that does not claim a browser is `Skip` before its JA4 is looked at, so
     /// `NoJa4` counts only the requests the check would have wanted to compare.
-    pub fn ua_verdict(&self, ja4: Option<&str>, user_agent: Option<&[u8]>) -> UaVerdict {
+    pub fn ua_verdict<'a>(
+        &self,
+        ja4: Option<&str>,
+        user_agents: impl IntoIterator<Item = &'a [u8]>,
+    ) -> UaVerdict {
         let Some(ua) = self.ua.as_ref() else {
             return UaVerdict::Skip;
         };
-        let Some(user_agent) = user_agent else {
-            return UaVerdict::Skip;
-        };
-        if !ua
-            .browser_ua
-            .iter()
-            .any(|b| contains_ascii_ci(user_agent, b))
-        {
+        // EVERY User-Agent value counts: a request may carry several and the proxy forwards
+        // them all, so a tool that sends `curl/8.5` first and `Chrome/131` second would
+        // otherwise be judged by the first and reach an upstream that reads the last.
+        if !user_agents.into_iter().any(|user_agent| {
+            ua.browser_ua
+                .iter()
+                .any(|b| contains_ascii_ci(user_agent, b))
+        }) {
             return UaVerdict::Skip;
         }
         match ja4 {
@@ -696,10 +700,10 @@ impl TlsFpRuntime {
     /// `/healthz` and `/readyz` are exempt for the reason given on [`Self::route_gate`].
     /// Logged at debug: the User-Agent and JA4 are client-controlled and replayable; the
     /// counters are the operator signal.
-    pub fn ua_gate(
+    pub fn ua_gate<'a>(
         &self,
         ja4: Option<&str>,
-        user_agent: Option<&[u8]>,
+        user_agents: impl IntoIterator<Item = &'a [u8]>,
         path: &str,
     ) -> GateDecision {
         use std::sync::atomic::Ordering::Relaxed;
@@ -707,7 +711,7 @@ impl TlsFpRuntime {
             return GateDecision::Proceed;
         }
         let m = &crate::metrics::METRICS;
-        match self.ua_verdict(ja4, user_agent) {
+        match self.ua_verdict(ja4, user_agents) {
             UaVerdict::Skip => GateDecision::Proceed,
             UaVerdict::NoJa4 => {
                 m.tls_fp_ua_no_ja4.fetch_add(1, Relaxed);
@@ -2166,24 +2170,61 @@ mod tests {
             ),
             UaVerdict::Consistent
         );
-        // No JA4 (HTTP/3, :80): never a mismatch, but counted apart.
+        // No JA4 (HTTP/3): never a mismatch, but counted apart.
         assert_eq!(rt.ua_verdict(None, Some(CHROME_UA)), UaVerdict::NoJa4);
         // A UA that does not claim a browser is not compared at all, whatever the JA4,
         // and neither is a request without a UA.
         assert_eq!(
-            rt.ua_verdict(Some(TOOL_JA4), Some(b"curl/8.5.0")),
+            rt.ua_verdict(Some(TOOL_JA4), Some(&b"curl/8.5.0"[..])),
             UaVerdict::Skip
         );
-        assert_eq!(rt.ua_verdict(None, Some(b"curl/8.5.0")), UaVerdict::Skip);
+        assert_eq!(
+            rt.ua_verdict(None, Some(&b"curl/8.5.0"[..])),
+            UaVerdict::Skip
+        );
         assert_eq!(rt.ua_verdict(Some(TOOL_JA4), None), UaVerdict::Skip);
         // The pattern list is case-insensitive: lowercasing the UA is no way out.
         assert_eq!(
-            rt.ua_verdict(Some(TOOL_JA4), Some(b"mozilla/5.0 chrome/131")),
+            rt.ua_verdict(Some(TOOL_JA4), Some(&b"mozilla/5.0 chrome/131"[..])),
             UaVerdict::Mismatch
         );
         assert_eq!(
-            rt.ua_verdict(Some(TOOL_JA4), Some(b"Mozilla/5.0 Gecko Firefox/120.0")),
+            rt.ua_verdict(
+                Some(TOOL_JA4),
+                Some(&b"Mozilla/5.0 Gecko Firefox/120.0"[..])
+            ),
             UaVerdict::Mismatch
+        );
+    }
+
+    #[test]
+    fn ua_verdict_considers_every_user_agent_value() {
+        use crate::config::UaCheckMode;
+        let rt = ua_runtime(UaCheckMode::Enforce);
+        let tool: &[u8] = b"curl/8.5.0";
+        // The proxy forwards every User-Agent header, so a browser claim in ANY of them is
+        // a claim, whichever comes first.
+        assert_eq!(
+            rt.ua_verdict(Some(TOOL_JA4), [tool, CHROME_UA]),
+            UaVerdict::Mismatch
+        );
+        assert_eq!(
+            rt.ua_verdict(Some(TOOL_JA4), [CHROME_UA, tool]),
+            UaVerdict::Mismatch
+        );
+        assert_eq!(
+            rt.ua_gate(Some(TOOL_JA4), [tool, CHROME_UA], "/"),
+            GateDecision::Reject
+        );
+        // None of them claims a browser: not compared.
+        assert_eq!(
+            rt.ua_verdict(Some(TOOL_JA4), [tool, &b"python-requests/2.31"[..]]),
+            UaVerdict::Skip
+        );
+        // No value at all: not compared.
+        assert_eq!(
+            rt.ua_verdict(Some(TOOL_JA4), std::iter::empty::<&[u8]>()),
+            UaVerdict::Skip
         );
     }
 

@@ -6,7 +6,7 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ### Added
 
-- **A browser `User-Agent` on a tool's TLS fingerprint can be flagged or refused** (#720). With `--features tls-fingerprint`, `[tls.fingerprint.ua_check]` compares the request's `User-Agent` with the connection's JA4: when it claims a browser (`browser_ua`) and the JA4 is one the operator named as a tool (`tool_names`, entries of `[[tls.fingerprint.allowed]]`), `shadow` counts it and `enforce` answers `403`. A soft signal, off by default; zion ships no fingerprint database, a request without a JA4 (HTTP/3, `:80`) is never a mismatch, and a config that could never fire is refused at boot. New counters `zion_tls_fp_ua_checked`, `zion_tls_fp_ua_mismatch`, `zion_tls_fp_ua_no_ja4`.
+- **A browser `User-Agent` on a tool's TLS fingerprint can be flagged or refused** (#720). With `--features tls-fingerprint`, `[tls.fingerprint.ua_check]` compares the request's `User-Agent` with the connection's JA4: when it claims a browser (`browser_ua`) and the JA4 is one the operator named as a tool (`tool_names`, entries of `[[tls.fingerprint.allowed]]`), `shadow` counts it and `enforce` answers `403`. A soft signal, off by default; zion ships no fingerprint database, a request without a JA4 (HTTP/3, an unfingerprintable ClientHello) is never a mismatch and is counted apart, every `User-Agent` value of a request is considered, and a config that could never fire is refused at boot. New counters `zion_tls_fp_ua_checked`, `zion_tls_fp_ua_mismatch`, `zion_tls_fp_ua_no_ja4`.
 
 ## [0.16.0] - 2026-10-26
 

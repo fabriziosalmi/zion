@@ -457,9 +457,8 @@ pub struct Metrics {
     /// Of those, the ones whose JA4 is a fingerprint named as a non-browser tool:
     /// 403 in `enforce`, counted only in `shadow`.
     pub tls_fp_ua_mismatch: AtomicU64,
-    /// Requests claiming a browser that carried no JA4 (HTTP/3, the plaintext
-    /// listener, an unfingerprintable hello): never a mismatch, counted so the
-    /// blind spot is visible.
+    /// Requests claiming a browser that carried no JA4 (HTTP/3, an unfingerprintable
+    /// hello): never a mismatch, counted so the blind spot is visible.
     pub tls_fp_ua_no_ja4: AtomicU64,
     /// Connections closed at accept because the source IP was already at
     /// its `max_connections_per_ip` concurrent cap (anti-DDoS lever).
@@ -1289,7 +1288,7 @@ impl Metrics {
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(
-            b"# HELP zion_tls_fp_ua_no_ja4 Requests claiming a browser that carried no JA4 (HTTP/3, plaintext listener); never a mismatch.\n\
+            b"# HELP zion_tls_fp_ua_no_ja4 Requests claiming a browser that carried no JA4 (HTTP/3, unfingerprintable hello); never a mismatch.\n\
                                 # TYPE zion_tls_fp_ua_no_ja4 counter\n\
                                 zion_tls_fp_ua_no_ja4 ",
         );

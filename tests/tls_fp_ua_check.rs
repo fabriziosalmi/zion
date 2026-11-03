@@ -209,14 +209,21 @@ fn connector(client: Client) -> tokio_rustls::TlsConnector {
 
 /// One GET over a fresh TLS connection; `(status, body)`.
 async fn get(zion: &Zion, client: Client, user_agent: &str) -> (u16, String) {
+    get_with(zion, client, &[user_agent]).await
+}
+
+/// As [`get`], with one `User-Agent` header per entry of `user_agents`, in that order.
+async fn get_with(zion: &Zion, client: Client, user_agents: &[&str]) -> (u16, String) {
+    let headers: String = user_agents
+        .iter()
+        .map(|ua| format!("User-Agent: {ua}\r\n"))
+        .collect();
     let tcp = TcpStream::connect(("127.0.0.1", zion.https)).await.unwrap();
     let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
     let mut tls = connector(client).connect(name, tcp).await.unwrap();
     tls.write_all(
-        format!(
-            "GET /x HTTP/1.1\r\nHost: localhost\r\nUser-Agent: {user_agent}\r\nConnection: close\r\n\r\n"
-        )
-        .as_bytes(),
+        format!("GET /x HTTP/1.1\r\nHost: localhost\r\n{headers}Connection: close\r\n\r\n")
+            .as_bytes(),
     )
     .await
     .unwrap();
@@ -293,6 +300,38 @@ async fn enforce_refuses_a_browser_user_agent_on_a_tool_fingerprint_and_nothing_
     assert_eq!(get(&zion, Client::B, CHROME_UA).await.0, 200);
     // The browser fingerprint with a tool User-Agent is not this check's business.
     assert_eq!(get(&zion, Client::B, "curl/8.5.0").await.0, 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_user_agent_header_does_not_hide_a_browser_claim() {
+    // The proxy forwards every User-Agent header, so an upstream that reads the last one sees
+    // the browser claim. Judging only the first would let the tool through.
+    let bp = backend();
+    let Some((a, b)) = measure(bp).await else {
+        return;
+    };
+    let Some(zion) = start(bp, &block(&a, &b, &UA_CHECK.replace("MODE", "enforce"))) else {
+        return;
+    };
+    assert_eq!(
+        get_with(&zion, Client::A, &["curl/8.5.0", CHROME_UA])
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        get_with(&zion, Client::A, &[CHROME_UA, "curl/8.5.0"])
+            .await
+            .0,
+        403
+    );
+    // Two values, neither claiming a browser: nothing to compare.
+    assert_eq!(
+        get_with(&zion, Client::A, &["curl/8.5.0", "python-requests/2.31"])
+            .await
+            .0,
+        200
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

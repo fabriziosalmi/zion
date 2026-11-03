@@ -143,13 +143,14 @@ A request is a **mismatch** when its `User-Agent` contains one of `browser_ua` (
 |---|---|
 | browser `User-Agent`, JA4 of a `tool_names` entry | mismatch |
 | browser `User-Agent`, any other JA4 (known or unknown) | consistent |
-| browser `User-Agent`, no JA4 | not compared, counted in `zion_tls_fp_ua_no_ja4` |
+| browser `User-Agent` (in any of its values), no JA4 | not compared, counted in `zion_tls_fp_ua_no_ja4` |
 | no `User-Agent`, or one that does not claim a browser | not compared |
 
 What it does not do:
 
 - It is a soft signal. It catches the client that forged the `User-Agent` only; one that also forges its ClientHello is not caught.
-- HTTP/3 and the plaintext `:80` listener carry no JA4, so they are never compared. Watch `zion_tls_fp_ua_no_ja4` to see how much of your browser traffic that is.
+- HTTP/3 carries no JA4, and neither does a `:443` connection whose ClientHello could not be fingerprinted, so those requests are never compared. Watch `zion_tls_fp_ua_no_ja4` to see how much of your browser traffic that is. The plaintext `:80` listener serves ACME challenges and redirects only, so there is no application traffic on it to compare.
+- Every `User-Agent` value of a request counts: a request carrying `curl/8.5` and `Chrome/131` in two headers claims a browser.
 - An unknown JA4 is never a mismatch. A browser update changes its JA4: keep the `chrome` entry current, or it is simply not named as a tool.
 - `/healthz` and `/readyz` are never refused.
 

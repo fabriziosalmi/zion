@@ -889,7 +889,8 @@ pub struct FingerprintConfig {
 /// A soft signal. It catches a client that forged only the `User-Agent` string
 /// (curl, a Go or Python HTTP client saying it is Chrome); a client that also
 /// forges the ClientHello is not caught. It needs a JA4, so it never applies to
-/// HTTP/3 or to the plaintext listener, which compute none, and a request
+/// HTTP/3, which computes none (the plaintext listener serves only ACME challenges and
+/// redirects), and a request
 /// without a JA4 is never a mismatch. Zion ships no fingerprint database: the
 /// operator names, in `[[tls.fingerprint.allowed]]`, the JA4s they have seen and
 /// know to be tools, and lists those names in `tool_names`.

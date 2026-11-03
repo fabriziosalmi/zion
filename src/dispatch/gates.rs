@@ -474,12 +474,13 @@ fn tls_fingerprint(ctx: &PreCtx, req: &Request<ReqBody>) -> Option<Response<Zion
         }
         // JA4 / User-Agent consistency (#720), after the route restriction so a request
         // that is refused there is not also counted here. A request with no JA4 (HTTP/3,
-        // the plaintext listener) still reaches it: that absence is what it counts.
-        let user_agent = req
+        // an unfingerprintable hello) still reaches it: that absence is what it counts.
+        let user_agents = req
             .headers()
-            .get(hyper::header::USER_AGENT)
+            .get_all(hyper::header::USER_AGENT)
+            .iter()
             .map(|v| v.as_bytes());
-        if fp.ua_gate(ja4, user_agent, req.uri().path()) == crate::tls_fp::GateDecision::Reject {
+        if fp.ua_gate(ja4, user_agents, req.uri().path()) == crate::tls_fp::GateDecision::Reject {
             return Some(empty_response(StatusCode::FORBIDDEN));
         }
     }
