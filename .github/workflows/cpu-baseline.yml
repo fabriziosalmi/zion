@@ -32,6 +32,7 @@ on:
       - "Dockerfile"
       - "rust-toolchain.toml"
       - "scripts/cpu-baseline-smoke.sh"
+      - "scripts/baseline-sysroot.sh"
       - ".github/workflows/cpu-baseline.yml"
       - ".github/workflows/release.yml"
   workflow_dispatch:
