@@ -37,8 +37,13 @@
 #   SMOKE_CC       C compiler for the control program, for the binary's
 #                  architecture (default: cc when the host is that architecture,
 #                  else `zig cc`, else the Debian cross gcc)
-#   SMOKE_SYSROOT  libraries for a dynamically linked binary of another
-#                  architecture (default /usr/<arch>-linux-gnu, when it exists)
+#   SMOKE_SYSROOT  libraries a dynamically linked binary loads (qemu -L). Default:
+#                  /usr/<arch>-linux-gnu when the host is another architecture,
+#                  else the host's own. Set it for a binary of the host's
+#                  architecture too when the host's libc is not baseline (Ubuntu
+#                  26.04 is x86-64-v3 throughout: its glibc stops under Opteron_G1
+#                  before main, so the binary is never reached; #766).
+#                  scripts/baseline-sysroot.sh makes the one the image ships.
 #
 # Needs: curl, openssl, python3; in emulate mode qemu-user and a C compiler.
 
@@ -79,9 +84,15 @@ if [ "$MODE" = emulate ]; then
   QEMU=qemu-$ARCH
   command -v "$QEMU" >/dev/null || fail "$QEMU is not installed (Debian/Ubuntu: qemu-user)"
   EMU=("$QEMU")
-  SYSROOT=${SMOKE_SYSROOT:-/usr/$ARCH-linux-gnu}
-  if [ "$(uname -m)" != "$ARCH" ] && [ -d "$SYSROOT" ]; then
-    EMU+=(-L "$SYSROOT")
+  if [ -n "${SMOKE_SYSROOT:-}" ]; then
+    # Asked for by name: on any host, and a typo is an error, not the host's libc.
+    [ -d "$SMOKE_SYSROOT" ] || fail "SMOKE_SYSROOT=$SMOKE_SYSROOT is not a directory"
+    EMU+=(-L "$SMOKE_SYSROOT")
+  else
+    SYSROOT=/usr/$ARCH-linux-gnu
+    if [ "$(uname -m)" != "$ARCH" ] && [ -d "$SYSROOT" ]; then
+      EMU+=(-L "$SYSROOT")
+    fi
   fi
   RUN=("${EMU[@]}" -cpu "$CPU")
   ulimit -c 0 # an illegal instruction is an outcome here, not something to keep a core file of
@@ -94,26 +105,44 @@ fi
 
 # ── control: the emulated processor refuses what it must refuse ──────────────
 if [ "$MODE" = emulate ]; then
+  # No libc: the control is a bare _start that exits through the system call, so
+  # nothing but its one instruction can stop it. With a libc, a host whose own
+  # startup code needs a newer processor (Ubuntu 26.04, #766) would end it with
+  # status 132 for that reason, and the control would pass without proving that
+  # the emulator refuses the instruction. A sibling without the instruction must
+  # run under the old processor: that is what rules this out.
   if [ "$ARCH" = x86_64 ]; then
     WHAT="an AVX2 instruction"
     CFLAGS=(-mavx2)
     cat >"$W/control.c" <<'C'
-int main(void) {
+void _start(void) {
+#ifdef CONTROL_INSN
   __asm__ volatile("vpxor %ymm0, %ymm0, %ymm0");
-  return 0;
+#endif
+  __asm__ volatile("xor %edi, %edi\n\tmov $231, %eax\n\tsyscall"); /* exit_group(0) */
+  for (;;) {
+  }
 }
 C
   else
     WHAT="an LSE instruction"
     CFLAGS=() # the extension is switched on in the assembly: no -march, which not every driver takes
     cat >"$W/control.c" <<'C'
-int main(void) {
+void _start(void) {
   unsigned cell = 0, expected = 0, wanted = 1;
+#ifdef CONTROL_INSN
   __asm__ volatile(".arch_extension lse\n\tcasal %w[e], %w[n], [%[p]]"
                    : [e] "+r"(expected)
                    : [n] "r"(wanted), [p] "r"(&cell)
                    : "memory");
-  return cell == 1 ? 0 : 3;
+#else
+  cell = 1;
+#endif
+  register long code __asm__("x0") = cell == 1 ? 0 : 3;
+  register long nr __asm__("x8") = 94; /* exit_group */
+  __asm__ volatile("svc #0" : : "r"(code), "r"(nr) : "memory");
+  for (;;) {
+  }
 }
 C
   fi
@@ -126,20 +155,28 @@ C
   else
     CC=("$ARCH-linux-gnu-gcc")
   fi
-  "${CC[@]}" -static -O0 ${CFLAGS[@]+"${CFLAGS[@]}"} -o "$W/control" "$W/control.c" 2>"$W/control.err" ||
-    { cat "$W/control.err" >&2; fail "could not compile the control program with '${CC[*]}'"; }
+  for variant in control baseline; do
+    DEF=()
+    [ "$variant" = control ] && DEF=(-DCONTROL_INSN)
+    "${CC[@]}" -static -nostdlib -nostartfiles -ffreestanding -fno-stack-protector -O0 \
+      ${DEF[@]+"${DEF[@]}"} ${CFLAGS[@]+"${CFLAGS[@]}"} -o "$W/$variant" "$W/control.c" 2>"$W/control.err" ||
+      { cat "$W/control.err" >&2; fail "could not compile the $variant program with '${CC[*]}'"; }
+  done
   # In subshells: the shell that waits for a process killed by a signal says so on its
   # stderr, and here that death is the expected outcome.
   set +e
+  ("${EMU[@]}" -cpu "$CPU" "$W/baseline"; exit $?) >/dev/null 2>&1
+  BASE=$?
   ("${EMU[@]}" -cpu "$CPU" "$W/control"; exit $?) >/dev/null 2>&1
   OLD=$?
   ("${EMU[@]}" -cpu "$NEWER" "$W/control"; exit $?) >/dev/null 2>&1
   NEW=$?
   set -e
+  [ "$BASE" -eq 0 ] || fail "control: the same program without $WHAT ended with status $BASE under -cpu $CPU, expected 0. Something other than that instruction stops it, so its status 132 would prove nothing."
   # 132 = 128 + SIGILL.
   [ "$OLD" -eq 132 ] || fail "control: $WHAT under -cpu $CPU ended with status $OLD, expected 132 (illegal instruction). This emulator does not enforce the processor model: the check would pass for any binary."
   [ "$NEW" -eq 0 ] || fail "control: $WHAT under -cpu $NEWER ended with status $NEW, expected 0. The control program is broken, not refused."
-  echo "  control: $WHAT stops under -cpu $CPU (status 132) and runs under -cpu $NEWER"
+  echo "  control: $WHAT stops under -cpu $CPU (status 132), the program without it runs there, and it runs under -cpu $NEWER"
 fi
 
 # ── check 1: what the binary says it was built for ───────────────────────────

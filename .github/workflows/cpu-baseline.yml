@@ -32,6 +32,7 @@ on:
       - "Dockerfile"
       - "rust-toolchain.toml"
       - "scripts/cpu-baseline-smoke.sh"
+      - "scripts/baseline-sysroot.sh"
       - ".github/workflows/cpu-baseline.yml"
       - ".github/workflows/release.yml"
   workflow_dispatch:
@@ -48,14 +49,10 @@ env:
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
 
-# Pinned, not ubuntu-latest: since 2026-10-26..31 latest is ubuntu-26.04 (qemu 10.2.1),
-# where the x86_64 gnu binary and the amd64 image stop with an illegal instruction
-# under Opteron_G1 (bisected: it fails on 18bc8b8, before any dependency change;
-# it passes on ubuntu-24.04, qemu 8.2.2). The cause on 26.04 is not yet explained.
 jobs:
   artefact:
     name: artefact (${{ matrix.target }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -107,10 +104,18 @@ jobs:
           export "${var}=$(bash scripts/remap-rustflags.sh)" ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-cache" ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/zig-cache"
           cargo zigbuild --release --locked --features dist --target "${TARGET}"
 
+      # The libc the binary loads is the one of the image we ship, not the runner's:
+      # see scripts/baseline-sysroot.sh. A musl binary does not load one; it is
+      # tested the same way so that no target is special.
+      - name: The libc of the shipped image, for the emulator
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash scripts/baseline-sysroot.sh "${TARGET%%-*}" "${RUNNER_TEMP}/sysroot"
+
       - name: Declared, and served under an emulated baseline CPU
         env:
           TARGET: ${{ matrix.target }}
-        run: bash scripts/cpu-baseline-smoke.sh "target/${TARGET}/release/zion"
+        run: SMOKE_SYSROOT="${RUNNER_TEMP}/sysroot" bash scripts/cpu-baseline-smoke.sh "target/${TARGET}/release/zion"
 
   image:
     name: image (${{ matrix.arch }})
@@ -121,7 +126,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-24.04
+            runner: ubuntu-latest
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -150,7 +155,9 @@ jobs:
           # built with, and the script asks it for the target's default features.
           rustup toolchain install >/dev/null 2>&1 || true
           rustc --version
-          bash scripts/cpu-baseline-smoke.sh "${RUNNER_TEMP}/zion"
+          # The libc of the image we ship, not the runner's (scripts/baseline-sysroot.sh).
+          bash scripts/baseline-sysroot.sh "$(uname -m)" "${RUNNER_TEMP}/sysroot"
+          SMOKE_SYSROOT="${RUNNER_TEMP}/sysroot" bash scripts/cpu-baseline-smoke.sh "${RUNNER_TEMP}/zion"
 
   declared:
     name: declared (${{ matrix.target }})
@@ -215,7 +222,7 @@ jobs:
 
   control:
     name: control (the script refuses the v0.12.0 ${{ matrix.arch }} build)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
