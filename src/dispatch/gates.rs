@@ -283,16 +283,11 @@ pub(crate) fn virtual_patch(
     if rules.is_empty() {
         return None;
     }
-    let content_type = req
-        .headers()
-        .get(hyper::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok());
     let target = crate::virtual_patch::Target {
         method: req.method().as_str(),
         path: req.uri().path(),
         query: req.uri().query(),
         headers: req.headers(),
-        content_type,
     };
     let ip = state.redact.ip_label(remote_addr.ip());
     match rules.evaluate(&target, cfg.virtual_patch_shadow) {

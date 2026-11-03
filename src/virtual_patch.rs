@@ -129,13 +129,19 @@ impl Rule {
     }
 }
 
-/// The request facts a rule matches against (the non-body shape).
+/// The request facts a rule matches against (the non-body shape). There is no separate
+/// `content_type` field: `headers` already carries every `Content-Type` value a request
+/// sent, and `rule_matches()` reads all of them -- a single pre-extracted value (as this
+/// struct used to carry, built from `HeaderMap::get()`, which only sees the FIRST of a
+/// repeated header) would have let a rule's `content_types` or `[[rule.headers]]` check be
+/// evaded by putting the dangerous value in a second occurrence of the header (found on
+/// review of #774's own audit trail: the same class of bug already fixed once today in
+/// `tls_fp`'s User-Agent check, for the same reason).
 pub struct Target<'a> {
     pub method: &'a str,
     pub path: &'a str,
     pub query: Option<&'a str>,
     pub headers: &'a hyper::HeaderMap,
-    pub content_type: Option<&'a str>,
 }
 
 /// What evaluating the rules decided.
@@ -277,32 +283,41 @@ fn rule_matches(rule: &Rule, t: &Target<'_>) -> bool {
             return false;
         }
     }
-    // content-type (any prefix matches)
+    // content-type (any prefix matches ANY of the request's Content-Type values -- a request
+    // can carry more than one, and the one an upstream actually acts on is not necessarily
+    // the first; HeaderMap::get() would only ever see that first one).
     if !c.content_types.is_empty() {
-        let ct = t.content_type.unwrap_or("");
-        if !c
-            .content_types
+        let any_matches = t
+            .headers
+            .get_all(hyper::header::CONTENT_TYPE)
             .iter()
-            .any(|p| ct.len() >= p.len() && ct[..p.len()].eq_ignore_ascii_case(p))
-        {
+            .any(|v| {
+                let ct = v.to_str().unwrap_or("");
+                c.content_types
+                    .iter()
+                    .any(|p| ct.len() >= p.len() && ct[..p.len()].eq_ignore_ascii_case(p))
+            });
+        if !any_matches {
             return false;
         }
     }
-    // headers
+    // headers: for each named header, some ONE of its (possibly repeated) values must satisfy
+    // every condition configured for it -- not "the first value satisfies equals and some
+    // other, different occurrence happens to satisfy contains". Repeating a header is how a
+    // request can carry a dangerous value while an inspector that only reads HeaderMap::get()
+    // (the first occurrence) sees only an innocuous one.
     for h in &c.headers {
-        let Some(val) = t.headers.get(&h.name) else {
+        let any_matches = t.headers.get_all(&h.name).iter().any(|val| {
+            let val = val.as_bytes();
+            let eq_ok = h.equals.as_deref().is_none_or(|eq| val == eq.as_bytes());
+            let sub_ok = h
+                .contains
+                .as_deref()
+                .is_none_or(|sub| contains_subslice(val, sub.as_bytes()));
+            eq_ok && sub_ok
+        });
+        if !any_matches {
             return false;
-        };
-        let val = val.as_bytes();
-        if let Some(eq) = &h.equals {
-            if val != eq.as_bytes() {
-                return false;
-            }
-        }
-        if let Some(sub) = &h.contains {
-            if !contains_subslice(val, sub.as_bytes()) {
-                return false;
-            }
         }
     }
     // cookies (names present)
@@ -531,14 +546,12 @@ mod tests {
         path: &'a str,
         query: Option<&'a str>,
         headers: &'a hyper::HeaderMap,
-        ct: Option<&'a str>,
     ) -> Target<'a> {
         Target {
             method,
             path,
             query,
             headers,
-            content_type: ct,
         }
     }
 
@@ -640,25 +653,25 @@ mod tests {
         // matches: POST /api/.. with x-evil present
         let h = hm(&[("x-evil", "1")]);
         assert!(matches!(
-            rules.evaluate(&target("POST", "/api/users", None, &h, None), false),
+            rules.evaluate(&target("POST", "/api/users", None, &h), false),
             Verdict::Block(_)
         ));
         // wrong method
         let h2 = hm(&[("x-evil", "1")]);
         assert!(matches!(
-            rules.evaluate(&target("GET", "/api/users", None, &h2, None), false),
+            rules.evaluate(&target("GET", "/api/users", None, &h2), false),
             Verdict::NoMatch
         ));
         // missing header
         let h3 = hm(&[("x-good", "1")]);
         assert!(matches!(
-            rules.evaluate(&target("POST", "/api/users", None, &h3, None), false),
+            rules.evaluate(&target("POST", "/api/users", None, &h3), false),
             Verdict::NoMatch
         ));
         // wrong path
         let h4 = hm(&[("x-evil", "1")]);
         assert!(matches!(
-            rules.evaluate(&target("POST", "/public", None, &h4, None), false),
+            rules.evaluate(&target("POST", "/public", None, &h4), false),
             Verdict::NoMatch
         ));
     }
@@ -672,12 +685,12 @@ mod tests {
         let h = hm(&[]);
         // shadow deny -> observed, not blocked, counted as would_block
         assert!(matches!(
-            rules.evaluate(&target("GET", "/x", None, &h, None), false),
+            rules.evaluate(&target("GET", "/x", None, &h), false),
             Verdict::Observed(_)
         ));
         // log -> observed
         assert!(matches!(
-            rules.evaluate(&target("POST", "/log/y", None, &h, None), false),
+            rules.evaluate(&target("POST", "/log/y", None, &h), false),
             Verdict::Observed(_)
         ));
         // counters: rule 's' matched once, would_block once
@@ -694,21 +707,12 @@ mod tests {
         let rules = VirtualPatchRules::from_toml_str(toml).unwrap();
         let h = hm(&[("content-type", "multipart/form-data; boundary=x")]);
         assert!(matches!(
-            rules.evaluate(
-                &target(
-                    "POST",
-                    "/u",
-                    Some("tag=bad&z=1"),
-                    &h,
-                    Some("multipart/form-data")
-                ),
-                false
-            ),
+            rules.evaluate(&target("POST", "/u", Some("tag=bad&z=1"), &h), false),
             Verdict::Block(_)
         ));
         // query value wrong
         assert!(matches!(
-            rules.evaluate(&target("POST", "/u", Some("tag=good"), &h, None), false),
+            rules.evaluate(&target("POST", "/u", Some("tag=good"), &h), false),
             Verdict::NoMatch
         ));
 
@@ -716,12 +720,91 @@ mod tests {
         let rules2 = VirtualPatchRules::from_toml_str(toml2).unwrap();
         let hc = hm(&[("cookie", "a=1; sessionid=zzz; b=2")]);
         assert!(matches!(
-            rules2.evaluate(&target("GET", "/", None, &hc, None), false),
+            rules2.evaluate(&target("GET", "/", None, &hc), false),
             Verdict::Block(_)
         ));
         let hc2 = hm(&[("cookie", "a=1; b=2")]);
         assert!(matches!(
-            rules2.evaluate(&target("GET", "/", None, &hc2, None), false),
+            rules2.evaluate(&target("GET", "/", None, &hc2), false),
+            Verdict::NoMatch
+        ));
+    }
+
+    #[test]
+    fn content_types_and_header_match_see_a_dangerous_value_in_any_repeated_occurrence() {
+        // Real finding on #774 (same class as the tls_fp User-Agent fix done earlier the same
+        // day): HeaderMap::get() only sees the FIRST of a repeated header. A request can carry
+        // the dangerous value in a SECOND occurrence while the first is innocuous -- zion
+        // forwards every value it received, so there is no basis for assuming an upstream
+        // only ever acts on the first one either. Confirmed against the real binary before
+        // this fix: curling two Content-Type headers (text/plain, then multipart/form-data)
+        // at a rule with content_types = ["multipart/form-data"] got 503 (not matched), not
+        // 403 -- and the same for a [[rule.headers]] equals check on a repeated header.
+        //
+        // Review on #775: the first version of this test only exercised `equals`, so a
+        // regression isolated to `contains`'s own repeated-value handling could have passed
+        // unnoticed -- the fix in rule_matches() treats them identically (both read
+        // get_all()), but the test must say so for each, not assume one proves the other.
+        let toml = "[[rule]]\nid='ct'\ncve='CVE-2099-7'\naction='deny'\ncontent_types=['multipart/form-data']\n\
+                    [[rule]]\nid='hdr'\ncve='CVE-2099-8'\naction='deny'\n\
+                    [[rule.headers]]\nname='x-probe'\nequals='bad'\n\
+                    [[rule]]\nid='hdr-sub'\ncve='CVE-2099-9'\naction='deny'\n\
+                    [[rule.headers]]\nname='x-sub'\ncontains='evil'\n";
+        let rules = VirtualPatchRules::from_toml_str(toml).unwrap();
+
+        // The dangerous Content-Type as the SECOND of two values.
+        let h1 = hm(&[
+            ("content-type", "text/plain"),
+            ("content-type", "multipart/form-data; boundary=x"),
+        ]);
+        assert!(matches!(
+            rules.evaluate(&target("POST", "/x", None, &h1), false),
+            Verdict::Block(_)
+        ));
+        // As the only value, for comparison -- must still match (not a regression).
+        let h1_only = hm(&[("content-type", "multipart/form-data; boundary=x")]);
+        assert!(matches!(
+            rules.evaluate(&target("POST", "/x", None, &h1_only), false),
+            Verdict::Block(_)
+        ));
+        // Neither value dangerous: must not match.
+        let h1_safe = hm(&[
+            ("content-type", "text/plain"),
+            ("content-type", "text/html"),
+        ]);
+        assert!(matches!(
+            rules.evaluate(&target("POST", "/x", None, &h1_safe), false),
+            Verdict::NoMatch
+        ));
+
+        // The dangerous header value as the SECOND of two x-probe occurrences.
+        let h2 = hm(&[("x-probe", "good"), ("x-probe", "bad")]);
+        assert!(matches!(
+            rules.evaluate(&target("GET", "/x", None, &h2), false),
+            Verdict::Block(_)
+        ));
+        let h2_safe = hm(&[("x-probe", "good"), ("x-probe", "also-good")]);
+        assert!(matches!(
+            rules.evaluate(&target("GET", "/x", None, &h2_safe), false),
+            Verdict::NoMatch
+        ));
+        // Missing entirely: must not match (unaffected by the fix).
+        let h2_absent = hm(&[]);
+        assert!(matches!(
+            rules.evaluate(&target("GET", "/x", None, &h2_absent), false),
+            Verdict::NoMatch
+        ));
+
+        // The same repeated-value proof, for `contains` specifically: the dangerous substring
+        // as the SECOND of two x-sub occurrences.
+        let h3 = hm(&[("x-sub", "fine"), ("x-sub", "this has evil in it")]);
+        assert!(matches!(
+            rules.evaluate(&target("GET", "/x", None, &h3), false),
+            Verdict::Block(_)
+        ));
+        let h3_safe = hm(&[("x-sub", "fine"), ("x-sub", "still fine")]);
+        assert!(matches!(
+            rules.evaluate(&target("GET", "/x", None, &h3_safe), false),
             Verdict::NoMatch
         ));
     }
@@ -764,14 +847,14 @@ mod tests {
         for q in ["id=1z", "%69d=1z", "i%64=1z", "%69%64=1z"] {
             assert!(
                 matches!(
-                    rules.evaluate(&target("GET", "/x", Some(q), &h, None), false),
+                    rules.evaluate(&target("GET", "/x", Some(q), &h), false),
                     Verdict::Block(_)
                 ),
                 "query {q:?} must be caught"
             );
         }
         assert!(matches!(
-            rules.evaluate(&target("GET", "/x", Some("other=1"), &h, None), false),
+            rules.evaluate(&target("GET", "/x", Some("other=1"), &h), false),
             Verdict::NoMatch
         ));
     }
