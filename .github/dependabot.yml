@@ -77,6 +77,15 @@ updates:
       # until MSRV-core moves to 1.85. The 1.53.x patch line stays proposable.
       - dependency-name: "tokio"
         versions: [">=1.54.0"]
+      # notify 8.x is blocked by its own MSRV and by notify-types, not by code:
+      # notify 8.2.1 is rustc 1.85, and notify-types ^2.0.0 resolves to 2.2.0,
+      # which is edition 2024 / rustc 1.88. The MSRV job then fails at manifest
+      # parse ("feature `edition2024` is required", #761). notify 8.0.0 to 8.2.0
+      # are rustc 1.77, but the caret on notify-types still picks 2.2.0, so
+      # holding at 7.x is less upkeep than pinning a transitive. Revisit when
+      # MSRV-core moves to 1.88.
+      - dependency-name: "notify"
+        versions: [">=8.0.0"]
       # criterion 0.8 raised its MSRV to rustc 1.86, well past the 1.82
       # anchor. It's a dev/bench-only dependency with no runtime value, so
       # hold at 0.5.x rather than relitigate MSRV for a benchmark harness.
