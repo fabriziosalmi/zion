@@ -12,6 +12,11 @@ pub(super) struct Trace {
     pub(super) trace_hex: String,
     /// The request's `X-Request-ID`, to echo on the response.
     pub(super) request_id: Option<hyper::header::HeaderValue>,
+    /// The 8-byte span id this request's own span was stamped with (#640): the client's
+    /// `traceparent` span id when one was valid (so the exported span's parent context
+    /// matches what was propagated), or the freshly generated one otherwise.
+    #[cfg(feature = "otel")]
+    pub(super) span_id_bytes: [u8; 8],
 }
 
 /// Give the request an `X-Request-ID` and a valid `traceparent` (the client's, or a fresh one).
@@ -39,6 +44,8 @@ pub(super) fn stamp(req: &mut Request<ReqBody>) -> Trace {
     // The 16-byte trace ID is captured into `trace_id_bytes` regardless,
     // so the latency histogram can attach it as an OpenMetrics exemplar.
     let trace_id_bytes: [u8; 16];
+    #[cfg(feature = "otel")]
+    let span_id_bytes: [u8; 8];
     let inbound_valid = req
         .headers()
         .get("traceparent")
@@ -46,6 +53,10 @@ pub(super) fn stamp(req: &mut Request<ReqBody>) -> Trace {
 
     if let Some(ctx) = inbound_valid {
         trace_id_bytes = ctx.trace_id;
+        #[cfg(feature = "otel")]
+        {
+            span_id_bytes = ctx.span_id;
+        }
     } else {
         // Either no header, or the value was malformed. Bump the invalid
         // counter only when a header was actually present.
@@ -67,6 +78,11 @@ pub(super) fn stamp(req: &mut Request<ReqBody>) -> Trace {
         tid[0..8].copy_from_slice(&ts_us.to_be_bytes());
         tid[8..16].copy_from_slice(&seq.to_be_bytes());
         trace_id_bytes = tid;
+        // Same 8 trailing bytes as the span_id below (header and exported span agree).
+        #[cfg(feature = "otel")]
+        {
+            span_id_bytes = tid[8..16].try_into().unwrap();
+        }
 
         let mut buf = [0u8; 55]; // "00-" + 32hex + "-" + 16hex + "-01"
         buf[0..3].copy_from_slice(b"00-");
@@ -102,7 +118,42 @@ pub(super) fn stamp(req: &mut Request<ReqBody>) -> Trace {
         trace_id_bytes,
         trace_hex,
         request_id,
+        #[cfg(feature = "otel")]
+        span_id_bytes,
     }
+}
+
+/// The root span for this request's own processing, exported as an OpenTelemetry span when
+/// `--features otel` has an OTLP exporter installed (#640). Its trace id and span id are the
+/// SAME ones `stamp()` already decided -- the client's own `traceparent` when it sent a valid
+/// one, a freshly generated one otherwise -- so the exported span's trace id matches the
+/// access-log `trace_id` and the `traceparent` this request propagates.
+#[cfg(feature = "otel")]
+pub(super) fn otel_span(trace: &Trace) -> tracing::Span {
+    use opentelemetry::trace::{
+        SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
+    };
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let span = tracing::info_span!(target: "zion", "request");
+    let parent_cx = opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
+        TraceId::from_bytes(trace.trace_id_bytes),
+        SpanId::from_bytes(trace.span_id_bytes),
+        TraceFlags::SAMPLED,
+        true, // is_remote: this context did not originate in this process either way
+        TraceState::default(),
+    ));
+    // tracing-opentelemetry's set_parent fails closed (LayerNotFound, AlreadyStarted, or
+    // SpanDisabled -- the span was filtered out at creation and has no id, so nothing done
+    // to it afterward takes effect) rather than panicking, and is not expected to fail in
+    // this configuration (the otel layer is installed before any span is created, and this
+    // is the very first thing done to a freshly-built one) -- but a silently unparented span
+    // would still export, just as its own untraceable root, so a regression here is worth a
+    // log line rather than disappearing into an unused Result.
+    if let Err(e) = span.set_parent(parent_cx) {
+        crate::logging::warn("otel", &format!("span.set_parent failed: {e}"));
+    }
+    span
 }
 
 /// What the access log needs from the request, captured before the pipeline consumes it.
@@ -280,5 +331,89 @@ pub(super) fn record(
                 detail: Some(detail_parts.join(" ")),
             });
         }
+    }
+}
+
+#[cfg(all(test, feature = "otel"))]
+mod otel_tests {
+    use super::*;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
+    use tracing_subscriber::prelude::*;
+
+    fn trace_with(trace_id_bytes: [u8; 16], span_id_bytes: [u8; 8]) -> Trace {
+        Trace {
+            trace_id_bytes,
+            trace_hex: trace_id_to_hex(&trace_id_bytes),
+            request_id: None,
+            span_id_bytes,
+        }
+    }
+
+    /// `otel_span()` must produce a span that, once CLOSED, is actually exported with the
+    /// trace id `stamp()` already decided (not a fresh, unrelated one -- what a failed
+    /// `set_parent` would produce) and the given span id as its PARENT (an OpenTelemetry
+    /// child always gets its own freshly generated id; the id passed in is what the remote
+    /// parent context carries, read back as `parent_span_id` on the exported span -- this
+    /// distinction is why an earlier draft of this test asserted the wrong field and failed
+    /// even though the real, live export this was verified against was already correct: see
+    /// #640's PR description for the real OTLP collector output that caught the mistake).
+    /// `InMemorySpanExporter`, paired with a SIMPLE (synchronous) processor, exports the
+    /// instant the span is dropped -- no network, no batching delay, deterministic.
+    #[test]
+    fn the_request_span_is_exported_with_the_requests_trace_id_and_parent_span_id() {
+        let exporter = InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("test");
+        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+        let trace_id = [0x11u8; 16];
+        let span_id = [0x22u8; 8];
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = otel_span(&trace_with(trace_id, span_id));
+            assert!(!span.is_disabled(), "the span must not be filtered out");
+            drop(span); // on_close fires here: the simple processor exports synchronously
+        });
+
+        let spans = exporter
+            .get_finished_spans()
+            .expect("exporter not shut down");
+        assert_eq!(spans.len(), 1, "exactly one span must have been exported");
+        let exported = &spans[0];
+        assert_eq!(exported.name, "request");
+        assert_eq!(
+            exported.span_context.trace_id().to_bytes(),
+            trace_id,
+            "the exported trace id must be the request's own, not a freshly generated one"
+        );
+        assert_eq!(
+            exported.parent_span_id.to_bytes(),
+            span_id,
+            "the exported parent span id must be the one stamp() decided"
+        );
+        assert!(
+            exported.span_context.is_sampled(),
+            "an unsampled span is dropped before export"
+        );
+    }
+
+    /// Break-test for the fix itself: `set_parent` on `tracing-opentelemetry` 0.34 returns a
+    /// `Result` (LayerNotFound / AlreadyStarted / SpanDisabled) that an earlier draft of this
+    /// code discarded -- a silently-unparented span would still export, just with a FRESH,
+    /// unrelated trace id (the SDK's own default, not this request's), which the trace-id
+    /// assertion above exists specifically to catch. Confirmed by temporarily skipping
+    /// `set_parent` in `otel_span()` and rerunning this test: it fails on the trace id
+    /// assertion, not the parent id one, exactly as this comment predicts.
+    #[test]
+    fn a_request_with_no_active_otel_layer_still_returns_a_usable_span() {
+        // No `with_default` scope at all: the global default test-runner subscriber (plain,
+        // no otel layer) is whatever is active. otel_span() must not panic either way --
+        // `set_parent`'s Result is logged, not unwrapped.
+        let span = otel_span(&trace_with([0x33; 16], [0x44; 8]));
+        let _ = span; // must not have panicked to get here
     }
 }
