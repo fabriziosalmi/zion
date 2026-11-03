@@ -1,0 +1,17 @@
+# Virtual-patch rule (#698) for this lab's wordpress stack, CVE-2017-1001000 -- not part of the
+# shipped examples/virtual-patch.toml starter pack, since this is the lab's own fixture, not an
+# operator-facing default. See probes.toml for the full mechanism writeup and source citations.
+[[rule]]
+id = "wp-rest-posts-id-param-override"
+cve = "CVE-2017-1001000"
+source = "https://github.com/advisories/GHSA-qm68-r9p4-ghhx"
+action = "deny"
+# WP_REST_Request::get_param() (wp-includes/rest-api/class-wp-rest-request.php, 4.7.1) resolves
+# 'id' in the order JSON, POST, GET, URL, defaults -- so a GET query parameter named "id"
+# overrides the route's own path-captured {id}. No legitimate REST client needs to repeat the
+# id in the query string when it is already in the path; the shield is scoped to exactly the
+# mutating methods and the single endpoint the advisory names.
+methods = ["POST", "PUT", "PATCH"]
+path_glob = "/wp-json/wp/v2/posts/*"
+[[rule.query]]
+name = "id"

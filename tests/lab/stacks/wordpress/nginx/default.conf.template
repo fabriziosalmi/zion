@@ -1,0 +1,32 @@
+# Rendered by the nginx:*-alpine image's own startup hook (20-envsubst-on-templates.sh), which
+# substitutes only the environment variables actually set (FPM_HOST here; nginx's own $uri,
+# $request_uri etc. are left alone since they are not shell env vars) -- one template, used by
+# both nginx-vulnerable and nginx-fixed in ../compose.yml, each setting its own FPM_HOST.
+#
+# `root` points at the path WordPress lives at *inside the fpm container*, not this one: nginx
+# keeps no copy of the WordPress files (no shared volume), so a static asset (css/js/images)
+# 404s here, and every try_files falls through to index.php. That is deliberate: this lab's
+# probes and benign checks only exercise HTML/JSON responses, never a static asset, and it
+# avoids any shared-volume ownership/permission dance between two separately-built containers.
+server {
+    listen 80 default_server;
+    server_name _;
+    root /var/www/html;
+    index index.php;
+    client_max_body_size 16m;
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    location ~ \.php$ {
+        fastcgi_split_path_info ^(.+\.php)(/.+)$;
+        fastcgi_pass ${FPM_HOST}:9000;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME /var/www/html$fastcgi_script_name;
+        fastcgi_param PATH_INFO $fastcgi_path_info;
+    }
+
+    location = /favicon.ico { return 204; access_log off; log_not_found off; }
+}

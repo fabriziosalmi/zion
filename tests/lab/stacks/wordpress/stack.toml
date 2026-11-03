@@ -1,0 +1,29 @@
+[stack]
+name = "wordpress"
+ready_path = "/"
+guarded_variant = "vulnerable"   # the one zion is put in front of
+fixed_variant = "fixed"          # the patched build, for the oracle's negative control
+
+[[variant]]
+name = "vulnerable"
+service = "fpm-vulnerable"
+upstream = "http://127.0.0.1:18201"
+version_cmd = ["php", "-r", "include '/var/www/html/wp-includes/version.php'; echo $wp_version;"]
+
+[[variant]]
+name = "fixed"
+service = "fpm-fixed"
+upstream = "http://127.0.0.1:18202"
+version_cmd = ["php", "-r", "include '/var/www/html/wp-includes/version.php'; echo $wp_version;"]
+
+# The virtual-patch rule that shields CVE-2017-1001000 (#698) lives beside this file, not in
+# zion's own built-ins -- unlike the nextjs stack's CVE, zion ships nothing by default for a
+# WordPress REST API id-param-override bypass. `{stack_dir}` expands to this directory (see
+# tests/lab/README.md); the resulting [virtual_patch] table is its own top-level TOML table,
+# not nested inside [server] despite being spliced among its keys (a TOML table header starts a
+# new table wherever it appears in the file).
+[zion]
+server_extra = '''
+[virtual_patch]
+rules_file = "{stack_dir}/virtual-patch.toml"
+'''
