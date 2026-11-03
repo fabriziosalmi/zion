@@ -1,6 +1,9 @@
-# Request-shape probe for the wordpress stack (#699). Not a weaponized exploit: the body sets
-# the post's title back to its own, already-current value, so a successful bypass is provably
-# non-destructive (idempotent write), while still reaching the real vulnerable code path.
+# Request-shape probes for the wordpress stack (#699), none a weaponized exploit. The main probe
+# and the percent-encoded one write the post's title back to its own, already-current value, so
+# a successful bypass is provably non-destructive (idempotent) while still reaching the real
+# vulnerable code path. The method-override probe writes a marker string to the post's excerpt
+# instead (see its own comment for why) -- a real, disposable write, but to a field nothing else
+# here reads or depends on, in a container that `tests/lab/run.py` tears down after the run.
 
 [[probe]]
 id = "cve-2017-1001000-rest-id-param-override"
@@ -68,6 +71,77 @@ target = "/wp-json/wp/v2/posts/1"
 status = 200
 body_contains = "Hello world!"
 
+[[probe]]
+id = "cve-2017-1001000-method-override-tunnel"
+cve = "CVE-2017-1001000"
+advisory = "https://github.com/advisories/GHSA-qm68-r9p4-ghhx"
+affects = "WordPress 4.7, 4.7.1 (fixed in 4.7.2) -- same mechanism as the main probe above"
+# Found by review (#773), not by this lab's own first pass: a rule scoped to
+# methods = ["POST", "PUT", "PATCH"] (the shape of the vulnerable request) misses this entirely.
+# WP_REST_Server::serve_request() (wp-includes/rest-api/class-wp-rest-server.php, every affected
+# and fixed version alike -- this is unrelated to the CVE's own fix) reads a '_method' GET
+# parameter, or failing that an X-HTTP-Method-Override header, and calls
+# $request->set_method() with it BEFORE dispatch: a request that arrives over the wire as GET is
+# processed internally as PUT. So GET /wp-json/wp/v2/posts/1?id=1z&_method=PUT, with the same
+# body and the same missing credentials as the main probe, reaches the exact same
+# update_item_permissions_check() short-circuit -- on the wire, nothing about it looks like a
+# write.
+mechanism = "zion's virtual-patch rule is NOT scoped to a method list (examples/virtual-patch.toml, since #773): the redundant 'id' query parameter alone is denied, on every method, which is what actually closes this specific tunnel -- there is no reliable way to see WordPress's own method-override decision without parsing it exactly as WordPress does, so not restricting by method at all is the robust fix, not an attempt to special-case '_method'."
+mechanism_verified = true
+# Confirmed by a break-test (#773): with `methods = [\"POST\", \"PUT\", \"PATCH\"]` restored on
+# the rule, this probe's verdict flips from `covered` to `bypass` (the GET carrying the override
+# reaches the update path, 200, the marker written, unauthenticated); rule unscoped again,
+# `covered`.
+#
+# Oracle note: the main probe's idempotent title trick does not work here. A GET to this same
+# URL with NO override at all is itself a legitimate, unauthenticated PUBLIC READ (post 1 is
+# published) that also answers 200 with "Hello world!" in it -- so that text can never tell
+# "the bypass worked" apart from "this was just an ordinary read" when the real wire method is
+# GET either way. Writing a distinct marker to a field no read ever touches (the excerpt, empty
+# by default on the install's own default post) is what makes the two distinguishable.
+[probe.request]
+method = "GET"
+target = "/wp-json/wp/v2/posts/1?id=1z&_method=PUT"
+headers = [["Content-Type", "application/json"]]
+body = '{"excerpt":"zion-lab-probe-marker"}'
+
+[probe.baseline]
+# The override is what reaches the vulnerable path on a GET; strip it and this is an ordinary,
+# harmless read -- its response, and the post's excerpt, are untouched by the body.
+target = "/wp-json/wp/v2/posts/1"
+
+[probe.oracle.vulnerable_if]
+status = 200
+body_contains = "zion-lab-probe-marker"
+
+[[probe]]
+id = "cve-2017-1001000-percent-encoded-id-param-name"
+cve = "CVE-2017-1001000"
+advisory = "https://github.com/advisories/GHSA-qm68-r9p4-ghhx"
+affects = "WordPress 4.7, 4.7.1 (fixed in 4.7.2) -- same mechanism as the main probe above"
+# Found by review (#773): the virtual-patch engine's query-parameter matcher compared the RAW,
+# still-percent-encoded query string against a rule's plain-text parameter name, so a rule
+# naming 'id' never matched '?%69d=1z' even though PHP's own query-string parsing (which every
+# version of WordPress relies on, unrelated to this CVE's fix) decodes '%69' to 'i' before
+# $_GET is ever populated -- WordPress sees plain 'id', identical to the main probe.
+mechanism = "src/virtual_patch.rs's query_has() now percent-decodes both the query key and value before comparing (#773), the same way PHP's parse_str does, so '?%69d=1z' matches a rule naming 'id' exactly as '?id=1z' does."
+mechanism_verified = true
+# Confirmed by a break-test (#773): reverting query_has() to compare the raw, undecoded query
+# string flips this probe's verdict from `covered` to `bypass`; restored, `covered`.
+
+[probe.request]
+method = "PUT"
+target = "/wp-json/wp/v2/posts/1?%69d=1z"
+headers = [["Content-Type", "application/json"]]
+body = '{"title":"Hello world!"}'
+
+[probe.baseline]
+target = "/wp-json/wp/v2/posts/1"
+
+[probe.oracle.vulnerable_if]
+status = 200
+body_contains = "Hello world!"
+
 [[benign]]
 id = "anonymous-homepage"
 [benign.request]
@@ -114,3 +188,18 @@ body = "log=admin&pwd=wrong-password-on-purpose&wp-submit=Log+In&redirect_to=&te
 [benign.expect]
 status = 200
 body_contains = "ERROR"
+
+[[benign]]
+id = "method-override-without-the-id-query-override-is-not-the-rules-business"
+# The rule denies on the 'id' query parameter alone, not on '_method' itself: a GET using
+# WordPress's own documented method-tunneling convention, but with NO id override, must behave
+# identically direct and through zion -- correctly denied by WordPress's own permission check
+# (still no credentials), not by the virtual-patch rule. Proves the rule is scoped to the
+# dangerous combination, not to method-override tunneling in general.
+[benign.request]
+method = "GET"
+target = "/wp-json/wp/v2/posts/1?_method=PUT"
+headers = [["Content-Type", "application/json"]]
+body = '{"title":"Hello world!"}'
+[benign.expect]
+status = 401

@@ -9,9 +9,14 @@ action = "deny"
 # WP_REST_Request::get_param() (wp-includes/rest-api/class-wp-rest-request.php, 4.7.1) resolves
 # 'id' in the order JSON, POST, GET, URL, defaults -- so a GET query parameter named "id"
 # overrides the route's own path-captured {id}. No legitimate REST client needs to repeat the
-# id in the query string when it is already in the path; the shield is scoped to exactly the
-# mutating methods and the single endpoint the advisory names.
-methods = ["POST", "PUT", "PATCH"]
+# id in the query string when it is already in the path, on ANY method -- deliberately not
+# scoped to POST/PUT/PATCH: WP_REST_Server::serve_request() reads a '_method' query parameter
+# or an X-HTTP-Method-Override header and re-dispatches as that method before routing, so a GET
+# carrying '_method=PUT' reaches the same vulnerable update path a real PUT does (probe
+# 'method-override-tunnel-bypasses-a-method-restricted-rule' in probes.toml exercises exactly
+# this against the real stack). The query match also decodes percent-encoding on both sides
+# (src/virtual_patch.rs's query_has), so '?%69d=1z' is caught the same as '?id=1z' -- probe
+# 'percent-encoded-id-param-name-still-matches' covers that one.
 path_glob = "/wp-json/wp/v2/posts/*"
 [[rule.query]]
 name = "id"

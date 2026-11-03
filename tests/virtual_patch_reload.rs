@@ -207,12 +207,21 @@ fn the_shipped_pack_blocks_each_cve_shape() {
     };
 
     // (CVE, method, a path+query the rule must block). One case per rule in
-    // examples/virtual-patch.toml. The first two rules set no `methods` (any method matches),
-    // so GET exercises them same as any other; the third is scoped to mutating methods only.
+    // examples/virtual-patch.toml. None of the three sets `methods`: the first two match any
+    // method by having no list; the third is deliberately unscoped too (#773) -- a method
+    // restriction would have missed WordPress's own '_method'/X-HTTP-Method-Override tunnel,
+    // which re-dispatches a GET as a PUT internally, after zion has already seen it as a GET.
     let blocked: &[(&str, &str, &str)] = &[
         ("CVE-2022-22947", "GET", "/actuator/gateway/routes/x"),
         ("CVE-2021-22986", "GET", "/mgmt/tm/util/bash"),
         ("CVE-2017-1001000", "PUT", "/wp-json/wp/v2/posts/1?id=1z"),
+        // The same rule, exercised as a GET: proves it is NOT scoped to mutating methods,
+        // which is exactly what closes the method-override tunnel above.
+        ("CVE-2017-1001000", "GET", "/wp-json/wp/v2/posts/1?id=1z"),
+        // And with the query parameter NAME itself percent-encoded ('%69' = 'i'): PHP's own
+        // query-string parsing decodes this to 'id' before WordPress ever sees it, so the rule
+        // must too (query_has() in src/virtual_patch.rs).
+        ("CVE-2017-1001000", "PUT", "/wp-json/wp/v2/posts/1?%69d=1z"),
     ];
     for (cve, method, path) in blocked {
         assert_eq!(
@@ -221,13 +230,13 @@ fn the_shipped_pack_blocks_each_cve_shape() {
             "the pack must block {cve} ({method} {path})"
         );
     }
-    // A GET to the same endpoint, with no mutating method, must NOT be blocked by this rule
-    // (it only matches POST/PUT/PATCH): confirms the rule is scoped, not an accidental path-wide
-    // deny of the whole REST endpoint.
+    // The 'id' query override is what the rule denies -- a GET using the SAME method-override
+    // convention but WITHOUT it must not be touched (WordPress's own permission check, not this
+    // rule, is what would deny it for real).
     assert_eq!(
-        code(zion.https, "/wp-json/wp/v2/posts/1?id=1z"),
+        code(zion.https, "/wp-json/wp/v2/posts/1?_method=PUT"),
         503,
-        "a GET to the posts endpoint must reach the dead upstream, not be blocked"
+        "method-override tunneling alone, with no id query override, is not this rule's business"
     );
 
     // A request matching no rule is not blocked (reaches the dead upstream -> 503).
