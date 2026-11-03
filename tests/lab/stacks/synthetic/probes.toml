@@ -1,0 +1,46 @@
+[[probe]]
+id = "covered-case"
+cve = "CVE-0000-00001"
+advisory = "https://example.invalid/advisory-1"
+affects = "synthetic vulnerable variant only"
+mechanism = "A header named X-Bypass-Auth, sent by the client, skips the server's canary check on the vulnerable variant; the fixed variant ignores it."
+
+[probe.request]
+method = "GET"
+target = "/protected"
+headers = [["X-Bypass-Auth", "1"]]
+
+[probe.baseline]
+headers = []
+
+[probe.oracle.vulnerable_if]
+status = 200
+body_contains = "CANARY"
+
+[[probe]]
+id = "inconclusive-case"
+cve = "CVE-0000-00002"
+advisory = "https://example.invalid/advisory-2"
+affects = "neither variant"
+mechanism = "A header the synthetic server never acts on; included to prove judge() reports inconclusive rather than false success."
+
+[probe.request]
+method = "GET"
+target = "/protected"
+headers = [["X-Does-Nothing", "1"]]
+
+[probe.baseline]
+headers = []
+
+[probe.oracle.vulnerable_if]
+status = 200
+body_contains = "CANARY"
+
+[[benign]]
+id = "home-page-untouched"
+[benign.request]
+method = "GET"
+target = "/"
+[benign.expect]
+status = 200
+body_contains = "home"

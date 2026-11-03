@@ -1,0 +1,19 @@
+# Two builds of the same app, differing only in the version of next. Published on loopback
+# only; the lab puts zion in front of the vulnerable one.
+services:
+  next-vulnerable:
+    build: { context: app, args: { NEXT_VERSION: "14.2.24" } }
+    ports: ["127.0.0.1:18101:3000"]
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/"]
+      interval: 3s
+      retries: 40
+  next-fixed:
+    build: { context: app, args: { NEXT_VERSION: "14.2.25" } }
+    ports: ["127.0.0.1:18102:3000"]
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/"]
+      interval: 3s
+      retries: 40

@@ -1,0 +1,5 @@
+{
+  "name": "zion-lab-nextjs",
+  "private": true,
+  "scripts": { "build": "next build", "start": "next start -H 0.0.0.0 -p 3000" }
+}

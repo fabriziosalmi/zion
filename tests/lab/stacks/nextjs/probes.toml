@@ -1,0 +1,58 @@
+# Request-shape probes for the nextjs stack (#699). Each probe names the public advisory it
+# comes from; none is a weaponized exploit, only the shape of the vector.
+
+[[probe]]
+id = "cve-2025-29927-middleware-bypass"
+cve = "CVE-2025-29927"
+advisory = "https://github.com/advisories/GHSA-f82v-jwr5-mffw"
+affects = ">=14.0.0, <14.2.25 (and other 11.x-15.x ranges per the advisory; this lab pins 14.2.24 vulnerable / 14.2.25 fixed)"
+mechanism = "Next.js used an internal X-Middleware-Subrequest header to recognize a request it had already run through middleware, and skip running it again. The header is attacker-settable. The value must repeat the middleware's path segment (here root-level `middleware.js`, so the bare name) up to MAX_RECURSION_DEPTH (5) times, colon-separated, to clear the recursion-depth check (confirmed against the Zscaler write-up linked in the advisory, not assumed)."
+# Confirmed by a break-test, not only by reading the code: with header_policy.rs's
+# BUILT_IN_STRIP temporarily reduced to drop "x-middleware-subrequest", this probe's verdict
+# flipped from `covered` to `bypass` (and back to `covered` once restored). That is what zion
+# stops this CVE: the unconditional strip, not something else coincidentally blocking it.
+mechanism_verified = true
+
+[probe.request]
+method = "GET"
+target = "/protected"
+headers = [["X-Middleware-Subrequest", "middleware:middleware:middleware:middleware:middleware"]]
+# No session cookie on either the vector or the baseline request: the authorization check
+# itself (not this probe) is what must deny an anonymous request.
+
+[probe.baseline]
+headers = []
+
+[probe.oracle.vulnerable_if]
+status = 200
+body_contains = "PROTECTED-CANARY"
+
+[[benign]]
+id = "logged-in-session-reaches-the-protected-page"
+[benign.request]
+method = "GET"
+target = "/protected"
+headers = [["Cookie", "session=letmein"]]
+[benign.expect]
+status = 200
+body_contains = "PROTECTED-CANARY"
+
+[[benign]]
+id = "anonymous-home-page"
+[benign.request]
+method = "GET"
+target = "/"
+[benign.expect]
+status = 200
+body_contains = "home"
+
+[[benign]]
+id = "api-post-is-not-disturbed"
+[benign.request]
+method = "POST"
+target = "/api/echo"
+headers = [["Content-Type", "application/json"]]
+body = '{"x":1}'
+[benign.expect]
+status = 200
+body_contains = "\"x\":1"
