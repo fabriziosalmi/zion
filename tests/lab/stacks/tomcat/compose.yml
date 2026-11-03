@@ -1,0 +1,36 @@
+# Two official Tomcat images either side of the CVE-2017-12617 fix (#699), each with the SAME
+# minimal conf/web.xml (./web.xml, mounted read-only) that sets the Default servlet's
+# `readonly` init-param to false -- the precondition the advisory names. `platform: linux/amd64`
+# is pinned on both: the 8.5.19 tag has no arm64 build, so an Apple Silicon host always runs it
+# emulated; pinning the fixed variant to the same platform keeps the comparison on equal
+# footing instead of letting it run natively on one side and emulated on the other. A heap cap
+# (CATALINA_OPTS) keeps each JVM well inside mem_limit. Published on loopback only; the lab
+# puts zion in front of the vulnerable one.
+services:
+  tomcat-vulnerable:
+    image: tomcat:8.5.19-jre8@sha256:de3759416aac4c92b76f3e6fe13c82b17b2581ae3c3bfcf75bd51e987fc26cfe
+    platform: linux/amd64
+    environment:
+      CATALINA_OPTS: "-Xms128m -Xmx256m"
+    volumes:
+      - ./web.xml:/usr/local/tomcat/conf/web.xml:ro
+    ports: ["127.0.0.1:18301:8080"]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 3s
+      retries: 40
+
+  tomcat-fixed:
+    image: tomcat:8.5.23-jre8@sha256:a069d49c414bad0d98f5a4d7f9b7fdd318ccc451dc535084480c8aead68272d2
+    platform: linux/amd64
+    environment:
+      CATALINA_OPTS: "-Xms128m -Xmx256m"
+    volumes:
+      - ./web.xml:/usr/local/tomcat/conf/web.xml:ro
+    ports: ["127.0.0.1:18302:8080"]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 3s
+      retries: 40

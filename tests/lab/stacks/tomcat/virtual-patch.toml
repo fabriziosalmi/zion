@@ -1,0 +1,22 @@
+# Virtual-patch rule (#698) for this lab's tomcat stack, CVE-2017-12617 -- not part of the
+# shipped examples/virtual-patch.toml starter pack, since this is the lab's own fixture, not an
+# operator-facing default (a deployment with the Default servlet's `readonly` left at its safe
+# default, true, has no PUT to protect against in the first place). See probes.toml for the
+# full mechanism writeup and source citations.
+[[rule]]
+id = "tomcat-put-jsp-trailing-slash-upload"
+cve = "CVE-2017-12617"
+source = "https://github.com/advisories/GHSA-xjgh-84hx-56c5"
+action = "deny"
+# Tomcat's servlet mapper matches the `*.jsp` pattern on the literal request path: "/x.jsp/"
+# does not end in ".jsp", so it is NOT routed to JspServlet (which has no doPut and would 404 or
+# 405 the write) but falls through to the path-mapped DefaultServlet instead, which -- with
+# `readonly` set to false -- does implement doPut and writes the body to disk. When it resolves
+# the target file, the trailing "/" is not preserved in the stored name, so the file lands on
+# disk as plain "x.jsp": requestable, and executed as JSP, by the fixed-up `*.jsp` mapping on
+# the next GET. No legitimate client PUTs a resource whose own name ends in "/" to begin with,
+# so denying PUT to any path ending in ".jsp/" (case-insensitively, since #774) closes the
+# bypass without touching an ordinary (non-JSP) PUT upload, which this rule's own path_glob
+# does not match.
+methods = ["PUT"]
+path_glob = "*.jsp/"
