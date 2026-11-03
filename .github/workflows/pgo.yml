@@ -45,10 +45,11 @@ env:
   PGO_CARGO_TEST: cargo-zigbuild test
   PGO_MAX_GLIBC: "2.28"
 
+# Pinned to ubuntu-24.04: the baseline smoke below fails on 26.04 (see cpu-baseline.yml and #766).
 jobs:
   pgo:
     name: PGO build as the release (x86_64-unknown-linux-gnu)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

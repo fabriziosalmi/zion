@@ -48,10 +48,14 @@ env:
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
 
+# Pinned, not ubuntu-latest: since 2026-10-26..31 latest is ubuntu-26.04 (qemu 10.2.1),
+# where the x86_64 gnu binary and the amd64 image stop with an illegal instruction
+# under Opteron_G1 (bisected: it fails on 18bc8b8, before any dependency change;
+# it passes on ubuntu-24.04, qemu 8.2.2). The cause on 26.04 is not yet explained.
 jobs:
   artefact:
     name: artefact (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -117,7 +121,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -211,7 +215,7 @@ jobs:
 
   control:
     name: control (the script refuses the v0.12.0 ${{ matrix.arch }} build)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
