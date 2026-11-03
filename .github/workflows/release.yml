@@ -48,6 +48,11 @@ jobs:
   #      cross-compilation via Zig's toolchain — no QEMU, no Docker cross).
   #    - macOS x86_64+aarch64 native on the macos runners.
   #    - Windows x86_64 native via MSVC.
+  #
+  # The Linux jobs that run scripts/cpu-baseline-smoke.sh are pinned to
+  # ubuntu-24.04, not ubuntu-latest: on 26.04 (qemu 10.2.1) the x86_64 gnu binary
+  # and the amd64 image stop with an illegal instruction under Opteron_G1
+  # (see cpu-baseline.yml and #766).
   # ════════════════════════════════════════════════════════════════════════
   build:
     name: build (${{ matrix.target }})
@@ -61,23 +66,23 @@ jobs:
         include:
           # Linux glibc
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             cross: zig
             artifact: zion
             pgo: false
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             cross: zig
             artifact: zion
             pgo: false
           # Linux musl (fully static — runs on Alpine, distroless, scratch)
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             cross: zig
             artifact: zion
             pgo: false
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             cross: zig
             artifact: zion
             pgo: false
@@ -110,7 +115,7 @@ jobs:
           # runner must execute the instrumented binary, and a profile made
           # on one architecture does not apply to another.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             cross: zig
             artifact: zion
             pgo: true
@@ -532,7 +537,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════
   # 3. Multi-arch container image — keyless-signed + SBOM-attested.
   # ════════════════════════════════════════════════════════════════════════
-  # Build each architecture on its OWN native runner (amd64 on ubuntu-latest,
+  # Build each architecture on its OWN native runner (amd64 on ubuntu-24.04,
   # arm64 on the free ubuntu-24.04-arm hosted runner) — no QEMU emulation, so
   # the arm64 leg drops from ~40 min to a few. Each leg pushes by digest; the
   # `container` job below fuses the two digests into one multi-arch manifest.
@@ -545,7 +550,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             arch: amd64
             want: x86-64
           - platform: linux/arm64
