@@ -1,0 +1,27 @@
+[stack]
+name = "tomcat"
+ready_path = "/"
+guarded_variant = "vulnerable"   # the one zion is put in front of
+fixed_variant = "fixed"          # the patched build, for the oracle's negative control
+
+[[variant]]
+name = "vulnerable"
+service = "tomcat-vulnerable"
+upstream = "http://127.0.0.1:18301"
+version_cmd = ["sh", "-c", "catalina.sh version 2>/dev/null | awk -F/ '/Server version/{print $2}'"]
+
+[[variant]]
+name = "fixed"
+service = "tomcat-fixed"
+upstream = "http://127.0.0.1:18302"
+version_cmd = ["sh", "-c", "catalina.sh version 2>/dev/null | awk -F/ '/Server version/{print $2}'"]
+
+# The virtual-patch rule that shields CVE-2017-12617 (#698) lives beside this file, not in
+# zion's own built-ins -- unlike the nextjs stack's CVE, zion ships nothing by default for a
+# Tomcat Default-servlet PUT/JSP-upload bypass. `{stack_dir}` expands to this directory (see
+# tests/lab/README.md).
+[zion]
+server_extra = '''
+[virtual_patch]
+rules_file = "{stack_dir}/virtual-patch.toml"
+'''

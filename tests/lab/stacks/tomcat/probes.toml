@@ -1,0 +1,96 @@
+# Request-shape probe for the tomcat stack (#699), not a weaponized exploit: the uploaded "JSP"
+# only prints a fixed marker string, never anything that reads, writes or executes outside the
+# response it renders, and the container is torn down by `tests/lab/run.py` after the run.
+
+[[probe]]
+id = "cve-2017-12617-put-trailing-slash-jsp-upload"
+cve = "CVE-2017-12617"
+advisory = "https://github.com/advisories/GHSA-xjgh-84hx-56c5"
+# NVD description (fetched from the CVE 2.0 API, quoted verbatim): "When running Apache Tomcat
+# versions 9.0.0.M1 to 9.0.0, 8.5.0 to 8.5.22, 8.0.0.RC1 to 8.0.46 and 7.0.0 to 7.0.81 with HTTP
+# PUTs enabled (e.g. via setting the readonly initialisation parameter of the Default servlet
+# to false) it was possible to upload a JSP file to the server via a specially crafted request.
+# This JSP could then be requested and any code it contained would be executed by the server."
+# CVE-2017-12617 is the sibling advisory of CVE-2017-12615 (the original, Tomcat-7-only,
+# Windows-flagged report of the same DefaultServlet/readonly bug class) covering the later
+# branches, including 8.5.x -- this lab pins the official tomcat:8.5.19-jre8 image (vulnerable,
+# inside the advisory's 8.5.0-8.5.22 range) and tomcat:8.5.23-jre8 (fixed) -- see compose.yml
+# for the exact digests.
+affects = "Apache Tomcat 8.5.0-8.5.22 (fixed in 8.5.23); the same advisory also lists 7.0.0-7.0.81, 8.0.0.RC1-8.0.46 and 9.0.0.M1-9.0.0, fixed respectively in 7.0.82, 8.0.47 and 9.0.1 -- this lab pins the 8.5.x pair"
+# Confirmed against the real behavior of both pinned images, not just the advisory prose:
+# Tomcat's servlet mapper dispatches a request by matching its path against each
+# <servlet-mapping>'s <url-pattern> literally. `*.jsp` matches a path that ends in exactly
+# ".jsp"; "/x.jsp/" ends in "/", not ".jsp", so it is NOT routed to JspServlet (which has no
+# doPut override -- HttpServlet's default 405s it, though in practice JspServlet 404s first,
+# since it looks for the .jsp source file before dispatching on method, and none exists yet)
+# but falls through to the catch-all "/" mapping, DefaultServlet. With `readonly` set to false,
+# DefaultServlet.doPut() writes the request body to the resource the path resolves to -- and
+# when it resolves that path to a file on disk, the trailing "/" is not part of the stored
+# name, so the write lands as plain "x.jsp". The next GET of "/x.jsp" matches the `*.jsp`
+# pattern normally and JspServlet compiles and executes it.
+mechanism = "zion's virtual-patch rule 'tomcat-put-jsp-trailing-slash-upload' (virtual-patch.toml) denies any PUT whose path ends in '.jsp/': no legitimate client PUTs a resource whose own name ends in a slash, so this is a narrow, request-shape-only deny with no legitimate traffic to break."
+mechanism_verified = true
+# Confirmed by a break-test, not only by reading the code: with the rule removed from
+# virtual-patch.toml (so virtual_patch.rs loads zero rules), this probe's verdict flipped from
+# `covered` to `bypass` (status 201, the file written and, by a follow-up GET outside this
+# probe's own request/response pair, confirmed executable) -- and back to `covered` once
+# restored.
+
+[probe.request]
+method = "PUT"
+target = "/zion-lab-poc.jsp/"
+body = '<% out.println("ZION-LAB-POC-MARKER"); %>'
+
+[probe.baseline]
+# Same request, but without the trailing-slash vector: the path now matches `*.jsp` literally
+# and is routed to JspServlet, which 404s a PUT to a .jsp file that does not exist yet (it looks
+# for the source before dispatching on method) on BOTH the vulnerable and the fixed variant --
+# proving the baseline is not "vulnerable" by the oracle below for a reason unrelated to the fix
+# itself, exactly what a baseline must do.
+target = "/zion-lab-poc.jsp"
+
+[probe.oracle.vulnerable_if]
+# [201, 204] rather than plain 201: the "vulnerable" and "zion" observations hit the SAME
+# backend container at the SAME path, "vulnerable" always running first, so when nothing
+# blocks the write (a disabled rule, for the break-test below) the "zion" observation's PUT
+# lands on a path the previous observation already created -- DefaultServlet correctly answers
+# 204 (updated) rather than 201 (created) for that one. Both mean the write reached disk; an
+# attacker does not care which status code Tomcat used to say so.
+status = [201, 204]
+
+[[benign]]
+id = "homepage-still-serves"
+[benign.request]
+method = "GET"
+target = "/"
+[benign.expect]
+status = 200
+body_contains = "Apache Tomcat"
+
+[[benign]]
+id = "ordinary-non-jsp-put-upload-is-not-the-rules-business"
+# The rule's path_glob is scoped to paths ending in ".jsp/": an ordinary PUT of an ordinary file
+# -- the WebDAV-style behavior an operator who sets readonly = false is actually asking for --
+# must behave identically direct and through zion. Proves the rule does not break the very
+# feature its precondition depends on. [201, 204] rather than plain 201: the direct observation
+# runs first and creates this file on the one shared container, so the following "through
+# zion" PUT to the same path lands on a resource that now already exists -- DefaultServlet
+# correctly answers 204 (updated) rather than 201 (created) for that one, on every run, direct
+# or not; both are "succeeded, unaffected by the rule", never a block.
+[benign.request]
+method = "PUT"
+target = "/zion-lab-note.txt"
+body = "just an ordinary file, not a JSP"
+[benign.expect]
+status = [201, 204]
+
+[[benign]]
+id = "a-jsp-path-ending-in-slash-that-is-not-a-put-is-untouched"
+# The rule matches on method = PUT only: a GET to the same shape of path (ending in ".jsp/")
+# must behave identically direct and through zion -- it is just an ordinary 404 (no such
+# resource), not something the rule has any reason to see.
+[benign.request]
+method = "GET"
+target = "/does-not-exist.jsp/"
+[benign.expect]
+status = 404
