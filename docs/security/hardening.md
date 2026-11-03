@@ -115,6 +115,47 @@ the burst. The default (1,000/s, burst 2,000) is a generous threshold between a 
 behind one CGNAT IP (low hundreds/s) and a flood, on by default; `handshake_rate_allowlist` exempts
 named sources, and `0` disables it. Rejections are counted in `zion_connections_rejected_handshake_rate`.
 
+## JA4 and User-Agent consistency
+
+Needs `--features tls-fingerprint` and `[tls.fingerprint]` in `shadow` or `allowlist` mode. A client that forges only its `User-Agent` string (curl, a Go or Python HTTP client saying it is Chrome) still shows the TLS fingerprint of the library it really is. `[tls.fingerprint.ua_check]` compares the two.
+
+Zion ships no fingerprint database. You name, in `[[tls.fingerprint.allowed]]`, the JA4s you have seen and know to be tools, and list those names in `tool_names`:
+
+```toml
+[tls.fingerprint]
+mode = "shadow"
+allowed = [
+  { name = "curl", ja4 = "<the JA4 of your curl>" },
+  { name = "chrome", ja4 = "<the JA4 of your Chrome>" },
+]
+
+[tls.fingerprint.ua_check]
+mode = "shadow"                       # off (default) | shadow | enforce
+browser_ua = ["Chrome/", "Firefox/", "Safari/"]
+tool_names = ["curl"]
+```
+
+To read a client's JA4, connect with it to a zion in `shadow` mode and look at the `X-Client-TLS-JA4` header your upstream receives.
+
+A request is a **mismatch** when its `User-Agent` contains one of `browser_ua` (ASCII case-insensitive) and its connection's JA4 is one named in `tool_names`. `enforce` answers it with `403`; `shadow` only counts it. Nothing else is ever refused:
+
+| Request | Verdict |
+|---|---|
+| browser `User-Agent`, JA4 of a `tool_names` entry | mismatch |
+| browser `User-Agent`, any other JA4 (known or unknown) | consistent |
+| browser `User-Agent` (in any of its values), no JA4 | not compared, counted in `zion_tls_fp_ua_no_ja4` |
+| no `User-Agent`, or one that does not claim a browser | not compared |
+
+What it does not do:
+
+- It is a soft signal. It catches the client that forged the `User-Agent` only; one that also forges its ClientHello is not caught.
+- HTTP/3 carries no JA4, and neither does a `:443` connection whose ClientHello could not be fingerprinted, so those requests are never compared. Watch `zion_tls_fp_ua_no_ja4` to see how much of your browser traffic that is. The plaintext `:80` listener serves ACME challenges and redirects only, so there is no application traffic on it to compare.
+- Every `User-Agent` value of a request counts: a request carrying `curl/8.5` and `Chrome/131` in two headers claims a browser.
+- An unknown JA4 is never a mismatch. A browser update changes its JA4: keep the `chrome` entry current, or it is simply not named as a tool.
+- `/healthz` and `/readyz` are never refused.
+
+Start in `shadow` and read the counters before `enforce`: `zion_tls_fp_ua_checked` (compared), `zion_tls_fp_ua_mismatch` (flagged) and `zion_tls_fp_ua_no_ja4` (not comparable). A config that could never fire (the fingerprint mode `off`, an empty `browser_ua` or `tool_names`, a `tool_names` entry that matches no `allowed` name) is refused at boot.
+
 ## HTTP/2 control-frame floods
 
 HTTP/2 has frames that carry no request and that a server must still read, and often answer:

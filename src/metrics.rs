@@ -451,6 +451,15 @@ pub struct Metrics {
     /// Requests outside an allowlisted fingerprint's `allowed_routes` (#27
     /// follow-up): 403 in `allowlist` mode, counted-only in `shadow`.
     pub tls_fp_route_denied: AtomicU64,
+    /// Requests whose `User-Agent` claims a browser and that carried a JA4, so the
+    /// JA4 / User-Agent check (#720) could compare them.
+    pub tls_fp_ua_checked: AtomicU64,
+    /// Of those, the ones whose JA4 is a fingerprint named as a non-browser tool:
+    /// 403 in `enforce`, counted only in `shadow`.
+    pub tls_fp_ua_mismatch: AtomicU64,
+    /// Requests claiming a browser that carried no JA4 (HTTP/3, an unfingerprintable
+    /// hello): never a mismatch, counted so the blind spot is visible.
+    pub tls_fp_ua_no_ja4: AtomicU64,
     /// Connections closed at accept because the source IP was already at
     /// its `max_connections_per_ip` concurrent cap (anti-DDoS lever).
     pub connections_rejected_per_ip: AtomicU64,
@@ -634,6 +643,9 @@ impl Metrics {
             tls_fp_banned_hits: AtomicU64::new(0),
             tls_fp_rate_limited: AtomicU64::new(0),
             tls_fp_route_denied: AtomicU64::new(0),
+            tls_fp_ua_checked: AtomicU64::new(0),
+            tls_fp_ua_mismatch: AtomicU64::new(0),
+            tls_fp_ua_no_ja4: AtomicU64::new(0),
             connections_rejected_per_ip: AtomicU64::new(0),
             connections_rejected_handshake_rate: AtomicU64::new(0),
             connections_rejected_global: AtomicU64::new(0),
@@ -1247,6 +1259,42 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.tls_fp_route_denied.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_tls_fp_ua_checked Requests claiming a browser User-Agent that carried a JA4, compared by the JA4 and User-Agent check.\n\
+                                # TYPE zion_tls_fp_ua_checked counter\n\
+                                zion_tls_fp_ua_checked ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.tls_fp_ua_checked.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_tls_fp_ua_mismatch Requests claiming a browser whose JA4 is a named non-browser tool (403 in enforce, observed in shadow).\n\
+                                # TYPE zion_tls_fp_ua_mismatch counter\n\
+                                zion_tls_fp_ua_mismatch ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.tls_fp_ua_mismatch.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
+            b"# HELP zion_tls_fp_ua_no_ja4 Requests claiming a browser that carried no JA4 (HTTP/3, unfingerprintable hello); never a mismatch.\n\
+                                # TYPE zion_tls_fp_ua_no_ja4 counter\n\
+                                zion_tls_fp_ua_no_ja4 ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.tls_fp_ua_no_ja4.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(b"\n");

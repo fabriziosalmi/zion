@@ -877,6 +877,49 @@ pub struct FingerprintConfig {
     /// reloads but never outlive the process.
     #[serde(default = "default_ban_ttl_secs")]
     pub ban_ttl_secs: u64,
+    /// `[tls.fingerprint.ua_check]` (#720): flag a request whose User-Agent
+    /// claims a browser while its TLS fingerprint is one the operator named as
+    /// a non-browser tool. Absent or `mode = "off"` → not evaluated.
+    #[serde(default)]
+    pub ua_check: Option<UaCheckConfig>,
+}
+
+/// `[tls.fingerprint.ua_check]`: the JA4 / User-Agent consistency check (#720).
+///
+/// A soft signal. It catches a client that forged only the `User-Agent` string
+/// (curl, a Go or Python HTTP client saying it is Chrome); a client that also
+/// forges the ClientHello is not caught. It needs a JA4, so it never applies to
+/// HTTP/3, which computes none (the plaintext listener serves only ACME challenges and
+/// redirects), and a request
+/// without a JA4 is never a mismatch. Zion ships no fingerprint database: the
+/// operator names, in `[[tls.fingerprint.allowed]]`, the JA4s they have seen and
+/// know to be tools, and lists those names in `tool_names`.
+#[allow(dead_code)] // read only under `--features tls-fingerprint`
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct UaCheckConfig {
+    /// `off` (default) | `shadow` | `enforce`.
+    #[serde(default)]
+    pub mode: UaCheckMode,
+    /// A request is "claiming a browser" when its `User-Agent` contains one of
+    /// these (ASCII case-insensitive substrings, e.g. `Chrome/`, `Firefox/`).
+    #[serde(default)]
+    pub browser_ua: Vec<String>,
+    /// Names of `[[tls.fingerprint.allowed]]` entries whose JA4 is a non-browser
+    /// tool (e.g. `curl`, `go-http`). Each must name an existing entry.
+    #[serde(default)]
+    pub tool_names: Vec<String>,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UaCheckMode {
+    #[default]
+    Off,
+    /// Count and log a mismatch; never block.
+    Shadow,
+    /// Answer a mismatch with 403.
+    Enforce,
 }
 
 fn default_ban_ttl_secs() -> u64 {
@@ -900,6 +943,7 @@ impl Default for FingerprintConfig {
             on_unknown: OnUnknown::default(),
             on_unfingerprintable: OnUnfingerprintable::default(),
             ban_ttl_secs: default_ban_ttl_secs(),
+            ua_check: None,
         }
     }
 }
@@ -2504,6 +2548,48 @@ fn check_tls_fingerprint(config: &ZionConfig, errors: &mut Vec<String>) {
                 fp.ban_ttl_secs, MAX_BAN_TTL_SECS
             ));
         }
+        // [tls.fingerprint.ua_check] (#720). A check that can never fire is worse than
+        // none: it reads as protection. Refuse each way it would be silently inert.
+        if let Some(uc) = fp.ua_check.as_ref().filter(|u| u.mode != UaCheckMode::Off) {
+            if fp.mode == FingerprintMode::Off {
+                errors.push(
+                    "[tls.fingerprint.ua_check] is on but [tls.fingerprint] mode is \"off\": \
+                     no JA4 is computed, so the check would never see one. Set the fingerprint \
+                     mode to \"shadow\" or \"allowlist\"."
+                        .to_string(),
+                );
+            }
+            if uc.browser_ua.is_empty() {
+                errors.push(
+                    "[tls.fingerprint.ua_check] browser_ua is empty: no User-Agent would be \
+                     taken as claiming a browser, so nothing could mismatch."
+                        .to_string(),
+                );
+            }
+            for b in &uc.browser_ua {
+                if b.is_empty() || b.len() > 64 || !b.bytes().all(|c| (0x20..=0x7e).contains(&c)) {
+                    errors.push(format!(
+                        "[tls.fingerprint.ua_check] browser_ua entry {b:?} must be 1 to 64 \
+                         printable ASCII characters (an empty one would match every User-Agent)"
+                    ));
+                }
+            }
+            if uc.tool_names.is_empty() {
+                errors.push(
+                    "[tls.fingerprint.ua_check] tool_names is empty: no fingerprint is named as \
+                     a non-browser tool, so nothing could mismatch."
+                        .to_string(),
+                );
+            }
+            for t in &uc.tool_names {
+                if !fp.allowed.iter().any(|a| &a.name == t) {
+                    errors.push(format!(
+                        "[tls.fingerprint.ua_check] tool_names entry {t:?} names no \
+                         [[tls.fingerprint.allowed]] entry, so it would never match"
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -3789,6 +3875,88 @@ mod tests {
         let cfg = parse_schema(bad, "test").expect("parse");
         let err = validate_semantics(&cfg, "test").err().unwrap_or_default();
         assert!(err.contains("invalid JA4"), "got: {err}");
+    }
+
+    /// A config with `[tls.fingerprint] <fp>` and `[tls.fingerprint.ua_check] <uc>`.
+    #[cfg(feature = "tls-fingerprint")]
+    fn ua_check_cfg(fp: &str, uc: &str) -> String {
+        format!(
+            "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [tls.fingerprint]\n{fp}\n\
+             allowed=[{{name=\"curl\",ja4=\"t13d1516h2_8daaf6152771_e5627efa2ab1\"}}]\n\
+             [tls.fingerprint.ua_check]\n{uc}\n\
+             [upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{{*rest}}\"\nupstream=\"be\"\n"
+        )
+    }
+
+    #[cfg(feature = "tls-fingerprint")]
+    fn ua_check_errors(fp: &str, uc: &str) -> String {
+        let cfg = parse_schema(&ua_check_cfg(fp, uc), "test").expect("parse");
+        validate_semantics(&cfg, "test").err().unwrap_or_default()
+    }
+
+    #[cfg(feature = "tls-fingerprint")]
+    #[test]
+    fn ua_check_valid_config_boots() {
+        let err = ua_check_errors(
+            "mode=\"shadow\"",
+            "mode=\"enforce\"\nbrowser_ua=[\"Chrome/\"]\ntool_names=[\"curl\"]",
+        );
+        assert!(err.is_empty(), "a valid ua_check must boot, got: {err}");
+    }
+
+    #[cfg(feature = "tls-fingerprint")]
+    #[test]
+    fn ua_check_that_could_never_fire_is_refused() {
+        let ok_ua = "browser_ua=[\"Chrome/\"]";
+        let ok_tools = "tool_names=[\"curl\"]";
+        // No JA4 is computed with the fingerprint mode off.
+        let e = ua_check_errors(
+            "mode=\"off\"",
+            &format!("mode=\"shadow\"\n{ok_ua}\n{ok_tools}"),
+        );
+        assert!(e.contains("mode is \"off\""), "got: {e}");
+        // Nothing would count as a browser, or as a tool.
+        let e = ua_check_errors("mode=\"shadow\"", &format!("mode=\"shadow\"\n{ok_tools}"));
+        assert!(e.contains("browser_ua is empty"), "got: {e}");
+        let e = ua_check_errors("mode=\"shadow\"", &format!("mode=\"shadow\"\n{ok_ua}"));
+        assert!(e.contains("tool_names is empty"), "got: {e}");
+        // A tool name that matches no allowlist entry is a typo that would never match.
+        let e = ua_check_errors(
+            "mode=\"shadow\"",
+            &format!("mode=\"shadow\"\n{ok_ua}\ntool_names=[\"cur1\"]"),
+        );
+        assert!(e.contains("names no"), "got: {e}");
+        // An empty pattern would match every User-Agent.
+        let e = ua_check_errors(
+            "mode=\"shadow\"",
+            &format!("mode=\"shadow\"\nbrowser_ua=[\"\"]\n{ok_tools}"),
+        );
+        assert!(e.contains("browser_ua entry"), "got: {e}");
+    }
+
+    #[cfg(feature = "tls-fingerprint")]
+    #[test]
+    fn ua_check_off_is_not_validated_so_it_can_be_parked() {
+        // `mode = "off"` (or the default) with an unfinished block must not stop the boot.
+        let e = ua_check_errors("mode=\"shadow\"", "mode=\"off\"");
+        assert!(e.is_empty(), "got: {e}");
+        let e = ua_check_errors("mode=\"off\"", "tool_names=[\"nope\"]");
+        assert!(e.is_empty(), "got: {e}");
+    }
+
+    #[test]
+    fn ua_check_unknown_key_is_a_parse_error() {
+        // deny_unknown_fields: a typo'd key is an error on any build, not a silent no-op.
+        let toml = "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n\
+             [tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n\
+             [tls.fingerprint]\nmode=\"shadow\"\n\
+             [tls.fingerprint.ua_check]\nmode=\"shadow\"\nbrowser_uas=[\"Chrome/\"]\n\
+             [upstreams]\nbe=\"http://127.0.0.1:8000\"\n\
+             [[route]]\npath=\"/{*rest}\"\nupstream=\"be\"\n";
+        assert!(parse_schema(toml, "test").is_err());
     }
 
     #[cfg(feature = "tls-fingerprint")]

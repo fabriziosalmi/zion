@@ -463,14 +463,25 @@ fn tls_fingerprint(ctx: &PreCtx, req: &Request<ReqBody>) -> Option<Response<Zion
     // the :443 listener fast path.
     #[cfg(feature = "tls-fingerprint")]
     if let Some(fp) = cfg.tls_fingerprint.as_ref() {
-        if let Some(ja4) = req
+        let ja4 = req
             .headers()
             .get(crate::tls_fp::HDR_JA4)
-            .and_then(|v| v.to_str().ok())
-        {
+            .and_then(|v| v.to_str().ok());
+        if let Some(ja4) = ja4 {
             if fp.route_gate(ja4, req.uri().path()) == crate::tls_fp::GateDecision::Reject {
                 return Some(empty_response(StatusCode::FORBIDDEN));
             }
+        }
+        // JA4 / User-Agent consistency (#720), after the route restriction so a request
+        // that is refused there is not also counted here. A request with no JA4 (HTTP/3,
+        // an unfingerprintable hello) still reaches it: that absence is what it counts.
+        let user_agents = req
+            .headers()
+            .get_all(hyper::header::USER_AGENT)
+            .iter()
+            .map(|v| v.as_bytes());
+        if fp.ua_gate(ja4, user_agents, req.uri().path()) == crate::tls_fp::GateDecision::Reject {
+            return Some(empty_response(StatusCode::FORBIDDEN));
         }
     }
     None

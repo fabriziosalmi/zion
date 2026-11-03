@@ -511,6 +511,44 @@ pub struct TlsFpRuntime {
     ban_ttl: std::time::Duration,
     /// JA4 string → allowlist entry (name + optional rate limit).
     allowed: std::collections::HashMap<String, AllowedEntry>,
+    /// The JA4 / User-Agent consistency check (#720); `None` = off.
+    ua: Option<UaCheck>,
+}
+
+/// The resolved `[tls.fingerprint.ua_check]`.
+#[derive(Debug)]
+struct UaCheck {
+    mode: crate::config::UaCheckMode,
+    /// `browser_ua` patterns, ASCII-lowercased once so a request costs no allocation.
+    browser_ua: Vec<Vec<u8>>,
+    /// The JA4s of the allowlist entries named in `tool_names`: one hash lookup per request.
+    tool_ja4: std::collections::HashSet<String>,
+}
+
+/// What the JA4 / User-Agent check made of one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UaVerdict {
+    /// Nothing to compare: the check is off, the request has no `User-Agent`, or the
+    /// `User-Agent` does not claim a browser.
+    Skip,
+    /// It claims a browser but carries no JA4 (HTTP/3, an unfingerprintable
+    /// hello). Never a mismatch: absence proves nothing.
+    NoJa4,
+    /// It claims a browser and its JA4 is not one named as a tool.
+    Consistent,
+    /// It claims a browser and its JA4 is one named as a non-browser tool.
+    Mismatch,
+}
+
+/// ASCII case-insensitive `haystack.contains(needle)`, `needle` already lowercase.
+fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack.windows(needle.len()).any(|w| {
+            w.iter()
+                .zip(needle)
+                .all(|(h, n)| h.to_ascii_lowercase() == *n)
+        })
 }
 
 impl TlsFpRuntime {
@@ -554,12 +592,31 @@ impl TlsFpRuntime {
                 )
             })
             .collect();
+        let ua = cfg
+            .ua_check
+            .as_ref()
+            .filter(|u| u.mode != crate::config::UaCheckMode::Off)
+            .map(|u| UaCheck {
+                mode: u.mode,
+                browser_ua: u
+                    .browser_ua
+                    .iter()
+                    .map(|b| b.to_ascii_lowercase().into_bytes())
+                    .collect(),
+                tool_ja4: cfg
+                    .allowed
+                    .iter()
+                    .filter(|a| u.tool_names.iter().any(|t| t == &a.name))
+                    .map(|a| a.ja4.trim().to_ascii_lowercase())
+                    .collect(),
+            });
         Some(TlsFpRuntime {
             mode: cfg.mode.clone(),
             on_unknown: cfg.on_unknown,
             on_unfingerprintable: cfg.on_unfingerprintable,
             ban_ttl: std::time::Duration::from_secs(cfg.ban_ttl_secs),
             allowed,
+            ua,
         })
     }
 
@@ -604,6 +661,85 @@ impl TlsFpRuntime {
                 "tls-fp: route not in allowed_routes (shadow — proceeding)"
             );
             GateDecision::Proceed
+        }
+    }
+
+    /// The JA4 / User-Agent verdict for one request (#720), without side effects.
+    ///
+    /// `ja4` is the attested `X-Client-TLS-JA4` value (`None` when the connection has
+    /// none), `user_agents` the bytes of every `User-Agent` value the request carries. The order matters: a
+    /// request that does not claim a browser is `Skip` before its JA4 is looked at, so
+    /// `NoJa4` counts only the requests the check would have wanted to compare.
+    pub fn ua_verdict<'a>(
+        &self,
+        ja4: Option<&str>,
+        user_agents: impl IntoIterator<Item = &'a [u8]>,
+    ) -> UaVerdict {
+        let Some(ua) = self.ua.as_ref() else {
+            return UaVerdict::Skip;
+        };
+        // EVERY User-Agent value counts: a request may carry several and the proxy forwards
+        // them all, so a tool that sends `curl/8.5` first and `Chrome/131` second would
+        // otherwise be judged by the first and reach an upstream that reads the last.
+        if !user_agents.into_iter().any(|user_agent| {
+            ua.browser_ua
+                .iter()
+                .any(|b| contains_ascii_ci(user_agent, b))
+        }) {
+            return UaVerdict::Skip;
+        }
+        match ja4 {
+            None => UaVerdict::NoJa4,
+            Some(j) if ua.tool_ja4.contains(j) => UaVerdict::Mismatch,
+            Some(_) => UaVerdict::Consistent,
+        }
+    }
+
+    /// The per-request JA4 / User-Agent gate: verdict, metrics and mode in one place so
+    /// the dispatch wiring stays small. `Reject` ONLY in `enforce` mode on a `Mismatch`.
+    /// `/healthz` and `/readyz` are exempt for the reason given on [`Self::route_gate`].
+    /// Logged at debug: the User-Agent and JA4 are client-controlled and replayable; the
+    /// counters are the operator signal.
+    pub fn ua_gate<'a>(
+        &self,
+        ja4: Option<&str>,
+        user_agents: impl IntoIterator<Item = &'a [u8]>,
+        path: &str,
+    ) -> GateDecision {
+        use std::sync::atomic::Ordering::Relaxed;
+        if path == "/healthz" || path == "/readyz" {
+            return GateDecision::Proceed;
+        }
+        let m = &crate::metrics::METRICS;
+        match self.ua_verdict(ja4, user_agents) {
+            UaVerdict::Skip => GateDecision::Proceed,
+            UaVerdict::NoJa4 => {
+                m.tls_fp_ua_no_ja4.fetch_add(1, Relaxed);
+                GateDecision::Proceed
+            }
+            UaVerdict::Consistent => {
+                m.tls_fp_ua_checked.fetch_add(1, Relaxed);
+                GateDecision::Proceed
+            }
+            UaVerdict::Mismatch => {
+                m.tls_fp_ua_checked.fetch_add(1, Relaxed);
+                m.tls_fp_ua_mismatch.fetch_add(1, Relaxed);
+                let enforce = self
+                    .ua
+                    .as_ref()
+                    .is_some_and(|u| u.mode == crate::config::UaCheckMode::Enforce);
+                tracing::debug!(
+                    ja4,
+                    path,
+                    enforce,
+                    "tls-fp: browser User-Agent on a tool JA4"
+                );
+                if enforce {
+                    GateDecision::Reject
+                } else {
+                    GateDecision::Proceed
+                }
+            }
         }
     }
 
@@ -1270,6 +1406,7 @@ mod tests {
             on_unfingerprintable,
             ban_ttl: std::time::Duration::from_secs(600),
             allowed: std::collections::HashMap::new(),
+            ua: None,
         };
         // shadow NEVER rejects, whatever the policy knobs say.
         let sh = mk(
@@ -1556,6 +1693,7 @@ mod tests {
             on_unfingerprintable: OnUnfingerprintable::Allow,
             ban_ttl: std::time::Duration::from_secs(600),
             allowed: std::collections::HashMap::new(),
+            ua: None,
         };
         let entry = AllowedEntry {
             name: "chrome".into(),
@@ -1692,6 +1830,7 @@ mod tests {
             on_unfingerprintable: OnUnfingerprintable::Allow,
             ban_ttl: std::time::Duration::from_secs(600),
             allowed,
+            ua: None,
         }
     }
 
@@ -1952,6 +2091,271 @@ mod tests {
         // >= 1 rather than == 1: the metric is a global atomic shared with
         // parallel tests — only the delta from THIS test's denial is asserted.
         assert!(after > before, "denial must increment the metric");
+    }
+
+    // ── JA4 / User-Agent consistency check (#720) ───────────────────────────────
+
+    // Opaque fixtures for the logic under test: neither is claimed to be the fingerprint of any
+    // real client (the end-to-end test in tests/tls_fp_ua_check.rs measures real ones).
+    const TOOL_JA4: &str = "t13d1516h2_8daaf6152771_e5627efa2ab1";
+    const BROWSER_JA4: &str = "t13d1517h2_8daaf6152771_b0da82dd1658";
+    const CHROME_UA: &[u8] =
+        b"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36";
+
+    /// A runtime with one tool fingerprint ("curl") and one browser fingerprint ("chrome").
+    fn ua_runtime(mode: crate::config::UaCheckMode) -> TlsFpRuntime {
+        use crate::config::{
+            AllowedFingerprint, FingerprintConfig, FingerprintMode, UaCheckConfig,
+        };
+        let entry = |name: &str, ja4: &str| AllowedFingerprint {
+            name: name.into(),
+            ja4: ja4.into(),
+            rate_limit_cps: 0,
+            allowed_routes: vec![],
+        };
+        TlsFpRuntime::from_config(&FingerprintConfig {
+            mode: FingerprintMode::Shadow,
+            allowed: vec![entry("curl", TOOL_JA4), entry("chrome", BROWSER_JA4)],
+            ua_check: Some(UaCheckConfig {
+                mode,
+                browser_ua: vec!["Chrome/".into(), "Firefox/".into()],
+                tool_names: vec!["curl".into()],
+            }),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn contains_ascii_ci_matches_any_case_and_refuses_empty_needles() {
+        assert!(contains_ascii_ci(b"Mozilla Chrome/131", b"chrome/"));
+        assert!(
+            contains_ascii_ci(b"chrome/", b"chrome/"),
+            "needle is the whole haystack"
+        );
+        assert!(
+            contains_ascii_ci(b"xxCHROME/", b"chrome/"),
+            "needle at the end"
+        );
+        assert!(
+            !contains_ascii_ci(b"chrom", b"chrome/"),
+            "haystack shorter than the needle"
+        );
+        assert!(!contains_ascii_ci(b"curl/8.5", b"chrome/"));
+        assert!(
+            !contains_ascii_ci(b"anything", b""),
+            "an empty needle must not match everything"
+        );
+    }
+
+    #[test]
+    fn ua_verdict_matrix() {
+        use crate::config::UaCheckMode;
+        let rt = ua_runtime(UaCheckMode::Enforce);
+        // A browser UA on a tool JA4: the lie this check exists for.
+        assert_eq!(
+            rt.ua_verdict(Some(TOOL_JA4), Some(CHROME_UA)),
+            UaVerdict::Mismatch
+        );
+        // A browser UA on a browser JA4, or on a JA4 nobody named: consistent. An
+        // unknown fingerprint is NOT a mismatch (zion has no database to say it is a tool).
+        assert_eq!(
+            rt.ua_verdict(Some(BROWSER_JA4), Some(CHROME_UA)),
+            UaVerdict::Consistent
+        );
+        assert_eq!(
+            rt.ua_verdict(
+                Some("t13d0000h2_000000000000_000000000000"),
+                Some(CHROME_UA)
+            ),
+            UaVerdict::Consistent
+        );
+        // No JA4 (HTTP/3): never a mismatch, but counted apart.
+        assert_eq!(rt.ua_verdict(None, Some(CHROME_UA)), UaVerdict::NoJa4);
+        // A UA that does not claim a browser is not compared at all, whatever the JA4,
+        // and neither is a request without a UA.
+        assert_eq!(
+            rt.ua_verdict(Some(TOOL_JA4), Some(&b"curl/8.5.0"[..])),
+            UaVerdict::Skip
+        );
+        assert_eq!(
+            rt.ua_verdict(None, Some(&b"curl/8.5.0"[..])),
+            UaVerdict::Skip
+        );
+        assert_eq!(rt.ua_verdict(Some(TOOL_JA4), None), UaVerdict::Skip);
+        // The pattern list is case-insensitive: lowercasing the UA is no way out.
+        assert_eq!(
+            rt.ua_verdict(Some(TOOL_JA4), Some(&b"mozilla/5.0 chrome/131"[..])),
+            UaVerdict::Mismatch
+        );
+        assert_eq!(
+            rt.ua_verdict(
+                Some(TOOL_JA4),
+                Some(&b"Mozilla/5.0 Gecko Firefox/120.0"[..])
+            ),
+            UaVerdict::Mismatch
+        );
+    }
+
+    #[test]
+    fn ua_verdict_considers_every_user_agent_value() {
+        use crate::config::UaCheckMode;
+        let rt = ua_runtime(UaCheckMode::Enforce);
+        let tool: &[u8] = b"curl/8.5.0";
+        // The proxy forwards every User-Agent header, so a browser claim in ANY of them is
+        // a claim, whichever comes first.
+        assert_eq!(
+            rt.ua_verdict(Some(TOOL_JA4), [tool, CHROME_UA]),
+            UaVerdict::Mismatch
+        );
+        assert_eq!(
+            rt.ua_verdict(Some(TOOL_JA4), [CHROME_UA, tool]),
+            UaVerdict::Mismatch
+        );
+        assert_eq!(
+            rt.ua_gate(Some(TOOL_JA4), [tool, CHROME_UA], "/"),
+            GateDecision::Reject
+        );
+        // None of them claims a browser: not compared.
+        assert_eq!(
+            rt.ua_verdict(Some(TOOL_JA4), [tool, &b"python-requests/2.31"[..]]),
+            UaVerdict::Skip
+        );
+        // No value at all: not compared.
+        assert_eq!(
+            rt.ua_verdict(Some(TOOL_JA4), std::iter::empty::<&[u8]>()),
+            UaVerdict::Skip
+        );
+    }
+
+    #[test]
+    fn ua_check_off_or_absent_never_has_an_opinion() {
+        use crate::config::{AllowedFingerprint, FingerprintConfig, FingerprintMode, UaCheckMode};
+        // mode = off in the block: no check is built.
+        let off = ua_runtime(UaCheckMode::Off);
+        assert_eq!(
+            off.ua_verdict(Some(TOOL_JA4), Some(CHROME_UA)),
+            UaVerdict::Skip
+        );
+        assert_eq!(
+            off.ua_gate(Some(TOOL_JA4), Some(CHROME_UA), "/"),
+            GateDecision::Proceed
+        );
+        // No block at all.
+        let none = TlsFpRuntime::from_config(&FingerprintConfig {
+            mode: FingerprintMode::Shadow,
+            allowed: vec![AllowedFingerprint {
+                name: "curl".into(),
+                ja4: TOOL_JA4.into(),
+                rate_limit_cps: 0,
+                allowed_routes: vec![],
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            none.ua_verdict(Some(TOOL_JA4), Some(CHROME_UA)),
+            UaVerdict::Skip
+        );
+    }
+
+    #[test]
+    fn ua_gate_enforce_rejects_shadow_observes_and_health_is_exempt() {
+        use crate::config::UaCheckMode;
+        let enforce = ua_runtime(UaCheckMode::Enforce);
+        let shadow = ua_runtime(UaCheckMode::Shadow);
+        assert_eq!(
+            enforce.ua_gate(Some(TOOL_JA4), Some(CHROME_UA), "/"),
+            GateDecision::Reject
+        );
+        assert_eq!(
+            shadow.ua_gate(Some(TOOL_JA4), Some(CHROME_UA), "/"),
+            GateDecision::Proceed
+        );
+        // Everything that is not a mismatch proceeds in enforce.
+        for (ja4, ua) in [
+            (Some(BROWSER_JA4), Some(CHROME_UA)),
+            (None, Some(CHROME_UA)),
+            (Some(TOOL_JA4), Some(&b"curl/8.5.0"[..])),
+            (Some(TOOL_JA4), None),
+        ] {
+            assert_eq!(
+                enforce.ua_gate(ja4, ua, "/"),
+                GateDecision::Proceed,
+                "{ja4:?}"
+            );
+        }
+        // The load balancer's health probe is never policy-gated (over HTTP/3 it reaches dispatch).
+        assert_eq!(
+            enforce.ua_gate(Some(TOOL_JA4), Some(CHROME_UA), "/healthz"),
+            GateDecision::Proceed
+        );
+        assert_eq!(
+            enforce.ua_gate(Some(TOOL_JA4), Some(CHROME_UA), "/readyz"),
+            GateDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn ua_gate_counts_checked_mismatch_and_no_ja4_in_both_modes() {
+        use crate::config::UaCheckMode;
+        use std::sync::atomic::Ordering::Relaxed;
+        let m = &crate::metrics::METRICS;
+        // The counters are global atomics shared with parallel tests: assert only
+        // that THIS test's calls moved them, as the route_gate test does.
+        for mode in [UaCheckMode::Shadow, UaCheckMode::Enforce] {
+            let rt = ua_runtime(mode);
+            let (c0, m0, n0) = (
+                m.tls_fp_ua_checked.load(Relaxed),
+                m.tls_fp_ua_mismatch.load(Relaxed),
+                m.tls_fp_ua_no_ja4.load(Relaxed),
+            );
+            rt.ua_gate(Some(TOOL_JA4), Some(CHROME_UA), "/");
+            assert!(
+                m.tls_fp_ua_mismatch.load(Relaxed) > m0,
+                "{mode:?}: mismatch not counted"
+            );
+            assert!(
+                m.tls_fp_ua_checked.load(Relaxed) > c0,
+                "{mode:?}: mismatch is also a check"
+            );
+            let n1 = m.tls_fp_ua_no_ja4.load(Relaxed);
+            rt.ua_gate(None, Some(CHROME_UA), "/");
+            assert!(
+                m.tls_fp_ua_no_ja4.load(Relaxed) > n1,
+                "{mode:?}: no_ja4 not counted"
+            );
+            assert!(m.tls_fp_ua_no_ja4.load(Relaxed) > n0);
+        }
+    }
+
+    #[test]
+    fn tool_names_match_a_ja4_written_in_any_case() {
+        use crate::config::{
+            AllowedFingerprint, FingerprintConfig, FingerprintMode, UaCheckConfig, UaCheckMode,
+        };
+        // The allowlist normalizes JA4s (trim + lowercase); the tool set must too, or a
+        // fingerprint pasted in upper case would be named a tool and never match.
+        let rt = TlsFpRuntime::from_config(&FingerprintConfig {
+            mode: FingerprintMode::Shadow,
+            allowed: vec![AllowedFingerprint {
+                name: "curl".into(),
+                ja4: format!("  {}  ", TOOL_JA4.to_uppercase()),
+                rate_limit_cps: 0,
+                allowed_routes: vec![],
+            }],
+            ua_check: Some(UaCheckConfig {
+                mode: UaCheckMode::Enforce,
+                browser_ua: vec!["Chrome/".into()],
+                tool_names: vec!["curl".into()],
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            rt.ua_verdict(Some(TOOL_JA4), Some(CHROME_UA)),
+            UaVerdict::Mismatch
+        );
     }
 
     #[test]
