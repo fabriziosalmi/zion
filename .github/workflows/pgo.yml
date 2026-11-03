@@ -45,11 +45,10 @@ env:
   PGO_CARGO_TEST: cargo-zigbuild test
   PGO_MAX_GLIBC: "2.28"
 
-# Pinned to ubuntu-24.04: the baseline smoke below fails on 26.04 (see cpu-baseline.yml and #766).
 jobs:
   pgo:
     name: PGO build as the release (x86_64-unknown-linux-gnu)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -125,7 +124,9 @@ jobs:
       - name: CPU baseline (declared, and served under an emulated baseline CPU)
         run: |
           sudo apt-get install -y qemu-user >/dev/null
-          bash scripts/cpu-baseline-smoke.sh "${RUNNER_TEMP}/zion-first"
+          # The libc of the image we ship, not the runner's (#766, scripts/baseline-sysroot.sh).
+          bash scripts/baseline-sysroot.sh x86_64 "${RUNNER_TEMP}/sysroot"
+          SMOKE_SYSROOT="${RUNNER_TEMP}/sysroot" bash scripts/cpu-baseline-smoke.sh "${RUNNER_TEMP}/zion-first"
           bash scripts/check-build-date.sh "${RUNNER_TEMP}/zion-first"
 
       # A release is rebuilt from the profile published with it, kept somewhere else, by
