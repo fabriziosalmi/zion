@@ -421,7 +421,19 @@ fn query_has(q: &str, name: &str, value: Option<&str>) -> bool {
 }
 
 /// A minimal glob: `*` matches any run of characters (including `/` and the empty run). Every other
-/// character is literal. No `?` or character classes — enough to shield a CVE by path shape.
+/// character is literal, compared ASCII case-insensitively. No `?` or character classes — enough
+/// to shield a CVE by path shape.
+///
+/// Case-insensitive on purpose, not because HTTP paths are (RFC 3986: they are not) -- because
+/// case variation is a textbook WAF-evasion technique, and this engine is used only for narrow,
+/// specific, security-sensitive prefixes (an actuator endpoint, a management API, a REST route)
+/// that nothing legitimate is going to coincidentally share at a different case. The asymmetry
+/// is the point: a missed `/MGMT/tm/util/bash` because the real backend's routing turned out to
+/// be case-insensitive is a remote-code-execution-class miss; a path that happens to collide
+/// case-insensitively with one of these specific prefixes and gets a 403 it didn't need is a
+/// false positive on a shield a route opted into. Found by review-driven audit of the two
+/// pre-existing shipped rules (#773): `path_glob = "/mgmt/*"` let `/MGMT/tm/util/bash` straight
+/// through on the real binary, confirmed before this fix existed.
 #[derive(Debug)]
 pub struct Glob {
     /// Literal segments between `*`s. `leading`/`trailing` say whether the pattern starts/ends
@@ -441,7 +453,7 @@ impl Glob {
         let parts: Vec<String> = pattern
             .split('*')
             .filter(|p| !p.is_empty())
-            .map(String::from)
+            .map(str::to_ascii_lowercase)
             .collect();
         Ok(Glob {
             parts,
@@ -455,7 +467,10 @@ impl Glob {
         if self.parts.is_empty() {
             return true;
         }
-        let mut rest = s;
+        // One lowercase pass of the input, not one per part: parts are already lowercased
+        // at compile() time, so this keeps the comparison itself a plain byte match.
+        let lowered = s.to_ascii_lowercase();
+        let mut rest = lowered.as_str();
         for (i, part) in self.parts.iter().enumerate() {
             let first = i == 0;
             let last = i == self.parts.len() - 1;
@@ -534,6 +549,24 @@ mod tests {
         assert!(Glob::compile("/*/admin/*").unwrap().matches("/v1/admin/x"));
         assert!(Glob::compile("/exact").unwrap().matches("/exact"));
         assert!(!Glob::compile("/exact").unwrap().matches("/exact/more"));
+    }
+
+    #[test]
+    fn glob_matching_is_ascii_case_insensitive() {
+        // Case variation is a textbook evasion technique against a path-based security shield
+        // (found on the two pre-existing shipped rules, #773: `/mgmt/*` let `/MGMT/...` through).
+        // Every combination of pattern case and input case must match the same way.
+        for pattern in ["/mgmt/*", "/MGMT/*", "/Mgmt/*"] {
+            let g = Glob::compile(pattern).unwrap();
+            assert!(g.matches("/mgmt/tm/util/bash"), "{pattern}");
+            assert!(g.matches("/MGMT/tm/util/bash"), "{pattern}");
+            assert!(g.matches("/MgMt/Tm/UTIL/bash"), "{pattern}");
+        }
+        // A middle literal part (between two `*`s), not just the anchored prefix.
+        assert!(Glob::compile("/*/ADMIN/*").unwrap().matches("/v1/admin/x"));
+        // Still anchored correctly: case-folding must not loosen what the pattern excludes.
+        assert!(!Glob::compile("/mgmt/*").unwrap().matches("/not-mgmt/x"));
+        assert!(!Glob::compile("/EXACT").unwrap().matches("/exact/more"));
     }
 
     #[test]

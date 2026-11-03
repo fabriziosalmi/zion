@@ -222,6 +222,11 @@ fn the_shipped_pack_blocks_each_cve_shape() {
         // query-string parsing decodes this to 'id' before WordPress ever sees it, so the rule
         // must too (query_has() in src/virtual_patch.rs).
         ("CVE-2017-1001000", "PUT", "/wp-json/wp/v2/posts/1?%69d=1z"),
+        // And with the PATH's own case changed: Glob::matches() is ASCII case-insensitive on
+        // purpose (#773, found auditing these first two rules after the WordPress ones above --
+        // `/mgmt/*` let `/MGMT/tm/util/bash` straight through before this).
+        ("CVE-2022-22947", "GET", "/ACTUATOR/gateway/routes/x"),
+        ("CVE-2021-22986", "GET", "/MGMT/tm/util/bash"),
     ];
     for (cve, method, path) in blocked {
         assert_eq!(
