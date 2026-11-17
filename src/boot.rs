@@ -339,6 +339,32 @@ pub(crate) fn resolve_config(
     // `max_connections`, or the value derived from memory (the cgroup limit when there
     // is one). The per-IP default and the tarpit cap below are derived from it.
     let conn_ceiling = bootstrap::set_conn_ceiling(config.server.max_connections);
+    let fd = bootstrap::fd_limit();
+    if let Some((before, soft)) = fd {
+        if soft > before {
+            logging::info(
+                "boot",
+                &format!("file descriptor limit raised from {before} to {soft} (the hard limit)"),
+            );
+        }
+        let budget = bootstrap::fd_conn_budget(soft);
+        match config.server.max_connections {
+            Some(configured) if configured > budget => logging::warn(
+                "boot",
+                &format!(
+                    "server.max_connections = {configured} is above the {budget} proxied connections {soft} file descriptors can carry (two each, plus a reserve): past that, accepts and upstream connects fail with EMFILE before the ceiling refuses cleanly. Raise LimitNOFILE / ulimit -n, or lower max_connections"
+                ),
+            ),
+            None if conn_ceiling < platform.conn_limit => logging::info(
+                "boot",
+                &format!(
+                    "connection ceiling {conn_ceiling}: {} from {} MB of memory, lowered to what {soft} file descriptors can carry (two per proxied connection, plus a reserve)",
+                    platform.conn_limit, platform.ram_mb
+                ),
+            ),
+            _ => {}
+        }
+    }
     if let Some(configured) = config.server.max_connections {
         let derived = platform.conn_limit;
         let needs_mb = configured as u64 * 256 / 1024;
