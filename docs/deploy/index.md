@@ -234,7 +234,7 @@ covered by `tests/exit_codes.rs`:
 | `2`  | config   | Config unreadable, unparseable, or failed validation (bad address, dangling upstream, unknown profile reference, …) |
 | `3`  | tls      | TLS material bad — cert/key missing, malformed, or mismatched |
 | `4`  | listener | Binding a listen socket failed (port in use, permission denied) |
-| `5`  | runtime  | A runtime subsystem failed to start — ACME, auth, or audit |
+| `5`  | runtime  | Reserved, not emitted today. An ACME, auth or audit problem found at start (an unwritable certificate directory, a bad auth profile, an audit log that cannot be opened) is a config error, `2`; an ACME renewal that fails at runtime is logged and does not stop the daemon |
 | `1`  | other    | Any other fatal error |
 
 There is no dedicated `--check` mode: starting the daemon **is** the validation.

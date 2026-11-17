@@ -152,9 +152,13 @@ required).
   inside its block → the upstream's own address. Other sub-directives of a
   `reverse_proxy { … }` block (`lb_policy`, `health_uri`, `transport`, …) are
   reported as unsupported; before, they were dropped without a finding.
+- `encode` → `compress = { enabled = true }` on every route of the site
+  (partial: gzip and brotli, no zstd; text responses of 1 KiB or more; by default
+  not a response that sets a cookie or is `Cache-Control: private`, the BREACH
+  guard). The binary needs the `compress` feature, which is in `dist`.
 
 Not translated: `handle_path` (path rewriting), `respond "…" 403` (static
-responses), `encode` (Zion does not compress), named `@matcher`s.
+responses), named `@matcher`s.
 
 ## Automatic HTTPS (ACME)
 
@@ -229,7 +233,9 @@ Zion refuses to guess. These are `unsupported` on purpose — the ADRs
 - **Path rewriting** (`strip_prefix` / `handle_path` / nginx `rewrite`) — Zion
   forwards the original path unchanged.
 - **Arbitrary static responses** and **custom error pages**.
-- **Response compression** — a deliberate product choice.
+- **Response compression** — no longer on this list: since 0.16.0 zion compresses on
+  routes that opt in ([ADR-0025](/adr/0025-response-compression)), and Caddy's
+  `encode` is converted to it.
 - **Regex / conditional routing** — Zion routes on literal path segments.
 
 If a real migration needs one of these, it is reopened as an ADR amendment, not

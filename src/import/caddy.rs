@@ -670,6 +670,9 @@ fn map_site(
     // header block yields a CSP that applies to every route unless a handler
     // overrides it.
     let mut site_csp: Option<String> = None;
+    // `encode` compresses every response of the site: the routes made below get `compress`.
+    let mut site_encode = false;
+    let first_route = doc.routes.len();
     for node in body {
         match node.name.as_str() {
             "header" => {
@@ -678,12 +681,15 @@ fn map_site(
                 }
             }
             "tls" => map_tls(node, doc, findings),
-            "encode" => findings.push(Finding::new(
-                Status::Unsupported,
-                node.line,
-                "encode",
-                "Zion does not compress responses — the backend should",
-            )),
+            "encode" => {
+                site_encode = true;
+                findings.push(Finding::new(
+                    Status::Partial,
+                    node.line,
+                    "encode",
+                    "becomes `compress = { enabled = true }` on this site's routes: zion compresses text responses with gzip or brotli (no zstd), skips bodies under 1 KiB, and by default does not compress a response that sets a cookie or is `Cache-Control: private` (the BREACH guard, `allow_cookied`); the binary needs the `compress` feature (in `dist`)",
+                ));
+            }
             "log" => findings.push(Finding::new(
                 Status::Auto,
                 node.line,
@@ -822,8 +828,15 @@ fn map_site(
                 spa_fallback: spa,
                 internal_only: false,
                 preserve_host: false,
+                compress: false,
                 annotations: Vec::new(),
             });
+        }
+    }
+
+    if site_encode {
+        for route in &mut doc.routes[first_route..] {
+            route.compress = true;
         }
     }
 
@@ -1223,6 +1236,7 @@ fn push_route(
         spa_fallback: false,
         internal_only: false,
         preserve_host,
+        compress: false,
         annotations: Vec::new(),
     });
 }
@@ -1512,7 +1526,7 @@ mod tests {
         assert!(c.toml.contains("default-src 'self'"));
         // the source header is honest
         assert!(c.toml.contains("zion import caddy"));
-        // header block evaporated to auto; HSTS is partial; XSS + encode unsupported
+        // header block evaporated to auto; HSTS is partial; XSS unsupported; encode partial
         assert!(c
             .findings
             .iter()
@@ -1522,10 +1536,17 @@ mod tests {
             .findings
             .iter()
             .any(|f| f.status == Status::Unsupported && f.directive.contains("X-XSS-Protection")));
+        // `encode` is compression on every route of the site (since 0.16.0 zion compresses).
         assert!(c
             .findings
             .iter()
-            .any(|f| f.status == Status::Unsupported && f.directive == "encode"));
+            .any(|f| f.status == Status::Partial && f.directive == "encode"));
+        assert_eq!(
+            c.toml.matches("compress = { enabled = true }").count(),
+            c.toml.matches("[[route]]").count(),
+            "{}",
+            c.toml
+        );
     }
 
     #[test]
@@ -1773,11 +1794,48 @@ mod tests {
             .expect("static site converts to mode=static");
         assert!(c.toml.contains("mode = \"static\""));
         assert!(c.toml.contains("serve_dir = \"/srv/www\""));
-        // `encode` is still unsupported (Zion does not compress).
+        // `encode` on a static site: its files are compressed too.
         assert!(c
             .findings
             .iter()
-            .any(|f| f.status == Status::Unsupported && f.directive == "encode"));
+            .any(|f| f.status == Status::Partial && f.directive == "encode"));
+        assert!(
+            c.toml.contains("compress = { enabled = true }"),
+            "{}",
+            c.toml
+        );
+    }
+
+    /// `encode` used to be reported as unsupported ("Zion does not compress"), which also failed
+    /// an import under `--strict`, though zion compresses since 0.16.0. A site without `encode`
+    /// gets no `compress`, and the generated config is one zion accepts.
+    #[test]
+    fn encode_becomes_route_compression_and_only_where_it_was() {
+        let with = convert(
+            "example.com {\n  encode gzip zstd\n  reverse_proxy 127.0.0.1:8080\n}\n",
+            None,
+            &[],
+            None,
+        )
+        .expect("converts");
+        assert!(
+            with.toml.contains("compress = { enabled = true }"),
+            "{}",
+            with.toml
+        );
+        assert!(!with
+            .findings
+            .iter()
+            .any(|f| f.status == Status::Unsupported));
+        toml::from_str::<crate::config::ZionConfig>(&with.toml).expect("zion accepts the output");
+        let without = convert(
+            "example.com {\n  reverse_proxy 127.0.0.1:8080\n}\n",
+            None,
+            &[],
+            None,
+        )
+        .expect("converts");
+        assert!(!without.toml.contains("compress"), "{}", without.toml);
     }
 }
 

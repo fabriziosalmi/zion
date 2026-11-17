@@ -115,6 +115,31 @@ the burst. The default (1,000/s, burst 2,000) is a generous threshold between a 
 behind one CGNAT IP (low hundreds/s) and a flood, on by default; `handshake_rate_allowlist` exempts
 named sources, and `0` disables it. Rejections are counted in `zion_connections_rejected_handshake_rate`.
 
+## TLS client fingerprints (JA4)
+
+Needs `--features tls-fingerprint`. Zion computes the JA4 fingerprint of each TLS ClientHello before the handshake (it peeks the bytes, the handshake then reads them as usual):
+
+```toml
+[tls.fingerprint]
+mode = "shadow"                 # off (default) | shadow | allowlist
+on_unknown = "log_only"         # allowlist: log_only (default) | drop
+on_unfingerprintable = "allow"  # allowlist: allow (default) | drop
+ban_ttl_secs = 600              # allowlist + drop: seconds a rejected JA4 stays banned; 0 = no ban set
+
+[[tls.fingerprint.allowed]]
+name = "chrome-131"
+ja4 = "t13d1516h2_8daaf6152771_e5627efa2ab1"
+rate_limit_cps = 0              # new TLS connections per second for this JA4; 0 = no limit
+allowed_routes = []             # route patterns this JA4 may request; empty = no restriction
+```
+
+- `mode`: `off` does nothing and costs nothing. `shadow` computes the JA4 and counts known and unknown (`zion_tls_fp_known`, `zion_tls_fp_unknown`) without ever blocking. `allowlist` also enforces.
+- `on_unknown` (`allowlist`): what happens to a JA4 not in `allowed`. `log_only` counts it and lets it through; `drop` closes the socket before the handshake (`zion_tls_fp_rejected`).
+- `on_unfingerprintable` (`allowlist`): a ClientHello that cannot be fingerprinted (the peek timed out, the record is larger than the buffer, it is not TLS). `allow` keeps availability first; `drop` fails closed.
+- `ban_ttl_secs` (`allowlist` with `on_unknown = "drop"`): once a JA4 is rejected, repeat connections with it are rejected on a fast path for this many seconds, with one map lookup and a debug-level log instead of a warning each (`zion_tls_fp_banned_hits`). Bans survive config reloads, not restarts.
+- `rate_limit_cps`: a cap on new TLS connections per second for this fingerprint. These are connections, not requests: the gate runs before the handshake. Over the cap, a connection is dropped in `allowlist` and only counted (`zion_tls_fp_rate_limited`) in `shadow`.
+- `allowed_routes`: the routes this fingerprint may request, with the same pattern syntax as `[[route]] path`. A request outside them gets `403` in `allowlist` and is only counted (`zion_tls_fp_route_denied`) in `shadow`. The list grants the whole request surface, so a restricted scraper needs `/metrics` on it; `/healthz` and `/readyz` are always allowed. An invalid pattern refuses the config.
+
 ## JA4 and User-Agent consistency
 
 Needs `--features tls-fingerprint` and `[tls.fingerprint]` in `shadow` or `allowlist` mode. A client that forges only its `User-Agent` string (curl, a Go or Python HTTP client saying it is Chrome) still shows the TLS fingerprint of the library it really is. `[tls.fingerprint.ua_check]` compares the two.

@@ -1,7 +1,8 @@
 # Architecture
 
-Zion is a single async Rust binary built on Tokio, Hyper, and rustls. <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-~15,900 lines across 21 source files.
+Zion is a single async Rust binary built on Tokio, Hyper, and rustls.
+<!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
+86 modules, ~86,600 lines of Rust.
 
 ## Module map
 
@@ -52,6 +53,24 @@ src/
 ├── doctor.rs      # `zion doctor` environment diagnostic
 ├── init.rs        # `zion init` interactive wizard + `zion auto` ephemeral mode (feature: --features init)
 ├── tui.rs         # `zion top` live dashboard (feature: --features tui)
+├── handshake_rate.rs # Per-IP new-TLS-handshake rate limit (token bucket; IPv6 keyed per /64), enforced at accept
+├── h2_guard.rs    # Per-connection bound on HTTP/2 control frames, and the client-preface check when ALPN chose h2
+├── linger.rs      # Lingering close for HTTP/1.1: a client still sending a body when zion answers gets the answer
+├── upstream_body.rs # The request body as sent upstream: the route's `max_body_mb` and the no-progress deadline
+├── header_policy.rs # Request headers and cookies a route strips or refuses (`strip_headers`, `deny_headers`, `deny_cookies`)
+├── route_restrict.rs # Per-route `methods`, `content_types` and `deny_paths`
+├── reserved_headers.rs # Request headers an upstream reads as a statement about the request, and who may set them
+├── virtual_patch.rs # Operator-editable CVE shields from a hot-reloaded TOML file (`[virtual_patch]`)
+├── compress.rs    # Opt-in gzip/brotli response compression (ADR-0025; the codecs need `--features compress`)
+├── pem.rs         # PEM files read through `rustls::pki_types`
+├── crl.rs         # When a certificate revocation list says it will be replaced (`nextUpdate`)
+├── ktls.rs        # kTLS post-handshake offload (Linux, feature: --features ktls)
+├── tls_fp.rs      # JA4 TLS client fingerprinting, allowlist and User-Agent check (feature: --features tls-fingerprint)
+├── waf_ml.rs      # ML-augmented WAF scoring (feature: --features ml-waf)
+├── aimp_cp.rs     # The AIMP mesh as control plane (feature: --features sovereign-aimp)
+├── alloc_tuning.rs # mimalloc settings that keep the process's memory near what the response cache counts
+├── error.rs       # `ZionError` and the exit code of each failure category
+├── suggest.rs     # `zion suggest`: deterministic `zion.toml` synthesis from detected signals
 ├── cli.rs         # Command-line argument parsing
 └── logging.rs     # Structured logging (text/JSON)
 ```
