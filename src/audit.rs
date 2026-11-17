@@ -626,8 +626,8 @@ fn derive_key_id(key: &hmac::Key) -> String {
 /// `AppState`, and the [`AuditWriter`] to shut down on exit. `(noop, None)` when
 /// `cfg.enabled` is `false`.
 ///
-/// When audit IS enabled, a missing path, a missing/empty key, or a key shorter
-/// than 32 bytes is an `Err`: the operator asked for a tamper-evident trail, and
+/// When audit IS enabled, a missing path, a path that cannot be opened for
+/// appending, a missing/empty key, or a key shorter than 32 bytes is an `Err`: the operator asked for a tamper-evident trail, and
 /// booting without one because of a typo in `key_env` or a missing secret mount
 /// would silently remove it. The caller refuses to start.
 pub fn spawn_writer(cfg: &AuditConfig) -> Result<(AuditHandle, Option<AuditWriter>), String> {
@@ -694,6 +694,22 @@ pub fn spawn_writer(cfg: &AuditConfig) -> Result<(AuditHandle, Option<AuditWrite
             }
         }
     });
+
+    // The trail must be writable now, not only once the writer is running: the writer opens the
+    // file in its own task, and a path it cannot open (a missing directory, a read-only mount,
+    // wrong ownership) used to log "events will be dropped" there and leave zion serving with no
+    // trail at all. Same rule as a missing key: asked for a trail, refuse to start without one.
+    // (A later rotation that cannot open the next segment is a runtime failure, reported by
+    // `zion_audit_writer_up` / `zion_audit_write_failures_total`.)
+    if let Err(e) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        return Err(format!(
+            "[audit] cannot open audit.path {path}: {e} — refusing to start without the audit trail"
+        ));
+    }
 
     let (tx, rx) = tokio::sync::mpsc::channel::<AuditEvent>(cfg.queue_depth);
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -2150,6 +2166,28 @@ mod tests {
             queue_depth: 512,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn an_audit_path_that_cannot_be_opened_refuses_to_start() {
+        // The file used to be opened only inside the spawned writer: a path that could not be
+        // opened logged "events will be dropped", the writer exited, and zion served with no
+        // trail at all. Asked for one, it refuses to start instead, like a missing key.
+        let dir = tempdir();
+        std::env::set_var("ZION_TEST_SEC01_OPEN", "k".repeat(32));
+        let unopenable = dir.join("no-such-dir").join("audit.log");
+        let e = spawn_err(&cfg_for(&unopenable, "ZION_TEST_SEC01_OPEN"));
+        assert!(
+            e.contains("cannot open")
+                && e.contains("no-such-dir")
+                && e.contains("refusing to start"),
+            "{e}"
+        );
+        // The same config with a path that opens starts, and writes its chain there.
+        let ok = dir.join("audit.log");
+        let (_h, w) = spawn_writer(&cfg_for(&ok, "ZION_TEST_SEC01_OPEN")).expect("opens");
+        assert!(w.unwrap().shutdown(std::time::Duration::from_secs(5)).await);
+        assert!(std::fs::read_to_string(&ok).unwrap().contains("chain_init"));
     }
 
     #[tokio::test]
