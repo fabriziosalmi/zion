@@ -95,6 +95,34 @@ impl Drop for ConnSlot {
     }
 }
 
+/// What an open client connection holds: the global connection permit, its per-IP slot and its
+/// place in the active-connections gauge. Cloned (an `Arc`), and released when the last clone
+/// goes: hyper ends the connection's own task at a WebSocket upgrade, while the relay that
+/// carries the session keeps a clone, so a session counts against `max_connections` and
+/// `max_connections_per_ip` until it ends, not only until its `101`.
+#[derive(Clone)]
+pub struct HeldConnection {
+    _hold: Arc<Held>,
+}
+
+struct Held {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _ip_slot: ConnSlot,
+    _gauge: crate::metrics::ConnectionGuard,
+}
+
+impl HeldConnection {
+    pub fn new(permit: tokio::sync::OwnedSemaphorePermit, ip_slot: ConnSlot) -> Self {
+        Self {
+            _hold: Arc::new(Held {
+                _permit: permit,
+                _ip_slot: ip_slot,
+                _gauge: crate::metrics::ConnectionGuard::new(),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
