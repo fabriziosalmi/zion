@@ -700,11 +700,16 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthPr
     validation.validate_exp = true;
     validation.validate_nbf = true;
 
+    // A configured issuer / audience is a required claim. jsonwebtoken compares `iss` and `aud`
+    // only when the token carries them, so without this a token that simply leaves the claim out
+    // (one the same key signed for another service) passes the scoping.
     if let Some(ref iss) = config.issuer {
         validation.set_issuer(&[iss]);
+        validation.required_spec_claims.insert("iss".to_string());
     }
     if let Some(ref aud) = config.audience {
         validation.set_audience(&[aud]);
+        validation.required_spec_claims.insert("aud".to_string());
     }
 
     // Clock-skew tolerance for distributed systems (default 30s, capped above).
@@ -1368,6 +1373,55 @@ mod tests {
         // the single-string form is unchanged
         let one = token_with(u64::MAX, Some("api.zion.dev".into()));
         assert!(validate_token(&one, &p).is_ok());
+    }
+
+    /// A token signed with the profile's key, carrying exactly `claims` (a claim left out of the
+    /// JSON is absent from the token, as an IdP that never sets it would send it).
+    #[cfg(feature = "auth")]
+    fn token_from_json(claims: serde_json::Value) -> String {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"unit-test-secret-padding-padding-padding-padding"),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "auth")]
+    #[test]
+    fn a_configured_audience_or_issuer_is_a_required_claim() {
+        // jsonwebtoken compares `aud` / `iss` only when the token carries them, so a profile that
+        // set `audience` used to accept a token with no `aud` at all: one signed by the same key
+        // for another service passed the scoping. Configured means required.
+        let exp = now() + 600;
+
+        let p = resolve_auth_profile(&hmac_cfg(Some("api.zion.dev"), 30, None)).unwrap();
+        let no_aud = token_from_json(serde_json::json!({ "sub": "u", "exp": exp }));
+        assert!(
+            validate_token(&no_aud, &p).is_err(),
+            "audience is set: a token with no aud must be refused"
+        );
+        let with_aud =
+            token_from_json(serde_json::json!({ "sub": "u", "exp": exp, "aud": "api.zion.dev" }));
+        assert!(validate_token(&with_aud, &p).is_ok(), "matching aud");
+
+        let mut cfg = hmac_cfg(None, 30, None);
+        cfg.issuer = Some("auth.zion.dev".into());
+        let p = resolve_auth_profile(&cfg).unwrap();
+        let no_iss = token_from_json(serde_json::json!({ "sub": "u", "exp": exp }));
+        assert!(
+            validate_token(&no_iss, &p).is_err(),
+            "issuer is set: a token with no iss must be refused"
+        );
+        let with_iss =
+            token_from_json(serde_json::json!({ "sub": "u", "exp": exp, "iss": "auth.zion.dev" }));
+        assert!(validate_token(&with_iss, &p).is_ok(), "matching iss");
+
+        // Neither set: neither claim is asked for, as before.
+        let p = resolve_auth_profile(&hmac_cfg(None, 30, None)).unwrap();
+        let bare = token_from_json(serde_json::json!({ "sub": "u", "exp": exp }));
+        assert!(validate_token(&bare, &p).is_ok(), "no scoping configured");
     }
 
     #[cfg(feature = "auth")]

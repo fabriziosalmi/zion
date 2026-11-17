@@ -47,6 +47,7 @@ uncached, marked `X-Zion-Cache: BYPASS`):
 | `Vary` | Absent, or naming request headers zion can key on (see [Vary and secondary keys](#vary-and-secondary-keys)). **Not cached:** `Vary: *`, any varied credential header (`Cookie`, `Authorization`, `Proxy-Authorization`, `Set-Cookie`), more than 8 varied headers, or a variant over the per-key cap. |
 | `Set-Cookie` | The response must **not** set a cookie (any `Set-Cookie` header, whatever its `Cache-Control`). It starts or changes a session, so its body is for one client; it is streamed to that client and never stored. |
 | Freshness | A positive effective TTL (see below); an object that arrives already older than its lifetime isn't stored. |
+| Upstream progress | The body keeps coming: a gap longer than the upstream's `request_timeout_ms` between two body frames gives the fill up (counted in `zion_cache_fill_stalled`). The client that triggered the fetch keeps receiving whatever the upstream sends; nothing is stored, and the requests that were waiting for that fill fetch for themselves instead of waiting on a hung upstream. |
 
 ## Vary and secondary keys
 
@@ -244,7 +245,8 @@ x-zion-cache: HIT
 
 - **`X-Zion-Cache`** response header on every cacheable route: `HIT` (served from
   cache), `MISS` (fetched + stored), `BYPASS` (not cacheable / `no-store`).
-- **Metrics** (`/metrics`): `zion_cache_hits` / `zion_cache_misses`.
+- **Metrics** (`/metrics`): `zion_cache_hits` / `zion_cache_misses`; `zion_cache_fill_stalled`
+  counts fills given up because the upstream stopped sending the body.
 - **Purge** (loopback only, or the hosts in `[server] internal_networks` when it is
   set): `POST /_zion/cache/purge` clears everything;
   `POST /_zion/cache/purge?prefix=/static/` clears one path prefix (variants
