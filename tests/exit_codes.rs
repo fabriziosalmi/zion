@@ -286,3 +286,117 @@ upstream = "backend"
         "the error names the path:\n{stderr}"
     );
 }
+
+/// `[tls.acme]` writes the certificate it obtains to `[tls] cert_path` / `key_path`. A certificate
+/// directory zion cannot write (here read-only, as `/etc` is under the shipped systemd unit) made
+/// every issuance and renewal fail, found only when the bootstrap certificate expired. It is now
+/// a config error at boot: exit 2, naming the directory, before any port is bound or any ACME
+/// server is contacted. Only with `--features acme` (the CI `all-features` run).
+#[cfg(all(unix, feature = "acme"))]
+#[test]
+fn acme_with_an_unwritable_certificate_directory_exits_2() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = unique_dir("acme");
+    let certs = dir.join("certs");
+    fs::create_dir_all(&certs).unwrap();
+    let (cert, key) = (certs.join("cert.pem"), certs.join("key.pem"));
+    let made = Command::new("openssl")
+        .args(["req", "-x509", "-newkey", "ec"])
+        .args([
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-days",
+            "1",
+        ])
+        .args(["-subj", "/CN=localhost", "-keyout"])
+        .arg(&key)
+        .arg("-out")
+        .arg(&cert)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !made {
+        eprintln!("SKIP: openssl not available");
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+    fs::set_permissions(&certs, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::File::create(certs.join("probe")).is_ok() {
+        // Running as root: a read-only mode does not stop it, so there is nothing to refuse.
+        eprintln!("SKIP: running as root, the directory stays writable");
+        let _ = fs::set_permissions(&certs, fs::Permissions::from_mode(0o755));
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+    let cfg = dir.join("zion.toml");
+    fs::write(
+        &cfg,
+        format!(
+            r#"
+[server]
+listen_http = "127.0.0.1:18094"
+listen_https = "127.0.0.1:18494"
+
+[tls]
+cert_path = "{}"
+key_path = "{}"
+hot_reload = false
+
+[tls.acme]
+email = "ops@example.invalid"
+domains = ["example.invalid"]
+directory_url = "https://127.0.0.1:9/directory"
+state_dir = "{}"
+
+[upstreams]
+backend = "http://127.0.0.1:9099"
+
+[[route]]
+path = "/{{*rest}}"
+upstream = "backend"
+"#,
+            cert.display(),
+            key.display(),
+            dir.join("state").display()
+        ),
+    )
+    .unwrap();
+
+    // Bounded: without the check zion boots and serves, and `output()` would wait forever.
+    let log = dir.join("stderr.log");
+    let mut child = zion()
+        .env("ZION_CONFIG", &cfg)
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(&log).unwrap())
+        .spawn()
+        .expect("spawn zion");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let stderr = fs::read_to_string(&log).unwrap_or_default();
+    let _ = fs::set_permissions(&certs, fs::Permissions::from_mode(0o755));
+    let _ = fs::remove_dir_all(&dir);
+    let status = status.unwrap_or_else(|| panic!("zion booted and kept running:\n{stderr}"));
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "an unwritable certificate directory under [tls.acme] must exit 2, got {:?}\n{stderr}",
+        status.code()
+    );
+    assert!(
+        stderr.contains("cannot create files in") && stderr.contains("certs"),
+        "the error names the directory:\n{stderr}"
+    );
+}

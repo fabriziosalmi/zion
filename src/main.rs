@@ -355,6 +355,13 @@ async fn async_main(platform: &'static bootstrap::Platform) -> error::ZionResult
 
     let (config_path, config) = boot::load_config()?;
     let (tls_acceptor_store, _quic_reload_rx) = boot::load_tls(&config)?;
+    // `[tls.acme]` writes what it obtains to `[tls] cert_path` / `key_path`: refuse to start when
+    // it could not, instead of failing every renewal until the bootstrap certificate expires.
+    #[cfg(feature = "acme")]
+    if config.tls.acme.is_some() {
+        acme::check_cert_dirs_writable(&config.tls.cert_path, &config.tls.key_path)
+            .map_err(error::ZionError::Config)?;
+    }
     let (resolved, conn_ceiling) = boot::resolve_config(&config, platform)?;
     // The background tasks below (health prober, pool pre-warm) are spawned before the
     // snapshot moves into `AppState`, and need the upstream URL -> health map.
