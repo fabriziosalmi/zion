@@ -1300,10 +1300,14 @@ pub async fn proxy_websocket(
 /// spawn bidirectional pipe. Shared between plain TCP and TLS upstream paths.
 async fn send_ws_upgrade(
     sender: &mut hyper::client::conn::http1::SendRequest<ReqBody>,
-    req: Request<ReqBody>,
+    mut req: Request<ReqBody>,
     on_client_upgrade: hyper::upgrade::OnUpgrade,
     limits: WsLimits,
 ) -> Result<Response<ZionBody>, hyper::Error> {
+    // Taken before the request goes upstream; kept by the relay below.
+    let req_hold = req
+        .extensions_mut()
+        .remove::<crate::connlimit::HeldConnection>();
     // Send the upgrade request to upstream
     let upstream_resp = match sender.send_request(req).await {
         Ok(r) => r,
@@ -1367,8 +1371,12 @@ async fn send_ws_upgrade(
         )
         .unwrap();
 
+    // The client connection's permit, per-IP slot and gauge: hyper ends the connection's task at
+    // the upgrade, so the session holds them from here until it ends (see `HeldConnection`).
+    let held = req_hold;
     // Spawn the bidirectional pipe, bounded by `limits` (see `ws_pipe`).
     tokio::spawn(async move {
+        let _held = held;
         // Bound the upgrade handoff itself. `on_client_upgrade` normally
         // resolves near-instantly (right after the 101 is written), but a
         // client that vanishes in that window can otherwise leave this future
