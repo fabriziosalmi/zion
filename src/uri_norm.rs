@@ -195,7 +195,7 @@ pub fn sorted_query(query: &str) -> Cow<'_, str> {
 /// client writes honestly always reaches its canonical form in one.
 ///
 /// `None` too when the normalized path carries a byte no route accepts (see
-/// [`has_refused_bytes`]). The check reads the normalized form, where every escape has
+/// `has_refused_bytes`). The check reads the normalized form, where every escape has
 /// upper-case hex, so `%5c` and an escape completed by the pass (`%%35C`) are both seen.
 pub fn try_normalize_path(path: &str) -> Option<Cow<'_, str>> {
     let out = normalize_path(path);
@@ -240,6 +240,8 @@ pub fn without_path_params(path: &str) -> Option<String> {
 /// canonical form in one pass (see [`try_normalize_path`]) or the normalized URI cannot be
 /// rebuilt (the caller answers 400). Shared by the HTTPS pipeline and the plaintext :80
 /// handler, which routes and forwards ACME challenges on its own.
+// `()`: every caller answers 400 whatever the reason, so the error has nothing to carry.
+#[allow(clippy::result_unit_err)]
 pub fn rewrite_request<B>(req: &mut hyper::Request<B>) -> Result<(), ()> {
     let normalized = try_normalize_path(req.uri().path()).ok_or(())?;
     if matches!(normalized, Cow::Borrowed(_)) {

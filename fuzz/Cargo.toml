@@ -13,10 +13,9 @@ edition = "2021"
 #   cd fuzz
 #   cargo +nightly fuzz run traceparent_parser  # or any other target name
 #
-# CI does NOT run the fuzzers — it only builds them
-# (.github/workflows/fuzz.yml) so a regression to the harness itself fails
-# fast. Long-running fuzz campaigns happen on a dedicated runner and out
-# of band, with crash artifacts persisted to `fuzz/artifacts/`.
+# CI builds every target and runs each one (.github/workflows/fuzz.yml): 60 s
+# on a pull request or push that touches a fuzzed module, 10 minutes each on
+# the weekly schedule. A crash input is uploaded as a CI artifact.
 
 [package.metadata]
 cargo-fuzz = true
@@ -52,6 +51,20 @@ bench = false
 [[bin]]
 name = "audit_chain_verify"
 path = "fuzz_targets/audit_chain_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uri_normalize"
+path = "fuzz_targets/uri_normalize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "waf_stream_vs_whole"
+path = "fuzz_targets/waf_stream_vs_whole.rs"
 test = false
 doc = false
 bench = false
