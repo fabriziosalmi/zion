@@ -1042,9 +1042,104 @@ async fn serve_challenges(listener: tokio::net::TcpListener, store: ChallengeSto
     }
 }
 
+/// `[tls.acme]` writes the certificate it obtains to `[tls] cert_path` and `key_path`, not to
+/// `state_dir`: each file is staged beside its target and renamed into place
+/// ([`crate::atomic_file::write_cert_key_atomic`]), so the process must be able to create files
+/// in both directories. One it cannot write (`/etc` under the shipped systemd unit's
+/// `ProtectSystem=strict`, a read-only mount, the wrong owner) made every issuance and renewal
+/// fail, which showed only when the bootstrap certificate expired. Checked at boot by creating
+/// and removing a probe file in each directory.
+#[cfg(feature = "acme")]
+pub fn check_cert_dirs_writable(cert_path: &str, key_path: &str) -> Result<(), String> {
+    let mut dirs: Vec<&std::path::Path> = Vec::new();
+    for path in [cert_path, key_path] {
+        let dir = std::path::Path::new(path)
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    for dir in dirs {
+        let probe = dir.join(format!(".zion-acme-write-probe-{}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+            }
+            Err(e) => {
+                return Err(format!(
+                    "[tls.acme] writes the certificate it obtains to [tls] cert_path and key_path, \
+                     but zion cannot create files in {}: {e}. Put cert_path and key_path in a \
+                     directory the zion process can write (with the shipped systemd unit, under \
+                     /var/lib/zion, e.g. /var/lib/zion/acme/), or remove [tls.acme] and manage \
+                     the certificate outside zion",
+                    dir.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "acme")]
+    #[test]
+    fn the_certificate_directories_must_be_writable_for_acme() {
+        let base = std::env::temp_dir().join(format!("zion-acme-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let at = |dir: &std::path::Path, f: &str| dir.join(f).to_string_lossy().into_owned();
+
+        // Writable: accepted, and the probe leaves nothing behind.
+        assert_eq!(
+            check_cert_dirs_writable(&at(&base, "tls.crt"), &at(&base, "tls.key")),
+            Ok(())
+        );
+        assert_eq!(
+            std::fs::read_dir(&base).unwrap().count(),
+            0,
+            "no probe left"
+        );
+
+        // A directory that does not exist: refused, naming it.
+        let missing = base.join("missing");
+        let e =
+            check_cert_dirs_writable(&at(&missing, "tls.crt"), &at(&base, "tls.key")).unwrap_err();
+        assert!(
+            e.contains("cannot create files in") && e.contains("missing"),
+            "{e}"
+        );
+        // The key's directory is checked too, not only the certificate's.
+        let e =
+            check_cert_dirs_writable(&at(&base, "tls.crt"), &at(&missing, "tls.key")).unwrap_err();
+        assert!(e.contains("missing"), "{e}");
+
+        // A read-only directory (as `/etc` is under `ProtectSystem=strict`). Root writes anyway,
+        // so this part only holds for an unprivileged run.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let ro = base.join("ro");
+            std::fs::create_dir_all(&ro).unwrap();
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let writable_anyway = std::fs::File::create(ro.join("x")).is_ok();
+            if !writable_anyway {
+                let e =
+                    check_cert_dirs_writable(&at(&ro, "tls.crt"), &at(&ro, "tls.key")).unwrap_err();
+                assert!(e.contains("cannot create files in"), "{e}");
+            }
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[cfg(feature = "acme")]
     #[tokio::test]

@@ -11,6 +11,9 @@ ExecStart=/usr/local/bin/zion
 Environment=ZION_CONFIG=/etc/zion/zion.toml
 Restart=on-failure
 RestartSec=5
+# A config error (2) or bad TLS material (3) fails the same way on every start:
+# do not restart into it forever. A listener (4) or other failure still restarts.
+RestartPreventExitStatus=2 3
 
 # Security hardening
 NoNewPrivileges=true
@@ -19,11 +22,13 @@ ProtectHome=true
 ReadOnlyPaths=/etc/zion
 PrivateTmp=true
 
-# Writable runtime state. ProtectSystem=strict mounts the FS read-only, so
-# without this the ACME subsystem (account key + renewed cert/key under
-# /var/lib/zion) and the panic last-gasp file cannot be written and automatic
-# HTTPS issuance/renewal fails. StateDirectory creates /var/lib/zion owned by
-# the service user and grants write access under the strict sandbox.
+# Writable runtime state. ProtectSystem=strict mounts the FS read-only, and
+# StateDirectory creates /var/lib/zion owned by the service user and writable
+# under the strict sandbox: the ACME account (state_dir) and the panic last-gasp
+# file live there. With [tls.acme], ACME also writes the certificate it obtains
+# to [tls] cert_path / key_path, so put those under /var/lib/zion too (e.g.
+# /var/lib/zion/acme/fullchain.pem): under /etc they are read-only here, and
+# zion refuses to start rather than fail every renewal.
 StateDirectory=zion
 Environment=ZION_LAST_GASP_PATH=/var/lib/zion/last_panic.jsonl
 

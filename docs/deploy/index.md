@@ -128,6 +128,9 @@ ExecStart=/usr/local/bin/zion
 Environment=ZION_CONFIG=/etc/zion/zion.toml
 Restart=on-failure
 RestartSec=5
+# A config error (2) or bad TLS material (3) fails the same way on every start:
+# do not restart into it forever. A listener (4) or other failure still restarts.
+RestartPreventExitStatus=2 3
 
 # Security hardening
 NoNewPrivileges=true
@@ -136,10 +139,13 @@ ProtectHome=true
 ReadOnlyPaths=/etc/zion
 PrivateTmp=true
 
-# Writable runtime state. ProtectSystem=strict makes the FS read-only, so
-# without this the ACME subsystem (account key + renewed cert/key under
-# /var/lib/zion) and the panic last-gasp file cannot be written. StateDirectory
-# creates /var/lib/zion owned by the service user and grants write access.
+# Writable runtime state. ProtectSystem=strict mounts the FS read-only, and
+# StateDirectory creates /var/lib/zion owned by the service user and writable
+# under the strict sandbox: the ACME account (state_dir) and the panic last-gasp
+# file live there. With [tls.acme], ACME also writes the certificate it obtains
+# to [tls] cert_path / key_path, so put those under /var/lib/zion too (e.g.
+# /var/lib/zion/acme/fullchain.pem): under /etc they are read-only here, and
+# zion refuses to start rather than fail every renewal.
 StateDirectory=zion
 Environment=ZION_LAST_GASP_PATH=/var/lib/zion/last_panic.jsonl
 
@@ -149,6 +155,12 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # Resource limits
 LimitNOFILE=65535
+# No core dumps: the process holds key material (TLS keys, JWT/audit HMAC secrets,
+# the mesh identity seed), and a core file would write it to disk and to whatever
+# collects dumps. Key buffers Zion controls are wiped on drop, but a dump also
+# captures memory it cannot. Remove this line temporarily if you need a crash
+# core to debug a `panic = "abort"` (the release profile aborts on panic).
+LimitCORE=0
 
 [Install]
 WantedBy=multi-user.target
