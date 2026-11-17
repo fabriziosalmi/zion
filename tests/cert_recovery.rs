@@ -129,7 +129,7 @@ fn wait_port(port: u16) {
 #[test]
 fn a_boot_after_an_interrupted_renewal_restores_the_previous_key() {
     let Some(dir) = workdir("restore") else {
-        eprintln!("SKIP: openssl not available");
+        common::skip("openssl not available");
         return;
     };
     interrupted_renewal(&dir, "old.key");
@@ -165,7 +165,7 @@ fn a_boot_after_an_interrupted_renewal_restores_the_previous_key() {
 #[test]
 fn a_mismatched_pair_with_no_matching_backup_still_refuses_to_boot() {
     let Some(dir) = workdir("refuse") else {
-        eprintln!("SKIP: openssl not available");
+        common::skip("openssl not available");
         return;
     };
     // The "backup" is a key of some other certificate: not this certificate's.
@@ -187,7 +187,7 @@ fn a_mismatched_pair_with_no_matching_backup_still_refuses_to_boot() {
 #[test]
 fn a_mismatched_pair_without_any_backup_refuses_to_boot_as_before() {
     let Some(dir) = workdir("nobak") else {
-        eprintln!("SKIP: openssl not available");
+        common::skip("openssl not available");
         return;
     };
     interrupted_renewal(&dir, "old.key");
@@ -202,7 +202,7 @@ fn a_mismatched_pair_without_any_backup_refuses_to_boot_as_before() {
 #[test]
 fn a_key_that_is_not_a_key_is_not_replaced_from_a_backup() {
     let Some(dir) = workdir("garbage") else {
-        eprintln!("SKIP: openssl not available");
+        common::skip("openssl not available");
         return;
     };
     interrupted_renewal(&dir, "old.key");

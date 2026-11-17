@@ -106,7 +106,7 @@ fn h2_upstream(cert: &Path, key: &Path) -> u16 {
 #[test]
 fn a_request_with_a_body_is_not_delayed_on_its_way_to_an_h2_upstream() {
     if Command::new("curl").arg("--version").output().is_err() {
-        eprintln!("SKIP: curl not available");
+        common::skip("curl not available");
         return;
     }
     let dir = std::env::temp_dir().join(format!(
@@ -138,7 +138,7 @@ fn a_request_with_a_body_is_not_delayed_on_its_way_to_an_h2_upstream() {
         &cert.to_string_lossy(),
     ]);
     if !made {
-        eprintln!("SKIP: openssl could not make a certificate");
+        common::skip("openssl could not make a certificate");
         return;
     }
     let upstream = h2_upstream(&cert, &key);

@@ -13,6 +13,15 @@
 use std::fs;
 use std::process::Command;
 
+/// Report a test that cannot run here; with `ZION_TEST_STRICT=1` (CI) a skip is a failure
+/// (the same rule as `common::skip`, inlined: this binary does not use the shared helpers).
+fn skip(reason: &str) {
+    if std::env::var_os("ZION_TEST_STRICT").is_some_and(|v| v == "1") {
+        panic!("this test did not run and ZION_TEST_STRICT=1 forbids a skip: {reason}");
+    }
+    eprintln!("SKIP: {reason}");
+}
+
 fn zion() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_zion"));
     c.env("ZION_BOOT_FAST", "1")
@@ -211,7 +220,7 @@ fn an_audit_path_that_cannot_be_opened_exits_2() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !made {
-        eprintln!("SKIP: openssl not available");
+        skip("openssl not available");
         let _ = fs::remove_dir_all(&dir);
         return;
     }
@@ -319,7 +328,7 @@ fn acme_with_an_unwritable_certificate_directory_exits_2() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !made {
-        eprintln!("SKIP: openssl not available");
+        skip("openssl not available");
         let _ = fs::remove_dir_all(&dir);
         return;
     }

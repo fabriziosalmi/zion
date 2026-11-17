@@ -250,7 +250,7 @@ fn no_desync_form_smuggles_a_request_past_zion() {
         &dir.join("c.pem").to_string_lossy(),
     ]);
     if !made {
-        eprintln!("SKIP: openssl could not make a certificate");
+        common::skip("openssl could not make a certificate");
         return;
     }
     let (origin_port, seen) = origin();

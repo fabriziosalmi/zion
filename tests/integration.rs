@@ -25,6 +25,15 @@
 use std::process::Command;
 use std::time::Duration;
 
+/// Report a test that cannot run here; with `ZION_TEST_STRICT=1` (CI) a skip is a failure
+/// (the same rule as `common::skip`, inlined: this binary does not use the shared helpers).
+fn skip(reason: &str) {
+    if std::env::var_os("ZION_TEST_STRICT").is_some_and(|v| v == "1") {
+        panic!("this test did not run and ZION_TEST_STRICT=1 forbids a skip: {reason}");
+    }
+    eprintln!("SKIP: {reason}");
+}
+
 /// Macro to add the common `#[ignore]` + skip-if-not-running guard.
 macro_rules! integration_test {
     ($name:ident, $body:block) => {
@@ -32,7 +41,7 @@ macro_rules! integration_test {
         #[ignore]
         fn $name() {
             if !zion_is_running() {
-                eprintln!("SKIP: Zion not running on 127.0.0.1:4433");
+                skip("Zion not running on 127.0.0.1:4433");
                 return;
             }
             $body

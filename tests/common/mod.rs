@@ -100,3 +100,16 @@ pub fn process_memory_mib(pid: u32) -> u64 {
         .expect("ps prints the resident size in KiB");
     kib / 1024
 }
+
+/// Report that this test cannot run here (a tool it needs is missing) before returning from it.
+/// With `ZION_TEST_STRICT=1`, as CI sets, it panics instead: there a test that did not run must
+/// not pass green (the request-smuggling corpus once could, on a runner where openssl failed).
+/// Platform skips that are not about a missing tool (a kernel feature, running as root) stay
+/// plain `eprintln!`s.
+#[allow(dead_code)] // not every test binary can be skipped
+pub fn skip(reason: &str) {
+    if std::env::var_os("ZION_TEST_STRICT").is_some_and(|v| v == "1") {
+        panic!("this test did not run and ZION_TEST_STRICT=1 forbids a skip: {reason}");
+    }
+    eprintln!("SKIP: {reason}");
+}

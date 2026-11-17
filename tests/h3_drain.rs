@@ -100,7 +100,7 @@ fn boot(dir: &std::path::Path, upstream: u16) -> Option<(Daemon, u16)> {
         .map(|s| s.success())
         .unwrap_or(false);
     if !ok {
-        eprintln!("SKIP: openssl not available");
+        common::skip("openssl not available");
         return None;
     }
     let https = free_port();

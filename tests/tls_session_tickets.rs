@@ -177,7 +177,7 @@ fn session_tickets_are_two_by_default_and_the_key_changes_it() {
         &dir.join("c.pem").to_string_lossy(),
     ]);
     if !made {
-        eprintln!("SKIP: openssl could not make a certificate");
+        common::skip("openssl could not make a certificate");
         return;
     }
     let upstream = idle_upstream();
