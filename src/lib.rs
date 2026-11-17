@@ -58,8 +58,9 @@ pub mod logging;
 #[doc(hidden)]
 pub mod waf;
 
-/// Request-path normalization (RFC 3986 §6.2.2): what zion routes, checks and forwards.
-/// Depends only on `std` and `hyper`. Exposed for the `uri_normalize` fuzz target.
+// Request-path normalization (RFC 3986 §6.2.2): what zion routes, checks and forwards.
+// Depends only on `std` and `hyper`. Exposed for the `uri_normalize` fuzz target. (A plain
+// comment: an outer doc comment would make rustdoc resolve the module's own links from here.)
 #[doc(hidden)]
 pub mod uri_norm;
 
