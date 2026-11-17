@@ -27,7 +27,7 @@
 
 use aws_lc_rs::hmac;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::observability;
 
@@ -407,6 +407,10 @@ pub mod kind {
     pub const MESH_PUBLISH: &str = "mesh_publish";
     /// Mesh claim received from a peer and merged into local state.
     pub const MESH_RECEIVE: &str = "mesh_receive";
+    /// Written by the writer itself, in the chain: `detail` = `count=N`, the events shed under
+    /// back-pressure (queue full) since the previous record. `zion audit verify` sums them, so
+    /// a chain that verifies is not mistaken for a complete trail.
+    pub const EVENTS_DROPPED: &str = "events_dropped";
     /// Reserved for future mesh-side events. Defined here as the
     /// canonical strings so callsites added in follow-up PRs reference
     /// `audit::kind::MESH_PEER_JOINED` instead of hand-typing literals.
@@ -524,20 +528,32 @@ pub fn sign_event(
 #[derive(Clone)]
 pub struct AuditHandle {
     inner: Option<tokio::sync::mpsc::Sender<AuditEvent>>,
+    /// Events shed under back-pressure and not yet recorded in the chain: the writer takes the
+    /// count and writes it as a signed [`kind::EVENTS_DROPPED`] record.
+    dropped: std::sync::Arc<AtomicU64>,
 }
 
 impl AuditHandle {
     /// Create a no-op handle. Used when audit is disabled or the writer
     /// failed to start (the latter logs a warning).
     pub fn noop() -> Self {
-        Self { inner: None }
+        Self {
+            inner: None,
+            dropped: Default::default(),
+        }
     }
 
     /// A handle whose events can be read back, for tests of what the pipeline records.
     #[cfg(test)]
     pub fn capture() -> (Self, tokio::sync::mpsc::Receiver<AuditEvent>) {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        (Self { inner: Some(tx) }, rx)
+        (
+            Self {
+                inner: Some(tx),
+                dropped: Default::default(),
+            },
+            rx,
+        )
     }
 
     /// Push one event. Non-blocking — drops the event if the queue is full
@@ -555,6 +571,8 @@ impl AuditHandle {
             // Queue full: back-pressure. The writer is alive and will catch up.
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 observability::AUDIT_EVENTS_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                // For the chain: the writer records how many were shed (see `writer_loop`).
+                self.dropped.fetch_add(1, Ordering::Relaxed);
                 false
             }
             // Channel closed: the writer has exited (disk full, fd revoked, or
@@ -716,7 +734,9 @@ pub fn spawn_writer(cfg: &AuditConfig) -> Result<(AuditHandle, Option<AuditWrite
 
     // `max_size_mb = None` or `0` disables rotation (unbounded); otherwise the
     // active segment rotates once it crosses the byte cap.
+    let dropped = std::sync::Arc::new(AtomicU64::new(0));
     let opts = WriterOpts {
+        dropped: dropped.clone(),
         max_size_bytes: cfg
             .max_size_mb
             .filter(|&mb| mb > 0)
@@ -731,7 +751,10 @@ pub fn spawn_writer(cfg: &AuditConfig) -> Result<(AuditHandle, Option<AuditWrite
     let join = tokio::spawn(writer_loop(path, key, rx, stop_rx, opts));
 
     Ok((
-        AuditHandle { inner: Some(tx) },
+        AuditHandle {
+            inner: Some(tx),
+            dropped,
+        },
         Some(AuditWriter {
             stop: Some(stop_tx),
             join,
@@ -741,6 +764,8 @@ pub fn spawn_writer(cfg: &AuditConfig) -> Result<(AuditHandle, Option<AuditWrite
 
 /// Everything the writer needs besides the path, key and channels.
 struct WriterOpts {
+    /// Shared with the handle: events shed under back-pressure, not yet recorded.
+    dropped: std::sync::Arc<AtomicU64>,
     max_size_bytes: Option<u64>,
     max_files: usize,
     sync_interval: Option<std::time::Duration>,
@@ -784,6 +809,7 @@ async fn writer_loop(
     use tokio::io::AsyncWriteExt;
 
     let WriterOpts {
+        dropped,
         max_size_bytes,
         max_files,
         sync_interval,
@@ -845,7 +871,7 @@ async fn writer_loop(
         Stop,
     }
 
-    loop {
+    'writer: loop {
         if let Some(iv) = sync_interval {
             if dirty && last_sync.elapsed() >= iv {
                 sync_active(&mut file, &mut sync_degraded).await;
@@ -873,163 +899,180 @@ async fn writer_loop(
                 }
             } => w,
         };
-        let mut event = match wake {
+        let next = match wake {
             Wake::Stop => {
                 rx.close(); // no new events; queued ones still drain via recv()
                 stopping = true;
                 continue;
             }
-            Wake::SyncDue => continue,  // the check above syncs
-            Wake::Event(None) => break, // closed and drained
-            Wake::Event(Some(e)) => e,
+            Wake::SyncDue => continue, // the check above syncs
+            Wake::Event(e) => e,       // `None`: closed and drained
         };
-        // Shed when a configured rotation has broken and the segment is already
-        // at/over its cap: drop the event (counted) instead of appending and
-        // growing the file without bound. Self-heals only on restart — the
-        // failure is logged prominently below.
-        if rotation_broken {
-            if let Some(max) = max_size_bytes {
-                if bytes_written >= max {
-                    observability::AUDIT_EVENTS_DROPPED_TOTAL
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if !shed_logged {
-                        crate::logging::error(
+        let drained = next.is_none();
+        // Events shed under back-pressure since the previous record: a signed record of how
+        // many, in the chain, ahead of the next event (or as the last record on shutdown).
+        // Without it the chain verified clean over a trail with holes in it.
+        let shed = dropped.swap(0, Ordering::Relaxed);
+        let marker = (shed > 0).then(|| AuditEvent {
+            seq: 0,
+            ts: String::new(),
+            kind: kind::EVENTS_DROPPED,
+            trace_id: None,
+            remote_ip: None,
+            method: None,
+            path: None,
+            detail: Some(format!("count={shed}")),
+        });
+        for mut event in marker.into_iter().chain(next) {
+            // Shed when a configured rotation has broken and the segment is already
+            // at/over its cap: drop the event (counted) instead of appending and
+            // growing the file without bound. Self-heals only on restart — the
+            // failure is logged prominently below.
+            if rotation_broken {
+                if let Some(max) = max_size_bytes {
+                    if bytes_written >= max {
+                        observability::AUDIT_EVENTS_DROPPED_TOTAL
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if !shed_logged {
+                            crate::logging::error(
                             "audit",
                             "audit log rotation is broken and the segment is at its size cap — shedding (dropping + counting) further events to avoid an unbounded disk-fill; fix the directory permissions/disk and restart",
                         );
-                        shed_logged = true;
+                            shed_logged = true;
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
-        }
-        event.seq = seq;
-        if event.ts.is_empty() {
-            event.ts = now_iso8601();
-        }
-        match sign_event(&key, event, prev_hash.clone()) {
-            Ok((signed, new_prev)) => {
-                if let Ok(mut line) = serde_json::to_string(&signed) {
-                    line.push('\n'); // single all-or-nothing record write
-                    if file.write_all(line.as_bytes()).await.is_err() {
-                        // Terminal: the buffer can't even accept the record
-                        // (disk full / fd revoked). Stop rather than spin.
-                        note_write_failure();
-                        crate::logging::error(
+            event.seq = seq;
+            if event.ts.is_empty() {
+                event.ts = now_iso8601();
+            }
+            match sign_event(&key, event, prev_hash.clone()) {
+                Ok((signed, new_prev)) => {
+                    if let Ok(mut line) = serde_json::to_string(&signed) {
+                        line.push('\n'); // single all-or-nothing record write
+                        if file.write_all(line.as_bytes()).await.is_err() {
+                            // Terminal: the buffer can't even accept the record
+                            // (disk full / fd revoked). Stop rather than spin.
+                            note_write_failure();
+                            crate::logging::error(
                             "audit",
                             "audit log write failed — buffer cannot accept data (disk full / fd revoked), exiting writer",
                         );
-                        break;
-                    }
-                    prev_hash = new_prev;
-                    seq += 1;
-                    bytes_written += line.len() as u64;
-                    // Flush each event to the OS page cache. That survives a
-                    // process kill -9 (the kernel keeps the bytes) but not a
-                    // power loss or kernel crash, so the periodic `sync_active`
-                    // above bounds the exposure to `sync_interval` (and rotation
-                    // always syncs before sealing). A flush failure (transient
-                    // ENOSPC, slow network FS) does NOT kill the writer: the
-                    // record stays buffered and a later flush retries it, so
-                    // audit self-heals once the disk recovers. Log the
-                    // degraded↔healthy transition once.
-                    match file.flush().await {
-                        Ok(()) => {
-                            dirty = true;
-                            note_write_ok();
-                            if flush_degraded {
-                                crate::logging::warn(
-                                    "audit",
-                                    "audit log flush recovered — durability restored",
-                                );
-                                flush_degraded = false;
-                            }
+                            break 'writer;
                         }
-                        Err(e) => {
-                            note_write_failure();
-                            if !flush_degraded {
-                                crate::logging::error(
+                        prev_hash = new_prev;
+                        seq += 1;
+                        bytes_written += line.len() as u64;
+                        // Flush each event to the OS page cache. That survives a
+                        // process kill -9 (the kernel keeps the bytes) but not a
+                        // power loss or kernel crash, so the periodic `sync_active`
+                        // above bounds the exposure to `sync_interval` (and rotation
+                        // always syncs before sealing). A flush failure (transient
+                        // ENOSPC, slow network FS) does NOT kill the writer: the
+                        // record stays buffered and a later flush retries it, so
+                        // audit self-heals once the disk recovers. Log the
+                        // degraded↔healthy transition once.
+                        match file.flush().await {
+                            Ok(()) => {
+                                dirty = true;
+                                note_write_ok();
+                                if flush_degraded {
+                                    crate::logging::warn(
+                                        "audit",
+                                        "audit log flush recovered — durability restored",
+                                    );
+                                    flush_degraded = false;
+                                }
+                            }
+                            Err(e) => {
+                                note_write_failure();
+                                if !flush_degraded {
+                                    crate::logging::error(
                                     "audit",
                                     &format!("audit log flush failing ({e}) — records buffered, not yet durable; retrying (writer stays alive)"),
                                 );
-                                flush_degraded = true;
+                                    flush_degraded = true;
+                                }
                             }
                         }
                     }
                 }
+                Err(e) => {
+                    crate::logging::error("audit", &format!("audit event serialize failed: {e}"));
+                    continue;
+                }
             }
-            Err(e) => {
-                crate::logging::error("audit", &format!("audit event serialize failed: {e}"));
-                continue;
-            }
-        }
 
-        // Size-based rotation (RFC-agnostic disk hygiene, issue #288). Once the
-        // active segment crosses the cap, seal it and re-anchor into a fresh
-        // one. A rotation failure degrades to unbounded (logged once) rather
-        // than killing the writer or spinning on a rename that keeps failing.
-        if !rotation_disabled {
-            if let Some(max) = max_size_bytes {
-                if bytes_written >= max {
-                    // Flush the outgoing segment before sealing it. Unlike the
-                    // steady-state flush (which keeps records buffered and
-                    // retries), we are about to rename this file away, so a
-                    // failed flush here means buffered records are lost with the
-                    // old segment — surface it instead of discarding the error.
-                    if let Err(e) = file.flush().await {
-                        crate::logging::warn(
+            // Size-based rotation (RFC-agnostic disk hygiene, issue #288). Once the
+            // active segment crosses the cap, seal it and re-anchor into a fresh
+            // one. A rotation failure degrades to unbounded (logged once) rather
+            // than killing the writer or spinning on a rename that keeps failing.
+            if !rotation_disabled {
+                if let Some(max) = max_size_bytes {
+                    if bytes_written >= max {
+                        // Flush the outgoing segment before sealing it. Unlike the
+                        // steady-state flush (which keeps records buffered and
+                        // retries), we are about to rename this file away, so a
+                        // failed flush here means buffered records are lost with the
+                        // old segment — surface it instead of discarding the error.
+                        if let Err(e) = file.flush().await {
+                            crate::logging::warn(
                             "audit",
                             &format!("audit log flush before rotation failed ({e}) — buffered records in the outgoing segment may be lost"),
                         );
-                    }
-                    // The outgoing segment is about to be renamed away for good,
-                    // so make it durable first — independent of `sync_interval`.
-                    if let Err(e) = file.get_ref().sync_data().await {
-                        crate::logging::warn(
+                        }
+                        // The outgoing segment is about to be renamed away for good,
+                        // so make it durable first — independent of `sync_interval`.
+                        if let Err(e) = file.get_ref().sync_data().await {
+                            crate::logging::warn(
                             "audit",
                             &format!("audit log fsync before rotation failed ({e}) — the sealed segment may not survive a power loss"),
                         );
-                    }
-                    dirty = false;
-                    last_sync = std::time::Instant::now();
-                    let _ = file.shutdown().await; // best-effort close of the outgoing fd
-                    match rotate_paths(&path, max_files).await {
-                        Ok(rotated_to) => match open_and_anchor(
-                            &path,
-                            &key,
-                            previous_key.as_ref(),
-                            &key_id,
-                            "chain_rotate",
-                            &format!("audit chain re-anchored after size rotation → {rotated_to}"),
-                        )
-                        .await
-                        {
-                            Some((f, ph, bw)) => {
-                                file = f;
-                                prev_hash = ph;
-                                bytes_written = bw;
-                                seq = 1;
-                                crate::logging::info(
-                                    "audit",
-                                    &format!("audit log rotated → {rotated_to}"),
-                                );
-                            }
-                            None => {
-                                crate::logging::error(
-                                    "audit",
-                                    "cannot reopen audit log after rotation — exiting writer",
-                                );
-                                return;
-                            }
-                        },
-                        Err(e) => {
-                            crate::logging::warn(
+                        }
+                        dirty = false;
+                        last_sync = std::time::Instant::now();
+                        let _ = file.shutdown().await; // best-effort close of the outgoing fd
+                        match rotate_paths(&path, max_files).await {
+                            Ok(rotated_to) => match open_and_anchor(
+                                &path,
+                                &key,
+                                previous_key.as_ref(),
+                                &key_id,
+                                "chain_rotate",
+                                &format!(
+                                    "audit chain re-anchored after size rotation → {rotated_to}"
+                                ),
+                            )
+                            .await
+                            {
+                                Some((f, ph, bw)) => {
+                                    file = f;
+                                    prev_hash = ph;
+                                    bytes_written = bw;
+                                    seq = 1;
+                                    crate::logging::info(
+                                        "audit",
+                                        &format!("audit log rotated → {rotated_to}"),
+                                    );
+                                }
+                                None => {
+                                    crate::logging::error(
+                                        "audit",
+                                        "cannot reopen audit log after rotation — exiting writer",
+                                    );
+                                    return;
+                                }
+                            },
+                            Err(e) => {
+                                crate::logging::warn(
                                 "audit",
                                 &format!("audit log rotation failed ({e}) — continuing unbounded on the current segment; check the directory's permissions/disk"),
                             );
-                            // The original file is still at `path` (rename
-                            // failed); reopen it so events keep flowing.
-                            match open_and_anchor(
+                                // The original file is still at `path` (rename
+                                // failed); reopen it so events keep flowing.
+                                match open_and_anchor(
                                 &path,
                                 &key,
                                 previous_key.as_ref(),
@@ -1047,12 +1090,16 @@ async fn writer_loop(
                                 }
                                 None => return,
                             }
-                            rotation_disabled = true;
-                            rotation_broken = true;
+                                rotation_disabled = true;
+                                rotation_broken = true;
+                            }
                         }
                     }
                 }
             }
+        }
+        if drained {
+            break;
         }
     }
     if file.flush().await.is_err() {
@@ -1468,6 +1515,9 @@ pub struct VerifyReport {
     /// The final line had no newline: a write cut short (crash, `kill -9`) or an
     /// end-truncation. It is not counted in `records`.
     pub torn_tail: bool,
+    /// Events the writer shed under back-pressure, summed from its signed
+    /// [`kind::EVENTS_DROPPED`] records: the chain is intact, the trail is not complete.
+    pub dropped: u64,
 }
 
 /// Verify a whole segment: every record's HMAC, and that each record's `prev_hash`
@@ -1490,6 +1540,7 @@ pub fn verify_log(text: &str, keys: &[hmac::Key]) -> Result<VerifyReport, (usize
         records: 0,
         chains: 0,
         torn_tail,
+        dropped: 0,
     };
     // (key index, hmac of the previous record) of the chain being walked.
     let mut chain: Option<(usize, String)> = None;
@@ -1546,6 +1597,14 @@ pub fn verify_log(text: &str, keys: &[hmac::Key]) -> Result<VerifyReport, (usize
         }
         chain = Some((key_idx, mac.to_string()));
         report.records += 1;
+        if kind == kind::EVENTS_DROPPED {
+            let count = v["detail"]
+                .as_str()
+                .and_then(|d| d.strip_prefix("count="))
+                .and_then(|n| n.parse::<u64>().ok())
+                .ok_or_else(|| bad("events_dropped record without a count=N detail"))?;
+            report.dropped = report.dropped.saturating_add(count);
+        }
     }
     Ok(report)
 }
@@ -1555,7 +1614,8 @@ const VERIFY_USAGE: &str =
   Verifies the HMAC chain of one or more audit segments (each verifies independently).\n\
   --key-env           env var holding the HMAC key (default ZION_AUDIT_HMAC_KEY)\n\
   --previous-key-env  env var holding an outgoing key, for segments that predate a rotation\n\
-  exit: 0 all verified, 1 a segment failed, 2 usage / key error";
+  exit: 0 all verified and complete, 1 a segment failed, 2 usage / key error,\n\
+        3 all verified but the writer recorded events it dropped (the trail is incomplete)";
 
 /// `zion audit verify …`: returns the process exit code.
 pub fn run_cli(args: &[String]) -> i32 {
@@ -1609,6 +1669,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
     }
     let mut failed = false;
+    let mut incomplete = false;
     for f in files {
         let text = match std::fs::read(f) {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
@@ -1625,8 +1686,17 @@ pub fn run_cli(args: &[String]) -> i32 {
                 } else {
                     ""
                 };
+                let dropped = if r.dropped > 0 {
+                    incomplete = true;
+                    format!(
+                        ", {} event(s) dropped under back-pressure (the chain is intact, the trail is not complete)",
+                        r.dropped
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "ok   {f}: {} records, {} chain(s){torn}",
+                    "ok   {f}: {} records, {} chain(s){torn}{dropped}",
                     r.records, r.chains
                 );
             }
@@ -1636,7 +1706,13 @@ pub fn run_cli(args: &[String]) -> i32 {
             }
         }
     }
-    i32::from(failed)
+    if failed {
+        1
+    } else if incomplete {
+        3
+    } else {
+        0
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2168,6 +2244,101 @@ mod tests {
         }
     }
 
+    /// Events shed under back-pressure used to leave nothing in the signed chain: `zion audit
+    /// verify` reported an intact chain for a trail with holes in it, and only the metric knew.
+    /// The writer now records how many, signed, ahead of the next event.
+    #[tokio::test]
+    async fn events_shed_under_back_pressure_are_recorded_in_the_chain() {
+        let dir = tempdir();
+        let path = dir.join("audit.log");
+        std::env::set_var("ZION_TEST_D2_KEY", "k".repeat(32));
+        let mut cfg = cfg_for(&path, "ZION_TEST_D2_KEY");
+        cfg.queue_depth = 1;
+        let (h, w) = spawn_writer(&cfg).expect("starts");
+        // Single-threaded runtime: the writer cannot run until this test awaits, so the queue
+        // takes one event and sheds the other nine.
+        let accepted = (0..10)
+            .filter(|i| h.emit(make_event(*i, kind::REQUEST_BLOCKED)))
+            .count();
+        assert_eq!(accepted, 1);
+        assert!(w.unwrap().shutdown(std::time::Duration::from_secs(5)).await);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let key = hmac::Key::new(hmac::HMAC_SHA256, "k".repeat(32).as_bytes());
+        let r = verify_log(&text, &[key]).expect("the chain verifies");
+        assert_eq!(r.dropped, 9, "{text}");
+        // chain_init, the marker, then the one event that was queued.
+        let kinds: Vec<String> = text
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["kind"].to_string())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "\"chain_init\"",
+                "\"events_dropped\"",
+                "\"request_blocked\""
+            ],
+            "{text}"
+        );
+        assert!(text.contains("\"detail\":\"count=9\""), "{text}");
+
+        // `zion audit verify` says so, and exits 3: intact, not complete.
+        let file = path.to_string_lossy().into_owned();
+        let args = |f: &str| {
+            ["verify", "--key-env", "ZION_TEST_D2_KEY", f]
+                .map(String::from)
+                .to_vec()
+        };
+        assert_eq!(run_cli(&args(&file)), 3);
+        // A segment with nothing dropped still exits 0.
+        let clean = dir.join("clean.log");
+        let (h2, w2) = spawn_writer(&cfg_for(&clean, "ZION_TEST_D2_KEY")).unwrap();
+        assert!(h2.emit(make_event(1, kind::REQUEST_BLOCKED)));
+        assert!(
+            w2.unwrap()
+                .shutdown(std::time::Duration::from_secs(5))
+                .await
+        );
+        assert_eq!(run_cli(&args(&clean.to_string_lossy())), 0);
+    }
+
+    /// Events shed after the last one the writer took are recorded when it drains on shutdown,
+    /// as the last record of the chain.
+    #[tokio::test]
+    async fn events_shed_after_the_last_event_are_recorded_on_shutdown() {
+        let dir = tempdir();
+        let path = dir.join("audit.log");
+        let key = hmac::Key::new(hmac::HMAC_SHA256, b"this-is-a-32-byte-test-secret!ab");
+        let (tx, rx) = tokio::sync::mpsc::channel::<AuditEvent>(8);
+        let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let opts = test_opts(None, 0, None);
+        let dropped = opts.dropped.clone();
+        let jh = tokio::spawn(writer_loop(
+            path.to_string_lossy().into_owned(),
+            key,
+            rx,
+            stop_rx,
+            opts,
+        ));
+        tx.send(make_event(0, kind::AUTH_SUCCESS)).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        dropped.fetch_add(4, Ordering::Relaxed); // shed after the writer took the event
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), jh)
+            .await
+            .expect("the writer exits")
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let last = text.lines().last().unwrap();
+        assert!(
+            last.contains("\"kind\":\"events_dropped\"") && last.contains("count=4"),
+            "{text}"
+        );
+        let key = hmac::Key::new(hmac::HMAC_SHA256, b"this-is-a-32-byte-test-secret!ab");
+        assert_eq!(verify_log(&text, &[key]).unwrap().dropped, 4);
+    }
+
     #[tokio::test]
     async fn an_audit_path_that_cannot_be_opened_refuses_to_start() {
         // The file used to be opened only inside the spawned writer: a path that could not be
@@ -2532,6 +2703,7 @@ mod tests {
         sync_interval: Option<std::time::Duration>,
     ) -> WriterOpts {
         WriterOpts {
+            dropped: Default::default(),
             max_size_bytes,
             max_files,
             sync_interval,
