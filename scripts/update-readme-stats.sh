@@ -9,8 +9,9 @@
 #                       README and is excluded here on purpose)
 #
 # This script is the single source of truth for how those numbers are
-# computed. It rewrites three lines in README.md, anchored on HTML
-# marker comments so it's robust to surrounding-text edits:
+# computed. It rewrites three lines in README.md, and the modules/lines line in
+# docs/guide/architecture.md, anchored on HTML marker comments so it's robust to
+# surrounding-text edits:
 #
 #     30 modules, ~20,600 lines of Rust. See [arch ...]
 #     <!-- zion-stats:modules-lines (kept in sync ...) -->
@@ -91,10 +92,10 @@ echo "  tests   : $tests"
 # parentheses differs between BSD/GNU; Python is everywhere on the
 # platforms this repo supports (CI: Linux, dev: macOS). Python also gives
 # us guaranteed thousands-separator formatting via `{:,}`.
-python3 - "$README" "$modules" "$lines_rounded" "$tests" "$CHECK_MODE" <<'PY'
+python3 - "$README" "$modules" "$lines_rounded" "$tests" "$CHECK_MODE" docs/guide/architecture.md <<'PY'
 import re, sys, pathlib
 
-readme_path, modules, lines_rounded, tests, check_mode = sys.argv[1:]
+readme_path, modules, lines_rounded, tests, check_mode, arch_path = sys.argv[1:]
 modules = int(modules)
 lines_rounded = int(lines_rounded)
 lines_fmt = f"{lines_rounded:,}"
@@ -134,7 +135,18 @@ if n2 != 1:
         f"(expected exactly 1). README structure changed — update the regex."
     )
 
-if src_new == src:
+# The architecture page carries the same modules/lines line under the same marker. It used to
+# be outside this script, and said "~15,900 lines across 21 source files" long after that
+# stopped being true.
+arch = pathlib.Path(arch_path).read_text()
+arch_new, n3 = modules_lines_re.subn(lambda m: m.group(1) + new_modules_line, arch)
+if n3 != 1:
+    sys.exit(
+        f"FATAL: zion-stats:modules-lines marker matched {n3} times in {arch_path} "
+        f"(expected exactly 1). Its structure changed — update the regex."
+    )
+
+if src_new == src and arch_new == arch:
     print("  README already in sync — nothing to do.")
     sys.exit(0)
 
@@ -143,5 +155,6 @@ if check_mode:
     sys.exit(1)
 
 pathlib.Path(readme_path).write_text(src_new)
+pathlib.Path(arch_path).write_text(arch_new)
 print("  README updated.")
 PY

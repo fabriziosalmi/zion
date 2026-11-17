@@ -80,6 +80,9 @@ pub struct RouteOut {
     /// The source forwards the client's Host to this route's backend (nginx
     /// `proxy_set_header Host $host`, Traefik `passHostHeader`, Caddy's default).
     pub preserve_host: bool,
+    /// `compress = { enabled = true }`: the source compresses this route's responses
+    /// (Caddy `encode`).
+    pub compress: bool,
     /// Rendered as `# UNSUPPORTED: …` comment lines above the route.
     pub annotations: Vec<String>,
 }
@@ -1995,6 +1998,7 @@ fn map_location(
             spa_fallback,
             internal_only,
             preserve_host: false,
+            compress: false,
             annotations: Vec::new(),
         });
         return;
@@ -2140,6 +2144,7 @@ fn map_location(
         spa_fallback: false,
         internal_only,
         preserve_host,
+        compress: false,
         annotations,
     });
 }

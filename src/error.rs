@@ -72,7 +72,8 @@ impl ZionError {
     ///   * `2` — config / validation problem (operator must fix the file)
     ///   * `3` — TLS material problem (operator must rotate certs)
     ///   * `4` — bind/listener problem (port already used or no permission)
-    ///   * `5` — runtime subsystem (ACME, auth, audit) failed
+    ///   * `5` — runtime subsystem (ACME, auth, audit); reserved, nothing returns these
+    ///     variants today: their start-up problems are reported as `Config` (`2`)
     ///   * `1` — anything else
     ///
     /// Wired at the `main()` boundary so supervisors can branch on the code.

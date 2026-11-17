@@ -630,6 +630,7 @@ fn build_route(
         internal_only: false,
         // Traefik forwards the client's Host unless the service says passHostHeader=false.
         preserve_host: pass_host_header(routing, rname, router),
+        compress: false,
         annotations: Vec::new(),
     });
 }

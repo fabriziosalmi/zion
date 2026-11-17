@@ -150,6 +150,9 @@ fn render_route(out: &mut String, route: &RouteOut) {
     if let Some(mb) = route.max_body_mb {
         out.push_str(&format!("max_body_mb = {mb}\n"));
     }
+    if route.compress {
+        out.push_str("compress = { enabled = true }\n");
+    }
     out.push('\n');
 }
 
@@ -241,6 +244,7 @@ mod tests {
                 spa_fallback: false,
                 internal_only: false,
                 preserve_host: false,
+                compress: false,
                 annotations: vec!["evil\ninternal_only = false\n[admin]".into()],
             }],
         };
@@ -295,6 +299,7 @@ mod tests {
                 spa_fallback: false,
                 internal_only: false,
                 preserve_host: false,
+                compress: false,
                 annotations: vec!["demo annotation".into()],
             }],
         };
@@ -340,6 +345,7 @@ mod tests {
                 spa_fallback: false,
                 internal_only: false,
                 preserve_host: false,
+                compress: false,
                 annotations: Vec::new(),
             }],
         };
@@ -388,6 +394,7 @@ mod tests {
                 spa_fallback: false,
                 internal_only: false,
                 preserve_host: false,
+                compress: false,
                 annotations: Vec::new(),
             }],
         };
