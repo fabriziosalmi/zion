@@ -63,6 +63,8 @@ Six reliability counters are exposed alongside the existing ones:
 |---|---|
 | `zion_panics_total` | Worker panics caught by the panic hook. |
 | `zion_audit_events_total` | Audit-log events emitted (signed + chained). |
+| `zion_tls_reload_failures` | Certificate reloads that failed (file watcher, pre-warm, ACME renewal); the previous certificate kept serving. |
+| `zion_tls_cert_expiry_timestamp_seconds` (gauge) | Unix time the served default certificate expires; alert on it minus `time()`. |
 | `zion_audit_events_dropped_total` | Audit events dropped: the queue was full (slow disk or `audit.queue_depth` too small) **or** the writer has exited. Use `zion_audit_writer_up` to tell them apart. |
 | `zion_audit_write_failures_total` | Write, flush or fsync errors on the audit log. Non-zero means records are at risk. |
 | `zion_audit_prune_failures_total` | Rotated segments that could not be deleted when enforcing `max_files`. Non-zero means retention is not holding and segments accumulate until the disk is full. |
