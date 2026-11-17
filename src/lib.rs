@@ -58,6 +58,11 @@ pub mod logging;
 #[doc(hidden)]
 pub mod waf;
 
+/// Request-path normalization (RFC 3986 §6.2.2): what zion routes, checks and forwards.
+/// Depends only on `std` and `hyper`. Exposed for the `uri_normalize` fuzz target.
+#[doc(hidden)]
+pub mod uri_norm;
+
 /// Sovereign Edge Intelligence — IP classifier. Pure (no internal deps).
 /// Exposed for `benches/sovereign.rs`.
 #[doc(hidden)]
