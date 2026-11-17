@@ -33,6 +33,9 @@ struct Cx<'a> {
     takes_identity: bool,
     cache_key: String,
     identity_key: Option<String>,
+    /// `request_timeout_ms` of the route's upstream: how long a cache fill may go without
+    /// progress before it is given up.
+    fill_idle: std::time::Duration,
 }
 
 /// What the RAM lookup found, when it did not answer the request outright.
@@ -64,6 +67,9 @@ struct TeeEntry {
     cache_max: usize,
     max_object: usize,
     tag_epoch: u64,
+    /// How long the fill may go without a body frame from the upstream before it is given up
+    /// (`request_timeout_ms`, the same no-progress window the request itself had).
+    fill_idle: std::time::Duration,
 }
 
 /// Serve a request on a cached route.
@@ -166,6 +172,7 @@ pub(super) async fn handle(
         takes_identity,
         cache_key,
         identity_key,
+        fill_idle: proxy::request_timeout(&req),
     };
 
     // only-if-cached (§5.2.1.7): serve from cache or 504 — never fetch.
@@ -881,6 +888,7 @@ impl Cx<'_> {
                 cache_max: self.cache_max,
                 max_object: self.max_object,
                 tag_epoch: self.tag_epoch,
+                fill_idle: self.fill_idle,
             },
         );
 
@@ -920,15 +928,42 @@ fn spawn_tee(
             cache_max,
             max_object,
             tag_epoch,
+            fill_idle,
         } = entry;
-        let fetching = fetching;
+        // `None` once the fill is given up: the registration is gone and nothing is stored.
+        let mut fetching = Some(fetching);
         let mut cache_buffer = bytes::BytesMut::new();
         let mut total_bytes = 0;
         let mut cache_aborted = false;
         let mut stream_body = body; // Consume inner body entirely
 
         loop {
-            match BodyExt::frame(&mut stream_body).await {
+            // While the fill is live, the upstream has `fill_idle` to send each frame. Requests
+            // for this key wait on the fill, so an upstream that hangs mid-body would otherwise
+            // hold every one of them; after the window the fill is given up and they fetch for
+            // themselves. This client keeps streaming whatever comes, with no deadline, as on an
+            // uncached route (`request_timeout_ms` does not bound a streaming body).
+            //
+            // A client that goes away is noticed at once, not only when the next frame has
+            // nowhere to go: a hung upstream sends none, and the fill, its upstream connection
+            // and its registration stayed.
+            let idle = fetching.is_some().then_some(fill_idle);
+            let next = tokio::select! {
+                biased;
+                () = sender.closed() => return,
+                next = next_frame(&mut stream_body, idle) => next,
+            };
+            let Some(next) = next else {
+                // No frame within the window: give the fill up, keep streaming.
+                fetching = None;
+                cache_aborted = true;
+                cache_buffer = bytes::BytesMut::new();
+                metrics::METRICS
+                    .cache_fill_stalled
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            };
+            match next {
                 Some(Ok(frame)) => {
                     let f = match frame.into_data() {
                         Ok(data) => {
@@ -989,7 +1024,7 @@ fn spawn_tee(
                 .cache_tag_uncached
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        if outcome == Some(cache::TagStore::Stored) {
+        if let (Some(cache::TagStore::Stored), Some(fetching)) = (outcome, fetching) {
             // Cache populated: signal `true` so waiters' wait_for resolves
             // immediately at the next poll, even if they hadn't subscribed
             // before this point.
@@ -998,4 +1033,17 @@ fn spawn_tee(
         // (else not stored, e.g. the body exceeded max_object: `fetching` drops
         //  without signaling; waiters fetch for themselves.)
     });
+}
+
+/// The body's next frame; `None` when `idle` is set and none came within it.
+async fn next_frame(
+    body: &mut ZionBody,
+    idle: Option<std::time::Duration>,
+) -> Option<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+    match idle {
+        Some(window) => tokio::time::timeout(window, BodyExt::frame(body))
+            .await
+            .ok(),
+        None => Some(BodyExt::frame(body).await),
+    }
 }
