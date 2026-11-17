@@ -52,6 +52,9 @@ struct Origin {
     /// Answer `Content-Encoding: gzip` (with no `Vary`) to a request whose `Accept-Encoding`
     /// mentions gzip, identity otherwise: the misbehaving origin the per-encoding key guards.
     gzip_if_accepted: std::sync::atomic::AtomicBool,
+    /// The next answer sends its headers and one chunk of body, then nothing more, ever: an
+    /// upstream that hung mid-body. Taken by that one answer; the ones after it are whole.
+    stall_next_body: std::sync::atomic::AtomicBool,
 }
 
 /// `lang|foo|cookie|ae` of the request, so a body identifies who it was made for.
@@ -135,19 +138,29 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                         let body: http_body_util::combinators::BoxBody<
                             Bytes,
                             std::convert::Infallible,
-                        > = match *o.big.lock().unwrap() {
-                            Some((n, true)) => {
-                                // chunked: 64 KiB frames, no declared length
-                                let frames = (0..n.div_ceil(65536)).map(move |i| {
-                                    let len = 65536.min(n - i * 65536);
-                                    Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(
-                                        Bytes::from(vec![b'x'; len]),
-                                    ))
-                                });
-                                http_body_util::StreamBody::new(tokio_stream::iter(frames)).boxed()
+                        > = if o.stall_next_body.swap(false, Ordering::Relaxed) {
+                            use tokio_stream::StreamExt as _;
+                            let first = tokio_stream::iter([Ok::<_, std::convert::Infallible>(
+                                hyper::body::Frame::data(Bytes::from_static(b"first chunk")),
+                            )]);
+                            http_body_util::StreamBody::new(first.chain(tokio_stream::pending()))
+                                .boxed()
+                        } else {
+                            match *o.big.lock().unwrap() {
+                                Some((n, true)) => {
+                                    // chunked: 64 KiB frames, no declared length
+                                    let frames = (0..n.div_ceil(65536)).map(move |i| {
+                                        let len = 65536.min(n - i * 65536);
+                                        Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(
+                                            Bytes::from(vec![b'x'; len]),
+                                        ))
+                                    });
+                                    http_body_util::StreamBody::new(tokio_stream::iter(frames))
+                                        .boxed()
+                                }
+                                Some((n, false)) => Full::new(Bytes::from(vec![b'x'; n])).boxed(),
+                                None => Full::new(Bytes::from(body)).boxed(),
                             }
-                            Some((n, false)) => Full::new(Bytes::from(vec![b'x'; n])).boxed(),
-                            None => Full::new(Bytes::from(body)).boxed(),
                         };
                         Ok::<_, std::convert::Infallible>(b.body(body).unwrap())
                     }
@@ -234,6 +247,7 @@ async fn rig_with(vary: &str, cc: &str, profile_extra: &str) -> (Arc<Origin>, Ar
         status: std::sync::atomic::AtomicU16::new(200),
         extra: Mutex::new(None),
         gzip_if_accepted: std::sync::atomic::AtomicBool::new(false),
+        stall_next_body: std::sync::atomic::AtomicBool::new(false),
     });
     let port = start_origin(o.clone()).await;
     o.port.store(port, Ordering::Relaxed);
@@ -4688,6 +4702,97 @@ async fn a_fetch_abandoned_by_its_client_does_not_leave_the_url_unanswerable() {
     assert_eq!(later.0, 200);
     settle().await;
     assert_eq!(st.inflight.len(), 0, "the abandoned registration is gone");
+}
+
+/// Start the one fetch of `uri` from an origin that hangs after the first chunk, and return the
+/// fetcher's response body once that chunk has reached it: the cache fill is under way, stalled.
+async fn a_fill_that_stalls_mid_body(st: &Arc<AppState>, o: &Origin, uri: &str) -> ZionBodyOf {
+    o.stall_next_body.store(true, Ordering::Relaxed);
+    let resp = process_request(
+        get(uri, &[]),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-zion-cache").unwrap(), "MISS");
+    let mut body = resp.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(5), body.frame())
+        .await
+        .expect("the first chunk arrives")
+        .expect("a frame")
+        .expect("not an error");
+    assert_eq!(
+        first.into_data().unwrap(),
+        Bytes::from_static(b"first chunk")
+    );
+    assert_eq!(st.inflight.len(), 1, "the fill is registered");
+    body
+}
+
+type ZionBodyOf = crate::http_util::ZionBody;
+
+/// An upstream that sends headers and part of the body, then hangs: the fill makes no progress.
+/// Requests for the same URL were waiting on it with no deadline, so one hung origin connection
+/// held that URL for every client until each client's connection cap (1 h). After
+/// `request_timeout_ms` with no progress the fill is given up: the waiters fetch for themselves.
+/// The fetcher's own client still gets whatever the upstream sends, as on an uncached route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_waiting_on_a_fill_that_stalled_mid_body_are_answered() {
+    let (o, st) = rig("").await;
+    let stalled_before = crate::metrics::METRICS
+        .cache_fill_stalled
+        .load(Ordering::Relaxed);
+    // The fetcher's client stays connected, holding its body.
+    let _fetcher_body = a_fill_that_stalls_mid_body(&st, &o, "/stalls").await;
+    let t0 = std::time::Instant::now();
+    // The test-build default `request_timeout_ms` is 2 s.
+    let statuses = concurrent_statuses(&st, "/stalls", 3, Duration::from_secs(6))
+        .await
+        .expect("the waiters are answered, not held by the stalled fill");
+    assert_eq!(statuses, vec![200; 3]);
+    assert!(
+        t0.elapsed() >= Duration::from_millis(1500),
+        "answered after the no-progress window, not before: {:?}",
+        t0.elapsed()
+    );
+    assert!(hits(&o) >= 2, "the waiters went to the origin themselves");
+    assert!(
+        crate::metrics::METRICS
+            .cache_fill_stalled
+            .load(Ordering::Relaxed)
+            > stalled_before
+    );
+    // The stalled fill stored nothing and left nothing registered once its waiters are done.
+    settle().await;
+    assert_eq!(get_whole(&st, "/stalls").await.0, 200);
+}
+
+/// The fetcher's client leaves while the upstream is hung mid-body. The fill only noticed a
+/// client that left when it next had a chunk to hand over, which a hung upstream never sends:
+/// the fill, its upstream connection and its registration stayed. It now notices at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_fill_whose_client_left_releases_the_url_at_once() {
+    let (o, st) = rig("").await;
+    let fetcher_body = a_fill_that_stalls_mid_body(&st, &o, "/left").await;
+    let t0 = std::time::Instant::now();
+    let waiters = tokio::spawn({
+        let st = st.clone();
+        async move { concurrent_statuses(&st, "/left", 2, Duration::from_secs(6)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(fetcher_body); // the client goes away
+    assert_eq!(waiters.await.unwrap(), Some(vec![200, 200]));
+    // Well inside the 2 s no-progress window: released by the client leaving, not by the deadline.
+    assert!(
+        t0.elapsed() < Duration::from_millis(1000),
+        "released when the client left: {:?}",
+        t0.elapsed()
+    );
+    settle().await;
+    assert_eq!(st.inflight.len(), 0, "no registration is left behind");
 }
 
 /// The fetcher finishes and publishes before any other request has subscribed (the channel

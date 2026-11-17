@@ -185,6 +185,108 @@ fn import_usage_error_exits_1_not_the_strict_findings_code() {
     );
 }
 
+/// `[audit] enabled = true` with a path that cannot be opened (here, in a directory that does not
+/// exist) is a config error: exit 2, before any port is bound, naming the path. It used to boot
+/// and serve with no audit trail, the writer having logged "events will be dropped" and exited.
+#[test]
+fn an_audit_path_that_cannot_be_opened_exits_2() {
+    let dir = unique_dir("audit");
+    let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+    let made = Command::new("openssl")
+        .args(["req", "-x509", "-newkey", "ec"])
+        .args([
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-days",
+            "1",
+        ])
+        .args(["-subj", "/CN=localhost", "-keyout"])
+        .arg(&key)
+        .arg("-out")
+        .arg(&cert)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !made {
+        eprintln!("SKIP: openssl not available");
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+    let unopenable = dir.join("no-such-dir").join("audit.log");
+    let slash = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
+    let cfg = dir.join("zion.toml");
+    fs::write(
+        &cfg,
+        format!(
+            r#"
+[server]
+listen_http = "127.0.0.1:18093"
+listen_https = "127.0.0.1:18493"
+
+[tls]
+cert_path = "{}"
+key_path = "{}"
+hot_reload = false
+
+[audit]
+enabled = true
+path = "{}"
+key_env = "ZION_TEST_EXIT_AUDIT_KEY"
+
+[upstreams]
+backend = "http://127.0.0.1:9099"
+
+[[route]]
+path = "/{{*rest}}"
+upstream = "backend"
+"#,
+            slash(&cert),
+            slash(&key),
+            slash(&unopenable)
+        ),
+    )
+    .unwrap();
+
+    // Bounded: before the fix zion booted and served, so a plain `output()` would wait forever.
+    let log = dir.join("stderr.log");
+    let mut child = zion()
+        .env("ZION_CONFIG", &cfg)
+        .env("ZION_TEST_EXIT_AUDIT_KEY", "k".repeat(32))
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(&log).unwrap())
+        .spawn()
+        .expect("spawn zion");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let stderr_text = fs::read_to_string(&log).unwrap_or_default();
+    let _ = fs::remove_dir_all(&dir);
+    let stderr = stderr_text;
+    let status = status.unwrap_or_else(|| panic!("zion booted and kept running:\n{stderr}"));
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "an unopenable audit path must exit 2 (config category), got {:?}\n{stderr}",
+        status.code()
+    );
+    assert!(
+        stderr.contains("cannot open audit.path") && stderr.contains("no-such-dir"),
+        "the error names the path:\n{stderr}"
+    );
+}
+
 /// `[tls.acme]` writes the certificate it obtains to `[tls] cert_path` / `key_path`. A certificate
 /// directory zion cannot write (here read-only, as `/etc` is under the shipped systemd unit) made
 /// every issuance and renewal fail, found only when the bootstrap certificate expired. It is now
