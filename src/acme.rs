@@ -124,9 +124,16 @@ pub fn spawn_renewal_task(
                                     "acme",
                                     "TLS hot-reloaded with new certificate",
                                 );
+                                let cert_path = tls_config.cert_path.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    crate::tls::note_served_cert(&cert_path)
+                                })
+                                .await;
                             }
                             Err(e) => {
                                 failed = true;
+                                crate::tls::RELOAD_FAILURES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 crate::logging::error(
                                     "acme",
                                     &format!("failed to load renewed certificate: {e}"),

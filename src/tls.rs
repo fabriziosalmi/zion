@@ -38,6 +38,31 @@ use crate::error::ZionError;
 // ═══════════════════════════════════════════════════════════════════
 static CERT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Certificate reloads that failed (the file watcher, the pre-warm, an ACME renewal's reload):
+/// each time zion kept serving the previous certificate. `zion_tls_reload_failures`.
+pub static RELOAD_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Unix time the served default certificate expires (its `notAfter`), 0 until it is known.
+/// `zion_tls_cert_expiry_timestamp_seconds`: alert on it minus `time()`.
+pub static CERT_NOT_AFTER: AtomicU64 = AtomicU64::new(0);
+
+/// Record the `notAfter` of the certificate at `cert_path`, which zion now serves. Reads the
+/// file: call it off the async workers.
+pub fn note_served_cert(cert_path: &str) {
+    if let Some(t) = cert_not_after(cert_path).and_then(|t| u64::try_from(t).ok()) {
+        CERT_NOT_AFTER.store(t, Ordering::Relaxed);
+    }
+}
+
+/// A certificate reload failed and the previous certificate keeps serving: count and log it.
+fn note_reload_failure(what: &str, why: &str) {
+    RELOAD_FAILURES.fetch_add(1, Ordering::Relaxed);
+    crate::logging::error(
+        "tls",
+        &format!("{what} FAILED ({why}), keeping the previous certificate"),
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // CERT RESOLVERS
 // Three modes, selected at boot based on config:
@@ -716,12 +741,12 @@ pub fn spawn_tls_watcher(
                         "  tls: hot-reload complete (gen {}). zero downtime.",
                         CERT_GENERATION.load(Ordering::Relaxed)
                     );
+                    let cert_path = tls.cert_path.clone();
+                    let _ = tokio::task::spawn_blocking(move || note_served_cert(&cert_path)).await;
                 }
-                Ok(Err(e)) => {
-                    eprintln!("  tls: reload FAILED ({e}), keeping previous config.");
-                }
+                Ok(Err(e)) => note_reload_failure("certificate reload", &e),
                 Err(e) => {
-                    eprintln!("  tls: reload task panicked: {e}, keeping previous config.");
+                    note_reload_failure("certificate reload", &format!("the task panicked: {e}"))
                 }
             }
         }
@@ -776,18 +801,21 @@ pub fn spawn_cert_prewarm_task(acceptor_store: Arc<ArcSwap<TlsAcceptor>>, tls: T
                                 "  tls: pre-warm complete (gen {})",
                                 CERT_GENERATION.load(Ordering::Relaxed)
                             );
+                            let cert_path = tls.cert_path.clone();
+                            let _ =
+                                tokio::task::spawn_blocking(move || note_served_cert(&cert_path))
+                                    .await;
                         } else {
                             eprintln!(
                                 "  tls: pre-warm skipped — watcher already reloaded (gen {gen_before} → {gen_after})"
                             );
                         }
                     }
-                    Ok(Err(e)) => {
-                        eprintln!("  tls: pre-warm FAILED ({e}), keeping previous config.");
-                    }
-                    Err(e) => {
-                        eprintln!("  tls: pre-warm task panicked: {e}");
-                    }
+                    Ok(Err(e)) => note_reload_failure("certificate pre-warm", &e),
+                    Err(e) => note_reload_failure(
+                        "certificate pre-warm",
+                        &format!("the task panicked: {e}"),
+                    ),
                 }
             }
         }
@@ -798,20 +826,21 @@ pub fn spawn_cert_prewarm_task(acceptor_store: Arc<ArcSwap<TlsAcceptor>>, tls: T
 /// Returns None if the cert can't be parsed.
 pub fn cert_expiry_secs(cert_path: &str) -> Option<i64> {
     use std::time::SystemTime;
-
-    let certs = crate::pem::certs(&std::fs::read(cert_path).ok()?).ok()?;
-    let cert_der = certs.first()?;
-
-    // Parse the X.509 cert to get notAfter
-    // We do a minimal ASN.1 walk: the validity is at a known offset in the TBSCertificate.
-    // For robustness, use the raw DER bytes directly.
-    parse_x509_not_after(cert_der.as_ref()).map(|expiry_epoch| {
+    cert_not_after(cert_path).map(|expiry_epoch| {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
         expiry_epoch - now
     })
+}
+
+/// The `notAfter` of the first certificate in a PEM file, as Unix epoch seconds.
+pub fn cert_not_after(cert_path: &str) -> Option<i64> {
+    let certs = crate::pem::certs(&std::fs::read(cert_path).ok()?).ok()?;
+    let cert_der = certs.first()?;
+    // A minimal ASN.1 walk to the validity of the TBSCertificate.
+    parse_x509_not_after(cert_der.as_ref())
 }
 
 /// Minimal ASN.1 DER parser to extract notAfter from an X.509 certificate.

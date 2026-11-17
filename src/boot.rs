@@ -299,6 +299,8 @@ pub(crate) fn load_tls(
     let initial_tls = tls::load_tls_config(&config.tls).map_err(error::ZionError::Tls)?;
     let acceptor = TlsAcceptor::from(Arc::new(initial_tls));
     let tls_acceptor_store = Arc::new(ArcSwap::from_pointee(acceptor));
+    // `zion_tls_cert_expiry_timestamp_seconds` from the start; reloads update it.
+    tls::note_served_cert(&config.tls.cert_path);
     eprintln!(
         "  tls loaded (min={}, alpn={:?})",
         config.tls.min_version, config.tls.alpn

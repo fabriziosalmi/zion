@@ -87,6 +87,13 @@ When enabled, Zion watches the certificate directory using `notify` (inotify on 
 
 If the reload fails (bad cert, missing file), the previous configuration is retained and an error is logged. No downtime in any case.
 
+Two metrics on `/metrics` make this watchable without reading the log:
+
+| Metric | Meaning |
+|---|---|
+| `zion_tls_reload_failures` (counter) | Certificate reloads that failed: the file watcher, the pre-warm before expiry, or the reload after an ACME renewal. Each time the previous certificate kept serving. Alert on any increase. |
+| `zion_tls_cert_expiry_timestamp_seconds` (gauge) | Unix time the served default certificate expires (its `notAfter`), set at boot and after every successful reload, also with `hot_reload = false`. `0` until known. Alert on `zion_tls_cert_expiry_timestamp_seconds - time() < 14 * 86400`. |
+
 ## Session resumption & 0-RTT
 
 Zion configures aggressive session resumption by default:
