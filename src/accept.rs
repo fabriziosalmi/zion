@@ -363,11 +363,10 @@ fn spawn_https_handler(
     let builder = state.http_builder.clone();
 
     tokio::spawn(async move {
-        let _permit = permit;
-        // Held for the connection's lifetime; releases the per-IP slot on
-        // drop (including early return / panic during the handshake).
-        let _ip_slot = ip_slot;
-        let _conn_guard = metrics::ConnectionGuard::new();
+        // The permit, the per-IP slot and the gauge, held for the connection's lifetime and
+        // released on drop (including early return / panic during the handshake). A WebSocket
+        // relay takes a clone, so a session keeps them past the end of this task.
+        let held = crate::connlimit::HeldConnection::new(permit, ip_slot);
         let _ = tcp_stream.set_nodelay(true);
         net::tune_accepted(&tcp_stream);
         net::set_keepalive(&tcp_stream, state.config.load().tcp_keepalive_secs);
@@ -517,6 +516,7 @@ fn spawn_https_handler(
                 let early_flag = early_flag.clone();
                 let client_fp = client_fp.clone();
                 let armed = (!negotiated_h2).then(|| armed.clone());
+                let held = held.clone();
                 #[cfg(feature = "tls-fingerprint")]
                 let tls_fp_identity = tls_fp_identity.clone();
                 async move {
@@ -537,6 +537,12 @@ fn spawn_https_handler(
                     // Before the attestations below, so nothing zion sets can be named away.
                     crate::http_util::strip_connection_listed(req.headers_mut());
 
+                    // A request that may become a tunnel carries the connection's hold, for the
+                    // relay to keep once hyper ends this connection at the upgrade. Others do not:
+                    // no extension (and no allocation) on the common path.
+                    if req.headers().contains_key(hyper::header::UPGRADE) {
+                        req.extensions_mut().insert(held);
+                    }
                     // Consume early_data flag on first request.
                     let was_early = early_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
                     // The client-cert fingerprint is Zion's attestation of what TLS verified:
