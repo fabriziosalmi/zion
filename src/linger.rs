@@ -256,6 +256,16 @@ mod tests {
         (Linger::new(server, armed.clone()), client)
     }
 
+    /// An in-memory pair, for the tests on tokio's paused clock. With a real socket, a byte the
+    /// client wrote may still be in the kernel when every task is waiting: the paused clock then
+    /// jumps to the next timer (the idle deadline) as if the client had gone quiet, and the
+    /// linger ends at IDLE instead of TOTAL (seen on a macOS CI runner, and 4 times in 300 runs
+    /// locally). In memory, a write is visible to the reader before the runtime can idle.
+    fn memory_pair(armed: &Armed) -> (Linger<tokio::io::DuplexStream>, tokio::io::DuplexStream) {
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        (Linger::new(server, armed.clone()), client)
+    }
+
     #[tokio::test]
     async fn not_armed_it_closes_at_once() {
         let (mut server, _client) = pair(&Armed::default()).await;
@@ -289,7 +299,7 @@ mod tests {
     async fn a_client_that_keeps_sending_is_cut_off_at_the_total_time() {
         let armed = Armed::default();
         armed.arm();
-        let (mut server, mut client) = pair(&armed).await;
+        let (mut server, mut client) = memory_pair(&armed);
         tokio::spawn(async move {
             // a byte a second: never idle for IDLE, never done
             while client.write_all(b"x").await.is_ok() {
@@ -306,7 +316,7 @@ mod tests {
     async fn armed_it_gives_up_after_the_idle_time() {
         let armed = Armed::default();
         armed.arm();
-        let (mut server, _client) = pair(&armed).await;
+        let (mut server, _client) = memory_pair(&armed);
         let t = tokio::time::Instant::now();
         server.shutdown().await.unwrap();
         assert_eq!(t.elapsed(), IDLE);
