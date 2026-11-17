@@ -42,6 +42,7 @@ Both TCP (HTTP/1.1 + HTTP/2) and UDP (HTTP/3) listeners share:
 - The same routing table
 - The same WAF pipeline
 - The same security headers
+- The same request header bound: a header section of at most 16 KiB (decoded), as HTTP/1.1 and HTTP/2. HTTP/3 advertises it in its SETTINGS (`SETTINGS_MAX_FIELD_SECTION_SIZE`), so a conforming client does not send more, and a request over it gets `431`.
 
 ## TLS certificate hot-reload
 
