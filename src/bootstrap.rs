@@ -1250,7 +1250,76 @@ static CONN_CEILING: OnceLock<usize> = OnceLock::new();
 /// it is set, the value derived from memory otherwise. Called once at boot, before any
 /// listener; a later call does not change it.
 pub fn set_conn_ceiling(configured: Option<usize>) -> usize {
-    *CONN_CEILING.get_or_init(|| configured.unwrap_or_else(|| detect().conn_limit))
+    *CONN_CEILING.get_or_init(|| {
+        configured.unwrap_or_else(|| derived_ceiling(detect().conn_limit, fd_limit().map(|l| l.1)))
+    })
+}
+
+/// Descriptors held back from the connection budget, for everything that is not a client or
+/// upstream socket (listeners, the log and audit files, DNS sockets, certificate reloads,
+/// pooled upstream connections beyond one per client): a quarter of the limit, at most 1024.
+fn fd_reserve(soft: u64) -> u64 {
+    (soft / 4).min(1024)
+}
+
+/// How many proxied client connections `soft` file descriptors can carry: each holds its own
+/// socket and, while it is proxied, one to the upstream.
+pub fn fd_conn_budget(soft: u64) -> usize {
+    usize::try_from(soft.saturating_sub(fd_reserve(soft)) / 2).unwrap_or(usize::MAX)
+}
+
+/// The ceiling when `max_connections` is not set: the one derived from memory, lowered to what
+/// the descriptors can carry. Without the second bound a host with 64 GiB or more derived up to
+/// 100,000 under a `LimitNOFILE` of 65,535, and ran out of descriptors (EMFILE on accept and on
+/// upstream connects) at about half of it, before the clean refusal at the ceiling could act.
+fn derived_ceiling(from_memory: usize, fd_soft: Option<u64>) -> usize {
+    match fd_soft {
+        Some(soft) => from_memory.min(fd_conn_budget(soft).max(1)),
+        None => from_memory,
+    }
+}
+
+/// `RLIMIT_NOFILE` as `(soft before, soft in force)`, read once. The soft limit is raised to the
+/// hard one first (the hard limit is the ceiling an unprivileged process may lift itself to;
+/// raising the soft one is what Go's runtime and most servers do at start). `None` off unix or
+/// when the limit cannot be read.
+pub fn fd_limit() -> Option<(u64, u64)> {
+    static FD: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *FD.get_or_init(raise_fd_limit)
+}
+
+#[cfg(unix)]
+fn raise_fd_limit() -> Option<(u64, u64)> {
+    let read = || {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes into a valid, correctly laid out rlimit.
+        (unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0).then_some(lim)
+    };
+    let before = read()?;
+    if before.rlim_cur < before.rlim_max {
+        // macOS refuses a soft limit above OPEN_MAX (10240) when the hard one is unlimited.
+        for target in [before.rlim_max, before.rlim_max.min(10_240)] {
+            let lim = libc::rlimit {
+                rlim_cur: target,
+                rlim_max: before.rlim_max,
+            };
+            // SAFETY: setrlimit reads a valid rlimit; raising the soft limit up to the hard one
+            // needs no privilege.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } == 0 {
+                break;
+            }
+        }
+    }
+    let after = read()?;
+    Some((before.rlim_cur, after.rlim_cur))
+}
+
+#[cfg(not(unix))]
+fn raise_fd_limit() -> Option<(u64, u64)> {
+    None
 }
 
 /// The connection ceiling in force (the memory-derived one until
@@ -1654,6 +1723,25 @@ mod tests {
         assert_eq!(compute_conn_limit(pod), 1_000, "512 MiB: the floor");
         let (pod, _) = usable_memory_mb(65_536, Some(4_096 * MIB));
         assert_eq!(compute_conn_limit(pod), 4_096);
+    }
+
+    #[test]
+    fn the_derived_ceiling_fits_the_file_descriptors() {
+        // Two descriptors per proxied connection, after a reserve of a quarter (at most 1024).
+        assert_eq!(fd_conn_budget(65_535), (65_535 - 1_024) / 2);
+        assert_eq!(fd_conn_budget(2_048), (2_048 - 512) / 2);
+        assert_eq!(fd_conn_budget(1_024), (1_024 - 256) / 2);
+        // A 64 GiB host derives 65,536 from memory: under LimitNOFILE=65535 that is about twice
+        // what the descriptors carry, so the derived ceiling is the descriptor budget.
+        let from_memory = compute_conn_limit(64 * 1024);
+        assert_eq!(from_memory, 65_536);
+        assert_eq!(derived_ceiling(from_memory, Some(65_535)), 32_255);
+        // Enough descriptors: memory decides, as before.
+        assert_eq!(derived_ceiling(1_000, Some(65_535)), 1_000);
+        // No limit known (not unix): memory decides.
+        assert_eq!(derived_ceiling(from_memory, None), 65_536);
+        // Never zero.
+        assert_eq!(derived_ceiling(1_000, Some(0)), 1);
     }
 
     #[test]

@@ -32,6 +32,11 @@ impl Drop for Zion {
 
 /// Start zion with `server` appended to `[server]`; `None` when `openssl` is unavailable.
 fn start(server: &str) -> Option<Zion> {
+    start_with_fd_limit(server, None)
+}
+
+/// As [`start`], with `RLIMIT_NOFILE` (soft and hard) set to `fd_limit` for the daemon.
+fn start_with_fd_limit(server: &str, fd_limit: Option<u64>) -> Option<Zion> {
     let (http, https) = (free_port(), free_port());
     let dir = std::env::temp_dir().join(format!("zion-ceiling-{}-{http}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -71,14 +76,30 @@ fn start(server: &str) -> Option<Zion> {
         ),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_zion"))
-        .env("ZION_CONFIG", &cfg)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zion"));
+    cmd.env("ZION_CONFIG", &cfg)
         .env("ZION_BOOT_FAST", "1")
         .env("ZION_LAST_GASP_PATH", dir.join("gasp.jsonl"))
         .stdout(Stdio::null())
-        .stderr(std::fs::File::create(dir.join("zion.log")).unwrap())
-        .spawn()
-        .expect("spawn zion");
+        .stderr(std::fs::File::create(dir.join("zion.log")).unwrap());
+    if let Some(n) = fd_limit {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: only setrlimit runs between fork and exec, on a plain struct.
+        unsafe {
+            cmd.pre_exec(move || {
+                let lim = libc::rlimit {
+                    rlim_cur: n,
+                    rlim_max: n,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+    let child = cmd.spawn().expect("spawn zion");
     let zion = Zion {
         child,
         http,
@@ -221,5 +242,30 @@ fn without_the_setting_the_ceiling_is_derived_from_memory() {
     assert!(
         (1_000..=100_000).contains(&limit),
         "derived from memory, within its clamp: {limit}"
+    );
+}
+
+/// Without `max_connections`, the ceiling derived from memory is lowered to what the file
+/// descriptors can carry: two per proxied connection, after a reserve. A host with 64 GiB or more
+/// derived up to 100,000 under the shipped unit's `LimitNOFILE=65535`, and ran out of
+/// descriptors at about half of that, where accepts and upstream connects fail with EMFILE
+/// instead of the clean refusal at the ceiling.
+#[test]
+fn the_derived_ceiling_fits_the_file_descriptor_limit() {
+    // 2048 descriptors: a reserve of 512, then two per connection.
+    let Some(zion) = start_with_fd_limit("", Some(2_048)) else {
+        return;
+    };
+    let mut conn = connect(&zion);
+    assert_eq!(
+        snapshot(&mut conn)["platform"]["conn_limit"],
+        768,
+        "the ceiling is what 2048 descriptors carry"
+    );
+    let log = std::fs::read_to_string(zion.dir.join("zion.log")).unwrap_or_default();
+    assert!(
+        log.contains("connection ceiling 768:")
+            && log.contains("lowered to what 2048 file descriptors can carry"),
+        "the boot log says why:\n{log}"
     );
 }
