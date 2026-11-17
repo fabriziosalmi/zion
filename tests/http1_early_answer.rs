@@ -115,7 +115,7 @@ fn start(dir: &Path, origin_port: u16) -> Option<(Proc, u16)> {
         .map(|s| s.success())
         .unwrap_or(false);
     if !made {
-        eprintln!("SKIP: openssl not available");
+        common::skip("openssl not available");
         return None;
     }
     let https_port = free_port();

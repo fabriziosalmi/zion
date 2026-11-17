@@ -55,7 +55,7 @@ fn start(server: &str) -> Option<Zion> {
         .map(|s| s.success())
         .unwrap_or(false);
     if !made {
-        eprintln!("SKIP: openssl not available");
+        common::skip("openssl not available");
         return None;
     }
     let cfg = dir.join("zion.toml");

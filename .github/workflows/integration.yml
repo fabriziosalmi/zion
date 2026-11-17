@@ -96,6 +96,9 @@ jobs:
 
       - name: Run integration tests
         run: cargo test --release --test integration -- --ignored --test-threads=1
+        env:
+          # A daemon that is not answering fails the suite instead of skipping every test.
+          ZION_TEST_STRICT: "1"
 
       - name: Dump daemon logs on failure
         if: failure()

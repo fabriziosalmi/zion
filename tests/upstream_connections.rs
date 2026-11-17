@@ -78,7 +78,7 @@ fn opened(https: u16) -> u64 {
 fn upstream_connections_are_reused_one_after_another_and_counted_in_a_burst() {
     let has = |tool: &str| Command::new(tool).arg("--version").output().is_ok();
     if !has("curl") || !has("openssl") {
-        eprintln!("SKIP: openssl and curl are needed");
+        common::skip("openssl and curl are needed");
         return;
     }
     let dir = std::env::temp_dir().join(format!(

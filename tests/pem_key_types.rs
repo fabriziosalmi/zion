@@ -157,7 +157,7 @@ fn served_subject(port: u16) -> String {
 #[test]
 fn the_daemon_boots_with_every_kind_of_private_key() {
     if Command::new("openssl").arg("version").output().is_err() {
-        eprintln!("SKIP: openssl not available");
+        common::skip("openssl not available");
         return;
     }
     let mut covered = Vec::new();

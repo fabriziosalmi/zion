@@ -132,7 +132,11 @@ jobs:
           if grep -q '^tls ' /proc/modules; then echo "tls module: already loaded"
           else echo "tls module: not loaded, loading it"; sudo modprobe tls; fi
           grep -q '^tls ' /proc/modules
+      # A real-binary test that cannot run (openssl or curl missing, ...) fails here instead of
+      # passing green: see `skip` in tests/common/mod.rs.
       - run: cargo test --locked ${{ matrix.features }} --no-fail-fast
+        env:
+          ZION_TEST_STRICT: "1"
       # The address tables are behind the geo-* features, so the default run
       # compiles none of them. Their tests (structure, one pinned address per
       # curated ASN, floors, data age) run here too, not only with all features.

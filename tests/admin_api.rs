@@ -134,7 +134,7 @@ fn boot_once(persist: bool, write_token: bool) -> Boot {
         .map(|s| s.success())
         .unwrap_or(false);
     if !ok {
-        eprintln!("SKIP: openssl not available");
+        common::skip("openssl not available");
         return Boot::NoOpenssl;
     }
     let admin_port = free_port();
@@ -601,7 +601,7 @@ fn admin_mtls_trusts_only_the_admin_ca() {
         &dir.join("c.pem").to_string_lossy(),
     ]);
     if !(server_ok && ca_and_client(&dir, "data") && ca_and_client(&dir, "admin")) {
-        eprintln!("SKIP: openssl could not make the test certificates");
+        common::skip("openssl could not make the test certificates");
         return;
     }
     let d = dir.to_string_lossy();
@@ -773,7 +773,7 @@ fn a_revoked_client_certificate_is_refused_and_a_new_crl_needs_no_restart() {
         &dir.join("server/c.pem").to_string_lossy(),
     ]);
     if !(server_ok && pki_with_crl(&dir)) {
-        eprintln!("SKIP: openssl could not make the test certificates");
+        common::skip("openssl could not make the test certificates");
         return;
     }
     // The CRL the daemon reads: it starts with nothing revoked. It lives in a directory of
@@ -894,7 +894,7 @@ impl CrlDaemon {
             &dir.join("server/c.pem").to_string_lossy(),
         ]);
         if !(server_ok && pki_with_crl(&dir)) {
-            eprintln!("SKIP: openssl could not make the test certificates");
+            common::skip("openssl could not make the test certificates");
             return None;
         }
         fs::create_dir_all(dir.join("published")).unwrap();

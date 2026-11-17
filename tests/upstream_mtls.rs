@@ -271,7 +271,7 @@ fn zion_presents_its_client_certificate_to_an_upstream_that_requires_one() {
     ));
     fs::create_dir_all(&dir).unwrap();
     if !has("curl") || !pki(&dir) {
-        eprintln!("SKIP: openssl / curl not available");
+        common::skip("openssl / curl not available");
         return;
     }
     let d = dir.to_string_lossy().into_owned();
@@ -464,7 +464,7 @@ fn an_upstream_that_closes_without_close_notify_is_counted_and_logged() {
     ));
     fs::create_dir_all(&dir).unwrap();
     if Command::new("curl").arg("--version").output().is_err() || !pki(&dir) {
-        eprintln!("SKIP: openssl / curl not available");
+        common::skip("openssl / curl not available");
         return;
     }
     let d = dir.to_string_lossy().into_owned();

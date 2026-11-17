@@ -124,7 +124,7 @@ fn start_with(origin: u16, server: &str, env: &[(&str, &str)]) -> Option<Zion> {
             .is_ok()
     };
     if !has("openssl") || !has("curl") {
-        eprintln!("SKIP: openssl and curl are needed");
+        common::skip("openssl and curl are needed");
         return None;
     }
     let (http, https) = (free_port(), free_port());

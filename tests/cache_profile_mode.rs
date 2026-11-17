@@ -107,7 +107,7 @@ fn count(hits: &Arc<Mutex<HashMap<String, u32>>>, path: &str) -> u32 {
 #[test]
 fn a_none_profile_stores_nothing_and_a_memory_profile_does() {
     if Command::new("curl").arg("--version").output().is_err() {
-        eprintln!("SKIP: curl not available");
+        common::skip("curl not available");
         return;
     }
     let dir = std::env::temp_dir().join(format!(
@@ -136,7 +136,7 @@ fn a_none_profile_stores_nothing_and_a_memory_profile_does() {
         "-out",
         &cert.to_string_lossy(),
     ]) {
-        eprintln!("SKIP: openssl could not make a certificate");
+        common::skip("openssl could not make a certificate");
         return;
     }
     let hits = Arc::new(Mutex::new(HashMap::new()));

@@ -36,6 +36,11 @@ Before spending time on a large PR, we strongly suggest opening a feature reques
    ```bash
    cargo test
    ```
+   The tests that boot the real binary need `openssl` and `curl`; without them they print
+   `SKIP:` and pass. CI sets `ZION_TEST_STRICT=1`, which turns every such skip into a failure,
+   so set it too when you want to be sure the whole suite ran: `ZION_TEST_STRICT=1 cargo test`.
+   A new test that may have to skip calls `common::skip(reason)` (in `tests/common/mod.rs`),
+   not a bare `eprintln!`.
 5. Ensure no warnings are reported. These are the commands CI runs (stable Rust; CI also
    runs clippy once per feature: `acme`, `auth`, `http3`, `tui`, `init`, …):
    ```bash
