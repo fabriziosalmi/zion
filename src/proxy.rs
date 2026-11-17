@@ -139,7 +139,7 @@ pub const MAX_REQUEST_TIMEOUT_MS: u64 = 3_600_000;
 pub struct RequestTimeout(pub std::time::Duration);
 
 /// The deadline for `req`'s upstream attempt.
-fn request_timeout<B>(req: &Request<B>) -> std::time::Duration {
+pub(crate) fn request_timeout<B>(req: &Request<B>) -> std::time::Duration {
     req.extensions()
         .get::<RequestTimeout>()
         .map_or(UPSTREAM_REQUEST_TIMEOUT, |t| t.0)

@@ -411,6 +411,9 @@ pub struct Metrics {
     /// Responses not stored because they exceeded the profile's `max_object_mb`
     /// (declared up front, or discovered while streaming).
     pub cache_too_large: ShardedCounter,
+    /// Cache fills given up because the upstream sent no body for `request_timeout_ms`: the
+    /// response was not stored and the requests waiting on the fill fetched for themselves.
+    pub cache_fill_stalled: ShardedCounter,
     /// Cache entries dropped because an unsafe request (POST/PUT/PATCH/DELETE)
     /// succeeded on their URI (RFC 9111 §4.4).
     pub cache_invalidations: ShardedCounter,
@@ -628,6 +631,7 @@ impl Metrics {
             cache_swr_served: ShardedCounter::new(),
             cache_stale_if_error: ShardedCounter::new(),
             cache_too_large: ShardedCounter::new(),
+            cache_fill_stalled: ShardedCounter::new(),
             cache_invalidations: ShardedCounter::new(),
             cache_swr_refreshes: ShardedCounter::new(),
             cache_swr_refresh_failures: ShardedCounter::new(),
@@ -1079,6 +1083,11 @@ impl Metrics {
                 "zion_cache_too_large",
                 "Responses not stored because they exceeded the cache profile's max_object_mb.",
                 &self.cache_too_large,
+            ),
+            (
+                "zion_cache_fill_stalled",
+                "Cache fills given up because the upstream sent no body for request_timeout_ms; the waiting requests fetched for themselves.",
+                &self.cache_fill_stalled,
             ),
             (
                 "zion_cache_stale_if_error",
