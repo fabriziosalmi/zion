@@ -64,8 +64,8 @@ waf = true
 | `previous_secret_env` | string | — | Name of an env var holding the previous HMAC secret, accepted next to the current one during a [key rotation](#rotating-the-signing-key). Remove it when the old tokens have expired. |
 | `jwks_url` | string | — | JWKS endpoint URL (for RS256/ES256, auto-refreshed hourly). Must be `https://` (plain `http://` only to a loopback address); anything else is refused. |
 | `algorithm` | string | `HS256` | JWT algorithm. Auto-selects RS256 when `jwks_url` is set without `secret` |
-| `issuer` | string | — | Expected `iss` claim (optional) |
-| `audience` | string | — | Expected `aud` claim (optional) |
+| `issuer` | string | — | Expected `iss` claim. When set, a token without an `iss` claim is refused, not only one with a different value. |
+| `audience` | string | — | Expected `aud` claim. When set, a token without an `aud` claim is refused, not only one whose `aud` does not contain it. |
 | `forward_claims` | bool | `true` | Inject `X-Auth-Subject` and `X-Auth-Email` headers to upstream |
 | `leeway_secs` | integer | `30` | Clock-skew tolerance applied to `exp`/`nbf`. `0` is allowed; above `300` is rejected. |
 | `max_token_lifetime_secs` | integer | `86400` | Reject tokens whose `exp` is further in the future than this (plus `leeway_secs`): `403`. **Unset = 86400 (24 h) since 0.10.0** (before it: no cap). `0` = no cap, on purpose. A token accepted with more than 24 h left (under `0` or a cap above 24 h) is counted in `zion_auth_long_lived_tokens_total`. See [Token lifetime and revocation](#token-lifetime-and-revocation). |
@@ -164,7 +164,10 @@ Consequences for operators:
   tokens that are still accepted past 24 h because of `0` or a larger cap: the
   long-lived tokens you chose to keep.
 - `aud` may be a single string or an array (OIDC providers commonly send an
-  array); the profile's `audience` must appear in it.
+  array); the profile's `audience` must appear in it. A token with no `aud` at
+  all is refused by a profile that sets `audience`, and one with no `iss` by a
+  profile that sets `issuer` (before the fix for this, a token that left the
+  claim out passed).
 - A logout / key-compromise event cannot be enforced at the edge mid-lifetime;
   rotate the signing key (or JWKS) to invalidate outstanding tokens en masse.
 - If revocation must be durable or fleet-wide, terminate auth at a service that
