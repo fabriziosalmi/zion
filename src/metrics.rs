@@ -1321,6 +1321,28 @@ impl Metrics {
         out.extend_from_slice(b"\n");
 
         out.extend_from_slice(
+            b"# HELP zion_tls_reload_failures Certificate reloads that failed (file watcher, pre-warm, ACME renewal); the previous certificate kept serving.\n\
+                                # TYPE zion_tls_reload_failures counter\n\
+                                zion_tls_reload_failures ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(crate::tls::RELOAD_FAILURES.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(
+            b"\n# HELP zion_tls_cert_expiry_timestamp_seconds Unix time the served default certificate expires (notAfter); 0 until known. Alert on this minus time().\n\
+                                # TYPE zion_tls_cert_expiry_timestamp_seconds gauge\n\
+                                zion_tls_cert_expiry_timestamp_seconds ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(crate::tls::CERT_NOT_AFTER.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(b"\n");
+
+        out.extend_from_slice(
             b"# HELP zion_connections_rejected_per_ip Connections closed at accept for exceeding max_connections_per_ip.\n\
                                 # TYPE zion_connections_rejected_per_ip counter\n\
                                 zion_connections_rejected_per_ip ",

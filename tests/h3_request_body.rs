@@ -386,3 +386,70 @@ async fn a_h3_headers_fin_with_content_length_is_not_a_phantom_body() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// GET over HTTP/3 with one header whose value is `len` bytes: `Ok(status)`, or `Err` with the
+/// client's own refusal to send it (h3 checks the server's advertised header-section limit).
+async fn h3_get_with_header(port: u16, len: usize) -> Result<u16, String> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let mut tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCert))
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let qc = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(qc)));
+    let conn = ep
+        .connect(format!("127.0.0.1:{port}").parse().unwrap(), "localhost")
+        .unwrap()
+        .await
+        .map_err(|e| e.to_string())?;
+    let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn))
+        .await
+        .map_err(|e| e.to_string())?;
+    let _drive = tokio::spawn(async move {
+        let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+    // Let the server's SETTINGS arrive, as they would on any connection in use.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let req = hyper::Request::get("https://localhost/open/headers")
+        .header("x-big", "a".repeat(len))
+        .body(())
+        .unwrap();
+    let mut stream = send.send_request(req).await.map_err(|e| format!("{e:?}"))?;
+    stream.finish().await.map_err(|e| format!("{e:?}"))?;
+    let resp = stream.recv_response().await.map_err(|e| format!("{e:?}"))?;
+    while let Ok(Some(mut c)) = stream.recv_data().await {
+        c.advance(c.remaining());
+    }
+    Ok(resp.status().as_u16())
+}
+
+/// The HTTP/3 listener bounds a request's header section at 16 KiB, as HTTP/1.1 and HTTP/2 do.
+/// h3's default bound is VarInt::MAX, so a client could make zion decode and hold a header
+/// block of any size. The bound is advertised in SETTINGS: a conforming client refuses to send
+/// a bigger one (and its error names zion's limit), and zion answers one that arrives with 431.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_h3_header_section_over_16_kib_is_not_served() {
+    let dir = std::env::temp_dir().join(format!(
+        "zion-h3-hdr-{}-{}",
+        std::process::id(),
+        free_port()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let Some((_daemon, port)) = boot(&dir, upstream(seen.clone())) else {
+        return;
+    };
+    assert_eq!(
+        h3_get_with_header(port, 1024).await,
+        Ok(200),
+        "1 KiB is served"
+    );
+    let big = h3_get_with_header(port, 20 * 1024).await;
+    assert!(
+        matches!(&big, Ok(431)) || matches!(&big, Err(e) if e.contains("16384")),
+        "a 20 KiB header section is refused (431, or the client refuses on zion's 16384): {big:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
