@@ -280,7 +280,7 @@ pub mod revocation {
         .map_err(|e| e.to_string())?;
         line.push('\n');
         let mut options = std::fs::OpenOptions::new();
-        options.create(true).append(true);
+        options.create(true).append(true).read(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -289,9 +289,28 @@ pub mod revocation {
         let mut file = options
             .open(path)
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        // A previous write cut short (a full disk, a crash) leaves a last line with no newline:
+        // start this record on a line of its own, or it is glued to the fragment, the merged
+        // line does not parse at the next boot, and this revocation is lost. (`load` skips the
+        // fragment and the blank lines.)
+        if ends_mid_line(&mut file) {
+            line.insert(0, '\n');
+        }
         file.write_all(line.as_bytes())
             .and_then(|()| file.sync_data())
             .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// The file is not empty and its last byte is not a newline.
+    fn ends_mid_line(file: &mut std::fs::File) -> bool {
+        use std::io::{Read, Seek, SeekFrom};
+        if file.metadata().map_or(true, |m| m.len() == 0) {
+            return false;
+        }
+        let mut last = [0u8; 1];
+        file.seek(SeekFrom::End(-1))
+            .and_then(|_| file.read_exact(&mut last))
+            .map_or(true, |()| last[0] != b'\n')
     }
 
     /// Load the revocations recorded at `path` (boot), dropping the expired ones, and rewrite
@@ -620,6 +639,8 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthPr
         decoding_key = Some(Arc::new(DecodingKey::from_secret(secret.as_bytes())));
     } else if let Some(ref jwks_url) = config.jwks_url {
         let url = jwks_url.clone();
+        // What the logs show: the URL without a `user:password@`, as config validation shows it.
+        let shown = crate::http_util::redact_userinfo(&url);
         let key_store = jwk_set_arc.clone();
 
         // Spawn background task to periodically fetch JWKS.
@@ -656,7 +677,7 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthPr
                             key_store.store(Some(Arc::new(jwks)));
                             crate::logging::info(
                                 "auth",
-                                &format!("JWKS successfully loaded from {url}"),
+                                &format!("JWKS successfully loaded from {shown}"),
                             );
                             backoff_secs = 3600; // success: normal 1h refresh cycle
                         }
@@ -679,7 +700,7 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthPr
                         crate::logging::error(
                             "auth",
                             &format!(
-                                "Failed to fetch JWKS from {url}: {e}, retry in {backoff_secs}s"
+                                "Failed to fetch JWKS from {shown}: {e}, retry in {backoff_secs}s"
                             ),
                         );
                         backoff_secs = (backoff_secs * 2).min(300); // cap failure backoff at 5min
@@ -1182,6 +1203,33 @@ mod tests {
     /// A revocation recorded on disk is back after a restart (ZION-AUTH-06): `load` is what
     /// the boot runs. Expired entries are dropped and the file is compacted; a line cut
     /// short by a crash is skipped, not fatal; a missing file is an empty list.
+    /// A revocation recorded after a write that was cut short (a full disk, a crash) used to be
+    /// appended onto the fragment: the merged line did not parse at the next boot, so that
+    /// revocation was dropped and the token was valid again, though the operator got a 200 for it.
+    #[test]
+    fn a_revocation_recorded_after_a_torn_write_survives_a_restart() {
+        use revocation::{append, is_revoked, load};
+        let dir =
+            std::env::temp_dir().join(format!("zion-revocations-torn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("revoked.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // The previous write stopped half way: no newline at the end.
+        std::fs::write(&path, b"{\"jti\":\"torn-before").unwrap();
+        append(&path, "torn-after-revoked", now + 3600).unwrap();
+        assert_eq!(
+            load(&path).unwrap(),
+            (1, 1),
+            "the new revocation is its own line; only the fragment is unreadable"
+        );
+        assert!(is_revoked("torn-after-revoked"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_recorded_revocation_survives_a_restart() {
         use revocation::{append, is_revoked, load};
