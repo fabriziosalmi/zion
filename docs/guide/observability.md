@@ -325,7 +325,7 @@ zion audit verify /var/log/zion/audit.jsonl /var/log/zion/audit.jsonl.*
 # ok   /var/log/zion/audit.jsonl: 4312 records, 3 chain(s)
 ```
 
-Each segment is checked on its own: every record's HMAC, and that each `prev_hash` is the previous record's HMAC. A chain starts at a `chain_init` / `chain_rotate` marker signed from genesis. `--key-env VAR` picks another key variable, and `--previous-key-env VAR` supplies the outgoing key for segments written before a [key rotation](#key-rotation). The exit code is `0` when everything verified, `1` when a segment failed (the message names the line), `2` for a usage or key error.
+Each segment is checked on its own: every record's HMAC, and that each `prev_hash` is the previous record's HMAC. A chain starts at a `chain_init` / `chain_rotate` marker signed from genesis. `--key-env VAR` picks another key variable, and `--previous-key-env VAR` supplies the outgoing key for segments written before a [key rotation](#key-rotation). Events the writer shed under back-pressure are recorded in the chain itself, as signed `events_dropped` records (`detail` = `count=N`) ahead of the next event or at shutdown; the verifier sums them and reports `N event(s) dropped under back-pressure`. The exit code is `0` when everything verified and nothing was dropped, `1` when a segment failed (the message names the line), `2` for a usage or key error, and `3` when every segment verified but events were dropped: the chain is intact, the trail is not complete. Events lost because the writer had exited cannot be written anywhere; `zion_audit_writer_up` and the daemon log are the signal for those.
 
 It catches a record that was edited, removed or reordered inside a chain. It cannot see the **end** of a chain being cut off, because nothing after it commits to it; the `prev_head=` in the next marker is what covers that. A last line with no newline is reported as a torn tail and not counted.
 
@@ -376,7 +376,7 @@ The verifier walks top-down and stops at the first inconsistency. Tamper, deleti
 
 The writer task runs in `tokio::spawn`. If:
 
-- the queue is full, events are **dropped** and `zion_audit_events_dropped_total` ticks. The hot path never blocks.
+- the queue is full, events are **dropped** and `zion_audit_events_dropped_total` ticks. The hot path never blocks. The writer then records how many, as a signed `events_dropped` record in the chain, so `zion audit verify` reports the gap (exit `3`).
 - the file cannot be opened at startup, audit is **silently disabled** (with an error log) and the rest of the daemon continues.
 - a write fails mid-run (disk full, fd revoked), the writer task exits and subsequent events are dropped. A monitor on `zion_audit_events_dropped_total > 0` is the recommended alert.
 
