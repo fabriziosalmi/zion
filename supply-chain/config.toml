@@ -79,7 +79,7 @@ version = "1.9.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.arc-swap]]
-version = "1.9.3"
+version = "1.9.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.asn1-rs]]
@@ -379,7 +379,7 @@ version = "1.1.9"
 criteria = "safe-to-deploy"
 
 [[exemptions.flate2]]
-version = "1.1.10"
+version = "1.1.11"
 criteria = "safe-to-deploy"
 
 [[exemptions.float-cmp]]
@@ -571,7 +571,7 @@ version = "0.8.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.io-uring]]
-version = "0.7.15"
+version = "0.7.16"
 criteria = "safe-to-deploy"
 
 [[exemptions.ipnet]]
@@ -595,7 +595,7 @@ version = "0.13.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.itoa]]
-version = "1.0.18"
+version = "1.0.19"
 criteria = "safe-to-deploy"
 
 [[exemptions.jni]]
@@ -1571,7 +1571,7 @@ version = "1.0.10"
 criteria = "safe-to-deploy"
 
 [[exemptions.webpki-roots]]
-version = "1.0.11"
+version = "1.0.12"
 criteria = "safe-to-deploy"
 
 [[exemptions.winapi]]
