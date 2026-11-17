@@ -37,6 +37,24 @@ use std::sync::Arc;
 // continue independently).
 // ──────────────────────────────────────────────────────────────────────
 
+/// How long the accept loop waits after `e` before it tries again. Out of file descriptors or
+/// kernel memory (EMFILE, ENFILE, ENOBUFS, ENOMEM), every accept fails until something closes,
+/// and retrying at once spins a core on the error while the backlog fills. Any other error
+/// belongs to one connection (a peer that reset before the accept) and the next accept is tried
+/// at once.
+fn accept_error_pause(e: &std::io::Error) -> Option<std::time::Duration> {
+    #[cfg(unix)]
+    if matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    ) {
+        return Some(std::time::Duration::from_millis(50));
+    }
+    #[cfg(not(unix))]
+    let _ = e;
+    None
+}
+
 /// Run the plain-HTTP accept loop on the given listener until
 /// `shutdown_rx` flips to `true` or the channel closes. New incoming
 /// TCP connections are spawned as detached tasks; the loop never owns
@@ -67,6 +85,9 @@ pub(crate) async fn run_http_accept_loop(
                         if now.duration_since(last_err_log).as_secs() >= 1 {
                             logq::line(&format!("  http accept error: {e}"));
                             last_err_log = now;
+                        }
+                        if let Some(pause) = accept_error_pause(&e) {
+                            tokio::time::sleep(pause).await;
                         }
                         continue;
                     }
@@ -191,6 +212,9 @@ pub(crate) async fn run_https_accept_loop(
                         if now.duration_since(last_err_log).as_secs() >= 1 {
                             logq::line(&format!("  https accept error: {e}"));
                             last_err_log = now;
+                        }
+                        if let Some(pause) = accept_error_pause(&e) {
+                            tokio::time::sleep(pause).await;
                         }
                         continue;
                     }
@@ -902,6 +926,23 @@ mod redirect_tests {
                 *want,
                 "{host} {http:?} {https:?}"
             );
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod accept_error_tests {
+    use super::accept_error_pause;
+
+    #[test]
+    fn running_out_of_descriptors_pauses_the_accept_loop_a_reset_peer_does_not() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            let e = std::io::Error::from_raw_os_error(errno);
+            assert!(accept_error_pause(&e).is_some(), "{e}");
+        }
+        for errno in [libc::ECONNABORTED, libc::ECONNRESET, libc::EINTR] {
+            let e = std::io::Error::from_raw_os_error(errno);
+            assert_eq!(accept_error_pause(&e), None, "{e}");
         }
     }
 }
