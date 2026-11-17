@@ -20,6 +20,10 @@ use std::sync::Arc;
 use crate::config::TlsConfig;
 use crate::metrics;
 
+/// The largest decoded header section (QPACK) an HTTP/3 request may carry, the same 16 KiB as
+/// HTTP/1.1 and HTTP/2 (`H2_MAX_HEADER_LIST_SIZE`).
+const H3_MAX_FIELD_SECTION_SIZE: u64 = 16 * 1024;
+
 /// Pre-built Alt-Svc header value for HTTP/3 advertisement.
 pub static ALT_SVC_H3: hyper::header::HeaderValue =
     hyper::header::HeaderValue::from_static("h3=\":443\"; ma=86400");
@@ -158,7 +162,14 @@ pub fn spawn_quic_listener(
                 // Kept to close the connection ourselves once drained: after a GOAWAY an
                 // idle client never closes it, so h3 would wait for the idle timeout.
                 let quic = conn.clone();
-                let h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn)).await;
+                // Header sections are bounded like HTTP/1.1 (16 KiB buffer) and HTTP/2 (16 KiB
+                // header list): h3's default is no bound (VarInt::MAX), so a client could make zion
+                // decode and hold a header block of any size. Advertised in SETTINGS, and a request
+                // over it gets h3's own 431.
+                let h3_conn = h3::server::builder()
+                    .max_field_section_size(H3_MAX_FIELD_SECTION_SIZE)
+                    .build(h3_quinn::Connection::new(conn))
+                    .await;
 
                 let mut h3_conn = match h3_conn {
                     Ok(c) => c,
