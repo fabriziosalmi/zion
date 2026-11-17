@@ -89,7 +89,7 @@ fn certificate_expiry_and_failed_reloads_are_on_metrics() {
         .status()
         .is_ok_and(|s| s.success());
     if !have_curl || !make_pair(&cert, &key, 3) {
-        eprintln!("SKIP: openssl and curl are needed");
+        common::skip("openssl and curl are needed");
         let _ = std::fs::remove_dir_all(&dir);
         return;
     }
