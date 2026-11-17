@@ -60,7 +60,7 @@ fn start_with_fd_limit(server: &str, fd_limit: Option<u64>) -> Option<Zion> {
         .map(|s| s.success())
         .unwrap_or(false);
     if !made {
-        eprintln!("SKIP: openssl not available");
+        common::skip("openssl not available");
         return None;
     }
     let cfg = dir.join("zion.toml");

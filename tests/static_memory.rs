@@ -73,7 +73,7 @@ impl Zion {
             .map(|s| s.success())
             .unwrap_or(false);
         if !made {
-            eprintln!("SKIP: openssl not available");
+            common::skip("openssl not available");
             return None;
         }
         std::fs::write(dir.join("www/big.bin"), noise(FILE_BYTES)).unwrap();

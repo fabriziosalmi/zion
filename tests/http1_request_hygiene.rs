@@ -166,7 +166,7 @@ fn http1_host_and_connection_headers_follow_the_rfcs() {
         &dir.join("c.pem").to_string_lossy(),
     ]);
     if !made {
-        eprintln!("SKIP: openssl could not make a certificate");
+        common::skip("openssl could not make a certificate");
         return;
     }
     let (origin_port, seen) = origin();

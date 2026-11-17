@@ -353,7 +353,7 @@ fn origin_saw_method(seen: &Arc<Mutex<Vec<String>>>, method: &str, marker: &str)
 #[test]
 fn http1_methods_framing_and_hop_by_hop_on_a_proxy_route() {
     if !have_openssl() {
-        eprintln!("skipping http_conformance: openssl not installed");
+        common::skip("http_conformance: openssl not installed");
         return;
     }
     let dir = tempdir();
@@ -576,7 +576,7 @@ fn recorded_head(seen: &Arc<Mutex<Vec<String>>>, before: usize, prefix: &str) ->
 #[test]
 fn http1_request_targets_host_and_expect_continue() {
     if !have_openssl() {
-        eprintln!("skipping http_conformance slice 2: openssl not installed");
+        common::skip("http_conformance slice 2: openssl not installed");
         return;
     }
     let dir = tempdir();
@@ -738,7 +738,7 @@ fn header_val(head: &str, name: &str) -> String {
 #[test]
 fn http_conditional_range_and_encoding() {
     if !have_openssl() {
-        eprintln!("skipping http_conformance slice 3: openssl not installed");
+        common::skip("http_conformance slice 3: openssl not installed");
         return;
     }
     let dir = tempdir();
@@ -912,7 +912,7 @@ fn http_conditional_range_and_encoding() {
 #[test]
 fn http2_parity_status_and_vary_passthrough() {
     if !have_openssl() || !have_curl() {
-        eprintln!("skipping http_conformance slice 4: openssl or curl not installed");
+        common::skip("http_conformance slice 4: openssl or curl not installed");
         return;
     }
     let dir = tempdir();
@@ -1018,7 +1018,7 @@ fn origin_count(seen: &Arc<Mutex<Vec<String>>>, prefix: &str) -> usize {
 #[test]
 fn http_cache_variants_and_websocket_upgrade() {
     if !have_openssl() {
-        eprintln!("skipping http_conformance slice 5: openssl not installed");
+        common::skip("http_conformance slice 5: openssl not installed");
         return;
     }
     let dir = tempdir();

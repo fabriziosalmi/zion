@@ -44,7 +44,7 @@ fn have(cmd: &str, args: &[&str]) -> bool {
 /// are missing.
 fn start(initial_rules: &str) -> Option<Zion> {
     if !have("openssl", &["version"]) || !have("curl", &["--version"]) {
-        eprintln!("SKIP: openssl or curl missing");
+        common::skip("openssl or curl missing");
         return None;
     }
     let (http, https) = (free_port(), free_port());
