@@ -274,7 +274,7 @@ headers      = ["authorization", "cookie", "x-api-key"]
 query_params = ["token", "api_key", "session"]
 ```
 
-The HMAC key is taken from the named environment variable and must be **at least 32 bytes** (the SHA-256 output size). With `enabled = true`, a missing `path`, an unset or empty key variable, or a key under 32 bytes makes Zion **refuse to start**: a typo in `key_env` or a missing secret mount must not silently remove the tamper-evident trail you asked for. (`enabled = false`, the default, never reads the variable.)
+The HMAC key is taken from the named environment variable and must be **at least 32 bytes** (the SHA-256 output size). With `enabled = true`, a missing `path`, a `path` that cannot be opened for appending (a missing directory, a read-only mount, wrong ownership), an unset or empty key variable, or a key under 32 bytes makes Zion **refuse to start** (exit `2`, the config category): a typo in `key_env`, a missing secret mount or an unwritable log directory must not silently remove the tamper-evident trail you asked for. A segment that cannot be opened later, at rotation, stops the writer instead: `zion_audit_writer_up` goes to `0`. (`enabled = false`, the default, never reads the variable.)
 
 On `SIGTERM` the writer is stopped after the connections have drained: it writes everything still queued, flushes and `fsync`s, and Zion waits up to 5 seconds for it. If that takes longer the daemon logs `audit writer did not finish within 5s`.
 
