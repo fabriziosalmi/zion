@@ -162,7 +162,10 @@ jobs:
       - name: Install cmake (macOS)
         if: runner.os == 'macOS'
         run: brew install cmake
+      # Same rule as the Linux test jobs: a test that cannot run fails instead of passing green.
       - run: cargo test --locked --no-fail-fast
+        env:
+          ZION_TEST_STRICT: "1"
 
   # ── 5. MSRV — pinned to Cargo.toml `rust-version`. Independent toolchain. ─
   # The MSRV is 1.82 for the *core* binary (default features). Opt-in features
