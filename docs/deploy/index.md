@@ -335,9 +335,20 @@ helm install zion deploy/helm/zion -f my-values.yaml   # with tls.existingSecret
 - `terminationGracePeriodSeconds: 45` covers the drain.
 - `preserve_host` upstreams that refuse unknown hosts need `health_host` too, or
   their probes fail (see the [upstream settings](/config/#forward-the-client-s-host-preserve-host-opt-in)).
+- The LoadBalancer Service sets `externalTrafficPolicy: Local` (`service.externalTrafficPolicy`),
+  so zion sees each client's own address. With `Cluster`, kube-proxy presents every client
+  from a node address in a private range: zion would treat them all as internal, so
+  `/metrics` and `/_zion/snapshot.json` would answer the internet, and per-IP limits would
+  count per node. `Local` routes traffic only to nodes that run a zion pod.
+- Behind a load balancer or proxy that does not keep client addresses, set
+  `config.internalNetworks` to exactly the hosts that may read the internal-only endpoints
+  (for example your Prometheus pods' CIDR), and `config.trustedProxies` to the proxies whose
+  `X-Forwarded-For` zion should believe. They render as `[server] internal_networks` and
+  `trusted_proxies`.
 
 Every values file in `deploy/helm/zion/ci/` is rendered in CI and the resulting
-`zion.toml` checked with `zion doctor`.
+`zion.toml` checked with `zion doctor`; the same check asserts the Service's traffic policy and
+that the `[server]` lists reach the rendered config.
 
 ## Rollback
 

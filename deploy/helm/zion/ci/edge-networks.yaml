@@ -1,0 +1,19 @@
+# The internal-only endpoints restricted to named networks, behind a proxy whose
+# X-Forwarded-For is trusted: the rendered [server] must carry both lists, and
+# zion doctor must accept them.
+tls:
+  existingSecret: zion-tls
+service:
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+config:
+  internalNetworks:
+    - "127.0.0.1/32"
+    - "10.42.0.0/16"
+  trustedProxies:
+    - "10.0.0.0/8"
+  upstreams:
+    app: "http://app.default.svc:8000"
+  routes:
+    - path: "/{*rest}"
+      upstream: app

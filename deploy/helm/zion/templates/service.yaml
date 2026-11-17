@@ -4,8 +4,16 @@ metadata:
   name: {{ include "zion.fullname" . }}
   labels:
     {{- include "zion.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   type: {{ .Values.service.type }}
+  {{- if and .Values.service.externalTrafficPolicy (has .Values.service.type (list "LoadBalancer" "NodePort")) }}
+  # Keep each client's source address (see values.yaml: service.externalTrafficPolicy).
+  externalTrafficPolicy: {{ .Values.service.externalTrafficPolicy }}
+  {{- end }}
   ports:
     - name: http
       port: {{ .Values.service.portHttp }}

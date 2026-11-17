@@ -90,6 +90,14 @@ podLabels: {}
 
 service:
   type: LoadBalancer
+  # `Local` keeps each client's own source address. With `Cluster` (the Kubernetes
+  # default) kube-proxy rewrites it to a node address, which is in a private range:
+  # zion then sees every client as internal (so `/metrics` and `/_zion/snapshot.json`
+  # answer the internet) and its per-IP limits count per node, not per client. The
+  # cost of `Local`: only nodes running a zion pod take traffic (the load balancer's
+  # health check routes around the others). Applied to LoadBalancer and NodePort
+  # Services only; empty leaves the field out.
+  externalTrafficPolicy: Local
   portHttp: 80
   portHttps: 443
   # Annotations for cloud LB (e.g. NLB on AWS, GCLB on GCP). Empty by default.
@@ -235,6 +243,16 @@ config:
   # key_path: "/etc/ssl/zion/tls.key"
   upstreams: {}
   routes: []
+  # [server] internal_networks: the peers allowed on the internal-only endpoints
+  # (`/metrics`, `/_zion/snapshot.json`, `/_zion/cache/purge`) and `internal_only`
+  # routes, as CIDRs. Empty keeps zion's built-in rule: any loopback / private /
+  # link-local peer. Behind a load balancer or proxy that presents clients from a
+  # private range (one that does not keep source addresses), set it to exactly the
+  # hosts that should be internal, e.g. your Prometheus pods' CIDR.
+  internalNetworks: []
+  # [server] trusted_proxies: proxies whose X-Forwarded-For zion believes, as CIDRs.
+  # Set it when a proxy in front of zion carries the client address in that header.
+  trustedProxies: []
 
 # Optional: seal the audit-log HMAC key into a Kubernetes Secret. The
 # chart sets ZION_AUDIT_HMAC_KEY from this secret when `audit.enabled`.
