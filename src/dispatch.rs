@@ -33,7 +33,6 @@ use crate::audit::AuditEvent;
 use crate::bulkhead;
 use crate::http_util::{
     empty_response, generate_request_id, inject_security_headers, text_response, HEX_DIGITS,
-    REQUEST_COUNTER,
 };
 use crate::http_util::{ReqBody, ZionBody};
 use crate::pool;

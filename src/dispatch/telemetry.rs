@@ -19,6 +19,19 @@ pub(super) struct Trace {
     pub(super) span_id_bytes: [u8; 8],
 }
 
+/// The low 8 bytes of a generated trace id, which are also its span id: a random per-process
+/// base plus a sequence that every generated id takes. Two requests of one process never share
+/// them, whatever the microsecond and whether or not they brought an `X-Request-ID` (it used to
+/// be `REQUEST_COUNTER`, which only a generated request id moves, so behind a load balancer
+/// that sets one, every request of the same microsecond shared a trace id); the random base
+/// keeps two zion processes from producing the same sequence.
+fn next_trace_seq() -> u64 {
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    BASE.get_or_init(|| fastrand::u64(..))
+        .wrapping_add(SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Give the request an `X-Request-ID` and a valid `traceparent` (the client's, or a fresh one).
 pub(super) fn stamp(req: &mut Request<ReqBody>) -> Trace {
     // ── Request ID (preserve client's or generate new) ──
@@ -70,7 +83,7 @@ pub(super) fn stamp(req: &mut Request<ReqBody>) -> Trace {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
-        let seq = REQUEST_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
+        let seq = next_trace_seq();
 
         // Build the trace ID once, in raw bytes — we both stringify it for
         // the header and keep it for the exemplar.
@@ -91,9 +104,8 @@ pub(super) fn stamp(req: &mut Request<ReqBody>) -> Trace {
             buf[3 + i * 2 + 1] = HEX_DIGITS[(byte & 0xF) as usize];
         }
         buf[35] = b'-';
-        // span_id: same 8 trailing bytes — sequence is unique within a process
-        // for the lifetime of `REQUEST_COUNTER`. A future change can split
-        // span IDs from request IDs; for now they coincide.
+        // span_id: the same 8 trailing bytes, unique within the process (see
+        // `next_trace_seq`).
         for i in 0..8 {
             buf[36 + i * 2] = HEX_DIGITS[(tid[8 + i] >> 4) as usize];
             buf[36 + i * 2 + 1] = HEX_DIGITS[(tid[8 + i] & 0xF) as usize];
@@ -330,6 +342,60 @@ pub(super) fn record(
                 path: Some(path_safe.to_string()),
                 detail: Some(detail_parts.join(" ")),
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(with_request_id: bool) -> Request<ReqBody> {
+        let mut b = Request::builder().uri("/");
+        if with_request_id {
+            b = b.header("X-Request-ID", "set-by-the-load-balancer");
+        }
+        b.body(
+            http_body_util::Full::new(Bytes::new())
+                .map_err(|n| match n {})
+                .boxed(),
+        )
+        .unwrap()
+    }
+
+    /// A generated trace id was the microsecond plus `REQUEST_COUNTER.load()`, and only
+    /// `generate_request_id` moved the counter, which runs only when the request has no
+    /// `X-Request-ID`. Behind a load balancer that sets one, every request stamped in the same
+    /// microsecond (on any worker) got the same trace id and span id, merging unrelated requests
+    /// in the access log, the audit record and the exported span. Concurrent workers, as in
+    /// production: one thread alone rarely stamps twice in a microsecond.
+    #[test]
+    fn generated_trace_ids_are_distinct_across_concurrent_requests() {
+        for with_request_id in [true, false] {
+            let (threads, per_thread) = (8, 5_000);
+            let ids: Vec<[u8; 16]> = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..threads)
+                    .map(|_| {
+                        scope.spawn(move || {
+                            (0..per_thread)
+                                .map(|_| stamp(&mut request(with_request_id)).trace_id_bytes)
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .flat_map(|w| w.join().unwrap())
+                    .collect()
+            });
+            let distinct: std::collections::HashSet<_> = ids.iter().collect();
+            assert_eq!(
+                distinct.len(),
+                ids.len(),
+                "with X-Request-ID = {with_request_id}: {} of {} trace ids repeat",
+                ids.len() - distinct.len(),
+                ids.len()
+            );
         }
     }
 }

@@ -29,7 +29,7 @@ Every request carries a `traceparent` header. The dispatcher:
 
 1. Parses the inbound header per [W3C Trace Context v0](https://www.w3.org/TR/trace-context/). All-zero IDs and malformed values are rejected (`zion_traces_invalid_total` counter ticks).
 2. If the inbound header was valid, it is forwarded unchanged.
-3. Otherwise, Zion generates one and forwards it.
+3. Otherwise, Zion generates one and forwards it. A generated trace id is the microsecond it was made plus a per-process sequence that every generated id takes (from a random start), so no two requests of one process share a trace id or span id, including two that arrive in the same microsecond behind a load balancer that sets `X-Request-ID`.
 
 The parsed 16-byte trace ID is attached to the latency histogram as an OpenMetrics exemplar (see below) and to every audit event for the request.
 
