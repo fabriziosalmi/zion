@@ -111,7 +111,7 @@ docker run -d --name "$NGINX_CONTAINER" \
     -p 8443:443 \
     -v "$SCRIPT_DIR/nginx-native-bench.conf:/etc/nginx/nginx.conf:ro" \
     -v "$SCRIPT_DIR/certs:/etc/ssl/bench:ro" \
-    nginx:1.27-alpine
+    nginx:1.30.7-alpine@sha256:bef154735288bc38d99fac41ae63730684bcc661503673a04a0f9bc526ba8598
 wait_for_https "https://127.0.0.1:8443/"
 log "nginx ready on :8443"
 

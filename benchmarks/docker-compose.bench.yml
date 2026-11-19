@@ -14,11 +14,11 @@ services:
 
   # ── nginx: TLS reverse proxy (1 worker, access_log off) ──
   nginx:
-    image: nginx:1.27-alpine
+    image: nginx:1.30.7-alpine@sha256:bef154735288bc38d99fac41ae63730684bcc661503673a04a0f9bc526ba8598
     cpus: 1.0
     mem_limit: 256m
     ports:
-      - "8443:443"
+      - "127.0.0.1:8443:443"
     volumes:
       - ./nginx-bench.conf:/etc/nginx/nginx.conf:ro
       - ./certs:/etc/ssl/bench:ro
@@ -35,7 +35,7 @@ services:
     cpus: 1.0
     mem_limit: 256m
     ports:
-      - "9443:443"
+      - "127.0.0.1:9443:443"
     environment:
       - ZION_CONFIG=/etc/zion/zion.toml
     volumes:
@@ -54,7 +54,7 @@ services:
     cpus: 1.0
     mem_limit: 256m
     ports:
-      - "9444:443"
+      - "127.0.0.1:9444:443"
     environment:
       - ZION_CONFIG=/etc/zion/zion.toml
     volumes:
@@ -73,7 +73,7 @@ services:
     cpus: 1.0
     mem_limit: 256m
     ports:
-      - "9445:443"
+      - "127.0.0.1:9445:443"
     environment:
       - ZION_CONFIG=/etc/zion/zion.toml
     volumes:
