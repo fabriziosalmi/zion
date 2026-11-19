@@ -44,7 +44,7 @@ SCENARIO="${1:-multi-vhost}"
 _ZION_VERSION="$(awk -F'"' '/^\[package\]/{p=1} p && /^version *=/{print $2; exit}' "$(dirname "$0")/../../Cargo.toml")"
 ZION_IMAGE="${ZION_IMAGE:-ghcr.io/fabriziosalmi/zion:${_ZION_VERSION:?could not read the version from Cargo.toml}}"
 ZION_RUNTIME_IMAGE="${ZION_RUNTIME_IMAGE:-ubuntu:24.04}"
-NGINX_IMAGE="nginx:1.27-alpine"
+NGINX_IMAGE="nginx:1.30.7-alpine@sha256:bef154735288bc38d99fac41ae63730684bcc661503673a04a0f9bc526ba8598"
 CADDY_IMAGE="caddy:2-alpine"
 NET=zeq-net
 PROXY_PORT=18080
