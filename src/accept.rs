@@ -108,6 +108,7 @@ async fn handle_http_connection(
     state: Arc<AppState>,
     builder: Arc<AutoBuilder<TokioExecutor>>,
 ) {
+    let addr = security::canonical_peer(addr);
     // Mirror the HTTPS accept ceremony so :80 is not an unmetered bypass of
     // the connection ceiling. Without these, the :80 listener accepted
     // unbounded held connections — climbing FD/task count and starving the
@@ -329,6 +330,8 @@ fn spawn_https_handler(
     remote_addr: SocketAddr,
     state: Arc<AppState>,
 ) {
+    // `::ffff:a.b.c.d` from a dual-stack listener is the IPv4 client it is, for every gate.
+    let remote_addr = security::canonical_peer(remote_addr);
     // Global connection ceiling — fast atomic check, no Arc clone.
     let permit = match state.conn_limit.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -714,8 +717,16 @@ pub(crate) async fn handle_http(
     // copy is forged.
     security::strip_transport_attestations(req.headers_mut());
 
+    // The client as the HTTPS pipeline resolves it: behind a trusted proxy, the rate limit,
+    // the snapshot gate and the address the ACME fallback forwards go by the client the proxy
+    // names, not by the proxy (a private address, internal under the default rule).
+    let client_ip = state
+        .cfg()
+        .trusted_proxies
+        .resolve_client_ip(remote_addr.ip(), req.headers());
+
     // Rate limit HTTP/80 to prevent DoS via redirect/ACME flood
-    if !check_rate_limit(&state, remote_addr.ip()) {
+    if !check_rate_limit(&state, client_ip) {
         metrics::METRICS
             .rate_limited
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -742,7 +753,7 @@ pub(crate) async fn handle_http(
     // client. Same internal-IP gate as the HTTPS handler.
     if path == "/_zion/snapshot.json" {
         let cfg = state.cfg();
-        if !cfg.internal_networks.contains(&remote_addr.ip()) {
+        if !cfg.internal_networks.contains(&client_ip) {
             return Ok(empty_response(StatusCode::FORBIDDEN));
         }
         let platform = bootstrap::detect();
@@ -817,7 +828,8 @@ pub(crate) async fn handle_http(
                 req,
                 &rule.upstream_scheme,
                 &rule.upstream_authority,
-                Some(remote_addr),
+                // the resolved client (as the pipeline forwards it); the port is not used
+                Some(SocketAddr::new(client_ip, 0)),
                 "http",
                 cfg.xff_mode,
             )

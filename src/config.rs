@@ -105,7 +105,8 @@ pub struct ZionConfig {
 /// How Zion treats the inbound `X-Forwarded-For` header before forwarding.
 ///
 /// * `Append` (default): preserve the inbound chain, append the resolved
-///   client IP. Compatible with the prior behaviour and correct when Zion
+///   client IP, on one line (every inbound line joined in order, then the
+///   client, as nginx's `$proxy_add_x_forwarded_for`). Correct when Zion
 ///   sits behind a sanitising edge (Cloudflare, ALB, etc.) AND the
 ///   downstream app reads the *rightmost-trusted* hop. Vulnerable to
 ///   client-side spoofing of the leftmost entry when Zion is the front

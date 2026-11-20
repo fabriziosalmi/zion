@@ -311,12 +311,9 @@ async fn process_request_inner(
     // X-Forwarded-For using the rightmost-untrusted-hop algorithm.
     // This prevents rate limit bypass and internal-only gate evasion when
     // Zion is behind ALB/Cloudflare/nginx.
-    let client_ip = cfg.trusted_proxies.resolve_client_ip(
-        remote_addr.ip(),
-        req.headers()
-            .get("X-Forwarded-For")
-            .and_then(|v| v.to_str().ok()),
-    );
+    let client_ip = cfg
+        .trusted_proxies
+        .resolve_client_ip(remote_addr.ip(), req.headers());
     // SocketAddr wrapper for proxy::proxy_pass*, which extracts only the IP.
     // The port is irrelevant for forwarding headers — using 0 is safe.
     // We intentionally pass the *resolved* client IP (not the TCP peer)

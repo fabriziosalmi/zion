@@ -475,30 +475,51 @@ struct CidrRange {
 impl CidrRange {
     fn parse(s: &str) -> Option<Self> {
         let parts: Vec<&str> = s.split('/').collect();
-        match parts.len() {
+        let range = match parts.len() {
             1 => {
                 // Bare IP: treat as /32 or /128
                 let ip: std::net::IpAddr = parts[0].parse().ok()?;
                 let prefix_len = if ip.is_ipv4() { 32 } else { 128 };
-                Some(Self {
+                Self {
                     network: ip,
                     prefix_len,
-                })
+                }
             }
             2 => {
                 let ip: std::net::IpAddr = parts[0].parse().ok()?;
                 let prefix_len: u8 = parts[1].parse().ok()?;
-                Some(Self {
+                Self {
                     network: ip,
                     prefix_len,
-                })
+                }
             }
-            _ => None,
+            _ => return None,
+        };
+        Some(range.ipv4_if_mapped())
+    }
+
+    /// An IPv4-mapped network (`::ffff:10.0.0.5`, `::ffff:10.0.0.0/104`) as the IPv4 network
+    /// it covers (`10.0.0.5/32`, `10.0.0.0/8`). Peers are compared as IPv4 (see
+    /// [`canonical_peer`]), and on a dual-stack `[::]` listener the mapped form was the only
+    /// one that matched an IPv4 peer, so configurations written that way keep working. A
+    /// prefix shorter than 96 covers more than the mapped space and stays IPv6.
+    fn ipv4_if_mapped(self) -> Self {
+        match self.network {
+            std::net::IpAddr::V6(v6) if self.prefix_len >= 96 => match v6.to_ipv4_mapped() {
+                Some(v4) => Self {
+                    network: std::net::IpAddr::V4(v4),
+                    prefix_len: self.prefix_len.min(128) - 96,
+                },
+                None => self,
+            },
+            _ => self,
         }
     }
 
     fn contains(&self, ip: &std::net::IpAddr) -> bool {
-        match (&self.network, ip) {
+        // An IPv4 address seen as IPv4-mapped IPv6 (`::ffff:a.b.c.d`, a dual-stack `[::]`
+        // listener) is matched as the IPv4 address it is, by every list built on this.
+        match (&self.network, &ip.to_canonical()) {
             (std::net::IpAddr::V4(net), std::net::IpAddr::V4(candidate)) => {
                 let net_bits = u32::from(*net);
                 let cand_bits = u32::from(*candidate);
@@ -655,37 +676,100 @@ impl TrustedProxies {
         self.cidrs.is_empty()
     }
 
-    /// Resolve the real client IP from X-Forwarded-For using the
+    /// The client IP of a request that `socket_ip` sent with `headers`, by the
     /// rightmost-untrusted-hop algorithm.
     ///
-    /// If `socket_ip` is not a trusted proxy, returns `socket_ip` directly.
-    /// If trusted, walks X-Forwarded-For right-to-left, skipping trusted hops.
-    #[inline]
+    /// If `socket_ip` is not a trusted proxy, it is the answer. If it is, `X-Forwarded-For`
+    /// is walked right to left, skipping trusted hops:
+    ///
+    /// - Every field line counts, in order, as one list (RFC 9110 §5.3). A proxy that adds a
+    ///   line of its own (HAProxy `option forwardfor`) puts the client it saw on the last one;
+    ///   reading the first line only let the client choose its address.
+    /// - The value is read as bytes: a byte that is not ASCII makes its own hop unreadable,
+    ///   not the whole header. It used to drop the header, which resolved the client to the
+    ///   proxy's own address, internal under the default rule.
+    /// - A hop may be `ip`, `ip:port`, `[ipv6]` or `[ipv6]:port`; an empty element is skipped.
+    /// - A hop that cannot be read (`unknown`, garbage) was written by a trusted proxy (every
+    ///   hop to its right is trusted), so it stops the walk: the entries to its left are the
+    ///   client's own, and the proxy's address is not the client's either. The client is then
+    ///   [`UNIDENTIFIED_CLIENT`], which no default rule calls internal.
+    ///
+    /// IPv4-mapped IPv6 addresses come back as IPv4, the socket's included.
     pub fn resolve_client_ip(
         &self,
         socket_ip: std::net::IpAddr,
-        xff_header: Option<&str>,
+        headers: &hyper::HeaderMap,
     ) -> std::net::IpAddr {
+        let socket_ip = socket_ip.to_canonical();
         // Fast path: no trusted proxies configured, or socket is not trusted
         if self.cidrs.is_empty() || !self.is_trusted(&socket_ip) {
             return socket_ip;
         }
-
-        // Walk X-Forwarded-For right-to-left
-        if let Some(xff) = xff_header {
-            let hops: Vec<&str> = xff.split(',').map(|s| s.trim()).collect();
-            for hop in hops.iter().rev() {
-                if let Ok(ip) = hop.parse::<std::net::IpAddr>() {
-                    if !self.is_trusted(&ip) {
-                        return ip;
+        const XFF: hyper::header::HeaderName =
+            hyper::header::HeaderName::from_static("x-forwarded-for");
+        for line in headers.get_all(XFF).iter().rev() {
+            for hop in line.as_bytes().rsplit(|&b| b == b',') {
+                if hop.iter().all(|&b| b == b' ' || b == b'\t') {
+                    continue;
+                }
+                match parse_forwarded_hop(hop) {
+                    Some(ip) if self.is_trusted(&ip) => continue,
+                    Some(ip) => return ip,
+                    None => {
+                        log_unreadable_hop(socket_ip);
+                        return UNIDENTIFIED_CLIENT;
                     }
                 }
             }
         }
-
         // All hops are trusted or no XFF — fall back to socket IP
         socket_ip
     }
+}
+
+/// The client IP when a trusted proxy's `X-Forwarded-For` has a hop zion cannot read:
+/// `0.0.0.0`, which neither the default internal rule nor the default purge rule admits.
+/// Such clients share one per-IP rate-limit bucket.
+pub const UNIDENTIFIED_CLIENT: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
+/// One `X-Forwarded-For` element as an address: `ip`, `ip:port`, `[ipv6]` or `[ipv6]:port`,
+/// an IPv4-mapped IPv6 address as IPv4. `None` for anything else.
+fn parse_forwarded_hop(hop: &[u8]) -> Option<std::net::IpAddr> {
+    let s = std::str::from_utf8(hop)
+        .ok()?
+        .trim_matches(|c| c == ' ' || c == '\t');
+    let ip = if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        ip
+    } else if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
+        sa.ip()
+    } else {
+        let inner = s.strip_prefix('[')?.strip_suffix(']')?;
+        std::net::IpAddr::V6(inner.parse().ok()?)
+    };
+    Some(ip.to_canonical())
+}
+
+/// Say, at most three times a minute, that a trusted proxy sent a hop zion cannot read.
+fn log_unreadable_hop(proxy: std::net::IpAddr) {
+    static LOG: crate::logging::Throttle = crate::logging::Throttle::new(3, 60);
+    if LOG.allow() {
+        crate::logging::warn(
+            "xff",
+            &format!(
+                "trusted proxy {proxy} sent an X-Forwarded-For hop that is not an address; \
+                 the client is treated as unidentified ({UNIDENTIFIED_CLIENT})"
+            ),
+        );
+    }
+}
+
+/// A peer address as the gates compare it. An IPv4 client that reached a dual-stack `[::]`
+/// listener arrives as `::ffff:a.b.c.d`: the trusted-proxy and internal-network lists, the
+/// per-IP buckets (connections, handshakes, requests), the mesh reputation and the logs must
+/// all see `a.b.c.d`, or every IPv4 rule misses and all of IPv4 shares one IPv6 /64 bucket.
+pub fn canonical_peer(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    std::net::SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
 /// An explicit allowlist of IPs/CIDRs, with deny-by-default semantics: an empty list matches
@@ -758,6 +842,139 @@ mod proxy_tests {
 
     fn proxies(cidrs: &[&str]) -> TrustedProxies {
         TrustedProxies::from_config(&cidrs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    /// `resolve_client_ip` for a request carrying these `X-Forwarded-For` field lines, in order.
+    fn resolve(tp: &TrustedProxies, socket: std::net::IpAddr, lines: &[&str]) -> std::net::IpAddr {
+        let mut h = hyper::HeaderMap::new();
+        for l in lines {
+            h.append("x-forwarded-for", l.parse().unwrap());
+        }
+        tp.resolve_client_ip(socket, &h)
+    }
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn every_x_forwarded_for_line_counts_in_order() {
+        // A front proxy that adds its own line (HAProxy `option forwardfor`): the client wrote
+        // the first, the proxy the second. Reading the first line only gave the client the say.
+        let tp = proxies(&["127.0.0.1"]);
+        let socket = ip("127.0.0.1");
+        assert_eq!(
+            resolve(&tp, socket, &["10.0.0.1", "203.0.113.9"]),
+            ip("203.0.113.9")
+        );
+        assert_eq!(
+            resolve(
+                &tp,
+                socket,
+                &["10.0.0.1, 127.0.0.2", "203.0.113.9, 127.0.0.1"]
+            ),
+            ip("203.0.113.9"),
+            "trusted hops are skipped within the last line"
+        );
+        // Two trusted tiers that each add a line: the walk crosses from the last line into
+        // the one before it (reading only the last line would end on the proxy).
+        assert_eq!(
+            resolve(&tp, socket, &["10.0.0.1", "203.0.113.9", "127.0.0.1"]),
+            ip("203.0.113.9"),
+            "trusted hops are skipped across lines"
+        );
+    }
+
+    #[test]
+    fn a_list_entry_written_ipv4_mapped_matches_the_ipv4_peer() {
+        // On a `[::]` listener the mapped form was the only one that matched an IPv4 peer, so
+        // configurations carry it; peers are now compared as IPv4, and so are these entries.
+        let tp = proxies(&["::ffff:10.0.0.5"]);
+        for peer in ["10.0.0.5", "::ffff:10.0.0.5"] {
+            assert!(tp.is_trusted(&ip(peer)), "{peer}");
+            assert_eq!(resolve(&tp, ip(peer), &["203.0.113.7"]), ip("203.0.113.7"));
+        }
+        let wide = InternalNetworks::from_config(&["::ffff:10.0.0.0/104".to_string()]);
+        assert!(wide.contains(&ip("10.200.0.1")) && !wide.contains(&ip("11.0.0.1")));
+        assert!(
+            IpAllowlist::from_config(&["::ffff:192.0.2.1".to_string()]).contains(&ip("192.0.2.1"))
+        );
+        // a prefix shorter than the mapped space stays IPv6 (and matches no IPv4 peer)
+        assert!(!proxies(&["::ffff:0:0/95"]).is_trusted(&ip("10.0.0.5")));
+        // plain IPv6 entries are untouched
+        assert!(proxies(&["2001:db8::/32"]).is_trusted(&ip("2001:db8::1")));
+    }
+
+    #[test]
+    fn a_byte_that_is_not_ascii_spoils_only_its_own_hop() {
+        // `\xff, 203.0.113.9`: the header used to fail `to_str` as a whole, and the client
+        // resolved to the trusted proxy itself (private, so internal by default).
+        let tp = proxies(&["10.0.0.5"]);
+        let socket = ip("10.0.0.5");
+        let with = |v: &[u8]| {
+            let mut h = hyper::HeaderMap::new();
+            h.insert(
+                "x-forwarded-for",
+                hyper::header::HeaderValue::from_bytes(v).unwrap(),
+            );
+            tp.resolve_client_ip(socket, &h)
+        };
+        assert_eq!(with(b"\xff, 203.0.113.9"), ip("203.0.113.9"));
+        // the proxy's own hop unreadable: unidentified, not the proxy
+        assert_eq!(with(b"203.0.113.9, 1.2.3.\xff"), UNIDENTIFIED_CLIENT);
+    }
+
+    #[test]
+    fn a_proxy_hop_with_a_port_or_brackets_is_read_and_an_unreadable_one_stops_the_walk() {
+        // The trusted proxy writes the rightmost hop; the client wrote `127.0.0.1` to its
+        // left. Skipping a hop zion could not parse handed resolution to the client.
+        let tp = proxies(&["10.0.0.0/8"]);
+        let socket = ip("10.0.1.4");
+        for (xff, want) in [
+            ("127.0.0.1, 198.51.100.7:53211", ip("198.51.100.7")),
+            ("127.0.0.1, [2001:db8::1]", ip("2001:db8::1")),
+            ("127.0.0.1, [2001:db8::1]:443", ip("2001:db8::1")),
+            ("127.0.0.1, ::ffff:203.0.113.7", ip("203.0.113.7")),
+            ("127.0.0.1, unknown", UNIDENTIFIED_CLIENT),
+            ("127.0.0.1, 198.51.100.7:port", UNIDENTIFIED_CLIENT),
+            // empty list elements are not hops (RFC 9110 §5.6.1)
+            ("198.51.100.7, , ", ip("198.51.100.7")),
+        ] {
+            assert_eq!(resolve(&tp, socket, &[xff]), want, "{xff:?}");
+        }
+    }
+
+    #[test]
+    fn an_unidentified_client_is_not_internal_and_may_not_purge() {
+        let default = InternalNetworks::default();
+        assert!(!default.contains(&UNIDENTIFIED_CLIENT));
+        assert!(!default.allows_purge(&UNIDENTIFIED_CLIENT));
+        let named = InternalNetworks::from_config(&["10.0.0.0/8".to_string()]);
+        assert!(!named.contains(&UNIDENTIFIED_CLIENT));
+    }
+
+    #[test]
+    fn an_ipv4_peer_seen_through_a_dual_stack_listener_is_matched_as_ipv4() {
+        // A `[::]` listener hands the IPv4 load balancer 10.0.0.5 over as `::ffff:10.0.0.5`.
+        let mapped = ip("::ffff:10.0.0.5");
+        let tp = proxies(&["10.0.0.0/8"]);
+        assert!(tp.is_trusted(&mapped));
+        assert_eq!(resolve(&tp, mapped, &["203.0.113.7"]), ip("203.0.113.7"));
+        // not a trusted proxy: the socket comes back as IPv4
+        assert_eq!(
+            resolve(&proxies(&["192.0.2.1"]), mapped, &["203.0.113.7"]),
+            ip("10.0.0.5")
+        );
+        let named = InternalNetworks::from_config(&["10.0.0.0/8".to_string()]);
+        assert!(named.contains(&mapped));
+        assert!(IpAllowlist::from_config(&["10.0.0.0/8".to_string()]).contains(&mapped));
+        let peer: std::net::SocketAddr = "[::ffff:10.0.0.5]:4433".parse().unwrap();
+        assert_eq!(
+            canonical_peer(peer),
+            "10.0.0.5:4433".parse::<std::net::SocketAddr>().unwrap()
+        );
+        let v6: std::net::SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        assert_eq!(canonical_peer(v6), v6);
     }
 
     #[test]
@@ -1009,20 +1226,14 @@ mod proxy_tests {
     fn no_trusted_proxies_returns_socket_ip() {
         let tp = proxies(&[]);
         let socket: std::net::IpAddr = "1.2.3.4".parse().unwrap();
-        assert_eq!(
-            tp.resolve_client_ip(socket, Some("10.0.0.1, 5.6.7.8")),
-            socket
-        );
+        assert_eq!(resolve(&tp, socket, &["10.0.0.1, 5.6.7.8"]), socket);
     }
 
     #[test]
     fn socket_not_trusted_returns_socket_ip() {
         let tp = proxies(&["10.0.0.0/8"]);
         let socket: std::net::IpAddr = "1.2.3.4".parse().unwrap();
-        assert_eq!(
-            tp.resolve_client_ip(socket, Some("10.0.0.1, 5.6.7.8")),
-            socket
-        );
+        assert_eq!(resolve(&tp, socket, &["10.0.0.1, 5.6.7.8"]), socket);
     }
 
     #[test]
@@ -1031,10 +1242,7 @@ mod proxy_tests {
         let socket: std::net::IpAddr = "10.0.0.1".parse().unwrap();
         let expected: std::net::IpAddr = "5.6.7.8".parse().unwrap();
         // XFF: client, proxy1 → rightmost untrusted = 5.6.7.8
-        assert_eq!(
-            tp.resolve_client_ip(socket, Some("1.1.1.1, 5.6.7.8")),
-            expected
-        );
+        assert_eq!(resolve(&tp, socket, &["1.1.1.1, 5.6.7.8"]), expected);
     }
 
     #[test]
@@ -1044,7 +1252,7 @@ mod proxy_tests {
         let expected: std::net::IpAddr = "203.0.113.42".parse().unwrap();
         // XFF: real_client, proxy1(trusted), proxy2(trusted)
         assert_eq!(
-            tp.resolve_client_ip(socket, Some("203.0.113.42, 172.16.1.1, 10.0.0.5")),
+            resolve(&tp, socket, &["203.0.113.42, 172.16.1.1, 10.0.0.5"]),
             expected
         );
     }
@@ -1053,17 +1261,14 @@ mod proxy_tests {
     fn all_hops_trusted_falls_back_to_socket() {
         let tp = proxies(&["10.0.0.0/8"]);
         let socket: std::net::IpAddr = "10.0.0.1".parse().unwrap();
-        assert_eq!(
-            tp.resolve_client_ip(socket, Some("10.0.0.2, 10.0.0.3")),
-            socket
-        );
+        assert_eq!(resolve(&tp, socket, &["10.0.0.2, 10.0.0.3"]), socket);
     }
 
     #[test]
     fn no_xff_returns_socket_ip() {
         let tp = proxies(&["10.0.0.0/8"]);
         let socket: std::net::IpAddr = "10.0.0.1".parse().unwrap();
-        assert_eq!(tp.resolve_client_ip(socket, None), socket);
+        assert_eq!(resolve(&tp, socket, &[]), socket);
     }
 
     #[test]
@@ -1071,7 +1276,7 @@ mod proxy_tests {
         let tp = proxies(&["192.168.1.100"]);
         let socket: std::net::IpAddr = "192.168.1.100".parse().unwrap();
         let expected: std::net::IpAddr = "8.8.8.8".parse().unwrap();
-        assert_eq!(tp.resolve_client_ip(socket, Some("8.8.8.8")), expected);
+        assert_eq!(resolve(&tp, socket, &["8.8.8.8"]), expected);
     }
 }
 

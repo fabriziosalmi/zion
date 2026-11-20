@@ -169,6 +169,11 @@ mod response_header_tests {
 /// (`Upgrade` stays what the WebSocket handshake needs). Run it where the request comes in, before
 /// anything of ours is added: a client that lists `X-Client-Cert-Fingerprint` or `X-Auth-Subject`
 /// must not be able to make us drop the value we set after this point.
+///
+/// `X-Forwarded-For` is not dropped either: it is addressed to zion, which reads it to resolve the
+/// client behind a trusted proxy and then applies `xff_mode` to what it forwards. Dropping it here
+/// let a client behind such a proxy (one that passed the `Connection` token on) become the proxy
+/// itself, internal under the default rule.
 pub(crate) fn strip_connection_listed(headers: &mut hyper::HeaderMap) {
     if !headers.contains_key(hyper::header::CONNECTION) {
         return;
@@ -182,6 +187,7 @@ pub(crate) fn strip_connection_listed(headers: &mut hyper::HeaderMap) {
                 || token.eq_ignore_ascii_case("close")
                 || token.eq_ignore_ascii_case("keep-alive")
                 || token.eq_ignore_ascii_case("upgrade")
+                || token.eq_ignore_ascii_case("x-forwarded-for")
             {
                 continue;
             }
@@ -251,6 +257,19 @@ mod connection_listed_tests {
             h.contains_key("connection"),
             "the caller decides about Connection itself"
         );
+    }
+
+    #[test]
+    fn x_forwarded_for_is_kept_for_the_client_ip_resolution() {
+        let mut h = map(&[
+            ("connection", "keep-alive, X-Forwarded-For, x-a"),
+            ("x-forwarded-for", "10.0.0.1"),
+            ("x-forwarded-for", "203.0.113.9"),
+            ("x-a", "1"),
+        ]);
+        strip_connection_listed(&mut h);
+        assert_eq!(h.get_all("x-forwarded-for").iter().count(), 2);
+        assert!(!h.contains_key("x-a"));
     }
 
     #[test]
