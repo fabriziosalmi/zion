@@ -44,9 +44,9 @@ uncached, marked `X-Zion-Cache: BYPASS`):
 | Status | **`200 OK` only.** |
 | Response `Cache-Control` | Not `private`, `no-store`, or `no-cache` (RFC 9111 §3.2 / §5.2.2), on **any** of its lines: `Cache-Control: max-age=300` followed by `Cache-Control: private` is one list, `max-age=300, private` (RFC 9110 §5.3), which is what nginx sends for `expires 5m;` plus `add_header Cache-Control private;`. The three words are matched anywhere in the list, so an unusual spelling still refuses. |
 | Authenticated request (§3.5) | A response to a request carrying `Authorization` is stored **only** if the origin explicitly opts in with a `public`, `s-maxage`, or `must-revalidate` directive (a whole directive: `x-public-ish` is not one). Otherwise one user's response could be served to another. |
-| `Vary` | Absent, or naming request headers zion can key on (see [Vary and secondary keys](#vary-and-secondary-keys)). **Not cached:** `Vary: *`, any varied credential header (`Cookie`, `Authorization`, `Proxy-Authorization`, `Set-Cookie`), more than 8 varied headers, or a variant over the per-key cap. |
+| `Vary` | Absent, or naming request headers zion can key on (see [Vary and secondary keys](#vary-and-secondary-keys)). **Not cached:** `Vary: *`, any varied credential header (`Cookie`, `Authorization`, `Proxy-Authorization`, `Set-Cookie`), any varied header zion sets or rewrites for the origin (`X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `Forwarded`, `Via`), more than 8 varied headers, or a variant over the per-key cap. |
 | `Set-Cookie` | The response must **not** set a cookie (any `Set-Cookie` header, whatever its `Cache-Control`). It starts or changes a session, so its body is for one client; it is streamed to that client and never stored. |
-| Headers | At most 32 KiB of origin headers to keep ([What a hit carries](#what-a-hit-carries); each field counts as its name, its value and 32 bytes). A response with more is streamed through, marked `BYPASS`, and counted in `zion_cache_too_large`, as is a background refresh or a `304` update that would go over it; it takes no `Vary` variant slot. |
+| Headers | At most 32 KiB of origin headers to keep ([What a hit carries](#what-a-hit-carries); each field counts as its name, its value and 32 bytes, `Content-Type`, `Content-Encoding`, `ETag` and `Last-Modified` included). A response with more is streamed through, marked `BYPASS`, and counted in `zion_cache_too_large`, as is a background refresh or a `304` update that would go over it; it takes no `Vary` variant slot. |
 | Freshness | A positive effective TTL (see below); an object that arrives already older than its lifetime isn't stored. |
 | Upstream progress | The body keeps coming: a gap longer than the upstream's `request_timeout_ms` between two body frames gives the fill up (counted in `zion_cache_fill_stalled`). The client that triggered the fetch keeps receiving whatever the upstream sends; nothing is stored, and the requests that were waiting for that fill fetch for themselves instead of waiting on a hung upstream. |
 
@@ -67,6 +67,11 @@ each variant under its own **secondary key** built from the values of those head
   by the route's `max_entries`.
 - **Never keyed, never stored:** `Vary: *` and varied credential headers. A response
   that varies on `Cookie` is per-user; a shared cache must not keep a copy per session.
+  Nor a response that varies on a header zion sets or rewrites on the way to the origin
+  (`X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `Forwarded`,
+  `Via`): the origin chose it by what zion sent, while the key would be built from what the
+  client sent. A browser sends no `X-Real-IP`, so every browser would share the first one's
+  variant.
 - If the origin changes the set of headers it varies on, or stops varying, the key
   follows on the next fetch; entries filed under the old key are no longer reachable.
 - A background [stale-while-revalidate](#stale-while-revalidate-rfc-5861) refresh
@@ -132,24 +137,28 @@ attachment` and `Content-Security-Policy: sandbox` stays inert on every hit.
 - **Not kept:** hop-by-hop headers (`Connection` and the fields any `Connection` line names,
   `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`,
   `Proxy-Authenticate`, `Proxy-Authentication-Info`; the proxy removes them from every upstream
-  response, so the miss does not carry them either), `Content-Length`, `Content-Range`, `Date`
-  and `Age` (set again for each answer), `Set-Cookie` (a response that sets one is never
+  response, so the miss does not carry them either), `Content-Length`, `Content-Range` and
+  `Age` (set again for each answer), `Set-Cookie` (a response that sets one is never
   stored), and what zion sets or removes on every response (`X-Zion-Cache`, `X-Request-ID`,
   `Alt-Svc`, which is zion's own with `--features http3` and removed without it, `Server`,
   `Surrogate-Key`, the security headers). `Content-Type`, `Content-Encoding`, `ETag` and
   `Last-Modified` are kept in fields of their own and set once; a `Content-Type` or
   `Content-Encoding` the origin sent on several lines is set once with the lines joined
   (`Content-Encoding: gzip, br`), which RFC 9110 §5.3 makes the same field.
+- **`Date`** is the origin's, as on the miss: with `Expires`, it states the lifetime the origin
+  gave, and with `Age`, how old the response is. (A hit dated when it is sent, beside its
+  `Age`, had a downstream cache count the time spent in zion twice.)
 - **A ranged answer** (`206` / `416`) does not carry `Content-Digest` or `Content-MD5`: they
-  are digests of the whole stored body, not of the part. `Repr-Digest` stays.
+  are digests of the whole stored body, not of the part. `Repr-Digest` stays. A compressed
+  answer (a `compress` route) carries none of the three: they are of the bytes the origin sent.
 - **`Cache-Control`** is the origin's, as on the miss. When the origin sent none, a hit carries
   `public, max-age=<lifetime>` (`immutable` for a lifetime of a year or more), which is what the
   miss carried too. Every hit carries an **`Age`** header (RFC 9111 §4.2.3), seeded from the
   upstream `Age` at insert plus the time lived in zion's cache, so a downstream cache does not
   restart the origin's lifetime.
 - **A `304`** to a client's conditional request carries the validators and, of the stored
-  headers, those RFC 9110 §15.4.5 lists for it: `Cache-Control`, `Content-Location`, `Expires`
-  and `Vary`. The client keeps the rest from the `200` it stored.
+  headers, those RFC 9110 §15.4.5 lists for it: `Cache-Control`, `Content-Location`, `Date`,
+  `Expires` and `Vary`. The client keeps the rest from the `200` it stored.
 - **A revalidation that ends in `304`** updates the entry (RFC 9111 §4.3.4): each header the
   304 carries replaces the stored values of that name, the others stay. The body's
   `Content-Type` and `Content-Encoding` and the validators stay as stored, and a `Set-Cookie` on
@@ -158,14 +167,18 @@ attachment` and `Content-Security-Policy: sandbox` stays inert on every hit.
   itself, as a `200` is: no `Set-Cookie`, no `private`, `no-store` or `no-cache`, a `public`,
   `s-maxage` or `must-revalidate` on the 304 when the request carried `Authorization`, and a
   `Vary` zion can key on. Otherwise this client is answered with it and the entry stays as it
-  was, stale. The renewed lifetime is that of the updated response: the 304's `Cache-Control`
-  or, when it sends none, the stored one (a bare `304` does not stretch a `max-age=60` entry to
-  the profile TTL).
-- **Bounded:** at most 32 KiB of headers per entry (a response with more is not stored, an
-  update that would go over it is served and the entry left stale). The stored headers count
-  against `cache_max_memory_mb` at their size in memory (each field's name and value, its slot
-  in the entry and the reference counts of its buffers), and with the body toward the per-thread
-  L1 limits.
+  was, stale; when neither the 304 nor the entry has a `Cache-Control`, that answer says
+  `private` (the `public, max-age=<lifetime>` of a hit would let a shared cache downstream keep
+  one client's answer for every client). The renewed lifetime is that of the updated response:
+  the 304's `Cache-Control` or, when it sends none, the stored one (a bare `304` does not
+  stretch a `max-age=60` entry to the profile TTL). The 304's `Date` replaces the stored one; a
+  304 without a `Date` leaves none, and the answer is dated when it is sent.
+- **Bounded:** at most 32 KiB of headers per entry, `Content-Type`, `Content-Encoding`, `ETag`
+  and `Last-Modified` included (a response with more is not stored, an update that would go
+  over it is served and the entry left stale). The stored headers count against
+  `cache_max_memory_mb` at their size in memory (each field's name and value, its slot in the
+  entry and the reference counts of its buffers; for those four, the value and the reference
+  count of its buffer), and with the body toward the per-thread L1 limits.
 
 ## Origin-side revalidation (RFC 9111 §4.3)
 
@@ -219,11 +232,16 @@ background, so the client does not wait for the origin round trip. `M` is capped
   stale copy is still served and `zion_cache_swr_refresh_skipped` counts it.
 - **Not on the caller's behalf**: the refresh is a `GET` to the same target with the
   same content negotiation, but without the caller's `Authorization`, `Cookie`,
-  `Proxy-Authorization`, conditional or `Range` headers. It is conditional on the
+  `Proxy-Authorization`, conditional or `Range` headers, and without what zion asserts about
+  the caller (the auth gate's `X-Auth-Subject` / `X-Auth-Email`, the mesh score, the verified
+  client certificate's `X-Client-Cert-*` and `X-Client-TLS-*`). It is conditional on the
   stored `ETag` / `Last-Modified`: a `304` revives the stored body and updates its headers,
   under the same rules as the synchronous revalidation ([What a hit carries](#what-a-hit-carries)),
-  and a cacheable `200` replaces it, headers included. Anything else leaves the stale entry in
-  place; once outside its window it is no longer served stale.
+  and a cacheable `200` replaces it, headers included. When the request that found the entry
+  stale carried `Authorization`, the refresh's answer needs the same `public`, `s-maxage` or
+  `must-revalidate` opt-in (RFC 9111 §3.5) as the foreground one: the origin may still have
+  answered for that client. Anything else leaves the stale entry in place; once outside its
+  window it is no longer served stale.
 - Metrics: `zion_cache_swr_served`, `zion_cache_swr_refreshes`,
   `zion_cache_swr_refresh_failures`, `zion_cache_swr_refresh_skipped`.
 - A client request with `Cache-Control: no-cache` / `max-age=0` still forces a fresh
@@ -286,7 +304,7 @@ The cache preserves each entry's `ETag` and `Last-Modified`. On a fresh hit:
   `Last-Modified`.
 
 A match returns a bodyless **`304 Not Modified`** with the validators and the
-stored `Cache-Control`, `Content-Location`, `Expires` and `Vary` (RFC 9110 §15.4.5),
+stored `Cache-Control`, `Content-Location`, `Date`, `Expires` and `Vary` (RFC 9110 §15.4.5),
 which saves the transfer on the common browser-revalidation path.
 
 ```console
@@ -355,7 +373,7 @@ gated and POST-only like the rest of the endpoint.
 | Stored header fields replayed on every answer from the cache; hop-by-hop ones not stored | 9111 §3.1, §4 | Yes (32 KiB per entry) |
 | A `304` revalidation updates the stored header fields | 9111 §3.2, §4.3.4 | Yes (not `Content-Type`, `Content-Encoding`, validators) |
 | Authenticated-request storage opt-in | 9111 §3.5 | Yes |
-| `Vary` matching (secondary keys) | 9111 §4.1 | Yes (exact match on the varied headers, bounded; `*` and credential headers → uncached) |
+| `Vary` matching (secondary keys) | 9111 §4.1 | Yes (exact match on the varied headers, bounded; `*`, credential headers and the headers zion writes for the origin → uncached) |
 | Origin-driven freshness (`max-age` / `s-maxage`) + `Age` | 9111 §4.2 | Yes |
 | Request `Cache-Control` (no-cache/no-store/max-age=0/only-if-cached) | 9111 §5.2.1 | Yes |
 | Client conditional → `304` (If-None-Match / If-Modified-Since) | 9110 §13 | Yes |

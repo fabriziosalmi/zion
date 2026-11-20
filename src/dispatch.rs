@@ -505,15 +505,7 @@ async fn process_request_inner(
             resp.headers_mut().insert("X-Request-ID", rid);
         }
 
-        // Alt-Svc: advertise HTTP/3 to clients (zero cost if feature disabled). Either way the
-        // origin's is not passed on: it names the origin's alternatives, and a client would
-        // take them for zion's own authority. (The cache does not store it for that reason, so
-        // a hit and a miss agree.)
-        #[cfg(feature = "http3")]
-        resp.headers_mut()
-            .insert(hyper::header::ALT_SVC, crate::quic::ALT_SVC_H3.clone());
-        #[cfg(not(feature = "http3"))]
-        resp.headers_mut().remove(hyper::header::ALT_SVC);
+        advertise_alt_svc(resp.headers_mut());
 
         Ok(resp)
     };
@@ -525,6 +517,18 @@ async fn process_request_inner(
     }
     #[cfg(not(feature = "otel"))]
     tail.await
+}
+
+/// `Alt-Svc`: zion's own HTTP/3 advertisement with `--features http3`, none without it. Either
+/// way the origin's is not passed on: it names the origin's alternatives, and a client would take
+/// them for zion's own authority. (The cache does not store it for that reason, so a hit and a
+/// miss agree.) Every answer that came from an upstream goes through here, the WebSocket
+/// handshake's included: an upstream that declines the upgrade answers with its own headers.
+fn advertise_alt_svc(headers: &mut hyper::HeaderMap) {
+    #[cfg(feature = "http3")]
+    headers.insert(hyper::header::ALT_SVC, crate::quic::ALT_SVC_H3.clone());
+    #[cfg(not(feature = "http3"))]
+    headers.remove(hyper::header::ALT_SVC);
 }
 
 /// Mark the request with what the forwarding paths need to know about its route.
@@ -645,6 +649,9 @@ async fn websocket_upgrade(
         breaker_record(entry, resp.status(), breaker_probe);
     }
     inject_security_headers(&mut resp);
+    // An upstream that declines the upgrade answers with its own headers (a `400`, a `426`, a
+    // `200`), its `Alt-Svc` among them; the `101` is zion's own.
+    advertise_alt_svc(resp.headers_mut());
     Ok(resp)
 }
 
@@ -910,6 +917,12 @@ struct SwrRefresh {
     primary_key: Arc<str>,
     stale: cache::CacheHit,
     request: Request<ReqBody>,
+    /// The request that found the entry stale carried `Authorization`. The refresh does not
+    /// send it ([`swr_request`]), but the origin may still answer for that client: the refresh
+    /// has the same target and the client's other headers (an application token in a header of
+    /// its own, the client's address in `X-Forwarded-For`). So the answer is held to the
+    /// RFC 9111 §3.5 opt-in as the foreground one is.
+    req_authenticated: bool,
     /// The upstream's HTTP client (connect deadline, HTTP/1-only, keepalive).
     client_spec: crate::proxy::ClientSpec,
     scheme: hyper::http::uri::Scheme,
@@ -929,7 +942,11 @@ struct SwrRefresh {
 /// negotiation as the one that found the entry stale, but NOT the caller's
 /// credentials. The refresh is on behalf of the cache, not of that client, so
 /// `Authorization` / `Cookie` / `Proxy-Authorization` and any conditional or range
-/// header are dropped (the stored validators are added when it is sent).
+/// header are dropped (the stored validators are added when it is sent), and so is what zion
+/// itself asserts about the caller: the identity the auth gate established (`X-Auth-Subject`,
+/// `X-Auth-Email`), the mesh score and what the TLS handshake verified (`X-Client-Cert-*`,
+/// `X-Client-TLS-*`). With them the origin answered the refresh for that user, without
+/// `Authorization`, and a per-user answer could become the shared entry.
 fn swr_request(req: &Request<ReqBody>) -> Request<ReqBody> {
     let mut out = Request::builder()
         .method(hyper::Method::GET)
@@ -963,6 +980,12 @@ fn swr_request(req: &Request<ReqBody>) -> Request<ReqBody> {
             continue;
         }
         out.headers_mut().append(name.clone(), value.clone());
+    }
+    for asserter in [
+        crate::reserved_headers::Asserter::Pipeline,
+        crate::reserved_headers::Asserter::Transport,
+    ] {
+        crate::reserved_headers::scrub(out.headers_mut(), asserter);
     }
     out
 }
@@ -1058,13 +1081,16 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
 
     if resp.status() == StatusCode::NOT_MODIFIED {
         // The 304's headers update the stored ones (RFC 9111 §4.3.4). A result too large to
-        // keep, or a 304 that could not have been stored itself, leaves the entry as it is.
-        // The refresh carries no credentials, so the request is not "authenticated".
-        let rv = revalidated(&job.stale.meta, resp.headers(), false, job.cache_ttl);
+        // keep, or a 304 that could not have been stored itself, leaves the entry as it is. It
+        // is judged with the triggering request's `Authorization` (see `SwrRefresh`).
+        let rv = revalidated(
+            &job.stale.meta,
+            resp.headers(),
+            job.req_authenticated,
+            job.cache_ttl,
+        );
         if !rv.fits {
-            metrics::METRICS
-                .cache_too_large
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            job.state.static_cache.count_too_large();
         }
         // Not revived if a tag purge ran since this refresh was scheduled (it may have removed
         // the very entry being revalidated).
@@ -1095,8 +1121,8 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
     let ttl = origin_freshness(&parts.headers)
         .map(|o| o.min(job.cache_ttl))
         .unwrap_or(job.cache_ttl);
-    // The refresh carries no credentials, so the request is not "authenticated".
-    if !is_shared_cacheable(false, &parts.headers, ttl, initial_age) {
+    // Held to the §3.5 opt-in when the triggering request carried `Authorization`.
+    if !is_shared_cacheable(job.req_authenticated, &parts.headers, ttl, initial_age) {
         return false;
     }
     // It refreshes ONE entry. If the origin's Vary no longer matches what that entry
@@ -1114,9 +1140,7 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
     }
     // Headers too large to keep: not stored (see `cached_meta`).
     let Some(meta) = cached_meta(parts.status, &parts.headers) else {
-        metrics::METRICS
-            .cache_too_large
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        job.state.static_cache.count_too_large();
         return false;
     };
     let Ok(collected) = http_body_util::Limited::new(body, job.max_object)
@@ -1426,16 +1450,17 @@ enum Replay {
     All,
     /// A `304` to a client's conditional request (RFC 9110 §15.4.5): of what a `200` would
     /// carry, the fields that guide the client's cache, `Cache-Control`, `Content-Location`,
-    /// `Expires` and `Vary` (`ETag` and `Last-Modified` come from their own fields, `Date` is
-    /// set when the answer is sent). Not the representation's other metadata: the client keeps
-    /// what it stored with the `200` (RFC 9111 §4.3.4).
+    /// `Date`, `Expires` and `Vary` (`ETag` and `Last-Modified` come from their own fields; a
+    /// `Date` is set when the answer is sent if the origin sent none). Not the representation's
+    /// other metadata: the client keeps what it stored with the `200` (RFC 9111 §4.3.4).
     NotModified,
 }
 
 /// The headers a `304` from the cache replays, see [`Replay::NotModified`].
-const NOT_MODIFIED_REPLAYS: [hyper::header::HeaderName; 4] = [
+const NOT_MODIFIED_REPLAYS: [hyper::header::HeaderName; 5] = [
     hyper::header::CACHE_CONTROL,
     hyper::header::CONTENT_LOCATION,
+    hyper::header::DATE,
     hyper::header::EXPIRES,
     hyper::header::VARY,
 ];
@@ -1457,7 +1482,8 @@ const WHOLE_CONTENT_DIGESTS: [hyper::header::HeaderName; 2] = [
 /// - `Cache-Control`: the origin's, as on the miss; when the origin sent none, the entry's
 ///   lifetime as `public, max-age=N` (`immutable` for a year), which is what the miss carried;
 /// - `X-Zion-Cache: <disposition>`, and `Age` (RFC 9111 §4.2.3: since the origin made it, the
-///   upstream `Age` included), so a downstream cache does not restart the clock;
+///   upstream `Age` included), so a downstream cache does not restart the clock; the origin's
+///   `Date` is one of the stored headers, so `Expires` minus `Date` stays the lifetime it gave;
 /// - `Content-Type`, `Content-Encoding` (not on a `304`), `ETag` and `Last-Modified`, as the
 ///   origin sent them.
 ///
@@ -1662,8 +1688,8 @@ fn client_conditional_hit(req_headers: &hyper::HeaderMap, meta: &cache::CachedMe
 }
 
 /// 304 Not Modified from a cache hit, no body: the validators, and of the stored origin headers
-/// those RFC 9110 §15.4.5 lists for a 304 (`Cache-Control`, `Content-Location`, `Expires`,
-/// `Vary`; see [`Replay::NotModified`]).
+/// those RFC 9110 §15.4.5 lists for a 304 (`Cache-Control`, `Content-Location`, `Date`,
+/// `Expires`, `Vary`; see [`Replay::NotModified`]).
 fn not_modified_response(hit: &cache::CacheHit) -> Response<ZionBody> {
     from_cache(
         hit,
@@ -1767,6 +1793,14 @@ fn revalidated(
         meta.stale_while_revalidate_secs = origin_swr(not_modified);
         meta.must_revalidate = forbids_stale(not_modified);
     }
+    // The 304's `Date` replaced the stored one. A 304 without one (an origin with no clock,
+    // RFC 9110 §6.6.1) still confirmed the response now, and the answer says `Age` from the 304:
+    // with the stored `Date` beside it, a downstream cache would take the response for as old
+    // as that `Date`. Without one, the answer is dated when it is sent.
+    if !not_modified.contains_key(hyper::header::DATE) {
+        meta.headers
+            .retain(|(name, _)| *name != hyper::header::DATE);
+    }
     let updated_cache_control: hyper::HeaderMap = meta
         .headers
         .iter()
@@ -1786,6 +1820,39 @@ fn revalidated(
         fits,
         shareable,
     }
+}
+
+/// The answer to a request whose revalidation the origin confirmed with a `304`: the stored body
+/// with the entry as the 304 updated it, marked `REVALIDATED`, with the 304's `Age` and the
+/// lifetime it gave (as on the next hit, not those of the stale lookup: an `Age` past the
+/// `max-age` made a downstream cache take the answer as stale on arrival).
+///
+/// A 304 that could not update the shared entry ([`Revalidation::shareable`]) answered this
+/// client alone, its headers included. When neither it nor the entry carries a `Cache-Control`,
+/// that answer says `private`: the `public, max-age=<lifetime>` a hit on the entry carries
+/// would let a shared cache downstream keep, for every client, a response zion has just judged
+/// to be one client's (an authenticated request's, with that user's headers).
+fn revalidated_response(stale: cache::CacheHit, rv: Revalidation) -> Response<ZionBody> {
+    let for_this_client_alone = !rv.shareable
+        && !rv
+            .meta
+            .headers
+            .iter()
+            .any(|(name, _)| *name == hyper::header::CACHE_CONTROL);
+    let hit = cache::CacheHit {
+        meta: Arc::new(rv.meta),
+        age_secs: rv.initial_age,
+        max_age_secs: rv.ttl,
+        ..stale
+    };
+    let mut resp = cache_response(hit, "REVALIDATED");
+    if for_this_client_alone {
+        resp.headers_mut().insert(
+            hyper::header::CACHE_CONTROL,
+            hyper::header::HeaderValue::from_static("private"),
+        );
+    }
+    resp
 }
 
 /// A request's place in the singleflight map: it became the fetcher for `key`, and other
@@ -2594,10 +2661,11 @@ mod tests {
     }
 
     /// The headers of `origin` an answer with the stored body must carry, each as many times
-    /// as the origin sent it: all of them but what is recomputed for each answer.
+    /// as the origin sent it: all of them but what is recomputed for each answer. `Date` is the
+    /// origin's.
     fn assert_carries_the_origin_headers(resp: &Response<ZionBody>, origin: &hyper::HeaderMap) {
         for name in origin.keys() {
-            if matches!(name.as_str(), "content-length" | "date") {
+            if name.as_str() == "content-length" {
                 continue;
             }
             let want: Vec<String> = origin
@@ -2628,9 +2696,12 @@ mod tests {
         assert_eq!(values(&resp, "age"), ["5"]);
         assert_eq!(values(&resp, "accept-ranges"), ["bytes"]);
         assert!(
-            values(&resp, "date").is_empty() && values(&resp, "content-length").is_empty(),
+            values(&resp, "content-length").is_empty(),
             "recomputed when the answer is sent"
         );
+        // When the origin made it: with `Expires`, the lifetime it gave, and with `Age`, how old
+        // it is. A `Date` of now beside `Age: 5` counted the 5 s twice.
+        assert_eq!(values(&resp, "date"), ["Thu, 01 Jan 2026 00:00:00 GMT"]);
         // The stale and revalidated answers carry them too.
         for disposition in ["STALE", "REVALIDATED", "STALE-WHILE-REVALIDATE"] {
             let resp = cache_response(stored_hit(&origin), disposition);
@@ -2734,6 +2805,7 @@ mod tests {
         // RFC 9110 §15.4.5: Cache-Control, Content-Location, Date, ETag, Expires, Vary.
         assert_eq!(values(&resp, "cache-control"), ["max-age=60, public"]);
         assert_eq!(values(&resp, "content-location"), ["/media/upload.svg"]);
+        assert_eq!(values(&resp, "date"), ["Thu, 01 Jan 2026 00:00:00 GMT"]);
         assert_eq!(values(&resp, "etag"), ["\"u1\""]);
         assert_eq!(values(&resp, "expires"), ["Thu, 01 Jan 2099 00:00:00 GMT"]);
         assert_eq!(values(&resp, "vary"), ["Accept-Language"]);
@@ -2866,6 +2938,119 @@ mod tests {
                 "{pairs:?} (authenticated: {authenticated}) renewed the shared entry"
             );
         }
+    }
+
+    /// A `304` that answered one client alone is not labelled `public` for a shared cache
+    /// downstream: with no `Cache-Control` in the 304 or the entry, a hit's `public,
+    /// max-age=<lifetime>` went on alice's answer, her `X-Account` with it.
+    #[test]
+    fn a_304_that_answered_one_client_alone_is_not_marked_public() {
+        let mut no_cc = upload_origin_headers();
+        no_cc.remove(hyper::header::CACHE_CONTROL);
+        let stale = || stored_hit(&no_cc);
+        let hers = request(&[("etag", "\"u1\""), ("x-account", "alice")]);
+        let rv = revalidated(&stale().meta, &hers, true, 3600);
+        assert!(!rv.shareable);
+        let resp = revalidated_response(stale(), rv);
+        assert_eq!(values(&resp, "x-zion-cache"), ["REVALIDATED"]);
+        assert_eq!(values(&resp, "x-account"), ["alice"], "her own answer");
+        assert_eq!(values(&resp, "cache-control"), ["private"]);
+        // The same 304 to an anonymous request renews the entry, and its answer is what a hit
+        // on the entry carries.
+        let rv = revalidated(&stale().meta, &hers, false, 3600);
+        assert!(rv.renews());
+        let resp = revalidated_response(stale(), rv);
+        assert_eq!(values(&resp, "cache-control"), ["public, max-age=3600"]);
+        // A Cache-Control the origin sent is the origin's word, kept as it is.
+        let with_cc = request(&[("cache-control", "max-age=30"), ("x-account", "alice")]);
+        let rv = revalidated(&stale().meta, &with_cc, true, 3600);
+        assert!(!rv.shareable);
+        let resp = revalidated_response(stale(), rv);
+        assert_eq!(values(&resp, "cache-control"), ["max-age=30"]);
+    }
+
+    /// The entry keeps the origin's `Date` (with `Expires`, the lifetime it gave). A `304` that
+    /// renews it brings its own; one without a `Date` leaves none, rather than the old one beside
+    /// the 304's `Age`, which would make the answer as old as the first `200` downstream.
+    #[test]
+    fn a_304s_date_replaces_the_stored_one_and_a_304_without_one_leaves_none() {
+        let stored = cached_meta(StatusCode::OK, &upload_origin_headers()).unwrap();
+        let date = |meta: &cache::CachedMeta| -> Vec<String> {
+            meta.headers
+                .iter()
+                .filter(|(name, _)| *name == hyper::header::DATE)
+                .map(|(_, v)| v.to_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(date(&stored), ["Thu, 01 Jan 2026 00:00:00 GMT"], "kept");
+        let rv = revalidated(
+            &stored,
+            &request(&[("date", "Fri, 02 Jan 2026 00:00:00 GMT")]),
+            false,
+            3600,
+        );
+        assert_eq!(date(&rv.meta), ["Fri, 02 Jan 2026 00:00:00 GMT"]);
+        let rv = revalidated(&stored, &request(&[("etag", "\"u1\"")]), false, 3600);
+        assert!(date(&rv.meta).is_empty(), "{:?}", date(&rv.meta));
+    }
+
+    /// The bound on what an entry keeps counts the fields of their own: a stored `ETag` near the
+    /// bound and the headers a `304` adds go over it together.
+    #[test]
+    fn a_304_whose_headers_and_the_stored_etag_go_over_the_bound_is_not_kept() {
+        let big_etag = format!("\"{}\"", "e".repeat(cache::MAX_STORED_HEADER_BYTES - 2_000));
+        let stored = cached_meta(
+            StatusCode::OK,
+            &request(&[("etag", big_etag.as_str()), ("cache-control", "max-age=60")]),
+        )
+        .expect("fits on its own");
+        let extra = "x".repeat(3_000);
+        let rv = revalidated(
+            &stored,
+            &request(&[("x-extra", extra.as_str())]),
+            false,
+            3600,
+        );
+        assert!(rv.shareable && !rv.fits && !rv.renews());
+    }
+
+    /// The background refresh is the cache's request, not the caller's: what zion asserts about
+    /// the caller (the auth gate's identity, the mesh score, the verified client certificate)
+    /// stays behind with the credentials.
+    #[test]
+    fn a_background_refresh_does_not_carry_what_zion_asserts_about_the_caller() {
+        use crate::reserved_headers::{reserved, Asserter};
+        let mut b = Request::builder().method(hyper::Method::GET).uri("/feed");
+        let asserted: Vec<&str> = reserved(Asserter::Pipeline)
+            .chain(reserved(Asserter::Transport))
+            .collect();
+        for name in &asserted {
+            b = b.header(*name, "alice");
+        }
+        for (k, v) in [
+            ("authorization", "Bearer alice"),
+            ("cookie", "sid=alice"),
+            ("if-none-match", "\"v0\""),
+            ("accept-language", "de"),
+            ("accept-encoding", "br"),
+        ] {
+            b = b.header(k, v);
+        }
+        let req = b
+            .body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+            .unwrap();
+        let out = swr_request(&req);
+        for name in asserted
+            .iter()
+            .chain(&["authorization", "cookie", "if-none-match"])
+        {
+            assert!(
+                out.headers().get(*name).is_none(),
+                "the refresh sends {name}"
+            );
+        }
+        assert_eq!(out.headers().get("accept-language").unwrap(), "de");
+        assert_eq!(out.headers().get("accept-encoding").unwrap(), "br");
     }
 
     #[test]

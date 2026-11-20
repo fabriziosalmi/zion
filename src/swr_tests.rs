@@ -95,8 +95,10 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                             let mut b = Response::builder()
                                 .header(vary.0, vary.1)
                                 .status(StatusCode::OK)
-                                .header("etag", &etag)
-                                .header("cache-control", &cc);
+                                .header("etag", &etag);
+                            if !cc.is_empty() {
+                                b = b.header("cache-control", &cc);
+                            }
                             for (k, v) in o.extra_200.lock().unwrap().iter() {
                                 b = b.header(*k, *v);
                             }
@@ -115,6 +117,12 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
 }
 
 fn state_for(origin_port: u16) -> Arc<AppState> {
+    state_with_ttl(origin_port, 3600)
+}
+
+/// The test state, with the cache profile's `ttl_seconds` (what an entry lives when the origin
+/// gives no lifetime).
+fn state_with_ttl(origin_port: u16, ttl_seconds: u64) -> Arc<AppState> {
     let toml = format!(
         r#"
 [server]
@@ -129,7 +137,7 @@ key_path = "/k"
 o = "http://127.0.0.1:{origin_port}"
 
 [cache_profile.c]
-ttl_seconds = 3600
+ttl_seconds = {ttl_seconds}
 max_entries = 100
 
 [[route]]
@@ -617,16 +625,22 @@ async fn a_304_that_sets_a_cookie_does_not_renew_the_shared_entry() {
 /// `HIT` for the 304's 60 s).
 #[tokio::test]
 async fn a_private_304_to_one_user_is_not_served_to_the_next() {
-    for alice in [
+    for (n, alice) in [
         &[("cookie", "sid=alice")][..],
         &[("authorization", "Bearer alice")],
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A path of its own per case: on a one-core host the store is a map of the thread's,
+        // shared by the two states, and the second case would find the first one's entry.
+        let uri = format!("/acct{n}");
         let (o, st) = upload_origin("public, max-age=1").await;
         *o.cache_control_304.lock().unwrap() = Some("private, max-age=60".into());
         *o.extra_304.lock().unwrap() = vec![("x-account", "alice@example.com")];
-        fetch(&st, "/acct", &[]).await;
-        stored_then_stale(&st, "/acct").await;
-        let hers = fetch(&st, "/acct", alice).await;
+        fetch(&st, &uri, &[]).await;
+        stored_then_stale(&st, &uri).await;
+        let hers = fetch(&st, &uri, alice).await;
         assert_eq!(hers.cache, "REVALIDATED", "{alice:?}");
         assert_eq!(
             header(&hers, "x-account").as_deref(),
@@ -636,7 +650,7 @@ async fn a_private_304_to_one_user_is_not_served_to_the_next() {
         // The origin answers the next revalidation with the public 304.
         *o.cache_control_304.lock().unwrap() = None;
         o.extra_304.lock().unwrap().clear();
-        let bobs = fetch(&st, "/acct", &[("cookie", "sid=bob")]).await;
+        let bobs = fetch(&st, &uri, &[("cookie", "sid=bob")]).await;
         assert_eq!(
             header(&bobs, "x-account"),
             None,
@@ -741,15 +755,9 @@ async fn a_background_200_refresh_stores_the_new_responses_headers() {
 /// `Vary` does not install a rule or take a variant slot for a response that is not stored.
 #[tokio::test]
 async fn a_response_with_more_headers_than_an_entry_keeps_is_served_and_not_stored() {
-    use std::sync::atomic::Ordering::Relaxed;
     let (o, st) = origin_and_state("public, max-age=60").await;
-    let huge: &'static str = Box::leak(
-        "x".repeat(crate::cache::MAX_STORED_HEADER_BYTES)
-            .into_boxed_str(),
-    );
-    *o.extra_200.lock().unwrap() = vec![("x-huge", huge), ("vary", "Accept-Language")];
+    *o.extra_200.lock().unwrap() = vec![("x-huge", huge()), ("vary", "Accept-Language")];
     let de = [("accept-language", "de")];
-    let before = crate::metrics::METRICS.cache_too_large.load(Relaxed);
     let first = fetch(&st, "/huge", &de).await;
     assert_eq!(
         (first.status, first.cache.as_str(), first.body.as_str()),
@@ -757,12 +765,13 @@ async fn a_response_with_more_headers_than_an_entry_keeps_is_served_and_not_stor
     );
     assert_eq!(
         header(&first, "x-huge").map(|v| v.len()),
-        Some(huge.len()),
+        Some(huge().len()),
         "served whole"
     );
-    assert!(
-        crate::metrics::METRICS.cache_too_large.load(Relaxed) > before,
-        "not counted in zion_cache_too_large"
+    assert_eq!(
+        st.static_cache.too_large(),
+        1,
+        "counted in zion_cache_too_large, once"
     );
     assert!(
         st.static_cache.vary.get("/huge\u{1f}\u{1c}").is_none(),
@@ -806,25 +815,21 @@ async fn a_private_background_304_does_not_renew_the_shared_entry() {
 /// `zion_cache_too_large` like that of a `200`.
 #[tokio::test]
 async fn a_304_with_more_headers_than_an_entry_keeps_is_served_and_counted() {
-    use std::sync::atomic::Ordering::Relaxed;
     let (o, st) = upload_origin("public, max-age=1").await;
-    let huge: &'static str = Box::leak(
-        "x".repeat(crate::cache::MAX_STORED_HEADER_BYTES)
-            .into_boxed_str(),
-    );
-    *o.extra_304.lock().unwrap() = vec![("x-huge", huge)];
+    *o.extra_304.lock().unwrap() = vec![("x-huge", huge())];
     fetch(&st, "/huge-304", &[]).await;
     stored_then_stale(&st, "/huge-304").await;
-    let before = crate::metrics::METRICS.cache_too_large.load(Relaxed);
+    assert_eq!(st.static_cache.too_large(), 0);
     let revalidated = fetch(&st, "/huge-304", &[]).await;
     assert_eq!(revalidated.cache, "REVALIDATED");
     assert_eq!(
         header(&revalidated, "x-huge").map(|v| v.len()),
-        Some(huge.len())
+        Some(huge().len())
     );
-    assert!(
-        crate::metrics::METRICS.cache_too_large.load(Relaxed) > before,
-        "not counted in zion_cache_too_large"
+    assert_eq!(
+        st.static_cache.too_large(),
+        1,
+        "counted in zion_cache_too_large, once"
     );
     o.extra_304.lock().unwrap().clear();
     let next = fetch(&st, "/huge-304", &[]).await;
@@ -832,5 +837,236 @@ async fn a_304_with_more_headers_than_an_entry_keeps_is_served_and_counted() {
         (next.cache.as_str(), o.count()),
         ("REVALIDATED", 3),
         "the entry was renewed with more headers than it keeps"
+    );
+}
+
+/// More header bytes than an entry keeps, in one field.
+fn huge() -> &'static str {
+    static HUGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HUGE.get_or_init(|| "x".repeat(crate::cache::MAX_STORED_HEADER_BYTES))
+}
+
+/// Wait until the stale-while-revalidate refresh of `key` has reached the origin (its
+/// `n`-th request) and is over (its singleflight registration is gone).
+async fn refresh_over(o: &Origin, st: &Arc<AppState>, key: &str, n: usize) {
+    let key: Arc<str> = Arc::from(key);
+    until("the background refresh is over", || {
+        o.count() >= n && st.inflight.get(&key).is_none()
+    })
+    .await;
+}
+
+/// The background `304` refresh whose headers, with the stored ones, are more than an entry
+/// keeps: the entry is not renewed with them, and the refusal is counted in
+/// `zion_cache_too_large`, as on the foreground path.
+#[tokio::test]
+async fn a_background_304_with_more_headers_than_an_entry_keeps_is_counted() {
+    let (o, st) = origin_and_state("public, max-age=1, stale-while-revalidate=30").await;
+    *o.extra_304.lock().unwrap() = vec![("x-huge", huge())];
+    fetch(&st, "/swr-huge-304", &[]).await;
+    stored_then_stale(&st, "/swr-huge-304").await;
+    let stale = fetch(&st, "/swr-huge-304", &[]).await;
+    assert_eq!(stale.cache, "STALE-WHILE-REVALIDATE");
+    let key = "/swr-huge-304\u{1f}\u{1c}";
+    refresh_over(&o, &st, key, 2).await;
+    assert_eq!(
+        st.static_cache.too_large(),
+        1,
+        "counted in zion_cache_too_large, once"
+    );
+    assert!(
+        st.static_cache.get(key).fresh().is_none(),
+        "renewed with more headers than an entry keeps"
+    );
+}
+
+/// The background `200` refresh with more header bytes than an entry keeps: not stored, and
+/// counted in `zion_cache_too_large`.
+#[tokio::test]
+async fn a_background_200_with_more_headers_than_an_entry_keeps_is_counted() {
+    let (o, st) = origin_and_state("public, max-age=1, stale-while-revalidate=30").await;
+    fetch(&st, "/swr-huge-200", &[]).await;
+    stored_then_stale(&st, "/swr-huge-200").await;
+    *o.body.lock().unwrap() = ("v2".into(), "\"e2\"".into());
+    *o.extra_200.lock().unwrap() = vec![("x-huge", huge())];
+    let stale = fetch(&st, "/swr-huge-200", &[]).await;
+    assert_eq!(
+        (stale.cache.as_str(), stale.body.as_str()),
+        ("STALE-WHILE-REVALIDATE", "v1")
+    );
+    let key = "/swr-huge-200\u{1f}\u{1c}";
+    refresh_over(&o, &st, key, 2).await;
+    assert_eq!(
+        st.static_cache.too_large(),
+        1,
+        "counted in zion_cache_too_large, once"
+    );
+    assert!(
+        st.static_cache.get(key).fresh().is_none(),
+        "stored with more headers than an entry keeps"
+    );
+}
+
+/// The stale-while-revalidate refresh goes without the caller's `Authorization`, but the origin
+/// can still answer it for that caller (the same target; behind an auth gate, the identity is in
+/// `X-Auth-Subject` too). It is held to the RFC 9111 §3.5 opt-in as the foreground request is:
+/// a `304` or a `200` without `public`, `s-maxage` or `must-revalidate` does not become the
+/// shared entry. It did, judged as an anonymous request: bob was served alice's `X-Account`, or
+/// alice's page.
+#[tokio::test]
+async fn a_background_refresh_for_an_authenticated_request_is_held_to_the_opt_in() {
+    let alice = [("authorization", "Bearer alice")];
+
+    // A 304 for her.
+    let (o, st) = upload_origin("public, max-age=1, stale-while-revalidate=30").await;
+    *o.cache_control_304.lock().unwrap() = Some("max-age=60, stale-while-revalidate=30".into());
+    *o.extra_304.lock().unwrap() = vec![("x-account", "alice@example.com")];
+    fetch(&st, "/swr-auth-304", &[]).await;
+    stored_then_stale(&st, "/swr-auth-304").await;
+    let hers = fetch(&st, "/swr-auth-304", &alice).await;
+    assert_eq!(hers.cache, "STALE-WHILE-REVALIDATE");
+    let key = "/swr-auth-304\u{1f}\u{1c}";
+    refresh_over(&o, &st, key, 2).await;
+    assert!(
+        st.static_cache.get(key).fresh().is_none(),
+        "her 304 renewed the shared entry"
+    );
+    *o.cache_control_304.lock().unwrap() = None;
+    o.extra_304.lock().unwrap().clear();
+    let bobs = fetch(&st, "/swr-auth-304", &[]).await;
+    assert_eq!(header(&bobs, "x-account"), None, "served as {}", bobs.cache);
+
+    // A 200 for her.
+    let (o, st) = origin_and_state("public, max-age=1, stale-while-revalidate=30").await;
+    fetch(&st, "/swr-auth-200", &[]).await;
+    stored_then_stale(&st, "/swr-auth-200").await;
+    *o.body.lock().unwrap() = ("alice's page".into(), "\"e-alice\"".into());
+    *o.cache_control.lock().unwrap() = "max-age=60, stale-while-revalidate=30".into();
+    let hers = fetch(&st, "/swr-auth-200", &alice).await;
+    assert_eq!(
+        (hers.cache.as_str(), hers.body.as_str()),
+        ("STALE-WHILE-REVALIDATE", "v1")
+    );
+    let key = "/swr-auth-200\u{1f}\u{1c}";
+    refresh_over(&o, &st, key, 2).await;
+    assert!(
+        st.static_cache.get(key).fresh().is_none(),
+        "her page became the shared entry"
+    );
+}
+
+/// With no `Cache-Control` in the stored entry or the `304`, a hit on the entry carries `public,
+/// max-age=<lifetime>`. A 304 that answered one client alone (here an authenticated request
+/// without the §3.5 opt-in) is not the entry: its answer said `public` with alice's `X-Account`,
+/// for any shared cache downstream to keep. It now says `private`.
+#[tokio::test]
+async fn a_304_that_answered_one_user_alone_is_not_marked_public() {
+    let o = Arc::new(Origin::default());
+    *o.body.lock().unwrap() = ("v1".into(), "\"e1\"".into());
+    // No Cache-Control anywhere: the entry lives the profile's 1 s.
+    *o.cache_control.lock().unwrap() = String::new();
+    *o.cache_control_304.lock().unwrap() = Some(String::new());
+    *o.extra_304.lock().unwrap() = vec![("x-account", "alice@example.com")];
+    let st = state_with_ttl(start_origin(o.clone()).await, 1);
+    let miss = fetch(&st, "/np", &[]).await;
+    assert_eq!(
+        (
+            miss.cache.as_str(),
+            header(&miss, "cache-control").as_deref()
+        ),
+        ("MISS", Some("public, max-age=1"))
+    );
+    stored_then_stale(&st, "/np").await;
+    let hers = fetch(&st, "/np", &[("authorization", "Bearer alice")]).await;
+    assert_eq!(hers.cache, "REVALIDATED");
+    assert_eq!(
+        header(&hers, "x-account").as_deref(),
+        Some("alice@example.com"),
+        "her own answer"
+    );
+    assert_eq!(
+        header(&hers, "cache-control").as_deref(),
+        Some("private"),
+        "her answer is labelled for a shared cache to keep"
+    );
+    // An anonymous revalidation renews the entry, and its answer is what a hit carries.
+    o.extra_304.lock().unwrap().clear();
+    let anon = fetch(&st, "/np", &[]).await;
+    assert_eq!(
+        (
+            anon.cache.as_str(),
+            header(&anon, "cache-control").as_deref(),
+            header(&anon, "x-account")
+        ),
+        ("REVALIDATED", Some("public, max-age=1"), None)
+    );
+}
+
+/// When the origin made the response: with `Expires`, the lifetime it gave. A hit carries the
+/// origin's `Date`, as the miss did, and so does a `304` from the cache (RFC 9110 §15.4.5); a
+/// `304` from the origin that renews the entry brings its own. A hit dated now, beside its
+/// `Age`, had a downstream cache count the time spent in zion twice.
+#[tokio::test]
+async fn an_answer_from_the_cache_carries_the_origins_date() {
+    const MADE: &str = "Thu, 01 Jan 2026 00:00:00 GMT";
+    const CONFIRMED: &str = "Fri, 02 Jan 2026 00:00:00 GMT";
+    let (o, st) = origin_and_state("public, max-age=1").await;
+    *o.extra_200.lock().unwrap() =
+        vec![("date", MADE), ("expires", "Thu, 01 Jan 2026 01:00:00 GMT")];
+    let miss = fetch(&st, "/dated", &[]).await;
+    assert_eq!(
+        (miss.cache.as_str(), header(&miss, "date").as_deref()),
+        ("MISS", Some(MADE))
+    );
+    until("entry stored", || {
+        st.static_cache.get("/dated\u{1f}\u{1c}").fresh().is_some()
+    })
+    .await;
+    let hit = fetch(&st, "/dated", &[]).await;
+    assert_eq!(
+        (hit.cache.as_str(), header(&hit, "date").as_deref()),
+        ("HIT", Some(MADE))
+    );
+    let not_modified = fetch(&st, "/dated", &[("if-none-match", "\"e1\"")]).await;
+    assert_eq!(
+        (
+            not_modified.status,
+            header(&not_modified, "date").as_deref()
+        ),
+        (304, Some(MADE))
+    );
+    *o.extra_304.lock().unwrap() = vec![("date", CONFIRMED)];
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let revalidated = fetch(&st, "/dated", &[]).await;
+    assert_eq!(
+        (
+            revalidated.cache.as_str(),
+            header(&revalidated, "date").as_deref()
+        ),
+        ("REVALIDATED", Some(CONFIRMED))
+    );
+    let after = fetch(&st, "/dated", &[]).await;
+    assert_eq!(
+        (after.cache.as_str(), header(&after, "date").as_deref()),
+        ("HIT", Some(CONFIRMED))
+    );
+}
+
+/// `ETag` (and `Content-Type`, `Content-Encoding`, `Last-Modified`) live in fields of their own:
+/// one over the bound with a one-byte body was stored, and charged a few hundred bytes for its
+/// 32 KiB. It is now refused like any other header over the bound, and counted.
+#[tokio::test]
+async fn a_response_whose_etag_is_more_than_an_entry_keeps_is_not_stored() {
+    let (o, st) = origin_and_state("public, max-age=60").await;
+    let etag = format!("\"{}\"", "e".repeat(crate::cache::MAX_STORED_HEADER_BYTES));
+    *o.body.lock().unwrap() = ("v".into(), etag);
+    let first = fetch(&st, "/big-etag", &[]).await;
+    assert_eq!((first.cache.as_str(), first.body.as_str()), ("BYPASS", "v"));
+    assert_eq!(st.static_cache.too_large(), 1);
+    let second = fetch(&st, "/big-etag", &[]).await;
+    assert_eq!(
+        (second.cache.as_str(), o.count()),
+        ("BYPASS", 2),
+        "stored: the origin was not asked again"
     );
 }
