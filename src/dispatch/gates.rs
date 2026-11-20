@@ -156,7 +156,8 @@ fn uri_length(req: &Request<ReqBody>) -> Option<Response<ZionBody>> {
 /// Gate: a request target whose authority carries userinfo (`GET http://user:pass@shop.example/`,
 /// an HTTP/2 or HTTP/3 `:authority` of `shop.example@evil.example`) is a 400, before anything reads
 /// the host. Why, and what counts: [`crate::security::target_has_userinfo`]. The `:80` handler,
-/// which routes the ACME fallback on its own, asks the same function.
+/// which routes the ACME fallback on its own, asks the same function, and the TLS listener's
+/// health fast path sends such a request on to this gate instead of answering it.
 fn target_userinfo(req: &Request<ReqBody>) -> Option<Response<ZionBody>> {
     crate::security::target_has_userinfo(req).then(|| empty_response(StatusCode::BAD_REQUEST))
 }

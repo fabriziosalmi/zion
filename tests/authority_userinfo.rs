@@ -2,7 +2,9 @@
 //! A request target whose authority carries userinfo is a 400 on every listener and protocol
 //! that carries one, against the real binary: HTTP/1.1 and HTTP/1.0 absolute-form on the TLS
 //! listener and on `:80` (its redirect, and the ACME fallback that forwards on its own), HTTP/2
-//! over TLS and h2c on `:80` (`:authority`), and HTTP/3 with `--features http3`.
+//! over TLS and h2c on `:80` (`:authority`), and HTTP/3 with `--features http3`. `/healthz` and
+//! `/readyz` included: the TLS listener answers them on a fast path before the pipeline, and a
+//! target with userinfo does not take it.
 //!
 //! RFC 9110 §4.2.4: userinfo is how a link hides its real host (`http://shop.example@evil.example/`
 //! goes to evil.example), and RFC 9113 §8.3.1 and RFC 9114 §4.3.1 forbid it in `:authority`.
@@ -402,6 +404,23 @@ async fn a_target_with_userinfo_is_refused_on_every_listener_and_never_forwarded
         200
     );
     wait_for_origin("GET /.well-known/acme-challenge/c-h2c ");
+    // The TLS listener's health fast path answers a probe without userinfo, in origin-form, in
+    // absolute-form and over HTTP/2.
+    let line = send_raw(
+        https,
+        true,
+        b"GET /healthz HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(line.starts_with("HTTP/1.1 200"), "TLS /healthz: {line:?}");
+    let line = send_raw(
+        https,
+        true,
+        b"GET http://a.example/readyz HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(line.starts_with("HTTP/1.1 200"), "TLS /readyz: {line:?}");
+    assert_eq!(h2_get(https, true, "https://a.example/healthz").await, 200);
 
     // With userinfo: a 400 on each, and the origin never sees the request. Every case runs
     // before anything is asserted, so a failure lists each listener and protocol that let one in.
@@ -424,6 +443,18 @@ async fn a_target_with_userinfo_is_refused_on_every_listener_and_never_forwarded
             https,
             true,
             b"GET http://user:pass@a.example/u-h10 HTTP/1.0\r\n\r\n",
+        ),
+        (
+            "TLS HTTP/1.1, /healthz (the health fast path)",
+            https,
+            true,
+            b"GET http://user:pass@a.example/healthz HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n",
+        ),
+        (
+            "TLS HTTP/1.1, /readyz (the health fast path)",
+            https,
+            true,
+            b"GET http://a.example@evil.example/readyz HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n",
         ),
         (
             ":80 HTTP/1.1, the ACME fallback that forwards",
@@ -464,6 +495,12 @@ async fn a_target_with_userinfo_is_refused_on_every_listener_and_never_forwarded
             "https://user:pass@a.example/u-h2-pass",
         ),
         (
+            "HTTP/2 over TLS, /healthz (the health fast path)",
+            https,
+            true,
+            "https://user:pass@a.example/healthz",
+        ),
+        (
             "h2c on :80, the ACME fallback",
             http,
             false,
@@ -490,6 +527,11 @@ async fn a_target_with_userinfo_is_refused_on_every_listener_and_never_forwarded
             (
                 "HTTP/3, :authority localhost@evil.example",
                 "https://localhost@evil.example/u-h3-hide",
+                None,
+            ),
+            (
+                "HTTP/3, :authority user:pass@localhost on /healthz",
+                "https://user:pass@localhost/healthz",
                 None,
             ),
             // h3 makes a `host` field sent without `:authority` the target's authority.
