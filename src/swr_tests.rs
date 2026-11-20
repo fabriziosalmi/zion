@@ -50,6 +50,14 @@ struct Origin {
     /// A request whose `X-User` is listed here is held, once it is recorded, until the test takes
     /// the name out: the test can change the cache between zion's lookup and the origin's answer.
     held: Mutex<Vec<&'static str>>,
+    /// When set, a request without this header is answered `401`, as an origin that trusts what
+    /// zion asserts about the client (`X-Auth-Subject`, `X-Client-Cert-Fingerprint`) answers one.
+    requires: Mutex<Option<&'static str>>,
+    /// When set, every request is answered with this status and no body.
+    status: Mutex<Option<u16>>,
+    /// When set, every response to a request without a `Cookie` starts a session, a `304`
+    /// included (express-session with `saveUninitialized: true`): `Set-Cookie: sid=new`.
+    session_cookie: std::sync::atomic::AtomicBool,
 }
 
 impl Origin {
@@ -93,6 +101,16 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                         if o.down.load(Ordering::Relaxed) {
                             return Err("origin down");
                         }
+                        let required = *o.requires.lock().unwrap();
+                        let refused = required
+                            .filter(|name| !req.headers().contains_key(*name))
+                            .map(|_| StatusCode::UNAUTHORIZED);
+                        let status = *o.status.lock().unwrap();
+                        let status = status.map(|s| StatusCode::from_u16(s).unwrap());
+                        if let Some(status) = refused.or(status) {
+                            let resp = Response::builder().status(status);
+                            return Ok(resp.body(Full::new(Bytes::new())).unwrap());
+                        }
                         let d = o.delay_ms.load(Ordering::Relaxed);
                         if d > 0 {
                             tokio::time::sleep(Duration::from_millis(d)).await;
@@ -127,6 +145,11 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                             None => !lm.is_empty() && ims == Some(lm.as_str()),
                         };
                         let mut b = Response::builder().header(vary.0, vary.1);
+                        if o.session_cookie.load(Ordering::Relaxed)
+                            && !req.headers().contains_key("cookie")
+                        {
+                            b = b.header("set-cookie", "sid=new");
+                        }
                         if !etag.is_empty() {
                             b = b.header("etag", &etag);
                         }
@@ -184,6 +207,11 @@ fn state_for(origin_port: u16) -> Arc<AppState> {
 /// The test state, with the cache profile's `ttl_seconds` (what an entry lives when the origin
 /// gives no lifetime).
 fn state_with_ttl(origin_port: u16, ttl_seconds: u64) -> Arc<AppState> {
+    state_with_profile(origin_port, ttl_seconds, "")
+}
+
+/// The test state, with `more` lines in the cache profile.
+fn state_with_profile(origin_port: u16, ttl_seconds: u64, more: &str) -> Arc<AppState> {
     let toml = format!(
         r#"
 [server]
@@ -200,6 +228,7 @@ o = "http://127.0.0.1:{origin_port}"
 [cache_profile.c]
 ttl_seconds = {ttl_seconds}
 max_entries = 100
+{more}
 
 [[route]]
 path = "/{{*rest}}"
@@ -867,8 +896,20 @@ async fn a_private_background_304_does_not_renew_the_shared_entry() {
         st.static_cache.get(&key).fresh().is_none(),
         "the private 304 renewed the shared entry"
     );
+    assert_eq!(
+        account_under(&st, &key).as_deref(),
+        Some("-"),
+        "the shared entry took the private 304's headers"
+    );
+    // The refused refresh ended the window: the next request revalidates in the foreground, and
+    // the origin answers it with a public 304.
+    *o.cache_control_304.lock().unwrap() = None;
+    o.extra_304.lock().unwrap().clear();
     let next = fetch(&st, "/swr-p", &[]).await;
-    assert_eq!(header(&next, "x-account"), None, "served as {}", next.cache);
+    assert_eq!(
+        (next.cache.as_str(), header(&next, "x-account")),
+        ("REVALIDATED", None)
+    );
 }
 
 /// A `304` whose headers, with the stored ones, are more than an entry keeps: this client is
@@ -1784,5 +1825,207 @@ async fn a_background_refresh_that_adds_a_name_to_vary_renews_nothing_for_the_va
             Some(vec!["accept-language".to_string(), "x-user".to_string()]),
             "a 200: {changed}: bob's 200 files the response under the new Vary"
         );
+    }
+}
+
+// ── a refresh the origin answers without renewing the entry ends its window ──
+
+/// mTLS in front of an origin that trusts zion's `X-Client-Cert-Fingerprint` and answers `401` to
+/// a request without it (an auth gate's `X-Auth-Subject` is the same case). The background refresh
+/// leaves that header out (`swr_drops`), so the origin refuses every refresh. Nothing recorded the
+/// refusal: the entry was served stale for the rest of its window, after the origin had a new
+/// version, and each request after the previous refresh ended started another refused one. The
+/// refusal now ends the window: the next request revalidates the entry in the foreground, with its
+/// own fingerprint, and gets the new version.
+#[tokio::test]
+async fn a_refresh_the_origin_refuses_ends_the_window() {
+    let cert = [("x-client-cert-fingerprint", "sha256:ab12")];
+    let (o, st) = origin_and_state("public, max-age=1, stale-while-revalidate=30").await;
+    *o.requires.lock().unwrap() = Some("x-client-cert-fingerprint");
+    let miss = fetch(&st, "/mtls", &cert).await;
+    assert_eq!((miss.cache.as_str(), miss.body.as_str()), ("MISS", "v1"));
+    stored_then_stale(&st, "/mtls").await;
+    let stale = fetch(&st, "/mtls", &cert).await;
+    assert_eq!(
+        (stale.cache.as_str(), stale.body.as_str()),
+        ("STALE-WHILE-REVALIDATE", "v1")
+    );
+    let key = "/mtls\u{1f}\u{1c}";
+    refresh_over(&o, &st, key, 2).await;
+    assert_eq!(
+        o.requests.lock().unwrap()[1].get("x-client-cert-fingerprint"),
+        None,
+        "the refresh went with the fingerprint"
+    );
+    *o.body.lock().unwrap() = ("v2".into(), "\"e2\"".into());
+    let next = fetch(&st, "/mtls", &cert).await;
+    assert_eq!(
+        (
+            next.status,
+            next.cache.as_str(),
+            next.body.as_str(),
+            o.count()
+        ),
+        (200, "MISS", "v2", 3),
+        "the refused refresh left the entry in its window"
+    );
+    until("the new version stored", || {
+        st.static_cache
+            .get(key)
+            .fresh()
+            .is_some_and(|h| h.body == "v2")
+    })
+    .await;
+    let after = fetch(&st, "/mtls", &cert).await;
+    assert_eq!(
+        (after.cache.as_str(), after.body.as_str(), o.count()),
+        ("HIT", "v2", 3)
+    );
+}
+
+/// An origin that gives every request without a `Cookie` a session, on a `304` too (express-session
+/// with `saveUninitialized: true`). The entry was stored from a visitor who had one, so its `200`
+/// set none. The background refresh sends no `Cookie`, and its `304` sets a session no client
+/// holds: it cannot renew the shared entry. It was refused at every refresh, the entry served stale
+/// for the whole window, one more session made in the origin's store at each refresh. The refusal
+/// now ends the window: the next visitor's request, with its cookie, revalidates the entry in the
+/// foreground, and its `304` renews it.
+#[tokio::test]
+async fn a_refresh_whose_304_sets_a_cookie_ends_the_window() {
+    let visitor = [("cookie", "sid=visitor")];
+    let (o, st) = origin_and_state("public, max-age=1, stale-while-revalidate=30").await;
+    o.session_cookie.store(true, Ordering::Relaxed);
+    let miss = fetch(&st, "/session", &visitor).await;
+    assert_eq!(
+        (miss.cache.as_str(), header(&miss, "set-cookie")),
+        ("MISS", None)
+    );
+    stored_then_stale(&st, "/session").await;
+    let stale = fetch(&st, "/session", &visitor).await;
+    assert_eq!(stale.cache, "STALE-WHILE-REVALIDATE");
+    let key = "/session\u{1f}\u{1c}";
+    refresh_over(&o, &st, key, 2).await;
+    assert!(
+        st.static_cache.get(key).fresh().is_none(),
+        "the 304 with a new session renewed the shared entry"
+    );
+    let next = fetch(&st, "/session", &visitor).await;
+    assert_eq!(
+        (
+            next.cache.as_str(),
+            next.body.as_str(),
+            header(&next, "set-cookie"),
+            o.count()
+        ),
+        ("REVALIDATED", "v1", None, 3),
+        "the refused refresh left the entry in its window"
+    );
+    let after = fetch(&st, "/session", &visitor).await;
+    assert_eq!((after.cache.as_str(), o.count()), ("HIT", 3));
+}
+
+/// A background `200` over the profile's `max_object_mb` cannot replace the entry: the refresh is
+/// refused as any answer that cannot be stored is, and the next request is answered in the
+/// foreground with the new version.
+#[tokio::test]
+async fn a_refresh_whose_body_is_over_the_object_limit_ends_the_window() {
+    let o = Arc::new(Origin::default());
+    *o.body.lock().unwrap() = ("v1".into(), "\"e1\"".into());
+    *o.cache_control.lock().unwrap() = "public, max-age=1, stale-while-revalidate=30".into();
+    let st = state_with_profile(start_origin(o.clone()).await, 3600, "max_object_mb = 1");
+    fetch(&st, "/swr-big", &[]).await;
+    stored_then_stale(&st, "/swr-big").await;
+    let big = "x".repeat((1 << 20) + 1);
+    *o.body.lock().unwrap() = (big.clone(), "\"e2\"".into());
+    let stale = fetch(&st, "/swr-big", &[]).await;
+    assert_eq!(
+        (stale.cache.as_str(), stale.body.as_str()),
+        ("STALE-WHILE-REVALIDATE", "v1")
+    );
+    refresh_over(&o, &st, "/swr-big\u{1f}\u{1c}", 2).await;
+    let next = fetch(&st, "/swr-big", &[]).await;
+    assert_eq!(
+        (next.cache.as_str(), next.body.len(), o.count()),
+        ("BYPASS", big.len(), 3),
+        "the refused refresh left the entry in its window"
+    );
+}
+
+/// A refresh that gets a 5xx, or no answer, is not refused: the origin is failing for every client,
+/// and the stale copy served at once is what the window (and stale-if-error) are for. The entry
+/// stays in its window.
+#[tokio::test]
+async fn a_refresh_that_gets_a_server_error_keeps_the_window() {
+    for (n, down) in [(0, false), (1, true)] {
+        let uri = format!("/swr-5xx{n}");
+        let (o, st) = origin_and_state("public, max-age=1, stale-while-revalidate=30").await;
+        fetch(&st, &uri, &[]).await;
+        stored_then_stale(&st, &uri).await;
+        if down {
+            o.down.store(true, Ordering::Relaxed);
+        } else {
+            *o.status.lock().unwrap() = Some(503);
+        }
+        let stale = fetch(&st, &uri, &[]).await;
+        assert_eq!(stale.cache, "STALE-WHILE-REVALIDATE", "down: {down}");
+        refresh_over(&o, &st, &format!("{uri}\u{1f}\u{1c}"), 2).await;
+        let next = fetch(&st, &uri, &[]).await;
+        assert_eq!(
+            (next.cache.as_str(), next.body.as_str()),
+            ("STALE-WHILE-REVALIDATE", "v1"),
+            "down: {down}: the failed refresh ended the window"
+        );
+    }
+}
+
+/// `zion_cache_too_large` counts what a size limit alone kept out of the cache. A response that
+/// may not be stored anyway, or a `304` that may not renew the entry, was counted too when its
+/// headers were over the bound: a `private` page with a large `Content-Security-Policy` added one
+/// per request, pointing an operator at the limit for objects it never lost.
+#[tokio::test]
+async fn what_may_not_be_stored_is_not_counted_as_too_large() {
+    // A 200 that may not be stored: `private`, a `Set-Cookie`, a request's `no-store`.
+    for (n, cc, extra, request) in [
+        (0, "private, max-age=60", None, None),
+        (1, "public, max-age=60", Some(("set-cookie", "sid=x")), None),
+        (
+            2,
+            "public, max-age=60",
+            None,
+            Some(("cache-control", "no-store")),
+        ),
+    ] {
+        let uri = format!("/huge-private{n}");
+        let (o, st) = origin_and_state(cc).await;
+        let mut headers = vec![("x-huge", huge())];
+        headers.extend(extra);
+        *o.extra_200.lock().unwrap() = headers;
+        let first = fetch(&st, &uri, &Vec::from_iter(request)).await;
+        assert_eq!((first.status, first.body.as_str()), (200, "v1"), "case {n}");
+        assert_eq!(st.static_cache.too_large(), 0, "case {n}: {cc} {extra:?}");
+    }
+
+    // A 304 that may not renew the entry (it sets a cookie), in the foreground and from the
+    // background refresh.
+    for swr in [false, true] {
+        let uri = format!("/huge-304-cookie-{swr}");
+        let cc = if swr {
+            "public, max-age=1, stale-while-revalidate=30"
+        } else {
+            "public, max-age=1"
+        };
+        let (o, st) = origin_and_state(cc).await;
+        fetch(&st, &uri, &[]).await;
+        stored_then_stale(&st, &uri).await;
+        *o.extra_304.lock().unwrap() = vec![("x-huge", huge()), ("set-cookie", "sid=x")];
+        let answer = fetch(&st, &uri, &[]).await;
+        let expected = if swr {
+            "STALE-WHILE-REVALIDATE"
+        } else {
+            "REVALIDATED"
+        };
+        assert_eq!(answer.cache, expected);
+        refresh_over(&o, &st, &format!("{uri}\u{1f}\u{1c}"), 2).await;
+        assert_eq!(st.static_cache.too_large(), 0, "background: {swr}");
     }
 }

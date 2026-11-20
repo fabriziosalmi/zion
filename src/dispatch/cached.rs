@@ -435,11 +435,14 @@ impl Cx<'_> {
                 // [staleness, staleness + 1): `<` keeps us from ever serving past the
                 // window the origin allowed. A variant keyed on a header the refresh does not
                 // send is not refreshed in the background: it is answered as an entry without
-                // the window is (`refresh_sends_what_it_varies_on`).
+                // the window is (`refresh_sends_what_it_varies_on`). So is an entry whose last
+                // background refresh the origin answered with something that could not renew it
+                // (`CacheHit::refresh_refused`): this request's own headers may get it renewed.
                 let staleness = hit.age_secs.saturating_sub(hit.max_age_secs);
                 if hit.meta.stale_while_revalidate_secs > 0
                     && !hit.meta.must_revalidate
                     && staleness < hit.meta.stale_while_revalidate_secs
+                    && !hit.refresh_refused
                     && refresh_sends_what_it_varies_on(filed.as_deref())
                 {
                     if client_conditional_hit(req.headers(), &hit.meta) {
@@ -734,7 +737,7 @@ impl Cx<'_> {
                     cache_ttl,
                     filed.map(|rule| rule.names.as_slice()),
                 );
-                if !rv.fits {
+                if rv.too_large() {
                     state.static_cache.count_too_large();
                 }
                 if rv.renews() {
@@ -818,13 +821,15 @@ impl Cx<'_> {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<usize>().ok())
             .is_some_and(|n| n > max_object);
-        if too_big || !headers_fit {
+        let storable = !rcc_no_store
+            && is_shared_cacheable(req_authenticated, headers, effective_ttl, initial_age);
+        // `zion_cache_too_large` counts what a limit alone kept out: a response that may not be
+        // stored anyway (`private`, a `Set-Cookie`, a request's `no-store`) is not counted however
+        // large it is.
+        if storable && (too_big || !headers_fit) {
             state.static_cache.count_too_large();
         }
-        let cacheable = !rcc_no_store
-            && !too_big
-            && headers_fit
-            && is_shared_cacheable(req_authenticated, headers, effective_ttl, initial_age);
+        let cacheable = storable && !too_big && headers_fit;
         // Where the entry lives: the primary key, or — when the response varies — the
         // secondary key of THIS request's varied headers (bounded; see `vary`).
         // An identity body the origin did not select by Accept-Encoding goes under the

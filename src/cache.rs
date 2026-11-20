@@ -284,6 +284,11 @@ pub struct CacheHit {
     /// The entry's freshness lifetime in seconds — the `max-age` to emit so
     /// downstream caches compute the same expiry zion does.
     pub max_age_secs: u64,
+    /// The origin answered a background stale-while-revalidate refresh of this entry, and the
+    /// answer could not renew it ([`StaticCache::refuse_refresh`]): the entry is no longer served
+    /// stale-while-revalidate, and the next request revalidates it in the foreground, with its own
+    /// headers. Never set on a fresh hit: the mark goes on a stale entry, and a store replaces it.
+    pub refresh_refused: bool,
 }
 
 /// Outcome of a cache lookup (RFC 9111 §4.3). `Stale` returns the stored entry
@@ -339,6 +344,9 @@ struct L2Entry {
     initial_age_secs: u64,
     /// Freshness lifetime used for this entry (origin-derived, clamped to profile).
     freshness_secs: u64,
+    /// See [`CacheHit::refresh_refused`]. Only [`StaticCache::refuse_refresh`] sets it; a store
+    /// under the key makes a new entry without it.
+    refresh_refused: bool,
 }
 
 /// Expiry instant from a freshness lifetime and the age the object already
@@ -483,6 +491,8 @@ impl L1Cache {
             meta,
             age_secs,
             max_age_secs,
+            // L1 holds fresh entries only, and the mark is only ever on a stale one.
+            refresh_refused: false,
         })
     }
 
@@ -1142,6 +1152,25 @@ impl StaticCache {
             .is_some()
     }
 
+    /// Mark the entry under `key`, if it is still the one `seen` was read from (as in
+    /// [`Self::remove_unchanged`]), as one whose background refresh the origin answered with
+    /// something that cannot renew it ([`CacheHit::refresh_refused`]). The entry stays, with its
+    /// body, age and expiry, for the foreground revalidation and stale-if-error; nothing else
+    /// about it changes. `true` when it was marked.
+    pub fn refuse_refresh(&self, key: &str, seen: &CacheHit) -> bool {
+        let mark = |e: &mut L2Entry| {
+            let this = Arc::ptr_eq(&e.meta, &seen.meta);
+            if this {
+                e.refresh_refused = true;
+            }
+            this
+        };
+        match &self.l2 {
+            Some(l2) => l2.get_mut(key).is_some_and(|mut e| mark(e.value_mut())),
+            None => LOCAL_L2.with(|m| m.borrow_mut().get_mut(key).is_some_and(mark)),
+        }
+    }
+
     /// Drop every entry stored under any of `tags`. One generation bump however many go;
     /// returns the entries removed.
     pub fn purge_tags(&self, tags: &[&str]) -> usize {
@@ -1187,6 +1216,7 @@ impl StaticCache {
                             age_secs: entry.initial_age_secs
                                 + entry.inserted_at.elapsed().as_secs(),
                             max_age_secs: entry.freshness_secs,
+                            refresh_refused: entry.refresh_refused,
                         };
                         if Instant::now() >= entry.expires_at {
                             CacheLookup::Stale(hit)
@@ -1237,12 +1267,14 @@ impl StaticCache {
         let age_secs = entry.initial_age_secs + entry.inserted_at.elapsed().as_secs();
         let freshness_secs = entry.freshness_secs;
         if Instant::now() >= entry.expires_at {
+            let refresh_refused = entry.refresh_refused;
             drop(entry); // release the DashMap read lock; leave the entry stored
             return CacheLookup::Stale(CacheHit {
                 body,
                 meta,
                 age_secs,
                 max_age_secs: freshness_secs,
+                refresh_refused,
             });
         }
         let key: Arc<str> = entry.key().clone();
@@ -1290,6 +1322,7 @@ impl StaticCache {
             meta,
             age_secs,
             max_age_secs: freshness_secs,
+            refresh_refused: false,
         })
     }
 
@@ -1345,6 +1378,7 @@ impl StaticCache {
             expires_at: expiry_from(now, freshness_secs, initial_age_secs),
             initial_age_secs,
             freshness_secs,
+            refresh_refused: false,
         };
         let cost = entry_cost(&key, &entry);
         let budget = self.budget();
@@ -1586,6 +1620,48 @@ mod tests {
             assert!(!cache.remove_unchanged("/a", &seen), "gone already");
             assert!(matches!(cache.get("/b"), CacheLookup::Stale(h) if h.body == "other"));
             assert_eq!(cache.bytes(), cache.recount());
+        }
+    }
+
+    /// `refuse_refresh` marks the entry a lookup read, keeps it as it was otherwise, and marks
+    /// nothing else: not one stored under the key since, nor another key's, on either backend. A
+    /// store under the key makes an entry without the mark.
+    #[test]
+    fn refuse_refresh_marks_only_the_entry_that_was_read() {
+        for cache in [
+            StaticCache::with_byte_budget(0),
+            StaticCache::single_worker_with_byte_budget(0),
+        ] {
+            let put = |k: &str, body: &'static [u8]| {
+                cache.insert(k, Bytes::from_static(body), default_meta(), 0, 0, 100)
+            };
+            let marked = |k: &str| match cache.get(k) {
+                CacheLookup::Stale(h) => Some((h.refresh_refused, h.body)),
+                _ => None,
+            };
+            put("/a", b"old");
+            put("/b", b"other");
+            let CacheLookup::Stale(seen) = cache.get("/a") else {
+                panic!("/a is stale")
+            };
+            assert!(!seen.refresh_refused, "a new entry is not marked");
+            put("/a", b"new");
+            assert!(
+                !cache.refuse_refresh("/a", &seen),
+                "an entry stored since was marked"
+            );
+            assert_eq!(marked("/a"), Some((false, Bytes::from_static(b"new"))));
+            let CacheLookup::Stale(seen) = cache.get("/a") else {
+                panic!("/a is stale")
+            };
+            assert!(!cache.refuse_refresh("/b", &seen), "another key's entry");
+            assert!(cache.refuse_refresh("/a", &seen));
+            assert_eq!(marked("/a"), Some((true, Bytes::from_static(b"new"))));
+            assert_eq!(marked("/b"), Some((false, Bytes::from_static(b"other"))));
+            assert_eq!(cache.bytes(), cache.recount());
+            put("/a", b"renewed");
+            assert_eq!(marked("/a"), Some((false, Bytes::from_static(b"renewed"))));
+            assert!(!cache.refuse_refresh("/c", &seen), "no entry");
         }
     }
 
@@ -3100,6 +3176,7 @@ mod tests {
                 expires_at: expiry_from(now, 400, 0),
                 initial_age_secs: 0,
                 freshness_secs: 400,
+                refresh_refused: false,
             };
             let new_cost = entry_cost(&key, &entry);
             let reserved = cache.make_room(&key, new_cost, 0, budget).expect("room");
@@ -3141,6 +3218,7 @@ mod tests {
                 expires_at: expiry_from(now, 1_000, 0),
                 initial_age_secs: 0,
                 freshness_secs: 1_000,
+                refresh_refused: false,
             };
             let new_cost = entry_cost(&key, &entry);
             let reserved = cache.make_room(&key, new_cost, 0, budget).expect("room");
