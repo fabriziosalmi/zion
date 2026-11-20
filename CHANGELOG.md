@@ -4,6 +4,22 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-20
+
+**Security fixes from a code audit and a security hunt, and request spans over OpenTelemetry.** Two crashes are fixed: an h2c request with a raw DEL in its path on the plain-HTTP listener, and the first HTTP/3 handshake after a certificate reload (`--features http3`), each of which stopped the process. HTTP/3 now enforces `client_auth` from boot. Behind a trusted proxy, a client can no longer choose the address the internal-only endpoints and the rate limit go by. JWT profiles require the `aud` and `iss` they name, WebSocket sessions count against the connection limits, audit and ACME misconfigurations stop the boot instead of failing at run time, and the connection ceiling fits the file-descriptor limit.
+
+### Upgrade notes
+
+- **JWT profiles that set `audience` or `issuer` refuse tokens without that claim** (`403`). Add the claim at the issuer, or remove the setting from the profile.
+- **A proxied WebSocket session counts against `max_connections` and `max_connections_per_ip` until it ends**, and a graceful shutdown waits for open sessions up to its drain timeout.
+- **HTTP/3 (`--features http3`) enforces `[tls] client_auth` from boot**: a client without a certificate that verifies is refused at the QUIC handshake, as on TCP. HTTP/3 runs without 0-RTT.
+- **Client IP behind `trusted_proxies`**: a proxy that writes `unknown` in `X-Forwarded-For` (Squid `forwarded_for off`) now makes its clients `0.0.0.0` instead of itself, and `xff_mode = "append"` sends one comma-separated line instead of adding a second line.
+- **`zion audit verify` exits `3`** when every segment verifies but events were dropped under back-pressure; `1` still means a verification failure.
+- **Boot refuses (exit `2`)** an `[audit]` path that cannot be opened, and, with `[tls.acme]`, a certificate directory zion cannot write. The shipped systemd unit no longer restarts on exit `2` or `3`.
+- **Without `max_connections`, the connection ceiling also fits `RLIMIT_NOFILE`** (two descriptors per connection), which lowers it on large hosts under the shipped unit; boot logs the value.
+- **`webpki-roots` 1.0.12 removes six roots** (DigiCert Trusted Root G4, QuoVadis Root CA 1 G3 and 3 G3, Buypass Class 2 and Class 3, Certigna). An HTTPS upstream that chains only to one of them needs its CA in `ca_path`.
+- **Helm**: the LoadBalancer and NodePort Services render `externalTrafficPolicy: Local` (`service.externalTrafficPolicy`, empty to leave it out), so only nodes running a zion pod take traffic; the unused `ingress.*` values are removed.
+
 ### Added
 
 - **`--features otel` exports a span for every request** (#640). The root span, named `request`, carries the SAME trace id and parent span id already in the `traceparent` the request propagates (the client's own, when valid; a freshly generated one otherwise) — the exported trace stitches onto whatever sent the request, with the same trace id already in the access log, the audit record and the latency exemplar. Verified against a real OTLP collector, including client-`traceparent` propagation; an unreachable collector does not slow down or block request serving. A previous attempt (then reverted) saw correctly-built, correctly-sampled spans still ship as empty batches; this rebuild also checks `tracing-opentelemetry`'s `set_parent` `Result` (undiscussed by that attempt's notes, and not something that fails in this configuration), logging rather than discarding it — whether that was the earlier cause was not re-established, since this rebuild worked end to end on its own.
