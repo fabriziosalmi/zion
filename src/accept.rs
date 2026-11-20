@@ -864,16 +864,24 @@ pub(crate) async fn handle_http(
         cfg_http_port(&state),
         state.cfg().listen_https.map(|a| a.port()),
     );
-    let redirect_uri = format!("https://{authority}{safe_path}");
-    Ok(Response::builder()
-        .status(StatusCode::MOVED_PERMANENTLY)
-        .header(hyper::header::LOCATION, redirect_uri)
-        .body(
-            Full::new(Bytes::new())
-                .map_err(|never| match never {})
-                .boxed(),
-        )
-        .unwrap())
+    Ok(redirect_to(&format!("https://{authority}{safe_path}")))
+}
+
+/// The `:80` 301 to `location`, or a 400 when `location` cannot be a header value.
+///
+/// The path comes from the client, and HTTP/2 (h2c on this listener) carries one byte in
+/// `:path` that a header value refuses, a raw DEL (0x7F); h2 resets a stream whose path has
+/// any other control byte. Building the `Location` from such a path and unwrapping it
+/// panicked, and the release profile aborts on panic: one request took the whole process
+/// down. Such a path is not a valid URI either (RFC 3986 has no raw control bytes), so the
+/// client gets a 400. Any other value a header refuses gets the same, whatever its source.
+fn redirect_to(location: &str) -> Response<ZionBody> {
+    let Ok(location) = hyper::header::HeaderValue::from_str(location) else {
+        return empty_response(StatusCode::BAD_REQUEST);
+    };
+    let mut resp = empty_response(StatusCode::MOVED_PERMANENTLY);
+    resp.headers_mut().insert(hyper::header::LOCATION, location);
+    resp
 }
 
 /// Lock-free per-IP rate limiter — delegates to security module.
@@ -891,7 +899,7 @@ fn check_rate_limit(state: &AppState, ip: std::net::IpAddr) -> bool {
 
 #[cfg(test)]
 mod redirect_tests {
-    use super::https_authority;
+    use super::{https_authority, redirect_to};
 
     #[test]
     fn the_redirect_goes_to_the_https_port_not_back_to_the_http_one() {
@@ -926,6 +934,27 @@ mod redirect_tests {
                 *want,
                 "{host} {http:?} {https:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_location_that_is_not_a_header_value_is_a_400_not_a_panic() {
+        let ok = redirect_to("https://app.example/a?b=c");
+        assert_eq!(ok.status(), hyper::StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            ok.headers()[hyper::header::LOCATION],
+            "https://app.example/a?b=c"
+        );
+        // DEL is what h2c lets through in `:path` and a header value refuses; h2 already
+        // resets the other two, kept here so redirect_to answers every input.
+        for bad in [
+            "https://app.example/\x7f",
+            "https://app.example/\x01",
+            "https://app.example/\n",
+        ] {
+            let resp = redirect_to(bad);
+            assert_eq!(resp.status(), hyper::StatusCode::BAD_REQUEST, "{bad:?}");
+            assert!(resp.headers().get(hyper::header::LOCATION).is_none());
         }
     }
 }

@@ -46,15 +46,13 @@ pub fn build_quinn_server_config(tls: &TlsConfig) -> Result<quinn::ServerConfig,
         .map_err(|e| format!("parse QUIC key PEM: {e}"))?
         .ok_or_else(|| "no private key in PEM".to_string())?;
 
-    let mut tls_config =
+    let tls_config =
         rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| format!("build QUIC TLS config: {e}"))?;
 
-    tls_config.alpn_protocols = vec![b"h3".to_vec()];
-
-    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
+    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(for_quic(tls_config))
         .map_err(|e| format!("create QUIC server config: {e}"))?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
 
@@ -67,11 +65,25 @@ pub fn build_quinn_server_config(tls: &TlsConfig) -> Result<quinn::ServerConfig,
     Ok(server_config)
 }
 
+/// The rustls config the QUIC listener runs: `cfg` with ALPN `h3` and no 0-RTT.
+///
+/// QUIC allows no `max_early_data_size` but 0 and `u32::MAX`, and the check happens per
+/// connection: rustls' `quic::ServerConnection::new` refuses any other value and quinn-proto
+/// unwraps that refusal. The certificate hot reload hands over the TCP listener's config,
+/// which allows 16384 bytes of early data, so the first HTTP/3 handshake after a reload
+/// panicked, and the release profile aborts on panic. 0 rather than `u32::MAX`: HTTP/3
+/// requests reach the pipeline with `is_early_data = false`, so the 425 replay gate the TCP
+/// path has would not see a 0-RTT request.
+fn for_quic(mut cfg: rustls::ServerConfig) -> rustls::ServerConfig {
+    cfg.alpn_protocols = vec![b"h3".to_vec()];
+    cfg.max_early_data_size = 0;
+    cfg
+}
+
 pub fn quinn_server_config_from_rustls(
     arc_config: Arc<rustls::ServerConfig>,
 ) -> Result<quinn::ServerConfig, String> {
-    let mut cloned = (*arc_config).clone();
-    cloned.alpn_protocols = vec![b"h3".to_vec()];
+    let cloned = for_quic((*arc_config).clone());
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(cloned)
         .map_err(|e| format!("convert rustls config to QUIC config: {e}"))?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
@@ -480,6 +492,28 @@ mod tests {
         for name in transport() {
             assert!(!out.headers().contains_key(name), "{name} survived");
         }
+    }
+
+    #[test]
+    fn the_quic_tls_config_takes_no_early_data_whatever_the_tcp_one_allows() {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut tcp = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+        // What tls::load_tls_config sets for the TCP listener (0-RTT behind the 425 gate).
+        tcp.max_early_data_size = 16384;
+        let session = |cfg: rustls::ServerConfig| {
+            rustls::quic::ServerConnection::new(Arc::new(cfg), rustls::quic::Version::V1, vec![])
+                .map(drop)
+        };
+        // rustls refuses a QUIC connection on it, and quinn-proto unwraps that refusal.
+        assert!(session(tcp.clone()).is_err());
+        let quic = for_quic(tcp);
+        assert_eq!(quic.max_early_data_size, 0);
+        assert_eq!(quic.alpn_protocols, vec![b"h3".to_vec()]);
+        assert!(session(quic).is_ok());
     }
 
     #[test]
