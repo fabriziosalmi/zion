@@ -677,26 +677,33 @@ impl Cx<'_> {
                 let effective_ttl = origin_freshness(resp.headers())
                     .map(|o| o.min(cache_ttl))
                     .unwrap_or(cache_ttl);
-                let mut refreshed_meta = (*hit.meta).clone();
-                if resp.headers().contains_key(hyper::header::CACHE_CONTROL) {
-                    refreshed_meta.stale_while_revalidate_secs = origin_swr(resp.headers());
-                    refreshed_meta.must_revalidate = forbids_stale(resp.headers());
+                // The 304's headers update the stored ones (RFC 9111 §4.3.4), for the entry and
+                // for this answer.
+                let (refreshed_meta, fits) = revalidated_meta(&hit.meta, resp.headers());
+                if fits {
+                    // Skipped when a tag purge ran since this request began: it must not bring
+                    // back an entry the purge may have just removed.
+                    state.static_cache.refresh_checked(
+                        &found_key,
+                        hit.body.clone(),
+                        refreshed_meta.clone(),
+                        effective_ttl,
+                        initial_age,
+                        cache_max,
+                        tag_epoch,
+                    );
+                    fetching.stored(); // waiters observe the revived (fresh) entry
+                } else {
+                    // Too many headers to keep: served, the entry stays stale.
+                    drop(fetching);
                 }
-                // Skipped when a tag purge ran since this request began: it must not bring back an
-                // entry the purge may have just removed.
-                state.static_cache.refresh_checked(
-                    &found_key,
-                    hit.body.clone(),
-                    refreshed_meta,
-                    effective_ttl,
-                    initial_age,
-                    cache_max,
-                    tag_epoch,
-                );
-                fetching.stored(); // waiters observe the revived (fresh) entry
                 crate::metrics::METRICS
                     .cache_revalidations
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let hit = cache::CacheHit {
+                    meta: Arc::new(refreshed_meta),
+                    ..hit
+                };
                 return Ok(cache_response(hit, "REVALIDATED"));
             }
             // else: origin returned new content (200) or a non-304 status — drop the
@@ -851,22 +858,19 @@ impl Cx<'_> {
             return resp;
         };
 
-        // Preserve Content-Type and Content-Encoding for cache (S-05 fix).
-        // Without Content-Encoding, gzip-compressed bodies are served garbled.
-        let content_type = parts.headers.get(hyper::header::CONTENT_TYPE).cloned();
-        let content_encoding = parts.headers.get(hyper::header::CONTENT_ENCODING).cloned();
-        // Preserve validators for conditional requests (client If-None-Match →
-        // 304; origin revalidation in a later phase).
-        let etag = parts.headers.get(hyper::header::ETAG).cloned();
-        let last_modified = parts.headers.get(hyper::header::LAST_MODIFIED).cloned();
-        let meta = cache::CachedMeta {
-            content_type,
-            content_encoding,
-            status: parts.status,
-            etag,
-            last_modified,
-            stale_while_revalidate_secs: origin_swr(&parts.headers),
-            must_revalidate: forbids_stale(&parts.headers),
+        // What the entry keeps of the response, its end-to-end headers included, so that a hit
+        // carries what this miss carries. Headers too large to keep: streamed, not stored.
+        let Some(meta) = cached_meta(parts.status, &parts.headers) else {
+            drop(fetching);
+            metrics::METRICS
+                .cache_too_large
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut resp = Response::from_parts(parts, body.map_err(hyper::Error::from).boxed());
+            resp.headers_mut().insert(
+                "X-Zion-Cache",
+                hyper::header::HeaderValue::from_static("BYPASS"),
+            );
+            return resp;
         };
 
         let (sender, receiver) =

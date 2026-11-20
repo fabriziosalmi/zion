@@ -29,6 +29,9 @@ struct Origin {
     down: std::sync::atomic::AtomicBool,
     /// When set, every response carries `Vary: Accept-Encoding`.
     vary_ae: std::sync::atomic::AtomicBool,
+    /// More headers on every `200`, and on every `304`.
+    extra_200: Mutex<Vec<(&'static str, &'static str)>>,
+    extra_304: Mutex<Vec<(&'static str, &'static str)>>,
 }
 
 impl Origin {
@@ -74,19 +77,25 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                             ("x-test", "-")
                         };
                         let resp = if inm.as_deref() == Some(etag.as_str()) {
-                            Response::builder()
+                            let mut b = Response::builder()
                                 .header(vary.0, vary.1)
                                 .status(StatusCode::NOT_MODIFIED)
                                 .header("etag", &etag)
-                                .header("cache-control", &cc)
-                                .body(Full::new(Bytes::new()))
+                                .header("cache-control", &cc);
+                            for (k, v) in o.extra_304.lock().unwrap().iter() {
+                                b = b.header(*k, *v);
+                            }
+                            b.body(Full::new(Bytes::new()))
                         } else {
-                            Response::builder()
+                            let mut b = Response::builder()
                                 .header(vary.0, vary.1)
                                 .status(StatusCode::OK)
                                 .header("etag", &etag)
-                                .header("cache-control", &cc)
-                                .body(Full::new(Bytes::from(body)))
+                                .header("cache-control", &cc);
+                            for (k, v) in o.extra_200.lock().unwrap().iter() {
+                                b = b.header(*k, *v);
+                            }
+                            b.body(Full::new(Bytes::from(body)))
                         };
                         Ok::<_, &'static str>(resp.unwrap())
                     }
@@ -143,6 +152,7 @@ struct Answer {
     cache: String,
     body: String,
     took: Duration,
+    headers: hyper::HeaderMap,
 }
 
 async fn fetch(st: &Arc<AppState>, uri: &str, headers: &[(&str, &str)]) -> Answer {
@@ -156,6 +166,7 @@ async fn fetch(st: &Arc<AppState>, uri: &str, headers: &[(&str, &str)]) -> Answe
     .await
     .unwrap();
     let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
     let cache = resp
         .headers()
         .get("x-zion-cache")
@@ -176,6 +187,7 @@ async fn fetch(st: &Arc<AppState>, uri: &str, headers: &[(&str, &str)]) -> Answe
         cache,
         body,
         took: t.elapsed(),
+        headers,
     }
 }
 
@@ -451,5 +463,110 @@ async fn a_304_renews_a_per_encoding_entry_under_its_own_key() {
         (after.cache.as_str(), o.count()),
         ("HIT", 2),
         "the 304 made the entry fresh again"
+    );
+}
+
+// ── what an answer from a stale entry carries of the origin's headers ──
+
+/// The headers that make an uploaded SVG inert in a browser.
+const UPLOAD_HEADERS: [(&str, &str); 2] = [
+    ("content-security-policy", "sandbox"),
+    ("content-disposition", "attachment; filename=\"upload.svg\""),
+];
+
+fn header(a: &Answer, name: &str) -> Option<String> {
+    let all: Vec<&str> = a
+        .headers
+        .get_all(name)
+        .iter()
+        .map(|v| v.to_str().unwrap())
+        .collect();
+    (!all.is_empty()).then(|| all.join(" | "))
+}
+
+fn assert_upload_headers(a: &Answer, what: &str) {
+    for (name, value) in UPLOAD_HEADERS {
+        assert_eq!(
+            header(a, name).as_deref(),
+            Some(value),
+            "{what} ({}) without the origin's {name}",
+            a.cache
+        );
+    }
+}
+
+async fn upload_origin(cc: &str) -> (Arc<Origin>, Arc<AppState>) {
+    let (o, st) = origin_and_state(cc).await;
+    *o.extra_200.lock().unwrap() = UPLOAD_HEADERS.to_vec();
+    (o, st)
+}
+
+/// A stale copy served at once while the refresh runs carries the origin's headers.
+#[tokio::test]
+async fn a_stale_while_revalidate_answer_carries_the_origin_headers() {
+    let (_o, st) = upload_origin("public, max-age=1, stale-while-revalidate=30").await;
+    let miss = fetch(&st, "/up-swr", &[]).await;
+    assert_eq!(miss.cache, "MISS");
+    assert_upload_headers(&miss, "the miss");
+    until("entry stored", || {
+        st.static_cache.get("/up-swr\u{1f}\u{1c}").fresh().is_some()
+    })
+    .await;
+    let hit = fetch(&st, "/up-swr", &[]).await;
+    assert_eq!(hit.cache, "HIT");
+    assert_upload_headers(&hit, "a fresh hit");
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let stale = fetch(&st, "/up-swr", &[]).await;
+    assert_eq!(stale.cache, "STALE-WHILE-REVALIDATE");
+    assert_upload_headers(&stale, "a stale-while-revalidate answer");
+}
+
+/// A stale copy served because the origin is down carries the origin's headers.
+#[tokio::test]
+async fn a_stale_if_error_answer_carries_the_origin_headers() {
+    let (o, st) = upload_origin("public, max-age=1").await;
+    fetch(&st, "/up-sie", &[]).await;
+    until("entry stored", || {
+        st.static_cache.get("/up-sie\u{1f}\u{1c}").fresh().is_some()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    o.down.store(true, Ordering::Relaxed);
+    let stale = fetch(&st, "/up-sie", &[]).await;
+    assert_eq!((stale.cache.as_str(), stale.body.as_str()), ("STALE", "v1"));
+    assert_upload_headers(&stale, "a stale-if-error answer");
+}
+
+/// A `304` from the origin confirms the entry: the answer, and the hits after it, keep the
+/// stored headers and take the ones the 304 brought (RFC 9111 §4.3.4).
+#[tokio::test]
+async fn a_revalidated_entry_keeps_its_headers_and_takes_the_304s() {
+    let (o, st) = upload_origin("public, max-age=1").await;
+    *o.extra_304.lock().unwrap() = vec![("x-revalidated", "yes"), ("set-cookie", "sid=x")];
+    fetch(&st, "/up-rv", &[]).await;
+    until("entry stored", || {
+        st.static_cache.get("/up-rv\u{1f}\u{1c}").fresh().is_some()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let revalidated = fetch(&st, "/up-rv", &[]).await;
+    assert_eq!(
+        (revalidated.cache.as_str(), revalidated.body.as_str()),
+        ("REVALIDATED", "v1")
+    );
+    assert_eq!(o.seen.lock().unwrap()[1].0.as_deref(), Some("\"e1\""));
+    assert_upload_headers(&revalidated, "the revalidated answer");
+    assert_eq!(
+        header(&revalidated, "x-revalidated").as_deref(),
+        Some("yes")
+    );
+    let after = fetch(&st, "/up-rv", &[]).await;
+    assert_eq!((after.cache.as_str(), o.count()), ("HIT", 2));
+    assert_upload_headers(&after, "a hit on the renewed entry");
+    assert_eq!(header(&after, "x-revalidated").as_deref(), Some("yes"));
+    assert_eq!(
+        header(&after, "set-cookie"),
+        None,
+        "a cookie on the 304 is not kept for other clients"
     );
 }
