@@ -808,13 +808,17 @@ impl StaticCache {
 
     /// Remove the entry under `key` if it is the one stored at `stored_at`, with its cost.
     fn map_remove_stored_at(&self, key: &str, stored_at: Instant) -> Option<L2Entry> {
+        self.map_remove_if(key, |e| e.inserted_at == stored_at)
+    }
+
+    /// Remove the entry under `key` if `this` says it is the one, with its cost. The test and the
+    /// removal are one step: an entry stored under the key in between is not the one tested.
+    fn map_remove_if(&self, key: &str, this: impl Fn(&L2Entry) -> bool) -> Option<L2Entry> {
         let removed = match &self.l2 {
-            Some(l2) => l2
-                .remove_if(key, |_, e| e.inserted_at == stored_at)
-                .map(|(_, e)| e),
+            Some(l2) => l2.remove_if(key, |_, e| this(e)).map(|(_, e)| e),
             None => LOCAL_L2.with(|m| {
                 let mut m = m.borrow_mut();
-                if m.get(key).is_some_and(|e| e.inserted_at == stored_at) {
+                if m.get(key).is_some_and(&this) {
                     m.remove(key)
                 } else {
                     None
@@ -1125,6 +1129,17 @@ impl StaticCache {
             max_entries,
         );
         true
+    }
+
+    /// Take out the entry under `key` if it is still the one `seen` was read from, and nothing
+    /// else: every store makes the entry's metadata anew, so an entry stored under the key since
+    /// (a fetch that ended in between) is not the same allocation, and stays. For a revalidation
+    /// that found the stale entry it read no longer valid under its key. `true` when it was
+    /// taken out. Its tags stay in the index, as an evicted entry's do, until a store under the
+    /// key replaces them, a purge of one of them, or the index making room drops them.
+    pub fn remove_unchanged(&self, key: &str, seen: &CacheHit) -> bool {
+        self.map_remove_if(key, |e| Arc::ptr_eq(&e.meta, &seen.meta))
+            .is_some()
     }
 
     /// Drop every entry stored under any of `tags`. One generation bump however many go;
@@ -1533,6 +1548,44 @@ mod tests {
         }
         for kept in ["/ab\u{1f}", "/a/b\u{1f}", "/b\u{1f}"] {
             assert!(cache.get(kept).fresh().is_some(), "{kept} must survive");
+        }
+    }
+
+    /// `remove_unchanged` takes out the entry a lookup read and nothing else: not one stored under
+    /// the key since, nor another key's, on either backend, and the byte count follows.
+    #[test]
+    fn remove_unchanged_takes_out_only_the_entry_that_was_read() {
+        for cache in [
+            StaticCache::with_byte_budget(0),
+            StaticCache::single_worker_with_byte_budget(0),
+        ] {
+            // A lifetime of 0: stale at once, as an entry being revalidated is.
+            let put = |k: &str, body: &'static [u8]| {
+                cache.insert(k, Bytes::from_static(body), default_meta(), 0, 0, 100)
+            };
+            put("/a", b"old");
+            put("/b", b"other");
+            let CacheLookup::Stale(seen) = cache.get("/a") else {
+                panic!("/a is stale")
+            };
+            put("/a", b"new");
+            assert!(
+                !cache.remove_unchanged("/a", &seen),
+                "an entry stored since was taken out"
+            );
+            assert!(matches!(cache.get("/a"), CacheLookup::Stale(h) if h.body == "new"));
+            let CacheLookup::Stale(seen) = cache.get("/a") else {
+                panic!("/a is stale")
+            };
+            assert!(
+                !cache.remove_unchanged("/b", &seen),
+                "another key's entry was taken out"
+            );
+            assert!(cache.remove_unchanged("/a", &seen));
+            assert!(matches!(cache.get("/a"), CacheLookup::Miss));
+            assert!(!cache.remove_unchanged("/a", &seen), "gone already");
+            assert!(matches!(cache.get("/b"), CacheLookup::Stale(h) if h.body == "other"));
+            assert_eq!(cache.bytes(), cache.recount());
         }
     }
 
