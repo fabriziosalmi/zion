@@ -167,9 +167,12 @@ attachment` and `Content-Security-Policy: sandbox` stays inert on every hit.
   itself, as a `200` is: no `Set-Cookie`, no `private`, `no-store` or `no-cache`, a `public`,
   `s-maxage` or `must-revalidate` on the 304 when the request carried `Authorization`, and a
   `Vary` zion can key on. Otherwise this client is answered with it and the entry stays as it
-  was, stale; when neither the 304 nor the entry has a `Cache-Control`, that answer says
-  `private` (the `public, max-age=<lifetime>` of a hit would let a shared cache downstream keep
-  one client's answer for every client). The renewed lifetime is that of the updated response:
+  was, stale. That answer is for this client alone, whatever the 304 or the entry said: its
+  `Cache-Control` is `private`, followed by those of the entry's directives a private cache obeys
+  that only hold it back or give the origin's own lifetime (`no-store`, `no-cache`,
+  `must-revalidate`, `no-transform`, `max-age`), never `public` or `s-maxage` (they would let a
+  shared cache downstream keep one client's answer for every client); and it carries the 304's
+  `Set-Cookie`, which the entry does not keep. The renewed lifetime is that of the updated response:
   the 304's `Cache-Control` or, when it sends none, the stored one (a bare `304` does not
   stretch a `max-age=60` entry to the profile TTL). The 304's `Date` replaces the stored one; a
   304 without a `Date` leaves none, and the answer is dated when it is sent.
@@ -185,7 +188,14 @@ attachment` and `Content-Security-Policy: sandbox` stays inert on every hit.
 A stale entry is **revalidated**, not blindly re-fetched. When a stored entry is
 past its freshness and carries a validator, zion sends a **conditional GET** to
 the origin (`If-None-Match` from the stored `ETag`, `If-Modified-Since` from
-`Last-Modified`):
+`Last-Modified`). Those are its only preconditions: the client's own `If-None-Match`,
+`If-Modified-Since`, `If-Match`, `If-Unmodified-Since` and `If-Range` are not sent, and neither
+is its `Range` (without its `If-Range` it would ask for a part of whatever the origin now has).
+A client's `If-None-Match: *` beside zion's `If-Modified-Since` used to reach the origin, which
+evaluates `If-None-Match` first (RFC 9110 §13.2.2): for an entry with no `ETag`, its `304`
+renewed a version the origin had since replaced. The validators go on the request to the
+origin only: a request that waits for this revalidation is answered from the renewed entry as
+the request it is (a plain `GET` gets the body, not a `304`).
 
 - **`304 Not Modified`** → the stored entry is still good: zion revives its
   freshness in place and serves the **cached body**, marked
@@ -234,7 +244,8 @@ background, so the client does not wait for the origin round trip. `M` is capped
   same content negotiation, but without the caller's `Authorization`, `Cookie`,
   `Proxy-Authorization`, conditional or `Range` headers, and without what zion asserts about
   the caller (the auth gate's `X-Auth-Subject` / `X-Auth-Email`, the mesh score, the verified
-  client certificate's `X-Client-Cert-*` and `X-Client-TLS-*`). It is conditional on the
+  client certificate's `X-Client-Cert-*` and the TLS fingerprint's `X-Client-TLS-*`, the JA4
+  and the allowlist entry it matched). It is conditional on the
   stored `ETag` / `Last-Modified`: a `304` revives the stored body and updates its headers,
   under the same rules as the synchronous revalidation ([What a hit carries](#what-a-hit-carries)),
   and a cacheable `200` replaces it, headers included. When the request that found the entry
@@ -242,6 +253,12 @@ background, so the client does not wait for the origin round trip. `M` is capped
   `must-revalidate` opt-in (RFC 9111 §3.5) as the foreground one: the origin may still have
   answered for that client. Anything else leaves the stale entry in place; once outside its
   window it is no longer served stale.
+- **Not for a variant keyed on what the refresh leaves out**: an entry whose `Vary` names one of
+  the headers above (`Vary: X-Auth-Subject` behind an auth gate, `Vary: X-Client-TLS-JA4`) is
+  not served stale while it revalidates. A refresh without that header would get the
+  representation for a request without it and store it under this variant's key. Such an entry
+  is answered as one without the window is: revalidated in the foreground with the client's own
+  request, or fetched again when it has no validator.
 - Metrics: `zion_cache_swr_served`, `zion_cache_swr_refreshes`,
   `zion_cache_swr_refresh_failures`, `zion_cache_swr_refresh_skipped`.
 - A client request with `Cache-Control: no-cache` / `max-age=0` still forces a fresh
