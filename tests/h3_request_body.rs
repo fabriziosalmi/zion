@@ -290,6 +290,34 @@ async fn h3_post_parts(
     gap: Duration,
     fin: bool,
 ) -> Option<u16> {
+    let end = if fin { End::Fin } else { End::Open };
+    h3_post_frames(port, path, declared, parts, gap, end).await
+}
+
+/// How the client ends a request stream after its DATA frames.
+#[derive(Clone, Copy, Debug)]
+enum End {
+    /// FIN.
+    Fin,
+    /// A trailer section, then FIN.
+    Trailers,
+    /// Nothing: the stream stays open while the client waits for the answer.
+    Open,
+}
+
+/// A body that is to reach the upstream whole: a name, its `content-length` lines, the sizes of
+/// its DATA frames, how the stream ends, and the bytes the upstream is to receive.
+type WholeCase<'a> = (&'a str, &'a [&'a str], &'a [usize], End, usize);
+
+/// [`h3_post_parts`], ending the stream as `end` says. A part of 0 is a zero-length DATA frame.
+async fn h3_post_frames(
+    port: u16,
+    path: &str,
+    declared: &[&str],
+    parts: &[usize],
+    gap: Duration,
+    end: End,
+) -> Option<u16> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut tls = rustls::ClientConfig::builder()
         .dangerous()
@@ -323,8 +351,17 @@ async fn h3_post_parts(
         // zion may stop reading once it has seen the body is too long: the answer still comes
         let _ = stream.send_data(bytes::Bytes::from(vec![b'a'; n])).await;
     }
-    if fin {
-        let _ = stream.finish().await;
+    match end {
+        End::Fin => {
+            let _ = stream.finish().await;
+        }
+        End::Trailers => {
+            let mut trailers = hyper::HeaderMap::new();
+            trailers.insert("x-checksum", hyper::header::HeaderValue::from_static("1"));
+            let _ = stream.send_trailers(trailers).await;
+            let _ = stream.finish().await;
+        }
+        End::Open => {}
     }
     let resp = stream.recv_response().await.ok()?;
     Some(resp.status().as_u16())
@@ -935,5 +972,100 @@ async fn a_h3_body_past_its_length_on_an_open_stream_is_refused_and_zion_keeps_s
         h3_post_declaring(port, "/waf/after", &["5"], 5).await,
         Some(200)
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A zero-length DATA frame does not end an HTTP/3 request body: RFC 9114 does not forbid one,
+/// and more DATA may follow it. h3 0.0.8 answers `recv_data` with `Ok(None)` at such a frame as
+/// at the end of the stream (hyperium/h3#372), and zion took that as the end of the body: one
+/// without a `Content-Length` went upstream cut at the empty frame as a complete body, one with
+/// a length was refused as short, and the bytes past a length after an empty frame were never
+/// seen, so the declared bytes went upstream as the whole body. On a streamed route, a WAF route
+/// and a `require_content_length` route alike, with the frames sent together and, for the short
+/// sequences, 300 ms apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zero_length_h3_data_frame_does_not_end_the_body() {
+    let dir = std::env::temp_dir().join(format!(
+        "zion-h3-empty-data-{}-{}",
+        std::process::id(),
+        free_port()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let Some((_daemon, port)) = boot(&dir, upstream(seen.clone())) else {
+        return;
+    };
+    // the longest run of empty DATA frames zion reads through (src/quic.rs, H3_BODY_END_ANSWERS)
+    let run = [0usize; 15];
+    let with_runs: Vec<usize> = [&run[..], &[500], &run, &[500], &[0]].concat();
+    let past_a_run: Vec<usize> = [&[10][..], &run, &[990]].concat();
+    // the runs go together only: 300 ms apart they would take seconds each
+    let skip = |gap: Duration, parts: &[usize]| !gap.is_zero() && parts.len() > 3;
+
+    for route in ["open", "waf", "framed"] {
+        for gap in [Duration::ZERO, Duration::from_millis(300)] {
+            // whole bodies, each to reach the upstream whole: (case, lines, DATA, end, bytes)
+            let whole_cases: [WholeCase<'_>; 7] = [
+                ("unframed", &[], &[500, 0, 500], End::Fin, 1000),
+                ("framed", &["1000"], &[500, 0, 500], End::Fin, 1000),
+                ("runs", &["1000"], &with_runs, End::Fin, 1000),
+                ("empty-last", &["10"], &[10, 0], End::Fin, 10),
+                ("zero-empty", &["0"], &[0], End::Fin, 0),
+                ("trailers", &["10"], &[10], End::Trailers, 10),
+                (
+                    "unframed-trailers",
+                    &[],
+                    &[500, 0, 500],
+                    End::Trailers,
+                    1000,
+                ),
+            ];
+            for (case, declared, parts, end, bytes) in whole_cases {
+                if skip(gap, parts) {
+                    continue;
+                }
+                let path = format!("/{route}/{case}-{}", gap.as_millis());
+                let status = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    h3_post_frames(port, &path, declared, parts, gap, end),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{path}: zion hung"));
+                std::thread::sleep(Duration::from_millis(300));
+                let whole = whole_bodies(&seen, &path);
+                assert!(
+                    status == Some(200) && whole.len() == 1 && whole[0].received == bytes,
+                    "{path}: content-length {declared:?} with DATA {parts:?} and {end:?}: \
+                     {status:?}, the upstream took {whole:?} of {bytes} bytes"
+                );
+            }
+
+            // past the length after empty frames: refused, never taken whole
+            let refused_cases: [(&str, &str, &[usize]); 3] = [
+                ("long-after-empty", "10", &[10, 0, 990]),
+                ("long-after-run", "10", &past_a_run),
+                ("zero-then-data", "0", &[0, 1000]),
+            ];
+            for (case, declared, parts) in refused_cases {
+                if skip(gap, parts) {
+                    continue;
+                }
+                let path = format!("/{route}/{case}-{}", gap.as_millis());
+                let status = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    h3_post_frames(port, &path, &[declared], parts, gap, End::Fin),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{path}: zion hung"));
+                std::thread::sleep(Duration::from_millis(300));
+                let whole = whole_bodies(&seen, &path);
+                assert!(
+                    status == Some(400) && whole.is_empty(),
+                    "{path}: content-length {declared} with DATA {parts:?}: {status:?}, the \
+                     upstream took it as a whole body: {whole:?}"
+                );
+            }
+        }
+    }
     let _ = std::fs::remove_dir_all(dir);
 }

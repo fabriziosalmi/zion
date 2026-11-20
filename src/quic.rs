@@ -309,6 +309,33 @@ impl std::fmt::Display for BodyLengthMismatch {
 
 impl std::error::Error for BodyLengthMismatch {}
 
+/// How many times in a row h3 has to answer `recv_data` with `Ok(None)` before the bridge
+/// takes a request body as ended. h3 0.0.8 answers `Ok(None)` at a zero-length DATA frame as
+/// it does at the end of the stream (hyperium/h3#372), and DATA may follow such a frame: RFC
+/// 9114 does not forbid one. Asked again, h3 reads on to the next frame, while at the end of
+/// the stream it answers `Ok(None)` again at once. So a run of up to 15 empty DATA frames is
+/// read through, and a 16th in a row still ends the body there.
+const H3_BODY_END_ANSWERS: usize = 16;
+
+/// The next DATA of a request body, `None` once h3 has answered [`H3_BODY_END_ANSWERS`] times
+/// in a row that the body ended. A trailer section is also answered `Ok(None)`, and what
+/// follows one is read on as more of the body.
+async fn recv_body_data<R>(
+    stream: &mut h3::server::RequestStream<R, Bytes>,
+) -> Result<Option<Bytes>, h3::error::StreamError>
+where
+    R: h3::quic::RecvStream,
+{
+    use bytes::Buf;
+    for _ in 0..H3_BODY_END_ANSWERS {
+        if let Some(mut buf) = stream.recv_data().await? {
+            let n = buf.remaining();
+            return Ok(Some(buf.copy_to_bytes(n)));
+        }
+    }
+    Ok(None)
+}
+
 /// Log an HTTP/3 request that failed inside zion, a few lines every ten seconds at most
 /// (a peer can make this happen as often as it likes). Without it the only trace is a
 /// `500` in the metrics.
@@ -363,11 +390,12 @@ where
     // A body declared empty must end empty, and the upstream request sends no body for it:
     // hyper never reads a body whose `Content-Length` is 0, so DATA after such headers was
     // dropped unseen and the request answered as if it were whole. Its end is waited for here,
-    // before the request goes on (a client that sends no body ends the stream with its HEADERS).
+    // before the request goes on (a client that sends no body ends the stream with its HEADERS),
+    // past any zero-length DATA frame, as [`recv_body_data`] reads it.
     if declared == Some(0) {
         let refused = match tokio::time::timeout(
             crate::dispatch::BODY_FRAME_IDLE_TIMEOUT,
-            stream.recv_data(),
+            recv_body_data(&mut stream),
         )
         .await
         {
@@ -417,13 +445,17 @@ where
     // The receive half is never asked to stop here: h3-quinn panics on `stop_sending` while a
     // read of the stream is in flight (it unwraps the stream the read holds). It is dropped
     // when this task ends instead, and quinn then sends STOP_SENDING for the bytes not read.
+    //
+    // The body ends where [`recv_body_data`] says so, not at h3's first `Ok(None)`: that comes
+    // at a zero-length DATA frame too, and ending there handed on the bytes before it as the
+    // whole body, with or without a `Content-Length`.
     let body_log = (remote_addr, method.clone(), path.clone());
     tokio::spawn(async move {
         let mut received: u64 = 0;
         let mut last: Option<Bytes> = None;
         loop {
-            let mut buf = match recv_stream.recv_data().await {
-                Ok(Some(buf)) => buf,
+            let bytes = match recv_body_data(&mut recv_stream).await {
+                Ok(Some(bytes)) => bytes,
                 Ok(None) => {
                     if let Some(declared) = declared.filter(|&d| d != received) {
                         let e = BodyLengthMismatch { declared, received };
@@ -448,19 +480,16 @@ where
                     break;
                 }
             };
-            use bytes::Buf;
-            let rem = buf.remaining();
-            if rem == 0 {
+            if bytes.is_empty() {
                 continue;
             }
-            received = received.saturating_add(rem as u64);
+            received = received.saturating_add(bytes.len() as u64);
             if let Some(declared) = declared.filter(|&d| received > d) {
                 let e = BodyLengthMismatch { declared, received };
                 log_h3_failure(&body_log.0, &body_log.1, &body_log.2, &e.to_string());
                 let _ = tx.send(Err(Box::new(e))).await;
                 break;
             }
-            let bytes = bytes::Buf::copy_to_bytes(&mut buf, rem);
             if declared == Some(received) {
                 last = Some(bytes);
                 continue;

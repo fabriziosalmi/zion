@@ -131,7 +131,12 @@ WAF route and a `require_content_length` route alike: a route that reads it firs
 (RFC 9114 §4.1.2; h3 checks neither). The upstream request reads a body no further than its
 declared length, so the DATA that completes the length is held back until the stream shows
 whether more follows, and a body declared `0` is read to its end before the request goes on
-(DATA after it is refused before anything is forwarded). Not covered: h3 0.0.8 reports a
-zero-length DATA frame as the end of the body, so DATA after one is not seen. A body past its
-length then goes upstream cut at the length, and a body without a `Content-Length` is cut at
-the empty frame.
+(DATA after it is refused before anything is forwarded). h3 0.0.8 reports a zero-length DATA
+frame as the end of the body ([hyperium/h3#372](https://github.com/hyperium/h3/issues/372)), so
+Zion asks again before it takes a body as ended, and a run of up to 15 empty DATA frames is
+read through: a body with empty frames inside reaches the upstream whole, and DATA past the
+length after them is refused. Not covered: a 16th empty DATA frame in a row still ends the body
+there, so a body past its length then goes upstream cut at the length, and a body without a
+`Content-Length` cut at that run. h3 reports a trailer section the same way, so DATA after one
+(malformed, RFC 9114 §4.1) is read as more of the body. The WAF, a buffer and the upstream
+request read the body from the same place, so a cut body is the same cut body for all of them.
