@@ -330,6 +330,16 @@ pub(crate) fn load_tls(
     Ok((tls_acceptor_store, _quic_reload_rx))
 }
 
+/// A file descriptor limit as the boot log shows it: `unlimited` for the kernel's "no limit"
+/// (`RLIM_INFINITY`, `i64::MAX` on macOS and `u64::MAX` on Linux), the number otherwise.
+fn fd_count(n: u64) -> String {
+    if n >= i64::MAX as u64 {
+        "unlimited".to_string()
+    } else {
+        n.to_string()
+    }
+}
+
 /// Build the config-derived snapshot (router, health map, trusted proxies, XFF policy, rate-limit
 /// settings: everything that follows from `zion.toml`) and fix the connection ceiling.
 ///
@@ -347,7 +357,11 @@ pub(crate) fn resolve_config(
         if soft > before {
             logging::info(
                 "boot",
-                &format!("file descriptor limit raised from {before} to {soft} (the hard limit)"),
+                &format!(
+                    "file descriptor limit raised from {} to {} (the hard limit)",
+                    fd_count(before),
+                    fd_count(soft)
+                ),
             );
         }
         let budget = bootstrap::fd_conn_budget(soft);
@@ -1110,6 +1124,18 @@ pub(crate) async fn drain_and_exit(
     }
 
     logging::info("shutdown", "ZION offline.");
+}
+
+#[cfg(test)]
+mod fd_count_tests {
+    #[test]
+    fn the_kernel_no_limit_value_reads_unlimited() {
+        assert_eq!(super::fd_count(65_535), "65535");
+        assert_eq!(super::fd_count(1_048_576), "1048576");
+        // macOS reports RLIM_INFINITY as i64::MAX, Linux as u64::MAX
+        assert_eq!(super::fd_count(i64::MAX as u64), "unlimited");
+        assert_eq!(super::fd_count(u64::MAX), "unlimited");
+    }
 }
 
 #[cfg(test)]
