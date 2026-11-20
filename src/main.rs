@@ -63,6 +63,7 @@ mod doctor;
 mod drain;
 mod error;
 mod h2_guard;
+mod h2_stream;
 mod handshake_rate;
 mod header_policy;
 mod health;
@@ -89,6 +90,7 @@ mod routing;
 mod security;
 #[cfg(any(feature = "geo-ita", feature = "geo-eu"))]
 mod sovereign;
+mod static_budget;
 mod static_files;
 mod suggest;
 mod tarpit;

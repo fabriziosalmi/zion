@@ -12,15 +12,15 @@ use crate::state::AppState;
 #[cfg(feature = "tls-fingerprint")]
 use crate::tls_fp;
 use crate::{
-    acme, bootstrap, drain, h2_guard, linger, logging, logq, metrics, net, proxy, security,
-    uri_norm,
+    acme, bootstrap, drain, h2_guard, h2_stream, linger, logging, logq, metrics, net, proxy,
+    security, uri_norm,
 };
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -100,13 +100,30 @@ pub(crate) async fn run_http_accept_loop(
     }
 }
 
+/// [`handle_http`] on an HTTP/2 stream (h2c) under the send deadline of `h2_conn` (see
+/// `h2_stream`), or for an HTTP/1.1 request (`h2_conn` is `None`) under that of the
+/// connection's `h1` stream. A named `async fn` and not a block
+/// in the service closure: awaited in a block there, the request future fails rustc's
+/// higher-ranked `Send` proof for the `serve_connection` future.
+async fn handle_http_stream(
+    req: Request<ReqBody>,
+    state: Arc<AppState>,
+    remote_addr: SocketAddr,
+    h2_conn: Option<Arc<h2_stream::Conn>>,
+    h1: Option<Arc<h2_stream::Stream>>,
+) -> Result<Response<ZionBody>, hyper::Error> {
+    let stream = h2_conn.and_then(h2_stream::enter).or(h1);
+    let resp = handle_http(req, state, remote_addr).await?;
+    Ok(h2_stream::watch(resp, stream.as_ref()))
+}
+
 /// Single HTTP/1.1 connection on port 80 — runs until the client closes.
 /// Extracted from the previous inline spawn; behaviour unchanged.
 async fn handle_http_connection(
     stream: tokio::net::TcpStream,
     addr: SocketAddr,
     state: Arc<AppState>,
-    builder: Arc<AutoBuilder<TokioExecutor>>,
+    builder: Arc<AutoBuilder<h2_stream::Executor>>,
 ) {
     let addr = security::canonical_peer(addr);
     // Mirror the HTTPS accept ceremony so :80 is not an unmetered bypass of
@@ -162,6 +179,11 @@ async fn handle_http_connection(
     );
     let (h2_verdict, flood_log_state) = (io.verdict(), state.clone());
     let io = TokioIo::new(io);
+    // HTTP/2 (h2c): the send deadline, as on :443 (see `h2_stream`).
+    let h2_conn = h2_stream::Conn::new(state.cfg().send_stall_secs);
+    // HTTP/1.1: the same deadline, for the connection (see `h2_stream::serve_http1`).
+    let h1 = h2_stream::http1_stream(state.cfg().send_stall_secs);
+    let h1_conn = h1.clone();
     // Connection-level idle timeout — matches the HTTPS path (1h, generous
     // enough for keep-alive; header_read_timeout bounds the slowloris header
     // phase, per-request limits live in handle_http).
@@ -169,15 +191,21 @@ async fn handle_http_connection(
         io,
         service_fn(move |req| {
             use http_body_util::BodyExt;
+            let h2 = req.version() == hyper::Version::HTTP_2;
+            let h2_conn = h2.then(|| h2_conn.clone());
+            let h1 = (!h2).then(|| h1.clone());
             let req_boxed = req
                 .map(|b: hyper::body::Incoming| b.map_err(|e| -> BoxError { Box::new(e) }).boxed());
-            handle_http(req_boxed, state.clone(), addr)
+            handle_http_stream(req_boxed, state.clone(), addr, h2_conn, h1)
         }),
     );
     tokio::pin!(conn);
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(3600),
-        drain::serve(conn.as_mut(), drain::subscribe(), |c| c.graceful_shutdown()),
+    let _ = h2_stream::serve_http1(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            drain::serve(conn.as_mut(), drain::subscribe(), |c| c.graceful_shutdown()),
+        ),
+        &h1_conn,
     )
     .await;
     log_h2_flood(&h2_verdict, &flood_log_state, addr);
@@ -526,6 +554,12 @@ fn spawn_https_handler(
         // `linger`). HTTP/2 ends one stream instead, so its requests never arm it.
         let armed = linger::Armed::default();
         let io = TokioIo::new(linger::Linger::new(io, armed.clone()));
+        // HTTP/2: a stream whose client leaves its response waiting past `send_stall_secs`
+        // is reset, and the connection's static responses share its slots (`h2_stream`).
+        let h2_conn = h2_stream::Conn::new(state.cfg().send_stall_secs);
+        // HTTP/1.1: the same deadline, for the connection (see `h2_stream::serve_http1`).
+        let h1 = h2_stream::http1_stream(state.cfg().send_stall_secs);
+        let h1_conn = h1.clone();
         // Connection-level idle timeout. 1h to cover long-lived HTTP/2
         // mux / WebSocket / SSE; per-request timeouts are in process_request.
         let conn = builder.serve_connection_with_upgrades(
@@ -535,6 +569,9 @@ fn spawn_https_handler(
                 let early_flag = early_flag.clone();
                 let client_fp = client_fp.clone();
                 let armed = (!negotiated_h2).then(|| armed.clone());
+                let h2 = req.version() == hyper::Version::HTTP_2;
+                let h2_conn = h2.then(|| h2_conn.clone());
+                let h1 = (!h2).then(|| h1.clone());
                 let held = held.clone();
                 #[cfg(feature = "tls-fingerprint")]
                 let tls_fp_identity = tls_fp_identity.clone();
@@ -591,14 +628,19 @@ fn spawn_https_handler(
                             .boxed(),
                         None => b.map_err(|e| -> BoxError { Box::new(e) }).boxed(),
                     });
-                    process_request(req_boxed, state, remote_addr, was_early).await
+                    let stream = h2_conn.and_then(h2_stream::enter).or(h1);
+                    let resp = process_request(req_boxed, state, remote_addr, was_early).await?;
+                    Ok::<_, hyper::Error>(h2_stream::watch(resp, stream.as_ref()))
                 }
             }),
         );
         tokio::pin!(conn);
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(3600),
-            drain::serve(conn.as_mut(), drain::subscribe(), |c| c.graceful_shutdown()),
+        let _ = h2_stream::serve_http1(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3600),
+                drain::serve(conn.as_mut(), drain::subscribe(), |c| c.graceful_shutdown()),
+            ),
+            &h1_conn,
         )
         .await;
         log_h2_flood(&h2_verdict, &flood_log_state, remote_addr);

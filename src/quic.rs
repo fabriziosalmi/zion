@@ -14,6 +14,7 @@
 //! `clippy::duplicated_attributes`.
 
 use bytes::Bytes;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -183,6 +184,11 @@ pub fn spawn_quic_listener(
                 // also outlives them when the client closes first.
                 let mut drain_rx = crate::drain::subscribe();
                 let mut requests = tokio::task::JoinSet::new();
+                // What the connection's requests share, as on HTTP/2: the static-response
+                // slots and the send deadline (`h2_stream`). Without them each of its 256
+                // streams could hold an open file, or an upstream connection, for as long as
+                // its client withheld flow-control credit and kept the connection alive.
+                let streams = crate::h2_stream::Conn::new(state.cfg().send_stall_secs);
                 loop {
                     let accepted = tokio::select! {
                         a = h3_conn.accept() => a,
@@ -197,7 +203,8 @@ pub fn spawn_quic_listener(
                         Ok(Some(resolver)) => {
                             let state = state.clone();
                             let client_fp = client_fp.clone();
-                            requests.spawn(async move {
+                            let streams = streams.clone();
+                            requests.spawn(crate::h2_stream::scope(streams, async move {
                                 match resolver.resolve_request().await {
                                     Ok((req, stream)) => {
                                         if let Err(e) = handle_h3_request(
@@ -216,7 +223,7 @@ pub fn spawn_quic_listener(
                                         eprintln!("  h3 resolve error: {e}");
                                     }
                                 }
-                            });
+                            }));
                         }
                         Ok(None) => break,
                         Err(e) => {
@@ -530,6 +537,12 @@ where
         }
     };
 
+    // A static response's slot (`static_budget`), kept until the last of its body has been
+    // handed to QUIC: each send returns once quinn has copied the piece.
+    let _static_slot = resp
+        .extensions()
+        .get::<crate::static_budget::StaticSlot>()
+        .cloned();
     let status = resp.status();
     let mut h3_resp_builder = hyper::Response::builder().status(status);
 
@@ -553,7 +566,19 @@ where
     // INVARIANT: hop-by-hop headers were filtered above; remaining headers
     // came from a successfully-built `Response`, so `body(())` cannot fail.
     let h3_resp = h3_resp_builder.body(()).unwrap();
-    send_stream.send_response(h3_resp).await?;
+    // Each send must be taken by the client within `send_stall_secs`: QUIC flow control lets
+    // it withhold credit, and the connection stays up while it answers PINGs. Past that the
+    // stream is reset, which drops what the response holds (an open file, an upstream
+    // connection) with the request task.
+    let stall = crate::h2_stream::send_stall();
+    if within(stall, send_stream.send_response(h3_resp))
+        .await
+        .transpose()?
+        .is_none()
+    {
+        reset_stalled(&mut send_stream);
+        return Ok(());
+    }
 
     use http_body_util::BodyExt;
     let mut body = resp.into_body();
@@ -561,8 +586,21 @@ where
     loop {
         match body.frame().await {
             Some(Ok(frame)) => {
-                if let Ok(data) = frame.into_data() {
-                    send_stream.send_data(data).await?;
+                if let Ok(mut data) = frame.into_data() {
+                    // A body read whole is one chunk of up to 576 KiB, and a proxied chunk may
+                    // be larger: sent in pieces of 64 KiB, so that the deadline counts per
+                    // 64 KiB, as it does on HTTP/2 (`h2_stream::SEND_PIECE`).
+                    while !data.is_empty() {
+                        let piece = data.split_to(data.len().min(H3_SEND_PIECE));
+                        if within(stall, send_stream.send_data(piece))
+                            .await
+                            .transpose()?
+                            .is_none()
+                        {
+                            reset_stalled(&mut send_stream);
+                            return Ok(());
+                        }
+                    }
                 }
             }
             Some(Err(_)) => {
@@ -575,6 +613,32 @@ where
 
     send_stream.finish().await?;
     Ok(())
+}
+
+/// The most of a response body one HTTP/3 send carries: what a static file is streamed in.
+const H3_SEND_PIECE: usize = crate::h2_stream::SEND_PIECE;
+
+/// `send` to its end, or `None` when the client has not taken it within `stall` (`None` = no
+/// deadline).
+async fn within<T>(stall: Option<std::time::Duration>, send: impl Future<Output = T>) -> Option<T> {
+    match stall {
+        None => Some(send.await),
+        Some(stall) => tokio::time::timeout(stall, send).await.ok(),
+    }
+}
+
+/// Reset a response stream whose client took nothing of it within `send_stall_secs`, as
+/// HTTP/2 does (`H3_REQUEST_CANCELLED` is HTTP/3's `CANCEL`), and count it. Dropping the stream
+/// instead would finish it, and a client could read a cut body as a whole one.
+fn reset_stalled<S, B>(stream: &mut h3::server::RequestStream<S, B>)
+where
+    S: h3::quic::SendStream<B>,
+    B: bytes::Buf,
+{
+    stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+    metrics::METRICS
+        .streams_stalled
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]

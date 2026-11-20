@@ -60,6 +60,7 @@ When `rate_limit_rps = 0` (default), rate limiting is disabled — the code retu
 | Connection pool idle | 30 seconds | Reclaim unused upstream connections |
 | TCP keepalive (clients) | `tcp_keepalive_secs`, 60 s | Free the slot of a peer that vanished while the connection was *idle* |
 | `TCP_USER_TIMEOUT` (clients) | `tcp_user_timeout_secs`, off (opt-in, Linux) | Free the slot of a client that vanished *while a response was in flight*; also drops a client that stops reading for longer than the value |
+| Response waiting for a client that takes nothing of it | `send_stall_secs`, 300 s | Reset that HTTP/2 or HTTP/3 stream, or close that HTTP/1.1 connection, and free the file, share or upstream connection it holds ([below](#http-2-responses-a-client-does-not-read)) |
 | Upstream DNS lookup | `dns_timeout_ms`, 2000 ms | A resolver outage or hang falls back to the last good answer instead of stalling connections |
 
 ## Connection limit
@@ -100,6 +101,17 @@ connections that are all stuck mid-download hold about 900 MB. Where that matter
 container that serves large files), set `max_connections` from the busy figure, and
 `max_connections_per_ip` (an eighth of the ceiling by default) so that one address cannot take
 the whole of it.
+
+The HTTP/2 row is one stream, and a connection carries up to 128 (an HTTP/3 connection, 256). On
+a static route at most eight of them stream a file at once, and the smaller files read whole share
+4.5 MiB, so one connection that does not read holds at most eight files open and about 10.5 MiB of
+file data (eight streamed responses of up to 768 KiB, and 4.5 MiB), not one file per stream. One
+address may open an eighth of the ceiling's connections (and over QUIC, any number), so every
+static response also takes from its address's share of a budget for the whole process: 256 MiB of
+2 GiB on a 16 GiB host (see
+[HTTP/2 responses a client does not read](#http-2-responses-a-client-does-not-read)). A proxied
+route has no such cap: each stream a client does not read holds an upstream connection until
+`send_stall_secs` resets it.
 
 ## New-handshake floods
 
@@ -250,6 +262,170 @@ nothing and opens with the HTTP/2 preface, or the preface on the plaintext liste
 connection is counted in `zion_h2_control_flood_closed_total{reason}` and logged with the client
 address (one line a second at most). The `GOAWAY` is sent if the connection takes it at once; a
 client that is still sending when the socket closes may see a reset instead.
+
+## HTTP/2 responses a client does not read
+
+HTTP/2 flow control lets a client stop a response wherever it likes: a stream whose window is zero
+is sent nothing more, and the server waits with the next chunk of the response in hand. The
+HTTP/2 library puts no deadline on that wait, and the keep-alive `PING` (every 30 s) does not help:
+it asks whether the client is alive, and a client that answers it can keep its windows closed for
+the hour a connection may last. Whatever the response holds stays held: on a static route the
+open file and up to 768 KiB of it, on a proxied route an upstream connection. One connection opens
+up to 128 streams, and v0.18.0 held a file for each: 128 descriptors to a 2 MiB file for 128
+requests on one connection with its windows closed. One address may hold an eighth of the
+connection ceiling (2048 connections on a 16 GiB host): 262,144 files, sixteen for every connection
+of the ceiling, where the descriptor budget is about two. Eight files and 4.5 MiB read whole per
+connection, the first bound below, still let that address hold 16,384 files and about 21 GiB of
+file data: more than the host. HTTP/3 has the same hold through QUIC's flow control, with 256
+streams to a connection and no per-address connection cap at all. Past the descriptor limit,
+accepts and upstream connects fail with `EMFILE`.
+
+Three bounds apply:
+
+- **Per connection, on HTTP/2 and HTTP/3: eight large static files at once, and a budget for small
+  ones.** A `GET` on a static route takes a slot of its connection before the file is opened. A
+  file above 576 KiB is streamed with the file open, and takes one of eight file slots, whatever
+  range of it is asked for. A smaller one is read whole, and takes its length out of a budget of
+  4.5 MiB, eight of the largest. The two are apart so that a page's stylesheets, scripts and
+  images are never kept waiting by large files being sent on the same connection. A request that
+  finds no slot waits for one, holding no file and no buffer: what it waits for is its own
+  client's. A `HEAD` takes none. A connection from a `trusted_proxies` peer has no such slots: a
+  proxy that multiplexes many clients over one HTTP/2 connection would make them wait for each
+  other.
+- **Per client address and for the whole process, on every protocol: a budget for what static
+  responses hold.** Every static `GET`, on HTTP/1.1, HTTP/2 and HTTP/3, also takes the bytes it may
+  hold from a budget derived from the host: 128 KiB for each connection of the connection ceiling,
+  at most an eighth of the memory the process may use, at least 6 MiB. A streamed response is
+  counted as 768 KiB, what it holds when stalled, so the budget also bounds the files held open, to
+  a sixth of the connection ceiling. There is no separate count of open files for that reason: the
+  descriptor budget gives each connection of the ceiling two, so a file counter sized from it
+  would sit far above the sixth the bytes already allow, and never be the bound that applies. One client address may hold an eighth of it, as it may hold an
+  eighth of the connections. The address is the peer's, keyed as the per-IP connection cap keys
+  it, or on a connection from a `trusted_proxies` peer the client the request resolves to (the
+  address `X-Real-IP` carries). A request that finds its address's share or the budget spent waits
+  at most 10 s, holding nothing, and is then answered `503`: what it waits for may be another
+  client's, and a client that does not read keeps what it holds until `send_stall_secs` resets it,
+  five minutes by default. The boot log gives the budget (`static responses may hold ...`):
+
+  | Host | Connection ceiling | Budget | One address | Streamed files, all / one address |
+  | --- | --- | --- | --- | --- |
+  | 16 GiB (the boot log of a 16 GiB macOS host with no descriptor limit; a Linux host with `LimitNOFILE` 65535 derives the same ceiling) | 16384 | 2 GiB | 256 MiB | 2730 / 341 |
+  | `max_connections = 1024` (the tests below) | 1024 | 128 MiB | 16 MiB | 170 / 21 |
+  | 512 MiB container (computed, not run) | 1000 | 64 MiB | 8 MiB | 85 / 10 |
+
+  Waits are counted in `zion_static_budget_waited_total`, refusals in
+  `zion_static_budget_refused_total`. There is no setting: `max_connections` sizes the budget with
+  the ceiling.
+- **A deadline on a response nothing is taken from, on every protocol.** When a response has had
+  a piece ready for `[server] send_stall_secs` (default 300) and the client has not taken it (an
+  HTTP/2 or HTTP/3 client that does not open its window, an HTTP/1.1 client that does not read
+  its socket), that one stream is reset (HTTP/2 `RST_STREAM(CANCEL)`, HTTP/3
+  `H3_REQUEST_CANCELLED`) and the connection and its other streams go on; HTTP/1.1 cannot cancel
+  one response, so its connection is closed. Its file, its buffers, its slot and share and its
+  upstream connection are freed, static and proxied routes alike. On HTTP/1.1 a piece counts as
+  taken once the kernel has taken it into the socket's buffer, and the deadline is checked
+  before the connection is polled again: polled first, a connection on macOS found room the
+  kernel had made in that buffer without waking it, handed over one more piece, and so closed at
+  6.0 s under a 3 s deadline instead of 3.0 s. A body is handed to the HTTP/2 library in pieces of at most 64 KiB, and HTTP/3
+  sends at most 64 KiB at a time, whatever the size of the body's chunks: the library takes a
+  piece as soon as the window has room for one byte of it, so a larger chunk (a static file read
+  whole is one chunk of up to 576 KiB, a proxied chunk can be hundreds of KiB) had to be taken
+  whole within the deadline, and the last chunk of a response left the stream with no deadline at
+  all. On HTTP/2 a static response also ends its stream only once its last piece has left the
+  library's buffer, with one empty `DATA` frame that carries the end, so the deadline covers the
+  whole of it. The time counts from the last piece the client took, not from the start of the
+  response: a client that takes 64 KiB or more in every 300 s is never cut, whatever the size of
+  the response. A stream waiting on its own source (a slow upstream, an event stream with nothing
+  to send) is not waiting on the client, and no deadline applies. Resets and closes are counted in
+  `zion_streams_stalled_total`. `0` turns the deadline off. It applies on both listeners (h2c and
+  HTTP/1.1 on the plain one too, which serves no static route).
+
+```toml
+[server]
+send_stall_secs = 300   # 0 = no deadline
+```
+
+Measured with the debug build on macOS (one run each, `tests/static_memory.rs`), v0.18.0 against
+this version:
+
+| Case | v0.18.0 | Now |
+| --- | --- | --- |
+| One connection, 128 requests for a 2 MiB file, windows closed | 128 descriptors | 8 |
+| The same over HTTP/3, no stream credit | not measured | 8 |
+| One connection, 128 requests for a 576 KiB file, windows closed | 5 to 87 MiB, 128 begun | 5 to 22 MiB, 8 begun |
+| The same, each window opened by one byte | 5 to 90 MiB, 128 begun | 5 to 22 MiB, 8 begun |
+| The same through a route that compresses with brotli | 12 to 360 MiB, 128 begun | 12 to 41-85 MiB over three runs, 8 begun |
+| One connection, 100 requests for a 32 MiB file | 5 to 80 MiB | 5 to 22 MiB |
+| A route with `precompressed = true`, 64 requests for a 2 MiB file | 64 descriptors | 8 |
+| One address, 16 HTTP/2 connections, 8 requests each for a 2 MiB file, windows closed, `max_connections = 1024` | 128 descriptors, 5 to 97 MiB | 21 descriptors, 5 to 30 MiB; the other 107 answered `503` 10.1 to 10.8 s in |
+| The same over 16 HTTP/3 connections | 128 descriptors, 5 to 80 MiB | 21, 5 to 28 MiB |
+| The same over 30 HTTP/1.1 connections, one request each for a 32 MiB file, not read | 30 descriptors | 21 |
+| One trusted proxy connection carrying 100 clients, one 2 MiB file each, then 40 requests from one client and 100 more clients | 240 responses begun | 100 on the one connection, 21 for the one client, 170 in all (the budget) |
+| A 20 KiB file asked for beside eight stalled 2 MiB responses on one connection | 0.20 s | 0.21 s |
+
+With `send_stall_secs = 2`, every stalled stream is reset about 2 s in (2.00 s on HTTP/2, 1.95 s on
+h2c, 2.08 s for the descriptors on HTTP/3), its file closed and the reset counted. A batch client
+that keeps the default 65,535-byte windows and reads no body until 30 responses for a 200 KiB file
+have begun gets 23 at once, the 23 reset at 2.06 s and the other seven begun then; with the 64 KiB
+pieces and the held end both taken out of the code, no stream was reset in 7 s and the seven never
+began. A 20 KiB file to a window of one byte is reset at 2.06 s (not within 5 s without the held
+end). A proxied download of 768 KiB whose upstream sends it in one write, read
+64 KiB every 600 ms, completes in 7.3 s; handed over in the upstream's chunks, it was reset 4.3 s
+in, 448 KiB in, though the client never stopped reading. Over HTTP/1.1, 21 clients of one address
+that stop reading a 32 MiB file (a 16 MiB share, `send_stall_secs = 3`) have their connections
+closed at the deadline, and a 22nd request from the address, waiting for the share, is answered
+`200` 3.03 s in (without the deadline, `503` at 11.1 s); a proxied 16 MiB download not read for
+4 s gets 450,917 bytes and the close (all of it without the deadline); a reader that takes 64 KiB
+every 300 ms through a 16 KiB receive buffer gets all of a 2 MiB file in 8.1 s under a 2 s
+deadline (cut at 4.3 s, 1 MiB in, with a deadline counted from the first piece). A client that reads 64 KiB every 400 ms
+outlasts a 2 s deadline on HTTP/2 and HTTP/3. When the address's share is held by streams that do
+not read and `send_stall_secs = 3`, the 11 requests waiting behind them begin once those are reset
+(3.1 s in), none refused; 64 requests for a 2 MiB file from one address that reads them are all
+served in 0.64 s, none refused.
+
+What the three do not cover:
+
+- A proxied route has no per-connection cap and no budget: a client can still hold one upstream
+  connection per stream it does not read, for up to `send_stall_secs`, and open new streams after
+  the reset. The per-IP connection cap bounds it, and `[upstream.x] max_in_flight` when it is set.
+  The last piece of a proxied response (64 KiB at most) is handed to the HTTP/2 library with the
+  end of the stream, and what the client does not read of it waits in the library's buffer with no
+  deadline: by the code, at most 64 KiB for each of the 128 streams a connection may hold open (a
+  stream whose bytes are still buffered counts against that cap), the upstream connection free by
+  then. This was not measured. On HTTP/3 the QUIC library holds what it accepted, within the credit
+  the client granted.
+- About eight client addresses that fill their shares spend the budget for the whole process.
+  After that, static `GET`s from every client wait 10 s and get `503`, until `send_stall_secs`
+  resets the holders (which must then ask again). This replaces the previous outcome, memory
+  exhaustion of the host. Measured with `max_connections = 1024` (128 MiB, 16 MiB a share,
+  `send_stall_secs = 15`), the eight addresses being clients named by a trusted proxy, since on
+  macOS the loopback addresses 127.0.0.2 and up cannot be bound without configuring them as root:
+  eight clients held 168 streamed responses, a ninth got the 2 the budget had left and `503` for
+  its other 3 at 12.1 s (10 s after it asked), the holders were reset at 15.1 s, and the ninth's
+  next request began at once (asked at 17.0 s). A rising `zion_static_budget_refused_total` is the
+  signal to alert on. What an operator can do: lower `send_stall_secs`, so that holders that do
+  not read are reset sooner; raise `max_connections` or the memory the process may use, which
+  sizes the budget; put a proxy that resolves clients in `trusted_proxies`.
+- Many clients behind one address (a large NAT) share one address's share, as they share the
+  per-IP connection cap. Behind a proxy of yours, list it in `trusted_proxies`.
+- A client that takes one piece just inside each deadline keeps its stream, at the cost of
+  reading it (64 KiB per 300 s per stream at the default).
+- A slot is held for as long as its response is being sent, whether the client reads or not. A
+  ninth large file asked for on one connection gets no response, not even its headers, until one
+  of the eight has been sent in full or reset: behind eight long downloads, for as long as the
+  first of them takes (measured: 8.20 s behind eight 2 MiB downloads each read 64 KiB every
+  250 ms, the instant the first of them ended), and behind eight paused videos, up to
+  `send_stall_secs`. A client that wants the headers of more than eight large responses before it
+  reads the body of any of them (a page that awaits every `fetch` of a batch before it reads one)
+  waits until `send_stall_secs` resets the eight it does not read, and those then fail (measured
+  with nine requests for a 2 MiB file sent at once: the last headers came 2.06 s in under a 2 s
+  deadline, 10.06 s in under a 10 s one, as the eight were reset). The same holds for more than
+  4.5 MiB of small files unread, which a browser does not reach: its windows are larger than such
+  files, so they are sent at once. Over HTTP/1.1 a browser knows it has six connections to a host
+  and queues its requests by priority; over HTTP/2 it believes it has 128 streams, so the wait is
+  zion's, and it follows no priority: requests sent together take the free slots in the order zion
+  has looked at their files, not the order they were sent (in the two runs above, the one left
+  waiting was the first and the seventh sent).
 
 ## Protecting the upstream
 

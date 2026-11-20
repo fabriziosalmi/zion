@@ -2,7 +2,7 @@
 
 Zion is a single async Rust binary built on Tokio, Hyper, and rustls.
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-87 modules, ~96,600 lines of Rust.
+89 modules, ~98,400 lines of Rust.
 
 ## Module map
 
@@ -55,6 +55,8 @@ src/
 ├── tui.rs         # `zion top` live dashboard (feature: --features tui)
 ├── handshake_rate.rs # Per-IP new-TLS-handshake rate limit (token bucket; IPv6 keyed per /64), enforced at accept
 ├── h2_guard.rs    # Per-connection bound on HTTP/2 control frames, and the client-preface check when ALPN chose h2
+├── h2_stream.rs   # HTTP/2 and HTTP/3 responses a client does not read: the send deadline per stream, the static-file slots per connection, bodies in 64 KiB pieces
+├── static_budget.rs # What static responses may hold at once: per connection, per client address and for the whole process
 ├── linger.rs      # Lingering close for HTTP/1.1: a client still sending a body when zion answers gets the answer
 ├── upstream_body.rs # The request body as sent upstream: the route's `max_body_mb` and the no-progress deadline
 ├── header_policy.rs # Request headers and cookies a route strips or refuses (`strip_headers`, `deny_headers`, `deny_cookies`)
