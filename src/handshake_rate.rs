@@ -27,6 +27,9 @@ const MAX_TRACKED: usize = 131_072;
 /// The rate-limit key for a peer: the full IPv4 address, or the /64 prefix of an IPv6 address
 /// (the low 64 bits zeroed).
 fn key_for(ip: IpAddr) -> IpAddr {
+    // An IPv4 client seen through a dual-stack listener (`::ffff:a.b.c.d`) is keyed by its
+    // IPv4 address: the /64 mask would put all of IPv4 in the one bucket `::`.
+    let ip = ip.to_canonical();
     match ip {
         IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => {
@@ -186,6 +189,28 @@ mod tests {
         assert!(
             r.admit_at(ip("9.9.9.9"), 2, 2, now),
             "a quiet IP is unaffected"
+        );
+    }
+
+    /// Through a `[::]` listener every IPv4 peer arrives as `::ffff:a.b.c.d`; the /64 mask
+    /// zeroed the embedded IPv4 address, so all of IPv4 shared the bucket keyed `::`.
+    #[test]
+    fn a_mapped_ipv4_peer_keeps_its_own_bucket() {
+        let (a, b) = (ip("::ffff:198.51.100.1"), ip("::ffff:203.0.113.9"));
+        assert_eq!(key_for(a), ip("198.51.100.1"));
+        let r = PerIpHandshakeRate::new();
+        let now = Instant::now();
+        for _ in 0..100 {
+            let _ = r.admit_at(a, 2, 2, now);
+        }
+        assert!(!r.admit_at(a, 2, 2, now), "the flooding IP is now rejected");
+        assert!(
+            r.admit_at(b, 2, 2, now),
+            "another IPv4 client keeps its own bucket"
+        );
+        assert!(
+            !r.admit_at(ip("198.51.100.1"), 2, 2, now),
+            "the same client, mapped or not, is one bucket"
         );
     }
 

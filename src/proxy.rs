@@ -433,6 +433,24 @@ const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection")
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
 const TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
 
+/// The `X-Forwarded-For` that `append` sends: every inbound line joined in order with `, `,
+/// then `client`, on one line (what nginx's `$proxy_add_x_forwarded_for` does). Appending a
+/// line of its own put zion's entry on a second line, which an upstream that reads only the
+/// first line (or that line's last element) never saw: it took a value the client wrote.
+fn appended_xff(headers: &hyper::HeaderMap, client: &HeaderValue) -> HeaderValue {
+    let mut joined = Vec::new();
+    for line in headers.get_all(&X_FORWARDED_FOR) {
+        joined.extend_from_slice(line.as_bytes());
+        joined.extend_from_slice(b", ");
+    }
+    if joined.is_empty() {
+        return client.clone();
+    }
+    joined.extend_from_slice(client.as_bytes());
+    // Header values joined with ", " are still a header value; keep the client's alone if not.
+    HeaderValue::from_bytes(&joined).unwrap_or_else(|_| client.clone())
+}
+
 /// Forwarding header hygiene shared by the normal proxy ([`prepare_request`])
 /// and the WebSocket upgrade ([`proxy_websocket`]). Strips the dangerous
 /// hop-by-hop / credential headers that must never reach the upstream
@@ -488,7 +506,8 @@ fn apply_forwarding_hygiene<B>(
             if let Ok(val) = HeaderValue::from_str(&buf) {
                 match xff_mode {
                     XffMode::Append => {
-                        req.headers_mut().append(X_FORWARDED_FOR, val.clone());
+                        let folded = appended_xff(req.headers(), &val);
+                        req.headers_mut().insert(X_FORWARDED_FOR, folded);
                     }
                     XffMode::Rewrite => {
                         req.headers_mut().insert(X_FORWARDED_FOR, val.clone());
@@ -1945,12 +1964,38 @@ mod tests {
             XffMode::Append,
         )
         .unwrap();
-        // Append: spoofed value is preserved as a separate header value;
-        // our resolved IP is appended. Downstream reading XFF[0] would see
-        // 9.9.9.9 — this is the documented foot-gun of `append` mode.
+        // Append: the spoofed value is preserved and our resolved IP is appended, on the same
+        // line. Downstream reading the leftmost element would see 9.9.9.9 — this is the
+        // documented foot-gun of `append` mode; the rightmost is ours.
         let vals = xff_values(&req);
-        assert_eq!(vals, vec!["9.9.9.9".to_string(), "1.2.3.4".to_string()]);
+        assert_eq!(vals, vec!["9.9.9.9, 1.2.3.4".to_string()]);
         assert_eq!(req.headers().get("X-Real-IP").unwrap(), "1.2.3.4");
+    }
+
+    #[test]
+    fn xff_append_folds_every_inbound_line_into_one() {
+        // Two inbound lines (a client's, then a front proxy's): one line out, in order, ours
+        // last, so an upstream reading only the first line still sees our entry.
+        let req = Request::builder()
+            .uri("/test")
+            .header("X-Forwarded-For", "9.9.9.9")
+            .header("X-Forwarded-For", "10.0.0.1, 203.0.113.9")
+            .body(())
+            .unwrap();
+        let addr: SocketAddr = "203.0.113.9:5000".parse().unwrap();
+        let req = prepare_request(
+            req,
+            &scheme(),
+            &authority(),
+            Some(addr),
+            "https",
+            XffMode::Append,
+        )
+        .unwrap();
+        assert_eq!(
+            xff_values(&req),
+            vec!["9.9.9.9, 10.0.0.1, 203.0.113.9, 203.0.113.9".to_string()]
+        );
     }
 
     #[test]

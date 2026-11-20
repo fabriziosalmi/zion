@@ -319,7 +319,7 @@ TE, Trailer, Transfer-Encoding, Upgrade
 
 ## X-Forwarded-For policy (`xff_mode`)
 
-Outbound XFF behaviour is configured at `[server]` level. The default (`append`) preserves the prior behaviour and is correct when Zion sits behind a sanitising edge (CDN/ALB) that has already vetted the inbound chain. When Zion is the **front edge**, the default is unsafe: a client can send `X-Forwarded-For: 1.2.3.4` and the leftmost entry in the chain forwarded to your upstream will be that attacker-controlled value. Downstream apps that read `XFF[0]` for ACL or audit will be tricked.
+Outbound XFF behaviour is configured at `[server]` level. The default (`append`) is correct when Zion sits behind a sanitising edge (CDN/ALB) that has already vetted the inbound chain. When Zion is the **front edge**, the default is unsafe: a client can send `X-Forwarded-For: 1.2.3.4` and the leftmost entry in the chain forwarded to your upstream will be that attacker-controlled value. Downstream apps that read `XFF[0]` for ACL or audit will be tricked.
 
 ```toml
 [server]
@@ -328,11 +328,18 @@ xff_mode = "rewrite"   # one of: "append" | "rewrite" | "drop"
 
 | Mode | Inbound XFF | Outbound XFF | Use when |
 |---|---|---|---|
-| `append` (default) | preserved | inbound chain + resolved client IP appended | Zion is behind a trusted edge that already strips/normalises XFF |
+| `append` (default) | preserved | one line: the inbound lines joined in order, then the resolved client IP | Zion is behind a trusted edge that already strips/normalises XFF |
 | `rewrite` | dropped | single entry: the resolved client IP | Zion is the front edge — guarantees a clean one-hop chain regardless of what the client sent |
 | `drop` | dropped | not emitted | Upstreams must not learn the client IP at all |
 
-`X-Real-IP` is **always** set from the resolved client IP and never trusted from inbound headers, regardless of `xff_mode`. The "resolved client IP" is the output of `TrustedProxies::resolve_client_ip`: the rightmost X-Forwarded-For entry that is not a trusted-proxy CIDR, or the TCP peer IP when no proxies are configured.
+`X-Real-IP` is **always** set from the resolved client IP and never trusted from inbound headers, regardless of `xff_mode`. The "resolved client IP" is the output of `TrustedProxies::resolve_client_ip`: the TCP peer IP when it is not in `trusted_proxies`; otherwise the rightmost X-Forwarded-For entry that is not a trusted-proxy CIDR, or the peer IP when every entry is trusted or there is none. How the header is read:
+
+- Every `X-Forwarded-For` field line counts, in order, as one list: a proxy that adds a line of its own (HAProxy `option forwardfor`) puts the client it saw on the last one.
+- An entry may be `ip`, `ip:port`, `[ipv6]` or `[ipv6]:port`; an empty entry is skipped. A byte that is not ASCII makes only its own entry unreadable.
+- An entry that cannot be read as an address (`unknown`, anything else) stops the walk: a trusted proxy wrote it, the entries to its left are the client's own, and the proxy's address is not the client's. The client is then `0.0.0.0`, which the built-in internal rule does not admit (all such clients share one per-IP rate-limit bucket), and zion logs a warning, at most three a minute.
+- An IPv4 peer of a dual-stack `[::]` listener (`::ffff:a.b.c.d`) is taken as its IPv4 address everywhere: `trusted_proxies`, `internal_networks`, `handshake_rate_allowlist`, the per-IP limits and `X-Real-IP`. An entry of those lists written in the mapped form is read as the IPv4 network it names.
+- `X-Forwarded-For` is read even when the request's `Connection` header lists it.
+- The HTTPS and plain-HTTP listeners resolve the client the same way.
 
 ## mTLS client certificate forwarding
 

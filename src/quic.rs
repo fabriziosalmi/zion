@@ -138,7 +138,7 @@ pub fn spawn_quic_listener(
                     }
                 };
 
-                let remote_addr = conn.remote_address();
+                let remote_addr = crate::security::canonical_peer(conn.remote_address());
                 // The client certificate the handshake verified (`[tls] client_auth`), attested
                 // on every request of the connection as the TCP listener does.
                 let client_fp: Option<Arc<str>> = conn
