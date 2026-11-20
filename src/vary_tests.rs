@@ -473,6 +473,39 @@ async fn per_user_vary_is_still_never_stored() {
     }
 }
 
+/// A `Vary` naming a header zion writes for the origin (`X-Real-IP`, `X-Forwarded-For`, ...)
+/// is never stored: the origin chose the response by what zion sent, the key would be built
+/// from what the client sent. A browser sends no `X-Real-IP`, so with `Vary: X-Real-IP` the first
+/// client's answer (its address, its location) was served to every other client as a `HIT`.
+#[tokio::test]
+async fn a_vary_on_a_header_zion_writes_for_the_origin_is_never_stored() {
+    for (n, vary) in [
+        "X-Real-IP",
+        "X-Forwarded-For",
+        "X-Forwarded-Proto",
+        "X-Forwarded-Host",
+        "Forwarded",
+        "Via",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (o, st) = rig(vary).await;
+        // a path of its own per case: the route cache is thread-local and keyed by path
+        let uri = format!("/fw{n}");
+        for _ in 0..3 {
+            let (c, _) = fetch(&st, &uri, &[]).await;
+            assert_eq!(c, "BYPASS", "Vary: {vary}");
+            settle().await;
+        }
+        assert_eq!(
+            hits(&o),
+            3,
+            "Vary: {vary}: every request must reach the origin"
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_number_of_variants_per_key_is_bounded() {
     let (o, st) = rig("X-Foo").await;
@@ -3600,6 +3633,64 @@ async fn a_websocket_upgrade_reaches_the_upstream_with_host_and_an_origin_form_t
         "{head}"
     );
     assert!(lower.contains("x-forwarded-host: app.test"), "{head}");
+}
+
+/// An upstream that declines the upgrade answers with its own headers: its `Alt-Svc` names its
+/// own alternatives and is not passed on, on the WebSocket path as on every other (zion's own
+/// with `--features http3`, none without it).
+#[tokio::test]
+async fn a_declined_websocket_upgrade_does_not_pass_the_origins_alt_svc_on() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut c, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match c.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let _ = c
+                    .write_all(
+                        b"HTTP/1.1 426 Upgrade Required\r\nAlt-Svc: h3=\":9443\"; ma=60\r\n\
+                          X-Origin-Thing: kept\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            });
+        }
+    });
+    let st = hosts_state(
+        "[[route]]\npath = \"/{*rest}\"\nupstream = \"w\"\n",
+        &format!("w = \"http://127.0.0.1:{port}\""),
+    );
+    let resp = process_request(
+        ws_request("/chat"),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 426);
+    assert_eq!(
+        resp.headers().get("x-origin-thing").unwrap(),
+        "kept",
+        "the origin's answer"
+    );
+    let alt_svc: Vec<&str> = resp
+        .headers()
+        .get_all("alt-svc")
+        .iter()
+        .map(|v| v.to_str().unwrap())
+        .collect();
+    #[cfg(feature = "http3")]
+    assert_eq!(alt_svc, [crate::quic::ALT_SVC_H3.to_str().unwrap()]);
+    #[cfg(not(feature = "http3"))]
+    assert!(alt_svc.is_empty(), "the origin's Alt-Svc: {alt_svc:?}");
 }
 
 // ── [upstream.x] preserve_host (ADR-0024) ───────────────────────────────────

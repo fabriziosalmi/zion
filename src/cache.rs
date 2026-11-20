@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Most bytes of origin headers one entry keeps in [`CachedMeta::headers`], each field counted
+/// Most bytes of origin headers one entry keeps, in [`CachedMeta::headers`] and in the fields of
+/// their own (`Content-Type`, `Content-Encoding`, `ETag`, `Last-Modified`), each field counted
 /// as its name, its value and 32 bytes (the HTTP/2 accounting, RFC 7541 §4.1, so a flood of
 /// empty fields counts too). A response with more is not stored: leaving some of its headers out
 /// of a hit is the bug the list exists to prevent.
@@ -42,10 +43,12 @@ const NOT_STORED: &[&str] = &[
     "proxy-authenticate",
     "proxy-authentication-info",
     "proxy-authorization",
-    // Computed again for each answer from the entry.
+    // Computed again for each answer from the entry. `Date` is kept: a hit says when the origin
+    // made the response, as the miss did, so that `Expires` minus `Date` is still the lifetime the
+    // origin gave it and a downstream cache does not count the time spent here twice (once in
+    // `Age`, once in a `Date` of now). A `304` that renews the entry brings its own.
     "content-length",
     "content-range",
-    "date",
     "age",
     // Kept in fields of their own.
     "content-type",
@@ -185,25 +188,57 @@ impl CachedMeta {
         self
     }
 
-    /// What [`Self::headers`] count for against [`MAX_STORED_HEADER_BYTES`]: each field's name,
-    /// value and 32 bytes, as HTTP/2 counts a header list.
+    /// The header values kept in fields of their own, with the names a hit sends them under.
+    /// They are origin headers like [`Self::headers`], and as large as the origin makes them
+    /// (`Content-Type` and `Content-Encoding` join every line): the bound and the memory count
+    /// include them.
+    fn slots(&self) -> impl Iterator<Item = (&'static str, &HeaderValue)> {
+        [
+            ("content-type", &self.content_type),
+            ("content-encoding", &self.content_encoding),
+            ("etag", &self.etag),
+            ("last-modified", &self.last_modified),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.as_ref().map(|value| (name, value)))
+    }
+
+    /// What the origin headers an entry keeps count for against [`MAX_STORED_HEADER_BYTES`]:
+    /// each field's name, value and 32 bytes, as HTTP/2 counts a header list, for
+    /// [`Self::headers`] and the fields of their own ([`Self::slots`]).
     fn headers_bytes(&self) -> usize {
-        self.headers
+        let listed: usize = self
+            .headers
             .iter()
             .map(|(name, value)| name.as_str().len() + value.len() + 32)
-            .sum()
+            .sum();
+        let slots: usize = self
+            .slots()
+            .map(|(name, value)| name.len() + value.len() + 32)
+            .sum();
+        listed + slots
     }
 
-    /// The memory [`Self::headers`] take once stored: what they count for in the byte budget and
-    /// against the L1 limits ([`STORED_FIELD_OVERHEAD_BYTES`]).
+    /// The memory the origin headers an entry keeps take once stored: what they count for in the
+    /// byte budget and against the L1 limits. A field of [`Self::headers`] costs its bytes and
+    /// [`STORED_FIELD_OVERHEAD_BYTES`]; a value in a field of its own costs its bytes and the
+    /// `bytes::Shared` record its first clone allocates (the field itself is part of the entry,
+    /// [`ENTRY_OVERHEAD_BYTES`]).
     fn headers_memory(&self) -> usize {
-        self.headers
+        let listed: usize = self
+            .headers
             .iter()
             .map(|(name, value)| name.as_str().len() + value.len() + STORED_FIELD_OVERHEAD_BYTES)
-            .sum()
+            .sum();
+        let slots: usize = self
+            .slots()
+            .map(|(_, value)| value.len() + 3 * std::mem::size_of::<usize>())
+            .sum();
+        listed + slots
     }
 
-    /// [`Self::headers`] are within [`MAX_STORED_HEADER_BYTES`]: the entry may be stored.
+    /// The origin headers an entry keeps, the fields of their own included, are within
+    /// [`MAX_STORED_HEADER_BYTES`]: the entry may be stored.
     pub fn headers_fit(&self) -> bool {
         self.headers_bytes() <= MAX_STORED_HEADER_BYTES
     }
@@ -629,6 +664,11 @@ pub struct StaticCache {
     bytes: std::sync::atomic::AtomicU64,
     /// A budget for this cache alone, in place of the process-wide one (tests).
     own_budget: Option<std::sync::atomic::AtomicU64>,
+    /// The refusals [`StaticCache::count_too_large`] counted for this cache. `zion_cache_too_large`
+    /// is one counter for the whole process, which the tests running beside one another all add
+    /// to: a test reads this one to know what its own requests were counted for.
+    #[cfg(test)]
+    too_large: std::sync::atomic::AtomicU64,
 }
 
 /// The memory budget of the response cache, in bytes: `[server] cache_max_memory_mb`,
@@ -664,8 +704,9 @@ fn stripe_of(key: &str) -> usize {
 /// Queue items tolerated beyond twice the entries before the queue is rebuilt.
 const QUEUE_SLACK: usize = 1024;
 
-/// What one entry is counted as, on top of its key, its body and the origin headers it keeps:
-/// the entry itself, its other metadata (a few short header values) and its slot in the map. An
+/// What one entry is counted as, on top of its key, its body and the origin headers it keeps
+/// (the values of the fields of their own included): the entry itself, its other metadata (the
+/// fields those values sit in, the status, the stale-serving rules) and its slot in the map. An
 /// estimate, there so that a cache of empty bodies is not counted as free.
 const ENTRY_OVERHEAD_BYTES: u64 = 256;
 
@@ -674,7 +715,8 @@ fn entry_cost(key: &str, entry: &L2Entry) -> u64 {
     (key.len() + entry.body.len() + entry.meta.headers_memory()) as u64 + ENTRY_OVERHEAD_BYTES
 }
 
-/// What an entry holds for L1's limits: its body and the origin headers it keeps.
+/// What an entry holds for L1's limits: its body and the origin headers it keeps, those in
+/// fields of their own included (a private L1 copy copies them too, see [`CachedMeta::detached`]).
 fn l1_size(body: &Bytes, meta: &CachedMeta) -> usize {
     body.len() + meta.headers_memory()
 }
@@ -893,7 +935,27 @@ impl StaticCache {
             queue: Mutex::new(VecDeque::new()),
             bytes: std::sync::atomic::AtomicU64::new(0),
             own_budget: None,
+            #[cfg(test)]
+            too_large: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// A response this cache does not store because it is over a limit of an entry (the
+    /// profile's `max_object_mb`, or [`MAX_STORED_HEADER_BYTES`]): counted in
+    /// `zion_cache_too_large`.
+    pub fn count_too_large(&self) {
+        crate::metrics::METRICS
+            .cache_too_large
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        self.too_large
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// What [`Self::count_too_large`] counted for this cache alone.
+    #[cfg(test)]
+    pub fn too_large(&self) -> u64 {
+        self.too_large.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A cache with a byte budget of its own, whatever the process-wide one is.
@@ -2306,6 +2368,8 @@ mod tests {
             ("link", "</b.js>; rel=preload"),
             ("expires", "Thu, 01 Jan 2099 00:00:00 GMT"),
             ("x-origin-thing", "1"),
+            // when the origin made it: `Expires` minus `Date` is the lifetime it gave
+            ("date", "Thu, 01 Jan 2026 00:00:00 GMT"),
             // hop-by-hop, and the fields `Connection` names (on its second line). The proxy has
             // removed them before a response reaches the cache (`scrub_response_hop_by_hop`,
             // tested through the real binary in tests/cache_hit_origin_headers.rs); this is the
@@ -2319,7 +2383,6 @@ mod tests {
             ("proxy-authenticate", "Basic"),
             // recomputed, or kept in fields of their own
             ("content-length", "12"),
-            ("date", "Thu, 01 Jan 2026 00:00:00 GMT"),
             ("age", "30"),
             ("content-type", "image/svg+xml"),
             ("etag", "\"u1\""),
@@ -2345,6 +2408,7 @@ mod tests {
                 "link: </b.js>; rel=preload",
                 "expires: Thu, 01 Jan 2099 00:00:00 GMT",
                 "x-origin-thing: 1",
+                "date: Thu, 01 Jan 2026 00:00:00 GMT",
             ]
         );
     }
@@ -2358,7 +2422,9 @@ mod tests {
             )],
             ..default_meta()
         };
-        let at_bound = MAX_STORED_HEADER_BYTES - "x-big".len() - 32;
+        // `default_meta`'s `Content-Type`, in a field of its own, counts too
+        let content_type = "content-type".len() + "text/css".len() + 32;
+        let at_bound = MAX_STORED_HEADER_BYTES - content_type - "x-big".len() - 32;
         assert!(meta(at_bound).headers_fit());
         assert!(!meta(at_bound + 1).headers_fit());
         // many empty fields count too
@@ -2388,6 +2454,57 @@ mod tests {
         );
     }
 
+    /// `Content-Type`, `Content-Encoding`, `ETag` and `Last-Modified` live in fields of their own,
+    /// not in [`CachedMeta::headers`], and are as large as the origin makes them: an entry with a
+    /// one-byte body and a 300 KB `ETag` was charged a few hundred bytes against the budget, fit
+    /// the bound, and was copied into each worker thread's L1.
+    #[test]
+    fn the_fields_of_their_own_count_in_the_bound_the_budget_and_the_l1_limits() {
+        let with_etag = |len: usize| CachedMeta {
+            etag: Some(HeaderValue::from_str(&"e".repeat(len)).unwrap()),
+            ..default_meta()
+        };
+        let content_type = "content-type".len() + "text/css".len() + 32;
+        let at_bound = MAX_STORED_HEADER_BYTES - content_type - "etag".len() - 32;
+        assert!(with_etag(at_bound).headers_fit());
+        assert!(
+            !with_etag(at_bound + 1).headers_fit(),
+            "the ETag over the bound"
+        );
+        for slot in [
+            |m: &mut CachedMeta, v: HeaderValue| m.content_type = Some(v),
+            |m: &mut CachedMeta, v: HeaderValue| m.content_encoding = Some(v),
+            |m: &mut CachedMeta, v: HeaderValue| m.last_modified = Some(v),
+        ] {
+            let mut meta = default_meta();
+            slot(
+                &mut meta,
+                HeaderValue::from_str(&"v".repeat(MAX_STORED_HEADER_BYTES)).unwrap(),
+            );
+            assert!(!meta.headers_fit());
+        }
+
+        // In the budget: the value's bytes and the record its first clone allocates.
+        let cache = StaticCache::with_byte_budget(1 << 30);
+        cache.insert(
+            "/e",
+            Bytes::from_static(b"b"),
+            with_etag(10_000),
+            3600,
+            0,
+            0,
+        );
+        let etag = 10_000 + 3 * std::mem::size_of::<usize>();
+        assert_eq!(cache.recount(), cost("/e", 1) + etag as u64);
+        assert_eq!(cache.recount(), cache.bytes());
+        // Toward the L1 limits, with the body.
+        assert_eq!(
+            l1_size(&Bytes::from_static(b"b"), &with_etag(10_000)),
+            1 + default_meta().headers_memory() + etag
+        );
+        assert!(l1_size(&Bytes::new(), &with_etag(L1_MAX_BODY_BYTES)) > L1_MAX_BODY_BYTES);
+    }
+
     #[test]
     fn a_304_replaces_the_headers_it_carries_and_keeps_the_others() {
         let stored = CachedMeta {
@@ -2397,6 +2514,7 @@ mod tests {
                 ("cache-control", "must-revalidate"),
                 ("content-security-policy", "sandbox"),
                 ("expires", "Thu, 01 Jan 2099 00:00:00 GMT"),
+                ("date", "Wed, 31 Dec 2025 00:00:00 GMT"),
             ])),
             ..default_meta()
         };
@@ -2415,8 +2533,10 @@ mod tests {
                 "expires: Thu, 01 Jan 2099 00:00:00 GMT",
                 "cache-control: max-age=120",
                 "x-new: 1",
+                "date: Thu, 01 Jan 2026 00:00:00 GMT",
             ],
-            "both stored Cache-Control lines are replaced by the 304's; nothing else is lost"
+            "both stored Cache-Control lines, and the stored Date, are replaced by the 304's; \
+             nothing else is lost"
         );
         assert_eq!(
             updated.content_type, stored.content_type,
@@ -2760,8 +2880,10 @@ mod tests {
         !matches!(cache.get(key), CacheLookup::Miss)
     }
 
+    /// What an entry of `len` body bytes with [`default_meta`] costs (its `Content-Type` value
+    /// counts).
     fn cost(key: &str, len: usize) -> u64 {
-        (key.len() + len) as u64 + ENTRY_OVERHEAD_BYTES
+        (key.len() + len + default_meta().headers_memory()) as u64 + ENTRY_OVERHEAD_BYTES
     }
 
     #[test]
@@ -2814,7 +2936,8 @@ mod tests {
             assert_eq!(cache.len(), 40);
             // A body that costs as much as sixteen small ones and a bit: seventeen have to
             // go, in one insert, and no more than that.
-            put(&cache, "/big", 20 * 1_000, 1_000);
+            let big = (16 * cost("/s00", 1_000) + 1 - cost("/big", 0)) as usize;
+            put(&cache, "/big", big, 1_000);
             assert!(stored(&cache, "/big"), "room was made");
             assert!(cache.bytes() <= budget);
             assert_eq!(cache.bytes(), cache.recount());
@@ -3158,11 +3281,13 @@ mod tests {
             m.etag = Some(HeaderValue::from_bytes(b"\"v1\"").unwrap());
             m
         };
+        // The limits are on the body and the headers the entry keeps (`l1_size`).
+        let headers = meta().headers_memory();
         for (len, shared) in [
             (1, false),
-            (L1_PRIVATE_BODY_BYTES, false),
-            (L1_PRIVATE_BODY_BYTES + 1, true),
-            (L1_MAX_BODY_BYTES, true),
+            (L1_PRIVATE_BODY_BYTES - headers, false),
+            (L1_PRIVATE_BODY_BYTES - headers + 1, true),
+            (L1_MAX_BODY_BYTES - headers, true),
         ] {
             let path = format!("/b{len}");
             cache.insert(&path, Bytes::from(vec![7u8; len]), meta(), 3600, 0, 100);
@@ -3202,8 +3327,10 @@ mod tests {
         if cache.l2.is_none() {
             return; // a single-core machine has no L1 tier
         }
-        put(&cache, "/small", L1_MAX_BODY_BYTES, 60);
-        put(&cache, "/large", L1_MAX_BODY_BYTES + 1, 60);
+        // With the `Content-Type` the entry keeps, which counts toward the cap too.
+        let headers = default_meta().headers_memory();
+        put(&cache, "/small", L1_MAX_BODY_BYTES - headers, 60);
+        put(&cache, "/large", L1_MAX_BODY_BYTES - headers + 1, 60);
         for key in ["/small", "/large"] {
             assert!(matches!(cache.get(key), CacheLookup::Fresh(_)));
             assert!(matches!(cache.get(key), CacheLookup::Fresh(_)), "and again");
@@ -3215,7 +3342,7 @@ mod tests {
                     .is_some_and(|l1| l1.map.contains_key(key))
             })
         };
-        assert!(in_l1("/small"), "a body at the cap is promoted");
+        assert!(in_l1("/small"), "an entry at the cap is promoted");
         assert!(!in_l1("/large"), "one byte more and it is not");
     }
 

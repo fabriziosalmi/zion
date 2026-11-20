@@ -420,6 +420,7 @@ impl Cx<'_> {
                         primary_key: Arc::from(at_primary.as_str()),
                         stale: hit.clone(),
                         request: swr_request(&req),
+                        req_authenticated: self.req_authenticated,
                         client_spec: rule.client_spec(),
                         scheme: dyn_scheme.clone(),
                         authority: dyn_authority.clone(),
@@ -678,9 +679,7 @@ impl Cx<'_> {
                 // this client's request, credentials included).
                 let rv = revalidated(&hit.meta, resp.headers(), self.req_authenticated, cache_ttl);
                 if !rv.fits {
-                    metrics::METRICS
-                        .cache_too_large
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    state.static_cache.count_too_large();
                 }
                 if rv.renews() {
                     // Skipped when a tag purge ran since this request began: it must not bring
@@ -702,16 +701,7 @@ impl Cx<'_> {
                 crate::metrics::METRICS
                     .cache_revalidations
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Just confirmed by the origin: its age is the 304's and its lifetime the one
-                // the 304 gave, as on the next hit, not those of the stale lookup (an `Age` past
-                // the `max-age` made a downstream cache take the answer as stale on arrival).
-                let hit = cache::CacheHit {
-                    meta: Arc::new(rv.meta),
-                    age_secs: rv.initial_age,
-                    max_age_secs: rv.ttl,
-                    ..hit
-                };
-                return Ok(cache_response(hit, "REVALIDATED"));
+                return Ok(revalidated_response(hit, rv));
             }
             // else: origin returned new content (200) or a non-304 status — drop the
             // stale hit and let the normal path below store/serve the fresh response.
@@ -767,9 +757,7 @@ impl Cx<'_> {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .is_some_and(|n| n > max_object);
         if too_big || !headers_fit {
-            metrics::METRICS
-                .cache_too_large
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state.static_cache.count_too_large();
         }
         let cacheable = !rcc_no_store
             && !too_big
@@ -980,9 +968,7 @@ fn spawn_tee(
                                 total_bytes += data.len();
                                 if total_bytes > max_object {
                                     cache_aborted = true; // Stop buffering, but continue streaming!
-                                    metrics::METRICS
-                                        .cache_too_large
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    state_clone.static_cache.count_too_large();
                                 } else {
                                     cache_buffer.extend_from_slice(&data);
                                 }

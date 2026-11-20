@@ -50,6 +50,10 @@ const SVG: &str =
 /// What the origin says about its own connection and alternatives, which no client may see.
 const ORIGIN_ALT_SVC: &str = "h3=\":9443\"; ma=60";
 
+/// When the origin made the response: a hit says so too, not the time it is sent (with its `Age`,
+/// that counted the time spent in the cache twice).
+const ORIGIN_DATE: &str = "Thu, 01 Jan 2026 00:00:00 GMT";
+
 /// An upload origin: every answer is a cacheable SVG neutralised by its response headers. Its
 /// `Cache-Control` is written as zion never writes one (`public, max-age=N`), so that a hit
 /// carrying one made up from the entry's lifetime cannot pass for the origin's.
@@ -87,6 +91,7 @@ fn origin(hits: Arc<Mutex<HashMap<String, u32>>>) -> u16 {
                      Link: </a.css>; rel=preload\r\n\
                      Link: </b.js>; rel=preload\r\n\
                      X-Origin-Thing: kept\r\n\
+                     Date: {ORIGIN_DATE}\r\n\
                      Content-Digest: sha-256=:d2hvbGUgZmlsZQ==:\r\n\
                      Alt-Svc: {ORIGIN_ALT_SVC}\r\n\
                      Proxy-Authentication-Info: nextnonce=\"n1\"\r\n\
@@ -304,6 +309,13 @@ fn a_cache_hit_keeps_the_origin_csp_content_disposition_and_vary() {
         all(&miss, "link"),
         "both lines, in order"
     );
+    let origin_date = ORIGIN_DATE.to_ascii_lowercase();
+    assert_eq!(all(&miss, "date"), [origin_date.as_str()], "{miss}");
+    assert_eq!(
+        all(&hit, "date"),
+        [origin_date.as_str()],
+        "the origin's Date\n{hit}"
+    );
 
     // The same header names as the miss, each as many times: a hit only adds `Age` and
     // `Accept-Ranges` (it answers ranges itself).
@@ -359,6 +371,11 @@ fn a_cache_hit_keeps_the_origin_csp_content_disposition_and_vary() {
     assert_eq!(
         header(&not_modified, "vary"),
         Some("accept-language"),
+        "{not_modified}"
+    );
+    assert_eq!(
+        all(&not_modified, "date"),
+        [origin_date.as_str()],
         "{not_modified}"
     );
 

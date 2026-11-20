@@ -371,9 +371,19 @@ mod encode {
         append_vary_accept_encoding(&mut parts.headers);
         // A strong ETag no longer identifies these bytes; weaken it to a weak validator.
         weaken_etag(&mut parts.headers);
+        // The origin's digests are of the bytes it sent, not of these: `Content-Digest` and
+        // `Content-MD5` are over the content, `Repr-Digest` over the representation, whose
+        // content coding has just changed (RFC 9530 §2, §3; RFC 1864). A client that checks
+        // one would reject the response as corrupt.
+        for digest in IDENTITY_DIGESTS {
+            parts.headers.remove(digest);
+        }
         let body = CompressBody::new(body, enc, permit).boxed();
         Response::from_parts(parts, body)
     }
+
+    /// The digests an origin sends of the bytes it sent, see [`compress_response`].
+    const IDENTITY_DIGESTS: [&str; 3] = ["content-digest", "content-md5", "repr-digest"];
 
     fn append_vary_accept_encoding(headers: &mut hyper::HeaderMap) {
         // If Vary already lists accept-encoding (any case) or is `*`, leave it.
@@ -887,6 +897,36 @@ mod encode_tests {
             .read_to_end(&mut out)
             .unwrap();
         assert!(out.is_empty());
+    }
+
+    /// The origin's digests describe the bytes it sent: on a compressed answer a client that checks
+    /// one rejects the response as corrupt. They go with the coding change; the rest stays.
+    #[test]
+    fn a_compressed_answer_does_not_carry_the_digests_of_the_identity_bytes() {
+        let mut resp = hyper::Response::new(chunked_body(vec![sample(4096)]));
+        for (k, v) in [
+            ("content-type", "text/css"),
+            ("content-digest", "sha-256=:d2hvbGUgZmlsZQ==:"),
+            ("content-md5", "Q2hlY2sgSW50ZWdyaXR5IQ=="),
+            ("repr-digest", "sha-256=:d2hvbGUgZmlsZQ==:"),
+            ("content-security-policy", "sandbox"),
+        ] {
+            resp.headers_mut().append(
+                hyper::header::HeaderName::from_static(k),
+                hyper::header::HeaderValue::from_static(v),
+            );
+        }
+        let cfg = super::ResolvedCompress {
+            min_bytes: 1024,
+            allow_cookied: false,
+        };
+        let out = super::apply(resp, Some(&cfg), &hyper::Method::GET, Some("br"), 0);
+        let h = out.headers();
+        assert_eq!(h.get("content-encoding").unwrap(), "br", "compressed");
+        for digest in ["content-digest", "content-md5", "repr-digest"] {
+            assert!(h.get(digest).is_none(), "{digest} on a compressed answer");
+        }
+        assert_eq!(h.get("content-security-policy").unwrap(), "sandbox");
     }
 }
 
