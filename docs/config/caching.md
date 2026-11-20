@@ -44,7 +44,7 @@ uncached, marked `X-Zion-Cache: BYPASS`):
 | Status | **`200 OK` only.** |
 | Response `Cache-Control` | Not `private`, `no-store`, or `no-cache` (RFC 9111 §3.2 / §5.2.2), on **any** of its lines: `Cache-Control: max-age=300` followed by `Cache-Control: private` is one list, `max-age=300, private` (RFC 9110 §5.3), which is what nginx sends for `expires 5m;` plus `add_header Cache-Control private;`. The three words are matched anywhere in the list, so an unusual spelling still refuses. |
 | Authenticated request (§3.5) | A response to a request carrying `Authorization` is stored **only** if the origin explicitly opts in with a `public`, `s-maxage`, or `must-revalidate` directive (a whole directive: `x-public-ish` is not one). Otherwise one user's response could be served to another. |
-| `Vary` | Absent, or naming request headers zion can key on (see [Vary and secondary keys](#vary-and-secondary-keys)). **Not cached:** `Vary: *`, any varied credential header (`Cookie`, `Authorization`, `Proxy-Authorization`, `Set-Cookie`), any varied header zion sets or rewrites for the origin (`X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `Forwarded`, `Via`), more than 8 varied headers, or a variant over the per-key cap. |
+| `Vary` | Absent, or naming request headers zion can key on (see [Vary and secondary keys](#vary-and-secondary-keys)). **Not cached:** `Vary: *`, any varied credential header (`Cookie`, `Authorization`, `Proxy-Authorization`, `Set-Cookie`), any varied header zion sets or rewrites for the origin with a value that differs between clients (`X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Host`, `Forwarded`, `Via`), more than 8 varied headers, or a variant over the per-key cap. |
 | `Set-Cookie` | The response must **not** set a cookie (any `Set-Cookie` header, whatever its `Cache-Control`). It starts or changes a session, so its body is for one client; it is streamed to that client and never stored. |
 | Headers | At most 32 KiB of origin headers to keep ([What a hit carries](#what-a-hit-carries); each field counts as its name, its value and 32 bytes, `Content-Type`, `Content-Encoding`, `ETag` and `Last-Modified` included). A response with more is streamed through, marked `BYPASS`, and counted in `zion_cache_too_large`, as is a background refresh or a `304` update that would go over it; it takes no `Vary` variant slot. The count is of what the bound (or `max_object_mb`) alone kept out: a response that may not be stored anyway (the rules above, a request's `no-store`) or a `304` that may not renew the entry is not counted, however large. |
 | Freshness | A positive effective TTL (see below); an object that arrives already older than its lifetime isn't stored. |
@@ -68,10 +68,12 @@ each variant under its own **secondary key** built from the values of those head
 - **Never keyed, never stored:** `Vary: *` and varied credential headers. A response
   that varies on `Cookie` is per-user; a shared cache must not keep a copy per session.
   Nor a response that varies on a header zion sets or rewrites on the way to the origin
-  (`X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `Forwarded`,
-  `Via`): the origin chose it by what zion sent, while the key would be built from what the
-  client sent. A browser sends no `X-Real-IP`, so every browser would share the first one's
-  variant.
+  with a value that differs between clients (`X-Real-IP`, `X-Forwarded-For`,
+  `X-Forwarded-Host`, `Forwarded`, `Via`): the origin chose it by what zion sent, while the
+  key would be built from what the client sent. A browser sends no `X-Real-IP`, so every
+  browser would share the first one's variant. `Vary: X-Forwarded-Proto` is keyed like any
+  other header: zion sends `X-Forwarded-Proto: https` on every request it caches, so the
+  origin chose by a value every client shares.
 - If the origin changes the set of headers it varies on, or stops varying, the key
   follows: the next `200` is filed under the new `Vary`, and entries filed under the old key
   are no longer reachable. A revalidation is held to the key the entry was filed under: a
@@ -96,10 +98,14 @@ The key is the **host** and the **full path + query**, plus the **canonical `Acc
 the stored response is encoded:
 
 - The **host** is part of the key, normalised as host routing sees it (lowercased,
-  port and trailing dot dropped; the HTTP/2 `:authority` or the HTTP/1 `Host`): two
+  port and trailing dot dropped; the target's authority when it has one, an HTTP/2
+  `:authority` or an absolute-form `GET http://host/path`, else the HTTP/1 `Host`): two
   hosts with the same path never share an entry, whether their routes go to two
   origins or one route serves several hosts from one multi-tenant origin. Path
-  invalidation and prefix purges still reach the path on every host.
+  invalidation and prefix purges still reach the path on every host. The origin is told
+  the host from the same field, as received (case and port kept), in `X-Forwarded-Host`
+  (and as `Host` with `preserve_host`), so an absolute-form target sent with another
+  `Host` cannot have the answer for that other host filed under the target's key.
 - `/a?user=alice` and `/a?user=bob` never share an entry (query is part of the key).
 - The query is part of the key **as written**, so `?b=2&a=1` and `?a=1&b=2` are two entries.
   A profile can opt in to `normalize_query = true` to sort the parameters by name in the
@@ -281,15 +287,17 @@ background, so the client does not wait for the origin round trip. `M` is capped
   nothing (a `401` or `403` from an origin that requires the headers above, a `304` that sets a
   cookie, as an origin that gives every request without a `Cookie` a session does, or that lacks
   the opt-in, a `200` that may not be stored or is over `max_object_mb`, any status but `200`,
-  `304` and a 5xx) takes the entry out of its window. The entry stays, and the next request
+  `304`, a 5xx, `429` and `408`) takes the entry out of its window. The entry stays, and the next request
   revalidates it in the foreground with its own headers, as an entry without the window is (or
   fetches it again when it has no validator); a renewal or a new `200` makes an entry with the
   window again. The next refresh would go out the same way and get the same answer: left in its
   window, the entry was served stale until the window closed, whatever the origin had since, and
   every request after the previous refresh ended started another one. A refresh that cannot reach
-  the origin, gets no answer in time or not the whole body, or gets a 5xx leaves the entry in its
-  window: the origin is failing for every client, and the stale copy served at once is what the
-  window is for. Once outside its window an entry is no longer served stale.
+  the origin, gets no answer in time or not the whole body, or gets a 5xx, a `429 Too Many
+  Requests` or a `408 Request Timeout` leaves the entry in its window: the origin, or a rate
+  limiter in front of it, is failing or shedding load for every client, the next refresh can get
+  another answer, and the stale copy served at once is what the window is for. Once outside its
+  window an entry is no longer served stale.
 - **Not for a variant keyed on what the refresh leaves out**: an entry whose `Vary` names one of
   the headers above (`Vary: X-Auth-Subject` behind an auth gate, `Vary: X-Client-TLS-JA4`) is
   not served stale while it revalidates. A refresh without that header would get the

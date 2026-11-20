@@ -1132,9 +1132,10 @@ enum Refresh {
     /// The entry was renewed by a `304` or replaced by a `200`.
     Renewed,
     /// The origin was not reached, gave no answer in time or not the whole body, or answered with
-    /// a 5xx; or a tag purge ran meanwhile, and what becomes of the entry is the purge's to say.
-    /// The entry keeps its stale-while-revalidate window: the origin is failing for every client,
-    /// and the stale copy served at once is what the window, and stale-if-error, are for.
+    /// a 5xx, a `429` or a `408`; or a tag purge ran meanwhile, and what becomes of the entry is
+    /// the purge's to say. The entry keeps its stale-while-revalidate window: the origin is failing
+    /// or shedding load for every client, and the stale copy served at once is what the window, and
+    /// stale-if-error, are for.
     Failed,
     /// The origin answered, and the answer cannot renew or replace the entry: another status (a
     /// `401` or `403` to a refresh without what zion asserts about the client, [`swr_drops`]), a
@@ -1152,8 +1153,9 @@ enum Refresh {
 /// stored body; a cacheable `200` replaces it. An answer whose `Vary` is not the one the entry
 /// was filed under does neither, and takes the stale entry out ([`same_vary_shape`],
 /// [`Revalidation::vary_changed`]). Any other answer that does neither ends the entry's
-/// stale-while-revalidate window ([`Refresh::Refused`]); a failure to get one leaves it as it is
-/// ([`Refresh::Failed`]): it is no longer served stale once outside its window.
+/// stale-while-revalidate window ([`Refresh::Refused`]); a failure to get one, a 5xx, a `429` or
+/// a `408` leaves it as it is ([`Refresh::Failed`]): it is no longer served stale once outside its
+/// window.
 async fn run_swr_refresh(job: &SwrRefresh) -> Refresh {
     let mut req = swr_request(&job.request);
     add_conditional_headers(req.headers_mut(), &job.stale.meta);
@@ -1182,8 +1184,16 @@ async fn run_swr_refresh(job: &SwrRefresh) -> Refresh {
         breaker_record(entry, resp.status(), None);
     }
     // `proxy_pass` answers an origin it could not reach, or that did not answer in time, with a
-    // 5xx of its own.
-    if resp.status().is_server_error() {
+    // 5xx of its own. A `429` or a `408` is the origin, or a rate limiter in front of it, shedding
+    // load or giving up on this one request: no answer about the entry, and the next refresh can
+    // get another. Taken for a refusal, it ended the window, and every request for the entry went
+    // to the origin in the foreground, at the rate the clients came, while it asked for fewer.
+    if resp.status().is_server_error()
+        || matches!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
+        )
+    {
         return Refresh::Failed;
     }
     // It refreshes ONE entry, filed under the `Vary` rule it was found under (none when it does

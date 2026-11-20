@@ -44,7 +44,7 @@ without it.
 | Form | Behaviour |
 |---|---|
 | origin-form (`/path`) | forwarded |
-| absolute-form (`http://host/path`) | accepted and re-framed to origin-form upstream; the absolute URI and its authority never reach the upstream |
+| absolute-form (`http://host/path`) | accepted and re-framed to origin-form upstream; the absolute URI never reaches the upstream. Its authority, not a `Host` sent with it, is the request's host (RFC 9112 §3.2.2): zion routes and caches on it and tells the upstream that one in `X-Forwarded-Host` (and as `Host` with `preserve_host`) |
 | asterisk-form (`OPTIONS *`) | refused (`404`), never forwarded |
 | authority-form (`CONNECT host:port`) | refused (`405`), never forwarded |
 
@@ -52,8 +52,8 @@ without it.
 
 | Route | `Host` sent upstream |
 |---|---|
-| default | rewritten to the upstream authority; the client's original `Host` is carried in `X-Forwarded-Host` |
-| `preserve_host = true` | the client's `Host` is forwarded as-is (HTTP/1.1 only) |
+| default | rewritten to the upstream authority; the request's host (the target's authority when it has one, else the client's `Host`) is carried in `X-Forwarded-Host` |
+| `preserve_host = true` | the request's host is forwarded as-is (HTTP/1.1 only) |
 
 ## Expect: 100-continue
 

@@ -114,7 +114,8 @@ health_host = "app.example.com"   # what the health probe sends as Host
 
 By default the upstream receives its own authority as `Host` (`10.0.0.5:8000`) and the
 client's host in `X-Forwarded-Host`. With `preserve_host = true` it receives the client's
-`Host` as sent (port included; for an HTTP/2 client, its `:authority`), like nginx
+host as sent (port included): the target's authority when it has one (an HTTP/2 client's
+`:authority`, an absolute-form target), else its `Host`, like nginx
 `proxy_set_header Host $http_host` and the Traefik and Caddy defaults. Use it for
 applications that check or build URLs from `Host`: Django `ALLOWED_HOSTS`, Rails host
 authorization, CSRF origin checks, absolute redirects, multi-tenant or virtual-host backends.
