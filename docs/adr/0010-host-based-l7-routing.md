@@ -87,6 +87,8 @@ with no `hosts` (shared) `path="/{*rest}"` → upstream `frontend`; both define
 |--------------------------|-----------|--------------------|-----------------|
 | `api.example.com`        | `/x`      | `A` (`api`)        | exact host      |
 | `api.example.com:8443`   | `/x`      | `A` (`api`)        | port stripped   |
+| `api.example.com:`       | `/x`      | `A` (`api`)        | empty port = default |
+| `api.example.com:x`      | `/x`      | `400`, not routed  | not `host[:port]` |
 | `API.example.com`        | `/x`      | `A` (`api`)        | case-folded     |
 | `api.example.com.`       | `/x`      | `A` (`api`)        | trailing dot    |
 | `app.example.com`        | `/x`      | `S` (`frontend`)   | shared fallback |
@@ -124,7 +126,27 @@ HTTP/1.1, RFC 9112 §3.2.2 would let the server answer from the target alone and
 forward that authority; refusing was preferred because it keeps the authority a
 client wrote in an absolute-form target from ever reaching the upstream (the
 #697 corpus invariant) and leaves nothing else that reads `Host` (WAF rules, the
-access log) looking at a different host than routing did.
+access log) looking at a different host than routing did. (Over HTTP/3 the `h3`
+crate already resets a request stream whose `:authority` and `host` differ by a
+byte, before zion sees it.)
+
+**An authority that is not `host[:port]` was a third key.** Normalization
+stripped a port only when it was non-empty and all digits, and the comparison
+above read ports through `http`'s `Authority::port_u16`, which gives no port for
+`a.example:x` and 443 for `a.example:+443`. So `a.example:`, `a.example:x` and
+`a.example:+443` passed the comparison as `a.example` but were routed by their
+whole text, which no host group or wildcard matches: the request got the shared
+routes, while an upstream that cuts the host at the first `:` (nginx) or splits
+host and port (Go) served `a.example`. One parser now reads every authority, for
+normalization and for the gate (`security::split_authority`): a host, then
+nothing or `:` and a port of ASCII digits up to 65535. An empty port is the
+scheme's default (RFC 3986 §6.2.3, RFC 9110 §4.2.3) and is stripped. Anything
+else (a port that is not a number or is out of range, a second `:`, a bare IPv6
+literal, text after `]`, userinfo, a `Host` that is not visible ASCII) has no
+key, and a request that names it, as its target or as a `Host`, over any
+protocol, is refused with `400` by the same gate. A `hosts` entry is checked by
+the same function, so one with an empty or non-numeric port, or a bare IPv6
+literal, is now a config error: no request is routed by that text any more.
 
 **The cache key was a hash, not the key.** The cache invariant above was
 enforced by folding the host into an unseeded 64-bit FNV hash, and a hit

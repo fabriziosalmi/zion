@@ -3721,10 +3721,12 @@ async fn preserve_host_sends_the_clients_host_in_every_mode() {
 // Routing, the route's policy and the response-cache key read the request target's authority
 // (`security::request_host`, authority first); the upstream is told the client's `Host` header
 // (`X-Forwarded-Host`, and `Host` under `preserve_host`). A client that sends both and makes
-// them differ (an HTTP/1.1 absolute-form target plus `Host`, HTTP/2 or HTTP/3 `:authority`
-// plus a `host` field) had a request decided as one host and served as another. It is refused
-// with 400 before routing. These model the absolute-form / `:authority` request the way hyper
-// hands it over: a URI with an authority, and the `Host` header beside it.
+// them differ (an HTTP/1.1 absolute-form target plus `Host`, HTTP/2 `:authority` plus a `host`
+// field) had a request decided as one host and served as another. It is refused with 400
+// before routing. (HTTP/3 never got that far: the `h3` crate resets a request stream whose
+// `:authority` and `host` differ by a byte.) These model the absolute-form / `:authority`
+// request the way hyper hands it over: a URI with an authority, and the `Host` header beside
+// it, at the default HTTP/1.1 version; the same gate runs for every protocol.
 
 /// An origin that answers from `X-Forwarded-Host` (a multi-tenant app; Rack and Rails honour it
 /// by default) must not have its answer for one host filed under another host's cache key.
@@ -3743,22 +3745,28 @@ cache_profile = "c"
     );
     // Attacker: the absolute-form target names the victim's host, the Host header the
     // attacker's. Keyed under www.victim.example, the origin would answer for attacker.example.
-    let (attacker_status, attacker_body) = body_for(
-        &st,
-        "http://www.victim.example/p",
-        &[("host", "attacker.example")],
-    )
-    .await;
+    // The second has the same host in both but a Host port that is not a port: the gate took
+    // it for the default port, so it was keyed as www.victim.example while the origin was told
+    // `www.victim.example:x`.
+    let mut attackers = Vec::new();
+    for host in ["attacker.example", "www.victim.example:x"] {
+        let answer = body_for(&st, "http://www.victim.example/p", &[("host", host)]).await;
+        attackers.push((host, answer));
+    }
     settle().await;
     // Victim: an ordinary HTTP/1.1 browser, origin-form target, its own host.
     let (victim_cache, victim_body) = fetch(&st, "/p", &[("host", "www.victim.example")]).await;
     assert_eq!(
         victim_body, "O:www.victim.example",
         "the victim must get the origin's answer for its own host, not one the attacker's \
-         request filed under its key (cache {victim_cache:?}; the attacker got \
-         {attacker_status} {attacker_body:?})"
+         request filed under its key (cache {victim_cache:?}; the attackers got {attackers:?})"
     );
-    assert_eq!(attacker_status, 400, "the disagreeing request is refused");
+    for (host, (status, _)) in &attackers {
+        assert_eq!(
+            *status, 400,
+            "Host {host:?}: the disagreeing request is refused"
+        );
+    }
     assert_eq!(
         hits.load(Ordering::Relaxed),
         1,
@@ -3843,6 +3851,100 @@ internal_only = true
     );
 }
 
+/// A shared route and an `internal_only` host-bound route on one `preserve_host` backend. Routing
+/// keyed an authority whose port is not a port (`admin.example:x`, `:+443`, `:1:2`) by its whole
+/// text, which no host group matches, so the request got the shared route, while the upstream
+/// cuts the host at the first `:` (nginx) and served the protected host. Such an authority is
+/// refused, as a target and as a `Host`. An empty port is the scheme's default (RFC 3986 §6.2.3):
+/// `admin.example:` names the protected host, and gets its policy.
+#[tokio::test]
+async fn an_authority_whose_port_is_not_a_port_cannot_reach_an_internal_only_host() {
+    let (port, hits) = host_echo_origin("no-store").await;
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstream.u]
+urls = ["http://127.0.0.1:{port}"]
+preserve_host = true
+[[route]]
+path = "/{{*rest}}"
+upstream = "u"
+mode = "standard"
+[[route]]
+path = "/{{*rest}}"
+hosts = ["admin.example"]
+upstream = "u"
+mode = "standard"
+internal_only = true
+"#
+    );
+    let st = AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"));
+    // Control: the shared route serves any other host; the protected host refuses this
+    // (non-internal) client.
+    assert_eq!(
+        body_for(&st, "/p", &[("host", "www.example")]).await,
+        (200, "host=www.example".to_string())
+    );
+    assert_eq!(
+        body_for(&st, "/p", &[("host", "admin.example")]).await.0,
+        403
+    );
+    let served = hits.load(Ordering::Relaxed);
+    assert_eq!(
+        served, 1,
+        "only the shared-route control reached the backend"
+    );
+
+    // (target, Host): an HTTP/1.1 absolute-form target or an HTTP/2 `:authority` with a `host`
+    // field, the target alone (HTTP/2, HTTP/3), and an origin-form `Host`.
+    let empty_port: &[(&str, Option<&str>)] = &[
+        ("https://admin.example:/p", Some("admin.example")),
+        ("https://admin.example:/p", None),
+        ("/p", Some("admin.example:")),
+        ("https://admin.example/p", Some("admin.example:")),
+    ];
+    for (uri, host) in empty_port {
+        let headers: Vec<(&str, &str)> = host.iter().map(|h| ("host", *h)).collect();
+        let (code, body) = body_for(&st, uri, &headers).await;
+        assert_eq!(
+            code, 403,
+            "{uri} with Host {host:?} names the protected host and gets its policy (upstream \
+             saw {body:?})"
+        );
+    }
+    let not_a_port: &[(&str, Option<&str>)] = &[
+        ("https://admin.example:x/p", Some("admin.example")),
+        ("https://admin.example:+443/p", Some("admin.example")),
+        ("https://admin.example:x/p", None),
+        ("https://admin.example:99999/p", None),
+        ("https://admin.example/p", Some("admin.example:x")),
+        ("/p", Some("admin.example:x")),
+        ("/p", Some("admin.example:+443")),
+        ("/p", Some("admin.example:443:443")),
+        ("/p", Some("admin.example:99999")),
+    ];
+    for (uri, host) in not_a_port {
+        let headers: Vec<(&str, &str)> = host.iter().map(|h| ("host", *h)).collect();
+        let (code, body) = body_for(&st, uri, &headers).await;
+        assert!(
+            !body.contains("admin.example"),
+            "{uri} with Host {host:?} got the shared route and reached the internal_only host \
+             (status {code}, upstream saw {body:?})"
+        );
+        assert_eq!(code, 400, "{uri} with Host {host:?} is refused");
+    }
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        served,
+        "nothing after the control reached the backend"
+    );
+}
+
 /// The `:80` ACME fallback routes by the target's authority and forwards on its own, outside
 /// the HTTPS pipeline: it refuses a request whose Host disagrees with it the same way.
 #[tokio::test]
@@ -3878,6 +3980,16 @@ async fn the_port_80_acme_fallback_refuses_a_host_that_disagrees_with_the_target
         .0,
         400
     );
+    // and an authority whose port is not a port, as a target or as the Host
+    for (uri, host) in [
+        (
+            "http://app.example:x/.well-known/acme-challenge/tok",
+            "app.example",
+        ),
+        ("/.well-known/acme-challenge/tok", "app.example:x"),
+    ] {
+        assert_eq!(on_80(uri, host).await.0, 400, "{uri} with Host {host:?}");
+    }
     assert_eq!(hits.load(Ordering::Relaxed), 0, "nothing was forwarded");
     assert_eq!(
         on_80(

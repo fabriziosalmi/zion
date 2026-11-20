@@ -11,8 +11,9 @@
 //! test watches.
 //!
 //! The same raw-frame client also pins that an h2c request whose `host` field disagrees with
-//! its `:authority` gets a 400: the HTTP/2 decoding hands zion both, and zion refuses a request
-//! that names two authorities before anything routes by one of them.
+//! its `:authority`, or whose authority has a port that is not a port, gets a 400: the HTTP/2
+//! decoding hands zion both fields as sent, and zion refuses a request that does not name one
+//! host before anything routes by it.
 //!
 //! Like the other binary-booting tests, a missing `openssl` (for a throwaway certificate)
 //! skips with a message.
@@ -260,15 +261,18 @@ fn a_del_byte_in_the_h2c_path_is_a_400_not_a_crash() {
     );
 }
 
-/// A complete `GET /` on `stream` with `:authority localhost` and a `host` field of `host`.
-/// HPACK: `:method GET` (0x82), `:scheme http` (0x86), `:path /` (0x84), `:authority` as above,
-/// then `host` as a literal with incremental indexing on static name index 38 (0x40 | 38).
-fn get_with_host(stream: u32, host: &[u8]) -> Vec<u8> {
-    assert!(host.len() < 127, "one-byte HPACK length");
-    let mut hpack = vec![0x82, 0x86, 0x84, 0x41, 9];
-    hpack.extend_from_slice(b"localhost");
-    hpack.extend_from_slice(&[0x40 | 38, host.len() as u8]);
-    hpack.extend_from_slice(host);
+/// A complete `GET /` on `stream` with an `:authority` of `authority` and, when given, a `host`
+/// field of `host`. HPACK: `:method GET` (0x82), `:scheme http` (0x86), `:path /` (0x84), then
+/// `:authority` and `host` as literals with incremental indexing on static name indexes 1 and 38
+/// (0x40 | index).
+fn get_with_host(stream: u32, authority: &[u8], host: Option<&[u8]>) -> Vec<u8> {
+    let mut hpack = vec![0x82, 0x86, 0x84];
+    for (index, value) in [(1u8, Some(authority)), (38, host)] {
+        let Some(value) = value else { continue };
+        assert!(value.len() < 127, "one-byte HPACK length");
+        hpack.extend_from_slice(&[0x40 | index, value.len() as u8]);
+        hpack.extend_from_slice(value);
+    }
     frame(HEADERS, 0x5, stream, &hpack) // END_STREAM | END_HEADERS
 }
 
@@ -282,15 +286,58 @@ fn an_h2c_request_whose_host_disagrees_with_its_authority_is_a_400() {
     let Some(zion) = Zion::start() else {
         return;
     };
-    let same = speak_h2c(zion.http, &get_with_host(1, b"localhost"));
+    let same = speak_h2c(
+        zion.http,
+        &get_with_host(1, b"localhost", Some(b"localhost")),
+    );
     assert!(
         matches!(same.as_slice(), [(1, Some(first))] if *first != STATUS_400),
         "control: the same authority in :authority and host is answered (a 301), got {same:?}"
     );
-    let other = speak_h2c(zion.http, &get_with_host(1, b"evil.example"));
+    let other = speak_h2c(
+        zion.http,
+        &get_with_host(1, b"localhost", Some(b"evil.example")),
+    );
     assert_eq!(
         other,
         vec![(1, Some(STATUS_400))],
         "a host field that disagrees with :authority gets one response, a 400"
     );
+}
+
+/// An h2c request whose `:authority` or `host` has a port that is not a port gets a 400: routing
+/// would key the whole text and an upstream would read the host before the `:`. An empty port is
+/// the scheme's default (RFC 3986 §6.2.3), so `localhost:` is answered as `localhost`.
+#[test]
+fn an_h2c_request_whose_authority_port_is_not_a_port_is_a_400() {
+    let Some(zion) = Zion::start() else {
+        return;
+    };
+    let empty: &[(&[u8], Option<&[u8]>)] =
+        &[(b"localhost:", None), (b"localhost", Some(b"localhost:"))];
+    for (authority, host) in empty {
+        let got = speak_h2c(zion.http, &get_with_host(1, authority, *host));
+        assert!(
+            matches!(got.as_slice(), [(1, Some(first))] if *first != STATUS_400),
+            "an empty port is the default one and is answered (a 301): :authority {:?}, host \
+             {:?}, got {got:?}",
+            String::from_utf8_lossy(authority),
+            host.map(String::from_utf8_lossy)
+        );
+    }
+    let not_a_port: &[(&[u8], Option<&[u8]>)] = &[
+        (b"localhost:x", None),
+        (b"localhost:x", Some(b"localhost")),
+        (b"localhost", Some(b"localhost:x")),
+        (b"localhost", Some(b"localhost:+80")),
+    ];
+    for (authority, host) in not_a_port {
+        assert_eq!(
+            speak_h2c(zion.http, &get_with_host(1, authority, *host)),
+            vec![(1, Some(STATUS_400))],
+            ":authority {:?}, host {:?}",
+            String::from_utf8_lossy(authority),
+            host.map(String::from_utf8_lossy)
+        );
+    }
 }

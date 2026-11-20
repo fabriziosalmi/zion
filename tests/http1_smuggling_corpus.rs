@@ -439,5 +439,27 @@ fn no_desync_form_smuggles_a_request_past_zion() {
         origin_bytes(&seen)
     );
 
+    // 8d. an authority whose port is not a port, in an absolute-form target or in Host, is refused
+    // with 400 and never forwarded: routing would key the whole text, while an upstream reads the
+    // host before the `:`.
+    for raw in [
+        &b"GET http://a.example:x/abs8d-target HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n"[..],
+        b"GET /abs8d-host HTTP/1.1\r\nHost: a.example:x\r\nConnection: close\r\n\r\n",
+        b"GET /abs8d-plus HTTP/1.1\r\nHost: a.example:+443\r\nConnection: close\r\n\r\n",
+    ] {
+        let line = send_raw(port, raw);
+        assert!(
+            line.starts_with("HTTP/1.1 400"),
+            "{:?} must be refused with 400: {line:?}",
+            String::from_utf8_lossy(raw)
+        );
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !origin_bytes(&seen).contains("/abs8d"),
+        "a request whose authority port is not a port reached the upstream:\n{}",
+        origin_bytes(&seen)
+    );
+
     let _ = fs::remove_dir_all(dir);
 }

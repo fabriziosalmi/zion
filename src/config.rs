@@ -4513,6 +4513,10 @@ mtls_fingerprint = false
             "api.example.com/x",
             "user@api.example.com",
             "",
+            // not `host[:port]`, or an empty port: no request is routed by that text
+            "api.example.com:",
+            "api.example.com:x",
+            "::1",
         ] {
             assert!(
                 validate_host_entry("r", bad).is_some(),

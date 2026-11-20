@@ -169,7 +169,7 @@ The `:80` ACME fallback applies the same lists before it forwards.
 
 Bind a route to one or more `hosts` to serve different backends for different domains on the same listener — the `Host` header (HTTP/1) or `:authority` (HTTP/2) selects the route. A route **without** `hosts` is *shared*: it matches every host and acts as a fallback.
 
-A request names one host. One that names two that disagree, a request-target authority (HTTP/2 or HTTP/3 `:authority`, an HTTP/1.1 absolute-form target such as `GET http://a.example/`) together with a `Host` header for another authority, or a target authority with userinfo (`user@host`), is refused with `400` before routing, on the HTTPS and the `:80` listeners. Routing, the route's policy and the cache key go by the target's authority while the upstream is told the `Host` header, so such a request would be decided as one host and served as the other. Host and port are compared as RFC 3986 §6.2.3 has it: `A.example` and `a.example:443` name the same authority as `https://a.example/`.
+A request names one host. One that names two that disagree, a request-target authority (HTTP/2 `:authority`, an HTTP/1.1 absolute-form target such as `GET http://a.example/`) together with a `Host` header for another authority, is refused with `400` before routing, on the HTTPS and the `:80` listeners. So is one whose target or `Host` authority is not `host[:port]`: userinfo (`user@host`), or a port that is not a port number (`a.example:x`, `a.example:+443`, `a.example:99999`, `a.example:1:2`), over HTTP/1.1, HTTP/2 and HTTP/3. Routing, the route's policy and the cache key go by the target's authority while the upstream is told the `Host` header, and an upstream reads the host before the `:` where routing would key the whole text, so such a request would be decided as one host and served as another. Host and port are compared as RFC 3986 §6.2.3 has it: `A.example`, `a.example:443` and `a.example:` (an empty port) name the same authority as `https://a.example/`. Over HTTP/3 the `h3` crate compares `:authority` and `host` itself, byte for byte, and resets the request stream (`H3_MESSAGE_ERROR`) when they differ at all, before zion sees the request.
 
 ```toml
 # api.example.com → API backend
@@ -205,7 +205,7 @@ An exact host beats a wildcard, and a matched host never falls through to *anoth
 
 ### Host normalization
 
-Authorities are normalized before matching: lowercased, port stripped (`api.example.com:8443` → `api.example.com`), and a trailing FQDN dot removed. Config `hosts` entries must be canonical bare hostnames — no scheme, path, port, or trailing dot (uppercase is folded). Only leading-label wildcards (`*.example.com`) are supported.
+Authorities are normalized before matching: lowercased, port stripped (`api.example.com:8443` → `api.example.com`, and an empty port, `api.example.com:`, is no port), and a trailing FQDN dot removed. An authority that is not `host[:port]` is not normalized: the request is refused (see above). Config `hosts` entries must be canonical bare hostnames: no scheme, path, port (an empty one included), or trailing dot (uppercase is folded), and an IPv6 literal in brackets (`[::1]`). Only leading-label wildcards (`*.example.com`) are supported.
 
 ### Relationship to TLS SNI
 

@@ -56,7 +56,8 @@ pub(super) enum Gate {
     NormalizePath,
     /// 405 for a method outside the whitelist.
     Method,
-    /// 400 for a request whose `Host` names another authority than its request target.
+    /// 400 for a request whose `Host` names another authority than its request target, or
+    /// whose target or `Host` authority is not `host[:port]`.
     Authority,
     /// 425 for a state-changing method in early data.
     EarlyData,
@@ -155,7 +156,9 @@ fn uri_length(req: &Request<ReqBody>) -> Option<Response<ZionBody>> {
 
 /// Gate: one authority per request. Routing, the route's policy and the cache key go by the
 /// request target's authority, the upstream is told the `Host` header: a request whose two
-/// disagree is refused before either is used (see [`crate::security::authority_is_ambiguous`]).
+/// disagree, or that names an authority routing would key differently from the upstream
+/// (`a.example:x`), is refused before either is used (see
+/// [`crate::security::authority_is_ambiguous`]).
 fn authority(req: &Request<ReqBody>) -> Option<Response<ZionBody>> {
     crate::security::authority_is_ambiguous(req).then(|| empty_response(StatusCode::BAD_REQUEST))
 }

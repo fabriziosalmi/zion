@@ -3,7 +3,9 @@
 //! real binary: a client sends part of a body without `Content-Length` and resets the stream. The
 //! upstream must not receive what had arrived as a complete body, whether zion streams it (no
 //! WAF), reads it first (a WAF) or reads it to give it a length (`require_content_length`). A body
-//! that arrives whole still reaches the upstream whole.
+//! that arrives whole still reaches the upstream whole. The same client also pins the HTTP/3
+//! limits on the request head: the header-section bound, and the `:authority` refused before
+//! routing.
 //!
 //! Needs `--features http3` (CI's all-features test job) and `openssl` (skipped without).
 #![cfg(all(unix, feature = "http3"))]
@@ -390,6 +392,17 @@ async fn a_h3_headers_fin_with_content_length_is_not_a_phantom_body() {
 /// GET over HTTP/3 with one header whose value is `len` bytes: `Ok(status)`, or `Err` with the
 /// client's own refusal to send it (h3 checks the server's advertised header-section limit).
 async fn h3_get_with_header(port: u16, len: usize) -> Result<u16, String> {
+    h3_get(
+        port,
+        "https://localhost/open/headers",
+        Some("a".repeat(len)),
+    )
+    .await
+}
+
+/// GET `uri` over HTTP/3 (its authority is the `:authority` sent), with an `x-big` header of
+/// `big` when given: `Ok(status)`, or `Err` with the client's or the stream's error.
+async fn h3_get(port: u16, uri: &str, big: Option<String>) -> Result<u16, String> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut tls = rustls::ClientConfig::builder()
         .dangerous()
@@ -412,10 +425,11 @@ async fn h3_get_with_header(port: u16, len: usize) -> Result<u16, String> {
     });
     // Let the server's SETTINGS arrive, as they would on any connection in use.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let req = hyper::Request::get("https://localhost/open/headers")
-        .header("x-big", "a".repeat(len))
-        .body(())
-        .unwrap();
+    let mut req = hyper::Request::get(uri);
+    if let Some(big) = big {
+        req = req.header("x-big", big);
+    }
+    let req = req.body(()).unwrap();
     let mut stream = send.send_request(req).await.map_err(|e| format!("{e:?}"))?;
     stream.finish().await.map_err(|e| format!("{e:?}"))?;
     let resp = stream.recv_response().await.map_err(|e| format!("{e:?}"))?;
@@ -450,6 +464,50 @@ async fn a_h3_header_section_over_16_kib_is_not_served() {
     assert!(
         matches!(&big, Ok(431)) || matches!(&big, Err(e) if e.contains("16384")),
         "a 20 KiB header section is refused (431, or the client refuses on zion's 16384): {big:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// An HTTP/3 `:authority` whose port is not a port gets a 400, as over HTTP/1.1 and HTTP/2: the
+/// `h3` crate hands it over as the request's authority, and routing would key its whole text
+/// while an upstream reads the host before the `:`. An empty port is the scheme's default
+/// (RFC 3986 §6.2.3), so `localhost:` is served as `localhost`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_h3_authority_whose_port_is_not_a_port_is_a_400() {
+    let dir = std::env::temp_dir().join(format!(
+        "zion-h3-authority-{}-{}",
+        std::process::id(),
+        free_port()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let Some((_daemon, port)) = boot(&dir, upstream(seen.clone())) else {
+        return;
+    };
+    assert_eq!(
+        h3_get(port, "https://localhost:/open/authority-empty", None).await,
+        Ok(200),
+        "an empty port is the default one"
+    );
+    for uri in [
+        "https://localhost:x/open/authority-x",
+        "https://localhost:+443/open/authority-plus",
+        "https://localhost:99999/open/authority-big",
+    ] {
+        assert_eq!(h3_get(port, uri, None).await, Ok(400), "{uri}");
+    }
+    // (the upstream also sees zion's own `GET /` warm-up and health probes)
+    let paths: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| s.path.clone())
+        .filter(|p| p.starts_with("/open/authority"))
+        .collect();
+    assert_eq!(
+        paths,
+        ["/open/authority-empty"],
+        "only the request with a default port reached the upstream"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
