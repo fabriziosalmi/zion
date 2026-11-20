@@ -15,7 +15,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -80,6 +80,11 @@ fn curl_h2(port: u16, method: &str, path: &str, headers: &[&str], body: &str) ->
 /// An origin that parses a keep-alive stream of HTTP/1.1 requests, records the head (start-line and
 /// header lines) of each, consumes its body (Content-Length or chunked) so the next request starts
 /// at a boundary, and answers `ok`.
+///
+/// Between two requests it waits as long as zion keeps the connection open; only the reads inside
+/// a request are bounded. An origin that closes an idle connection races zion reusing it: zion
+/// pools upstream connections, and a request it writes on one as the close arrives fails with a
+/// `502`, which none of these cases is about.
 fn origin() -> (u16, Arc<Mutex<Vec<String>>>) {
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -90,17 +95,20 @@ fn origin() -> (u16, Arc<Mutex<Vec<String>>>) {
             let Ok(s) = stream else { continue };
             let log = log.clone();
             std::thread::spawn(move || {
-                s.set_read_timeout(Some(Duration::from_millis(500))).ok();
                 let mut w = match s.try_clone() {
                     Ok(w) => w,
                     Err(_) => return,
                 };
                 let mut r = BufReader::new(s);
                 loop {
+                    r.get_ref().set_read_timeout(None).ok();
                     let mut start = String::new();
                     if r.read_line(&mut start).unwrap_or(0) == 0 {
                         break;
                     }
+                    r.get_ref()
+                        .set_read_timeout(Some(Duration::from_millis(500)))
+                        .ok();
                     let start = start.trim_end().to_string();
                     if start.is_empty() {
                         continue;
@@ -190,6 +198,39 @@ fn origin() -> (u16, Arc<Mutex<Vec<String>>>) {
         }
     });
     (port, seen)
+}
+
+/// The origin answers a second request on a keep-alive connection that sat idle for longer than
+/// its read bound inside a request (500 ms), as `origin` says it does.
+#[test]
+fn the_origin_keeps_an_idle_keep_alive_connection_open() {
+    let (port, seen) = origin();
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut r = BufReader::new(c.try_clone().unwrap());
+    // One request on the connection; its status line, with the head and the 2-byte body consumed.
+    let mut ask = |path: &str| -> String {
+        let _ = c.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes());
+        let mut status = String::new();
+        let _ = r.read_line(&mut status);
+        loop {
+            let mut h = String::new();
+            if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim_end().is_empty() {
+                break;
+            }
+        }
+        let mut body = [0u8; 2];
+        let _ = r.read_exact(&mut body);
+        status.trim_end().to_string()
+    };
+    assert_eq!(ask("/first"), "HTTP/1.1 200 OK");
+    std::thread::sleep(Duration::from_millis(800));
+    let second = ask("/second");
+    assert_eq!(
+        second, "HTTP/1.1 200 OK",
+        "the origin closed a keep-alive connection that sat idle for 800 ms"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
 }
 
 /// zion's response to `raw`: the status line and the full header block, read until the blank line.
