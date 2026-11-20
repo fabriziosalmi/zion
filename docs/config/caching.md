@@ -73,10 +73,18 @@ each variant under its own **secondary key** built from the values of those head
   client sent. A browser sends no `X-Real-IP`, so every browser would share the first one's
   variant.
 - If the origin changes the set of headers it varies on, or stops varying, the key
-  follows on the next fetch; entries filed under the old key are no longer reachable.
+  follows: the next `200` is filed under the new `Vary`, and entries filed under the old key
+  are no longer reachable. A revalidation is held to the key the entry was filed under: a
+  `304` whose `Vary` is not that one (a header more or less) does not renew the entry, in the
+  foreground or from a background refresh; a `304` that sends no `Vary` keeps the entry's. In
+  the foreground, the client it answered gets it for itself alone
+  ([What a hit carries](#what-a-hit-carries)); either way the stale entry is removed, so that the
+  next request is a miss whose `200` is filed under the new `Vary`. Renewed under the old key, one user's `304` from an origin that now varies on
+  `X-Auth-Subject` would be every user's entry, with that user's headers.
 - A background [stale-while-revalidate](#stale-while-revalidate-rfc-5861) refresh
-  fetches the **same variant** it refreshes, and is discarded if the origin's `Vary`
-  no longer matches the key it was filed under.
+  fetches the **same variant** it refreshes. An answer to it, `200` or `304`, whose `Vary` no
+  longer matches the key the entry was filed under is discarded, and the stale entry is
+  removed as above.
 
 ## Cache key
 
@@ -164,15 +172,20 @@ attachment` and `Content-Security-Policy: sandbox` stays inert on every hit.
   `Content-Type` and `Content-Encoding` and the validators stay as stored, and a `Set-Cookie` on
   the 304 is not kept. The 304 answers the request that was sent, the client's `Cookie` and
   `Authorization` included, so it renews the shared entry only when it could have been stored
-  itself, as a `200` is: no `Set-Cookie`, no `private`, `no-store` or `no-cache`, a `public`,
-  `s-maxage` or `must-revalidate` on the 304 when the request carried `Authorization`, and a
-  `Vary` zion can key on. Otherwise this client is answered with it and the entry stays as it
-  was, stale. That answer is for this client alone, whatever the 304 or the entry said: its
-  `Cache-Control` is `private`, followed by those of the entry's directives a private cache obeys
-  that only hold it back or give the origin's own lifetime (`no-store`, `no-cache`,
-  `must-revalidate`, `no-transform`, `max-age`), never `public` or `s-maxage` (they would let a
-  shared cache downstream keep one client's answer for every client); and it carries the 304's
-  `Set-Cookie`, which the entry does not keep. The renewed lifetime is that of the updated response:
+  itself, as a `200` is: no `Set-Cookie`, no `private`, `no-store` or `no-cache`, and a
+  `public`, `s-maxage` or `must-revalidate` on the 304 when the request carried
+  `Authorization`; and only when its `Vary` is the one the entry was filed under (the 304's own,
+  or the entry's when the 304 sends none; see [Vary and secondary keys](#vary-and-secondary-keys)).
+  Otherwise this client is answered with it and the entry stays as it was, stale, or, when the
+  `Vary` is what differs, is removed. That answer is for this client alone, whatever the 304 or
+  the entry said: its `Cache-Control` is `private`, followed by those of the entry's directives a
+  private cache obeys that only hold it back or give the origin's own lifetime (`no-store`,
+  `no-cache`, `must-revalidate`, `no-transform`, `max-age`), never `public` or `s-maxage` (they
+  would let a shared cache downstream keep one client's answer for every client); and it carries
+  the 304's `Set-Cookie`, which the entry does not keep. It carries none of the cache fields a
+  CDN in front of zion obeys in place of `Cache-Control` (`CDN-Cache-Control` and
+  `Cloudflare-CDN-Cache-Control`, RFC 9213, and `Surrogate-Control`), which the entry keeps and
+  a shared answer from it (a hit, a renewing `REVALIDATED`) still carries. The renewed lifetime is that of the updated response:
   the 304's `Cache-Control` or, when it sends none, the stored one (a bare `304` does not
   stretch a `max-age=60` entry to the profile TTL). The 304's `Date` replaces the stored one; a
   304 without a `Date` leaves none, and the answer is dated when it is sent.
@@ -201,8 +214,9 @@ the request it is (a plain `GET` gets the body, not a `304`).
   freshness in place and serves the **cached body**, marked
   `X-Zion-Cache: REVALIDATED`, without a re-download, and with the stored headers the
   304 updated ([What a hit carries](#what-a-hit-carries)), with the 304's `Age`. A 304 that
-  could not have been stored itself answers this client and leaves the entry stale (same
-  section). `zion_cache_revalidations` counts these.
+  could not have been stored itself answers this client and leaves the entry stale, and one
+  whose `Vary` is not the entry's removes it (same section). `zion_cache_revalidations` counts
+  these.
 - **`200 OK`** → the content changed: the new response replaces the stale entry
   and is served + cached as a normal fetch.
 - **Origin error** (unreachable, or a `500`/`502`/`503`/`504` answer during
@@ -251,8 +265,10 @@ background, so the client does not wait for the origin round trip. `M` is capped
   and a cacheable `200` replaces it, headers included. When the request that found the entry
   stale carried `Authorization`, the refresh's answer needs the same `public`, `s-maxage` or
   `must-revalidate` opt-in (RFC 9111 §3.5) as the foreground one: the origin may still have
-  answered for that client. Anything else leaves the stale entry in place; once outside its
-  window it is no longer served stale.
+  answered for that client. An answer whose `Vary` is not the one the entry was filed under
+  renews nothing and removes the stale entry ([Vary and secondary keys](#vary-and-secondary-keys)).
+  Anything else leaves the stale entry in place; once outside its window it is no longer served
+  stale.
 - **Not for a variant keyed on what the refresh leaves out**: an entry whose `Vary` names one of
   the headers above (`Vary: X-Auth-Subject` behind an auth gate, `Vary: X-Client-TLS-JA4`) is
   not served stale while it revalidates. A refresh without that header would get the

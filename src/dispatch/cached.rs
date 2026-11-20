@@ -46,6 +46,9 @@ struct Lookup {
     stale_entry: Option<cache::CacheHit>,
     /// The key the entry being revalidated lives under (its own key or the identity key).
     found_key: String,
+    /// The primary key `found_key` was derived from: its `Vary` rule is the one the entry was
+    /// filed under.
+    found_primary: String,
 }
 
 /// Where the response of a fetch is to be stored, and how fresh it is.
@@ -199,6 +202,7 @@ pub(super) async fn handle(
             revalidate: None,
             stale_entry: None,
             found_key: cx.cache_key.clone(),
+            found_primary: cx.primary_key.clone(),
         }
     };
 
@@ -456,6 +460,7 @@ impl Cx<'_> {
             revalidate,
             stale_entry,
             found_key,
+            found_primary: at_primary,
         })
     }
 
@@ -575,6 +580,7 @@ impl Cx<'_> {
             revalidate,
             stale_entry,
             found_key,
+            found_primary,
         } = lookup;
         // Opt-in circuit breaker: if the upstream's circuit is open, do not contact it. A stale
         // copy (when the origin allowed stale responses) stands in for it; otherwise the client
@@ -646,8 +652,15 @@ impl Cx<'_> {
             breaker_record(entry, resp.status(), probe.take());
         }
 
-        self.conclude(resp, revalidate, fetching, &found_key, &req_headers)
-            .await
+        self.conclude(
+            resp,
+            revalidate,
+            fetching,
+            &found_key,
+            &found_primary,
+            &req_headers,
+        )
+        .await
     }
 
     /// What to do with the origin's answer: serve the stale copy when the origin failed
@@ -658,6 +671,7 @@ impl Cx<'_> {
         revalidate: Option<cache::CacheHit>,
         fetching: Fetching,
         found_key: &str,
+        found_primary: &str,
         req_headers: &hyper::HeaderMap,
     ) -> Result<Response<ZionBody>, hyper::Error> {
         let state = self.state;
@@ -686,8 +700,16 @@ impl Cx<'_> {
             if resp.status() == StatusCode::NOT_MODIFIED {
                 // The 304's headers update the stored ones (RFC 9111 §4.3.4), for this answer,
                 // and for the entry when the 304 may update it (see `revalidated`: it answers
-                // this client's request, credentials included).
-                let rv = revalidated(&hit.meta, resp.headers(), self.req_authenticated, cache_ttl);
+                // this client's request, credentials included, and the entry is filed under the
+                // `Vary` rule of its primary key).
+                let filed = state.static_cache.vary.get(found_primary);
+                let rv = revalidated(
+                    &hit.meta,
+                    resp.headers(),
+                    self.req_authenticated,
+                    cache_ttl,
+                    filed.as_ref().map(|rule| rule.names.as_slice()),
+                );
                 if !rv.fits {
                     state.static_cache.count_too_large();
                 }
@@ -705,7 +727,13 @@ impl Cx<'_> {
                     );
                     fetching.stored(); // waiters observe the revived (fresh) entry
                 } else {
-                    // Served, and the entry stays stale: waiters fetch for themselves.
+                    // A 304 whose `Vary` is not the entry's takes the entry out, so that the next
+                    // request misses and its `200` files the response under the new `Vary`
+                    // (`Revalidation::vary_changed`).
+                    if rv.vary_changed {
+                        state.static_cache.remove_unchanged(found_key, &hit);
+                    }
+                    // Served, and the entry stays stale (or is gone): waiters fetch for themselves.
                     drop(fetching);
                 }
                 crate::metrics::METRICS
