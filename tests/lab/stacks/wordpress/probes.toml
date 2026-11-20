@@ -43,7 +43,7 @@ affects = "WordPress 4.7, 4.7.1 (fixed in 4.7.2)"
 # `get_post( (int) $id )` -- the SAME (int) cast update_item() uses, applied before the lookup.
 # "1z" becomes 1 either way now, so the permission check receives the real post 1 and correctly
 # denies the anonymous request (401 rest_cannot_edit), instead of silently granting it.
-mechanism = "zion's virtual-patch rule 'wp-rest-posts-id-param-override' (virtual-patch.toml) denies any POST/PUT/PATCH to /wp-json/wp/v2/posts/* that carries an 'id' query parameter at all: no legitimate REST client needs to repeat the id in the query string once it is already in the path, and that redundant parameter is exactly what the 4.7.1 permission check fails to validate."
+mechanism = "zion's virtual-patch rule 'wp-rest-posts-id-param-override' (virtual-patch.toml) denies any request to /wp-json/wp/v2/posts/* that carries an 'id' query parameter at all, on any method: no legitimate REST client needs to repeat the id in the query string once it is already in the path, and that redundant parameter is exactly what the 4.7.1 permission check fails to validate."
 mechanism_verified = true
 # Confirmed by a break-test, not only by reading the code: with virtual_patch.rs's
 # `rule_matches()` temporarily forced to always return `false` (so no rule can ever match),
@@ -183,8 +183,9 @@ body_contains = "Hello world!"
 
 [[benign]]
 id = "anonymous-rest-read-of-the-same-post"
-# Reading post 1 (no mutation, no id override) must stay public: the REST API's read path is
-# untouched by the virtual-patch rule, which only matches POST/PUT/PATCH.
+# Reading post 1 (no mutation, no id override) must stay public: the virtual-patch rule matches
+# any method since #773, so the read path stays untouched only because this request carries no
+# 'id' query parameter.
 [benign.request]
 method = "GET"
 target = "/wp-json/wp/v2/posts/1"
