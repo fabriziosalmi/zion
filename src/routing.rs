@@ -105,10 +105,15 @@ impl ResolvedRoute {
     /// May the plaintext `:80` listener hand an ACME-challenge request that no
     /// in-memory token matched to this route's upstream (for external clients such
     /// as certbot)? That fallback proxies without going through the request
-    /// pipeline, so it skips the auth gate, `internal_only`, and the WAF. It is
-    /// therefore only allowed for a route that has none of those protections to
-    /// bypass, and one that actually has an upstream: a static route's placeholder
-    /// upstream is `127.0.0.1`, which would send the request to a local port 80.
+    /// pipeline, so it skips the route's auth gate, `internal_only`, the WAF, the
+    /// restrictions (`methods`, `content_types`, `deny_paths`) and the bulkhead
+    /// (`max_in_flight`). It is therefore only allowed for a route that has none of
+    /// those to bypass, and one that actually has an upstream: a static route's
+    /// placeholder upstream is `127.0.0.1`, which would send the request to a local
+    /// port 80. The rest is covered where the fallback runs (`accept::handle_http`):
+    /// it takes only a bodyless GET or HEAD, so the body cap and
+    /// `require_content_length` have nothing to check; it runs the virtual patches
+    /// itself; and it asks the config about a circuit breaker on the upstream.
     /// ACME challenge paths are public by nature (the CA fetches them without
     /// credentials), so serve them from a route that is public too.
     pub fn serves_acme_fallback(&self) -> bool {
@@ -116,7 +121,12 @@ impl ResolvedRoute {
         let authed = self.auth.is_some();
         #[cfg(not(feature = "auth"))]
         let authed = false;
-        !self.internal_only && !authed && self.mode != RouteMode::Static
+        !self.internal_only
+            && !authed
+            && self.mode != RouteMode::Static
+            && self.waf.is_none()
+            && self.restrictions.is_none()
+            && self.max_in_flight == 0
     }
 }
 
@@ -1145,6 +1155,37 @@ upstream = "shared"
             !get("/site/x").serves_acme_fallback(),
             "static has no real upstream"
         );
+
+        // What else the fallback would skip: the WAF (a profile or the inline `waf = true`),
+        // the restrictions, and the bulkhead. A body cap or `require_content_length` is not:
+        // the fallback takes only a bodyless request, which the body gate passes.
+        let c = cfg(
+            "[upstream.busy]\nurl=\"http://127.0.0.1:8001\"\nmax_in_flight=4\n\
+             [waf_profile.w]\n\
+             [[route]]\npath=\"/profile/{*rest}\"\nupstream=\"be\"\nwaf_profile=\"w\"\n\
+             [[route]]\npath=\"/inline/{*rest}\"\nupstream=\"be\"\nwaf=true\n\
+             [[route]]\npath=\"/methods/{*rest}\"\nupstream=\"be\"\nmethods=[\"GET\"]\n\
+             [[route]]\npath=\"/types/{*rest}\"\nupstream=\"be\"\ncontent_types=[\"application/json\"]\n\
+             [[route]]\npath=\"/deny/{*rest}\"\nupstream=\"be\"\ndeny_paths=[\"/deny/admin\"]\n\
+             [[route]]\npath=\"/busy/{*rest}\"\nupstream=\"busy\"\n\
+             [[route]]\npath=\"/capped/{*rest}\"\nupstream=\"be\"\nmax_body_mb=1\n\
+             [[route]]\npath=\"/sized/{*rest}\"\nupstream=\"be\"\nrequire_content_length=true\n",
+        );
+        let router = build_router_quiet(&c).unwrap();
+        let get = |p: &str| router.at(None, p).unwrap().clone();
+        for p in [
+            "/profile/x",
+            "/inline/x",
+            "/methods/x",
+            "/types/x",
+            "/deny/x",
+            "/busy/x",
+        ] {
+            assert!(!get(p).serves_acme_fallback(), "{p} must not");
+        }
+        for p in ["/capped/x", "/sized/x"] {
+            assert!(get(p).serves_acme_fallback(), "{p} may");
+        }
     }
 
     #[cfg(feature = "auth")]

@@ -111,8 +111,8 @@ pub struct WafProfile {
     pub scan_headers: Vec<String>,
     /// Strict `multipart/form-data` structure limits (#694). A body labelled
     /// multipart is parsed the way the origin will read it and held to these
-    /// bounds; a body that does not parse cleanly is denied, never forwarded,
-    /// so zion cannot read it differently from the upstream (the multipart
+    /// bounds; a body that does not parse cleanly, or that a lenient backend
+    /// would split differently, is denied, never forwarded (the multipart
     /// smuggling class). Max number of parts. Default 1000: a real form has a
     /// handful, a part flood (PHP2Shell and a series of parser CVEs) has
     /// thousands.
@@ -1346,6 +1346,12 @@ fn inspect_part_headers(block: &[u8], profile: &WafProfile, form_data: bool) -> 
             Some(i) => (&rest[..i], &rest[i + 2..]),
             None => (rest, &b""[..]),
         };
+        // A CR or LF outside a CRLF: PHP breaks a line at a bare LF and Werkzeug at either, and
+        // Werkzeug ends the header block at "\n\n" or "\r\r", so they would read other headers,
+        // or another field name, than this walk does.
+        if memchr::memchr2(b'\r', b'\n', line).is_some() {
+            return PartHeaders::Deny("bare line break in multipart part headers");
+        }
         if !line.is_empty() {
             count += 1;
             if count > profile.max_part_headers {
@@ -1427,10 +1433,16 @@ fn cd_param<'a>(value: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
 
 /// Gate 2b (#694): strict multipart structure. Parses the body the way the origin will read it
 /// and holds it to the profile's limits. A body that does not parse cleanly is denied, never
-/// forwarded, so zion cannot read it differently from the upstream. It runs for a canonical
-/// `multipart/form-data` body (full field-name rules) and for any other content-type carrying a
-/// boundary — the Spring CVE-2026-41853 content-type-smuggling class — where only the structural
-/// limits apply. Runs on a fully buffered body.
+/// forwarded. It runs for a canonical `multipart/form-data` body (full field-name rules) and for
+/// any other content-type carrying a boundary (the Spring CVE-2026-41853 content-type-smuggling
+/// class), where only the structural limits apply. Runs on a fully buffered body.
+///
+/// Common backends parse more leniently than RFC 2046, so the body must also leave them no other
+/// split: the dash-boundary `--B` occurs only at the start and right after the CRLF that ends a
+/// part (PHP, Werkzeug and Django also split on a bare LF before it, Werkzeug and Django on a
+/// bare CR, Django on `--B` anywhere); nothing but spaces, tabs, CR and LF follows the close
+/// delimiter (PHP and Django read parts after it); and a part's headers have no CR or LF outside
+/// a CRLF (PHP breaks a line at a bare LF, Werkzeug at a bare LF or CR).
 ///
 /// Public so `benches/multipart_parse.rs` can measure the parse cost per MiB in isolation, the
 /// same way the benches reach [`validate_request`] and [`StreamingScanner`].
@@ -1449,18 +1461,25 @@ pub fn multipart_structure(ct: &str, body: &[u8], profile: &WafProfile) -> WafVe
         return WafVerdict::Deny("multipart body does not start at its boundary");
     }
     // CRLF dash-boundary separates parts; a trailing "--" closes the body.
-    let mut crlf_delim = Vec::with_capacity(2 + delim.len());
-    crlf_delim.extend_from_slice(b"\r\n");
-    crlf_delim.extend_from_slice(&delim);
+    let dash_boundary = memchr::memmem::Finder::new(&delim);
 
     let mut pos = delim.len();
     let mut parts = 0usize;
     let mut file_parts = 0usize;
     loop {
         let after = &body[pos..];
-        // "--" right after a dash-boundary is the close-delimiter: the body ends here.
-        if after.starts_with(b"--") {
-            return WafVerdict::Allow;
+        // "--" right after a dash-boundary is the close-delimiter: the body ends here. RFC 2046
+        // lets an epilogue follow, for parsers to ignore, but PHP and Django read parts out of
+        // it; real clients send at most a line break.
+        if let Some(epilogue) = after.strip_prefix(b"--") {
+            return if epilogue
+                .iter()
+                .all(|&b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+            {
+                WafVerdict::Allow
+            } else {
+                WafVerdict::Deny("data after the multipart close delimiter")
+            };
         }
         // Otherwise optional transport-padding (LWSP) then CRLF, then a part.
         let after = trim_leading_lws(after);
@@ -1495,13 +1514,18 @@ pub fn multipart_structure(ct: &str, body: &[u8], profile: &WafProfile) -> WafVe
             }
         }
 
-        // Part body runs from after the blank line to the next CRLF dash-boundary.
+        // Part body runs from after the blank line to the next CRLF dash-boundary. The first
+        // dash-boundary from the part's start must be that one: any earlier one (in the headers,
+        // in the content, or using the blank line's CRLF) is a split some backend makes there.
         let content_start = hdr_end + 4;
-        let d = match memchr::memmem::find(&body[content_start..], &crlf_delim) {
-            Some(i) => content_start + i,
+        let d = match dash_boundary.find(&body[pos..]) {
+            Some(i) => pos + i,
             None => return WafVerdict::Deny("unterminated multipart body"),
         };
-        pos = d + crlf_delim.len();
+        if d < content_start + 2 || &body[d - 2..d] != b"\r\n" {
+            return WafVerdict::Deny("ambiguous multipart delimiter");
+        }
+        pos = d + delim.len();
     }
 }
 
@@ -3982,6 +4006,239 @@ mod tests {
         assert!(!field_name_index_exceeds(b"items[4294967295]", 0)); // 0 disables
     }
 
+    // ── Multipart: what the gate reads is what common backends parse ────
+    //
+    // A route tightened as the docs suggest: the PHP upload-progress field is refused and the
+    // route takes no file uploads. Each smuggling body hides parts that violate it where the gate
+    // used to stop reading or splitting, but where a common backend still finds them. Werkzeug
+    // 3.1.9 and Django 5.1.15 were run on the same bytes; PHP's rfc1867 parser is read from its
+    // source. Every body below was allowed before the gate learned these rules.
+    fn tight_php_profile() -> WafProfile {
+        WafProfile {
+            deny_field_names: vec!["PHP_SESSION_UPLOAD_PROGRESS".to_string()],
+            max_file_parts: 0,
+            ..WafProfile::default()
+        }
+    }
+    const HIDDEN_FIELD: &[u8] =
+        b"Content-Disposition: form-data; name=\"PHP_SESSION_UPLOAD_PROGRESS\"\r\n\r\nx";
+    const HIDDEN_FILE: &[u8] =
+        b"Content-Disposition: form-data; name=\"f\"; filename=\"z.txt\"\r\n\r\ndata";
+    const FIRST_PART: &[u8] = b"--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv";
+
+    /// (what, body, the verdict the whole WAF must give it).
+    fn smuggling_bodies() -> Vec<(&'static str, Vec<u8>, &'static str)> {
+        let after_close = "data after the multipart close delimiter";
+        let ambiguous = "ambiguous multipart delimiter";
+        let bare = "bare line break in multipart part headers";
+        vec![
+            // Django and PHP read "--B" parts after "--B--".
+            (
+                "parts after the close delimiter",
+                [
+                    FIRST_PART,
+                    b"\r\n--B--\r\n--B\r\n",
+                    HIDDEN_FIELD,
+                    b"\r\n--B\r\n",
+                    HIDDEN_FILE,
+                    b"\r\n--B--\r\n",
+                ]
+                .concat(),
+                after_close,
+            ),
+            // Django splits on every "--B", so the bytes after "--B--" are one more part.
+            (
+                "an epilogue with no delimiter in it",
+                [FIRST_PART, b"\r\n--B--\r\n", HIDDEN_FIELD].concat(),
+                after_close,
+            ),
+            // PHP ("\n--B"), Werkzeug and Django split on a bare-LF dash-boundary.
+            (
+                "bare-LF delimiters",
+                [
+                    FIRST_PART,
+                    b"\n--B\r\n",
+                    HIDDEN_FIELD,
+                    b"\n--B\r\n",
+                    HIDDEN_FILE,
+                    b"\r\n--B--\r\n",
+                ]
+                .concat(),
+                ambiguous,
+            ),
+            // Werkzeug and Django split on a bare-CR dash-boundary.
+            (
+                "bare-CR delimiters",
+                [
+                    FIRST_PART,
+                    b"\r--B\r\n",
+                    HIDDEN_FIELD,
+                    b"\r--B\r\n",
+                    HIDDEN_FILE,
+                    b"\r\n--B--\r\n",
+                ]
+                .concat(),
+                ambiguous,
+            ),
+            // Django splits on "--B" anywhere, newline or not.
+            (
+                "newline-free dash-boundaries",
+                [
+                    FIRST_PART,
+                    b"--B\r\n",
+                    HIDDEN_FIELD,
+                    b"--B\r\n",
+                    HIDDEN_FILE,
+                    b"\r\n--B--\r\n",
+                ]
+                .concat(),
+                ambiguous,
+            ),
+            // The blank line's CRLF taken as the delimiter's: Werkzeug and Django split there.
+            (
+                "a delimiter right after the blank line",
+                [
+                    b"--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n--B\r\n",
+                    HIDDEN_FIELD,
+                    b"\r\n--B--\r\n",
+                ]
+                .concat(),
+                ambiguous,
+            ),
+            // Werkzeug ends a part's headers at "\n\n" or "\r\r" too, and reads the name.
+            (
+                "part headers ended by a bare LF blank line",
+                b"--B\r\nContent-Disposition: form-data; name=\"PHP_SESSION_UPLOAD_PROGRESS\"\n\nx\
+                  \r\n\r\n\r\n--B--\r\n"
+                    .to_vec(),
+                bare,
+            ),
+            (
+                "part headers ended by a bare CR blank line",
+                b"--B\r\nContent-Disposition: form-data; name=\"PHP_SESSION_UPLOAD_PROGRESS\"\r\rx\
+                  \r\n\r\n\r\n--B--\r\n"
+                    .to_vec(),
+                bare,
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_tight_profile_denies_the_hidden_parts_in_their_canonical_position() {
+        // The control: the same two parts, delimited the canonical way, are refused.
+        let p = tight_php_profile();
+        let field = mp(
+            "B",
+            &[
+                ("a", None, b"v"),
+                ("PHP_SESSION_UPLOAD_PROGRESS", None, b"x"),
+            ],
+        );
+        assert_eq!(
+            validate_request("POST", Some(&ct("B")), &field, &p),
+            WafVerdict::Deny("denied multipart field name")
+        );
+        let file = mp("B", &[("a", None, b"v"), ("f", Some("z.txt"), b"data")]);
+        assert_eq!(
+            validate_request("POST", Some(&ct("B")), &file, &p),
+            WafVerdict::Deny("too many multipart file parts")
+        );
+    }
+
+    #[test]
+    fn a_part_that_a_common_backend_parses_cannot_hide_from_the_gate() {
+        let p = tight_php_profile();
+        let mut wrong = Vec::new();
+        for (what, body, want) in smuggling_bodies() {
+            let got = validate_request("POST", Some(&ct("B")), &body, &p);
+            if got != WafVerdict::Deny(want) {
+                wrong.push(format!("{what}: {got:?}, want Deny({want:?})"));
+            }
+        }
+        assert!(wrong.is_empty(), "\n  {}", wrong.join("\n  "));
+    }
+
+    #[test]
+    fn the_streaming_waf_and_the_whole_body_waf_agree_on_the_smuggling_shapes() {
+        // The streaming path runs the raw scan as the frames arrive, then the buffered gates
+        // (multipart included) on the reassembled body: for every chunk size it refuses what
+        // the whole-body path refuses, and allows the well-formed body both allow.
+        let p = WafProfile {
+            streaming: true,
+            ..tight_php_profile()
+        };
+        let mut bodies = smuggling_bodies();
+        bodies.push(("well formed", mp("B", &[("a", None, b"v")]), ""));
+        for (what, body, _) in bodies {
+            let whole = validate_request("POST", Some(&ct("B")), &body, &p);
+            for chunk in [1, 3, 7, 64, body.len().max(1)] {
+                let mut scanner = StreamingScanner::new(p.mode, p.max_body_mb * 1_048_576);
+                let streamed_deny = body
+                    .chunks(chunk)
+                    .any(|c| matches!(scanner.feed(c), StreamVerdict::Deny(_)));
+                if streamed_deny {
+                    assert!(
+                        matches!(whole, WafVerdict::Deny(_)),
+                        "{what}, chunk {chunk}"
+                    );
+                } else {
+                    let streamed = validate_request_prescanned("POST", Some(&ct("B")), &body, &p);
+                    assert_eq!(streamed, whole, "{what}, chunk {chunk}");
+                }
+            }
+            assert_eq!(whole == WafVerdict::Allow, what == "well formed", "{what}");
+        }
+    }
+
+    #[test]
+    fn a_close_delimiter_followed_only_by_padding_and_line_breaks_is_allowed() {
+        // Browsers, curl and requests send "--B--\r\n"; some clients send nothing after it, or
+        // more line breaks. None of that can carry a part.
+        let p = tight_php_profile();
+        for tail in [&b""[..], b"\r\n", b"\r\n\r\n", b" \t\r\n", b"\n"] {
+            let body = [FIRST_PART, b"\r\n--B--", tail].concat();
+            assert_eq!(
+                multipart_structure(&ct("B"), &body, &p),
+                WafVerdict::Allow,
+                "tail {tail:?}"
+            );
+        }
+        // and the first byte that is not one of those is refused
+        let body = [FIRST_PART, b"\r\n--B--\r\nx"].concat();
+        assert_eq!(
+            multipart_structure(&ct("B"), &body, &p),
+            WafVerdict::Deny("data after the multipart close delimiter")
+        );
+    }
+
+    #[test]
+    fn a_dash_boundary_inside_a_part_is_refused_wherever_it_is() {
+        // RFC 2046 has the client pick a boundary its data does not contain: any other
+        // occurrence of "--B" is a split some backend makes and the gate would not.
+        let p = WafProfile::default();
+        for (body, want) in [
+            (
+                &b"--B\r\nContent-Disposition: form-data; name=\"a--B\"\r\n\r\nv\r\n--B--"[..],
+                "ambiguous multipart delimiter",
+            ),
+            (
+                b"--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nx--By\r\n--B--",
+                "ambiguous multipart delimiter",
+            ),
+            (
+                b"--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nx\r\n--B--\r\n--B--",
+                "data after the multipart close delimiter",
+            ),
+        ] {
+            assert_eq!(
+                multipart_structure(&ct("B"), body, &p),
+                WafVerdict::Deny(want),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
     use proptest::prelude::*;
 
     // A boundary over the RFC 2046 charset (no trailing space to keep it simple).
@@ -4038,6 +4295,49 @@ mod tests {
                     multipart_structure(&c, &body, &short_files),
                     WafVerdict::Deny("too many multipart file parts"),
                     "max_file_parts={} should reject files={}", files - 1, files
+                );
+            }
+        }
+
+        // A well-formed body with a stray dash-boundary, line break or byte put anywhere in
+        // it: whenever the gate allows the result, a lenient backend has no other split to
+        // make. Every dash-boundary is at the start or right after a CRLF, the last one is the
+        // close delimiter, and only spaces, tabs, CR and LF follow it.
+        #[test]
+        fn an_allowed_body_leaves_a_lenient_parser_no_other_split(
+            b in boundary_str(),
+            n_parts in 1usize..4,
+            at in any::<prop::sample::Index>(),
+            noise in prop::sample::select(
+                vec!["\n--", "\r--", "--", "\r\n--", "--\r\n", "\n", "\r", "\r\n", "x"],
+            ),
+        ) {
+            let parts: Vec<(&str, Option<&str>, &[u8])> =
+                (0..n_parts).map(|_| ("fld", None, &b"data"[..])).collect();
+            let mut body = mp(&b, &parts);
+            body.extend_from_slice(b"\r\n");
+            let c = ct(&b);
+            let p = WafProfile::default();
+            prop_assert_eq!(multipart_structure(&c, &body, &p), WafVerdict::Allow);
+
+            let mut stray = noise.as_bytes().to_vec();
+            if stray.ends_with(b"--") {
+                stray.extend_from_slice(b.as_bytes()); // a whole dash-boundary
+            }
+            let i = at.index(body.len() + 1);
+            body.splice(i..i, stray);
+            if multipart_structure(&c, &body, &p) == WafVerdict::Allow {
+                let delim = [b"--", b.as_bytes()].concat();
+                let hits: Vec<usize> = memchr::memmem::find_iter(&body, &delim).collect();
+                prop_assert_eq!(hits.first(), Some(&0));
+                for &h in &hits[1..] {
+                    prop_assert!(h >= 2 && &body[h - 2..h] == b"\r\n", "stray at {}", h);
+                }
+                let tail = &body[hits[hits.len() - 1] + delim.len()..];
+                prop_assert!(tail.starts_with(b"--"));
+                prop_assert!(
+                    tail[2..].iter().all(|&x| matches!(x, b' ' | b'\t' | b'\r' | b'\n')),
+                    "epilogue {:?}", String::from_utf8_lossy(&tail[2..])
                 );
             }
         }

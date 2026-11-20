@@ -69,8 +69,8 @@ waf_profile = "upload"
 When a request body is labelled `multipart/form-data`, the WAF parses it the way
 the origin will read it and holds it to the structure limits above, before the
 injection scan. The parser is strict: a body it cannot parse cleanly is refused
-(`400`), never forwarded, so Zion cannot read a multipart body differently from
-the upstream. That closes the multipart-smuggling class (e.g. the Spring
+(`400`), never forwarded, and so is a body a lenient backend would split into
+other parts (see below). That closes the multipart-smuggling class (e.g. the Spring
 CVE-2026-41853 family) and the part/header floods that PHP2Shell and a series of
 parser CVEs rely on.
 
@@ -82,6 +82,20 @@ terminated; `max_parts`, `max_file_parts`, `max_part_headers`,
 `deny_field_names` / `deny_part_header_names` entry matches. The defaults are
 generous enough for real browser and `curl -F` uploads; tighten them per profile
 for an endpoint that takes only small forms.
+
+Common backends parse multipart more leniently than RFC 2046, so a body that
+leaves them another reading is refused too:
+
+- `--boundary` anywhere except at the start of the body and right after the CRLF
+  that ends a part. PHP, Werkzeug and Django also split parts on a bare LF before
+  it, Werkzeug and Django on a bare CR, and Django on `--boundary` anywhere, so a
+  part there would be one the gate never saw.
+- anything but spaces, tabs, CR and LF after the closing `--boundary--`. RFC 2046
+  calls it an epilogue for parsers to ignore, but PHP and Django read parts out of
+  it; `curl -F` and Python `requests` send one CRLF there.
+- a CR or LF in a part's headers that is not part of a CRLF. PHP breaks a header
+  line at a bare LF and Werkzeug at either, and Werkzeug also ends the headers at
+  `\n\n` or `\r\r`, so they would read another field `name` than the gate.
 
 The gate also runs on **any other content-type that carries a `boundary`
 parameter** (for example `multipart/mixed`, or a wildcard variant a framework

