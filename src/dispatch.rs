@@ -900,14 +900,34 @@ fn named_same_origin_paths(headers: &hyper::HeaderMap, request_host: Option<&str
 /// responses are known to vary — the secondary key for this request's varied headers.
 /// `None` when a varied header value is too long to key on.
 fn lookup_key(state: &AppState, primary: &str, headers: &hyper::HeaderMap) -> Option<String> {
+    filed_key(state, primary, headers).map(|(key, _)| key)
+}
+
+/// [`lookup_key`], with the `Vary` rule the key was built from: `None` when the primary key does
+/// not vary, and the key is the primary key itself. An entry found under that key was filed under
+/// that rule: the key holds the rule's names ([`vary::variant_key`]), and an entry is only ever
+/// stored or renewed under a key built from the `Vary` of the response it holds. This is the rule
+/// an answer that would renew or replace the entry is held to ([`same_vary_shape`]), and not the
+/// one [`cache::StaticCache::vary`] holds for the primary key when the origin answers: another
+/// request may have filed a response under a new `Vary` in between (a request that missed while
+/// this one waited on a fetch, or while its revalidation was on its way to the origin).
+fn filed_key(
+    state: &AppState,
+    primary: &str,
+    headers: &hyper::HeaderMap,
+) -> Option<(String, Option<Arc<vary::VaryRule>>)> {
     match state.static_cache.vary.get(primary) {
-        Some(rule) => vary::variant_key(primary, &rule.names, headers),
-        None => Some(primary.to_string()),
+        Some(rule) => Some((
+            vary::variant_key(primary, &rule.names, headers)?,
+            Some(rule),
+        )),
+        None => Some((primary.to_string(), None)),
     }
 }
 
 /// Response headers have the `Vary` of the entry they would renew or replace: `filed` is the rule
-/// [`cache::StaticCache::vary`] holds for that entry's primary key (`None`: the key does not vary).
+/// that entry was found under ([`filed_key`], read when the request looked the entry up; `None`:
+/// the key does not vary).
 /// True when neither varies, or both vary on the same request headers ([`vary::policy`] lists them
 /// lower-cased, sorted and once each, `Accept-Encoding` aside). Any other `Vary` (a name more or
 /// less, `*`, a credential header) says the origin now chooses the response by other request
@@ -939,8 +959,12 @@ struct SwrRefresh {
     key: Arc<str>,
     /// `key` is a shared identity entry (#484): an encoded refresh must not overwrite it.
     identity_entry: bool,
-    /// The primary key `key` was derived from (they are equal unless the key varies).
-    primary_key: Arc<str>,
+    /// The `Vary` rule `key` was built from when the request found the entry ([`filed_key`];
+    /// `None`: it does not vary): the rule the entry was filed under, which the refresh's answer
+    /// is held to. Not read again when the origin answers: a `200` that another request filed
+    /// under a new `Vary` in between made a `304` with that `Vary` renew this entry, under a key
+    /// the origin no longer selects by, with the headers of the client the refresh went for.
+    filed: Option<Arc<vary::VaryRule>>,
     stale: cache::CacheHit,
     request: Request<ReqBody>,
     /// The request that found the entry stale carried `Authorization`. The refresh does not
@@ -992,20 +1016,17 @@ fn swr_drops(name: &str) -> bool {
     })
 }
 
-/// A background refresh of the entry under `found_key` (filed under `primary`) reaches the origin
-/// with every header that entry is keyed on. Not when the entry is a variant whose `Vary` names a
-/// header the refresh leaves out ([`swr_drops`]): the origin would answer the refresh for a request
-/// without it (no `X-Auth-Subject`, no TLS fingerprint), and that other representation would be
-/// stored under this variant's key. Such an entry is revalidated in the foreground instead, with
-/// the client's own request.
-fn refresh_sends_what_it_varies_on(state: &AppState, found_key: &str, primary: &str) -> bool {
-    // An entry that does not vary lives under its primary key.
-    found_key == primary
-        || state
-            .static_cache
-            .vary
-            .get(primary)
-            .is_none_or(|rule| !rule.names.iter().any(|name| swr_drops(name)))
+/// A background refresh of an entry filed under `filed` (the rule it was found under,
+/// [`filed_key`]; `None`: it does not vary) reaches the origin with every header that entry is
+/// keyed on. Not when the entry is a variant whose `Vary` names a header the refresh leaves out
+/// ([`swr_drops`]): the origin would answer the refresh for a request without it (no
+/// `X-Auth-Subject`, no TLS fingerprint), and that other representation would be stored under this
+/// variant's key. Such an entry is revalidated in the foreground instead, with the client's own
+/// request. The rule is the one the refresh's answer is then held to ([`SwrRefresh::filed`]), not
+/// one read again: a rule read again could be another, with no such header in it, while the
+/// answer is matched against the one with it.
+fn refresh_sends_what_it_varies_on(filed: Option<&vary::VaryRule>) -> bool {
+    filed.is_none_or(|rule| !rule.names.iter().any(|name| swr_drops(name)))
 }
 
 /// The request a background refresh sends: the same target and content
@@ -1131,10 +1152,9 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
         // closed, and is ignored when it is not.
         breaker_record(entry, resp.status(), None);
     }
-    // It refreshes ONE entry, filed under the `Vary` rule of its primary key (none when it does
+    // It refreshes ONE entry, filed under the `Vary` rule it was found under (none when it does
     // not vary): an answer with another `Vary` belongs to other keys.
-    let filed = job.state.static_cache.vary.get(&job.primary_key);
-    let filed = filed.as_ref().map(|rule| rule.names.as_slice());
+    let filed = job.filed.as_ref().map(|rule| rule.names.as_slice());
 
     if resp.status() == StatusCode::NOT_MODIFIED {
         // The 304's headers update the stored ones (RFC 9111 §4.3.4). A result too large to
@@ -1875,7 +1895,7 @@ impl Revalidation {
 /// ([`is_shared_cacheable`]: no `Set-Cookie`, no `private` / `no-store` / `no-cache`, the
 /// §3.5 opt-in on the 304 itself when the request carried `Authorization`, a `Vary` zion can key
 /// on, and fresh), and when the entry it makes keeps the `Vary` the entry was filed under
-/// (`filed`, the rule of the entry's primary key; see [`same_vary_shape`]): the 304's own, or the
+/// (`filed`, the rule the entry was found under, [`filed_key`]; see [`same_vary_shape`]): the 304's own, or the
 /// stored one when the 304 sends none. Otherwise one user's `304` (`private`, with that user's
 /// `X-Account`) became the entry every other user was served; and so did a public one that says
 /// the origin now varies on a header the entry's key does not hold (`Vary: X-Auth-Subject` on an
@@ -1948,19 +1968,35 @@ fn one_client_cache_control(meta: &cache::CachedMeta) -> hyper::header::HeaderVa
         .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("private"))
 }
 
-/// The cache fields a cache in front of zion obeys in place of `Cache-Control`: the targeted
-/// fields of RFC 9213 (`CDN-Cache-Control`, for every CDN that implements it, and
-/// `Cloudflare-CDN-Cache-Control`, for Cloudflare's alone) and `Surrogate-Control`, the older W3C
-/// Edge Architecture field with the same role. An answer for one client alone carries none of
-/// them ([`revalidated_response`]): its `private` says nothing to a CDN that reads one of these,
-/// which would keep that client's answer, the 304's per-user headers and `Set-Cookie` included,
-/// for every client. The entry keeps them, and a shared answer from it (a hit, a `REVALIDATED`
-/// that renewed it) still carries them.
-const TARGETED_CACHE_FIELDS: [hyper::header::HeaderName; 3] = [
-    hyper::header::HeaderName::from_static("cdn-cache-control"),
-    hyper::header::HeaderName::from_static("cloudflare-cdn-cache-control"),
-    hyper::header::HeaderName::from_static("surrogate-control"),
-];
+/// A cache field that a cache in front of zion obeys in place of `Cache-Control`, so a `private`
+/// in `Cache-Control` says nothing to a cache that reads it:
+///
+/// - the targeted fields of RFC 9213 (a cache they target ignores `Cache-Control` and `Expires`,
+///   §2.2): `CDN-Cache-Control`, for every CDN that implements it (§3), and one per CDN or vendor,
+///   named by the §2.4 convention with the suffix `-Cache-Control` (`Cloudflare-CDN-Cache-Control`,
+///   `Vercel-CDN-Cache-Control`, `Netlify-CDN-Cache-Control`, `Akamai-Cache-Control`): any name
+///   that ends in `-cache-control` (`Cache-Control` itself does not);
+/// - `Surrogate-Control`, the W3C Edge Architecture field (Fastly, Varnish);
+/// - `Edge-Control`, Akamai's older field;
+/// - `X-Accel-Expires`, which nginx `proxy_cache` ranks above `Cache-Control`.
+///
+/// A pattern, not a list: each CDN names its own targeted field, and a list of the three names
+/// known when it was written missed `Vercel-CDN-Cache-Control` and `Akamai-Cache-Control`. RFC
+/// 9213 §2.4 tells a cache that obeys targeted fields not to recognise one by the suffix alone;
+/// zion obeys none, it only leaves them off an answer that is `private`, so a name the pattern
+/// takes by mistake costs that one answer a field. An answer for one client alone carries none
+/// of them ([`revalidated_response`]): a CDN that reads one would keep that client's answer, the
+/// 304's per-user headers and `Set-Cookie` included, for every client. The entry keeps them, and
+/// a shared answer from it (a hit, a `REVALIDATED` that renewed it) still carries them. `name` is
+/// lower-case, as hyper keeps names.
+fn is_targeted_cache_field(name: &hyper::header::HeaderName) -> bool {
+    let name = name.as_str();
+    name.ends_with("-cache-control")
+        || matches!(
+            name,
+            "surrogate-control" | "edge-control" | "x-accel-expires"
+        )
+}
 
 /// The answer to a request whose revalidation the origin confirmed with a `304`: the stored body
 /// with the entry as the 304 updated it, marked `REVALIDATED`, with the 304's `Age` and the
@@ -1975,9 +2011,10 @@ const TARGETED_CACHE_FIELDS: [hyper::header::HeaderName; 3] = [
 /// a response zion has just judged to be one client's (with that user's headers); and the
 /// `Set-Cookie` that made the 304 one client's was dropped, so the client lost the cookie the
 /// origin rotated, and a downstream cache that does not store a response with a `Set-Cookie`
-/// stored this one. Nor does it carry the entry's [`TARGETED_CACHE_FIELDS`]: a CDN in front of
-/// zion obeys those instead of `Cache-Control`, and its `CDN-Cache-Control: max-age=600` would
-/// have it keep this client's answer for everyone, whatever the `private`.
+/// stored this one. Nor does it carry the entry's targeted cache fields
+/// ([`is_targeted_cache_field`]): a CDN in front of zion obeys those instead of `Cache-Control`,
+/// and its `CDN-Cache-Control: max-age=600` would have it keep this client's answer for everyone,
+/// whatever the `private`.
 fn revalidated_response(stale: cache::CacheHit, rv: Revalidation) -> Response<ZionBody> {
     let one_client = (!rv.shareable).then(|| (one_client_cache_control(&rv.meta), rv.set_cookie));
     let hit = cache::CacheHit {
@@ -1990,8 +2027,13 @@ fn revalidated_response(stale: cache::CacheHit, rv: Revalidation) -> Response<Zi
     if let Some((cache_control, set_cookie)) = one_client {
         let h = resp.headers_mut();
         h.insert(hyper::header::CACHE_CONTROL, cache_control);
-        for targeted in TARGETED_CACHE_FIELDS {
-            h.remove(targeted);
+        let targeted: Vec<hyper::header::HeaderName> = h
+            .keys()
+            .filter(|name| is_targeted_cache_field(name))
+            .cloned()
+            .collect();
+        for name in targeted {
+            h.remove(name);
         }
         for cookie in set_cookie {
             h.append(hyper::header::SET_COOKIE, cookie);
@@ -3305,32 +3347,83 @@ mod tests {
         assert!(!rv.renews() && !rv.vary_changed);
     }
 
+    /// The cache fields a cache in front of zion obeys in place of `Cache-Control`
+    /// ([`is_targeted_cache_field`]), each with a value of its own: the RFC 9213 targeted fields
+    /// of four CDNs and Akamai's, `Surrogate-Control`, Akamai's `Edge-Control` and nginx's
+    /// `X-Accel-Expires`.
+    const TARGETED: [(&str, &str); 8] = [
+        ("cdn-cache-control", "max-age=600"),
+        ("cloudflare-cdn-cache-control", "max-age=601"),
+        ("vercel-cdn-cache-control", "max-age=602"),
+        ("netlify-cdn-cache-control", "max-age=603"),
+        ("akamai-cache-control", "max-age=604"),
+        ("surrogate-control", "max-age=605"),
+        ("edge-control", "cache-maxage=606s"),
+        ("x-accel-expires", "607"),
+    ];
+
+    /// Which fields count as one a cache in front of zion obeys in place of `Cache-Control`: the
+    /// targeted fields by their `-Cache-Control` suffix, and three others by name. Not
+    /// `Cache-Control` itself, nor the other fields about caching a downstream cache reads beside
+    /// it.
+    #[test]
+    fn the_targeted_cache_fields_are_the_suffix_and_three_names() {
+        for (name, _) in TARGETED {
+            assert!(
+                is_targeted_cache_field(&hyper::header::HeaderName::from_static(name)),
+                "{name}"
+            );
+        }
+        // A CDN that names its own field after these were written.
+        assert!(is_targeted_cache_field(
+            &hyper::header::HeaderName::from_static("examplecdn-cache-control")
+        ));
+        for name in [
+            "cache-control",
+            "expires",
+            "pragma",
+            "vary",
+            "age",
+            "surrogate-key",
+            "cdn-loop",
+            "x-cache",
+            "cache-status",
+        ] {
+            assert!(
+                !is_targeted_cache_field(&hyper::header::HeaderName::from_static(name)),
+                "{name}"
+            );
+        }
+    }
+
     /// The answer for one client alone does not carry the cache fields a CDN in front of zion
-    /// obeys instead of `Cache-Control` (RFC 9213): with them, its `private` was read by no CDN
-    /// that has one, and the CDN kept alice's answer, her `Set-Cookie` and `X-Account`, for
-    /// everyone. The entry keeps them, and a shareable `REVALIDATED` answer and a hit carry them.
+    /// obeys instead of `Cache-Control` (RFC 9213 §2.2): with them, its `private` was read by no
+    /// CDN that has one, and the CDN kept alice's answer, her `Set-Cookie` and `X-Account`, for
+    /// everyone. Its `Cache-Control` is the `private` one. The entry keeps them, and a shareable
+    /// `REVALIDATED` answer and a hit carry them, each field as the origin sent it.
     #[test]
     fn a_one_client_answer_carries_none_of_the_cdns_own_cache_fields() {
         let mut origin = upload_origin_headers();
-        for (k, v) in [
-            ("cdn-cache-control", "max-age=600"),
-            ("cloudflare-cdn-cache-control", "max-age=900"),
-            ("surrogate-control", "max-age=1200"),
-        ] {
+        for (k, v) in TARGETED {
             origin.append(
                 hyper::header::HeaderName::from_static(k),
                 hyper::header::HeaderValue::from_static(v),
             );
         }
-        assert_eq!(TARGETED_CACHE_FIELDS.len(), 3);
         let stale = || stored_hit(&origin);
-        let carried = |resp: &Response<ZionBody>| -> Vec<String> {
-            TARGETED_CACHE_FIELDS
+        // Each field by name, so that one an answer keeps shows up with its value.
+        let carried = |resp: &Response<ZionBody>| -> Vec<(&str, Vec<String>)> {
+            TARGETED
                 .iter()
-                .flat_map(|name| values(resp, name.as_str()))
+                .map(|(name, _)| (*name, values(resp, name)))
+                .filter(|(_, v)| !v.is_empty())
                 .collect()
         };
-        let all = ["max-age=600", "max-age=900", "max-age=1200"];
+        let all: Vec<(&str, Vec<String>)> = TARGETED
+            .iter()
+            .map(|(name, value)| (*name, vec![value.to_string()]))
+            .collect();
+        let none = Vec::<(&str, Vec<String>)>::new();
         // One client's: a Set-Cookie, an authenticated request without the opt-in, another Vary.
         for (authenticated, pairs) in [
             (
@@ -3345,42 +3438,49 @@ mod tests {
         ] {
             let rv = revalidated_as_filed(&stale().meta, &request(pairs), authenticated, 3600);
             assert!(!rv.shareable, "{pairs:?}");
+            let kept: Vec<&str> = rv
+                .meta
+                .headers
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .filter(|name| TARGETED.iter().any(|(targeted, _)| name == targeted))
+                .collect();
             assert_eq!(
-                rv.meta
-                    .headers
-                    .iter()
-                    .filter(|(name, _)| TARGETED_CACHE_FIELDS.contains(name))
-                    .count(),
-                3,
+                kept,
+                TARGETED.map(|(name, _)| name),
                 "{pairs:?}: the entry keeps them"
             );
             let resp = revalidated_response(stale(), rv);
-            assert!(
-                values(&resp, "cache-control")[0].starts_with("private"),
+            assert_eq!(
+                values(&resp, "cache-control"),
+                ["private, max-age=60"],
                 "{pairs:?}"
             );
-            assert_eq!(carried(&resp), Vec::<String>::new(), "{pairs:?}");
+            assert_eq!(carried(&resp), none, "{pairs:?}");
         }
         // A targeted field the 304 brings goes too.
         let rv = revalidated_as_filed(
             &stale().meta,
-            &request(&[("set-cookie", "sid=x"), ("cdn-cache-control", "max-age=60")]),
+            &request(&[
+                ("set-cookie", "sid=x"),
+                ("cdn-cache-control", "max-age=60"),
+                ("akamai-cache-control", "max-age=60"),
+            ]),
             false,
             3600,
         );
-        assert_eq!(
-            carried(&revalidated_response(stale(), rv)),
-            Vec::<String>::new()
-        );
+        assert_eq!(carried(&revalidated_response(stale(), rv)), none);
         // A shareable 304: its answer is the entry's, CDN fields included.
         let rv = revalidated_as_filed(&stale().meta, &request(&[("x-new", "1")]), false, 3600);
         assert!(rv.renews());
         let resp = revalidated_response(stale(), rv);
         assert_eq!(values(&resp, "x-zion-cache"), ["REVALIDATED"]);
-        assert_eq!(values(&resp, "cdn-cache-control"), ["max-age=600"]);
+        assert_eq!(values(&resp, "cache-control"), ["max-age=60, public"]);
         assert_eq!(carried(&resp), all);
         // A hit too.
-        assert_eq!(carried(&cache_response(stale(), "HIT")), all);
+        let hit = cache_response(stale(), "HIT");
+        assert_eq!(values(&hit, "cache-control"), ["max-age=60, public"]);
+        assert_eq!(carried(&hit), all);
     }
 
     /// A revalidation is conditional on what zion stored and on nothing of the client's: its own

@@ -80,7 +80,11 @@ each variant under its own **secondary key** built from the values of those head
   the foreground, the client it answered gets it for itself alone
   ([What a hit carries](#what-a-hit-carries)); either way the stale entry is removed, so that the
   next request is a miss whose `200` is filed under the new `Vary`. Renewed under the old key, one user's `304` from an origin that now varies on
-  `X-Auth-Subject` would be every user's entry, with that user's headers.
+  `X-Auth-Subject` would be every user's entry, with that user's headers. The `Vary` an entry
+  was filed under is the one the request found it under, read when it looked the entry up: a
+  `200` that another request files under a new `Vary` while this revalidation is on its way (or
+  while this request waits on another one's fetch) does not make the new `Vary` the entry's, so
+  a `304` with the new `Vary` does not renew it either.
 - A background [stale-while-revalidate](#stale-while-revalidate-rfc-5861) refresh
   fetches the **same variant** it refreshes. An answer to it, `200` or `304`, whose `Vary` no
   longer matches the key the entry was filed under is discarded, and the stale entry is
@@ -183,9 +187,15 @@ attachment` and `Content-Security-Policy: sandbox` stays inert on every hit.
   `no-cache`, `must-revalidate`, `no-transform`, `max-age`), never `public` or `s-maxage` (they
   would let a shared cache downstream keep one client's answer for every client); and it carries
   the 304's `Set-Cookie`, which the entry does not keep. It carries none of the cache fields a
-  CDN in front of zion obeys in place of `Cache-Control` (`CDN-Cache-Control` and
-  `Cloudflare-CDN-Cache-Control`, RFC 9213, and `Surrogate-Control`), which the entry keeps and
-  a shared answer from it (a hit, a renewing `REVALIDATED`) still carries. The renewed lifetime is that of the updated response:
+  CDN or cache in front of zion obeys in place of `Cache-Control`, which the entry keeps and a
+  shared answer from it (a hit, a renewing `REVALIDATED`) still carries: every field whose name
+  ends in `-Cache-Control`, the RFC 9213 targeted fields and the vendor fields named the same way
+  (`CDN-Cache-Control`, `Cloudflare-CDN-Cache-Control`, `Vercel-CDN-Cache-Control`,
+  `Netlify-CDN-Cache-Control`, `Akamai-Cache-Control`, and any other CDN's), `Surrogate-Control`,
+  Akamai's `Edge-Control` and nginx's `X-Accel-Expires`. The name pattern is deliberate: each
+  CDN names its own targeted field, and a cache that reads one ignores `Cache-Control` (RFC 9213
+  §2.2), so a field missing from a list of names would let it keep this client's answer for every
+  client. The renewed lifetime is that of the updated response:
   the 304's `Cache-Control` or, when it sends none, the stored one (a bare `304` does not
   stretch a `max-age=60` entry to the profile TTL). The 304's `Date` replaces the stored one; a
   304 without a `Date` leaves none, and the answer is dated when it is sent.
@@ -265,8 +275,8 @@ background, so the client does not wait for the origin round trip. `M` is capped
   and a cacheable `200` replaces it, headers included. When the request that found the entry
   stale carried `Authorization`, the refresh's answer needs the same `public`, `s-maxage` or
   `must-revalidate` opt-in (RFC 9111 §3.5) as the foreground one: the origin may still have
-  answered for that client. An answer whose `Vary` is not the one the entry was filed under
-  renews nothing and removes the stale entry ([Vary and secondary keys](#vary-and-secondary-keys)).
+  answered for that client. A `200` or `304` whose `Vary` is not the one the entry was filed
+  under renews nothing and removes the stale entry ([Vary and secondary keys](#vary-and-secondary-keys)).
   Anything else leaves the stale entry in place; once outside its window it is no longer served
   stale.
 - **Not for a variant keyed on what the refresh leaves out**: an entry whose `Vary` names one of

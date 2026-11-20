@@ -47,6 +47,9 @@ struct Origin {
     /// and the ETag stay, so an entry stored before still revalidates with a `304`: an origin
     /// redeployed to vary on a header the entry was not filed under.
     per_user: Mutex<Option<&'static str>>,
+    /// A request whose `X-User` is listed here is held, once it is recorded, until the test takes
+    /// the name out: the test can change the cache between zion's lookup and the origin's answer.
+    held: Mutex<Vec<&'static str>>,
 }
 
 impl Origin {
@@ -77,6 +80,16 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                             || req.headers().contains_key("cookie");
                         o.seen.lock().unwrap().push((inm.clone(), creds));
                         o.requests.lock().unwrap().push(req.headers().clone());
+                        let user = req.headers().get("x-user").and_then(|v| v.to_str().ok());
+                        if let Some(user) = user {
+                            loop {
+                                let held = o.held.lock().unwrap().contains(&user);
+                                if !held {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                        }
                         if o.down.load(Ordering::Relaxed) {
                             return Err("origin down");
                         }
@@ -1544,4 +1557,232 @@ async fn a_background_refresh_that_varies_on_what_the_entry_is_not_filed_under_r
         ("MISS", "v2", Some("bob")),
         "bob's answer is not his own"
     );
+}
+
+/// The origin has seen a request from `user` (it may be held there, see [`Origin::held`]).
+fn asked_for(o: &Origin, user: &str) -> bool {
+    o.requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|h| h.get("x-user").is_some_and(|v| v == user))
+}
+
+fn release(o: &Origin, user: &str) {
+    o.held.lock().unwrap().retain(|held| *held != user);
+}
+
+/// The `X-Account` of the entry under `key`, fresh or stale (`-` when it has none); `None` when
+/// there is no entry.
+fn account_under(st: &Arc<AppState>, key: &str) -> Option<String> {
+    let hit = match st.static_cache.get(key) {
+        crate::cache::CacheLookup::Fresh(hit) | crate::cache::CacheLookup::Stale(hit) => hit,
+        crate::cache::CacheLookup::Miss => return None,
+    };
+    let account = hit
+        .meta
+        .headers
+        .iter()
+        .find(|(name, _)| name == "x-account")
+        .map_or("-", |(_, value)| value.to_str().unwrap());
+    Some(account.to_string())
+}
+
+const CAROL: [(&str, &str); 2] = [("authorization", "Bearer carol"), ("x-user", "carol")];
+const DAVE: [(&str, &str); 2] = [("authorization", "Bearer dave"), ("x-user", "dave")];
+
+/// A `304` is held to the `Vary` rule its entry was found under, not to the one the cache holds
+/// when the `304` arrives. The race, scripted: the entry `/vary-race` was stored from a `200` with
+/// no `Vary`, is stale, and the origin now answers per user (`Vary: X-User`, her own `X-Account`,
+/// the same ETag). Alice revalidates it; bob finds it stale too and waits on her fetch. Her `304`
+/// does not match the entry's `Vary`: she is answered alone, the entry is taken out, and bob,
+/// woken with nothing stored, revalidates the entry he found, alone. While his revalidation is at
+/// the origin, carol misses, and her `200` files the response under `Vary: X-User`. Bob's `304`
+/// says `Vary: X-User`: read when it arrived, the rule was carol's, the `304` matched it, and the
+/// entry was renewed under the key that does not vary, with bob's `X-Account`. Once that rule
+/// expired (here: taken out, as `VaryRules::get` takes out an expired one), every client was a
+/// `HIT` with bob's `X-Account`.
+#[tokio::test]
+async fn a_waiters_304_is_held_to_the_vary_its_entry_was_found_under() {
+    let (o, st) = origin_and_state("public, max-age=1").await;
+    let key = "/vary-race\u{1f}\u{1c}";
+    stored_then_redeployed(&o, &st, "/vary-race", key, &[]).await;
+    *o.held.lock().unwrap() = vec!["alice", "bob"];
+    let hers = {
+        let st = st.clone();
+        tokio::spawn(async move { fetch(&st, "/vary-race", &ALICE).await })
+    };
+    until("alice's revalidation at the origin", || {
+        asked_for(&o, "alice")
+    })
+    .await;
+    let his = {
+        let st = st.clone();
+        tokio::spawn(async move { fetch(&st, "/vary-race", &BOB).await })
+    };
+    let flight: Arc<str> = Arc::from(key);
+    until("bob waits on alice's fetch", || {
+        st.inflight
+            .get(&flight)
+            .is_some_and(|tx| tx.receiver_count() > 0)
+    })
+    .await;
+    release(&o, "alice");
+    let hers = hers.await.unwrap();
+    assert_eq!(
+        (hers.cache.as_str(), header(&hers, "x-account").as_deref()),
+        ("REVALIDATED", Some("alice"))
+    );
+    until("bob's own revalidation at the origin", || {
+        asked_for(&o, "bob")
+    })
+    .await;
+    assert!(is_miss(&st, key), "alice's 304 took the entry out");
+    let carols = fetch(&st, "/vary-race", &CAROL).await;
+    assert_eq!(
+        (
+            carols.cache.as_str(),
+            header(&carols, "x-account").as_deref()
+        ),
+        ("MISS", Some("carol"))
+    );
+    let carols_variant = "/vary-race\u{1f}\u{1c}\u{1e}x-user=carol\u{1f}";
+    until("carol's variant stored", || {
+        st.static_cache.get(carols_variant).fresh().is_some()
+    })
+    .await;
+    assert_eq!(filed_under(&st, key), Some(vec!["x-user".to_string()]));
+    release(&o, "bob");
+    let his = his.await.unwrap();
+    // The rule expires.
+    st.static_cache.vary.remove(key);
+    let daves = fetch(&st, "/vary-race", &DAVE).await;
+    assert_eq!(
+        (daves.cache.as_str(), header(&daves, "x-account").as_deref()),
+        ("MISS", Some("dave")),
+        "bob's 304 renewed the entry under the key that does not vary"
+    );
+    assert_eq!(
+        (
+            his.cache.as_str(),
+            header(&his, "x-account").as_deref(),
+            header(&his, "cache-control").as_deref()
+        ),
+        ("REVALIDATED", Some("bob"), Some("private, max-age=60")),
+        "bob is answered with his 304, for himself alone"
+    );
+    assert!(
+        is_miss(&st, key),
+        "the key that does not vary holds nothing"
+    );
+    assert_eq!(o.count(), 5, "the first miss, alice, bob, carol, dave");
+}
+
+/// The background refresh is held to the rule the entry was found under too, for its `304` and
+/// for its `200`. Alice's request finds the entry in its stale-while-revalidate window and the
+/// refresh goes for her; while it is at the origin, a response is filed under `Vary: X-User` (as
+/// the `200` of a request that missed would file it; installed by hand, because a request for this
+/// key waits on the refresh). The answer says `Vary: X-User` and carries her `X-Account`: matched
+/// against that rule, the `304` renewed the entry under the key that does not vary, and the `200`
+/// was stored there; once the rule expired, bob was a `HIT` with her `X-Account`.
+#[tokio::test]
+async fn a_background_refresh_is_held_to_the_vary_its_entry_was_found_under() {
+    for changed in [false, true] {
+        let uri = format!("/swr-vary-race-{changed}");
+        let key = format!("{uri}\u{1f}\u{1c}");
+        let (o, st) = origin_and_state("public, max-age=1, stale-while-revalidate=30").await;
+        stored_then_redeployed(&o, &st, &uri, &key, &[]).await;
+        if changed {
+            *o.body.lock().unwrap() = ("v2".into(), "\"e2\"".into());
+        }
+        *o.held.lock().unwrap() = vec!["alice"];
+        let hers = fetch(&st, &uri, &ALICE).await;
+        assert_eq!(
+            (hers.cache.as_str(), hers.body.as_str()),
+            ("STALE-WHILE-REVALIDATE", "v1"),
+            "a 200: {changed}"
+        );
+        until("the refresh at the origin", || asked_for(&o, "alice")).await;
+        assert!(st
+            .static_cache
+            .vary
+            .install(&key, vec!["x-user".to_string()], 3600, 100)
+            .is_some());
+        release(&o, "alice");
+        refresh_over(&o, &st, &key, 2).await;
+        // The rule expires.
+        st.static_cache.vary.remove(&key);
+        let bobs = fetch(&st, &uri, &BOB).await;
+        let body = if changed { "v2" } else { "v1" };
+        assert_eq!(
+            (
+                bobs.cache.as_str(),
+                bobs.body.as_str(),
+                header(&bobs, "x-account").as_deref()
+            ),
+            ("MISS", body, Some("bob")),
+            "a 200: {changed}: alice's answer is the entry under the key that does not vary"
+        );
+        assert_eq!(o.count(), 3, "a 200: {changed}");
+    }
+}
+
+/// The background refresh of a variant: the entry is filed under `Vary: Accept-Language`, and the
+/// answer to its refresh, a `304` or a `200`, adds `X-User` to it. Neither renews or replaces the
+/// variant, which is taken out: bob, with the same `Accept-Language`, misses and is answered for
+/// himself.
+#[tokio::test]
+async fn a_background_refresh_that_adds_a_name_to_vary_renews_nothing_for_the_variant() {
+    let de = ("accept-language", "de");
+    for changed in [false, true] {
+        let uri = format!("/swr-vary-grew-{changed}");
+        let primary = format!("{uri}\u{1f}\u{1c}");
+        let key = format!("{primary}\u{1e}accept-language=de\u{1f}");
+        let (o, st) = origin_and_state("public, max-age=1, stale-while-revalidate=30").await;
+        *o.vary_on.lock().unwrap() = Some("accept-language");
+        stored_then_redeployed(&o, &st, &uri, &key, &[de]).await;
+        if changed {
+            *o.body.lock().unwrap() = ("v2".into(), "\"e2\"".into());
+        }
+        let hers = fetch(&st, &uri, &[de, ALICE[0], ALICE[1]]).await;
+        assert_eq!(
+            (hers.cache.as_str(), hers.body.as_str()),
+            ("STALE-WHILE-REVALIDATE", "v1 for de"),
+            "a 200: {changed}"
+        );
+        refresh_over(&o, &st, &key, 2).await;
+        {
+            let refresh = o.requests.lock().unwrap()[1].clone();
+            let sent = |name: &str| refresh.get(name).map(|v| v.to_str().unwrap().to_string());
+            assert_eq!(
+                (
+                    sent("accept-language").as_deref(),
+                    sent("x-user").as_deref()
+                ),
+                (Some("de"), Some("alice")),
+                "a refresh of the variant, for alice"
+            );
+        }
+        assert_eq!(
+            account_under(&st, &key),
+            None,
+            "a 200: {changed}: the variant was renewed or replaced"
+        );
+        let bobs = fetch(&st, &uri, &[de, BOB[0], BOB[1]]).await;
+        let body = if changed { "v2 for de" } else { "v1 for de" };
+        assert_eq!(
+            (
+                bobs.cache.as_str(),
+                bobs.body.as_str(),
+                header(&bobs, "x-account").as_deref()
+            ),
+            ("MISS", body, Some("bob")),
+            "a 200: {changed}: bob's answer is not his own"
+        );
+        assert_eq!(
+            filed_under(&st, &primary),
+            Some(vec!["accept-language".to_string(), "x-user".to_string()]),
+            "a 200: {changed}: bob's 200 files the response under the new Vary"
+        );
+    }
 }
