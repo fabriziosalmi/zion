@@ -98,6 +98,7 @@ Client
        ▼
   ┌─ Health Probe Fast-Path ───────────────────────────┐
   │  /healthz, /readyz → 200 OK (~1us, bypasses below) │
+  │  (a target with userinfo goes on to gate 4)        │
   └────────────────────────────────────────────────────┘
        │
        ▼
@@ -105,12 +106,13 @@ Client
   │  1. Scrub client-supplied identity headers             │
   │  2. Scrub client routing/host override headers         │
   │  3. URI length check (path+query >8192 bytes → 414)   │
-  │  4. Path normalisation (RFC 3986 §6.2.2)               │
-  │  5. Method whitelist (7 methods, else 405)             │
-  │  6. 0-RTT replay protection (non-idempotent → 425)    │
-  │  7. Loop detection (Via, → 508)                        │
-  │  8. Per-IP rate limiter (packed atomic, lock-free)     │
-  │  9. Feature-gated: sovereign class, TLS fingerprint,   │
+  │  4. Target with userinfo (user@host, → 400)            │
+  │  5. Path normalisation (RFC 3986 §6.2.2)               │
+  │  6. Method whitelist (7 methods, else 405)             │
+  │  7. 0-RTT replay protection (non-idempotent → 425)    │
+  │  8. Loop detection (Via, → 508)                        │
+  │  9. Per-IP rate limiter (packed atomic, lock-free)     │
+  │ 10. Feature-gated: sovereign class, TLS fingerprint,   │
   │     mesh score                                         │
   │  then: built-in endpoints (/metrics → internal IPs),   │
   │        CORS pre-flight (OPTIONS → 204)                 │
