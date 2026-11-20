@@ -456,8 +456,8 @@ fn appended_xff(headers: &hyper::HeaderMap, client: &HeaderValue) -> HeaderValue
 /// and the WebSocket upgrade ([`proxy_websocket`]). Strips the dangerous
 /// hop-by-hop / credential headers that must never reach the upstream
 /// (Transfer-Encoding, TE, Trailer, Proxy-Authorization, Proxy-Connection,
-/// Keep-Alive), drops the inbound Host (re-surfaced as `X-Forwarded-Host` for
-/// vhost-routing upstreams), and sets the `X-Forwarded-*` / `X-Real-IP` trust
+/// Keep-Alive), drops the inbound Host (the request's host is re-surfaced as `X-Forwarded-Host`
+/// for vhost-routing upstreams), and sets the `X-Forwarded-*` / `X-Real-IP` trust
 /// headers per the XFF policy. `Connection` / `Upgrade` are intentionally left
 /// to the caller: the normal proxy strips `Connection`, a WS upgrade keeps
 /// both for the handshake.
@@ -467,14 +467,18 @@ fn apply_forwarding_hygiene<B>(
     proto: &str,
     xff_mode: XffMode,
 ) {
-    // Capture the inbound host for X-Forwarded-Host before we strip it: the Host header, or the
-    // URI authority when there is none (HTTP/2 carries it there and sends no Host header).
+    // Capture the request's host for X-Forwarded-Host before we strip the Host header. It is read
+    // from the field routing and the cache key read it from (`security::request_host`): the URI
+    // authority when the target has one (absolute-form, an HTTP/2 or HTTP/3 `:authority`), else
+    // the Host header. RFC 9112 §3.2.2: the target's host replaces a Host received with it. Read
+    // from the Host header first, `GET http://shop.example/` with `Host: evil.example` was routed
+    // and cached as shop.example's while the origin was told evil.example, and the answer it built
+    // for evil.example was stored under shop.example's key, for every client of shop.example.
     // Whatever X-Forwarded-Host the client sent is discarded either way.
-    let inbound_host = req.headers().get(hyper::header::HOST).cloned().or_else(|| {
-        req.uri()
-            .authority()
-            .and_then(|a| hyper::header::HeaderValue::from_str(a.as_str()).ok())
-    });
+    let inbound_host = match req.uri().authority() {
+        Some(a) => hyper::header::HeaderValue::from_str(a.as_str()).ok(),
+        None => req.headers().get(hyper::header::HOST).cloned(),
+    };
     req.headers_mut().remove(&X_FORWARDED_HOST);
     let preserve_host = req.extensions().get::<PreserveHost>().is_some();
     // RFC 9110 §7.6.3: name this proxy in `Via` (also what loop detection reads).
@@ -527,13 +531,13 @@ fn apply_forwarding_hygiene<B>(
             PROTO_HTTP.clone()
         },
     );
-    // X-Forwarded-Host: re-surface the original Host so a vhost-routing
+    // X-Forwarded-Host: re-surface the request's host so a vhost-routing
     // upstream still sees it (the module doc claimed this header was set but
     // it never was).
     if let Some(host) = inbound_host {
         // `preserve_host`: the client's host is also the upstream's `Host`, as received
-        // (for an HTTP/2 client, its `:authority`). The pooled client only adds `Host` when
-        // it is absent, so this survives the URI rewrite.
+        // (the target's authority when it has one, an HTTP/2 client's `:authority`). The pooled
+        // client only adds `Host` when it is absent, so this survives the URI rewrite.
         if preserve_host {
             req.headers_mut().insert(hyper::header::HOST, host.clone());
         }
@@ -668,7 +672,7 @@ fn scrub_response_hop_by_hop(headers: &mut hyper::HeaderMap) {
     headers.remove(hyper::header::TRAILER);
     headers.remove(hyper::header::UPGRADE);
     headers.remove(hyper::header::PROXY_AUTHENTICATE);
-    // For the next client on the response chain only, which is zion (RFC 9110 §11.7.4).
+    // For the next client on the response chain only, which is zion (RFC 9110 §11.7.3).
     headers.remove(&PROXY_AUTHENTICATION_INFO);
     headers.remove(&PROXY_CONNECTION);
     headers.remove(&KEEP_ALIVE);
@@ -1766,6 +1770,62 @@ mod tests {
             prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).unwrap();
         assert!(req.headers().get(hyper::header::HOST).is_none());
         assert!(req.headers().get(hyper::header::CONNECTION).is_none());
+    }
+
+    /// The upstream is told the host zion routes and caches the request on
+    /// (`security::request_host`): the target's authority when it has one, the `Host` header
+    /// otherwise (RFC 9112 §3.2.2). It was told the `Host` header's whenever there was one, so an
+    /// absolute-form target, or an HTTP/2 `:authority` sent with a `host` field, named one host
+    /// to the cache and another to the origin.
+    #[test]
+    fn the_upstream_is_told_the_host_the_request_is_routed_on() {
+        for (uri, host, expected) in [
+            (
+                "http://shop.example/p",
+                Some("evil.example"),
+                "shop.example",
+            ),
+            (
+                "https://Shop.Example:8443/p",
+                Some("evil.example"),
+                "Shop.Example:8443",
+            ),
+            ("http://shop.example/p", None, "shop.example"),
+            ("/p", Some("shop.example"), "shop.example"),
+        ] {
+            for preserve in [false, true] {
+                let mut b = Request::builder().method("GET").uri(uri);
+                if let Some(h) = host {
+                    b = b.header(hyper::header::HOST, h);
+                }
+                let mut req = b.body(()).unwrap();
+                if preserve {
+                    req.extensions_mut().insert(PreserveHost);
+                }
+                assert_eq!(
+                    crate::security::request_host(&req).as_deref(),
+                    Some(expected.to_ascii_lowercase().split(':').next().unwrap()),
+                    "{uri} {host:?}: what routing and the cache key read"
+                );
+                let req =
+                    prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append)
+                        .unwrap();
+                assert_eq!(
+                    req.headers().get("x-forwarded-host").unwrap(),
+                    expected,
+                    "{uri} {host:?} preserve_host={preserve}"
+                );
+                let sent_host = req.headers().get(hyper::header::HOST);
+                if preserve {
+                    assert_eq!(sent_host.unwrap(), expected, "{uri} {host:?}: Host");
+                } else {
+                    assert!(
+                        sent_host.is_none(),
+                        "{uri} {host:?}: the pooled client adds its own"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

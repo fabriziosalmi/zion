@@ -1978,6 +1978,31 @@ async fn a_refresh_that_gets_a_server_error_keeps_the_window() {
     }
 }
 
+/// A refresh answered `429 Too Many Requests` or `408 Request Timeout` (the origin, or a rate
+/// limiter in front of it, shedding load) is not refused either: the next refresh can get another
+/// answer. Taken for a refusal, it ended the window, and every request for the entry went to the
+/// origin in the foreground, got the `429` and passed it to the client, at the rate the clients
+/// came, where the stale copy was served at once and one refresh at a time reached the origin.
+#[tokio::test]
+async fn a_refresh_the_origin_sheds_keeps_the_window() {
+    for status in [429, 408] {
+        let uri = format!("/swr-shed{status}");
+        let (o, st) = origin_and_state("public, max-age=1, stale-while-revalidate=30").await;
+        fetch(&st, &uri, &[]).await;
+        stored_then_stale(&st, &uri).await;
+        *o.status.lock().unwrap() = Some(status);
+        let stale = fetch(&st, &uri, &[]).await;
+        assert_eq!(stale.cache, "STALE-WHILE-REVALIDATE", "{status}");
+        refresh_over(&o, &st, &format!("{uri}\u{1f}\u{1c}"), 2).await;
+        let next = fetch(&st, &uri, &[]).await;
+        assert_eq!(
+            (next.status, next.cache.as_str(), next.body.as_str()),
+            (200, "STALE-WHILE-REVALIDATE", "v1"),
+            "a refresh answered {status} ended the window"
+        );
+    }
+}
+
 /// `zion_cache_too_large` counts what a size limit alone kept out of the cache. A response that
 /// may not be stored anyway, or a `304` that may not renew the entry, was counted too when its
 /// headers were over the bound: a `private` page with a large `Content-Security-Policy` added one
