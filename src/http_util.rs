@@ -287,6 +287,180 @@ mod connection_listed_tests {
     }
 }
 
+/// The `Cache-Control` of a request or a response: every field line, read as one list.
+///
+/// RFC 9110 §5.3: a field sent on several lines means what one line with their values joined by
+/// commas means, so `Cache-Control: max-age=300` followed by `Cache-Control: private` is
+/// `max-age=300, private` (nginx sends exactly that with `expires 5m;` and
+/// `add_header Cache-Control private;`). hyper keeps each line as its own value, and a reader that
+/// took the first one (`HeaderMap::get`) stored that `private` response in the shared cache and
+/// served it to other users. Every reader of `Cache-Control` goes through this type, so none can
+/// look at one line only.
+///
+/// Values are read as bytes: a line that is not visible ASCII still counts.
+#[derive(Clone, Copy)]
+pub(crate) struct CacheControl<'a> {
+    headers: &'a hyper::HeaderMap,
+}
+
+/// One directive of a [`CacheControl`] list (RFC 9111 §5.2): `name` or `name=argument`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CacheDirective<'a> {
+    name: &'a [u8],
+    arg: Option<&'a [u8]>,
+}
+
+impl CacheDirective<'_> {
+    /// The directive is `name` (directive names are case-insensitive, RFC 9111 §5.2).
+    pub(crate) fn is(&self, name: &str) -> bool {
+        self.name.eq_ignore_ascii_case(name.as_bytes())
+    }
+
+    /// The argument as seconds (`max-age=60`, `max-age="60"`); `None` when there is none or it
+    /// is not a number.
+    pub(crate) fn seconds(&self) -> Option<u64> {
+        let arg = self.arg?;
+        let arg = arg
+            .strip_prefix(b"\"")
+            .and_then(|a| a.strip_suffix(b"\""))
+            .unwrap_or(arg);
+        std::str::from_utf8(arg).ok()?.trim().parse().ok()
+    }
+}
+
+impl<'a> CacheControl<'a> {
+    pub(crate) fn of(headers: &'a hyper::HeaderMap) -> Self {
+        Self { headers }
+    }
+
+    /// Every directive of every line, in order. Elements are separated by commas; empty ones
+    /// (`a,,b`, a trailing comma) are skipped. The name is what comes before the first `=`,
+    /// the argument what comes after it, both trimmed.
+    pub(crate) fn directives(self) -> impl Iterator<Item = CacheDirective<'a>> {
+        self.headers
+            .get_all(hyper::header::CACHE_CONTROL)
+            .iter()
+            .flat_map(|line| line.as_bytes().split(|&b| b == b','))
+            .filter_map(|element| {
+                let element = element.trim_ascii();
+                let (name, arg) = match element.iter().position(|&b| b == b'=') {
+                    Some(i) => (
+                        element[..i].trim_ascii(),
+                        Some(element[i + 1..].trim_ascii()),
+                    ),
+                    None => (element, None),
+                };
+                (!name.is_empty()).then_some(CacheDirective { name, arg })
+            })
+    }
+
+    /// A directive called `name` is present, on any line.
+    pub(crate) fn has(self, name: &str) -> bool {
+        self.directives().any(|d| d.is(name))
+    }
+
+    /// The seconds of directive `name` (`max-age`, `s-maxage`, `stale-while-revalidate`), on
+    /// any line. `None` when it is absent or none of its values is a number. Given twice with
+    /// different values it is `0`: RFC 9111 §4.2.1 lets a cache use the first occurrence or
+    /// consider the response stale, and stale is the reading that never keeps or serves a
+    /// response for longer than either value allows.
+    pub(crate) fn seconds(self, name: &str) -> Option<u64> {
+        let mut found: Option<u64> = None;
+        for secs in self
+            .directives()
+            .filter(|d| d.is(name))
+            .filter_map(|d| d.seconds())
+        {
+            match found {
+                Some(seen) if seen != secs => return Some(0),
+                _ => found = Some(secs),
+            }
+        }
+        found
+    }
+
+    /// `word` appears anywhere in the list, case-insensitively, whatever the directive
+    /// boundaries. For the checks that must err on the side of refusing (`private`,
+    /// `no-store`, `no-transform`): a directive hidden in an unusual spelling or a quoted
+    /// argument still counts, as it does for nginx and Varnish.
+    pub(crate) fn mentions(self, word: &str) -> bool {
+        let word = word.as_bytes();
+        self.headers
+            .get_all(hyper::header::CACHE_CONTROL)
+            .iter()
+            .any(|line| {
+                line.as_bytes()
+                    .windows(word.len())
+                    .any(|w| w.eq_ignore_ascii_case(word))
+            })
+    }
+}
+
+#[cfg(test)]
+mod cache_control_tests {
+    use super::CacheControl;
+    use hyper::header::CACHE_CONTROL;
+    use hyper::HeaderMap;
+
+    fn lines(values: &[&[u8]]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for v in values {
+            h.append(
+                CACHE_CONTROL,
+                hyper::header::HeaderValue::from_bytes(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn every_line_is_one_list() {
+        let h = lines(&[b"max-age=300", b"private"]);
+        let cc = CacheControl::of(&h);
+        assert!(cc.has("private"), "a directive on the second line");
+        assert!(cc.mentions("private"));
+        assert_eq!(cc.seconds("max-age"), Some(300));
+        assert_eq!(cc.directives().count(), 2);
+        // three lines, empty elements and whitespace
+        let h = lines(&[b" , public", b"", b"s-maxage = \"60\" ,, No-Transform "]);
+        let cc = CacheControl::of(&h);
+        assert!(cc.has("public") && cc.has("no-transform"));
+        assert_eq!(cc.seconds("s-maxage"), Some(60));
+        assert_eq!(cc.directives().count(), 3);
+    }
+
+    #[test]
+    fn names_are_whole_and_case_insensitive() {
+        let h = lines(&[b"x-public-ish, s-maxage-like=5, MAX-AGE=7"]);
+        let cc = CacheControl::of(&h);
+        assert!(!cc.has("public"), "a longer name is another directive");
+        assert_eq!(cc.seconds("s-maxage"), None);
+        assert_eq!(cc.seconds("max-age"), Some(7));
+        assert!(cc.mentions("public"), "mentions is a substring search");
+        assert!(!CacheControl::of(&HeaderMap::new()).mentions("private"));
+    }
+
+    #[test]
+    fn seconds_ignore_a_non_number_and_read_a_conflict_as_stale() {
+        let s = |v: &[&[u8]]| CacheControl::of(&lines(v)).seconds("max-age");
+        assert_eq!(s(&[b"max-age=abc"]), None);
+        assert_eq!(s(&[b"max-age=abc, max-age=60"]), Some(60));
+        assert_eq!(s(&[b"max-age=60", b"max-age=60"]), Some(60), "a repeat");
+        assert_eq!(s(&[b"max-age=300", b"max-age=60"]), Some(0), "a conflict");
+        assert_eq!(s(&[b"max-age"]), None, "no argument");
+        assert_eq!(s(&[b"max-age=99999999999999999999999"]), None, "overflow");
+    }
+
+    #[test]
+    fn a_line_that_is_not_ascii_is_still_read() {
+        let h = lines(&[b"max-age=60, x-\xe9t\xe9, private"]);
+        let cc = CacheControl::of(&h);
+        assert!(h.get(CACHE_CONTROL).unwrap().to_str().is_err());
+        assert!(cc.has("private") && cc.mentions("private"));
+        assert_eq!(cc.seconds("max-age"), Some(60));
+    }
+}
+
 /// A URL without the `user:pass@` of its authority. Upstream URLs may carry basic-auth
 /// credentials, and they are written to metric labels, the JSON snapshot, the logs and
 /// config error messages: none of those may show them.

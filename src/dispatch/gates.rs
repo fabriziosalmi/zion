@@ -52,6 +52,8 @@ pub(super) enum Gate {
     ScrubOverrideHeaders,
     /// 414 for an oversized URI.
     UriLength,
+    /// 400 for a request target whose authority carries userinfo (RFC 9110 §4.2.4).
+    TargetUserinfo,
     /// Rewrite the path to its normalized form (mutation; 400 if it cannot be rebuilt).
     NormalizePath,
     /// 405 for a method outside the whitelist.
@@ -80,6 +82,7 @@ pub(super) const PRE_ROUTING: &[Gate] = &[
     Gate::ScrubIdentityHeaders,
     Gate::ScrubOverrideHeaders,
     Gate::UriLength,
+    Gate::TargetUserinfo,
     Gate::NormalizePath,
     Gate::Method,
     Gate::EarlyData,
@@ -112,6 +115,7 @@ pub(super) async fn run_pre_routing(
                 None
             }
             Gate::UriLength => uri_length(req),
+            Gate::TargetUserinfo => target_userinfo(req),
             Gate::NormalizePath => normalize_path(req),
             Gate::Method => method_whitelist(req),
             Gate::EarlyData => early_data(ctx, req),
@@ -147,6 +151,15 @@ pub(crate) fn uri_too_long<B>(req: &Request<B>) -> bool {
 /// Gate: URI length (reject oversized URIs before routing).
 fn uri_length(req: &Request<ReqBody>) -> Option<Response<ZionBody>> {
     uri_too_long(req).then(|| empty_response(StatusCode::URI_TOO_LONG))
+}
+
+/// Gate: a request target whose authority carries userinfo (`GET http://user:pass@shop.example/`,
+/// an HTTP/2 or HTTP/3 `:authority` of `shop.example@evil.example`) is a 400, before anything reads
+/// the host. Why, and what counts: [`crate::security::target_has_userinfo`]. The `:80` handler,
+/// which routes the ACME fallback on its own, asks the same function, and the TLS listener's
+/// health fast path sends such a request on to this gate instead of answering it.
+fn target_userinfo(req: &Request<ReqBody>) -> Option<Response<ZionBody>> {
+    crate::security::target_has_userinfo(req).then(|| empty_response(StatusCode::BAD_REQUEST))
 }
 
 /// Gate: auth (JWT/OIDC). `Some` is the 401/403 that ends the request; on success the claims the
@@ -840,6 +853,7 @@ mod tests {
             Gate::ScrubIdentityHeaders,
             Gate::ScrubOverrideHeaders,
             Gate::UriLength,
+            Gate::TargetUserinfo,
             Gate::NormalizePath,
             Gate::Method,
             Gate::EarlyData,
