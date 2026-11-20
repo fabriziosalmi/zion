@@ -840,15 +840,7 @@ fn fetch_snapshot(url: &str) -> Result<Snapshot, String> {
         .map_err(|e| format!("connect {host}:{port}: {e}"))?;
     stream.set_read_timeout(Some(FETCH_TIMEOUT)).ok();
     stream.set_write_timeout(Some(FETCH_TIMEOUT)).ok();
-    let req = format!(
-        "GET {path} HTTP/1.1\r\n\
-         Host: {host}\r\n\
-         User-Agent: zion-top/{ver}\r\n\
-         Accept: application/json\r\n\
-         Connection: close\r\n\
-         \r\n",
-        ver = env!("CARGO_PKG_VERSION"),
-    );
+    let req = snapshot_request(&host, port, &path);
     stream
         .write_all(req.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
@@ -871,6 +863,36 @@ fn fetch_snapshot(url: &str) -> Result<Snapshot, String> {
 
     let body = &buf[header_end..];
     serde_json::from_slice::<Snapshot>(body).map_err(|e| format!("decode snapshot: {e}"))
+}
+
+/// The HTTP/1.1 request `zion top` sends for `path` on `host`:`port`.
+fn snapshot_request(host: &str, port: u16, path: &str) -> String {
+    format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {authority}\r\n\
+         User-Agent: zion-top/{ver}\r\n\
+         Accept: application/json\r\n\
+         Connection: close\r\n\
+         \r\n",
+        authority = host_field(host, port),
+        ver = env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// The `Host` field for `host` and `port`: the URL's authority (RFC 9110 §7.2), with an IPv6
+/// address in brackets (RFC 3986 §3.2.2) and the port unless it is 80. zion refuses a `Host`
+/// that is not an authority, such as a bare `::1`, with a 400.
+fn host_field(host: &str, port: u16) -> String {
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    if port == 80 {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
@@ -938,6 +960,72 @@ mod tests {
         assert_eq!(h, "::1");
         assert_eq!(p, 8080);
         assert_eq!(path, "/x");
+    }
+
+    #[test]
+    fn the_host_field_is_the_urls_authority() {
+        for (host, port, want) in [
+            ("::1", 8080, "[::1]:8080"),
+            ("::1", 80, "[::1]"),
+            ("2001:db8::1", 9000, "[2001:db8::1]:9000"),
+            ("127.0.0.1", 8080, "127.0.0.1:8080"),
+            ("localhost", 80, "localhost"),
+        ] {
+            assert_eq!(host_field(host, port), want, "{host} {port}");
+        }
+    }
+
+    /// The request `zion top` sends for each URL the boot banner prints, an IPv6 bind's
+    /// included (`[::]:PORT` is printed as `http://[::1]:PORT/...`), gets the snapshot from the
+    /// `:80` handler, not a 400: a bare `Host: ::1` is not an authority, and zion refuses it.
+    #[tokio::test]
+    async fn the_request_zion_top_sends_gets_the_snapshot() {
+        use http_body_util::BodyExt;
+        let cfg: crate::config::ZionConfig = toml::from_str(
+            r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstreams]
+u = "http://127.0.0.1:9"
+[[route]]
+path = "/{*rest}"
+upstream = "u"
+"#,
+        )
+        .expect("test config parses");
+        let st = crate::state::AppState::for_tests(&cfg);
+        for (url, peer) in [
+            ("http://[::1]:8080/_zion/snapshot.json", "[::1]:40000"),
+            ("http://[::1]/_zion/snapshot.json", "[::1]:40000"),
+            (
+                "http://127.0.0.1:8080/_zion/snapshot.json",
+                "127.0.0.1:40000",
+            ),
+            ("http://localhost/_zion/snapshot.json", "127.0.0.1:40000"),
+        ] {
+            let (host, port, path) = parse_http_url(url).unwrap();
+            let sent = snapshot_request(&host, port, &path);
+            let value = sent
+                .lines()
+                .find_map(|line| line.strip_prefix("Host: "))
+                .expect("the request has a Host field");
+            let req = hyper::Request::get(path.as_str())
+                .header(hyper::header::HOST, value)
+                .body(
+                    http_body_util::Full::new(bytes::Bytes::new())
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap();
+            let resp = crate::accept::handle_http(req, st.clone(), peer.parse().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{url}: Host {value:?}");
+        }
     }
 
     #[test]

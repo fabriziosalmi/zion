@@ -11,9 +11,10 @@
 //! test watches.
 //!
 //! The same raw-frame client also pins that an h2c request whose `host` field disagrees with
-//! its `:authority`, or whose authority has a port that is not a port, gets a 400: the HTTP/2
-//! decoding hands zion both fields as sent, and zion refuses a request that does not name one
-//! host before anything routes by it.
+//! its `:authority`, or whose authority has a port that is not a port or a host that is not a
+//! host name, gets a 400: the HTTP/2 decoding hands zion both fields as sent, and zion refuses
+//! a request that does not name one host before anything routes by it. An `:authority` the
+//! `http` crate cannot parse never reaches zion: h2 resets that stream itself.
 //!
 //! Like the other binary-booting tests, a missing `openssl` (for a throwaway certificate)
 //! skips with a message.
@@ -266,8 +267,17 @@ fn a_del_byte_in_the_h2c_path_is_a_400_not_a_crash() {
 /// `:authority` and `host` as literals with incremental indexing on static name indexes 1 and 38
 /// (0x40 | index).
 fn get_with_host(stream: u32, authority: &[u8], host: Option<&[u8]>) -> Vec<u8> {
+    get_with_fields(stream, Some(authority), host)
+}
+
+/// An `:authority` and a `host` field, each sent only when given.
+type AuthorityAndHost<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
+
+/// [`get_with_host`] with the `:authority` optional too: without it, h2 hands zion an
+/// origin-form target and the `host` field.
+fn get_with_fields(stream: u32, authority: Option<&[u8]>, host: Option<&[u8]>) -> Vec<u8> {
     let mut hpack = vec![0x82, 0x86, 0x84];
-    for (index, value) in [(1u8, Some(authority)), (38, host)] {
+    for (index, value) in [(1u8, authority), (38, host)] {
         let Some(value) = value else { continue };
         assert!(value.len() < 127, "one-byte HPACK length");
         hpack.extend_from_slice(&[0x40 | index, value.len() as u8]);
@@ -338,6 +348,93 @@ fn an_h2c_request_whose_authority_port_is_not_a_port_is_a_400() {
             ":authority {:?}, host {:?}",
             String::from_utf8_lossy(authority),
             host.map(String::from_utf8_lossy)
+        );
+    }
+}
+
+/// Send `hpack_request` as one h2c request on stream 1 and return the error code of the
+/// `RST_STREAM` that ends it, or `None` when a response or the end of the connection comes
+/// first.
+fn h2c_reset_code(port: u16, hpack_request: &[u8]) -> Option<u32> {
+    let mut conn = connect(port);
+    let mut out = PREFACE.to_vec();
+    out.extend(frame(SETTINGS, 0, 0, &[]));
+    out.extend_from_slice(hpack_request);
+    conn.write_all(&out).unwrap();
+    conn.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match read_frame(&mut conn)? {
+            (RST_STREAM, _, 1, code) => {
+                let code: [u8; 4] = code.as_slice().try_into().ok()?;
+                return Some(u32::from_be_bytes(code));
+            }
+            (HEADERS, _, 1, _) | (GOAWAY, _, _, _) => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// h2's `PROTOCOL_ERROR` (RFC 9113 §7).
+const PROTOCOL_ERROR: u32 = 0x1;
+
+/// An h2c request whose `:authority` or `host` names a host that is not a host name (a `,`, a
+/// `;`, a tab) gets a 400: routing would key the whole text, while an upstream that reads
+/// `X-Forwarded-Host` as a list reads the host before the `,`. The `http` crate takes a `,` or a
+/// `;` in an authority, so h2 hands these over; a tab it refuses in `:authority`, but not in a
+/// `host` field, which h2 passes on as a header when there is no `:authority`.
+#[test]
+fn an_h2c_request_whose_authority_host_is_not_a_host_name_is_a_400() {
+    let Some(zion) = Zion::start() else {
+        return;
+    };
+    let control = speak_h2c(zion.http, &get_with_fields(1, None, Some(b"localhost")));
+    assert!(
+        matches!(control.as_slice(), [(1, Some(first))] if *first != STATUS_400),
+        "control: a host field without :authority is answered (a 301), got {control:?}"
+    );
+    let not_a_host_name: &[AuthorityAndHost] = &[
+        (Some(b"localhost,x"), None),
+        (Some(b"localhost,x"), Some(b"localhost,x")),
+        (Some(b"localhost;x"), None),
+        (None, Some(b"localhost,x")),
+        (None, Some(b"x\tlocalhost")),
+    ];
+    for (authority, host) in not_a_host_name {
+        assert_eq!(
+            speak_h2c(zion.http, &get_with_fields(1, *authority, *host)),
+            vec![(1, Some(STATUS_400))],
+            ":authority {:?}, host {:?}",
+            authority.map(String::from_utf8_lossy),
+            host.map(String::from_utf8_lossy)
+        );
+    }
+}
+
+/// An `:authority` the `http` crate does not parse as an authority (a second `:` outside
+/// brackets, a bare IPv6 literal, a tab) never reaches zion: h2 resets the stream with
+/// `PROTOCOL_ERROR`, before any response. The same text in a `host` field reaches zion, which
+/// answers it with a 400.
+#[test]
+fn an_h2c_authority_the_http_crate_cannot_parse_is_reset_by_h2() {
+    let Some(zion) = Zion::start() else {
+        return;
+    };
+    for authority in [&b"localhost:1:2"[..], b"::1", b"x\tlocalhost"] {
+        assert_eq!(
+            h2c_reset_code(zion.http, &get_with_fields(1, Some(authority), None)),
+            Some(PROTOCOL_ERROR),
+            ":authority {:?}",
+            String::from_utf8_lossy(authority)
+        );
+    }
+    for host in [&b"localhost:1:2"[..], b"::1"] {
+        assert_eq!(
+            speak_h2c(zion.http, &get_with_fields(1, None, Some(host))),
+            vec![(1, Some(STATUS_400))],
+            "host {:?}",
+            String::from_utf8_lossy(host)
         );
     }
 }

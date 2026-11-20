@@ -40,7 +40,7 @@ token are stripped before the upstream. Ordinary end-to-end headers are forwarde
 | origin-form (`/path`) | forwarded |
 | absolute-form (`http://host/path`) naming the same authority as `Host` | accepted and re-framed to origin-form upstream; the absolute URI never reaches the upstream |
 | absolute-form naming another authority than `Host` | refused (`400`), never forwarded (pinned in the smuggling corpus, case 8) |
-| absolute-form whose authority is not `host[:port]` (`http://host:x/path`) | refused (`400`), never forwarded (smuggling corpus, case 8d) |
+| absolute-form whose authority is not `host[:port]` (`http://host:x/path`, `http://host,x/path`) | refused (`400`), never forwarded (smuggling corpus, case 8d) |
 | asterisk-form (`OPTIONS *`) | refused (`404`), never forwarded |
 | authority-form (`CONNECT host:port`) | refused (`405`), never forwarded |
 
@@ -53,16 +53,21 @@ token are stripped before the upstream. Ordinary end-to-end headers are forwarde
 
 A `Host` that names another authority than the request target (an absolute-form target, or
 an HTTP/2 `:authority`) is refused with `400` before routing, on every route. So is a target or
-`Host` authority that is not `host[:port]`: userinfo, or a port that is not a port number
-(`a.example:x`, `a.example:+443`, `a.example:99999`). An upstream reads the host before the `:`
-whatever follows it, where routing keyed `a.example:x` by its whole text. An empty port
-(`a.example:`) is the scheme's default (RFC 3986 §6.2.3). The `Host` forwarded therefore names the host the request was
-routed, checked and cache-keyed as (in the client's spelling: case, port, trailing dot). Over
-HTTP/3 the `h3` crate already resets a request stream (`H3_MESSAGE_ERROR`) whose `:authority`
-and `host` differ by a byte, before zion sees it, so that disagreement gets a stream reset
-rather than a `400`. With the real binary the `400`s are asserted for HTTP/1.1 on the TLS
-listener (smuggling corpus, cases 8 and 8d), for HTTP/2 over h2c on `:80`
-(`tests/h2c_redirect_panic.rs`) and for an HTTP/3 `:authority` (`tests/h3_request_body.rs`). The
+`Host` authority that is not `host[:port]`: userinfo, a host that is neither a DNS-style name
+or IPv4 address (ASCII letters, digits, `-`, `.`, `_`) nor an IPv6 address in brackets
+(`a.example,x`, `a.example;x`, a tab), or a port that is not a port number (`a.example:x`,
+`a.example:+443`, `a.example:99999`). An upstream reads the host before the `:` whatever
+follows it, and can read `X-Forwarded-Host` as a list (Express 5 keeps the part before the
+first `,`), where routing keyed `a.example:x` and `a.example,x` by their whole text. An empty
+port (`a.example:`) is the scheme's default (RFC 3986 §6.2.3). The `Host` forwarded therefore
+names the host the request was routed, checked and cache-keyed as (in the client's spelling:
+case, port, trailing dot). Over HTTP/2 and HTTP/3 an `:authority` that the `http` crate does
+not parse (a second `:` outside brackets, a tab) gets a stream reset from `h2`
+(`PROTOCOL_ERROR`) or `h3` (`H3_MESSAGE_ERROR`) rather than a `400`, and over HTTP/3 the `h3`
+crate also resets a request stream whose `:authority` and `host` differ by a byte, before zion
+sees it. With the real binary the `400`s are asserted for HTTP/1.1 on the TLS listener
+(smuggling corpus, cases 8 and 8d), for HTTP/2 over h2c on `:80`, and the `h2` resets with
+them (`tests/h2c_redirect_panic.rs`), and for an HTTP/3 `:authority` (`tests/h3_request_body.rs`). The
 in-process pipeline tests (`src/vary_tests.rs`) send requests with a URI authority, a `Host`
 header or both, at the default HTTP/1.1 version, through the gate every protocol runs.
 

@@ -10,7 +10,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | TLS connection pre-warming | Health checks reuse shared HttpClient; startup pre-warm task fires GET to all upstreams |
 | `TCP_CORK` on listener (Linux) | Batches TLS record + HTTP headers into full MSS segments |
 | Connection pool pre-warming | Fires GET to all upstreams before accept loop starts |
-| Thread-local route lookup cache | FNV hash of `(host, path)` picks the slot of a cached `Arc<ResolvedRoute>`, a hit compares the full `(host, path)`. `cargo bench --bench route_cache` (the real module; Apple M4, rustc 1.88.0, two runs with another build running): a hit costs 20.0 to 20.6 ns without host routing and 36.3 to 36.5 ns with it, a radix lookup in 17 routes 37.9 to 41.1 ns, a miss (lookup, radix, insert with eviction) 137.9 to 148.8 ns |
+| Thread-local route lookup cache | FNV hash of `(host, path)` picks the slot of a cached `Arc<ResolvedRoute>`, a hit compares the full `(host, path)`. `cargo bench --bench route_cache` (the real module; Apple M4, rustc 1.88.0, the bench profile: thin LTO, 16 codegen units; two runs with another build running): a hit costs 20.0 to 20.6 ns without host routing and 36.3 to 36.5 ns with it, a radix lookup in 17 routes 37.9 to 41.1 ns, a miss (lookup, radix, insert with eviction) 137.9 to 148.8 ns |
 
 ## Compiler / build
 

@@ -468,9 +468,10 @@ async fn a_h3_header_section_over_16_kib_is_not_served() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// An HTTP/3 `:authority` whose port is not a port gets a 400, as over HTTP/1.1 and HTTP/2: the
-/// `h3` crate hands it over as the request's authority, and routing would key its whole text
-/// while an upstream reads the host before the `:`. An empty port is the scheme's default
+/// An HTTP/3 `:authority` whose port is not a port, or whose host is not a host name (a `,`, a
+/// `;`), gets a 400, as over HTTP/1.1 and HTTP/2: the `h3` crate hands it over as the request's
+/// authority, and routing would key its whole text while an upstream reads the host before the
+/// `:`, or before the `,` of what it takes for a list. An empty port is the scheme's default
 /// (RFC 3986 §6.2.3), so `localhost:` is served as `localhost`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_h3_authority_whose_port_is_not_a_port_is_a_400() {
@@ -493,6 +494,8 @@ async fn a_h3_authority_whose_port_is_not_a_port_is_a_400() {
         "https://localhost:x/open/authority-x",
         "https://localhost:+443/open/authority-plus",
         "https://localhost:99999/open/authority-big",
+        "https://localhost,x/open/authority-comma",
+        "https://localhost;x/open/authority-semicolon",
     ] {
         assert_eq!(h3_get(port, uri, None).await, Ok(400), "{uri}");
     }

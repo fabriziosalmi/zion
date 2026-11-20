@@ -2,7 +2,7 @@
 
 Zion is a single async Rust binary built on Tokio, Hyper, and rustls.
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-87 modules, ~87,800 lines of Rust.
+87 modules, ~88,000 lines of Rust.
 
 ## Module map
 
@@ -108,7 +108,7 @@ Client
   │  4. Path normalisation (RFC 3986 §6.2.2)               │
   │  5. Method whitelist (7 methods, else 405)             │
   │  6. One authority per request (target vs Host,         │
-  │     invalid port, userinfo → 400)                      │
+  │     invalid host or port, userinfo → 400)              │
   │  7. 0-RTT replay protection (non-idempotent → 425)     │
   │  8. Loop detection (Via, → 508)                        │
   │  9. Per-IP rate limiter (packed atomic, lock-free)     │

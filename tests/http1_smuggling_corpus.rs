@@ -439,13 +439,17 @@ fn no_desync_form_smuggles_a_request_past_zion() {
         origin_bytes(&seen)
     );
 
-    // 8d. an authority whose port is not a port, in an absolute-form target or in Host, is refused
-    // with 400 and never forwarded: routing would key the whole text, while an upstream reads the
-    // host before the `:`.
+    // 8d. an authority whose port is not a port, or whose host is not a host name, in an
+    // absolute-form target or in Host, is refused with 400 and never forwarded: routing would key
+    // the whole text, while an upstream reads the host before the `:`, or before the `,` of what
+    // it takes for a list (`X-Forwarded-Host`).
     for raw in [
         &b"GET http://a.example:x/abs8d-target HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n"[..],
         b"GET /abs8d-host HTTP/1.1\r\nHost: a.example:x\r\nConnection: close\r\n\r\n",
         b"GET /abs8d-plus HTTP/1.1\r\nHost: a.example:+443\r\nConnection: close\r\n\r\n",
+        b"GET /abs8d-comma HTTP/1.1\r\nHost: a.example,x\r\nConnection: close\r\n\r\n",
+        b"GET /abs8d-tab HTTP/1.1\r\nHost: x\ta.example\r\nConnection: close\r\n\r\n",
+        b"GET http://a.example,x/abs8d-comma-target HTTP/1.1\r\nHost: a.example,x\r\nConnection: close\r\n\r\n",
     ] {
         let line = send_raw(port, raw);
         assert!(

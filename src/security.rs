@@ -420,27 +420,43 @@ pub fn request_host<B>(req: &hyper::Request<B>) -> Option<Cow<'_, str>> {
 /// ([`normalize_host`]) and for the gate that refuses what it cannot read
 /// ([`authority_is_ambiguous`]).
 ///
-/// `None` when it is not `host[:port]`: userinfo (`user@host`), an unclosed `[`, or anything after
-/// the host other than a `:` and a port number (`a.example:x`, `a.example:+443`,
-/// `a.example:99999`, `a.example:1:2`, a bare IPv6 literal such as `::1`). An upstream cuts the
-/// host at the first `:` (nginx) or splits host and port itself (Go's `net.SplitHostPort`), so
-/// such a text would name the host before the `:` to the upstream and something else to zion.
+/// The host is a DNS-style name or an IPv4 address (ASCII letters, digits, `-`, `.` and `_`
+/// only), or an IPv6 address in brackets. `None` when the authority is not `host[:port]`:
+///
+/// - a host with any other byte: userinfo (`user@host`), a `,` or a `;` (`a.example,x`),
+///   whitespace or a tab (`x\ta.example`), a `%`; an unclosed `[`, or brackets around
+///   something that is not an IPv6 address (a zone ID included);
+/// - anything after the host other than a `:` and a port number (`a.example:x`,
+///   `a.example:+443`, `a.example:99999`, `a.example:1:2`, a bare IPv6 literal such as `::1`).
+///
+/// An upstream cuts the host at the first `:` (nginx) or splits host and port itself (Go's
+/// `net.SplitHostPort`), and can read `X-Forwarded-Host` as a list (Express 5 keeps the part
+/// before the first `,`). Routing keys such a text by its whole bytes, a key no host group
+/// matches, so the request gets the shared routes while the upstream reads the host inside it.
 /// An empty port (`a.example:`) is no port: RFC 3986 §6.2.3 and RFC 9110 §4.2.3 make it the
 /// scheme's default, like an absent one.
 pub fn split_authority(raw: &str) -> Option<(&str, Option<u16>)> {
-    if raw.contains('@') {
-        return None;
-    }
-    let (host, port) = if raw.starts_with('[') {
-        // `[2001:db8::1]`, `[2001:db8::1]:443`: the host runs through the closing `]`.
-        let (host, rest) = raw.split_at(raw.find(']')? + 1);
-        if rest.is_empty() {
-            (host, rest)
-        } else {
-            (host, rest.strip_prefix(':')?)
+    let (host, port) = match raw.strip_prefix('[') {
+        // `[2001:db8::1]`, `[2001:db8::1]:443`: the host runs through the closing `]`, and
+        // what the brackets hold is an IPv6 address.
+        Some(literal) => {
+            let (address, rest) = literal.split_once(']')?;
+            address.parse::<std::net::Ipv6Addr>().ok()?;
+            // `[`, the address, `]`: all ASCII, so the length is a char boundary
+            let host = raw.get(..address.len() + 2)?;
+            if rest.is_empty() {
+                (host, rest)
+            } else {
+                (host, rest.strip_prefix(':')?)
+            }
         }
-    } else {
-        raw.split_once(':').unwrap_or((raw, ""))
+        None => {
+            let (host, port) = raw.split_once(':').unwrap_or((raw, ""));
+            if !host.bytes().all(is_host_name_byte) {
+                return None;
+            }
+            (host, port)
+        }
     };
     if port.is_empty() {
         return Some((host, None));
@@ -452,13 +468,21 @@ pub fn split_authority(raw: &str) -> Option<(&str, Option<u16>)> {
     port.parse().ok().map(|port| (host, Some(port)))
 }
 
+/// A byte of a DNS-style host name or an IPv4 address: RFC 3986's unreserved set without `~`.
+/// The rest of a `reg-name` (sub-delims such as `,` and `;`, `%`-encoding) and every control or
+/// whitespace byte are left out, because an upstream can read them as a separator.
+#[inline]
+fn is_host_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_')
+}
+
 /// Whether a request does not name one host that routing and the upstream both read the same
 /// way, so that it cannot be served as one host:
 ///
 /// - an authority, in the request target (HTTP/2 and HTTP/3 `:authority`, an HTTP/1.1
 ///   absolute-form target) or in a `Host` header, that is not `host[:port]`
-///   ([`split_authority`]): userinfo, a port that is not a port, a `Host` that is not visible
-///   ASCII;
+///   ([`split_authority`]): userinfo, a host that is neither a DNS-style name nor an IP
+///   address (a `,`, a tab), a port that is not a port, a `Host` that is not visible ASCII;
 /// - a target authority with a `Host` header that names another authority.
 ///
 /// Routing, the route's policy (`internal_only`, auth, WAF) and the response-cache key read
@@ -472,8 +496,8 @@ pub fn split_authority(raw: &str) -> Option<(&str, Option<u16>)> {
 /// `:authority` and first `host` field differ by a byte, before zion sees it.) An authority
 /// that is not `host[:port]` is refused for the same reason: routing would key it by its
 /// whole text, a key no host group matches, so it would get the shared routes, while the
-/// upstream reads the host before the `:`. RFC 9110 §4.2.4 has a recipient treat userinfo in
-/// an `http(s)` target as an error.
+/// upstream reads the host before the `:`, or before the `,` of what it takes for a list.
+/// RFC 9110 §4.2.4 has a recipient treat userinfo in an `http(s)` target as an error.
 ///
 /// The comparison is the scheme-based one RFC 9113 asks of an intermediary (RFC 3986
 /// §6.2.3): the host without regard to case, and an absent or empty port equal to the
@@ -1519,6 +1543,23 @@ mod normalize_host_tests {
             ("api.example.com:443:443", None),
             ("[2001:db8::1]x", None),
             ("[2001:db8::1]:x", None),
+            // a host is a DNS-style name or an IP address: letters, digits, `-`, `.`, `_`
+            ("_acme-1.Example.com", Some("_acme-1.example.com")),
+            ("10.0.0.5:8080", Some("10.0.0.5")),
+            // any other byte has no key: an upstream may read a list separator in it
+            ("api.example.com,x", None),
+            ("x,api.example.com", None),
+            ("api.example.com;x", None),
+            ("x\tapi.example.com", None),
+            ("api.example.com x", None),
+            ("api%2eexample.com", None),
+            ("api.example.com~", None),
+            ("*.example.com", None),
+            // brackets hold an IPv6 address and nothing else
+            ("[api.example.com]", None),
+            ("[2001:db8::1,x]", None),
+            ("[fe80::1%25en0]", None),
+            ("[]", None),
         ];
         for (raw, want) in cases {
             assert_eq!(
@@ -1636,6 +1677,22 @@ mod normalize_host_tests {
             ("/p", &["a.example", "a.example:x"], true),
             // userinfo in a `Host`, also without a target
             ("/p", &["u@a.example"], true),
+            // a host that is neither a DNS-style name nor an IP address, in the target or in
+            // a `Host`: routing would key the whole text, an upstream that reads
+            // `X-Forwarded-Host` as a list the host before the `,`
+            ("/p", &["a_b-1.example"], false),
+            ("/p", &["10.0.0.5:8080"], false),
+            ("/p", &["a.example,x"], true),
+            ("/p", &["x,a.example"], true),
+            ("/p", &["a.example;x"], true),
+            ("/p", &["x\ta.example"], true),
+            ("/p", &["a.example,x:443"], true),
+            ("/p", &["[a.example]"], true),
+            ("/p", &["[::1,x]"], true),
+            ("https://a.example,x/p", &[], true),
+            ("https://a.example,x/p", &["a.example,x"], true),
+            ("https://a.example/p", &["a.example,x"], true),
+            ("https://[a.example]/p", &["[a.example]"], true),
         ];
         for (uri, hosts, want) in cases {
             assert_eq!(

@@ -3945,6 +3945,96 @@ internal_only = true
     );
 }
 
+/// A shared route, a public `*.example.com` wildcard and two `internal_only` hosts, all on one
+/// `preserve_host` backend. Routing keyed an authority with a byte no host name has
+/// (`admin.example,x`, `x<TAB>admin.example`) by its whole text: no exact group matched it, so
+/// it got the shared route, or the wildcard whose suffix it ends with. The upstream reads
+/// `X-Forwarded-Host` as a list (Express 5 keeps the part before the first `,`) and served the
+/// protected host. Such an authority is refused, as a target, as a `Host`, and as both.
+#[tokio::test]
+async fn an_authority_with_a_list_separator_cannot_reach_an_internal_only_host() {
+    let (port, hits) = host_echo_origin("no-store").await;
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstream.u]
+urls = ["http://127.0.0.1:{port}"]
+preserve_host = true
+[[route]]
+path = "/{{*rest}}"
+upstream = "u"
+mode = "standard"
+[[route]]
+path = "/{{*rest}}"
+hosts = ["*.example.com"]
+upstream = "u"
+mode = "standard"
+[[route]]
+path = "/{{*rest}}"
+hosts = ["admin.example", "admin.example.com"]
+upstream = "u"
+mode = "standard"
+internal_only = true
+"#
+    );
+    let st = AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"));
+    // Controls: the shared route and the wildcard serve their hosts; the protected hosts
+    // refuse this (non-internal) client.
+    assert_eq!(
+        body_for(&st, "/p", &[("host", "www.example")]).await,
+        (200, "host=www.example".to_string())
+    );
+    assert_eq!(
+        body_for(&st, "/p", &[("host", "x.example.com")]).await,
+        (200, "host=x.example.com".to_string())
+    );
+    for host in ["admin.example", "admin.example.com"] {
+        assert_eq!(
+            body_for(&st, "/p", &[("host", host)]).await.0,
+            403,
+            "{host}"
+        );
+    }
+    let served = hits.load(Ordering::Relaxed);
+    assert_eq!(served, 2, "only the two open controls reached the backend");
+
+    // (target, Host): an origin-form `Host`, an HTTP/2 or HTTP/3 `:authority` alone, and an
+    // absolute-form target with the same text in `Host`.
+    let cases: &[(&str, Option<&str>)] = &[
+        ("/p", Some("admin.example,x")),
+        ("/p", Some("admin.example, x")),
+        ("/p", Some("x,admin.example")),
+        ("/p", Some("admin.example;x")),
+        ("/p", Some("x\tadmin.example")),
+        ("/p", Some("admin.example,x:443")),
+        ("/p", Some("[admin.example]")),
+        ("/p", Some("admin.example.com,x.example.com")),
+        ("https://admin.example,x/p", None),
+        ("https://admin.example.com,x.example.com/p", None),
+        ("http://admin.example,x/p", Some("admin.example,x")),
+    ];
+    for (uri, host) in cases {
+        let headers: Vec<(&str, &str)> = host.iter().map(|h| ("host", *h)).collect();
+        let (code, body) = body_for(&st, uri, &headers).await;
+        assert!(
+            !body.contains("admin.example"),
+            "{uri} with Host {host:?} got an open route and reached the internal_only host \
+             (status {code}, upstream saw {body:?})"
+        );
+        assert_eq!(code, 400, "{uri} with Host {host:?} is refused");
+    }
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        served,
+        "nothing after the controls reached the backend"
+    );
+}
+
 /// The `:80` ACME fallback routes by the target's authority and forwards on its own, outside
 /// the HTTPS pipeline: it refuses a request whose Host disagrees with it the same way.
 #[tokio::test]
@@ -3980,13 +4070,20 @@ async fn the_port_80_acme_fallback_refuses_a_host_that_disagrees_with_the_target
         .0,
         400
     );
-    // and an authority whose port is not a port, as a target or as the Host
+    // and an authority whose port is not a port, or whose host is not a host name, as a
+    // target or as the Host
     for (uri, host) in [
         (
             "http://app.example:x/.well-known/acme-challenge/tok",
             "app.example",
         ),
         ("/.well-known/acme-challenge/tok", "app.example:x"),
+        ("/.well-known/acme-challenge/tok", "app.example,x"),
+        ("/.well-known/acme-challenge/tok", "x\tapp.example"),
+        (
+            "http://app.example,x/.well-known/acme-challenge/tok",
+            "app.example,x",
+        ),
     ] {
         assert_eq!(on_80(uri, host).await.0, 400, "{uri} with Host {host:?}");
     }

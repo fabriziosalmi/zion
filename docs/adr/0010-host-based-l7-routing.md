@@ -89,6 +89,7 @@ with no `hosts` (shared) `path="/{*rest}"` → upstream `frontend`; both define
 | `api.example.com:8443`   | `/x`      | `A` (`api`)        | port stripped   |
 | `api.example.com:`       | `/x`      | `A` (`api`)        | empty port = default |
 | `api.example.com:x`      | `/x`      | `400`, not routed  | not `host[:port]` |
+| `api.example.com,x`      | `/x`      | `400`, not routed  | not a host name |
 | `API.example.com`        | `/x`      | `A` (`api`)        | case-folded     |
 | `api.example.com.`       | `/x`      | `A` (`api`)        | trailing dot    |
 | `app.example.com`        | `/x`      | `S` (`frontend`)   | shared fallback |
@@ -107,7 +108,8 @@ in the shared layer). An empty-string host is rejected.
 
 ## Amendment (2026-11-20): one authority per request, and a hit compares the full key
 
-Two ways around the two load-bearing risks above were found and closed.
+Ways around both load-bearing risks above were found and closed: three around
+the authority precedence, one around the cache key.
 
 **The precedence alone did not settle Host against `:authority`.** Routing, the
 route's policy and the response-cache key took the URI authority first, but the
@@ -143,10 +145,22 @@ nothing or `:` and a port of ASCII digits up to 65535. An empty port is the
 scheme's default (RFC 3986 §6.2.3, RFC 9110 §4.2.3) and is stripped. Anything
 else (a port that is not a number or is out of range, a second `:`, a bare IPv6
 literal, text after `]`, userinfo, a `Host` that is not visible ASCII) has no
-key, and a request that names it, as its target or as a `Host`, over any
-protocol, is refused with `400` by the same gate. A `hosts` entry is checked by
-the same function, so one with an empty or non-numeric port, or a bare IPv6
-literal, is now a config error: no request is routed by that text any more.
+key, and a request that names it, as its target or as a `Host`, is refused with
+`400` by the same gate. Over HTTP/2 and HTTP/3 an `:authority` that the `http`
+crate does not parse at all (a second `:` outside brackets) never reaches the
+gate: `h2` and `h3` reset the stream. A `hosts` entry and a `health_host` are
+checked by the same function, so one with a non-numeric port or a bare IPv6
+literal, and a `hosts` entry with an empty port, is now a config error: no
+request is routed by that text any more.
+
+**A host that is not a host name was a fourth key.** The parser read the port
+but took any other host text whole, and the HTTP/1.1 `Host` check let a `,`, a
+`;` and a tab through. `admin.example,x` was routed by its whole text, so it got
+the shared routes (or a `*.suffix` wildcard it ends with), while the upstream
+was told it in `X-Forwarded-Host`, which an upstream can read as a list
+(Express 5 keeps the part before the first `,`), and served `admin.example`. The
+host is now a DNS-style name or IPv4 address (ASCII letters, digits, `-`, `.`,
+`_`) or an IPv6 address in brackets; any other byte in it gets the `400`.
 
 **The cache key was a hash, not the key.** The cache invariant above was
 enforced by folding the host into an unseeded 64-bit FNV hash, and a hit
