@@ -15,10 +15,11 @@
 //! Names are compared without case, and with `_` and `-` as the same character: a CGI or PHP
 //! upstream reads `X_Debug` as `X-Debug` (both become `HTTP_X_DEBUG`). Cookie names are
 //! compared exactly (RFC 6265 names are case-sensitive), percent-decoded (`%43acheWarmer` is
-//! `CacheWarmer` to an upstream that decodes cookie names, as PHP did before 7.2.34, 7.3.23 and
-//! 7.4.11), and as the key PHP files them under (`XDEBUG.SESSION` is
-//! `$_COOKIE['XDEBUG_SESSION']`, see [`crate::virtual_patch::cookie_is`]). A `Cookie` field is
-//! read as bytes: a byte outside ASCII in one cookie does not hide the others.
+//! `CacheWarmer` to an upstream that decodes cookie names), and as the key PHP files them under,
+//! as sent (`XDEBUG.SESSION` is `$_COOKIE['XDEBUG_SESSION']`) and url-decoded, as PHP did before
+//! 7.2.34, 7.3.23 and 7.4.11 (`XDEBUG%2ESESSION` and `%20CacheWarmer`), see
+//! [`crate::virtual_patch::cookie_is`]. A `Cookie` field is read as bytes: a byte outside ASCII
+//! in one cookie does not hide the others.
 
 use crate::http_util::{empty_response, ZionBody};
 use crate::reserved_headers::same_name;
@@ -115,11 +116,9 @@ impl HeaderPolicy {
                 // denied cookie next to it, was let through.
                 if value.as_bytes().split(|&b| b == b';').any(|pair| {
                     let name = pair.split(|&b| b == b'=').next().unwrap_or_default();
-                    let decoded = percent_decoded(name.trim_ascii());
-                    self.deny_cookies.iter().any(|d| {
-                        crate::virtual_patch::cookie_is(name, d)
-                            || decoded.as_deref() == Some(d.as_bytes())
-                    })
+                    self.deny_cookies
+                        .iter()
+                        .any(|d| crate::virtual_patch::cookie_is(name, d))
                 }) {
                     return Some(empty_response(StatusCode::BAD_REQUEST));
                 }
@@ -135,27 +134,6 @@ impl HeaderPolicy {
 /// `name` lower-cased (hyper stores it so) with `_` as `-`.
 fn fold(name: &str) -> String {
     name.to_ascii_lowercase().replace('_', "-")
-}
-
-/// `b` with its percent-escapes decoded, or `None` when it has none (or a malformed one).
-fn percent_decoded(b: &[u8]) -> Option<Vec<u8>> {
-    if !b.contains(&b'%') {
-        return None;
-    }
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' {
-            let hex = |c: u8| (c as char).to_digit(16);
-            let (h, l) = (hex(*b.get(i + 1)?)?, hex(*b.get(i + 2)?)?);
-            out.push((h * 16 + l) as u8);
-            i += 3;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    Some(out)
 }
 
 fn header_names(owner: &str, key: &str, written: Vec<String>) -> Result<Vec<String>, String> {
@@ -353,6 +331,41 @@ mod tests {
         }
     }
 
+    /// PHP before 7.2.34, 7.3.23 and 7.4.11 (the PHP 7.0 of the lab's WordPress image among
+    /// them) url-decoded a cookie name and then filed it under its key: a leading space it
+    /// decoded is dropped, a decoded NUL ends the name, and a decoded '.' or a '+' (a space)
+    /// becomes '_'. Each of these is a denied cookie to it.
+    #[test]
+    fn a_cookie_name_an_older_php_decodes_to_a_denied_one_is_refused() {
+        let p = HeaderPolicy::merge(
+            &lists(&[], &[], &["CacheWarmer", "XDEBUG_SESSION"]),
+            &HeaderLists::default(),
+        );
+        let missed: Vec<&str> = [
+            "%20CacheWarmer=O:8:\"stdClass\":0:{}",
+            "+CacheWarmer=x",
+            "CacheWarmer%00x=x",
+            "a=1; %20%20CacheWarmer=x",
+            "XDEBUG%2ESESSION=1",
+            "XDEBUG+SESSION=1",
+            "XDEBUG%20SESSION=1",
+            "XDEBUG%5BSESSION=1",
+            "XDEBUG%5FSESSION=1",
+        ]
+        .into_iter()
+        .filter(|c| !refused(&p, &[("cookie", c)]))
+        .collect();
+        assert!(missed.is_empty(), "deny_cookies let through: {missed:?}");
+        for cookie in [
+            "CacheWarmer%01=x",
+            "CacheWarmerX%00=x",
+            "XDEBUG%2DSESSION=1",
+            "XDEBUG_SESSION+=1",
+        ] {
+            assert!(!refused(&p, &[("cookie", cookie)]), "{cookie}");
+        }
+    }
+
     #[test]
     fn a_routes_lists_add_to_the_global_ones() {
         let p = HeaderPolicy::merge(
@@ -426,15 +439,6 @@ mod tests {
             prop_assert_eq!(got, fold(&a) == fold(&b), "a={:?} b={:?}", a, b);
         }
 
-        // percent_decoded never panics and reports "no escapes" as None.
-        #[test]
-        fn percent_decoded_is_total(s in prop::collection::vec(any::<u8>(), 0..32)) {
-            let d = percent_decoded(&s);
-            if !s.contains(&b'%') {
-                prop_assert!(d.is_none(), "no % but decoded: {:?}", s);
-            }
-        }
-
         // A byte outside ASCII anywhere in another cookie of the same field never changes the
         // verdict: the denied cookie next to it is still refused.
         #[test]
@@ -457,27 +461,26 @@ mod tests {
             prop_assert!(p.apply(&mut h).is_some(), "{:?}", field.escape_ascii().to_string());
         }
 
-        // Percent-encoding any subset of a token's bytes still decodes back to it:
-        // a denied cookie name cannot be hidden behind percent-escapes.
+        // Percent-encoding any subset of a denied name's bytes never hides the cookie: the
+        // request is still refused.
         #[test]
-        fn encoding_a_cookie_name_round_trips(tok in token_no_pct(), mask in any::<u64>()) {
+        fn a_percent_encoded_denied_cookie_is_still_refused(tok in token_no_pct(), mask in any::<u64>()) {
             let mut enc = String::new();
-            let mut encoded_any = false;
             for (i, b) in tok.bytes().enumerate() {
                 if (mask >> (i % 64)) & 1 == 1 {
                     enc.push('%');
                     enc.push_str(&format!("{b:02X}"));
-                    encoded_any = true;
                 } else {
                     enc.push(b as char);
                 }
             }
-            let decoded = percent_decoded(enc.as_bytes());
-            if encoded_any {
-                prop_assert_eq!(decoded.as_deref(), Some(tok.as_bytes()), "enc={:?}", enc);
-            } else {
-                prop_assert!(decoded.is_none());
-            }
+            let p = HeaderPolicy::merge(&lists(&[], &[], &[tok.as_str()]), &HeaderLists::default());
+            // `other` has no byte of the token alphabet, so only the encoded cookie can match.
+            let cookie = format!("other=1; {enc}=x");
+            prop_assert!(
+                refused(&p, &[("cookie", cookie.as_str())]),
+                "deny {:?}, sent {:?}", tok, cookie
+            );
         }
     }
 }

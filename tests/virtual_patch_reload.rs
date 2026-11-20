@@ -209,8 +209,8 @@ fn the_shipped_pack_blocks_each_cve_shape() {
     };
 
     // (CVE, method, a path+query the rule must block). One case per rule in
-    // examples/virtual-patch.toml. None of the three sets `methods`: the first two match any
-    // method by having no list; the third is deliberately unscoped too (#773) -- a method
+    // examples/virtual-patch.toml. None of them sets `methods`: the first two match any
+    // method by having no list; the WordPress ones are deliberately unscoped too (#773) -- a method
     // restriction would have missed WordPress's own '_method'/X-HTTP-Method-Override tunnel,
     // which re-dispatches a GET as a PUT internally, after zion has already seen it as a GET.
     let blocked: &[(&str, &str, &str)] = &[
@@ -226,7 +226,7 @@ fn the_shipped_pack_blocks_each_cve_shape() {
         ("CVE-2017-1001000", "PUT", "/wp-json/wp/v2/posts/1?%69d=1z"),
         // And every other spelling PHP files under `$_GET['id']` (php_register_variable_ex):
         // leading spaces dropped, `id[]` and `id[x]` cut to the array `id`, the name read up to
-        // a NUL (query_has() and php_key() in src/virtual_patch.rs).
+        // a NUL (query_has() and php_name() in src/virtual_patch.rs).
         ("CVE-2017-1001000", "PUT", "/wp-json/wp/v2/posts/1?+id=1z"),
         ("CVE-2017-1001000", "PUT", "/wp-json/wp/v2/posts/1?%20id=1z"),
         ("CVE-2017-1001000", "PUT", "/wp-json/wp/v2/posts/1?id[]=1z"),
@@ -239,6 +239,23 @@ fn the_shipped_pack_blocks_each_cve_shape() {
             "CVE-2017-1001000",
             "PUT",
             "/wp-json/wp/v2/posts/1?id%00x=1z",
+        ),
+        // The same REST route named by the `rest_route` query variable, which WordPress serves
+        // from any path (the second WordPress rule): no `/wp-json/` in the path at all.
+        (
+            "CVE-2017-1001000",
+            "PUT",
+            "/?rest_route=/wp/v2/posts/1&id=1z",
+        ),
+        (
+            "CVE-2017-1001000",
+            "GET",
+            "/index.php?rest_route=/wp/v2/posts/1&id=1z&_method=PUT",
+        ),
+        (
+            "CVE-2017-1001000",
+            "PUT",
+            "/?rest_route=%2Fwp%2Fv2%2Fposts%2F1&+id=1z",
         ),
         // And with the PATH's own case changed: Glob::matches() is ASCII case-insensitive on
         // purpose (#773, found auditing these first two rules after the WordPress ones above --
@@ -266,6 +283,12 @@ fn the_shipped_pack_blocks_each_cve_shape() {
         code(zion.https, "/wp-json/wp/v2/posts/1?idx=1z&id_=1z"),
         503,
         "a parameter that is not `id` to PHP is not this rule's business"
+    );
+    // `rest_route` without an `id` override is an ordinary REST request.
+    assert_eq!(
+        code(zion.https, "/?rest_route=/wp/v2/posts/1"),
+        503,
+        "a REST request through `rest_route` with no id query override is not blocked"
     );
 
     // A request matching no rule is not blocked (reaches the dead upstream -> 503).

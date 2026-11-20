@@ -142,6 +142,36 @@ target = "/wp-json/wp/v2/posts/1"
 status = 200
 body_contains = "Hello world!"
 
+[[probe]]
+id = "cve-2017-1001000-rest-route-query-var"
+cve = "CVE-2017-1001000"
+advisory = "https://github.com/advisories/GHSA-qm68-r9p4-ghhx"
+affects = "WordPress 4.7, 4.7.1 (fixed in 4.7.2) -- same mechanism as the main probe above"
+# Found by review: the rule above matches path_glob = "/wp-json/wp/v2/posts/*", but WordPress
+# routes the same REST request from any path. rest_api_init() (wp-includes/rest-api.php) adds
+# 'rest_route' as a public query var, WP::parse_request() fills it from $_POST or $_GET, and
+# rest_api_loaded() serves the REST route it names. This request's path is '/', so the first
+# rule never matches it, and WordPress still reaches update_item_permissions_check() with the
+# query 'id' of "1z", as in the main probe.
+mechanism = "zion's virtual-patch rule 'wp-rest-route-id-param-override' (virtual-patch.toml) denies a request that carries both a 'rest_route' and an 'id' query parameter, on any path and any method."
+mechanism_verified = true
+# Break-test: with that rule removed from virtual-patch.toml, this probe's verdict is `bypass`;
+# with it, `covered`.
+
+[probe.request]
+method = "PUT"
+target = "/?rest_route=/wp/v2/posts/1&id=1z"
+headers = [["Content-Type", "application/json"]]
+body = '{"title":"Hello world!"}'
+
+[probe.baseline]
+# The same REST request through 'rest_route', with no 'id' override: WordPress denies it.
+target = "/?rest_route=/wp/v2/posts/1"
+
+[probe.oracle.vulnerable_if]
+status = 200
+body_contains = "Hello world!"
+
 [[benign]]
 id = "anonymous-homepage"
 [benign.request]
@@ -203,3 +233,14 @@ headers = [["Content-Type", "application/json"]]
 body = '{"title":"Hello world!"}'
 [benign.expect]
 status = 401
+
+[[benign]]
+id = "anonymous-rest-read-through-rest-route"
+# The plain-permalink spelling of the REST read of post 1 (no 'id' override) stays public
+# through zion: the 'rest_route' rule needs an 'id' query parameter next to it.
+[benign.request]
+method = "GET"
+target = "/?rest_route=/wp/v2/posts/1"
+[benign.expect]
+status = 200
+body_contains = "Hello world!"

@@ -284,11 +284,11 @@ Each `[[rule]]` in the rules file:
 | `methods` | string[] | `[]` | HTTP methods the rule applies to (empty = any) |
 | `path_glob` | string? | — | Glob over the request path; `*` matches any run of characters |
 | `headers` | table[] | `[]` | Each `{ name, equals?, contains? }` must match (presence if neither `equals` nor `contains`) |
-| `cookies` | string[] | `[]` | Cookie names that must be present, as sent or under the key PHP files them under (`XDEBUG.SESSION` is `XDEBUG_SESSION`) |
-| `query` | table[] | `[]` | Each `{ name, equals? }` query parameter must be present (and equal `equals` if given). Names and values are compared percent-decoded, and a name also matches under the key PHP files it under (`?+id=`, `?id[]=` and `?id%00x=` are all `id`) |
+| `cookies` | string[] | `[]` | Cookie names that must be present, as sent, percent-decoded, or under the key PHP files them under, from the name as sent (`XDEBUG.SESSION` is `XDEBUG_SESSION`) or url-decoded, as PHP before 7.2.34, 7.3.23 and 7.4.11 read it (`XDEBUG%2ESESSION` and `XDEBUG+SESSION` are `XDEBUG_SESSION`) |
+| `query` | table[] | `[]` | Each `{ name, equals? }` query parameter must be present (and equal `equals` if given). Names and values are compared percent-decoded, and a name also matches under the key PHP files it under (`?+id=`, `?id[]=` and `?id%00x=` are all `id`). A `name` that names an array element (`name[x]`) matches that element and the ones inside it, never the plain `name` |
 | `content_types` | string[] | `[]` | Content-Type prefixes, any one matching (empty = any) |
 
-Header values are read as bytes, so a byte outside ASCII elsewhere in a `Cookie` or `Content-Type` field does not hide a cookie or media type from a rule.
+Header values are read as bytes, so a byte outside ASCII elsewhere in a `Cookie` or `Content-Type` field does not hide a cookie or media type from a rule. `headers` and `content_types` compare a value without the spaces and tabs around it: HTTP/2 and HTTP/3 keep them in the value, zion forwards it as it came, and an HTTP/1.1 upstream drops them, so `\tmultipart/form-data` is a multipart body to it.
 
 A starter pack ships in [`examples/virtual-patch.toml`](https://github.com/fabriziosalmi/zion/blob/master/examples/virtual-patch.toml).
 

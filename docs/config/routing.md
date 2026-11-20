@@ -169,8 +169,12 @@ a CGI or PHP upstream reads `X_Debug` as `X-Debug`. Cookie names are compared as
 that decodes cookie names, as PHP did before 7.2.34, 7.3.23 and 7.4.11), and as the key PHP
 files them under: PHP drops the whitespace before a cookie name, turns ` ` and `.` into `_`,
 and reads `name[...]` as the array `name` (an unclosed `[` also becomes `_`), so
-`XDEBUG.SESSION`, `XDEBUG SESSION` and `XDEBUG[SESSION` are all `XDEBUG_SESSION` to it. The
-`Cookie` field is read as bytes: a byte outside ASCII in one cookie does not hide the others.
+`XDEBUG.SESSION`, `XDEBUG SESSION` and `XDEBUG[SESSION` are all `XDEBUG_SESSION` to it. A
+PHP before those versions url-decoded the name first (`+` is a space, `%XX` the byte it
+names, and a decoded NUL ends the name), so the key of the url-decoded name is compared too:
+`%20CacheWarmer` and `CacheWarmer%00x` are `CacheWarmer`, and `XDEBUG%2ESESSION` and
+`XDEBUG+SESSION` are `XDEBUG_SESSION`. The `Cookie` field is read as bytes: a byte outside
+ASCII in one cookie does not hide the others.
 A name that is not a header name or a cookie name is a config error.
 
 Some are built in, on every route, with no configuration:

@@ -6,7 +6,12 @@
 //!   `Content-Type` field does not let `deny_cookies` or a virtual-patch `cookies` /
 //!   `content_types` rule skip the field, over HTTP/1.1 and HTTP/2.
 //! - A cookie name PHP files under a denied name (`XDEBUG.SESSION` is
-//!   `$_COOKIE['XDEBUG_SESSION']`) is refused like that name.
+//!   `$_COOKIE['XDEBUG_SESSION']`, and `XDEBUG%2ESESSION` is too to a PHP that url-decodes
+//!   cookie names) is refused like that name. A rule that names an array element
+//!   (`name[#post_render][]`) does not refuse the plain `name`.
+//! - Whitespace at the start or end of a header value, which h2 keeps and an HTTP/1.1 upstream
+//!   drops, does not hide a `content_types` or `headers` value from a rule over HTTP/2 (a
+//!   hyper client: curl drops the whitespace itself).
 //! - The underscore spelling of a reserved header (`X_Client_Cert_Fingerprint`) or of a
 //!   forwarding header zion sets (`X_Real_IP`) never reaches the upstream: an upstream that names
 //!   headers the CGI way (RFC 3875; Python's `wsgiref` is one) folds `_` and `-` into one
@@ -122,6 +127,21 @@ action = "deny"
 methods = ["POST"]
 path_glob = "/upload*"
 content_types = ["multipart/form-data"]
+
+[[rule]]
+id = "vp-header"
+cve = "CVE-2099-0003"
+action = "deny"
+[[rule.headers]]
+name = "x-mode"
+equals = "debug"
+
+[[rule]]
+id = "vp-element"
+cve = "CVE-2099-0004"
+action = "deny"
+[[rule.query]]
+name = "name[#post_render][]"
 "#;
 
 /// Boot zion in front of `origin_port` with `deny_cookies`, the virtual-patch [`RULES`] and
@@ -474,11 +494,269 @@ fn a_cookie_name_php_reads_as_a_denied_one_is_refused() {
             "HTTP/1.1 403",
         ),
     ];
-    let bypassed = check_all(port, &seen, &attacks);
+    let mut bypassed = check_all(port, &seen, &attacks);
+
+    // `$_COOKIE['CacheWarmer']`, `$_COOKIE['XDEBUG_SESSION']` and `$_COOKIE['wp_evil']` to a PHP
+    // before 7.2.34, 7.3.23 and 7.4.11 (the lab's WordPress image runs PHP 7.0), which
+    // url-decoded a cookie name before it made it a key.
+    let decoded: [(&str, &[u8], &str); 6] = [
+        (
+            "/o1",
+            b"GET /o1 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\
+              Cookie: %20CacheWarmer=O:8:\"stdClass\":0:{}\r\n\r\n",
+            "HTTP/1.1 400",
+        ),
+        (
+            "/o2",
+            b"GET /o2 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\
+              Cookie: a=1; CacheWarmer%00x=O:8:\"stdClass\":0:{}\r\n\r\n",
+            "HTTP/1.1 400",
+        ),
+        (
+            "/o3",
+            b"GET /o3 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\
+              Cookie: XDEBUG%2ESESSION=1\r\n\r\n",
+            "HTTP/1.1 400",
+        ),
+        (
+            "/o4",
+            b"GET /o4 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\
+              Cookie: XDEBUG+SESSION=1\r\n\r\n",
+            "HTTP/1.1 400",
+        ),
+        (
+            "/o5",
+            b"GET /o5 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\
+              Cookie: wp%5Fevil=1\r\n\r\n",
+            "HTTP/1.1 403",
+        ),
+        (
+            "/o6",
+            b"GET /o6 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\
+              Cookie: a=1; wp+evil=1\r\n\r\n",
+            "HTTP/1.1 403",
+        ),
+    ];
+    bypassed.extend(check_all(port, &seen, &decoded));
+    // A name that decodes to something else is forwarded.
+    let kept: [(&str, &[u8], &str); 1] = [(
+        "/o0",
+        b"GET /o0 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\
+          Cookie: XDEBUG%2DSESSION=1; CacheWarmerX%00=1; wp_evil+=1\r\n\r\n",
+        "HTTP/1.1 200",
+    )];
+    let wrong = check_all(port, &seen, &kept);
     let _ = fs::remove_dir_all(&dir);
+    assert!(wrong.is_empty(), "{wrong:#?}");
     assert!(
         bypassed.is_empty(),
         "{} of the cookie names PHP reads as a denied one got through:\n  {}",
+        bypassed.len(),
+        bypassed.join("\n  ")
+    );
+}
+
+/// A rule that names an array element (`name[#post_render][]`) blocks that element, and leaves a
+/// request that only carries the plain `name` alone.
+#[test]
+fn a_rule_naming_an_array_element_does_not_block_the_plain_name() {
+    let Some(dir) = pki("php-element") else {
+        common::skip("openssl could not make the certificates");
+        return;
+    };
+    let (origin_port, _seen) = origin();
+    let (_z, port) = start(&dir, origin_port);
+    let cases: [(&str, &[u8], &str); 5] = [
+        (
+            "/e1",
+            b"GET /e1?name[%23post_render][]=passthru HTTP/1.1\r\nHost: a.example\r\n\
+              Connection: close\r\n\r\n",
+            "HTTP/1.1 403",
+        ),
+        (
+            "/e2",
+            b"GET /e2?+name[%23post_render][]=passthru HTTP/1.1\r\nHost: a.example\r\n\
+              Connection: close\r\n\r\n",
+            "HTTP/1.1 403",
+        ),
+        (
+            "/e3",
+            b"GET /e3?name=bob HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200",
+        ),
+        (
+            "/e4",
+            b"GET /e4?name[]=bob HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200",
+        ),
+        (
+            "/e5",
+            b"GET /e5?name[x]=bob&name.y=1 HTTP/1.1\r\nHost: a.example\r\n\
+              Connection: close\r\n\r\n",
+            "HTTP/1.1 200",
+        ),
+    ];
+    // `forwarded` matches the request line on " {path} ", which a query string hides.
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|(path, raw, want)| {
+            let line = status_line(port, raw);
+            (!line.starts_with(want)).then(|| format!("{path}: expected {want:?}, got {line:?}"))
+        })
+        .collect();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[derive(Debug)]
+struct NoVerify;
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// `method path` over HTTP/2 (TLS, ALPN `h2`, no client certificate) with one header whose value
+/// is sent exactly as given, and the status code. curl cannot be used here: it drops the
+/// whitespace at the start of a header value, and h2 keeps it.
+fn h2_raw_status(port: u16, method: &str, path: &str, name: &str, value: &[u8]) -> u16 {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"h2".to_vec()];
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                tcp,
+            )
+            .await
+            .unwrap();
+        let (mut send, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(tls),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(conn);
+        let req = hyper::Request::builder()
+            .method(method)
+            .uri(format!("https://localhost:{port}{path}"))
+            .header(
+                name,
+                hyper::header::HeaderValue::from_bytes(value).expect("h2 accepts it"),
+            )
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(8), send.send_request(req))
+            .await
+            .expect("an answer within 8 s")
+            .expect("an HTTP/2 answer")
+            .status()
+            .as_u16()
+    })
+}
+
+/// h2 (and h3) keep whitespace at the start or end of a field value, which an HTTP/1.1 parser
+/// drops; zion forwards the value as it came, and the HTTP/1.1 upstream reads
+/// `\tmultipart/form-data` as a multipart body. A `content_types` or `headers` rule must match it
+/// over HTTP/2 the way it matches the plain value.
+#[test]
+fn whitespace_around_an_h2_value_does_not_hide_it_from_a_rule() {
+    let Some(dir) = pki("h2-ows") else {
+        common::skip("openssl could not make the certificates");
+        return;
+    };
+    let (origin_port, seen) = origin();
+    let (_z, port) = start(&dir, origin_port);
+    let ct = "content-type";
+    // Controls: the plain value is refused, and a value no rule names is forwarded.
+    let controls = [
+        (
+            "/upload-w0",
+            ct,
+            &b"multipart/form-data; boundary=B"[..],
+            403,
+        ),
+        ("/x-w0", "x-mode", b"debug", 403),
+        ("/upload-w1", ct, b"\ttext/plain", 200),
+        ("/x-w1", "x-mode", b" release", 200),
+    ];
+    let attacks = [
+        (
+            "/upload-w2",
+            ct,
+            &b"\tmultipart/form-data; boundary=B"[..],
+            403,
+        ),
+        ("/upload-w3", ct, b" multipart/form-data; boundary=B", 403),
+        ("/x-w2", "x-mode", b"\tdebug", 403),
+        ("/x-w3", "x-mode", b"debug ", 403),
+    ];
+    let run = |cases: &[(&str, &str, &[u8], u16)]| -> Vec<String> {
+        cases
+            .iter()
+            .filter_map(|(path, name, value, want)| {
+                let method = if path.starts_with("/upload") {
+                    "POST"
+                } else {
+                    "GET"
+                };
+                let got = h2_raw_status(port, method, path, name, value);
+                (got != *want).then(|| {
+                    format!(
+                        "{method} {path} {name}: {:?}: expected {want}, got {got}; origin saw: {}",
+                        value.escape_ascii().to_string(),
+                        forwarded(&seen, path).unwrap_or_else(|| "<nothing>".into())
+                    )
+                })
+            })
+            .collect()
+    };
+    let wrong = run(&controls);
+    assert!(wrong.is_empty(), "controls: {wrong:#?}");
+    let bypassed = run(&attacks);
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        bypassed.is_empty(),
+        "{} of the values with whitespace around them got past the rule over HTTP/2:\n  {}",
         bypassed.len(),
         bypassed.join("\n  ")
     );

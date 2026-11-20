@@ -32,8 +32,8 @@ pub enum Asserter {
 /// Every reserved header (lower-case, as hyper stores names) with its asserter.
 ///
 /// `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto` and `X-Forwarded-Host` are not here:
-/// Zion always overwrites (or, for a trusted proxy, extends) them when it forwards, and drops
-/// their underscore spellings there ([`FORWARDING_HEADERS`]).
+/// Zion sets or drops them when it forwards, and drops their underscore spellings there
+/// ([`FORWARDING_HEADERS`]).
 pub const RESERVED_HEADERS: [(&str, Asserter); 16] = [
     // What the TLS handshake verified.
     ("x-client-cert-fingerprint", Asserter::Transport),
@@ -60,12 +60,15 @@ pub const RESERVED_HEADERS: [(&str, Asserter); 16] = [
     ("x-original-host", Asserter::TrustedProxy),
 ];
 
-/// The forwarding headers Zion writes on every request it forwards (`proxy.rs`,
-/// `apply_forwarding_hygiene`), under the dashed name: it overwrites the inbound copy, or for
-/// `X-Forwarded-For` in `append` mode extends it. An underscore spelling of one is a second copy
-/// that Zion neither overwrites nor reads, and that a CGI-style upstream merges with Zion's value
-/// into one variable (behind Python's `wsgiref`, `X_Real_IP: 1.2.3.4` makes `HTTP_X_REAL_IP`
-/// `1.2.3.4,<client>`), so [`drop_underscore_spellings`] removes it there.
+/// The forwarding headers Zion sets or drops on every request it forwards (`proxy.rs`,
+/// `apply_forwarding_hygiene`), under the dashed name: `X-Forwarded-Proto` is always set,
+/// `X-Real-IP` when the client address is known, `X-Forwarded-Host` when the request names a
+/// host, and `X-Forwarded-For` as `xff_mode` says (extended in `append`, replaced in `rewrite`,
+/// removed in `drop`). An underscore spelling of one is a second copy that Zion neither
+/// overwrites nor reads, and
+/// that a CGI-style upstream merges with Zion's value into one variable (behind Python's
+/// `wsgiref`, `X_Real_IP: 1.2.3.4` makes `HTTP_X_REAL_IP` `1.2.3.4,<client>`), so
+/// [`drop_underscore_spellings`] removes it from every forwarded request.
 pub const FORWARDING_HEADERS: [&str; 4] = [
     "x-forwarded-for",
     "x-forwarded-host",

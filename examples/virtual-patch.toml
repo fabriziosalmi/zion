@@ -50,11 +50,32 @@ path_glob = "/mgmt/*"
 # Fixed upstream in WordPress 4.7.2; this rule is for an unpatched or EOL install. CVSS 7.5
 # (NVD CVSS 3.0), verified -- including the method-override and percent-encoded-name bypasses
 # above -- against a real 4.7.1/4.7.2 pair in tests/lab/ (see docs/security/cve-coverage.md).
+# Out of reach of this rule and the next one: an 'id' in a JSON or form body, which get_param()
+# reads before the query string, and a 'rest_route' in a form body. This engine does not read
+# request bodies, so it cannot see either.
 [[rule]]
 id = "wordpress-rest-posts-id-param-override"
 cve = "CVE-2017-1001000"
 source = "https://github.com/advisories/GHSA-qm68-r9p4-ghhx"
 action = "deny"
 path_glob = "/wp-json/wp/v2/posts/*"
+[[rule.query]]
+name = "id"
+
+# The same CVE without /wp-json/ in the path. rest_api_init() makes 'rest_route' a public query
+# variable, WP::parse_request() fills it from the query string on any path that reaches
+# index.php, and rest_api_loaded() serves the REST route it names, so
+# PUT /?rest_route=/wp/v2/posts/1&id=1z reaches the same update_item_permissions_check() as the
+# rule above, with a path that rule never sees. Shield: refuse a request that carries both a
+# 'rest_route' and an 'id' query parameter, on any path and any method. This engine cannot
+# compare the start of a value, so the rule does not look at which route 'rest_route' names: a
+# plugin route that takes an 'id' query parameter, called through ?rest_route=, is refused too.
+[[rule]]
+id = "wordpress-rest-route-id-param-override"
+cve = "CVE-2017-1001000"
+source = "https://github.com/advisories/GHSA-qm68-r9p4-ghhx"
+action = "deny"
+[[rule.query]]
+name = "rest_route"
 [[rule.query]]
 name = "id"

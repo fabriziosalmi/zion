@@ -31,10 +31,12 @@ pub enum Action {
 pub struct HeaderMatch {
     /// Header name, compared case-insensitively.
     pub name: String,
-    /// Exact value (case-sensitive) the header must have. Omit to match on mere presence.
+    /// Exact value (case-sensitive) the header must have, without the whitespace around it.
+    /// Omit to match on mere presence.
     #[serde(default)]
     pub equals: Option<String>,
-    /// Substring the header value must contain. Omit to match on mere presence.
+    /// Substring the header value (without the whitespace around it) must contain. Omit to
+    /// match on mere presence.
     #[serde(default)]
     pub contains: Option<String>,
 }
@@ -44,7 +46,8 @@ pub struct HeaderMatch {
 #[serde(deny_unknown_fields)]
 pub struct QueryMatch {
     /// Parameter name (case-sensitive), compared with the request's after percent-decoding, and
-    /// also with the key PHP files the request's under (`?id[]=` is `$_GET['id']`).
+    /// also with where PHP files the request's (`?id[]=` is `$_GET['id']`; a name with an index,
+    /// `name[x]`, matches that element and the ones inside it, not a plain `name`).
     pub name: String,
     /// Exact value the parameter must have. Omit to match on mere presence.
     #[serde(default)]
@@ -77,14 +80,15 @@ pub struct RuleConfig {
     /// Header conditions (all must match).
     #[serde(default)]
     pub headers: Vec<HeaderMatch>,
-    /// Cookie names that must be present, as sent or under the key PHP files them under
-    /// (`XDEBUG.SESSION` is `$_COOKIE['XDEBUG_SESSION']`).
+    /// Cookie names that must be present, as sent, percent-decoded, or under the key PHP files
+    /// them under (`XDEBUG.SESSION` is `$_COOKIE['XDEBUG_SESSION']`), see [`cookie_is`].
     #[serde(default)]
     pub cookies: Vec<String>,
     /// Query-parameter conditions (all must match).
     #[serde(default)]
     pub query: Vec<QueryMatch>,
-    /// Content-Type prefixes (any one matching is enough); empty = any.
+    /// Content-Type prefixes (any one matching is enough), compared with the value without the
+    /// whitespace before it; empty = any.
     #[serde(default)]
     pub content_types: Vec<String>,
 }
@@ -289,14 +293,15 @@ fn rule_matches(rule: &Rule, t: &Target<'_>) -> bool {
     // can carry more than one, and the one an upstream actually acts on is not necessarily
     // the first; HeaderMap::get() would only ever see that first one). Compared as bytes: a
     // byte outside ASCII further on in the value (obs-text, which hyper and h2 accept) made
-    // `to_str()` fail, and the value was read as empty, so it matched no rule.
+    // `to_str()` fail, and the value was read as empty, so it matched no rule. Compared without
+    // the whitespace around the value ([`field_value`]).
     if !c.content_types.is_empty() {
         let any_matches = t
             .headers
             .get_all(hyper::header::CONTENT_TYPE)
             .iter()
             .any(|v| {
-                let ct = v.as_bytes();
+                let ct = field_value(v);
                 c.content_types.iter().any(|p| {
                     let p = p.as_bytes();
                     ct.len() >= p.len() && ct[..p.len()].eq_ignore_ascii_case(p)
@@ -310,10 +315,11 @@ fn rule_matches(rule: &Rule, t: &Target<'_>) -> bool {
     // every condition configured for it -- not "the first value satisfies equals and some
     // other, different occurrence happens to satisfy contains". Repeating a header is how a
     // request can carry a dangerous value while an inspector that only reads HeaderMap::get()
-    // (the first occurrence) sees only an innocuous one.
+    // (the first occurrence) sees only an innocuous one. Each value is compared without the
+    // whitespace around it ([`field_value`]).
     for h in &c.headers {
         let any_matches = t.headers.get_all(&h.name).iter().any(|val| {
-            let val = val.as_bytes();
+            let val = field_value(val);
             let eq_ok = h.equals.as_deref().is_none_or(|eq| val == eq.as_bytes());
             let sub_ok = h
                 .contains
@@ -360,6 +366,15 @@ fn push_label(out: &mut String, s: &str) {
     }
 }
 
+/// A field value as the upstream reads it: without the whitespace (SP and HTAB, RFC 9110 5.5)
+/// around it. httparse already drops it from an HTTP/1.1 field, but h2 and h3 keep a leading or
+/// trailing SP or HTAB in the value, zion forwards the value as it came, and an HTTP/1.1
+/// upstream drops it, so `\tmultipart/form-data` sent over HTTP/2 or HTTP/3 is a multipart body
+/// to it.
+fn field_value(v: &hyper::header::HeaderValue) -> &[u8] {
+    v.as_bytes().trim_ascii()
+}
+
 fn contains_subslice(hay: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
@@ -385,41 +400,63 @@ fn cookie_names(headers: &hyper::HeaderMap) -> Vec<&[u8]> {
 }
 
 /// Does a cookie whose name was sent as `raw` (from [`cookie_names`]) name the cookie `want`?
-/// Its name without the whitespace around it, or the key PHP files it under in `$_COOKIE`:
-/// PHP drops the whitespace before a cookie name, does not percent-decode it, and then makes it
-/// a key as [`php_key`] says, so `XDEBUG.SESSION`, `XDEBUG SESSION` and `XDEBUG[SESSION` are
-/// all `$_COOKIE['XDEBUG_SESSION']`.
+///
+/// - Its name without the whitespace around it.
+/// - The key PHP files it under in `$_COOKIE` ([`same_php_name`]): PHP drops the whitespace
+///   before a cookie name and makes the rest a key, so `XDEBUG.SESSION`, `XDEBUG SESSION` and
+///   `XDEBUG[SESSION` are all `$_COOKIE['XDEBUG_SESSION']`.
+/// - Its percent-decoded name (`%43acheWarmer` is `CacheWarmer` to an upstream that decodes
+///   cookie names).
+/// - The key PHP files its url-decoded name under. PHP before 7.2.34, 7.3.23 and 7.4.11
+///   url-decoded a cookie name (`+` is a space, `%XX` the byte it names) before it made it a
+///   key, so to it `%20CacheWarmer` and `CacheWarmer%00x` are `CacheWarmer`, and
+///   `XDEBUG%2ESESSION` and `XDEBUG+SESSION` are `XDEBUG_SESSION`.
+///
+/// A name with no `%` or `+` in it is never decoded, so the common case allocates nothing.
 pub(crate) fn cookie_is(raw: &[u8], want: &str) -> bool {
     let want = want.as_bytes();
-    raw.trim_ascii() == want || same_php_name(raw.trim_ascii_start(), want)
+    let sent = raw.trim_ascii_start();
+    sent.trim_ascii_end() == want
+        || same_php_name(sent, want)
+        || url_decoded(sent, false).is_some_and(|name| name.trim_ascii() == want)
+        || url_decoded(sent, true).is_some_and(|name| same_php_name(&name, want))
 }
 
-/// `a` and `b` are the same non-empty key to PHP ([`php_key`]), compared without building
-/// either key.
-fn same_php_name(a: &[u8], b: &[u8]) -> bool {
-    let (a, b) = (php_key(a), php_key(b));
-    !b.is_empty()
-        && a.len() == b.len()
-        && a.iter()
-            .zip(b)
+/// Does PHP file a request variable named `sent` where the rule's name `want` points? Both are
+/// split as [`php_name`] says. The keys must be the same and not empty, compared as
+/// [`php_key_byte`] maps them, without building either key. When `want` names an array element
+/// (`name[x]`), `sent` must name that element or one inside it (`name[x]` or `name[x][y]`), so
+/// a rule for `name[x]` does not match a plain `name` or `name[y]`. A `want` without an index
+/// matches every element: `id[]` and `id[x]` are both `$_GET['id']`.
+fn same_php_name(sent: &[u8], want: &[u8]) -> bool {
+    let ((sent_key, sent_index), (want_key, want_index)) = (php_name(sent), php_name(want));
+    !want_key.is_empty()
+        && sent_key.len() == want_key.len()
+        && sent_key
+            .iter()
+            .zip(want_key)
             .all(|(&x, &y)| php_key_byte(x) == php_key_byte(y))
+        && sent_index.starts_with(want_index)
 }
 
-/// The bytes of `name` that PHP keeps for the key it files a request variable under in
-/// `$_GET`, `$_POST` or `$_COOKIE` (`php_register_variable_ex` in PHP's `main/php_variables.c`),
-/// for a name already percent-decoded where PHP decodes it (query and form names, not cookie
-/// names):
+/// `name` split where PHP splits a request variable's name before it files it in `$_GET`,
+/// `$_POST` or `$_COOKIE` (`php_register_variable_ex` in PHP's `main/php_variables.c`): the
+/// bytes it keeps for the key, and the array index after them (empty for a plain variable).
+/// For a name already decoded where PHP decodes it (query and form names; cookie names only
+/// before PHP 7.2.34, 7.3.23 and 7.4.11):
 ///
 /// - the name ends at a NUL byte (PHP reads it as a C string);
 /// - leading spaces are dropped;
-/// - at the first `[`, when a `]` follows it anywhere, the name ends there (`id[]` and `id[x]`
-///   are the array `id`).
+/// - at the first `[`, when a `]` follows it anywhere, the key ends and the index begins
+///   (`id[]` and `id[x]` are the array `id`, with the index `[]` or `[x]`).
 ///
-/// Each byte kept then becomes [`php_key_byte`] of it: ` ` and `.` become `_`, and so does a `[`
-/// (one is left only when the first `[` has no `]` after it). That is PHP 8. PHP 7 turns only
-/// that first `[` into `_`, so its key can still hold a ` ` or a `.`; for a key without them
-/// (every key PHP 8 can produce) the two agree. PHP ignores a variable whose key is empty.
-fn php_key(name: &[u8]) -> &[u8] {
+/// Each byte of the key then becomes [`php_key_byte`] of it: ` ` and `.` become `_`, and so
+/// does a `[` (one is left only when the first `[` has no `]` after it). That is PHP 8. PHP 7
+/// turns only that first `[` into `_` and keeps any ` `, `.` or `[` after it (`a[b.c` is
+/// `a_b.c` to PHP 7 and `a_b_c` to PHP 8); [`php_key_byte`] maps all three to `_` on both
+/// sides of a comparison, so a name matches under PHP 7 and PHP 8 alike. PHP ignores a
+/// variable whose key is empty.
+fn php_name(name: &[u8]) -> (&[u8], &[u8]) {
     let name = name
         .iter()
         .position(|&b| b == 0)
@@ -427,12 +464,12 @@ fn php_key(name: &[u8]) -> &[u8] {
     let start = name.iter().position(|&b| b != b' ').unwrap_or(name.len());
     let name = &name[start..];
     match name.iter().position(|&b| b == b'[') {
-        Some(open) if name[open + 1..].contains(&b']') => &name[..open],
-        _ => name,
+        Some(open) if name[open + 1..].contains(&b']') => name.split_at(open),
+        _ => (name, &[]),
     }
 }
 
-/// What PHP turns a byte of a [`php_key`] into.
+/// What PHP turns a byte of a key ([`php_name`]) into.
 fn php_key_byte(b: u8) -> u8 {
     if b" .[".contains(&b) {
         b'_'
@@ -449,51 +486,59 @@ fn php_key_byte(b: u8) -> u8 {
 /// `id=1z` by the time PHP sees it, so a rule naming `id` never matched it and the shield it was
 /// meant to be could be bypassed with any percent-encoding of its parameter name (found by
 /// review on #773, which also promoted the WordPress rule this engine first needed it for).
-/// Decoding is only half of what PHP does to a name: [`php_key`] is the other half.
+/// Decoding is only half of what PHP does to a name: [`php_name`] is the other half.
 fn percent_decode(s: &str) -> std::borrow::Cow<'_, str> {
-    if !s.contains(['%', '+']) {
-        return std::borrow::Cow::Borrowed(s);
+    match url_decoded(s.as_bytes(), true) {
+        None => std::borrow::Cow::Borrowed(s),
+        // A decoded byte sequence that is not valid UTF-8 cannot equal any rule's (UTF-8)
+        // `name` or `value` anyway, so lossy conversion -- never a panic, never rejecting the
+        // request -- is the right failure mode here: the comparison just returns false for it.
+        Some(out) => String::from_utf8_lossy(&out).into_owned().into(),
     }
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+}
+
+/// `b` decoded in one pass, or `None` when it has nothing to decode: `%XX` is the byte it names,
+/// `+` is a space when `plus_is_space` (a query string, or a cookie name to an older PHP), and a
+/// `%` not followed by two hex digits stays as written, as PHP's `urldecode` leaves it.
+fn url_decoded(b: &[u8], plus_is_space: bool) -> Option<Vec<u8>> {
+    if !b.iter().any(|&c| c == b'%' || (plus_is_space && c == b'+')) {
+        return None;
+    }
+    let hex = |c: Option<&u8>| c.and_then(|&c| (c as char).to_digit(16));
+    let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
+    while i < b.len() {
+        match b[i] {
+            b'+' if plus_is_space => {
                 out.push(b' ');
                 i += 1;
             }
-            b'%' if i + 2 < bytes.len() => {
-                let hex = |b: u8| (b as char).to_digit(16);
-                match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                    (Some(hi), Some(lo)) => {
-                        out.push((hi * 16 + lo) as u8);
-                        i += 3;
-                    }
-                    _ => {
-                        out.push(b'%');
-                        i += 1;
-                    }
+            b'%' => match (hex(b.get(i + 1)), hex(b.get(i + 2))) {
+                (Some(hi), Some(lo)) => {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
                 }
-            }
-            b => {
-                out.push(b);
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            c => {
+                out.push(c);
                 i += 1;
             }
         }
     }
-    // A decoded byte sequence that is not valid UTF-8 cannot equal any rule's (UTF-8) `name` or
-    // `value` anyway, so lossy conversion -- never a panic, never rejecting the request -- is
-    // the right failure mode here: the comparison below just returns false for it.
-    String::from_utf8_lossy(&out).into_owned().into()
+    Some(out)
 }
 
 /// Does query string `q` carry a parameter `name` (optionally equal to `value`)? Both the
 /// string being searched and `name`/`value` are compared after percent-decoding -- see
 /// [`percent_decode`] -- since `q` is the raw bytes of the URI's query component (hyper does not
 /// decode it) and is compared against a rule's plain-text `name`/`value` in `virtual-patch.toml`.
-/// A decoded name also matches when PHP files it under the same key as `name` ([`php_key`]):
-/// `?+id=`, `?%20id=`, `?id[]=` and `?id%00x=` are all `$_GET['id']`.
+/// A decoded name also matches when PHP files it where `name` points ([`same_php_name`]):
+/// `?+id=`, `?%20id=`, `?id[]=` and `?id%00x=` are all `$_GET['id']`, while a rule naming
+/// `name[x]` does not match `?name=`.
 fn query_has(q: &str, name: &str, value: Option<&str>) -> bool {
     q.split('&').any(|pair| {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
@@ -1006,33 +1051,39 @@ mod tests {
     }
 
     #[test]
-    fn php_key_files_a_name_under_the_key_php_does() {
-        let key_of =
-            |name: &[u8]| -> Vec<u8> { php_key(name).iter().map(|&b| php_key_byte(b)).collect() };
-        // Each pair follows main/php_variables.c (php_register_variable_ex), PHP 8.
-        for (name, key) in [
-            ("id", "id"),
-            (" id", "id"),
-            ("   id", "id"),
-            ("id ", "id_"),
-            ("a.b", "a_b"),
-            ("a b", "a_b"),
-            ("id[]", "id"),
-            ("id[x]", "id"),
-            ("id[x][y]", "id"),
-            ("id[", "id_"),
-            ("a[b.c d[e", "a_b_c_d_e"),
-            ("a.b[c]", "a_b"),
-            ("id\0x", "id"),
-            ("", ""),
-            ("   ", ""),
-            ("[x]", ""),
-            ("a-b", "a-b"),
+    fn php_name_files_a_name_under_the_key_php_does() {
+        let key_of = |name: &[u8]| -> (Vec<u8>, Vec<u8>) {
+            let (key, index) = php_name(name);
+            (
+                key.iter().map(|&b| php_key_byte(b)).collect(),
+                index.to_vec(),
+            )
+        };
+        // Each row follows main/php_variables.c (php_register_variable_ex), PHP 8.
+        for (name, key, index) in [
+            ("id", "id", ""),
+            (" id", "id", ""),
+            ("   id", "id", ""),
+            ("id ", "id_", ""),
+            ("a.b", "a_b", ""),
+            ("a b", "a_b", ""),
+            ("id[]", "id", "[]"),
+            ("id[x]", "id", "[x]"),
+            ("id[x][y]", "id", "[x][y]"),
+            ("id[", "id_", ""),
+            ("a[b.c d[e", "a_b_c_d_e", ""),
+            ("a.b[c]", "a_b", "[c]"),
+            ("id\0x", "id", ""),
+            ("id[x]\0[y]", "id", "[x]"),
+            ("", "", ""),
+            ("   ", "", ""),
+            ("[x]", "", "[x]"),
+            ("a-b", "a-b", ""),
         ] {
             assert_eq!(
                 key_of(name.as_bytes()),
-                key.as_bytes(),
-                "{name:?} should be the PHP key {key:?}"
+                (key.as_bytes().to_vec(), index.as_bytes().to_vec()),
+                "{name:?} should be the PHP key {key:?} with the index {index:?}"
             );
             // same_php_name agrees with the keys it never builds.
             assert_eq!(
@@ -1044,6 +1095,266 @@ mod tests {
         assert!(!same_php_name(b"id", b"idx"));
         assert!(!same_php_name(b"id_", b"id"));
         assert!(!same_php_name(b"", b""), "an empty key matches nothing");
+        // PHP 7 keeps a ' ', '.' or '[' after an unclosed '[' (`a[b.c` is `a_b.c` to it, `a_b_c`
+        // to PHP 8): both spellings are the same name here.
+        assert!(same_php_name(b"a[b.c", b"a_b.c"));
+        assert!(same_php_name(b"a[b[c", b"a_b[c"));
+        assert!(same_php_name(b"a_b.c", b"a_b_c"));
+    }
+
+    /// A rule that names an array element (`name[x]`) is about that element: it matches the
+    /// element and what is inside it, under any spelling PHP files there, and never the bare
+    /// array name or another element of it.
+    #[test]
+    fn a_rule_name_with_an_index_matches_only_that_element() {
+        for (sent, want) in [
+            ("name[#post_render][]", "name[#post_render][]"),
+            (" name[#post_render][]", "name[#post_render][]"),
+            ("name[#post_render][]\0x", "name[#post_render][]"),
+            ("options[debug]", "options[debug]"),
+            ("options[debug][x]", "options[debug]"),
+            ("a.b[x]", "a_b[x]"),
+        ] {
+            assert!(
+                same_php_name(sent.as_bytes(), want.as_bytes()),
+                "{sent:?} vs {want:?}"
+            );
+        }
+        for (sent, want) in [
+            ("name", "name[#post_render][]"),
+            ("name[]", "name[#post_render][]"),
+            ("options", "options[debug]"),
+            ("options[page]", "options[debug]"),
+            ("options[debugger]", "options[debug]"),
+            ("prefs", "prefs[admin]"),
+        ] {
+            assert!(
+                !same_php_name(sent.as_bytes(), want.as_bytes()),
+                "{sent:?} vs {want:?}"
+            );
+        }
+
+        let rules = VirtualPatchRules::from_toml_str(
+            "[[rule]]\nid='q'\ncve='CVE-2099-12'\naction='deny'\n\
+             [[rule.query]]\nname='name[#post_render][]'\n\
+             [[rule]]\nid='e'\ncve='CVE-2099-13'\naction='deny'\n\
+             [[rule.query]]\nname='options[debug]'\nequals='1'\n\
+             [[rule]]\nid='c'\ncve='CVE-2099-14'\naction='deny'\ncookies=['prefs[admin]']\n",
+        )
+        .unwrap();
+        let verdict = |query: Option<&str>, cookie: Option<&str>| {
+            let h = cookie.map_or_else(|| hm(&[]), |c| hm(&[("cookie", c)]));
+            match rules.evaluate(&target("GET", "/", query, &h), false) {
+                Verdict::Block(r) => r.id().to_string(),
+                _ => "-".to_string(),
+            }
+        };
+        let mut wrong = Vec::new();
+        for (query, cookie, want) in [
+            // What each rule names, and spellings PHP files there.
+            (Some("name[%23post_render][]=passthru"), None, "q"),
+            (Some("+name[%23post_render][]=passthru"), None, "q"),
+            (Some("options[debug]=1"), None, "e"),
+            (None, Some("prefs[admin]=1"), "c"),
+            // The bare array name, or another element of it, is not what they name.
+            (Some("name=bob"), None, "-"),
+            (Some("name[]=bob"), None, "-"),
+            (Some("options[page]=1"), None, "-"),
+            (Some("options=1"), None, "-"),
+            (None, Some("prefs=dark"), "-"),
+            (None, Some("prefs[theme]=dark"), "-"),
+        ] {
+            let got = verdict(query, cookie);
+            if got != want {
+                wrong.push(format!("{query:?} {cookie:?}: expected {want}, got {got}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// PHP before 7.2.34, 7.3.23 and 7.4.11 url-decoded a cookie name before it filed it, so
+    /// each of these is `$_COOKIE['wp_evil']` to it (`%20` and `+` a leading space it drops,
+    /// `%00` the end of the name, `%2E`, `+` and `%5F` an `_`).
+    #[test]
+    fn a_cookie_rule_matches_the_names_an_older_php_decodes_to_its_name() {
+        for sent in [
+            "wp_evil",
+            " wp_evil ",
+            "%77p_evil",
+            "wp%5Fevil",
+            "wp%2Eevil",
+            "wp+evil",
+            "%20wp_evil",
+            "+wp_evil",
+            "wp_evil%00x",
+            "wp%5Bevil",
+        ] {
+            assert!(cookie_is(sent.as_bytes(), "wp_evil"), "{sent:?}");
+        }
+        for sent in [
+            "wp-evil",
+            "wp_evil%01",
+            "wp%5Fevilx",
+            "%zzwp_evil",
+            "wp_evil+",
+        ] {
+            assert!(!cookie_is(sent.as_bytes(), "wp_evil"), "{sent:?}");
+        }
+        // A name with '+' in it still matches its percent-encoded spelling, read without
+        // turning '+' into a space (an upstream that only percent-decodes reads `a+b`).
+        assert!(cookie_is(b"%61+b", "a+b"));
+
+        let rules = VirtualPatchRules::from_toml_str(
+            "[[rule]]\nid='c'\ncve='CVE-2099-15'\naction='deny'\ncookies=['wp_evil']\n",
+        )
+        .unwrap();
+        for c in [
+            "a=1; wp%5Fevil=1",
+            "%20wp_evil=1",
+            "wp_evil%00x=1",
+            "wp+evil=1",
+        ] {
+            let h = hm(&[("cookie", c)]);
+            assert!(
+                matches!(
+                    rules.evaluate(&target("GET", "/", None, &h), false),
+                    Verdict::Block(_)
+                ),
+                "{c:?}"
+            );
+        }
+    }
+
+    /// h2 and h3 keep a leading or trailing SP or HTAB in a field value; the HTTP/1.1 upstream
+    /// drops it. A `content_types` or `headers` rule must read the value the way it does.
+    #[test]
+    fn whitespace_around_a_value_does_not_hide_it_from_a_rule() {
+        let rules = VirtualPatchRules::from_toml_str(
+            "[[rule]]\nid='m'\ncve='CVE-2099-16'\naction='deny'\nmethods=['POST']\n\
+             content_types=['multipart/form-data']\n\
+             [[rule]]\nid='eq'\ncve='CVE-2099-17'\naction='deny'\n\
+             [[rule.headers]]\nname='x-mode'\nequals='debug'\n\
+             [[rule]]\nid='sub'\ncve='CVE-2099-18'\naction='deny'\n\
+             [[rule.headers]]\nname='x-sub'\ncontains='evil'\n",
+        )
+        .unwrap();
+        let verdict = |m: &str, name: &str, value: &[u8]| {
+            let mut h = hyper::HeaderMap::new();
+            h.append(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                hyper::header::HeaderValue::from_bytes(value).expect("h2 and h3 accept it"),
+            );
+            match rules.evaluate(&target(m, "/", None, &h), false) {
+                Verdict::Block(r) => r.id().to_string(),
+                _ => "-".to_string(),
+            }
+        };
+        let mut wrong = Vec::new();
+        for (m, name, value, want) in [
+            (
+                "POST",
+                "content-type",
+                &b"multipart/form-data; boundary=B"[..],
+                "m",
+            ),
+            (
+                "POST",
+                "content-type",
+                b"\tmultipart/form-data; boundary=B",
+                "m",
+            ),
+            (
+                "POST",
+                "content-type",
+                b" multipart/form-data; boundary=B",
+                "m",
+            ),
+            ("POST", "content-type", b" \t multipart/form-data", "m"),
+            ("POST", "content-type", b"\ttext/plain", "-"),
+            ("GET", "x-mode", b"debug", "eq"),
+            ("GET", "x-mode", b"\tdebug", "eq"),
+            ("GET", "x-mode", b" debug ", "eq"),
+            ("GET", "x-mode", b"debug\t", "eq"),
+            ("GET", "x-mode", b" debugx", "-"),
+            ("GET", "x-sub", b"\tevil", "sub"),
+        ] {
+            let got = verdict(m, name, value);
+            if got != want {
+                wrong.push(format!(
+                    "{m} {name}: {:?}: expected {want}, got {got}",
+                    value.escape_ascii().to_string()
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The shipped pack's second WordPress rule: WordPress serves a REST request named by the
+    /// `rest_route` query variable from any path, so the posts endpoint is reached without
+    /// `/wp-json/` in the path.
+    #[test]
+    fn the_shipped_wordpress_rules_block_the_rest_route_spelling() {
+        let pack = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/virtual-patch.toml"
+        ));
+        let rules = VirtualPatchRules::from_toml_str(pack).unwrap();
+        let h = hm(&[]);
+        let verdict = |m: &str, path: &str, q: &str| match rules
+            .evaluate(&target(m, path, Some(q), &h), false)
+        {
+            Verdict::Block(r) => r.id().to_string(),
+            _ => "-".to_string(),
+        };
+        let mut wrong = Vec::new();
+        for (m, path, q, want) in [
+            (
+                "PUT",
+                "/",
+                "rest_route=/wp/v2/posts/1&id=1z",
+                "wordpress-rest-route-id-param-override",
+            ),
+            (
+                "GET",
+                "/index.php",
+                "rest_route=/wp/v2/posts/1&id=1z&_method=PUT",
+                "wordpress-rest-route-id-param-override",
+            ),
+            (
+                "PUT",
+                "/",
+                "rest_route=%2Fwp%2Fv2%2Fposts%2F1&%69d=1z",
+                "wordpress-rest-route-id-param-override",
+            ),
+            (
+                "PUT",
+                "/",
+                "rest.route=/wp/v2/posts/1&id[]=1z",
+                "wordpress-rest-route-id-param-override",
+            ),
+            (
+                "PUT",
+                "/",
+                "id=1z&rest_route=/wp/v2/posts/1",
+                "wordpress-rest-route-id-param-override",
+            ),
+            (
+                "PUT",
+                "/wp-json/wp/v2/posts/1",
+                "id=1z",
+                "wordpress-rest-posts-id-param-override",
+            ),
+            // Without the `id` override, or without `rest_route`, neither rule matches.
+            ("PUT", "/", "rest_route=/wp/v2/posts/1", "-"),
+            ("GET", "/", "rest_route=/wp/v2/posts&per_page=5", "-"),
+            ("GET", "/", "p=1&id=5", "-"),
+        ] {
+            let got = verdict(m, path, q);
+            if got != want {
+                wrong.push(format!("{m} {path}?{q}: expected {want}, got {got}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// PHP's php_register_variable_ex drops leading spaces from a variable name, turns ' ' and
@@ -1154,5 +1465,38 @@ mod tests {
             rules.evaluate(&target("GET", "/", None, &other), false),
             Verdict::NoMatch
         ));
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        // url_decoded never panics, reports "nothing to decode" as None, and never makes a
+        // name longer.
+        #[test]
+        fn url_decoded_is_total(s in prop::collection::vec(any::<u8>(), 0..32), plus in any::<bool>()) {
+            let d = url_decoded(&s, plus);
+            let has_escape = s.contains(&b'%') || (plus && s.contains(&b'+'));
+            if !has_escape {
+                prop_assert!(d.is_none(), "nothing to decode but decoded: {:?}", s);
+            }
+            if let Some(d) = d {
+                prop_assert!(d.len() <= s.len());
+            }
+        }
+
+        // A name PHP files under a key always matches a rule naming that key, with or without
+        // an index after it; and a rule naming an element never matches the bare key.
+        #[test]
+        fn an_index_narrows_a_rule_and_never_widens_it(
+            key in "[a-z]{1,6}",
+            index in "\\[[a-z0-9#]{0,4}\\]",
+        ) {
+            let elem = format!("{key}{index}");
+            prop_assert!(same_php_name(elem.as_bytes(), key.as_bytes()));
+            prop_assert!(same_php_name(elem.as_bytes(), elem.as_bytes()));
+            prop_assert!(!same_php_name(key.as_bytes(), elem.as_bytes()));
+        }
     }
 }
