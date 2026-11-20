@@ -296,8 +296,8 @@ pub(crate) fn load_tls(
     config: &config::ZionConfig,
 ) -> error::ZionResult<(Arc<ArcSwap<TlsAcceptor>>, QuicReload)> {
     tls::recover_interrupted_renewals(&config.tls);
-    let initial_tls = tls::load_tls_config(&config.tls).map_err(error::ZionError::Tls)?;
-    let acceptor = TlsAcceptor::from(Arc::new(initial_tls));
+    let initial_tls = Arc::new(tls::load_tls_config(&config.tls).map_err(error::ZionError::Tls)?);
+    let acceptor = TlsAcceptor::from(initial_tls.clone());
     let tls_acceptor_store = Arc::new(ArcSwap::from_pointee(acceptor));
     // `zion_tls_cert_expiry_timestamp_seconds` from the start; reloads update it.
     tls::note_served_cert(&config.tls.cert_path);
@@ -307,11 +307,12 @@ pub(crate) fn load_tls(
     );
 
     // 4. Start TLS hot-reload watcher (rebuilds acceptor on cert change).
-    // The QUIC listener consumes the receiver to reload its server config in
-    // sync with the TCP listener. Without the http3 feature there is no QUIC
-    // listener, so the receiver is intentionally unused; the underscore-prefix
-    // tells rustc this is by design.
-    let (quic_reload_tx, _quic_reload_rx) = tokio::sync::watch::channel(None);
+    // The QUIC listener starts from the receiver's first value, this same config (client
+    // authentication, CRL, SNI certificates, ticketer: what the TCP listener enforces), and
+    // reloads from it in sync with the TCP listener. Without the http3 feature there is no
+    // QUIC listener, so the receiver is intentionally unused; the underscore-prefix tells
+    // rustc this is by design.
+    let (quic_reload_tx, _quic_reload_rx) = tokio::sync::watch::channel(Some(initial_tls));
     if config.tls.hot_reload {
         tls::spawn_tls_watcher(
             tls_acceptor_store.clone(),
@@ -1027,7 +1028,7 @@ pub(crate) fn spawn_quic(
             config.server.listen_https
         ))
     })?;
-    quic::spawn_quic_listener(quic_addr, &config.tls, state.clone(), Some(quic_reload_rx))
+    quic::spawn_quic_listener(quic_addr, state.clone(), quic_reload_rx)
         .map_err(error::ZionError::Tls)?;
     Ok(())
 }

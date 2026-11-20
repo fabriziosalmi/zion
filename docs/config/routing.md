@@ -116,7 +116,7 @@ else, a trusted proxy included, is dropped; zion then sets the real value, or no
 
 | Header | What it states | Set by |
 |---|---|---|
-| `X-Client-Cert-Fingerprint`, `X-Client-Cert-DN` | the client certificate the TLS handshake verified | the HTTPS listener |
+| `X-Client-Cert-Fingerprint`, `X-Client-Cert-DN` | the client certificate the TLS handshake verified | the HTTPS and HTTP/3 listeners |
 | `X-Client-TLS-JA4`, `X-Client-TLS-Allowlisted` | the client's TLS fingerprint and whether it is on the allowlist | the HTTPS listener |
 | `X-Auth-Subject`, `X-Auth-Email` | the identity an `auth_profile` verified | the auth gate |
 | `X-Zion-Mesh-Score` | the mesh's reputation for the client IP | the mesh gate |

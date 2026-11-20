@@ -598,6 +598,20 @@ pub fn strip_transport_attestations(headers: &mut hyper::HeaderMap) {
     crate::reserved_headers::scrub(headers, crate::reserved_headers::Asserter::Transport);
 }
 
+/// The `X-Client-Cert-Fingerprint` value for a client certificate: `sha256:` and the lowercase
+/// hex SHA-256 of its DER. The same on every listener that verifies one (TCP and QUIC).
+pub fn client_cert_fingerprint(der: &[u8]) -> String {
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der);
+    let bytes = digest.as_ref();
+    let mut s = String::with_capacity(7 + bytes.len() * 2);
+    s.push_str("sha256:");
+    for &b in bytes {
+        s.push(crate::http_util::HEX_DIGITS[(b >> 4) as usize] as char);
+        s.push(crate::http_util::HEX_DIGITS[(b & 0xF) as usize] as char);
+    }
+    s
+}
+
 /// Make `X-Client-Cert-Fingerprint` say what the TLS layer verified and nothing else: drop
 /// every inbound attestation, then set the fingerprint only when the peer presented a
 /// certificate. A forged value therefore never survives to the upstream or the access log as

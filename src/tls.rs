@@ -1101,19 +1101,10 @@ mod tests {
     // Name. SHA-256 is collision-resistant and matches the convention
     // used by openssl/nginx ($ssl_client_fingerprint).
 
-    /// Reconstruct the fingerprint exactly as main.rs computes it, so the
-    /// tests pin the wire format (`sha256:HEX`) and detect any drift.
+    /// The function both listeners (TCP and QUIC) attest with, so the tests pin the wire
+    /// format (`sha256:HEX`) of what upstreams receive.
     fn fingerprint(der: &[u8]) -> String {
-        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der);
-        let bytes = digest.as_ref();
-        let mut s = String::with_capacity(7 + bytes.len() * 2);
-        s.push_str("sha256:");
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        for &b in bytes {
-            s.push(HEX[(b >> 4) as usize] as char);
-            s.push(HEX[(b & 0xF) as usize] as char);
-        }
-        s
+        crate::security::client_cert_fingerprint(der)
     }
 
     #[test]
