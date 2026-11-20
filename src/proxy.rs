@@ -475,10 +475,20 @@ fn apply_forwarding_hygiene<B>(
     // and cached as shop.example's while the origin was told evil.example, and the answer it built
     // for evil.example was stored under shop.example's key, for every client of shop.example.
     // Whatever X-Forwarded-Host the client sent is discarded either way.
+    //
+    // A value with an `@` is never forwarded, whichever field it came from: userinfo is not a
+    // host. `http://shop.example@evil.example/` told the origin `shop.example@evil.example` (links
+    // built from it go to evil.example) and `http://user:pass@shop.example/` gave it the
+    // password. The pipeline and the `:80` handler refuse such a target with a 400
+    // (`security::target_has_userinfo`); this holds for any path that skips them, and for a `Host`
+    // header with one where nothing refused it (HTTP/1.0, the `:80` ACME fallback, an HTTP/2
+    // request without `:authority`). Routing and the cache key found no host in it
+    // (`request_host` refuses an `@`), so telling the origin none keeps the three in agreement.
     let inbound_host = match req.uri().authority() {
         Some(a) => hyper::header::HeaderValue::from_str(a.as_str()).ok(),
         None => req.headers().get(hyper::header::HOST).cloned(),
-    };
+    }
+    .filter(|h| !h.as_bytes().contains(&b'@'));
     req.headers_mut().remove(&X_FORWARDED_HOST);
     let preserve_host = req.extensions().get::<PreserveHost>().is_some();
     // RFC 9110 §7.6.3: name this proxy in `Via` (also what loop detection reads).
@@ -1824,6 +1834,66 @@ mod tests {
                         "{uri} {host:?}: the pooled client adds its own"
                     );
                 }
+            }
+        }
+    }
+
+    /// No host with userinfo reaches the upstream, in `X-Forwarded-Host` or as `Host` with
+    /// `preserve_host`, from the target's authority or from a `Host` header: the gate that
+    /// refuses such a target is not what keeps it from the origin. Routing and the cache key
+    /// found no host in it, and the upstream is told none (the pooled client adds its own `Host`).
+    #[test]
+    fn a_host_with_userinfo_is_never_forwarded() {
+        for (uri, host) in [
+            ("http://shop.example@evil.example/p", None),
+            ("http://user:pass@shop.example/p", None),
+            ("http://user:pass@shop.example/p", Some("shop.example")),
+            (
+                "https://shop.example@evil.example:8443/p",
+                Some("evil.example"),
+            ),
+            ("/p", Some("user:pass@shop.example")),
+            ("/p", Some("shop.example@evil.example")),
+        ] {
+            for preserve in [false, true] {
+                let mut b = Request::builder().method("GET").uri(uri);
+                if let Some(h) = host {
+                    b = b.header(hyper::header::HOST, h);
+                }
+                let mut req = b.body(()).unwrap();
+                req.headers_mut().insert(
+                    "x-forwarded-host",
+                    HeaderValue::from_static("client.example"),
+                );
+                if preserve {
+                    req.extensions_mut().insert(PreserveHost);
+                }
+                assert_eq!(
+                    crate::security::request_host(&req),
+                    None,
+                    "{uri} {host:?}: routing and the cache key find no host"
+                );
+                let req =
+                    prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append)
+                        .unwrap();
+                let at = |name: hyper::header::HeaderName| {
+                    req.headers()
+                        .get_all(&name)
+                        .iter()
+                        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    at(X_FORWARDED_HOST),
+                    Vec::<String>::new(),
+                    "{uri} {host:?} preserve_host={preserve}: X-Forwarded-Host"
+                );
+                assert_eq!(
+                    at(hyper::header::HOST),
+                    Vec::<String>::new(),
+                    "{uri} {host:?} preserve_host={preserve}: Host"
+                );
+                assert_eq!(req.uri().to_string(), "http://127.0.0.1:8000/p");
             }
         }
     }

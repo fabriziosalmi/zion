@@ -361,7 +361,7 @@ Zion's contract for the headers it sets or strips on the way to the upstream. An
 |--------|-----------|---------|-------|
 | `X-Forwarded-For` | set per `xff_mode` | client IP chain (see table above) | 0.1 |
 | `X-Real-IP` | set (inbound never trusted) | resolved client IP | 0.1 |
-| `X-Forwarded-Proto` / `X-Forwarded-Host` | set | original scheme / the request's host, as received: the request-target's authority when the target has one (absolute-form, HTTP/2 or HTTP/3 `:authority`), else `Host` (the field routing and the cache key read) | 0.1 (the target's authority before `Host`: after 0.17.0) |
+| `X-Forwarded-Proto` / `X-Forwarded-Host` | set | original scheme / the request's host, as received: the request-target's authority when the target has one (absolute-form, HTTP/2 or HTTP/3 `:authority`), else `Host` (the field routing and the cache key read); never a value with userinfo (`@`): such a target is a `400` before routing, such a `Host` is not forwarded | 0.1 (the target's authority before `Host`: after 0.17.0) |
 | `X-Request-ID` | set if absent, else echoed | request correlation id | 0.1 |
 | `X-Client-Cert-Fingerprint` | set on mTLS routes (inbound stripped) | `sha256:<hex>` of the leaf DER | **0.1.7** (replaced `X-Client-Cert-DN`) |
 | `X-Client-TLS-JA4` / `X-Client-TLS-*` | set on TLS-fingerprint routes (inbound stripped) | verified JA4 identity | 0.7.5 |

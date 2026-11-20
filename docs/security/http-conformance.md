@@ -45,6 +45,7 @@ without it.
 |---|---|
 | origin-form (`/path`) | forwarded |
 | absolute-form (`http://host/path`) | accepted and re-framed to origin-form upstream; the absolute URI never reaches the upstream. Its authority, not a `Host` sent with it, is the request's host (RFC 9112 §3.2.2): zion routes and caches on it and tells the upstream that one in `X-Forwarded-Host` (and as `Host` with `preserve_host`) |
+| absolute-form with userinfo (`http://user:pass@host/path`, `http://host@other.example/path`) | refused (`400`) before routing, on the TLS listener and on `:80` (the ACME fallback included), never forwarded. The same for an HTTP/2 or HTTP/3 `:authority` with userinfo. RFC 9110 §4.2.4 has a recipient treat userinfo in an `http(s)` URI as an error (it hides the real host), RFC 9113 §8.3.1 and RFC 9114 §4.3.1 forbid it in `:authority` |
 | asterisk-form (`OPTIONS *`) | refused (`404`), never forwarded |
 | authority-form (`CONNECT host:port`) | refused (`405`), never forwarded |
 
