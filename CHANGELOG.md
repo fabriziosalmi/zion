@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A WebSocket upgrade through zion answers the client with `Connection: Upgrade`, so browsers complete the handshake.** zion removes `Connection` from every response it sends, and did so on the `101 Switching Protocols` of a `mode = "websocket"` route too: the client got `Upgrade: websocket` and `Sec-WebSocket-Accept` without `Connection: Upgrade`. RFC 6455 §4.1 has a client fail the connection then, and browsers do; a client that does not check the field worked. Measured on the real binary before the fix (the client's `101` had no `Connection` field). A `101` now keeps the `Connection: Upgrade` zion builds for it; every other response still loses `Connection`. Tested in the HTTP conformance suite against the real binary (the client's `101` carries all three fields) and in a unit test, both break-tested (removing `Connection` from the `101` again fails both).
+
 ## [0.17.0] - 2026-11-20
 
 **Security fixes from a code audit and a security hunt, and request spans over OpenTelemetry.** Two crashes are fixed: an h2c request with a raw DEL in its path on the plain-HTTP listener, and the first HTTP/3 handshake after a certificate reload (`--features http3`), each of which stopped the process. HTTP/3 now enforces `client_auth` from boot. Behind a trusted proxy, a client can no longer choose the address the internal-only endpoints and the rate limit go by. JWT profiles require the `aud` and `iss` they name, WebSocket sessions count against the connection limits, audit and ACME misconfigurations stop the boot instead of failing at run time, and the connection ceiling fits the file-descriptor limit.

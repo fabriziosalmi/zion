@@ -103,7 +103,9 @@ again), while a different `Accept-Encoding` is a separate variant. An upstream's
 ## WebSocket upgrade
 
 A `mode = "websocket"` route relays the upstream's `101 Switching Protocols` to the
-client, upgrading the connection.
+client, upgrading the connection. The client's `101` carries `Upgrade: websocket`,
+`Connection: Upgrade` and the upstream's `Sec-WebSocket-Accept`, which RFC 6455 §4.1
+requires before a client (a browser) completes the handshake.
 
 ## Not yet pinned
 
