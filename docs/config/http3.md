@@ -4,7 +4,7 @@
 Build with `--features http3` to enable HTTP/3 QUIC support.
 :::
 
-Zion supports HTTP/3 over QUIC alongside HTTP/1.1 and HTTP/2 on the same port. QUIC provides zero-RTT connection establishment, built-in encryption (TLS 1.3), and connection migration for mobile clients.
+Zion supports HTTP/3 over QUIC alongside HTTP/1.1 and HTTP/2 on the same port. QUIC provides built-in encryption (TLS 1.3) and connection migration for mobile clients. Zion runs it without 0-RTT (TLS early data), at boot and after a certificate reload.
 
 ## How it works
 
@@ -38,7 +38,7 @@ Client (TCP)  ─── TLS  ───  Zion (:443 TCP)  ─── HTTP/1.1 ─�
 ```
 
 Both TCP (HTTP/1.1 + HTTP/2) and UDP (HTTP/3) listeners share:
-- The same TLS certificate
+- The same TLS configuration, from boot: the certificate, the `[[tls.sni]]` certificates, `client_auth` with its client CA and CRL, and the session ticket keys. With `client_auth = "required"`, a client without a certificate that verifies is refused at the QUIC handshake as at the TCP one, and a verified client certificate reaches the upstream as `X-Client-Cert-Fingerprint` on both. HTTP/3 carries no JA4.
 - The same routing table
 - The same WAF pipeline
 - The same security headers

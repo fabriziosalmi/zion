@@ -17,7 +17,6 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::config::TlsConfig;
 use crate::metrics;
 
 /// The largest decoded header section (QPACK) an HTTP/3 request may carry, the same 16 KiB as
@@ -27,43 +26,6 @@ const H3_MAX_FIELD_SECTION_SIZE: u64 = 16 * 1024;
 /// Pre-built Alt-Svc header value for HTTP/3 advertisement.
 pub static ALT_SVC_H3: hyper::header::HeaderValue =
     hyper::header::HeaderValue::from_static("h3=\":443\"; ma=86400");
-
-/// Build a quinn ServerConfig from Zion's TLS config.
-/// QUIC mandates TLS 1.3 — we reuse the same cert/key as the TCP listener.
-///
-/// Returns a `String` error on every failure mode (file open, PEM parse,
-/// rustls build, quinn config conversion) so the caller can surface a
-/// `ZionError::Tls` to the operator instead of aborting the daemon.
-pub fn build_quinn_server_config(tls: &TlsConfig) -> Result<quinn::ServerConfig, String> {
-    let cert_pem =
-        std::fs::read(&tls.cert_path).map_err(|e| format!("QUIC cert {}: {e}", tls.cert_path))?;
-    let key_pem =
-        std::fs::read(&tls.key_path).map_err(|e| format!("QUIC key {}: {e}", tls.key_path))?;
-
-    let certs = crate::pem::certs(&cert_pem).map_err(|e| format!("parse QUIC cert PEM: {e}"))?;
-
-    let key = crate::pem::private_key(&key_pem)
-        .map_err(|e| format!("parse QUIC key PEM: {e}"))?
-        .ok_or_else(|| "no private key in PEM".to_string())?;
-
-    let tls_config =
-        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| format!("build QUIC TLS config: {e}"))?;
-
-    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(for_quic(tls_config))
-        .map_err(|e| format!("create QUIC server config: {e}"))?;
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
-
-    // Transport config tuning
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(256u32.into());
-    transport.max_concurrent_uni_streams(64u32.into());
-    server_config.transport_config(Arc::new(transport));
-
-    Ok(server_config)
-}
 
 /// The rustls config the QUIC listener runs: `cfg` with ALPN `h3` and no 0-RTT.
 ///
@@ -80,6 +42,9 @@ fn for_quic(mut cfg: rustls::ServerConfig) -> rustls::ServerConfig {
     cfg
 }
 
+/// The quinn config for the TCP listener's rustls config: at boot and after every reload, so
+/// HTTP/3 has the TCP listener's certificates (SNI included), client authentication, CRL and
+/// ticketer. QUIC itself requires TLS 1.3, which every `[tls] min_version` enables.
 pub fn quinn_server_config_from_rustls(
     arc_config: Arc<rustls::ServerConfig>,
 ) -> Result<quinn::ServerConfig, String> {
@@ -96,43 +61,51 @@ pub fn quinn_server_config_from_rustls(
 
 /// Spawn the QUIC listener on the given address.
 /// Runs in a background tokio task, accepting connections forever.
+///
+/// `tls` carries the TCP listener's rustls config: its current value is the one the listener
+/// starts with, and every later value is a certificate reload. The boot config used to be
+/// built apart, from the certificate and key files only, so HTTP/3 ignored `client_auth`,
+/// the client CA, the CRL and the SNI certificates until the first reload.
+///
 /// Returns a `String` error on configuration / bind failures so the caller
 /// can surface a `ZionError::{Tls,Listener}` instead of aborting the daemon.
 pub fn spawn_quic_listener(
     addr: SocketAddr,
-    tls: &TlsConfig,
     state: Arc<crate::state::AppState>,
-    reload_rx: Option<tokio::sync::watch::Receiver<Option<Arc<rustls::ServerConfig>>>>,
+    mut tls: tokio::sync::watch::Receiver<Option<Arc<rustls::ServerConfig>>>,
 ) -> Result<(), String> {
-    let server_config = build_quinn_server_config(tls)?;
+    let initial = tls
+        .borrow_and_update()
+        .clone()
+        .ok_or_else(|| "no TLS config for the QUIC listener".to_string())?;
+    let server_config = quinn_server_config_from_rustls(initial)?;
 
     let endpoint = quinn::Endpoint::server(server_config, addr)
         .map_err(|e| format!("bind QUIC on {addr}: {e}"))?;
 
     eprintln!("  listening HTTP/3 (QUIC) on {addr}");
 
-    if let Some(mut rx) = reload_rx {
-        let endpoint_clone = endpoint.clone();
-        tokio::spawn(async move {
-            while rx.changed().await.is_ok() {
-                if let Some(arc_config) = rx.borrow().clone() {
-                    match quinn_server_config_from_rustls(arc_config) {
-                        Ok(new_quinn_cfg) => {
-                            endpoint_clone.set_server_config(Some(new_quinn_cfg));
-                            eprintln!("  h3: certificates hot-reloaded.");
-                        }
-                        Err(e) => {
-                            // Non-fatal — keep the previous config running.
-                            crate::logging::warn(
-                                "quic",
-                                &format!("hot-reload rejected: {e}; keeping previous config"),
-                            );
-                        }
-                    }
+    let endpoint_clone = endpoint.clone();
+    tokio::spawn(async move {
+        while tls.changed().await.is_ok() {
+            let Some(arc_config) = tls.borrow_and_update().clone() else {
+                continue;
+            };
+            match quinn_server_config_from_rustls(arc_config) {
+                Ok(new_quinn_cfg) => {
+                    endpoint_clone.set_server_config(Some(new_quinn_cfg));
+                    eprintln!("  h3: certificates hot-reloaded.");
+                }
+                Err(e) => {
+                    // Non-fatal — keep the previous config running.
+                    crate::logging::warn(
+                        "quic",
+                        &format!("hot-reload rejected: {e}; keeping previous config"),
+                    );
                 }
             }
-        });
-    }
+        }
+    });
 
     tokio::spawn(async move {
         // On shutdown stop accepting new QUIC connections, like the TCP listeners.
@@ -166,6 +139,19 @@ pub fn spawn_quic_listener(
                 };
 
                 let remote_addr = conn.remote_address();
+                // The client certificate the handshake verified (`[tls] client_auth`), attested
+                // on every request of the connection as the TCP listener does.
+                let client_fp: Option<Arc<str>> = conn
+                    .peer_identity()
+                    .and_then(|id| {
+                        id.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                            .ok()
+                    })
+                    .and_then(|certs| {
+                        certs
+                            .first()
+                            .map(|c| crate::security::client_cert_fingerprint(c.as_ref()).into())
+                    });
                 metrics::METRICS
                     .connections_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -210,11 +196,18 @@ pub fn spawn_quic_listener(
                     match accepted {
                         Ok(Some(resolver)) => {
                             let state = state.clone();
+                            let client_fp = client_fp.clone();
                             requests.spawn(async move {
                                 match resolver.resolve_request().await {
                                     Ok((req, stream)) => {
-                                        if let Err(e) =
-                                            handle_h3_request(req, stream, state, remote_addr).await
+                                        if let Err(e) = handle_h3_request(
+                                            req,
+                                            stream,
+                                            state,
+                                            remote_addr,
+                                            client_fp,
+                                        )
+                                        .await
                                         {
                                             eprintln!("  h3 request error: {e}");
                                         }
@@ -275,15 +268,17 @@ where
 /// The HTTP/3 request as the shared pipeline sees it.
 ///
 /// It keeps the client's method, URI with its authority, version and every header, minus
-/// the transport attestations no client may set: this listener verifies no client
-/// certificate and computes no JA4. The forwarding headers are the pipeline's job, from
-/// the real peer address, as for HTTP/1 and HTTP/2.
+/// the transport attestations no client may set; `X-Client-Cert-Fingerprint` is then set
+/// from the certificate the handshake verified, if any (`client_fp`). This listener
+/// computes no JA4. The forwarding headers are the pipeline's job, from the real peer
+/// address, as for HTTP/1 and HTTP/2.
 pub(crate) fn bridge_request(
     req: hyper::Request<()>,
     body: crate::http_util::ReqBody,
+    client_fp: Option<&str>,
 ) -> hyper::Request<crate::http_util::ReqBody> {
     let (mut parts, ()) = req.into_parts();
-    crate::security::strip_transport_attestations(&mut parts.headers);
+    crate::security::attest_client_cert(&mut parts.headers, client_fp);
     hyper::Request::from_parts(parts, body)
 }
 
@@ -318,6 +313,7 @@ async fn handle_h3_request<S>(
     stream: h3::server::RequestStream<S, Bytes>,
     state: Arc<crate::state::AppState>,
     remote_addr: SocketAddr,
+    client_fp: Option<Arc<str>>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: h3::quic::BidiStream<Bytes>,
@@ -364,7 +360,7 @@ where
         }
     });
 
-    let uni_req = bridge_request(req, stream_body.boxed());
+    let uni_req = bridge_request(req, stream_body.boxed(), client_fp.as_deref());
 
     // Dispatch the bridged request through the single source of truth HTTP processing engine
     // (This automatically executes all Gates: WAF, CORS, Auth, Rate Limits, and Routes).
@@ -466,7 +462,7 @@ mod tests {
             .header("x-custom", "b")
             .body(())
             .unwrap();
-        let out = bridge_request(req, empty());
+        let out = bridge_request(req, empty(), None);
         assert_eq!(out.method(), "POST");
         assert_eq!(out.uri(), "https://app.example/api?q=1");
         assert_eq!(out.version(), hyper::Version::HTTP_3);
@@ -488,10 +484,32 @@ mod tests {
         for name in transport() {
             b = b.header(name, "forged").header(name, "forged-again");
         }
-        let out = bridge_request(b.body(()).unwrap(), empty());
+        let out = bridge_request(b.body(()).unwrap(), empty(), None);
         for name in transport() {
             assert!(!out.headers().contains_key(name), "{name} survived");
         }
+    }
+
+    #[test]
+    fn the_bridged_request_carries_the_verified_client_certificate_only() {
+        let forged = || {
+            hyper::Request::builder()
+                .uri("https://app.example/")
+                .header("x-client-cert-fingerprint", "sha256:forged")
+                .body(())
+                .unwrap()
+        };
+        let fp = crate::security::client_cert_fingerprint(b"a certificate");
+        let out = bridge_request(forged(), empty(), Some(&fp));
+        let got: Vec<_> = out
+            .headers()
+            .get_all("x-client-cert-fingerprint")
+            .iter()
+            .collect();
+        assert_eq!(got, [fp.as_str()], "only the verified one");
+        assert!(fp.starts_with("sha256:") && fp.len() == 7 + 64);
+        let out = bridge_request(forged(), empty(), None);
+        assert!(!out.headers().contains_key("x-client-cert-fingerprint"));
     }
 
     #[test]

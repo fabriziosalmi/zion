@@ -7,7 +7,7 @@
 //! changes.
 
 use crate::dispatch::{self, process_request};
-use crate::http_util::{empty_response, text_response, BoxError, ReqBody, ZionBody, HEX_DIGITS};
+use crate::http_util::{empty_response, text_response, BoxError, ReqBody, ZionBody};
 use crate::state::AppState;
 #[cfg(feature = "tls-fingerprint")]
 use crate::tls_fp;
@@ -482,18 +482,7 @@ fn spawn_https_handler(
             .1
             .peer_certificates()
             .and_then(|certs| certs.first())
-            .map(|cert| {
-                let der = cert.as_ref();
-                let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der);
-                let bytes = digest.as_ref();
-                let mut s = String::with_capacity(7 + bytes.len() * 2);
-                s.push_str("sha256:");
-                for &b in bytes {
-                    s.push(HEX_DIGITS[(b >> 4) as usize] as char);
-                    s.push(HEX_DIGITS[(b & 0xF) as usize] as char);
-                }
-                s
-            });
+            .map(|cert| security::client_cert_fingerprint(cert.as_ref()));
         let client_fp = client_cert_fingerprint.map(std::sync::Arc::new);
 
         // Optionally swap the userspace TLS stream for an in-kernel
