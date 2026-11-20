@@ -32,7 +32,11 @@ struct Cx<'a> {
     identity_primary: String,
     takes_identity: bool,
     cache_key: String,
+    /// The `Vary` rule `cache_key` was built from (`None`: `primary_key` does not vary).
+    cache_filed: Option<Arc<vary::VaryRule>>,
     identity_key: Option<String>,
+    /// The `Vary` rule `identity_key` was built from.
+    identity_filed: Option<Arc<vary::VaryRule>>,
     /// `request_timeout_ms` of the route's upstream: how long a cache fill may go without
     /// progress before it is given up.
     fill_idle: std::time::Duration,
@@ -46,9 +50,13 @@ struct Lookup {
     stale_entry: Option<cache::CacheHit>,
     /// The key the entry being revalidated lives under (its own key or the identity key).
     found_key: String,
-    /// The primary key `found_key` was derived from: its `Vary` rule is the one the entry was
-    /// filed under.
-    found_primary: String,
+    /// The `Vary` rule `found_key` was built from when the entry was looked up (`None`: it does
+    /// not vary): the rule the entry was filed under, which a `304` to its revalidation is held to
+    /// ([`filed_key`]). Read once, here: a request that waits on another one's fetch keeps this
+    /// lookup, and by the time its own revalidation is answered another request may have filed a
+    /// `200` under a new `Vary`. Matched against that rule, the waiter's `304` with the new `Vary`
+    /// renewed the entry under the key that no longer varies, with the waiter's headers.
+    filed: Option<Arc<vary::VaryRule>>,
 }
 
 /// Where the response of a fetch is to be stored, and how fresh it is.
@@ -136,7 +144,7 @@ pub(super) async fn handle(
     let (primary_key, identity_primary, takes_identity) = derive_keys(&req, normalize_query);
     // If this primary key's responses vary (RFC 9111 §4.1), the entry for THIS request
     // lives under a secondary key built from the varied request headers.
-    let Some(cache_key) = lookup_key(&state, &primary_key, req.headers()) else {
+    let Some((cache_key, cache_filed)) = filed_key(&state, &primary_key, req.headers()) else {
         return bypass_unkeyable(
             req,
             &state,
@@ -150,11 +158,12 @@ pub(super) async fn handle(
         .await;
     };
 
-    // Where the shared identity entry for this request would live.
-    let identity_key: Option<String> = if takes_identity {
-        lookup_key(&state, &identity_primary, req.headers())
+    // Where the shared identity entry for this request would live, and the rule it is filed under.
+    let (identity_key, identity_filed) = if takes_identity {
+        filed_key(&state, &identity_primary, req.headers())
+            .map_or((None, None), |(key, filed)| (Some(key), filed))
     } else {
-        None
+        (None, None)
     };
     let cx = Cx {
         state: &state,
@@ -174,7 +183,9 @@ pub(super) async fn handle(
         identity_primary,
         takes_identity,
         cache_key,
+        cache_filed,
         identity_key,
+        identity_filed,
         fill_idle: proxy::request_timeout(&req),
     };
 
@@ -202,7 +213,7 @@ pub(super) async fn handle(
             revalidate: None,
             stale_entry: None,
             found_key: cx.cache_key.clone(),
-            found_primary: cx.primary_key.clone(),
+            filed: cx.cache_filed.clone(),
         }
     };
 
@@ -367,8 +378,16 @@ async fn bypass_unkeyable(
 
 impl Cx<'_> {
     /// Look the request up under its own key, then under the identity key. Returns the
-    /// outcome and the key (and primary key) it was found under.
-    fn find(&self) -> (cache::CacheLookup, String, String) {
+    /// outcome, the key it was found under, that key's primary key and the `Vary` rule the key was
+    /// built from.
+    fn find(
+        &self,
+    ) -> (
+        cache::CacheLookup,
+        String,
+        String,
+        Option<Arc<vary::VaryRule>>,
+    ) {
         let state = self.state;
         let own = state.static_cache.get(&self.cache_key);
         match (&own, &self.identity_key) {
@@ -376,8 +395,14 @@ impl Cx<'_> {
                 state.static_cache.get(ik),
                 ik.clone(),
                 self.identity_primary.clone(),
+                self.identity_filed.clone(),
             ),
-            _ => (own, self.cache_key.clone(), self.primary_key.clone()),
+            _ => (
+                own,
+                self.cache_key.clone(),
+                self.primary_key.clone(),
+                self.cache_filed.clone(),
+            ),
         }
     }
 
@@ -394,7 +419,7 @@ impl Cx<'_> {
         let (identity_primary, breaker) = (&self.identity_primary, &self.breaker);
         let mut revalidate: Option<cache::CacheHit> = None;
         let mut stale_entry: Option<cache::CacheHit> = None;
-        let (outcome, at_key, at_primary) = self.find();
+        let (outcome, at_key, at_primary, filed) = self.find();
         let found_key = at_key.clone();
         match outcome {
             cache::CacheLookup::Fresh(hit) => {
@@ -415,7 +440,7 @@ impl Cx<'_> {
                 if hit.meta.stale_while_revalidate_secs > 0
                     && !hit.meta.must_revalidate
                     && staleness < hit.meta.stale_while_revalidate_secs
-                    && refresh_sends_what_it_varies_on(state, &at_key, &at_primary)
+                    && refresh_sends_what_it_varies_on(filed.as_deref())
                 {
                     if client_conditional_hit(req.headers(), &hit.meta) {
                         return Err(not_modified_response(&hit));
@@ -424,7 +449,7 @@ impl Cx<'_> {
                         state: state.clone(),
                         key: Arc::from(at_key.as_str()),
                         identity_entry: at_primary == *identity_primary,
-                        primary_key: Arc::from(at_primary.as_str()),
+                        filed: filed.clone(),
                         stale: hit.clone(),
                         request: swr_request(req),
                         req_authenticated: self.req_authenticated,
@@ -460,7 +485,7 @@ impl Cx<'_> {
             revalidate,
             stale_entry,
             found_key,
-            found_primary: at_primary,
+            filed,
         })
     }
 
@@ -580,7 +605,7 @@ impl Cx<'_> {
             revalidate,
             stale_entry,
             found_key,
-            found_primary,
+            filed,
         } = lookup;
         // Opt-in circuit breaker: if the upstream's circuit is open, do not contact it. A stale
         // copy (when the origin allowed stale responses) stands in for it; otherwise the client
@@ -657,7 +682,7 @@ impl Cx<'_> {
             revalidate,
             fetching,
             &found_key,
-            &found_primary,
+            filed.as_deref(),
             &req_headers,
         )
         .await
@@ -671,7 +696,7 @@ impl Cx<'_> {
         revalidate: Option<cache::CacheHit>,
         fetching: Fetching,
         found_key: &str,
-        found_primary: &str,
+        filed: Option<&vary::VaryRule>,
         req_headers: &hyper::HeaderMap,
     ) -> Result<Response<ZionBody>, hyper::Error> {
         let state = self.state;
@@ -701,14 +726,13 @@ impl Cx<'_> {
                 // The 304's headers update the stored ones (RFC 9111 §4.3.4), for this answer,
                 // and for the entry when the 304 may update it (see `revalidated`: it answers
                 // this client's request, credentials included, and the entry is filed under the
-                // `Vary` rule of its primary key).
-                let filed = state.static_cache.vary.get(found_primary);
+                // `Vary` rule it was found under, `Lookup::filed`).
                 let rv = revalidated(
                     &hit.meta,
                     resp.headers(),
                     self.req_authenticated,
                     cache_ttl,
-                    filed.as_ref().map(|rule| rule.names.as_slice()),
+                    filed.map(|rule| rule.names.as_slice()),
                 );
                 if !rv.fits {
                     state.static_cache.count_too_large();
