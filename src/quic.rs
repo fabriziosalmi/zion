@@ -360,6 +360,38 @@ where
         return h3_error_response(&mut stream, hyper::StatusCode::BAD_REQUEST).await;
     };
 
+    // A body declared empty must end empty, and the upstream request sends no body for it:
+    // hyper never reads a body whose `Content-Length` is 0, so DATA after such headers was
+    // dropped unseen and the request answered as if it were whole. Its end is waited for here,
+    // before the request goes on (a client that sends no body ends the stream with its HEADERS).
+    if declared == Some(0) {
+        let refused = match tokio::time::timeout(
+            crate::dispatch::BODY_FRAME_IDLE_TIMEOUT,
+            stream.recv_data(),
+        )
+        .await
+        {
+            Ok(Ok(None)) => None,
+            Ok(Ok(Some(_))) => Some((
+                hyper::StatusCode::BAD_REQUEST,
+                "request refused: DATA after a Content-Length of 0".to_string(),
+            )),
+            Ok(Err(e)) => Some((
+                hyper::StatusCode::BAD_REQUEST,
+                format!("request body stream broke: {e}"),
+            )),
+            Err(_elapsed) => Some((
+                hyper::StatusCode::REQUEST_TIMEOUT,
+                "request refused: no end to a body declared empty".to_string(),
+            )),
+        };
+        if let Some((status, why)) = refused {
+            log_h3_failure(&remote_addr, req.method().as_str(), req.uri().path(), &why);
+            crate::metrics::METRICS.record_status(status.as_u16());
+            return h3_error_response(&mut stream, status).await;
+        }
+    }
+
     // Bridge HTTP/3 QUIC connection directly into the universal pipeline
     let (mut send_stream, mut recv_stream) = stream.split();
     let (tx, rx) = tokio::sync::mpsc::channel::<
@@ -376,9 +408,19 @@ where
     // with a `BodyLengthMismatch` at a FIN short of the length, or instead of the DATA that
     // would go past it, so whatever reads it (the WAF, a buffer, the upstream request) sees a
     // broken body and never a whole one of another length.
+    //
+    // The DATA that brings the body to its declared length is held back until the stream says
+    // whether more follows. Handed on at once, it let the upstream request write its last
+    // declared byte, and hyper reads no further than that: DATA past the length, arriving
+    // after it, went unseen, and the declared bytes went upstream as the whole body.
+    //
+    // The receive half is never asked to stop here: h3-quinn panics on `stop_sending` while a
+    // read of the stream is in flight (it unwraps the stream the read holds). It is dropped
+    // when this task ends instead, and quinn then sends STOP_SENDING for the bytes not read.
     let body_log = (remote_addr, method.clone(), path.clone());
     tokio::spawn(async move {
         let mut received: u64 = 0;
+        let mut last: Option<Bytes> = None;
         loop {
             let mut buf = match recv_stream.recv_data().await {
                 Ok(Some(buf)) => buf,
@@ -387,6 +429,8 @@ where
                         let e = BodyLengthMismatch { declared, received };
                         log_h3_failure(&body_log.0, &body_log.1, &body_log.2, &e.to_string());
                         let _ = tx.send(Err(Box::new(e))).await;
+                    } else if let Some(last) = last.take() {
+                        let _ = tx.send(Ok(hyper::body::Frame::data(last))).await;
                     }
                     break;
                 }
@@ -406,15 +450,21 @@ where
             };
             use bytes::Buf;
             let rem = buf.remaining();
+            if rem == 0 {
+                continue;
+            }
             received = received.saturating_add(rem as u64);
             if let Some(declared) = declared.filter(|&d| received > d) {
                 let e = BodyLengthMismatch { declared, received };
                 log_h3_failure(&body_log.0, &body_log.1, &body_log.2, &e.to_string());
-                recv_stream.stop_sending(h3::error::Code::H3_MESSAGE_ERROR);
                 let _ = tx.send(Err(Box::new(e))).await;
                 break;
             }
             let bytes = bytes::Buf::copy_to_bytes(&mut buf, rem);
+            if declared == Some(received) {
+                last = Some(bytes);
+                continue;
+            }
             if tx.send(Ok(hyper::body::Frame::data(bytes))).await.is_err() {
                 break;
             }

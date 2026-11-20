@@ -273,6 +273,23 @@ async fn h3_headers_fin_with_cl(port: u16, path: &str, declared: usize) -> Optio
 /// `sent` bytes of DATA (none: the stream ends right after the HEADERS) and FIN, whatever the
 /// lines say. Returns the client-visible status, or None if the request got no response.
 async fn h3_post_declaring(port: u16, path: &str, declared: &[&str], sent: usize) -> Option<u16> {
+    let parts: &[usize] = if sent > 0 { &[sent] } else { &[] };
+    h3_post_parts(port, path, declared, parts, Duration::ZERO, true).await
+}
+
+/// POST over HTTP/3 whose HEADERS carry one `content-length` line per entry of `declared`, then
+/// one DATA frame per entry of `parts`, of that many bytes, `gap` apart, whatever the lines say.
+/// With `fin` the stream then ends; without it the client sends nothing more and keeps the
+/// stream open while it waits for the answer. Returns the client-visible status, or None if the
+/// request got no response.
+async fn h3_post_parts(
+    port: u16,
+    path: &str,
+    declared: &[&str],
+    parts: &[usize],
+    gap: Duration,
+    fin: bool,
+) -> Option<u16> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut tls = rustls::ClientConfig::builder()
         .dangerous()
@@ -299,11 +316,16 @@ async fn h3_post_declaring(port: u16, path: &str, declared: &[&str], sent: usize
         req = req.header("content-length", *value);
     }
     let mut stream = send.send_request(req.body(()).unwrap()).await.ok()?;
-    if sent > 0 {
+    for (i, &n) in parts.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(gap).await;
+        }
         // zion may stop reading once it has seen the body is too long: the answer still comes
-        let _ = stream.send_data(bytes::Bytes::from(vec![b'a'; sent])).await;
+        let _ = stream.send_data(bytes::Bytes::from(vec![b'a'; n])).await;
     }
-    let _ = stream.finish().await;
+    if fin {
+        let _ = stream.finish().await;
+    }
     let resp = stream.recv_response().await.ok()?;
     Some(resp.status().as_u16())
 }
@@ -754,7 +776,9 @@ async fn a_h3_request_whose_content_length_lines_disagree_is_refused() {
     for (path, declared, sent) in [
         ("/open/two", &["0", "1000"][..], 0),
         ("/waf/two", &["0", "1000"], 0),
+        ("/framed/two", &["0", "1000"], 0),
         ("/waf/nan", &["5", "five"], 5),
+        ("/framed/nan", &["5", "five"], 5),
     ] {
         let status = tokio::time::timeout(
             Duration::from_secs(10),
@@ -780,6 +804,135 @@ async fn a_h3_request_whose_content_length_lines_disagree_is_refused() {
     // one length, repeated, is one length
     assert_eq!(
         h3_post_declaring(port, "/waf/twice", &["5", "5"], 5).await,
+        Some(200)
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The upstream's record of `path`: what reached it as a whole body, if anything did.
+fn whole_bodies(seen: &Arc<Mutex<Vec<Seen>>>, path: &str) -> Vec<Seen> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.path == path && s.complete)
+        .cloned()
+        .collect()
+}
+
+/// A body that does not end at its `Content-Length` is refused on a streamed route, a WAF route
+/// and a `require_content_length` route alike, and none of them hands the upstream a whole body.
+/// Shorter: the stream ends with no DATA, or with 5 of 10 bytes. Longer: the declared 10 bytes
+/// arrive in a DATA frame of their own and the rest 300 ms later, or a length of `0` comes with
+/// 1000 bytes. On a streamed route the upstream client stops reading the body at its declared
+/// length, so the 10 bytes went upstream as the whole body and the upstream's `200` came back,
+/// and a declared `0` went upstream as an empty request, the 1000 bytes dropped unseen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_h3_body_that_does_not_end_at_its_content_length_is_refused_on_every_route() {
+    let dir = std::env::temp_dir().join(format!(
+        "zion-h3-cl-matrix-{}-{}",
+        std::process::id(),
+        free_port()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let Some((_daemon, port)) = boot(&dir, upstream(seen.clone())) else {
+        return;
+    };
+    let gap = Duration::from_millis(300);
+
+    for route in ["open", "waf", "framed"] {
+        for (case, declared, parts) in [
+            ("short-none", "1000", &[][..]),
+            ("short", "10", &[5]),
+            ("long-later", "10", &[10, 990]),
+            ("long-zero", "0", &[1000]),
+        ] {
+            let path = format!("/{route}/{case}");
+            let status = tokio::time::timeout(
+                Duration::from_secs(10),
+                h3_post_parts(port, &path, &[declared], parts, gap, true),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{path}: zion hung"));
+            std::thread::sleep(Duration::from_millis(300));
+            let whole = whole_bodies(&seen, &path);
+            assert!(
+                whole.is_empty(),
+                "{path}: content-length {declared} with DATA {parts:?}: the upstream took it \
+                 as a whole body: {whole:?}"
+            );
+            assert_eq!(
+                status,
+                Some(400),
+                "{path}: content-length {declared} with DATA {parts:?}"
+            );
+        }
+
+        // A body that matches its length still goes through whole: in two DATA frames apart,
+        // and empty.
+        let path = format!("/{route}/fits-later");
+        let status = h3_post_parts(port, &path, &["1000"], &[10, 990], gap, true).await;
+        std::thread::sleep(Duration::from_millis(300));
+        let whole = whole_bodies(&seen, &path);
+        assert!(
+            status == Some(200) && whole.len() == 1 && whole[0].received == 1000,
+            "{path}: {status:?} {whole:?}"
+        );
+        let path = format!("/{route}/fits-empty");
+        let status = h3_post_parts(port, &path, &["0"], &[], gap, true).await;
+        std::thread::sleep(Duration::from_millis(300));
+        let whole = whole_bodies(&seen, &path);
+        assert!(
+            status == Some(200) && whole.len() == 1 && whole[0].received == 0,
+            "{path}: {status:?} {whole:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A body past its `Content-Length` on a stream the client keeps open: the request is refused,
+/// nothing reaches the upstream as a whole body, and zion goes on serving. Asking h3-quinn to stop
+/// the stream while a read on it is in flight panics there (it unwraps a stream the read holds),
+/// and the release profile aborts on a panic (`panic = "abort"`), so one request would take every
+/// listener down. The client here sends the DATA and no FIN, so the read after it is in flight.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_h3_body_past_its_length_on_an_open_stream_is_refused_and_zion_keeps_serving() {
+    let dir = std::env::temp_dir().join(format!(
+        "zion-h3-cl-open-{}-{}",
+        std::process::id(),
+        free_port()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let Some((_daemon, port)) = boot(&dir, upstream(seen.clone())) else {
+        return;
+    };
+
+    for route in ["open", "waf", "framed"] {
+        let path = format!("/{route}/held");
+        let status = tokio::time::timeout(
+            Duration::from_secs(10),
+            h3_post_parts(port, &path, &["10"], &[1000], Duration::ZERO, false),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{path}: zion hung"));
+        std::thread::sleep(Duration::from_millis(300));
+        let whole = whole_bodies(&seen, &path);
+        assert!(
+            whole.is_empty(),
+            "{path}: the upstream took a body past its Content-Length as a whole one: {whole:?}"
+        );
+        assert_eq!(status, Some(400), "{path}");
+    }
+
+    let log = std::fs::read_to_string(dir.join("daemon.log")).unwrap_or_default();
+    assert!(
+        !log.contains("panicked"),
+        "zion panicked on a body past its Content-Length:\n{log}"
+    );
+    // and it still serves
+    assert_eq!(
+        h3_post_declaring(port, "/waf/after", &["5"], 5).await,
         Some(200)
     );
     let _ = std::fs::remove_dir_all(dir);

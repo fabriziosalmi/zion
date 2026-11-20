@@ -614,9 +614,12 @@ fn http1_host_is_wrong<B>(req: &Request<B>) -> bool {
 
 /// Whether an HTTP/2 request breaks RFC 9113 §8.1.1 on `Content-Length`: lines that do not
 /// declare one valid length. Such a request is malformed and an intermediary must not forward
-/// it. h2 checks only the first `content-length` line against the DATA frames, so a second line
-/// with another value (`0` then `1000` on a request that ended with its headers) reached the
-/// upstream as written. hyper refuses such an HTTP/1.1 request itself.
+/// it. h2 resets the stream itself when the first `content-length` line is not a number, and
+/// checks only that line against the DATA frames, so a second line with another value (`0`
+/// then `1000` on a request that ended with its headers) reached the upstream as written.
+/// hyper refuses such an HTTP/1.1 request itself. Both listeners ask this: the TLS one, and
+/// the plaintext one, which speaks HTTP/2 to a client that opens with the preface and forwards
+/// an ACME challenge it does not hold.
 fn http2_content_length_is_wrong<B>(req: &Request<B>) -> bool {
     req.version() == hyper::Version::HTTP_2
         && crate::http_util::content_length(req.headers()).is_err()
@@ -753,6 +756,12 @@ pub(crate) async fn handle_http(
     // Likewise for the JA4 identity headers — no TLS on :80, so any inbound
     // copy is forged.
     security::strip_transport_attestations(req.headers_mut());
+
+    // RFC 9113 §8.1.1, as on the TLS listener: this one speaks h2c too, and its ACME fallback
+    // forwards the request without the HTTPS pipeline.
+    if http2_content_length_is_wrong(&req) {
+        return Ok(empty_response(StatusCode::BAD_REQUEST));
+    }
 
     // The client as the HTTPS pipeline resolves it: behind a trusted proxy, the rate limit,
     // the snapshot gate and the address the ACME fallback forwards go by the client the proxy

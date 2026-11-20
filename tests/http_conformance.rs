@@ -258,6 +258,12 @@ fn code(resp: &Resp) -> u16 {
 }
 
 fn start(dir: &Path, origin_port: u16) -> (Proc, u16) {
+    let (zion, https_port, _) = start_with_http(dir, origin_port);
+    (zion, https_port)
+}
+
+/// [`start`], also returning the port of the plaintext listener.
+fn start_with_http(dir: &Path, origin_port: u16) -> (Proc, u16, u16) {
     let (cert, key) = (dir.join("c.pem"), dir.join("k.pem"));
     assert!(
         Command::new("openssl")
@@ -291,11 +297,11 @@ fn start(dir: &Path, origin_port: u16) -> (Proc, u16) {
     fs::create_dir_all(&www).unwrap();
     let doc = "the quick brown fox jumps over the lazy dog\n".repeat(60);
     fs::write(www.join("doc.txt"), &doc).unwrap();
-    let https_port = free_port();
+    let (http_port, https_port) = (free_port(), free_port());
     fs::write(
         dir.join("zion.toml"),
         format!(
-            "[server]\nlisten_http = \"127.0.0.1:{}\"\nlisten_https = \"127.0.0.1:{https_port}\"\n\n\
+            "[server]\nlisten_http = \"127.0.0.1:{http_port}\"\nlisten_https = \"127.0.0.1:{https_port}\"\n\n\
              [tls]\ncert_path = \"{}\"\nkey_path = \"{}\"\nhot_reload = false\n\n\
              [upstream.backend]\nurl = \"http://127.0.0.1:{origin_port}\"\n\n\
              [upstream.ph]\nurl = \"http://127.0.0.1:{origin_port}\"\npreserve_host = true\n\n\
@@ -306,7 +312,6 @@ fn start(dir: &Path, origin_port: u16) -> (Proc, u16) {
              [[route]]\npath = \"/cache/{{*rest}}\"\nupstream = \"backend\"\nmode = \"standard\"\ncache_profile = \"short\"\n\n\
              [[route]]\npath = \"/ws/{{*rest}}\"\nupstream = \"backend\"\nmode = \"websocket\"\n\n\
              [[route]]\npath = \"/{{*rest}}\"\nupstream = \"backend\"\nmode = \"standard\"\n",
-            free_port(),
             cert.to_string_lossy(),
             key.to_string_lossy(),
             www = www.to_string_lossy(),
@@ -323,11 +328,13 @@ fn start(dir: &Path, origin_port: u16) -> (Proc, u16) {
         .expect("spawn zion");
     let z = Proc(child);
     let deadline = Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(("127.0.0.1", https_port)).is_err() {
+    while TcpStream::connect(("127.0.0.1", https_port)).is_err()
+        || TcpStream::connect(("127.0.0.1", http_port)).is_err()
+    {
         assert!(Instant::now() < deadline, "zion never listened");
         std::thread::sleep(Duration::from_millis(100));
     }
-    (z, https_port)
+    (z, https_port, http_port)
 }
 
 /// Did the origin receive a request whose start-line begins with `method ` and targets `/marker`?
@@ -1063,14 +1070,31 @@ async fn h2_post_declaring(port: u16, path: &str, declared: &[&str], body: &'sta
         )
         .await
         .unwrap();
+    h2_send_declaring(tls, &format!("https://localhost{path}"), declared, body).await
+}
+
+/// [`h2_post_declaring`] in cleartext to the plaintext listener, which speaks HTTP/2 to a client
+/// that opens with the connection preface (h2c with prior knowledge).
+async fn h2c_post_declaring(port: u16, path: &str, declared: &[&str], body: &'static [u8]) -> u16 {
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    h2_send_declaring(tcp, &format!("http://localhost{path}"), declared, body).await
+}
+
+/// One HTTP/2 POST to `uri` over `io`, as [`h2_post_declaring`] describes.
+async fn h2_send_declaring<T>(io: T, uri: &str, declared: &[&str], body: &'static [u8]) -> u16
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (mut send, conn) = hyper::client::conn::http2::handshake(
         hyper_util::rt::TokioExecutor::new(),
-        hyper_util::rt::TokioIo::new(tls),
+        hyper_util::rt::TokioIo::new(io),
     )
     .await
     .unwrap();
     tokio::spawn(conn);
-    let mut req = hyper::Request::post(format!("https://localhost{path}"));
+    let mut req = hyper::Request::post(uri);
     for value in declared {
         req = req.header("content-length", *value);
     }
@@ -1111,7 +1135,7 @@ fn http2_content_length_is_one_valid_length_and_is_reframed_from_the_body() {
     }
     let dir = tempdir();
     let (origin_port, seen) = origin();
-    let (_zion, port) = start(&dir, origin_port);
+    let (_zion, port, http_port) = start_with_http(&dir, origin_port);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1121,6 +1145,16 @@ fn http2_content_length_is_one_valid_length_and_is_reframed_from_the_body() {
             tokio::time::timeout(
                 Duration::from_secs(10),
                 h2_post_declaring(port, path, declared, body),
+            )
+            .await
+            .unwrap_or(0)
+        })
+    };
+    let post_h2c = |path: &str, declared: &[&str], body: &'static [u8]| {
+        rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                h2c_post_declaring(http_port, path, declared, body),
             )
             .await
             .unwrap_or(0)
@@ -1154,6 +1188,59 @@ fn http2_content_length_is_one_valid_length_and_is_reframed_from_the_body() {
             "{declared:?}: the malformed request reached the upstream"
         );
     }
+
+    // A first line that is not a number is h2's to refuse, and it does so by resetting the
+    // stream (PROTOCOL_ERROR) before zion sees the request: no status, nothing forwarded. A
+    // first line of `5, 5` too, which zion's own parser reads as one length.
+    for (marker, declared) in [
+        ("h2cl-nan-first", &["five"][..]),
+        ("h2cl-list-first", &["5, 5"]),
+    ] {
+        let c = post(&format!("/{marker}"), declared, b"hello");
+        let saw = origin_saw_method(&seen, "POST", marker);
+        record(
+            &format!("h2 Content-Length {declared:?}"),
+            format!("zion {c} (0: stream reset), forwarded ({saw})"),
+        );
+        assert_eq!(c, 0, "{declared:?}: h2 resets the stream");
+        assert!(
+            !saw,
+            "{declared:?}: the malformed request reached the upstream"
+        );
+    }
+
+    // ---- The plaintext listener, which forwards an ACME challenge it does not hold ----
+    // It speaks HTTP/2 to a client that opens with the preface, and its ACME fallback forwards
+    // without the HTTPS pipeline: the same lines went upstream from there.
+    for (marker, declared, body) in [
+        ("h2c-zero-then-1000", &["0", "1000"][..], &b""[..]),
+        ("h2c-5-then-1000", &["5", "1000"], b"hello"),
+    ] {
+        let marker = format!(".well-known/acme-challenge/{marker}");
+        let c = post_h2c(&format!("/{marker}"), declared, body);
+        let saw = origin_saw_method(&seen, "POST", &marker);
+        record(
+            &format!("h2c :80 Content-Length {declared:?}"),
+            format!("zion {c}, forwarded ({saw})"),
+        );
+        assert_eq!(
+            c, 400,
+            "{declared:?} over h2c to the plaintext listener: malformed"
+        );
+        assert!(
+            !saw,
+            "{declared:?} over h2c: the malformed request reached the upstream"
+        );
+    }
+    let marker = ".well-known/acme-challenge/h2c-once";
+    let c = post_h2c(&format!("/{marker}"), &["5"], b"hello");
+    assert!(origin_saw_method(&seen, "POST", marker), "{marker}");
+    let forwarded = origin_content_lengths(&seen, marker);
+    record(
+        "h2c :80 Content-Length [\"5\"]",
+        format!("zion {c}, upstream Content-Length {forwarded:?}"),
+    );
+    assert_eq!((c, forwarded), (200, vec!["5".to_string()]), "{marker}");
 
     // ---- Re-framed: the upstream gets one length, the one of the body zion sends ----
     for (marker, declared) in [("h2cl-once", &["5"][..]), ("h2cl-twice", &["5", "5"])] {

@@ -295,9 +295,11 @@ pub(crate) struct InvalidContentLength;
 /// The body length a request's `Content-Length` declares (RFC 9110 §8.6): `None` without the
 /// header, `Err` when its lines do not agree on one valid decimal value. Lines and
 /// comma-separated elements that all repeat the same value declare that value, which is how
-/// hyper reads an HTTP/1.1 request; hyper refuses any other HTTP/1.1 request itself. h2 checks
-/// only the first line of an HTTP/2 request against its DATA frames and h3 checks none, so the
-/// HTTP/2 and HTTP/3 listeners ask this before a request goes on.
+/// hyper's HTTP/1.1 client reads the lines of a request it writes (`content_length_parse_all`):
+/// the length the proxy keeps from here is the one hyper frames the upstream body with. hyper's
+/// HTTP/1.1 server is stricter and refuses a comma list itself, accepting only repeated equal
+/// lines. h2 checks only the first line of an HTTP/2 request against its DATA frames and h3
+/// checks none, so the HTTP/2 and HTTP/3 listeners ask this before a request goes on.
 pub(crate) fn content_length(
     headers: &hyper::HeaderMap,
 ) -> Result<Option<u64>, InvalidContentLength> {

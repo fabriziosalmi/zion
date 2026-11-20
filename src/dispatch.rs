@@ -99,8 +99,9 @@ const DEFAULT_MAX_OBJECT_BYTES: usize = 50 * 1024 * 1024;
 /// path: if no body frame arrives within this window the client is trickling
 /// (slow-read / slowloris-body) and we evict it with 408. This bounds the idle
 /// time *between* reads rather than total upload time, so a legit large upload
-/// over a slow-but-steady link is not penalised.
-const BODY_FRAME_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// over a slow-but-steady link is not penalised. The HTTP/3 listener waits as long
+/// for the end of a body declared empty.
+pub(crate) const BODY_FRAME_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Total timeout for buffering a request body on the non-streaming path (the
 /// smaller default bodies). A trickled body trips this long before a legit
