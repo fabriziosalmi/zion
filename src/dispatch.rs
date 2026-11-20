@@ -1100,9 +1100,15 @@ fn spawn_swr_refresh(job: SwrRefresh) {
             .extensions()
             .get::<proxy::RequestTimeout>()
             .map_or(SWR_REFRESH_TIMEOUT, |t| t.0.max(SWR_REFRESH_TIMEOUT));
-        let ok = tokio::time::timeout(budget, run_swr_refresh(&job))
+        let outcome = tokio::time::timeout(budget, run_swr_refresh(&job))
             .await
-            .unwrap_or(false);
+            .unwrap_or(Refresh::Failed);
+        // Marked before the registration goes: a request that finds no refresh running finds
+        // the mark, and revalidates in the foreground instead of starting the same refresh again.
+        if outcome == Refresh::Refused {
+            job.state.static_cache.refuse_refresh(&job.key, &job.stale);
+        }
+        let ok = outcome == Refresh::Renewed;
         if ok {
             metrics::METRICS.cache_swr_refreshes.fetch_add(1, Relaxed);
         } else {
@@ -1120,12 +1126,35 @@ fn spawn_swr_refresh(job: SwrRefresh) {
     });
 }
 
+/// How a background refresh ended ([`run_swr_refresh`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refresh {
+    /// The entry was renewed by a `304` or replaced by a `200`.
+    Renewed,
+    /// The origin was not reached, gave no answer in time or not the whole body, or answered with
+    /// a 5xx; or a tag purge ran meanwhile, and what becomes of the entry is the purge's to say.
+    /// The entry keeps its stale-while-revalidate window: the origin is failing for every client,
+    /// and the stale copy served at once is what the window, and stale-if-error, are for.
+    Failed,
+    /// The origin answered, and the answer cannot renew or replace the entry: another status (a
+    /// `401` or `403` to a refresh without what zion asserts about the client, [`swr_drops`]), a
+    /// `304` that could not have been stored itself (a `Set-Cookie` on a refresh that sent no
+    /// `Cookie`, no §3.5 opt-in after an `Authorization` request) or over the header bound, a `200`
+    /// that may not be stored. The next background refresh would be sent the same way and get the
+    /// same answer: the entry is marked ([`cache::StaticCache::refuse_refresh`]) and the next
+    /// request revalidates it in the foreground with its own headers. Left in its window, it was
+    /// served stale until the window closed, whatever the origin had since, and each request after
+    /// the previous refresh ended started another one.
+    Refused,
+}
+
 /// One refresh: a conditional GET with the stored validators. A `304` revives the
 /// stored body; a cacheable `200` replaces it. An answer whose `Vary` is not the one the entry
 /// was filed under does neither, and takes the stale entry out ([`same_vary_shape`],
-/// [`Revalidation::vary_changed`]). Anything else leaves the stale entry as it is (it is no
-/// longer served stale once outside its window).
-async fn run_swr_refresh(job: &SwrRefresh) -> bool {
+/// [`Revalidation::vary_changed`]). Any other answer that does neither ends the entry's
+/// stale-while-revalidate window ([`Refresh::Refused`]); a failure to get one leaves it as it is
+/// ([`Refresh::Failed`]): it is no longer served stale once outside its window.
+async fn run_swr_refresh(job: &SwrRefresh) -> Refresh {
     let mut req = swr_request(&job.request);
     add_conditional_headers(req.headers_mut(), &job.stale.meta);
     let resp = match proxy::proxy_pass(
@@ -1144,13 +1173,18 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
             if let Some(entry) = &job.breaker {
                 entry.breaker.record(false, breaker::now_ms(), None);
             }
-            return false;
+            return Refresh::Failed;
         }
     };
     if let Some(entry) = &job.breaker {
         // No probe token: a refresh counts toward the failure window while the circuit is
         // closed, and is ignored when it is not.
         breaker_record(entry, resp.status(), None);
+    }
+    // `proxy_pass` answers an origin it could not reach, or that did not answer in time, with a
+    // 5xx of its own.
+    if resp.status().is_server_error() {
+        return Refresh::Failed;
     }
     // It refreshes ONE entry, filed under the `Vary` rule it was found under (none when it does
     // not vary): an answer with another `Vary` belongs to other keys.
@@ -1168,7 +1202,8 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
             job.cache_ttl,
             filed,
         );
-        if !rv.fits {
+        // Counted only when the bound is what kept it out (see `Revalidation::too_large`).
+        if rv.too_large() {
             job.state.static_cache.count_too_large();
         }
         if rv.vary_changed {
@@ -1176,28 +1211,29 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
                 .static_cache
                 .remove_unchanged(&job.key, &job.stale);
         }
+        if !rv.renews() {
+            return Refresh::Refused;
+        }
         // Not revived if a tag purge ran since this refresh was scheduled (it may have removed
         // the very entry being revalidated).
-        if !rv.renews()
-            || !job.state.static_cache.refresh_checked(
-                &job.key,
-                job.stale.body.clone(),
-                rv.meta,
-                rv.ttl,
-                rv.initial_age,
-                job.cache_max,
-                job.tag_epoch,
-            )
-        {
-            return false;
+        if !job.state.static_cache.refresh_checked(
+            &job.key,
+            job.stale.body.clone(),
+            rv.meta,
+            rv.ttl,
+            rv.initial_age,
+            job.cache_max,
+            job.tag_epoch,
+        ) {
+            return Refresh::Failed;
         }
         metrics::METRICS
             .cache_revalidations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return true;
+        return Refresh::Renewed;
     }
     if resp.status() != StatusCode::OK {
-        return false;
+        return Refresh::Refused;
     }
 
     let (parts, body) = resp.into_parts();
@@ -1210,7 +1246,7 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
         job.state
             .static_cache
             .remove_unchanged(&job.key, &job.stale);
-        return false;
+        return Refresh::Refused;
     }
     let initial_age = upstream_age(&parts.headers);
     let ttl = origin_freshness(&parts.headers)
@@ -1218,29 +1254,33 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
         .unwrap_or(job.cache_ttl);
     // Held to the §3.5 opt-in when the triggering request carried `Authorization`.
     if !is_shared_cacheable(job.req_authenticated, &parts.headers, ttl, initial_age) {
-        return false;
+        return Refresh::Refused;
     }
     // A shared identity entry is found by every Accept-Encoding: an encoded body must
     // never replace it (it would reach clients that did not accept that encoding).
     if job.identity_entry && !shareable_identity(&parts.headers) {
-        return false;
+        return Refresh::Refused;
     }
     // Headers too large to keep: not stored (see `cached_meta`).
     let Some(meta) = cached_meta(parts.status, &parts.headers) else {
         job.state.static_cache.count_too_large();
-        return false;
+        return Refresh::Refused;
     };
-    let Ok(collected) = http_body_util::Limited::new(body, job.max_object)
+    let collected = match http_body_util::Limited::new(body, job.max_object)
         .collect()
         .await
-    else {
-        return false;
+    {
+        Ok(collected) => collected,
+        // A body over the profile's `max_object_mb` is an answer that cannot be stored; one the
+        // origin did not finish sending is a failure to get an answer.
+        Err(e) if e.is::<http_body_util::LengthLimitError>() => return Refresh::Refused,
+        Err(_) => return Refresh::Failed,
     };
     // The refreshed response may carry new tags; one that cannot be tracked is not stored.
     let Ok(tags) = cache::surrogate_keys(&parts.headers) else {
-        return false;
+        return Refresh::Refused;
     };
-    let stored = job.state.static_cache.insert_tagged(
+    match job.state.static_cache.insert_tagged(
         &job.key,
         collected.to_bytes(),
         meta,
@@ -1249,13 +1289,17 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
         job.cache_max,
         &tags,
         job.tag_epoch,
-    );
-    if stored == cache::TagStore::IndexFull {
-        metrics::METRICS
-            .cache_tag_uncached
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ) {
+        cache::TagStore::Stored => Refresh::Renewed,
+        cache::TagStore::PurgedMeanwhile => Refresh::Failed,
+        // The entry under the key went with it (`insert_tagged`): nothing is left to mark.
+        cache::TagStore::IndexFull => {
+            metrics::METRICS
+                .cache_tag_uncached
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Refresh::Refused
+        }
     }
-    stored == cache::TagStore::Stored
 }
 
 /// Serve from RAM cache or fetch from upstream, then cache.
@@ -1878,6 +1922,13 @@ impl Revalidation {
     /// the entry is left as it was, stale (or taken out, see [`Self::vary_changed`]).
     fn renews(&self) -> bool {
         self.fits && self.shareable
+    }
+
+    /// The header bound alone kept the 304 from renewing the entry: what `zion_cache_too_large`
+    /// counts. A 304 that could not renew it anyway (not shareable, or under another `Vary`) is
+    /// not counted however many headers it brought.
+    fn too_large(&self) -> bool {
+        !self.fits && self.shareable
     }
 }
 
@@ -2845,6 +2896,7 @@ mod tests {
             meta: Arc::new(cached_meta(StatusCode::OK, origin).expect("fits")),
             age_secs: 5,
             max_age_secs: 60,
+            refresh_refused: false,
         }
     }
 

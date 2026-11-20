@@ -46,7 +46,7 @@ uncached, marked `X-Zion-Cache: BYPASS`):
 | Authenticated request (§3.5) | A response to a request carrying `Authorization` is stored **only** if the origin explicitly opts in with a `public`, `s-maxage`, or `must-revalidate` directive (a whole directive: `x-public-ish` is not one). Otherwise one user's response could be served to another. |
 | `Vary` | Absent, or naming request headers zion can key on (see [Vary and secondary keys](#vary-and-secondary-keys)). **Not cached:** `Vary: *`, any varied credential header (`Cookie`, `Authorization`, `Proxy-Authorization`, `Set-Cookie`), any varied header zion sets or rewrites for the origin (`X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `Forwarded`, `Via`), more than 8 varied headers, or a variant over the per-key cap. |
 | `Set-Cookie` | The response must **not** set a cookie (any `Set-Cookie` header, whatever its `Cache-Control`). It starts or changes a session, so its body is for one client; it is streamed to that client and never stored. |
-| Headers | At most 32 KiB of origin headers to keep ([What a hit carries](#what-a-hit-carries); each field counts as its name, its value and 32 bytes, `Content-Type`, `Content-Encoding`, `ETag` and `Last-Modified` included). A response with more is streamed through, marked `BYPASS`, and counted in `zion_cache_too_large`, as is a background refresh or a `304` update that would go over it; it takes no `Vary` variant slot. |
+| Headers | At most 32 KiB of origin headers to keep ([What a hit carries](#what-a-hit-carries); each field counts as its name, its value and 32 bytes, `Content-Type`, `Content-Encoding`, `ETag` and `Last-Modified` included). A response with more is streamed through, marked `BYPASS`, and counted in `zion_cache_too_large`, as is a background refresh or a `304` update that would go over it; it takes no `Vary` variant slot. The count is of what the bound (or `max_object_mb`) alone kept out: a response that may not be stored anyway (the rules above, a request's `no-store`) or a `304` that may not renew the entry is not counted, however large. |
 | Freshness | A positive effective TTL (see below); an object that arrives already older than its lifetime isn't stored. |
 | Upstream progress | The body keeps coming: a gap longer than the upstream's `request_timeout_ms` between two body frames gives the fill up (counted in `zion_cache_fill_stalled`). The client that triggered the fetch keeps receiving whatever the upstream sends; nothing is stored, and the requests that were waiting for that fill fetch for themselves instead of waiting on a hung upstream. |
 
@@ -277,8 +277,19 @@ background, so the client does not wait for the origin round trip. `M` is capped
   `must-revalidate` opt-in (RFC 9111 §3.5) as the foreground one: the origin may still have
   answered for that client. A `200` or `304` whose `Vary` is not the one the entry was filed
   under renews nothing and removes the stale entry ([Vary and secondary keys](#vary-and-secondary-keys)).
-  Anything else leaves the stale entry in place; once outside its window it is no longer served
-  stale.
+- **A refresh the origin refuses ends the window**: any other answer that renews or replaces
+  nothing (a `401` or `403` from an origin that requires the headers above, a `304` that sets a
+  cookie, as an origin that gives every request without a `Cookie` a session does, or that lacks
+  the opt-in, a `200` that may not be stored or is over `max_object_mb`, any status but `200`,
+  `304` and a 5xx) takes the entry out of its window. The entry stays, and the next request
+  revalidates it in the foreground with its own headers, as an entry without the window is (or
+  fetches it again when it has no validator); a renewal or a new `200` makes an entry with the
+  window again. The next refresh would go out the same way and get the same answer: left in its
+  window, the entry was served stale until the window closed, whatever the origin had since, and
+  every request after the previous refresh ended started another one. A refresh that cannot reach
+  the origin, gets no answer in time or not the whole body, or gets a 5xx leaves the entry in its
+  window: the origin is failing for every client, and the stale copy served at once is what the
+  window is for. Once outside its window an entry is no longer served stale.
 - **Not for a variant keyed on what the refresh leaves out**: an entry whose `Vary` names one of
   the headers above (`Vary: X-Auth-Subject` behind an auth gate, `Vary: X-Client-TLS-JA4`) is
   not served stale while it revalidates. A refresh without that header would get the
