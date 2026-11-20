@@ -85,11 +85,17 @@ impl RouteRestrictions {
             // Only a request that carries a body declares what it is (a GET, or a POST with
             // `Content-Length: 0`, has nothing to label).
             if !hyper::body::Body::is_end_stream(req.body()) {
-                let ok = req
-                    .headers()
-                    .get(hyper::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|ct| crate::waf::content_type_allowed(ct, allowed));
+                // Exactly one Content-Type line, of a listed type. The field is a singleton
+                // (RFC 9110 §8.3), zion forwards every line, and an upstream may act on another
+                // one than the first: gunicorn 23 hands the app the last. The WAF refuses such a
+                // body too (`dispatch::waf_gate`).
+                let mut lines = req.headers().get_all(hyper::header::CONTENT_TYPE).iter();
+                let ok = match (lines.next(), lines.next()) {
+                    (Some(only), None) => only
+                        .to_str()
+                        .is_ok_and(|ct| crate::waf::content_type_allowed(ct, allowed)),
+                    _ => false,
+                };
                 if !ok {
                     return Some(empty_response(StatusCode::UNSUPPORTED_MEDIA_TYPE));
                 }
@@ -274,6 +280,31 @@ mod tests {
         );
         // A body with no Content-Type says nothing about itself: refused.
         assert_eq!(status(&r, &req("POST", "/", None, "{}")), 415);
+    }
+
+    /// A JSON line then a multipart line passed `content_types = ["application/json"]`, and
+    /// gunicorn 23 handed the app the multipart line (measured with Werkzeug 3.1.9 behind it:
+    /// the app read the form). A body with more than one Content-Type line is refused, in either
+    /// order and with the same type twice; a request without a body is not affected.
+    #[test]
+    fn a_body_with_more_than_one_content_type_line_is_415() {
+        let r = build(None, Some(&["application/json"]), None);
+        let typed = |cts: &[&str], body: &'static str| {
+            let mut b = Request::builder().method("POST").uri("/");
+            for ct in cts {
+                b = b.header(hyper::header::CONTENT_TYPE, *ct);
+            }
+            b.body(Full::new(Bytes::from_static(body.as_bytes())))
+                .unwrap()
+        };
+        let (json, multipart) = ("application/json", "multipart/form-data; boundary=B");
+        // controls: each line on its own
+        assert_eq!(status(&r, &typed(&[json], "{}")), 200);
+        assert_eq!(status(&r, &typed(&[multipart], "--B")), 415);
+        for cts in [[json, multipart], [multipart, json], [json, json]] {
+            assert_eq!(status(&r, &typed(&cts, "--B")), 415, "{cts:?}");
+        }
+        assert_eq!(status(&r, &typed(&[json, multipart], "")), 200, "no body");
     }
 
     #[test]

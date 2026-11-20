@@ -150,18 +150,25 @@ The two automata are built lazily (on first hit per process) and cached; switchi
 
 ## Content-Type enforcement
 
+A request that carries a body and no `Content-Type` is refused (`400`), whatever the
+setting below.
+
 When `deny_unknown_content_types = true` (default):
 
-- POST/PUT/PATCH requests must include a `Content-Type` header
 - The content type must match one of the `allowed_content_types` (case-insensitive prefix match)
 - Charset suffixes like `; charset=utf-8` are allowed
 - Unknown content types return `400 Bad Request`
 
-When set to `false`, requests with unlisted content types pass through without body inspection.
+When set to `false`, a body of an unlisted content type is not refused for its type, but
+it is still inspected: the size cap, the [multipart structure](#multipart-structure)
+gate, the injection scan and the entropy check run on it as on a listed type. Only the
+JSON checks (depth, string length, well-formed JSON) are left out: they run on a listed
+`application/json` body alone.
 
 Whatever the setting, a request with a body and more than one `Content-Type` line is
 refused (`400`): the field is a singleton (RFC 9110), the gates read the first line,
-and an upstream may act on another one (gunicorn 23 hands the app the last).
+and an upstream may act on another one (gunicorn 23 hands the app the last). A route's
+`content_types` list refuses such a body too, with its `415`.
 
 ## Legacy configuration
 

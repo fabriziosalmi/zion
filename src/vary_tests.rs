@@ -1850,8 +1850,10 @@ async fn a_trusted_proxy_peer_keeps_its_headers() {
 #[tokio::test]
 async fn the_port_80_acme_fallback_strips_them_too() {
     let (o, st) = rig("").await;
+    let mut headers = hostile_headers();
+    headers.push(("host", "example.test"));
     let resp = crate::accept::handle_http(
-        get("/.well-known/acme-challenge/tok", &hostile_headers()),
+        get("/.well-known/acme-challenge/tok", &headers),
         st.clone(),
         "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
     )
@@ -1878,7 +1880,7 @@ async fn the_port_80_acme_fallback_forwards_no_path_the_route_refuses() {
         "/.well-known/acme-challenge/tok;x",
     ] {
         let resp = crate::accept::handle_http(
-            get(p, &[]),
+            get(p, &[("host", "example.test")]),
             st.clone(),
             "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
         )
@@ -2019,7 +2021,11 @@ async fn the_port_80_acme_fallback_applies_the_header_policy_too() {
     let resp = crate::accept::handle_http(
         get(
             "/.well-known/acme-challenge/tok",
-            &[("x-middleware-subrequest", "middleware"), ("x-debug", "1")],
+            &[
+                ("host", "example.test"),
+                ("x-middleware-subrequest", "middleware"),
+                ("x-debug", "1"),
+            ],
         ),
         st.clone(),
         "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
@@ -2031,7 +2037,10 @@ async fn the_port_80_acme_fallback_applies_the_header_policy_too() {
     assert_eq!(seen(&o, "x-middleware-subrequest"), None);
     assert_eq!(seen(&o, "x-debug"), None);
     let resp = crate::accept::handle_http(
-        get("/.well-known/acme-challenge/tok", &[("__proto__", "x")]),
+        get(
+            "/.well-known/acme-challenge/tok",
+            &[("host", "example.test"), ("__proto__", "x")],
+        ),
         st.clone(),
         "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
     )
@@ -5903,6 +5912,58 @@ async fn the_port_80_acme_fallback_leaves_a_route_with_something_to_bypass_to_ht
     assert!(leaks.is_empty(), "\n  {}", leaks.join("\n  "));
 }
 
+/// The TLS listener answers `400` to an HTTP/1.1 request without exactly one valid `Host`
+/// (RFC 9112 §3.2, `accept::http1_host_is_wrong`), before routing. The shortcut used to forward
+/// such a challenge `GET`: routed on the first line or on no host at all, with the client's value
+/// sent upstream as `X-Forwarded-Host` (measured on the real binary: `:443` 400, `:80` 200 from
+/// the upstream). It is now redirected, never forwarded. The controls: one valid `Host` is
+/// forwarded, and so is an HTTP/1.0 request without one, which the TLS listener serves too.
+#[tokio::test]
+async fn the_port_80_acme_fallback_takes_only_a_host_the_tls_listener_accepts() {
+    let (port, seen) = recording_origin().await;
+    let st = acme_state(
+        port,
+        "[upstreams]\napi = \"http://127.0.0.1:{port}\"\n\
+         [[route]]\npath = \"/{*rest}\"\nupstream = \"api\"\n",
+    );
+    let p = "/.well-known/acme-challenge/tok";
+    let req = |version: hyper::Version, hosts: &[&str]| {
+        let mut b = Request::builder().version(version).uri(p);
+        for h in hosts {
+            b = b.header("host", *h);
+        }
+        b.body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+            .unwrap()
+    };
+    let (h10, h11) = (hyper::Version::HTTP_10, hyper::Version::HTTP_11);
+    for (what, version, hosts) in [
+        ("one valid Host", h11, &["api.example.com"][..]),
+        ("HTTP/1.0 without Host", h10, &[]),
+    ] {
+        let (status, reached) = via_port_80(&st, &seen, req(version, hosts)).await;
+        assert_eq!(
+            (status, reached.map(|r| r.1)),
+            (200, Some(p.to_string())),
+            "control: {what}"
+        );
+    }
+    let mut leaks = Vec::new();
+    for (what, hosts) in [
+        ("no Host", &[][..]),
+        ("two Host lines", &["api.example.com", "other.example"]),
+        ("Host x@api.example.com", &["x@api.example.com"]),
+        ("Host 'exa mple.com'", &["exa mple.com"]),
+    ] {
+        let (status, reached) = via_port_80(&st, &seen, req(h11, hosts)).await;
+        if (status, &reached) != (301, &None) {
+            leaks.push(format!(
+                "{what}: {status}, the upstream received {reached:?}"
+            ));
+        }
+    }
+    assert!(leaks.is_empty(), "\n  {}", leaks.join("\n  "));
+}
+
 // ── WAF: one Content-Type per body ──────────────────────────────────────────
 
 /// Content-Type is a singleton field, but a request can carry two lines of it, and zion forwards
@@ -5971,5 +6032,68 @@ waf_profile = "forms"
     }
     // a bodyless request has nothing for either line to label
     let (status, reached) = via_pipeline(&st, &seen, req(&[z, b], b"")).await;
+    assert_eq!((status, reached.map(|r| r.2)), (200, Some(0)), "empty body");
+}
+
+/// The same rule on a route's `content_types` (#693), which reads the request before the WAF and
+/// needs none. `Content-Type: application/json` then `Content-Type: multipart/form-data` passed
+/// `content_types = ["application/json"]` on the first line, and gunicorn 23 handed the app the
+/// second (measured with Werkzeug 3.1.9 behind it: the app read the multipart form). A body with
+/// more than one Content-Type line is refused with the route's `415`, before the upstream.
+#[tokio::test]
+async fn a_route_with_content_types_refuses_a_body_with_two_content_types_before_the_upstream() {
+    let (port, seen) = recording_origin().await;
+    let st = acme_state(
+        port,
+        r#"
+[upstreams]
+api = "http://127.0.0.1:{port}"
+
+[[route]]
+path = "/{*rest}"
+upstream = "api"
+content_types = ["application/json"]
+"#,
+    );
+    let json = "application/json";
+    let multipart = "multipart/form-data; boundary=B";
+    let form = b"--B\r\nContent-Disposition: form-data; name=\"hidden\"\r\n\r\nx\r\n--B--\r\n";
+    let req = |cts: &[&str], body: &[u8]| {
+        let mut r = Request::builder()
+            .method(Method::POST)
+            .uri("/api")
+            .header("host", "api.example.com")
+            .header("content-length", body.len().to_string());
+        for ct in cts {
+            r = r.header("content-type", *ct);
+        }
+        r.body(
+            Full::new(Bytes::copy_from_slice(body))
+                .map_err(|n| match n {})
+                .boxed(),
+        )
+        .unwrap()
+    };
+    // controls: a JSON body under the JSON line alone is forwarded, the form alone is refused
+    let (status, reached) = via_pipeline(&st, &seen, req(&[json], b"{}")).await;
+    assert_eq!(
+        (status, reached.map(|r| r.2)),
+        (200, Some(2)),
+        "control: JSON"
+    );
+    assert_eq!(
+        via_pipeline(&st, &seen, req(&[multipart], form)).await,
+        (415, None),
+        "control: the form alone"
+    );
+    for cts in [[json, multipart], [multipart, json], [json, json]] {
+        assert_eq!(
+            via_pipeline(&st, &seen, req(&cts, form)).await,
+            (415, None),
+            "{cts:?}"
+        );
+    }
+    // a bodyless request has nothing for either line to label
+    let (status, reached) = via_pipeline(&st, &seen, req(&[json, multipart], b"")).await;
     assert_eq!((status, reached.map(|r| r.2)), (200, Some(0)), "empty body");
 }

@@ -821,11 +821,16 @@ pub(crate) async fn handle_http(
         // The shortcut runs only some of the pipeline's gates, so it takes only what an HTTP-01
         // validation is: a GET (RFC 8555 §8.3) or a HEAD, with no body. That leaves the method
         // whitelist, CORS and the body gates (which pass a bodyless request) nothing to check.
+        // It also takes only a `Host` the TLS listener accepts (exactly one valid line on
+        // HTTP/1.1, RFC 9112 §3.2): that listener answers 400 to any other before routing, while
+        // this one would route on the first line or on no host at all, and forward the client's
+        // value upstream (`X-Forwarded-Host`, and `Host` under `preserve_host`).
         // The route must have nothing else to bypass (`serves_acme_fallback`, no circuit
         // breaker) and accept the path (`;`, `%2F`). Anything else falls through to the
         // redirect, and the HTTPS pipeline applies every gate.
         let challenge_fetch = matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD)
-            && hyper::body::Body::is_end_stream(req.body());
+            && hyper::body::Body::is_end_stream(req.body())
+            && !http1_host_is_wrong(&req);
         if let Some(rule) = rule.filter(|r| {
             challenge_fetch
                 && r.serves_acme_fallback()

@@ -112,8 +112,9 @@ impl ResolvedRoute {
     /// placeholder upstream is `127.0.0.1`, which would send the request to a local
     /// port 80. The rest is covered where the fallback runs (`accept::handle_http`):
     /// it takes only a bodyless GET or HEAD, so the body cap and
-    /// `require_content_length` have nothing to check; it runs the virtual patches
-    /// itself; and it asks the config about a circuit breaker on the upstream.
+    /// `require_content_length` have nothing to check, with a `Host` the TLS
+    /// listener accepts; it runs the virtual patches itself; and it asks the config
+    /// about a circuit breaker on the upstream.
     /// ACME challenge paths are public by nature (the CA fetches them without
     /// credentials), so serve them from a route that is public too.
     pub fn serves_acme_fallback(&self) -> bool {

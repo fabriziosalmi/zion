@@ -1519,12 +1519,12 @@ fn disposition_params(value: &[u8]) -> Result<Disposition<'_>, &'static str> {
 ///
 /// Common backends parse more leniently than RFC 2046, so the body must also leave them no other
 /// split: one boundary that PHP, Werkzeug and Django read the same way (see
-/// [`multipart_boundary`]); the dash-boundary `--B` only at the start and right after the CRLF
+/// `multipart_boundary`); the dash-boundary `--B` only at the start and right after the CRLF
 /// that ends a part (PHP, Werkzeug and Django also split on a bare LF before it, Werkzeug and
 /// Django on a bare CR, Django on `--B` anywhere); nothing but spaces, tabs, CR and LF after the
 /// close delimiter (PHP and Django read parts after it); and a part's headers with no CR or LF
 /// outside a CRLF (PHP breaks a line at a bare LF, Werkzeug at a bare LF or CR), one
-/// Content-Disposition and one plain `name` (see [`disposition_params`]). This does not make
+/// Content-Disposition and one plain `name` (see `disposition_params`). This does not make
 /// every backend read the same field names: the shape of a parameter value is still open (bytes
 /// after a quoted value, `name="x"y`, or after an unquoted one, `name=x y`, which Werkzeug
 /// ignores; single quotes, which PHP strips).
@@ -2317,6 +2317,11 @@ mod tests {
         let body = br#"{"a":1}"#;
         assert_eq!(
             validate_request("POST", None, body, &strict_profile()),
+            WafVerdict::Deny("missing content-type header")
+        );
+        // whatever deny_unknown_content_types says (docs/config/waf.md)
+        assert_eq!(
+            validate_request("POST", None, body, &relaxed_profile()),
             WafVerdict::Deny("missing content-type header")
         );
     }
@@ -3192,6 +3197,12 @@ mod tests {
         assert_eq!(
             validate_request("POST", Some("text/html"), b"hello world", &lenient),
             WafVerdict::Allow
+        );
+        // and the entropy check runs on it too (docs/config/waf.md): every byte value once
+        let uniform: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(
+            validate_request("POST", Some("text/html"), &uniform, &lenient),
+            WafVerdict::Deny("suspicious payload entropy")
         );
     }
 

@@ -278,7 +278,8 @@ Port 80 serves only two purposes:
 
 1. **ACME challenges**: a token Zion's own ACME client issued is answered from memory. Any other
    `/.well-known/acme-challenge/*` request is proxied to the route's upstream only when it is a
-   `GET` or `HEAD` with no body and the route has nothing that shortcut would skip (no auth, WAF,
+   `GET` or `HEAD` with no body, with a `Host` the HTTPS listener accepts (on HTTP/1.1 exactly
+   one, valid), and the route has nothing that shortcut would skip (no auth, WAF,
    restrictions, `internal_only`, static mode, bulkhead or circuit breaker; see
    [ACME](/config/acme)); otherwise it is redirected like everything else
 2. **Everything else**: `301 Moved Permanently` redirect to `https://`
