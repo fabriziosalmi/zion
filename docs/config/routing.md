@@ -1,6 +1,6 @@
 # Routing
 
-Zion routes requests using a radix tree (via the [`matchit`](https://crates.io/crates/matchit) crate -- the same engine used by Axum). Route lookup is ~15ns regardless of route count.
+Zion routes requests using a radix tree (via the [`matchit`](https://crates.io/crates/matchit) crate -- the same engine used by Axum). `cargo bench --bench route_cache` measures a lookup in a tree of 17 routes and the per-thread route cache in front of it.
 
 ## Route patterns
 

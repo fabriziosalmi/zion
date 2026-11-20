@@ -49,7 +49,7 @@ token are stripped before the upstream. Ordinary end-to-end headers are forwarde
 | Route | `Host` sent upstream |
 |---|---|
 | default | rewritten to the upstream authority; the client's original `Host` is carried in `X-Forwarded-Host` |
-| `preserve_host = true` | the client's `Host` is forwarded as-is (HTTP/1.1 only) |
+| `preserve_host = true` | the client's `Host` is forwarded as-is, port included (for an HTTP/2 client, its `:authority`); zion speaks HTTP/1.1 to that upstream, since HTTP/2 cannot carry a `Host` that differs from `:authority` |
 
 A `Host` that names another authority than the request target (an absolute-form target, or
 an HTTP/2 `:authority`) is refused with `400` before routing, on every route. So is a target or

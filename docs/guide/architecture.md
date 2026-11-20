@@ -2,7 +2,7 @@
 
 Zion is a single async Rust binary built on Tokio, Hyper, and rustls.
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-86 modules, ~87,000 lines of Rust.
+87 modules, ~87,800 lines of Rust.
 
 ## Module map
 
@@ -13,8 +13,8 @@ src/
 ├── accept.rs      # Accept loops, the per-connection HTTPS service (mTLS/JA4 identity headers, health fast path) and the :80 handler
 ├── state.rs       # AppState, ResolvedAppConfig (ArcSwap snapshot) and the per-source limiters shared by every handler
 ├── http_util.rs   # Request-ID generation and the small response builders (empty/text/405/401, security headers)
-├── dispatch.rs    # Request pipeline: routing (LRU + radix), WAF gates, cache, CORS, metrics; thread-local route LRU lives here
-├── dispatch/      # The pipeline's stages as modules: `gates` (pre-routing, CORS, auth), `route` (route lookup, upstream choice), `waf_gate` (URI, headers, body), `cached` (cached routes: lookup, singleflight, revalidation, store), `telemetry` (trace context, access log)
+├── dispatch.rs    # Request pipeline: routing (LRU + radix), WAF gates, cache, CORS, metrics
+├── dispatch/      # The pipeline's stages as modules: `gates` (pre-routing, CORS, auth), `route` (route lookup, upstream choice), `route_cache` (the per-thread route LRU; a hit compares the full `(host, path)`), `waf_gate` (URI, headers, body), `cached` (cached routes: lookup, singleflight, revalidation, store), `telemetry` (trace context, access log)
 ├── config.rs      # TOML schema (serde types), parsing and validation
 ├── routing.rs     # Resolves the parsed routes into ResolvedRoute + the host-aware radix HostRouter
 ├── tls.rs         # TLS config, SNI resolution, session tickets, 0-RTT, hot-reload, predictive prewarming

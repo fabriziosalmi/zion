@@ -4,6 +4,10 @@ All notable changes to Zion Edge Gateway are documented here.
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Boot refuses (exit `2`) a route `hosts` entry with an empty or non-numeric port, or a bare IPv6 literal** (`api.example.com:`, `api.example.com:x`, `::1`): no request is routed by that text any more. Write the host alone (`api.example.com`), and an IPv6 literal in brackets (`[::1]`).
+
 ### Fixed
 
 - **A WebSocket upgrade through zion answers the client with `Connection: Upgrade`, so browsers complete the handshake.** zion removes `Connection` from every response it sends, and did so on the `101 Switching Protocols` of a `mode = "websocket"` route too: the client got `Upgrade: websocket` and `Sec-WebSocket-Accept` without `Connection: Upgrade`. RFC 6455 §4.1 has a client fail the connection then, and browsers do; a client that does not check the field worked. Measured on the real binary before the fix (the client's `101` had no `Connection` field). A `101` now keeps the `Connection: Upgrade` zion builds for it; every other response still loses `Connection`. Tested in the HTTP conformance suite against the real binary (the client's `101` carries all three fields) and in a unit test, both break-tested (removing `Connection` from the `101` again fails both).

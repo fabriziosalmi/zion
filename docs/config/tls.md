@@ -63,10 +63,10 @@ key_path = "/etc/ssl/zion/app.key"
 
 Zion selects the resolver mode at boot:
 
-| Mode | Condition | Overhead |
+| Mode | Condition | Certificate selection |
 |---|---|---|
-| SingleCertResolver | No `[[tls.sni]]` entries | ~2ns (Arc clone) |
-| SniResolver | 1+ `[[tls.sni]]` entries | ~15ns (FNV hash + thread-local cache) |
+| SingleCertResolver | No `[[tls.sni]]` entries | no lookup: an `Arc` clone |
+| SniResolver | 1+ `[[tls.sni]]` entries | an FNV hash-map lookup of the SNI in a thread-local snapshot of the map |
 
 If the client's SNI does not match any entry, the default certificate is used as fallback.
 

@@ -17,13 +17,13 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | Change | Rationale |
 |---|---|
 | No build-wide `target-cpu` on x86_64 (.cargo/config.toml) | `x86-64-v3` was measured at nothing outside the noise on six workloads of seven, 1–3 % on the seventh and no microbenchmark faster beyond noise (the WAF body scan 10 % slower), and it stopped the binary on a CPU without AVX2 ([details](/deploy/#which-processors-a-build-runs-on)); AES-NI / AVX2 code in the dependencies is chosen at run time |
-| PGO build script (`bench-pgo.sh`) | Two-phase profile-guided optimization for 10-20% additional throughput |
+| PGO build script (`bench-pgo.sh`) | Two-phase profile-guided optimization; what it saves in CPU time per request, workload by workload, is measured in [PGO builds](/perf/pgo#what-it-is-worth) |
 
 ## Hot path allocation elimination
 
 | Change | Rationale |
 |---|---|
-| Traceparent: `[u8;55]` stack buffer | Replaces 3x `format!` heap allocations (-500ns/req) |
+| Traceparent: `[u8;55]` stack buffer | Replaces 3x `format!` heap allocations |
 | CORS origin: `HeaderValue` clone | Avoids `String` allocation per CORS request |
 | WAF content-type: borrow from `parts.headers` | Eliminates `to_owned()` clone on POST/PUT/PATCH |
 | Cache key: `Arc::from()` direct | Skips intermediate `String` allocation on cache miss |
@@ -50,7 +50,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 
 | Change | Rationale |
 |---|---|
-| Two pattern sets selected per profile via `mode` | `balanced` (default, ~100 high-precision patterns) or `aggressive` (~240, broader recall). Categories: SQLi, XSS, CMDi, path traversal, SSRF/cloud-metadata, LDAP, XXE, SSTI, CRLF, Log4Shell, prototype pollution; NoSQL, deserialization, generic XSS handlers, JS API sinks live in aggressive |
+| Two pattern sets selected per profile via `mode` | `balanced` (default, 121 high-precision patterns) or `aggressive` (those and 155 more, broader recall). Categories: SQLi, XSS, CMDi, path traversal, SSRF/cloud-metadata, LDAP, XXE, SSTI, CRLF, Log4Shell, prototype pollution; NoSQL, deserialization, generic XSS handlers, JS API sinks live in aggressive |
 | Aho-Corasick (no regex) | O(N) single-pass, no backtracking, case-insensitive, ReDoS-immune by construction |
 | Normalisation: iterative re-scan | URL-decode (`%XX`, `+`), SQL comment strip (`/* … */`), JSON unicode (`\uXXXX`); decode loop runs up to 3 passes (catches single, double, triple encoding) and re-scans after each pass |
 | Buffer shrink-to-fit (>64KB) | Prevents permanent memory inflation from adversarial large bodies |
@@ -63,8 +63,8 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | Change | Rationale |
 |---|---|
 | Request coalescing (singleflight) | N concurrent cache misses = 1 upstream fetch (thundering herd protection) |
-| Health probe inline fast-path | `/healthz` responds in ~1us, bypasses full process_request pipeline |
-| `SO_BUSY_POLL` (Linux) | Spin-poll NIC queue 50us before sleeping; -5-15us p99 latency |
+| Health probe inline fast-path | `/healthz` and `/readyz` are answered on the TLS listener before the `process_request` pipeline |
+| `SO_BUSY_POLL` (Linux) | Spin-poll NIC queue 50us before sleeping |
 
 ## Allocator
 
@@ -82,7 +82,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | 0-RTT early data (16 KB max) | Clients can send data before handshake completes (idempotent methods only) |
 | Server cipher order enforced | `ignore_client_order = true` |
 | `send_half_rtt_data = true` | Server sends data before client Finished on resumed connections |
-| `FnvHashMap` for SNI map | ~2x faster than SipHash for short hostname keys |
+| `FnvHashMap` for SNI map | FNV instead of the default SipHash for short hostname keys |
 | Thread-local SNI cache | Invalidated via dual-generation counter (instance + global) |
 | `Acquire`/`Release` ordering | Prevents stale cert serving on ARM (Graviton) after hot-reload |
 | `sys_membarrier` (Linux) | Ensures all threads observe new cert config after reload |
@@ -128,7 +128,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 
 | Change | Rationale |
 |---|---|
-| Two-level: L1 thread-local + L2 DashMap | L1 zero contention (~5ns), L2 sharded locks (~30ns) |
+| Two-level: L1 thread-local + L2 DashMap | L1 zero contention, L2 sharded locks |
 | L1 O(1) LRU via doubly-linked list | Index-based nodes in Vec with free-list recycling |
 | L1 sized from detected L1d cache | 50% of L1d for hot entries |
 | L1/L2 generation coherence | Atomic counter bumped on L2 insert; stale L1 entries detected on get |
