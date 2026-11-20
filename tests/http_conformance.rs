@@ -1058,17 +1058,30 @@ fn http_cache_variants_and_websocket_upgrade() {
         let raw = "GET /ws/x HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"; // gitleaks:allow
         let resp = send(port, raw.as_bytes());
         let c = code(&resp);
-        let upgraded = resp
-            .head
-            .to_ascii_lowercase()
-            .contains("upgrade: websocket");
+        let head = resp.head.to_ascii_lowercase();
+        let upgraded = head.contains("upgrade: websocket");
+        // RFC 6455 §4.1: a client fails the connection unless the 101 has `Upgrade: websocket`
+        // and a `Connection` field with the `upgrade` token (browsers enforce both).
+        let connection_upgrade = head
+            .lines()
+            .filter_map(|l| l.strip_prefix("connection:"))
+            .any(|v| v.split(',').any(|t| t.trim() == "upgrade"));
+        let accept = head.contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo=");
         record(
             "WebSocket upgrade (101)",
-            format!("zion {c}, Upgrade echoed ({upgraded})"),
+            format!(
+                "zion {c}, Upgrade echoed ({upgraded}), Connection: Upgrade ({connection_upgrade}), Sec-WebSocket-Accept ({accept})"
+            ),
         );
         assert_eq!(
             c, 101,
             "a WebSocket upgrade should relay the origin's 101, got {c}"
+        );
+        assert!(
+            upgraded && connection_upgrade && accept,
+            "the client's 101 must carry Upgrade: websocket, Connection: Upgrade and the \
+             Sec-WebSocket-Accept, or a browser fails the handshake:\n{}",
+            resp.head
         );
     }
 

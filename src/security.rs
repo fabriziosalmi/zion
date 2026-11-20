@@ -116,9 +116,15 @@ pub fn inject_security_headers(resp: &mut Response<ZionBody>) {
     h.insert(hyper::header::X_FRAME_OPTIONS, XFO.clone());
     h.insert(REFERRER_POLICY, REFERRER.clone());
     h.insert(PERMISSIONS_POLICY, PERMISSIONS.clone());
-    // Strip server identity + hop-by-hop (RFC 7230 §6.1)
+    // Strip server identity + hop-by-hop (RFC 7230 §6.1). A `101` keeps `Connection: Upgrade`:
+    // it is this hop's own answer to the client's upgrade, and RFC 6455 §4.1 has the client
+    // fail the WebSocket connection without it (browsers do).
+    let switching = resp.status() == hyper::StatusCode::SWITCHING_PROTOCOLS;
+    let h = resp.headers_mut();
     h.remove(hyper::header::SERVER);
-    h.remove(hyper::header::CONNECTION);
+    if !switching {
+        h.remove(hyper::header::CONNECTION);
+    }
     h.remove(hyper::header::TRANSFER_ENCODING);
     h.remove(KEEP_ALIVE);
     h.remove(hyper::header::PROXY_AUTHENTICATE);
@@ -794,6 +800,39 @@ impl IpAllowlist {
     #[inline]
     pub fn contains(&self, ip: &std::net::IpAddr) -> bool {
         self.cidrs.iter().any(|c| c.contains(ip))
+    }
+}
+
+#[cfg(test)]
+mod security_header_tests {
+    use super::inject_security_headers;
+    use http_body_util::BodyExt;
+
+    fn resp(status: u16) -> hyper::Response<crate::http_util::ZionBody> {
+        let mut r = hyper::Response::new(
+            http_body_util::Full::new(bytes::Bytes::new())
+                .map_err(|n| match n {})
+                .boxed(),
+        );
+        *r.status_mut() = hyper::StatusCode::from_u16(status).unwrap();
+        r.headers_mut()
+            .insert(hyper::header::CONNECTION, "Upgrade".parse().unwrap());
+        r.headers_mut()
+            .insert(hyper::header::UPGRADE, "websocket".parse().unwrap());
+        r
+    }
+
+    #[test]
+    fn a_101_keeps_connection_upgrade_and_other_answers_lose_connection() {
+        let mut switching = resp(101);
+        inject_security_headers(&mut switching);
+        assert_eq!(switching.headers()[hyper::header::CONNECTION], "Upgrade");
+        assert_eq!(switching.headers()[hyper::header::UPGRADE], "websocket");
+        assert!(switching.headers().contains_key("x-content-type-options"));
+
+        let mut ok = resp(200);
+        inject_security_headers(&mut ok);
+        assert!(!ok.headers().contains_key(hyper::header::CONNECTION));
     }
 }
 
