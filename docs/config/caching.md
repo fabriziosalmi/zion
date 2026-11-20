@@ -46,7 +46,7 @@ uncached, marked `X-Zion-Cache: BYPASS`):
 | Authenticated request (§3.5) | A response to a request carrying `Authorization` is stored **only** if the origin explicitly opts in with a `public`, `s-maxage`, or `must-revalidate` directive (a whole directive: `x-public-ish` is not one). Otherwise one user's response could be served to another. |
 | `Vary` | Absent, or naming request headers zion can key on (see [Vary and secondary keys](#vary-and-secondary-keys)). **Not cached:** `Vary: *`, any varied credential header (`Cookie`, `Authorization`, `Proxy-Authorization`, `Set-Cookie`), more than 8 varied headers, or a variant over the per-key cap. |
 | `Set-Cookie` | The response must **not** set a cookie (any `Set-Cookie` header, whatever its `Cache-Control`). It starts or changes a session, so its body is for one client; it is streamed to that client and never stored. |
-| Headers | At most 32 KiB of origin headers to keep ([What a hit carries](#what-a-hit-carries); each field counts as its name, its value and 32 bytes). A response with more is streamed through, marked `BYPASS`, and counted in `zion_cache_too_large`. |
+| Headers | At most 32 KiB of origin headers to keep ([What a hit carries](#what-a-hit-carries); each field counts as its name, its value and 32 bytes). A response with more is streamed through, marked `BYPASS`, and counted in `zion_cache_too_large`, as is a background refresh or a `304` update that would go over it; it takes no `Vary` variant slot. |
 | Freshness | A positive effective TTL (see below); an object that arrives already older than its lifetime isn't stored. |
 | Upstream progress | The body keeps coming: a gap longer than the upstream's `request_timeout_ms` between two body frames gives the fill up (counted in `zion_cache_fill_stalled`). The client that triggered the fetch keeps receiving whatever the upstream sends; nothing is stored, and the requests that were waiting for that fill fetch for themselves instead of waiting on a hung upstream. |
 
@@ -122,8 +122,8 @@ The freshness lifetime is **origin-driven, clamped to the profile**:
 An answer from the cache carries the origin's response headers, as the miss did. An entry
 keeps every end-to-end header of the response it stores (`Cache-Control`, `Vary`,
 `Content-Security-Policy`, `Content-Disposition`, `Link`, `Expires`, the origin's own `X-*`
-headers, ...) and replays each of them, every value once and in the origin's order, on a hit,
-a ranged hit (`206` / `416`), a stale answer (`STALE`, `STALE-WHILE-REVALIDATE`) and a
+headers, ...) and replays each of them, each field's values once and in the origin's order, on
+a hit, a ranged hit (`206` / `416`), a stale answer (`STALE`, `STALE-WHILE-REVALIDATE`) and a
 revalidated one (`REVALIDATED`). The answer then goes through the same steps as the miss
 (security headers, the route's `csp`, CORS, compression), so a hit leaves with the headers of
 the miss plus `Age` and `Accept-Ranges`. An upload served with `Content-Disposition:
@@ -131,11 +131,17 @@ attachment` and `Content-Security-Policy: sandbox` stays inert on every hit.
 
 - **Not kept:** hop-by-hop headers (`Connection` and the fields any `Connection` line names,
   `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`,
-  `Proxy-Authenticate`, `Proxy-Authentication-Info`), `Content-Length`, `Content-Range`, `Date`
+  `Proxy-Authenticate`, `Proxy-Authentication-Info`; the proxy removes them from every upstream
+  response, so the miss does not carry them either), `Content-Length`, `Content-Range`, `Date`
   and `Age` (set again for each answer), `Set-Cookie` (a response that sets one is never
   stored), and what zion sets or removes on every response (`X-Zion-Cache`, `X-Request-ID`,
-  `Alt-Svc`, `Server`, `Surrogate-Key`, the security headers). `Content-Type`,
-  `Content-Encoding`, `ETag` and `Last-Modified` are kept in fields of their own and set once.
+  `Alt-Svc`, which is zion's own with `--features http3` and removed without it, `Server`,
+  `Surrogate-Key`, the security headers). `Content-Type`, `Content-Encoding`, `ETag` and
+  `Last-Modified` are kept in fields of their own and set once; a `Content-Type` or
+  `Content-Encoding` the origin sent on several lines is set once with the lines joined
+  (`Content-Encoding: gzip, br`), which RFC 9110 §5.3 makes the same field.
+- **A ranged answer** (`206` / `416`) does not carry `Content-Digest` or `Content-MD5`: they
+  are digests of the whole stored body, not of the part. `Repr-Digest` stays.
 - **`Cache-Control`** is the origin's, as on the miss. When the origin sent none, a hit carries
   `public, max-age=<lifetime>` (`immutable` for a lifetime of a year or more), which is what the
   miss carried too. Every hit carries an **`Age`** header (RFC 9111 §4.2.3), seeded from the
@@ -147,10 +153,19 @@ attachment` and `Content-Security-Policy: sandbox` stays inert on every hit.
 - **A revalidation that ends in `304`** updates the entry (RFC 9111 §4.3.4): each header the
   304 carries replaces the stored values of that name, the others stay. The body's
   `Content-Type` and `Content-Encoding` and the validators stay as stored, and a `Set-Cookie` on
-  the 304 is not kept.
+  the 304 is not kept. The 304 answers the request that was sent, the client's `Cookie` and
+  `Authorization` included, so it renews the shared entry only when it could have been stored
+  itself, as a `200` is: no `Set-Cookie`, no `private`, `no-store` or `no-cache`, a `public`,
+  `s-maxage` or `must-revalidate` on the 304 when the request carried `Authorization`, and a
+  `Vary` zion can key on. Otherwise this client is answered with it and the entry stays as it
+  was, stale. The renewed lifetime is that of the updated response: the 304's `Cache-Control`
+  or, when it sends none, the stored one (a bare `304` does not stretch a `max-age=60` entry to
+  the profile TTL).
 - **Bounded:** at most 32 KiB of headers per entry (a response with more is not stored, an
-  update that would go over it is served and the entry left stale); the stored headers count
-  against `cache_max_memory_mb`.
+  update that would go over it is served and the entry left stale). The stored headers count
+  against `cache_max_memory_mb` at their size in memory (each field's name and value, its slot
+  in the entry and the reference counts of its buffers), and with the body toward the per-thread
+  L1 limits.
 
 ## Origin-side revalidation (RFC 9111 §4.3)
 
@@ -162,8 +177,9 @@ the origin (`If-None-Match` from the stored `ETag`, `If-Modified-Since` from
 - **`304 Not Modified`** → the stored entry is still good: zion revives its
   freshness in place and serves the **cached body**, marked
   `X-Zion-Cache: REVALIDATED`, without a re-download, and with the stored headers the
-  304 updated ([What a hit carries](#what-a-hit-carries)). `zion_cache_revalidations`
-  counts these.
+  304 updated ([What a hit carries](#what-a-hit-carries)), with the 304's `Age`. A 304 that
+  could not have been stored itself answers this client and leaves the entry stale (same
+  section). `zion_cache_revalidations` counts these.
 - **`200 OK`** → the content changed: the new response replaces the stale entry
   and is served + cached as a normal fetch.
 - **Origin error** (unreachable, or a `500`/`502`/`503`/`504` answer during
@@ -204,9 +220,10 @@ background, so the client does not wait for the origin round trip. `M` is capped
 - **Not on the caller's behalf**: the refresh is a `GET` to the same target with the
   same content negotiation, but without the caller's `Authorization`, `Cookie`,
   `Proxy-Authorization`, conditional or `Range` headers. It is conditional on the
-  stored `ETag` / `Last-Modified`: a `304` revives the stored body, a cacheable `200`
-  replaces it. Anything else leaves the stale entry in place; once outside its window
-  it is no longer served stale.
+  stored `ETag` / `Last-Modified`: a `304` revives the stored body and updates its headers,
+  under the same rules as the synchronous revalidation ([What a hit carries](#what-a-hit-carries)),
+  and a cacheable `200` replaces it, headers included. Anything else leaves the stale entry in
+  place; once outside its window it is no longer served stale.
 - Metrics: `zion_cache_swr_served`, `zion_cache_swr_refreshes`,
   `zion_cache_swr_refresh_failures`, `zion_cache_swr_refresh_skipped`.
 - A client request with `Cache-Control: no-cache` / `max-age=0` still forces a fresh

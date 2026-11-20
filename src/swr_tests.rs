@@ -32,6 +32,8 @@ struct Origin {
     /// More headers on every `200`, and on every `304`.
     extra_200: Mutex<Vec<(&'static str, &'static str)>>,
     extra_304: Mutex<Vec<(&'static str, &'static str)>>,
+    /// When set, the `Cache-Control` of a `304` instead of `cache_control` (empty: none).
+    cache_control_304: Mutex<Option<String>>,
 }
 
 impl Origin {
@@ -77,11 +79,14 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                             ("x-test", "-")
                         };
                         let resp = if inm.as_deref() == Some(etag.as_str()) {
+                            let cc = o.cache_control_304.lock().unwrap().clone().unwrap_or(cc);
                             let mut b = Response::builder()
                                 .header(vary.0, vary.1)
                                 .status(StatusCode::NOT_MODIFIED)
-                                .header("etag", &etag)
-                                .header("cache-control", &cc);
+                                .header("etag", &etag);
+                            if !cc.is_empty() {
+                                b = b.header("cache-control", &cc);
+                            }
                             for (k, v) in o.extra_304.lock().unwrap().iter() {
                                 b = b.header(*k, *v);
                             }
@@ -542,7 +547,7 @@ async fn a_stale_if_error_answer_carries_the_origin_headers() {
 #[tokio::test]
 async fn a_revalidated_entry_keeps_its_headers_and_takes_the_304s() {
     let (o, st) = upload_origin("public, max-age=1").await;
-    *o.extra_304.lock().unwrap() = vec![("x-revalidated", "yes"), ("set-cookie", "sid=x")];
+    *o.extra_304.lock().unwrap() = vec![("x-revalidated", "yes")];
     fetch(&st, "/up-rv", &[]).await;
     until("entry stored", || {
         st.static_cache.get("/up-rv\u{1f}\u{1c}").fresh().is_some()
@@ -564,9 +569,268 @@ async fn a_revalidated_entry_keeps_its_headers_and_takes_the_304s() {
     assert_eq!((after.cache.as_str(), o.count()), ("HIT", 2));
     assert_upload_headers(&after, "a hit on the renewed entry");
     assert_eq!(header(&after, "x-revalidated").as_deref(), Some("yes"));
+}
+
+/// Wait until `uri`'s identity entry is stored and fresh, then until it is stale.
+async fn stored_then_stale(st: &Arc<AppState>, uri: &str) {
+    let key = format!("{uri}\u{1f}\u{1c}");
+    until("entry stored", || {
+        st.static_cache.get(&key).fresh().is_some()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+}
+
+/// A `304` that sets a cookie answers the client whose request it was, and does not renew the
+/// shared entry, as a `200` that sets one is not stored: the next client is not given what came
+/// with it, and the origin is asked again.
+#[tokio::test]
+async fn a_304_that_sets_a_cookie_does_not_renew_the_shared_entry() {
+    let (o, st) = upload_origin("public, max-age=1").await;
+    *o.extra_304.lock().unwrap() = vec![("set-cookie", "sid=x"), ("x-session", "alice")];
+    fetch(&st, "/up-sc", &[]).await;
+    stored_then_stale(&st, "/up-sc").await;
+    let first = fetch(&st, "/up-sc", &[]).await;
     assert_eq!(
-        header(&after, "set-cookie"),
+        (first.cache.as_str(), first.body.as_str()),
+        ("REVALIDATED", "v1")
+    );
+    o.extra_304.lock().unwrap().clear();
+    let next = fetch(&st, "/up-sc", &[]).await;
+    assert_eq!(
+        (next.cache.as_str(), o.count()),
+        ("REVALIDATED", 3),
+        "the cookie's 304 renewed the entry"
+    );
+    assert_eq!(
+        header(&next, "x-session"),
         None,
-        "a cookie on the 304 is not kept for other clients"
+        "the next client got what came with the cookie"
+    );
+    assert_eq!(header(&next, "set-cookie"), None);
+    assert_upload_headers(&next, "the next answer");
+}
+
+/// Alice's revalidation goes to the origin with her `Cookie` or `Authorization`, and the origin
+/// answers `304`, `private`, with her account in a header. That is her answer: it must not become
+/// the shared entry the next user is served from (it did, and bob got alice's `X-Account` as a
+/// `HIT` for the 304's 60 s).
+#[tokio::test]
+async fn a_private_304_to_one_user_is_not_served_to_the_next() {
+    for alice in [
+        &[("cookie", "sid=alice")][..],
+        &[("authorization", "Bearer alice")],
+    ] {
+        let (o, st) = upload_origin("public, max-age=1").await;
+        *o.cache_control_304.lock().unwrap() = Some("private, max-age=60".into());
+        *o.extra_304.lock().unwrap() = vec![("x-account", "alice@example.com")];
+        fetch(&st, "/acct", &[]).await;
+        stored_then_stale(&st, "/acct").await;
+        let hers = fetch(&st, "/acct", alice).await;
+        assert_eq!(hers.cache, "REVALIDATED", "{alice:?}");
+        assert_eq!(
+            header(&hers, "x-account").as_deref(),
+            Some("alice@example.com"),
+            "her own answer"
+        );
+        // The origin answers the next revalidation with the public 304.
+        *o.cache_control_304.lock().unwrap() = None;
+        o.extra_304.lock().unwrap().clear();
+        let bobs = fetch(&st, "/acct", &[("cookie", "sid=bob")]).await;
+        assert_eq!(
+            header(&bobs, "x-account"),
+            None,
+            "{alice:?}: bob was served alice's 304 as {}",
+            bobs.cache
+        );
+        assert_eq!(
+            header(&bobs, "cache-control").as_deref(),
+            Some("public, max-age=1"),
+            "{alice:?}"
+        );
+        assert_eq!(
+            o.count(),
+            3,
+            "{alice:?}: alice's 304 renewed the shared entry"
+        );
+    }
+}
+
+/// A bare `304` (an `ETag`, no `Cache-Control`, as many application servers answer) renews the
+/// entry for the lifetime the origin gave it, not for the profile's 3600 s, and the answer says
+/// it was just confirmed (`Age` from the 304, not the stale entry's).
+#[tokio::test]
+async fn a_bare_304_renews_the_entry_for_the_origins_lifetime_only() {
+    let (o, st) = origin_and_state("public, max-age=1").await;
+    *o.cache_control_304.lock().unwrap() = Some(String::new());
+    fetch(&st, "/bare", &[]).await;
+    stored_then_stale(&st, "/bare").await;
+    let revalidated = fetch(&st, "/bare", &[]).await;
+    assert_eq!(revalidated.cache, "REVALIDATED");
+    assert_eq!(
+        header(&revalidated, "age").as_deref(),
+        Some("0"),
+        "the age of the stale lookup on a response the origin just confirmed"
+    );
+    let hit = fetch(&st, "/bare", &[]).await;
+    assert_eq!((hit.cache.as_str(), o.count()), ("HIT", 2));
+    assert_eq!(
+        header(&hit, "cache-control").as_deref(),
+        Some("public, max-age=1")
+    );
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let again = fetch(&st, "/bare", &[]).await;
+    assert_eq!(
+        (again.cache.as_str(), o.count()),
+        ("REVALIDATED", 3),
+        "fresh past the origin's 1 s: renewed for the profile TTL"
+    );
+}
+
+/// The stale-while-revalidate background refresh: a `304` updates the stored headers with its
+/// own and keeps the others (RFC 9111 §4.3.4), as the foreground revalidation does.
+#[tokio::test]
+async fn a_background_304_refresh_updates_the_stored_headers() {
+    let (o, st) = upload_origin("public, max-age=1, stale-while-revalidate=30").await;
+    *o.extra_304.lock().unwrap() = vec![("x-revalidated", "yes")];
+    fetch(&st, "/swr-304", &[]).await;
+    stored_then_stale(&st, "/swr-304").await;
+    let stale = fetch(&st, "/swr-304", &[]).await;
+    assert_eq!(stale.cache, "STALE-WHILE-REVALIDATE");
+    until("the background refresh", || o.count() >= 2).await;
+    until("entry fresh again", || {
+        st.static_cache
+            .get("/swr-304\u{1f}\u{1c}")
+            .fresh()
+            .is_some()
+    })
+    .await;
+    let after = fetch(&st, "/swr-304", &[]).await;
+    assert_eq!(
+        (after.cache.as_str(), after.body.as_str(), o.count()),
+        ("HIT", "v1", 2)
+    );
+    assert_upload_headers(&after, "a hit after a background 304");
+    assert_eq!(header(&after, "x-revalidated").as_deref(), Some("yes"));
+}
+
+/// The stale-while-revalidate background refresh that gets new content stores the new
+/// response's headers with it: a hit on it still carries the upload's.
+#[tokio::test]
+async fn a_background_200_refresh_stores_the_new_responses_headers() {
+    let (o, st) = upload_origin("public, max-age=1, stale-while-revalidate=30").await;
+    fetch(&st, "/swr-200", &[]).await;
+    stored_then_stale(&st, "/swr-200").await;
+    *o.body.lock().unwrap() = ("v2".into(), "\"e2\"".into());
+    let stale = fetch(&st, "/swr-200", &[]).await;
+    assert_eq!(stale.cache, "STALE-WHILE-REVALIDATE");
+    until("refreshed entry", || {
+        st.static_cache
+            .get("/swr-200\u{1f}\u{1c}")
+            .fresh()
+            .is_some_and(|h| h.body == "v2")
+    })
+    .await;
+    let after = fetch(&st, "/swr-200", &[]).await;
+    assert_eq!((after.cache.as_str(), after.body.as_str()), ("HIT", "v2"));
+    assert_upload_headers(&after, "a hit after a background 200");
+}
+
+/// A `200` with more header bytes than an entry keeps is served whole, marked `BYPASS`, counted
+/// in `zion_cache_too_large`, and not stored, so the next request goes to the origin; and its
+/// `Vary` does not install a rule or take a variant slot for a response that is not stored.
+#[tokio::test]
+async fn a_response_with_more_headers_than_an_entry_keeps_is_served_and_not_stored() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (o, st) = origin_and_state("public, max-age=60").await;
+    let huge: &'static str = Box::leak(
+        "x".repeat(crate::cache::MAX_STORED_HEADER_BYTES)
+            .into_boxed_str(),
+    );
+    *o.extra_200.lock().unwrap() = vec![("x-huge", huge), ("vary", "Accept-Language")];
+    let de = [("accept-language", "de")];
+    let before = crate::metrics::METRICS.cache_too_large.load(Relaxed);
+    let first = fetch(&st, "/huge", &de).await;
+    assert_eq!(
+        (first.status, first.cache.as_str(), first.body.as_str()),
+        (200, "BYPASS", "v1")
+    );
+    assert_eq!(
+        header(&first, "x-huge").map(|v| v.len()),
+        Some(huge.len()),
+        "served whole"
+    );
+    assert!(
+        crate::metrics::METRICS.cache_too_large.load(Relaxed) > before,
+        "not counted in zion_cache_too_large"
+    );
+    assert!(
+        st.static_cache.vary.get("/huge\u{1f}\u{1c}").is_none(),
+        "a Vary rule was installed for a response that is not stored"
+    );
+    let second = fetch(&st, "/huge", &de).await;
+    assert_eq!(
+        (second.cache.as_str(), o.count()),
+        ("BYPASS", 2),
+        "stored: the origin was not asked again"
+    );
+}
+
+/// The stale-while-revalidate background refresh carries no credentials, but its `304` is held
+/// to the same rule as the foreground one: a `private` 304 does not renew the shared entry with
+/// what it brought.
+#[tokio::test]
+async fn a_private_background_304_does_not_renew_the_shared_entry() {
+    let (o, st) = upload_origin("public, max-age=1, stale-while-revalidate=30").await;
+    *o.cache_control_304.lock().unwrap() = Some("private, max-age=60".into());
+    *o.extra_304.lock().unwrap() = vec![("x-account", "alice@example.com")];
+    fetch(&st, "/swr-p", &[]).await;
+    stored_then_stale(&st, "/swr-p").await;
+    let stale = fetch(&st, "/swr-p", &[]).await;
+    assert_eq!(stale.cache, "STALE-WHILE-REVALIDATE");
+    let key: Arc<str> = Arc::from("/swr-p\u{1f}\u{1c}");
+    until("the background refresh is over", || {
+        o.count() >= 2 && st.inflight.get(&key).is_none()
+    })
+    .await;
+    assert!(
+        st.static_cache.get(&key).fresh().is_none(),
+        "the private 304 renewed the shared entry"
+    );
+    let next = fetch(&st, "/swr-p", &[]).await;
+    assert_eq!(header(&next, "x-account"), None, "served as {}", next.cache);
+}
+
+/// A `304` whose headers, with the stored ones, are more than an entry keeps: this client is
+/// answered with them, the entry is not renewed, and the refusal is counted in
+/// `zion_cache_too_large` like that of a `200`.
+#[tokio::test]
+async fn a_304_with_more_headers_than_an_entry_keeps_is_served_and_counted() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (o, st) = upload_origin("public, max-age=1").await;
+    let huge: &'static str = Box::leak(
+        "x".repeat(crate::cache::MAX_STORED_HEADER_BYTES)
+            .into_boxed_str(),
+    );
+    *o.extra_304.lock().unwrap() = vec![("x-huge", huge)];
+    fetch(&st, "/huge-304", &[]).await;
+    stored_then_stale(&st, "/huge-304").await;
+    let before = crate::metrics::METRICS.cache_too_large.load(Relaxed);
+    let revalidated = fetch(&st, "/huge-304", &[]).await;
+    assert_eq!(revalidated.cache, "REVALIDATED");
+    assert_eq!(
+        header(&revalidated, "x-huge").map(|v| v.len()),
+        Some(huge.len())
+    );
+    assert!(
+        crate::metrics::METRICS.cache_too_large.load(Relaxed) > before,
+        "not counted in zion_cache_too_large"
+    );
+    o.extra_304.lock().unwrap().clear();
+    let next = fetch(&st, "/huge-304", &[]).await;
+    assert_eq!(
+        (next.cache.as_str(), o.count()),
+        ("REVALIDATED", 3),
+        "the entry was renewed with more headers than it keeps"
     );
 }

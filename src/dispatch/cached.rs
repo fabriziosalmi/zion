@@ -673,35 +673,42 @@ impl Cx<'_> {
         // store-and-serve path, replacing the stale entry with the new content.
         if let Some(hit) = revalidate {
             if resp.status() == StatusCode::NOT_MODIFIED {
-                let initial_age = upstream_age(resp.headers());
-                let effective_ttl = origin_freshness(resp.headers())
-                    .map(|o| o.min(cache_ttl))
-                    .unwrap_or(cache_ttl);
-                // The 304's headers update the stored ones (RFC 9111 §4.3.4), for the entry and
-                // for this answer.
-                let (refreshed_meta, fits) = revalidated_meta(&hit.meta, resp.headers());
-                if fits {
+                // The 304's headers update the stored ones (RFC 9111 §4.3.4), for this answer,
+                // and for the entry when the 304 may update it (see `revalidated`: it answers
+                // this client's request, credentials included).
+                let rv = revalidated(&hit.meta, resp.headers(), self.req_authenticated, cache_ttl);
+                if !rv.fits {
+                    metrics::METRICS
+                        .cache_too_large
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if rv.renews() {
                     // Skipped when a tag purge ran since this request began: it must not bring
                     // back an entry the purge may have just removed.
                     state.static_cache.refresh_checked(
                         &found_key,
                         hit.body.clone(),
-                        refreshed_meta.clone(),
-                        effective_ttl,
-                        initial_age,
+                        rv.meta.clone(),
+                        rv.ttl,
+                        rv.initial_age,
                         cache_max,
                         tag_epoch,
                     );
                     fetching.stored(); // waiters observe the revived (fresh) entry
                 } else {
-                    // Too many headers to keep: served, the entry stays stale.
+                    // Served, and the entry stays stale: waiters fetch for themselves.
                     drop(fetching);
                 }
                 crate::metrics::METRICS
                     .cache_revalidations
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Just confirmed by the origin: its age is the 304's and its lifetime the one
+                // the 304 gave, as on the next hit, not those of the stale lookup (an `Age` past
+                // the `max-age` made a downstream cache take the answer as stale on arrival).
                 let hit = cache::CacheHit {
-                    meta: Arc::new(refreshed_meta),
+                    meta: Arc::new(rv.meta),
+                    age_secs: rv.initial_age,
+                    max_age_secs: rv.ttl,
                     ..hit
                 };
                 return Ok(cache_response(hit, "REVALIDATED"));
@@ -723,8 +730,15 @@ impl Cx<'_> {
     }
 
     /// Decide whether the 200 is stored and under which key: its freshness (the origin's, capped by
-    /// the profile), the RFC 9111 storability gate, and the `Vary` policy.
-    fn plan_storage(&self, headers: &hyper::HeaderMap, req_headers: &hyper::HeaderMap) -> Storage {
+    /// the profile), the RFC 9111 storability gate, and the `Vary` policy. `headers_fit` is
+    /// whether an entry can hold its headers ([`cached_meta`]): a response that cannot is refused
+    /// here, before the `Vary` policy installs a rule or admits a variant for it.
+    fn plan_storage(
+        &self,
+        headers: &hyper::HeaderMap,
+        req_headers: &hyper::HeaderMap,
+        headers_fit: bool,
+    ) -> Storage {
         let state = self.state;
         let (cache_ttl, cache_max, max_object) = (self.cache_ttl, self.cache_max, self.max_object);
         let (takes_identity, rcc_no_store, req_authenticated) = (
@@ -752,13 +766,14 @@ impl Cx<'_> {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<usize>().ok())
             .is_some_and(|n| n > max_object);
-        if too_big {
+        if too_big || !headers_fit {
             metrics::METRICS
                 .cache_too_large
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let cacheable = !rcc_no_store
             && !too_big
+            && headers_fit
             && is_shared_cacheable(req_authenticated, headers, effective_ttl, initial_age);
         // Where the entry lives: the primary key, or — when the response varies — the
         // secondary key of THIS request's varied headers (bounded; see `vary`).
@@ -817,14 +832,19 @@ impl Cx<'_> {
         req_headers: &hyper::HeaderMap,
     ) -> Response<ZionBody> {
         let (parts, body) = resp.into_parts();
+        // What the entry keeps of the response, its end-to-end headers included, so that a hit
+        // carries what this miss carries. `None`: headers too large to keep, and the response
+        // is streamed, not stored (see `plan_storage`).
+        let meta = cached_meta(parts.status, &parts.headers);
         let Storage {
             initial_age,
             effective_ttl,
             cacheable,
             store_key,
-        } = self.plan_storage(&parts.headers, req_headers);
+        } = self.plan_storage(&parts.headers, req_headers, meta.is_some());
 
-        let Some(store_key) = store_key else {
+        // (`store_key` is `None` whenever `meta` is: the headers that do not fit are refused there.)
+        let (Some(store_key), Some(meta)) = (store_key, meta) else {
             // Stream the body straight to the client without caching.
             // Drop the registration (no `true` sent): waiters fetch for themselves,
             // since the cache will not be populated for this key.
@@ -849,21 +869,6 @@ impl Cx<'_> {
             drop(fetching);
             metrics::METRICS
                 .cache_tag_uncached
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mut resp = Response::from_parts(parts, body.map_err(hyper::Error::from).boxed());
-            resp.headers_mut().insert(
-                "X-Zion-Cache",
-                hyper::header::HeaderValue::from_static("BYPASS"),
-            );
-            return resp;
-        };
-
-        // What the entry keeps of the response, its end-to-end headers included, so that a hit
-        // carries what this miss carries. Headers too large to keep: streamed, not stored.
-        let Some(meta) = cached_meta(parts.status, &parts.headers) else {
-            drop(fetching);
-            metrics::METRICS
-                .cache_too_large
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut resp = Response::from_parts(parts, body.map_err(hyper::Error::from).boxed());
             resp.headers_mut().insert(

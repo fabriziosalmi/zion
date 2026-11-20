@@ -9,6 +9,9 @@
 //! too. The hit, a ranged hit (`206`) and a `304` to a conditional request are checked here,
 //! and the hit must leave with the same headers as the miss, none twice.
 //!
+//! The origin also sends what must reach no client, on the miss or on a hit: a field named on
+//! its second `Connection` line, its own `Alt-Svc` and a `Proxy-Authentication-Info`.
+//!
 //! Unix only; skipped with a message when `openssl` or `curl` is missing.
 #![cfg(unix)]
 
@@ -44,7 +47,12 @@ fn openssl(args: &[&str]) -> bool {
 const SVG: &str =
     "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(document.domain)</script></svg>";
 
-/// An upload origin: every answer is a cacheable SVG neutralised by its response headers.
+/// What the origin says about its own connection and alternatives, which no client may see.
+const ORIGIN_ALT_SVC: &str = "h3=\":9443\"; ma=60";
+
+/// An upload origin: every answer is a cacheable SVG neutralised by its response headers. Its
+/// `Cache-Control` is written as zion never writes one (`public, max-age=N`), so that a hit
+/// carrying one made up from the entry's lifetime cannot pass for the origin's.
 fn origin(hits: Arc<Mutex<HashMap<String, u32>>>) -> u16 {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -72,15 +80,20 @@ fn origin(hits: Arc<Mutex<HashMap<String, u32>>>) -> u16 {
                 let _ = write!(
                     conn,
                     "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\n\
-                     Cache-Control: public, max-age=60\r\n\
+                     Cache-Control: max-age=60, public\r\n\
                      Content-Security-Policy: sandbox\r\n\
                      Content-Disposition: attachment; filename=\"upload.svg\"\r\n\
                      Vary: Accept-Language\r\n\
                      Link: </a.css>; rel=preload\r\n\
                      Link: </b.js>; rel=preload\r\n\
                      X-Origin-Thing: kept\r\n\
+                     Content-Digest: sha-256=:d2hvbGUgZmlsZQ==:\r\n\
+                     Alt-Svc: {ORIGIN_ALT_SVC}\r\n\
+                     Proxy-Authentication-Info: nextnonce=\"n1\"\r\n\
                      ETag: \"u1\"\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{SVG}",
+                     Content-Length: {}\r\nConnection: close\r\n\
+                     Connection: X-Backend-Session\r\n\
+                     X-Backend-Session: per-connection\r\n\r\n{SVG}",
                     SVG.len()
                 );
             });
@@ -136,6 +149,19 @@ fn name_counts(block: &str) -> BTreeMap<String, usize> {
 
 fn count(hits: &Arc<Mutex<HashMap<String, u32>>>, path: &str) -> u32 {
     hits.lock().unwrap().get(path).copied().unwrap_or(0)
+}
+
+/// What the origin said about its own connection and alternatives: on no answer, whether it
+/// came from the origin or from the cache. (`Alt-Svc` may be zion's own, with HTTP/3.)
+fn assert_no_origin_hop_headers(block: &str, what: &str) {
+    for name in ["x-backend-session", "proxy-authentication-info"] {
+        assert_eq!(header(block, name), None, "{what} carries {name}\n{block}");
+    }
+    let origin_alt_svc = ORIGIN_ALT_SVC.to_ascii_lowercase();
+    assert!(
+        all(block, "alt-svc").iter().all(|v| *v != origin_alt_svc),
+        "{what} carries the origin's Alt-Svc\n{block}"
+    );
 }
 
 /// The headers the origin set to make the upload inert, and the ones a cache must keep with them.
@@ -241,6 +267,7 @@ fn a_cache_hit_keeps_the_origin_csp_content_disposition_and_vary() {
     assert_eq!(status, 200, "{miss}");
     assert_eq!(header(&miss, "x-zion-cache"), Some("miss"), "{miss}");
     assert_origin_headers(&miss, "the miss");
+    assert_no_origin_hop_headers(&miss, "the miss");
 
     // The victim's GET is a HIT from the stored entry.
     let (status, hit) = get(https, path, &[]);
@@ -249,6 +276,7 @@ fn a_cache_hit_keeps_the_origin_csp_content_disposition_and_vary() {
     eprintln!("--- MISS ---\n{miss}--- HIT ---\n{hit}");
     assert_eq!(count(&hits, path), 1, "the origin saw one request");
     assert_eq!(header(&hit, "content-type"), Some("image/svg+xml"), "{hit}");
+    assert_no_origin_hop_headers(&hit, "the hit");
 
     let dropped: Vec<&str> = [
         "content-security-policy",
@@ -300,6 +328,13 @@ fn a_cache_hit_keeps_the_origin_csp_content_disposition_and_vary() {
     );
     assert_origin_headers(&partial, "the ranged hit");
     assert_eq!(all(&partial, "x-origin-thing"), ["kept"], "{partial}");
+    assert_no_origin_hop_headers(&partial, "the ranged hit");
+    // The whole file's digest does not describe ten bytes of it (RFC 9530 §2).
+    assert_eq!(
+        header(&hit, "content-digest"),
+        header(&miss, "content-digest")
+    );
+    assert_eq!(header(&partial, "content-digest"), None, "{partial}");
 
     // A conditional request that matches gets a 304 from the cache with the headers RFC 9110
     // §15.4.5 lists for it: the validator, Cache-Control and Vary.
@@ -318,7 +353,7 @@ fn a_cache_hit_keeps_the_origin_csp_content_disposition_and_vary() {
     );
     assert_eq!(
         header(&not_modified, "cache-control"),
-        Some("public, max-age=60"),
+        Some("max-age=60, public"),
         "{not_modified}"
     );
     assert_eq!(
