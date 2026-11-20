@@ -284,9 +284,11 @@ Each `[[rule]]` in the rules file:
 | `methods` | string[] | `[]` | HTTP methods the rule applies to (empty = any) |
 | `path_glob` | string? | — | Glob over the request path; `*` matches any run of characters |
 | `headers` | table[] | `[]` | Each `{ name, equals?, contains? }` must match (presence if neither `equals` nor `contains`) |
-| `cookies` | string[] | `[]` | Cookie names that must be present |
-| `query` | table[] | `[]` | Each `{ name, equals? }` query parameter must be present (and equal `equals` if given) |
+| `cookies` | string[] | `[]` | Cookie names that must be present, as sent or under the key PHP files them under (`XDEBUG.SESSION` is `XDEBUG_SESSION`) |
+| `query` | table[] | `[]` | Each `{ name, equals? }` query parameter must be present (and equal `equals` if given). Names and values are compared percent-decoded, and a name also matches under the key PHP files it under (`?+id=`, `?id[]=` and `?id%00x=` are all `id`) |
 | `content_types` | string[] | `[]` | Content-Type prefixes, any one matching (empty = any) |
+
+Header values are read as bytes, so a byte outside ASCII elsewhere in a `Cookie` or `Content-Type` field does not hide a cookie or media type from a rule.
 
 A starter pack ships in [`examples/virtual-patch.toml`](https://github.com/fabriziosalmi/zion/blob/master/examples/virtual-patch.toml).
 

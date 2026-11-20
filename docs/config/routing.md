@@ -130,6 +130,17 @@ there is none. It never carries userinfo: a target whose authority has one
 routing, and a `Host` header with an `@` is not forwarded. The upstream's `Host` is its own authority, or the client's host when the upstream
 sets [`preserve_host`](/config/#forward-the-client-s-host-preserve-host-opt-in).
 
+Each of these headers is dropped under every spelling an upstream may read as that header: any
+case, and `_` for any `-`. CGI names the variable of a request header by upper-casing the name
+and turning `-` into `_` (RFC 3875), and WSGI and Rack do the same, so
+`X_Client_Cert_Fingerprint` and `X-Client-Cert-Fingerprint` are one
+`HTTP_X_CLIENT_CERT_FINGERPRINT` to a server that does not drop underscore names itself
+(Python's `wsgiref` does not): dropping only the dashed spelling would hand it the client's
+value. For the same reason, the underscore spellings of the forwarding headers zion sets itself
+(`X_Forwarded_For`, `X_Forwarded_Host`, `X_Forwarded_Proto`, `X_Real_IP`) are dropped from every
+request it forwards, a trusted proxy's included: such a server joins the client's value with
+zion's.
+
 ### Headers and cookies you strip or refuse
 
 Three lists name request headers and cookies by name, in `[server]` for every route and in a
@@ -154,8 +165,13 @@ deny_headers = ["X-Forwarded-Debug"]
 
 Header names are compared without case and with `_` and `-` as the same character, because
 a CGI or PHP upstream reads `X_Debug` as `X-Debug`. Cookie names are compared as written
-(they are case-sensitive) and also percent-decoded, because PHP reads `%43acheWarmer` as
-`CacheWarmer`. A name that is not a header name or a cookie name is a config error.
+(they are case-sensitive), percent-decoded (`%43acheWarmer` is `CacheWarmer` to an upstream
+that decodes cookie names, as PHP did before 7.2.34, 7.3.23 and 7.4.11), and as the key PHP
+files them under: PHP drops the whitespace before a cookie name, turns ` ` and `.` into `_`,
+and reads `name[...]` as the array `name` (an unclosed `[` also becomes `_`), so
+`XDEBUG.SESSION`, `XDEBUG SESSION` and `XDEBUG[SESSION` are all `XDEBUG_SESSION` to it. The
+`Cookie` field is read as bytes: a byte outside ASCII in one cookie does not hide the others.
+A name that is not a header name or a cookie name is a config error.
 
 Some are built in, on every route, with no configuration:
 

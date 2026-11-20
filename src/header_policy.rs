@@ -14,10 +14,14 @@
 //!
 //! Names are compared without case, and with `_` and `-` as the same character: a CGI or PHP
 //! upstream reads `X_Debug` as `X-Debug` (both become `HTTP_X_DEBUG`). Cookie names are
-//! compared exactly (RFC 6265 names are case-sensitive) and also percent-decoded, because PHP
-//! decodes them (`%43acheWarmer` is `CacheWarmer` to it).
+//! compared exactly (RFC 6265 names are case-sensitive), percent-decoded (`%43acheWarmer` is
+//! `CacheWarmer` to an upstream that decodes cookie names, as PHP did before 7.2.34, 7.3.23 and
+//! 7.4.11), and as the key PHP files them under (`XDEBUG.SESSION` is
+//! `$_COOKIE['XDEBUG_SESSION']`, see [`crate::virtual_patch::cookie_is`]). A `Cookie` field is
+//! read as bytes: a byte outside ASCII in one cookie does not hide the others.
 
 use crate::http_util::{empty_response, ZionBody};
+use crate::reserved_headers::same_name;
 use hyper::header::{HeaderMap, HeaderName, COOKIE};
 use hyper::{Response, StatusCode};
 
@@ -106,12 +110,16 @@ impl HeaderPolicy {
         }
         if !self.deny_cookies.is_empty() {
             for value in headers.get_all(COOKIE) {
-                let Ok(value) = value.to_str() else { continue };
-                if value.split(';').any(|pair| {
-                    let name = pair.split_once('=').map_or(pair, |(n, _)| n).trim();
-                    self.deny_cookies
-                        .iter()
-                        .any(|d| d == name || percent_decoded(name).is_some_and(|n| *d == n))
+                // As bytes: a byte outside ASCII in one cookie (obs-text, which hyper and h2
+                // accept in a field value) made `to_str()` fail, and the whole field, with the
+                // denied cookie next to it, was let through.
+                if value.as_bytes().split(|&b| b == b';').any(|pair| {
+                    let name = pair.split(|&b| b == b'=').next().unwrap_or_default();
+                    let decoded = percent_decoded(name.trim_ascii());
+                    self.deny_cookies.iter().any(|d| {
+                        crate::virtual_patch::cookie_is(name, d)
+                            || decoded.as_deref() == Some(d.as_bytes())
+                    })
                 }) {
                     return Some(empty_response(StatusCode::BAD_REQUEST));
                 }
@@ -129,23 +137,11 @@ fn fold(name: &str) -> String {
     name.to_ascii_lowercase().replace('_', "-")
 }
 
-/// `folded` (from [`fold`]) and a request header name (lower-case) are the same name, with
-/// `_` and `-` as one character.
-fn same_name(folded: &str, name: &str) -> bool {
-    folded.len() == name.len()
-        && folded
-            .bytes()
-            .zip(name.bytes())
-            .all(|(a, b)| a == b || (a == b'-' && b == b'_'))
-}
-
-/// `name` with its percent-escapes decoded, or `None` when it has none (or a malformed one,
-/// or decodes to bytes that are not UTF-8).
-fn percent_decoded(name: &str) -> Option<String> {
-    if !name.contains('%') {
+/// `b` with its percent-escapes decoded, or `None` when it has none (or a malformed one).
+fn percent_decoded(b: &[u8]) -> Option<Vec<u8>> {
+    if !b.contains(&b'%') {
         return None;
     }
-    let b = name.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
@@ -159,7 +155,7 @@ fn percent_decoded(name: &str) -> Option<String> {
             i += 1;
         }
     }
-    String::from_utf8(out).ok()
+    Some(out)
 }
 
 fn header_names(owner: &str, key: &str, written: Vec<String>) -> Result<Vec<String>, String> {
@@ -290,6 +286,73 @@ mod tests {
         }
     }
 
+    /// hyper (httparse) and h2 accept obs-text (0x80-0xFF) in a header value, and a PHP, Go or
+    /// Node upstream still reads `CacheWarmer` from this field. `to_str()` fails on the high
+    /// byte, so the field must not be skipped.
+    #[test]
+    fn a_high_byte_elsewhere_in_the_cookie_field_does_not_hide_a_denied_cookie() {
+        let p = HeaderPolicy::merge(&lists(&[], &[], &["CacheWarmer"]), &HeaderLists::default());
+        for field in [
+            &b"a=\x80; CacheWarmer=O:8:\"stdClass\":0:{}"[..],
+            b"CacheWarmer=x; a=\xff",
+            b"a=\xc3\xa9; %43acheWarmer=x",
+            b"\xe2\x82\xac=1; CacheWarmer=x",
+        ] {
+            let mut h = HeaderMap::new();
+            h.append(
+                COOKIE,
+                hyper::header::HeaderValue::from_bytes(field)
+                    .expect("http accepts obs-text, as hyper and h2 do"),
+            );
+            assert!(
+                p.apply(&mut h).is_some(),
+                "the field reaches the upstream unrefused: {h:?}"
+            );
+        }
+        // A high byte alone refuses nothing.
+        let mut h = HeaderMap::new();
+        h.append(
+            COOKIE,
+            hyper::header::HeaderValue::from_bytes(b"a=\x80; theme=d\xc3\xa9").unwrap(),
+        );
+        assert!(p.apply(&mut h).is_none());
+    }
+
+    /// PHP drops the whitespace before a cookie name and turns ' ', '.' and an unclosed '[' in
+    /// it into '_', so each of these is `$_COOKIE['XDEBUG_SESSION']` to it and must be refused
+    /// like the exact name.
+    #[test]
+    fn a_cookie_name_php_reads_as_a_denied_one_is_refused() {
+        let p = HeaderPolicy::merge(
+            &lists(&[], &[], &["XDEBUG_SESSION"]),
+            &HeaderLists::default(),
+        );
+        assert!(refused(&p, &[("cookie", "XDEBUG_SESSION=1")]), "control");
+        let missed: Vec<&str> = [
+            "XDEBUG.SESSION=1",
+            "XDEBUG SESSION=1",
+            "XDEBUG[SESSION=1",
+            "XDEBUG_SESSION[x]=1",
+            "a=1;  XDEBUG.SESSION=1",
+        ]
+        .into_iter()
+        .filter(|c| !refused(&p, &[("cookie", c)]))
+        .collect();
+        assert!(
+            missed.is_empty(),
+            "deny_cookies XDEBUG_SESSION let through: {missed:?}"
+        );
+        // Names PHP keeps apart from it are not refused.
+        for cookie in ["XDEBUG_SESSIONS=1", "XDEBUG-SESSION=1", "xdebug_session=1"] {
+            assert!(!refused(&p, &[("cookie", cookie)]), "{cookie}");
+        }
+        // A denied name written with '.' is the same PHP key as its '_' spelling.
+        let dotted = HeaderPolicy::merge(&lists(&[], &[], &["my.cookie"]), &HeaderLists::default());
+        for cookie in ["my.cookie=1", "my_cookie=1", "my cookie=1"] {
+            assert!(refused(&dotted, &[("cookie", cookie)]), "{cookie}");
+        }
+    }
+
     #[test]
     fn a_routes_lists_add_to_the_global_ones() {
         let p = HeaderPolicy::merge(
@@ -365,11 +428,33 @@ mod tests {
 
         // percent_decoded never panics and reports "no escapes" as None.
         #[test]
-        fn percent_decoded_is_total(s in ".{0,32}") {
+        fn percent_decoded_is_total(s in prop::collection::vec(any::<u8>(), 0..32)) {
             let d = percent_decoded(&s);
-            if !s.contains('%') {
+            if !s.contains(&b'%') {
                 prop_assert!(d.is_none(), "no % but decoded: {:?}", s);
             }
+        }
+
+        // A byte outside ASCII anywhere in another cookie of the same field never changes the
+        // verdict: the denied cookie next to it is still refused.
+        #[test]
+        fn a_high_byte_in_another_cookie_never_hides_a_denied_one(
+            other in "[a-z]{1,6}=[a-z0-9]{0,8}",
+            at in any::<prop::sample::Index>(),
+            high in 0x80u8..=0xff,
+            denied_first in any::<bool>(),
+        ) {
+            let p = HeaderPolicy::merge(&lists(&[], &[], &["CacheWarmer"]), &HeaderLists::default());
+            let mut other = other.into_bytes();
+            other.insert(at.index(other.len() + 1), high);
+            let field = if denied_first {
+                [&b"CacheWarmer=x; "[..], &other].concat()
+            } else {
+                [&other[..], b"; CacheWarmer=x"].concat()
+            };
+            let mut h = HeaderMap::new();
+            h.append(COOKIE, hyper::header::HeaderValue::from_bytes(&field).unwrap());
+            prop_assert!(p.apply(&mut h).is_some(), "{:?}", field.escape_ascii().to_string());
         }
 
         // Percent-encoding any subset of a token's bytes still decodes back to it:
@@ -387,9 +472,9 @@ mod tests {
                     enc.push(b as char);
                 }
             }
-            let decoded = percent_decoded(&enc);
+            let decoded = percent_decoded(enc.as_bytes());
             if encoded_any {
-                prop_assert_eq!(decoded.as_deref(), Some(tok.as_str()), "enc={:?}", enc);
+                prop_assert_eq!(decoded.as_deref(), Some(tok.as_bytes()), "enc={:?}", enc);
             } else {
                 prop_assert!(decoded.is_none());
             }

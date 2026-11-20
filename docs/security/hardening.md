@@ -360,7 +360,7 @@ Earlier Zion versions emitted `X-Client-Cert-DN`, computed as a 64-bit XOR-fold 
 
 ### Injected request-header contract
 
-Zion's contract for the headers it sets or strips on the way to the upstream. Anything an upstream trusts for identity is Zion-owned: any inbound copy from the client is stripped before Zion re-injects the verified value, so these cannot be forged by a client.
+Zion's contract for the headers it sets or strips on the way to the upstream. Anything an upstream trusts for identity is Zion-owned: any inbound copy from the client is stripped before Zion re-injects the verified value, so these cannot be forged by a client. An inbound copy is stripped under any case and with `_` for any `-` (`X_Client_Cert_Fingerprint`, `X_Real_IP`), since an upstream that names headers the CGI way (RFC 3875, as WSGI and Rack do) reads both spellings as one variable unless it drops underscore names itself.
 
 | Header | Direction | Meaning | Since |
 |--------|-----------|---------|-------|
