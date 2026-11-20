@@ -5775,7 +5775,9 @@ max_body_mb = 1
         ("POST", json, big),
         ("POST", json, b"{}".to_vec()),
         ("GET", json, b"{}".to_vec()),
+        ("HEAD", json, b"{}".to_vec()),
         ("PUT", None, vec![]),
+        ("PATCH", None, vec![]),
         ("DELETE", None, vec![]),
         ("OPTIONS", None, vec![]),
         ("TRACE", None, vec![]),
@@ -5787,6 +5789,24 @@ max_body_mb = 1
             (status, reached),
             (301, None),
             "{method} with a {n}-byte body must be redirected, not forwarded"
+        );
+    }
+
+    // A body of unknown length (chunked on HTTP/1, no size hint), on a GET and a HEAD.
+    for method in ["GET", "HEAD"] {
+        let frames = tokio_stream::iter([Ok::<_, crate::http_util::BoxError>(
+            hyper::body::Frame::data(Bytes::from_static(b"{}")),
+        )]);
+        let req = Request::builder()
+            .method(Method::from_bytes(method.as_bytes()).unwrap())
+            .uri(p)
+            .header("host", "api.example.com")
+            .body(http_body_util::StreamBody::new(frames).boxed())
+            .unwrap();
+        assert_eq!(
+            via_port_80(&st, &seen, req).await,
+            (301, None),
+            "{method} with a body of unknown length must be redirected, not forwarded"
         );
     }
 }
@@ -5835,21 +5855,32 @@ upstream = "api"
 }
 
 /// Even a plain challenge GET is left to the HTTPS pipeline (redirected, never forwarded) when
-/// the route has something the shortcut does not run: restrictions that refuse it, an inline
-/// WAF, or an upstream with a bulkhead (`max_in_flight`) or a circuit breaker (the shortcut
-/// has no admission stage). The same request on the same route without the setting is
-/// forwarded (the control).
+/// the route has something the shortcut does not run: restrictions (`methods`, `content_types`,
+/// `deny_paths`), a WAF (`waf = true` or a `waf_profile`), or an upstream with a bulkhead
+/// (`max_in_flight`) or a circuit breaker (the shortcut has no admission stage). The same
+/// request on the same route without the setting is forwarded (the control).
 #[tokio::test]
 async fn the_port_80_acme_fallback_leaves_a_route_with_something_to_bypass_to_https() {
     let (port, seen) = recording_origin().await;
     let breaker = "circuit_breaker = { error_rate_pct = 50, min_requests = 5, window_secs = 10, \
                    open_secs = 30 }";
     let p = "/.well-known/acme-challenge/tok";
+    let mut leaks = Vec::new();
     for (what, upstream, route) in [
         ("control", "", ""),
         ("methods", "", "methods = [\"POST\"]"),
+        (
+            "content_types",
+            "",
+            "content_types = [\"application/json\"]",
+        ),
         ("deny_paths", "", "deny_paths = [\"/.well-known/{*rest}\"]"),
         ("waf", "", "waf = true"),
+        (
+            "waf_profile",
+            "",
+            "waf_profile = \"w\"\n[waf_profile.w]\nmax_body_mb = 1",
+        ),
         ("max_in_flight", "max_in_flight = 4", ""),
         ("circuit_breaker", breaker, ""),
     ] {
@@ -5863,8 +5894,82 @@ async fn the_port_80_acme_fallback_leaves_a_route_with_something_to_bypass_to_ht
         let (status, reached) = via_port_80(&st, &seen, api_request("GET", p, None, vec![])).await;
         if what == "control" {
             assert_eq!((status, reached.is_some()), (200, true), "{what}");
-        } else {
-            assert_eq!((status, reached), (301, None), "{what}");
+        } else if (status, &reached) != (301, &None) {
+            leaks.push(format!(
+                "{what}: {status}, the upstream received {reached:?}"
+            ));
         }
     }
+    assert!(leaks.is_empty(), "\n  {}", leaks.join("\n  "));
+}
+
+// ── WAF: one Content-Type per body ──────────────────────────────────────────
+
+/// Content-Type is a singleton field, but a request can carry two lines of it, and zion forwards
+/// both. The multipart gate reads the first; gunicorn 23 hands the app the last (measured with
+/// Werkzeug 3.1.9 behind it: the app got boundary `B` and the denied field). So a WAF route
+/// refuses a body with more than one Content-Type, in either order, before the upstream.
+#[tokio::test]
+async fn a_body_with_two_content_types_is_refused_before_the_upstream() {
+    let (port, seen) = recording_origin().await;
+    let st = acme_state(
+        port,
+        r#"
+[upstreams]
+api = "http://127.0.0.1:{port}"
+
+[waf_profile.forms]
+deny_field_names = ["PHP_SESSION_UPLOAD_PROGRESS"]
+max_file_parts = 0
+
+[[route]]
+path = "/{*rest}"
+upstream = "api"
+waf_profile = "forms"
+"#,
+    );
+    // One part `a` under boundary Z; under boundary B, the denied field.
+    let body = b"--Z\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n\r\n--B\r\n\
+                 Content-Disposition: form-data; name=\"PHP_SESSION_UPLOAD_PROGRESS\"\r\n\r\nx\
+                 \r\n--B--\r\n\r\n--Z--\r\n";
+    let z = "multipart/form-data; boundary=Z";
+    let b = "multipart/form-data; boundary=B";
+    let req = |cts: &[&str], body: &[u8]| {
+        let mut r = Request::builder()
+            .method(Method::POST)
+            .uri("/upload")
+            .header("host", "api.example.com")
+            .header("content-length", body.len().to_string());
+        for ct in cts {
+            r = r.header("content-type", *ct);
+        }
+        r.body(
+            Full::new(Bytes::copy_from_slice(body))
+                .map_err(|n| match n {})
+                .boxed(),
+        )
+        .unwrap()
+    };
+    // controls: the gate allows the body under Z and refuses it under B
+    let (status, reached) = via_pipeline(&st, &seen, req(&[z], body)).await;
+    assert_eq!(
+        (status, reached.map(|r| r.2)),
+        (200, Some(body.len())),
+        "control: one part under Z"
+    );
+    assert_eq!(
+        via_pipeline(&st, &seen, req(&[b], body)).await,
+        (400, None),
+        "control: the denied field under B"
+    );
+    for cts in [[z, b], [b, z], [z, z]] {
+        assert_eq!(
+            via_pipeline(&st, &seen, req(&cts, body)).await,
+            (400, None),
+            "{cts:?}"
+        );
+    }
+    // a bodyless request has nothing for either line to label
+    let (status, reached) = via_pipeline(&st, &seen, req(&[z, b], b"")).await;
+    assert_eq!((status, reached.map(|r| r.2)), (200, Some(0)), "empty body");
 }

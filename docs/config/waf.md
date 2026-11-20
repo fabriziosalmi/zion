@@ -57,7 +57,7 @@ waf_profile = "upload"
 | `entropy_threshold` | f64 | `6.5` | Bits/byte. Bodies above this are denied. Default sits above pure base64 (theoretical max 6.0); random/encrypted blobs land at 7.5–8.0. |
 | `scan_headers` | string[] | `[]` | Request headers whose values go through the injection scanner (case-insensitive names, optional trailing `*`). Empty scans none. See [Scanning request headers](#scanning-request-headers). |
 | `max_parts` | usize | `1000` | Maximum number of parts in a `multipart/form-data` body. See [Multipart structure](#multipart-structure). |
-| `max_file_parts` | usize | `256` | Maximum number of file parts (a part with a `filename`, empty `filename=""` included). `0` refuses every file part. |
+| `max_file_parts` | usize | `256` | Maximum number of file parts (a part with a `filename` or a `filename*`, empty `filename=""` included). `0` refuses every file part. |
 | `max_part_headers` | usize | `16` | Maximum header lines in one part. |
 | `max_part_header_bytes` | usize | `8192` | Maximum total bytes of one part's header block. |
 | `deny_field_names` | string[] | `[]` | Form field names refused outright (a part whose Content-Disposition `name` matches, case-insensitive). E.g. `PHP_SESSION_UPLOAD_PROGRESS`. |
@@ -66,13 +66,13 @@ waf_profile = "upload"
 
 ## Multipart structure
 
-When a request body is labelled `multipart/form-data`, the WAF parses it the way
-the origin will read it and holds it to the structure limits above, before the
-injection scan. The parser is strict: a body it cannot parse cleanly is refused
-(`400`), never forwarded, and so is a body a lenient backend would split into
-other parts (see below). That closes the multipart-smuggling class (e.g. the Spring
-CVE-2026-41853 family) and the part/header floods that PHP2Shell and a series of
-parser CVEs rely on.
+When a request body is labelled `multipart/form-data`, the WAF parses it by RFC 2046
+and holds it to the structure limits above, before the injection scan. The parser
+is strict: a body it cannot parse cleanly is refused (`400`), never forwarded, and so
+is a body that PHP, Werkzeug or Django would split into other parts (see below).
+That stops the part/header floods that PHP2Shell and a series of parser CVEs rely
+on, and the smuggling shapes listed below. It does not make every backend read the
+same field names as the gate: see [what is still open](#what-is-still-open).
 
 A body is refused when: the `boundary` parameter is missing, malformed, or
 declared twice; the body does not begin at its boundary (a preamble); the closing
@@ -86,6 +86,14 @@ for an endpoint that takes only small forms.
 Common backends parse multipart more leniently than RFC 2046, so a body that
 leaves them another reading is refused too:
 
+- a `boundary` parameter another backend reads differently: an RFC 2231 form
+  (`boundary*`, `boundary*0`), which Werkzeug and Django take as the boundary; an
+  unquoted value with a space or one of `( ) , / : = ?` in it, which RFC 2045
+  wants quoted and Werkzeug cuts short there; a space or tab right after the `=`,
+  which PHP keeps in the boundary; or a `boundary` substring before the parameter
+  (`xboundary=C; boundary=B`, or inside another parameter's value), since PHP takes
+  the first one it finds. A quoted value (`boundary="a/b c"`) is read the same way
+  by all three and passes.
 - `--boundary` anywhere except at the start of the body and right after the CRLF
   that ends a part. PHP, Werkzeug and Django also split parts on a bare LF before
   it, Werkzeug and Django on a bare CR, and Django on `--boundary` anywhere, so a
@@ -96,16 +104,38 @@ leaves them another reading is refused too:
 - a CR or LF in a part's headers that is not part of a CRLF. PHP breaks a header
   line at a bare LF and Werkzeug at either, and Werkzeug also ends the headers at
   `\n\n` or `\r\r`, so they would read another field `name` than the gate.
+- a part with two `Content-Disposition` headers (PHP and Werkzeug read the first,
+  Django the last), two `name` parameters (all three keep the last), or a `name*`
+  or `name*0` parameter (RFC 2231), which Werkzeug and Django take as the field
+  name. A `filename*` parameter makes a part a file part, as it does for them; .NET
+  sends one next to every `filename`, which still passes.
+
+The field-name rules apply to every media type that a backend reads as
+`multipart/form-data`: spaces and tabs before it and before the `;` are skipped
+(`multipart/form-data<TAB>; boundary=B` is form-data to Werkzeug and Django), and
+so is anything after it that cannot continue a media type (PHP ends it at `,`).
 
 The gate also runs on **any other content-type that carries a `boundary`
-parameter** (for example `multipart/mixed`, or a wildcard variant a framework
-maps to multipart). A lenient upstream parses such a body as multipart while a
-front proxy that only recognised `multipart/form-data` would forward it unparsed,
-so the two could split the body on a different boundary — the content-type
-smuggling class (Spring CVE-2026-41853). Zion parses it to the same structural
-limits (without the form-data field-name rules), so they cannot disagree. A strict
-`deny_unknown_content_types` already refuses these at the content-type gate; this
-covers the lenient profiles that accept them.
+parameter**, plain or `boundary*` (for example `multipart/mixed`, or a wildcard
+variant a framework maps to multipart). A lenient upstream parses such a body as
+multipart while a front proxy that only recognised `multipart/form-data` would
+forward it unparsed, so the two could split the body on a different boundary: the
+content-type smuggling class (Spring CVE-2026-41853). Zion parses it with the same
+boundary and structure rules (without the form-data field-name rules) and refuses
+it unless it parses cleanly. A strict `deny_unknown_content_types` already refuses
+these at the content-type gate; this covers the lenient profiles that accept them.
+
+### What is still open
+
+The gate reads a part's field name as the value of its one `name` parameter, with
+one layer of double quotes removed. A backend can read a malformed value another
+way, so a name in `deny_field_names` can still reach it in that shape: Werkzeug
+ignores bytes after a closing quote (`name="x"y`) and after an unquoted value and a
+space (`name=x y`), and PHP also strips single quotes (`name='x'`, read from its
+source, not run). On a `multipart/mixed` or other non-form-data body the
+field-name rules do not apply at all. Treat `deny_field_names` as a limit for the
+bodies real clients send, not as proof that no parser behind zion can see another
+field name.
 
 ## Detection modes
 
@@ -128,6 +158,10 @@ When `deny_unknown_content_types = true` (default):
 - Unknown content types return `400 Bad Request`
 
 When set to `false`, requests with unlisted content types pass through without body inspection.
+
+Whatever the setting, a request with a body and more than one `Content-Type` line is
+refused (`400`): the field is a singleton (RFC 9110), the gates read the first line,
+and an upstream may act on another one (gunicorn 23 hands the app the last).
 
 ## Legacy configuration
 
