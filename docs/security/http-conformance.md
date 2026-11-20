@@ -80,7 +80,7 @@ from Zion, then the request is forwarded.
 | `Accept-Encoding: br` on a `compress` route | `Content-Encoding: br`, `Vary: Accept-Encoding`, `Content-Length` dropped |
 | `Accept-Encoding: gzip` | `Content-Encoding: gzip` |
 | no `Accept-Encoding` | identity |
-| a secret-bearing response (`Set-Cookie` / `Cache-Control: private`) | identity unless the route sets `allow_cookied` (BREACH guard, [ADR-0025](https://github.com/fabriziosalmi/zion/blob/master/docs/adr/0025-response-compression.md)) |
+| a secret-bearing response (`Set-Cookie`, or `private` on any `Cache-Control` line) | identity unless the route sets `allow_cookied` (BREACH guard, [ADR-0025](https://github.com/fabriziosalmi/zion/blob/master/docs/adr/0025-response-compression.md)) |
 
 Built without the feature, a `compress` route serves identity.
 
@@ -98,7 +98,8 @@ A `cache_profile` route caches a `GET 200`. When the upstream marks a response
 `Vary: Accept-Encoding`, Zion keys the cache by that variant: a repeated request
 with the same `Accept-Encoding` is served from the cache (the upstream is not asked
 again), while a different `Accept-Encoding` is a separate variant. An upstream's
-`Vary` header is forwarded to the client.
+`Vary` header is forwarded to the client, on a cache hit as on the miss (with the
+origin's other end-to-end headers; `tests/cache_hit_origin_headers.rs`).
 
 ## WebSocket upgrade
 

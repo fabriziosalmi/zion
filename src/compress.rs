@@ -21,9 +21,9 @@
 //! a route that asks for compression on a build without the backend degrades to
 //! no-op rather than failing.
 
-use crate::http_util::ZionBody;
+use crate::http_util::{CacheControl, ZionBody};
 use hyper::body::Body as _;
-use hyper::header::{HeaderMap, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, SET_COOKIE};
+use hyper::header::{HeaderMap, CONTENT_ENCODING, CONTENT_TYPE, SET_COOKIE};
 use hyper::{Method, Response, StatusCode};
 use serde::Deserialize;
 
@@ -189,15 +189,12 @@ pub fn negotiate(
     if headers.contains_key(CONTENT_ENCODING) {
         return None;
     }
-    let cache_control = headers
-        .get(CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_ascii_lowercase());
+    // Every `Cache-Control` line counts (RFC 9110 §5.3): a `no-transform` or a `private` on the
+    // second line is as binding as on the first.
+    let cache_control = CacheControl::of(headers);
     // `no-transform` forbids a proxy from changing the representation.
-    if let Some(cc) = &cache_control {
-        if cc.contains("no-transform") {
-            return None;
-        }
+    if cache_control.mentions("no-transform") {
+        return None;
     }
     // Non-text content types are not worth compressing.
     let compressible = headers
@@ -218,9 +215,7 @@ pub fn negotiate(
     // BREACH guard: a response that mixes a secret (a cookie, or a response marked
     // private) with reflected input is the BREACH oracle when compressed over TLS.
     if !cfg.allow_cookied {
-        let private = cache_control
-            .as_deref()
-            .is_some_and(|cc| cc.contains("private"));
+        let private = cache_control.mentions("private");
         if headers.contains_key(SET_COOKIE) || private {
             return None;
         }
@@ -535,6 +530,7 @@ mod encode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::header::CACHE_CONTROL;
 
     fn hv(s: &str) -> hyper::header::HeaderValue {
         hyper::header::HeaderValue::from_str(s).unwrap()
@@ -708,6 +704,38 @@ mod tests {
         let mut h = text_headers();
         h.insert(CACHE_CONTROL, hv("private, max-age=0"));
         assert_eq!(neg("br", &h, Some(4096), &enabled()), None);
+    }
+
+    /// hyper keeps each upstream `Cache-Control` field line as its own value; RFC 9110 §5.3
+    /// makes them one list. A `private` or `no-transform` on a later line stops compression
+    /// like the joined line does.
+    #[test]
+    fn breach_guard_and_no_transform_read_every_cache_control_line() {
+        for later in ["private", "no-transform"] {
+            let mut joined = text_headers();
+            joined.insert(CACHE_CONTROL, hv(&format!("max-age=300, {later}")));
+            assert_eq!(
+                neg("br", &joined, Some(4096), &enabled()),
+                None,
+                "control: joined `max-age=300, {later}` declines"
+            );
+            let mut split = text_headers();
+            split.insert(CACHE_CONTROL, hv("max-age=300"));
+            split.append(CACHE_CONTROL, hv(later));
+            assert_eq!(
+                neg("br", &split, Some(4096), &enabled()),
+                None,
+                "`max-age=300` + `{later}` on two lines was compressed"
+            );
+        }
+        // control: two lines that forbid nothing still compress
+        let mut plain = text_headers();
+        plain.insert(CACHE_CONTROL, hv("max-age=300"));
+        plain.append(CACHE_CONTROL, hv("public"));
+        assert_eq!(
+            neg("br", &plain, Some(4096), &enabled()),
+            Some(Encoding::Brotli)
+        );
     }
 
     #[test]

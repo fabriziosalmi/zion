@@ -32,7 +32,8 @@ use crate::audit;
 use crate::audit::AuditEvent;
 use crate::bulkhead;
 use crate::http_util::{
-    empty_response, generate_request_id, inject_security_headers, text_response, HEX_DIGITS,
+    empty_response, generate_request_id, inject_security_headers, text_response, CacheControl,
+    HEX_DIGITS,
 };
 use crate::http_util::{ReqBody, ZionBody};
 use crate::pool;
@@ -1055,22 +1056,22 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
         let ttl = origin_freshness(resp.headers())
             .map(|o| o.min(job.cache_ttl))
             .unwrap_or(job.cache_ttl);
-        let mut meta = (*job.stale.meta).clone();
-        if resp.headers().contains_key(hyper::header::CACHE_CONTROL) {
-            meta.stale_while_revalidate_secs = origin_swr(resp.headers());
-            meta.must_revalidate = forbids_stale(resp.headers());
-        }
+        // The 304's headers update the stored ones (RFC 9111 §4.3.4); a result too large to
+        // keep leaves the entry as it is.
+        let (meta, fits) = revalidated_meta(&job.stale.meta, resp.headers());
         // Not revived if a tag purge ran since this refresh was scheduled (it may have removed
         // the very entry being revalidated).
-        if !job.state.static_cache.refresh_checked(
-            &job.key,
-            job.stale.body.clone(),
-            meta,
-            ttl,
-            initial_age,
-            job.cache_max,
-            job.tag_epoch,
-        ) {
+        if !fits
+            || !job.state.static_cache.refresh_checked(
+                &job.key,
+                job.stale.body.clone(),
+                meta,
+                ttl,
+                initial_age,
+                job.cache_max,
+                job.tag_epoch,
+            )
+        {
             return false;
         }
         metrics::METRICS
@@ -1104,20 +1105,15 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
     if !same_shape || (job.identity_entry && !shareable_identity(&parts.headers)) {
         return false;
     }
+    // Headers too large to keep: not stored (see `cached_meta`).
+    let Some(meta) = cached_meta(parts.status, &parts.headers) else {
+        return false;
+    };
     let Ok(collected) = http_body_util::Limited::new(body, job.max_object)
         .collect()
         .await
     else {
         return false;
-    };
-    let meta = cache::CachedMeta {
-        content_type: parts.headers.get(hyper::header::CONTENT_TYPE).cloned(),
-        content_encoding: parts.headers.get(hyper::header::CONTENT_ENCODING).cloned(),
-        status: parts.status,
-        etag: parts.headers.get(hyper::header::ETAG).cloned(),
-        last_modified: parts.headers.get(hyper::header::LAST_MODIFIED).cloned(),
-        stale_while_revalidate_secs: origin_swr(&parts.headers),
-        must_revalidate: forbids_stale(&parts.headers),
     };
     // The refreshed response may carry new tags; one that cannot be tracked is not stored.
     let Ok(tags) = cache::surrogate_keys(&parts.headers) else {
@@ -1164,27 +1160,12 @@ fn profile_cache_control(ttl_seconds: u64) -> hyper::header::HeaderValue {
 /// `None` when the origin states no explicit lifetime — the caller then falls
 /// back to the profile TTL. This is what lets a short-lived origin policy
 /// (e.g. `max-age=300` on HTML) actually shorten zion's cache lifetime instead
-/// of being ignored in favour of the profile's blanket TTL.
+/// of being ignored in favour of the profile's blanket TTL. Every `Cache-Control` line counts
+/// ([`CacheControl`]): `public` on one line and `max-age=0` on the next is a lifetime of 0.
 fn origin_freshness(headers: &hyper::HeaderMap) -> Option<u64> {
-    let cc = headers
-        .get(hyper::header::CACHE_CONTROL)?
-        .to_str()
-        .ok()?
-        .to_ascii_lowercase();
+    let cc = CacheControl::of(headers);
     // s-maxage wins for shared caches; only then fall back to max-age.
-    for directive in ["s-maxage", "max-age"] {
-        for part in cc.split(',') {
-            let part = part.trim();
-            if let Some(rest) = part.strip_prefix(directive) {
-                if let Some(val) = rest.trim_start().strip_prefix('=') {
-                    if let Ok(secs) = val.trim().trim_matches('"').parse::<u64>() {
-                        return Some(secs);
-                    }
-                }
-            }
-        }
-    }
-    None
+    cc.seconds("s-maxage").or_else(|| cc.seconds("max-age"))
 }
 
 /// Longest `stale-while-revalidate` window honoured, whatever the origin asks for.
@@ -1245,38 +1226,17 @@ impl Drop for SwrPermit {
 /// the proxy-revalidate semantics for a shared cache, RFC 9111 §5.2.2.10). Matches
 /// whole directive names, not substrings.
 fn forbids_stale(headers: &hyper::HeaderMap) -> bool {
-    headers
-        .get_all(hyper::header::CACHE_CONTROL)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .any(|d| {
-            let name = d.split('=').next().unwrap_or("").trim();
-            name.eq_ignore_ascii_case("must-revalidate")
-                || name.eq_ignore_ascii_case("proxy-revalidate")
-                || name.eq_ignore_ascii_case("s-maxage")
-        })
+    CacheControl::of(headers)
+        .directives()
+        .any(|d| d.is("must-revalidate") || d.is("proxy-revalidate") || d.is("s-maxage"))
 }
 
-/// `stale-while-revalidate=N` (RFC 5861 §3) from a response's `Cache-Control`, in
-/// seconds, capped at [`MAX_SWR_SECS`]. `0` when absent or unparsable.
+/// `stale-while-revalidate=N` (RFC 5861 §3) from a response's `Cache-Control`, every line of
+/// it, in seconds, capped at [`MAX_SWR_SECS`]. `0` when absent or unparsable.
 fn origin_swr(headers: &hyper::HeaderMap) -> u64 {
-    let Some(cc) = headers
-        .get(hyper::header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return 0;
-    };
-    for part in cc.to_ascii_lowercase().split(',') {
-        if let Some(rest) = part.trim().strip_prefix("stale-while-revalidate") {
-            if let Some(val) = rest.trim_start().strip_prefix('=') {
-                if let Ok(secs) = val.trim().trim_matches('"').parse::<u64>() {
-                    return secs.min(MAX_SWR_SECS);
-                }
-            }
-        }
-    }
-    0
+    CacheControl::of(headers)
+        .seconds("stale-while-revalidate")
+        .map_or(0, |secs| secs.min(MAX_SWR_SECS))
 }
 
 /// Test hook: `origin_swr` over a bare `Cache-Control` value.
@@ -1313,38 +1273,27 @@ fn is_shared_cacheable(
         return false;
     }
 
-    // A response that sets a cookie starts or alters a session: its body is for that
-    // client. Cached hits do not replay headers, but they would replay the body to
-    // everyone, so it is never stored in the shared cache (what nginx and Varnish do by
-    // default). The client that triggered it still gets the response, cookie included.
+    // A response that sets a cookie starts or alters a session: its body and its cookie are
+    // for that client, so it is never stored in the shared cache (what nginx and Varnish do
+    // by default). The client that triggered it still gets the response, cookie included.
     if resp_headers.contains_key(hyper::header::SET_COOKIE) {
         return false;
     }
 
-    let cc = resp_headers
-        .get(hyper::header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_ascii_lowercase());
+    // Every `Cache-Control` line: `max-age=300` on one and `private` on the next is private.
+    let cc = CacheControl::of(resp_headers);
 
-    // §3.2 / §5.2.2: origin forbids shared storage.
-    if let Some(cc) = &cc {
-        if cc.contains("private") || cc.contains("no-store") || cc.contains("no-cache") {
-            return false;
-        }
+    // §3.2 / §5.2.2: origin forbids shared storage. Matched anywhere in the list, not only as
+    // a whole directive, so that an unusual spelling still refuses (as nginx and Varnish do).
+    if cc.mentions("private") || cc.mentions("no-store") || cc.mentions("no-cache") {
+        return false;
     }
 
     // §3.5: a response to an authenticated request is storable in a shared
-    // cache ONLY when the origin explicitly allows it.
-    if req_authenticated {
-        let opted_in = cc
-            .as_deref()
-            .map(|cc| {
-                cc.contains("public") || cc.contains("s-maxage") || cc.contains("must-revalidate")
-            })
-            .unwrap_or(false);
-        if !opted_in {
-            return false;
-        }
+    // cache ONLY when the origin explicitly allows it, with a whole directive: an extension
+    // whose name merely contains `public` is not an opt-in.
+    if req_authenticated && !(cc.has("public") || cc.has("s-maxage") || cc.has("must-revalidate")) {
+        return false;
     }
 
     // §4.1: a response that varies is stored under a secondary key built from the
@@ -1460,40 +1409,103 @@ fn upstream_age(headers: &hyper::HeaderMap) -> u64 {
         .unwrap_or(0)
 }
 
-/// Build the response for a RAM cache hit: preserved status/Content-Type/
-/// Content-Encoding, a `Cache-Control` whose `max-age` matches the entry's
-/// freshness lifetime, and the `Age` header so downstream caches subtract
-/// elapsed time instead of resetting their freshness clock on every hit.
+/// Which of an entry's stored origin headers an answer from the cache replays.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Replay {
+    /// All of them: an answer with the stored body or a slice of it.
+    All,
+    /// A `304` to a client's conditional request (RFC 9110 §15.4.5): of what a `200` would
+    /// carry, the fields that guide the client's cache, `Cache-Control`, `Content-Location`,
+    /// `Expires` and `Vary` (`ETag` and `Last-Modified` come from their own fields, `Date` is
+    /// set when the answer is sent). Not the representation's other metadata: the client keeps
+    /// what it stored with the `200` (RFC 9111 §4.3.4).
+    NotModified,
+}
+
+/// The headers a `304` from the cache replays, see [`Replay::NotModified`].
+const NOT_MODIFIED_REPLAYS: [hyper::header::HeaderName; 4] = [
+    hyper::header::CACHE_CONTROL,
+    hyper::header::CONTENT_LOCATION,
+    hyper::header::EXPIRES,
+    hyper::header::VARY,
+];
+
+const X_ZION_CACHE: hyper::header::HeaderName =
+    hyper::header::HeaderName::from_static("x-zion-cache");
+
+/// An answer from a cache entry: the origin's end-to-end headers the entry kept
+/// ([`cache::CachedMeta::headers`]), so that it carries what the miss carried, then the ones
+/// this answer sets, each replacing a stored one of the same name:
+///
+/// - `Cache-Control`: the origin's, as on the miss; when the origin sent none, the entry's
+///   lifetime as `public, max-age=N` (`immutable` for a year), which is what the miss carried;
+/// - `X-Zion-Cache: <disposition>`, and `Age` (RFC 9111 §4.2.3: since the origin made it, the
+///   upstream `Age` included), so a downstream cache does not restart the clock;
+/// - `Content-Type`, `Content-Encoding` (not on a `304`), `ETag` and `Last-Modified`, as the
+///   origin sent them.
+///
+/// The response pipeline then does to it what it does to the miss (security headers, the
+/// route's CSP, CORS, compression), so a hit and a miss leave with the same set of headers.
+fn from_cache(
+    hit: &cache::CacheHit,
+    status: StatusCode,
+    disposition: &'static str,
+    replay: Replay,
+    body: Bytes,
+) -> Response<ZionBody> {
+    use hyper::header;
+    let meta = &hit.meta;
+    let mut resp = Response::new(Full::new(body).map_err(|never| match never {}).boxed());
+    *resp.status_mut() = status;
+    let h = resp.headers_mut();
+    h.reserve(meta.headers.len() + 8);
+    for (name, value) in &meta.headers {
+        if replay == Replay::All || NOT_MODIFIED_REPLAYS.contains(name) {
+            h.append(name.clone(), value.clone());
+        }
+    }
+    if !h.contains_key(header::CACHE_CONTROL) {
+        h.insert(
+            header::CACHE_CONTROL,
+            profile_cache_control(hit.max_age_secs),
+        );
+    }
+    h.insert(X_ZION_CACHE, header::HeaderValue::from_static(disposition));
+    h.insert(header::AGE, header::HeaderValue::from(hit.age_secs));
+    if replay == Replay::All {
+        if let Some(ct) = &meta.content_type {
+            h.insert(header::CONTENT_TYPE, ct.clone());
+        }
+        if let Some(ce) = &meta.content_encoding {
+            h.insert(header::CONTENT_ENCODING, ce.clone());
+        }
+    }
+    // The validators the client echoes back (If-None-Match / If-Range), as the origin sent them.
+    if let Some(etag) = &meta.etag {
+        h.insert(header::ETAG, etag.clone());
+    }
+    if let Some(lm) = &meta.last_modified {
+        h.insert(header::LAST_MODIFIED, lm.clone());
+    }
+    resp
+}
+
 /// Serve a stored body with the given `X-Zion-Cache` disposition. `HIT` = a
 /// fresh hit; `REVALIDATED` = a stale entry the origin confirmed with a 304
 /// (RFC 9111 §4.3), served without re-downloading; `STALE` = stale served on an
-/// origin error (§4.2.4 stale-if-error).
-fn cache_response(hit: cache::CacheHit, disposition: &'static str) -> Response<ZionBody> {
-    let mut builder = Response::builder()
-        .status(hit.meta.status)
-        .header("Cache-Control", profile_cache_control(hit.max_age_secs))
-        .header("X-Zion-Cache", disposition)
-        .header(hyper::header::AGE, hit.age_secs);
-    if let Some(ct) = &hit.meta.content_type {
-        builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
-    }
-    if let Some(ce) = &hit.meta.content_encoding {
-        builder = builder.header(hyper::header::CONTENT_ENCODING, ce.clone());
-    }
-    // The validators the client echoes back (If-None-Match / If-Range), as the origin sent them.
-    if let Some(etag) = &hit.meta.etag {
-        builder = builder.header(hyper::header::ETAG, etag.clone());
-    }
-    if let Some(lm) = &hit.meta.last_modified {
-        builder = builder.header(hyper::header::LAST_MODIFIED, lm.clone());
-    }
+/// origin error (§4.2.4 stale-if-error); `STALE-WHILE-REVALIDATE` = stale served
+/// while a refresh runs (RFC 5861). Headers: see [`from_cache`].
+fn cache_response(mut hit: cache::CacheHit, disposition: &'static str) -> Response<ZionBody> {
+    let body = std::mem::take(&mut hit.body);
+    let mut resp = from_cache(&hit, hit.meta.status, disposition, Replay::All, body);
     // A fresh hit answers `Range` itself (see `ranged_hit_response`): say so.
     if disposition == "HIT" && hit.meta.status == StatusCode::OK {
-        builder = builder.header(hyper::header::ACCEPT_RANGES, "bytes");
+        resp.headers_mut().insert(
+            hyper::header::ACCEPT_RANGES,
+            hyper::header::HeaderValue::from_static("bytes"),
+        );
     }
-    builder
-        .body(Full::new(hit.body).map_err(|never| match never {}).boxed())
-        .unwrap()
+    resp
 }
 
 /// Answer a `Range` request from a fresh cached `200` (RFC 9110 §14): one satisfiable byte range
@@ -1523,51 +1535,32 @@ fn ranged_hit_response(
         return None;
     }
     let total = hit.body.len() as u64;
-    let mut builder = Response::builder()
-        .header("Cache-Control", profile_cache_control(hit.max_age_secs))
-        .header("X-Zion-Cache", "HIT")
-        .header(hyper::header::AGE, hit.age_secs)
-        .header(hyper::header::ACCEPT_RANGES, "bytes");
-    if let Some(ct) = &hit.meta.content_type {
-        builder = builder.header(hyper::header::CONTENT_TYPE, ct.clone());
+    let (status, content_range, body) =
+        match static_files::parse_range(headers.get(hyper::header::RANGE), total) {
+            RangeOutcome::Full => return None,
+            RangeOutcome::Unsatisfiable => (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                format!("bytes */{total}"),
+                Bytes::new(),
+            ),
+            RangeOutcome::Satisfiable(start, end) => (
+                StatusCode::PARTIAL_CONTENT,
+                format!("bytes {start}-{end}/{total}"),
+                hit.body.slice(start as usize..=end as usize),
+            ),
+        };
+    // The stored origin headers, as on a whole hit (see `from_cache`).
+    let mut resp = from_cache(hit, status, "HIT", Replay::All, body);
+    let h = resp.headers_mut();
+    h.insert(
+        hyper::header::ACCEPT_RANGES,
+        hyper::header::HeaderValue::from_static("bytes"),
+    );
+    // `bytes a-b/n` and `bytes */n` are digits, `-`, `/` and `*`: always a valid value.
+    if let Ok(range) = hyper::header::HeaderValue::from_str(&content_range) {
+        h.insert(hyper::header::CONTENT_RANGE, range);
     }
-    if let Some(ce) = &hit.meta.content_encoding {
-        builder = builder.header(hyper::header::CONTENT_ENCODING, ce.clone());
-    }
-    if let Some(etag) = &hit.meta.etag {
-        builder = builder.header(hyper::header::ETAG, etag.clone());
-    }
-    if let Some(lm) = &hit.meta.last_modified {
-        builder = builder.header(hyper::header::LAST_MODIFIED, lm.clone());
-    }
-    match static_files::parse_range(headers.get(hyper::header::RANGE), total) {
-        RangeOutcome::Full => None,
-        RangeOutcome::Unsatisfiable => Some(
-            builder
-                .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                .header(hyper::header::CONTENT_RANGE, format!("bytes */{total}"))
-                .body(
-                    Full::new(Bytes::new())
-                        .map_err(|never| match never {})
-                        .boxed(),
-                )
-                .unwrap(),
-        ),
-        RangeOutcome::Satisfiable(start, end) => Some(
-            builder
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(
-                    hyper::header::CONTENT_RANGE,
-                    format!("bytes {start}-{end}/{total}"),
-                )
-                .body(
-                    Full::new(hit.body.slice(start as usize..=end as usize))
-                        .map_err(|never| match never {})
-                        .boxed(),
-                )
-                .unwrap(),
-        ),
-    }
+    Some(resp)
 }
 
 #[inline]
@@ -1608,25 +1601,13 @@ fn add_conditional_headers(headers: &mut hyper::HeaderMap, meta: &cache::CachedM
 /// Parse the REQUEST's `Cache-Control` for the directives a shared cache honors
 /// (RFC 9111 §5.2.1): returns `(no_store, no_cache, only_if_cached)`. `no-cache`
 /// and `max-age=0` both mean "don't serve a stored response without
-/// revalidation", so they're folded together.
+/// revalidation", so they're folded together. Every `Cache-Control` line of the request counts.
 fn parse_request_cache_control(headers: &hyper::HeaderMap) -> (bool, bool, bool) {
-    let cc = headers
-        .get(hyper::header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let has = |d: &str| cc.split(',').any(|t| t.trim() == d);
-    let max_age_zero = cc.split(',').any(|t| {
-        t.trim()
-            .strip_prefix("max-age=")
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(|v| v == 0)
-            .unwrap_or(false)
-    });
+    let cc = CacheControl::of(headers);
     (
-        has("no-store"),
-        has("no-cache") || max_age_zero,
-        has("only-if-cached"),
+        cc.has("no-store"),
+        cc.has("no-cache") || cc.seconds("max-age") == Some(0),
+        cc.has("only-if-cached"),
     )
 }
 
@@ -1657,27 +1638,57 @@ fn client_conditional_hit(req_headers: &hyper::HeaderMap, meta: &cache::CachedMe
     )
 }
 
-/// 304 Not Modified from a cache hit — preserved validators + freshness, no body
-/// (RFC 9110 §15.4.5).
+/// 304 Not Modified from a cache hit, no body: the validators, and of the stored origin headers
+/// those RFC 9110 §15.4.5 lists for a 304 (`Cache-Control`, `Content-Location`, `Expires`,
+/// `Vary`; see [`Replay::NotModified`]).
 fn not_modified_response(hit: &cache::CacheHit) -> Response<ZionBody> {
-    let mut builder = Response::builder()
-        .status(StatusCode::NOT_MODIFIED)
-        .header("Cache-Control", profile_cache_control(hit.max_age_secs))
-        .header("X-Zion-Cache", "HIT")
-        .header(hyper::header::AGE, hit.age_secs);
-    if let Some(etag) = &hit.meta.etag {
-        builder = builder.header(hyper::header::ETAG, etag.clone());
+    from_cache(
+        hit,
+        StatusCode::NOT_MODIFIED,
+        "HIT",
+        Replay::NotModified,
+        Bytes::new(),
+    )
+}
+
+/// The metadata an entry keeps of the origin's response, headers included
+/// ([`cache::end_to_end_headers`]); `None` when those headers are more than an entry may hold
+/// ([`cache::MAX_STORED_HEADER_BYTES`]): such a response is served, not stored.
+fn cached_meta(status: StatusCode, headers: &hyper::HeaderMap) -> Option<cache::CachedMeta> {
+    use hyper::header;
+    let meta = cache::CachedMeta {
+        // Preserve Content-Type and Content-Encoding (S-05): without Content-Encoding,
+        // gzip-compressed bodies are served garbled.
+        content_type: headers.get(header::CONTENT_TYPE).cloned(),
+        content_encoding: headers.get(header::CONTENT_ENCODING).cloned(),
+        status,
+        // Validators for conditional requests (client If-None-Match → 304) and revalidation.
+        etag: headers.get(header::ETAG).cloned(),
+        last_modified: headers.get(header::LAST_MODIFIED).cloned(),
+        stale_while_revalidate_secs: origin_swr(headers),
+        must_revalidate: forbids_stale(headers),
+        headers: cache::end_to_end_headers(headers),
+    };
+    meta.headers_fit().then_some(meta)
+}
+
+/// The entry `stored` once the origin answered its revalidation with a `304` carrying
+/// `not_modified` (RFC 9111 §4.3.4): the 304's headers replace the stored ones of the same name
+/// and the rest are kept ([`cache::CachedMeta::updated_by`]); a 304 with a `Cache-Control` also
+/// sets the stale-serving rules again. The bool is whether the result fits in an entry
+/// ([`cache::CachedMeta::headers_fit`]): when it does not, it is served and the entry is not
+/// renewed.
+fn revalidated_meta(
+    stored: &cache::CachedMeta,
+    not_modified: &hyper::HeaderMap,
+) -> (cache::CachedMeta, bool) {
+    let mut meta = stored.updated_by(not_modified);
+    if not_modified.contains_key(hyper::header::CACHE_CONTROL) {
+        meta.stale_while_revalidate_secs = origin_swr(not_modified);
+        meta.must_revalidate = forbids_stale(not_modified);
     }
-    if let Some(lm) = &hit.meta.last_modified {
-        builder = builder.header(hyper::header::LAST_MODIFIED, lm.clone());
-    }
-    builder
-        .body(
-            Full::new(Bytes::new())
-                .map_err(|never| match never {})
-                .boxed(),
-        )
-        .unwrap()
+    let fits = meta.headers_fit();
+    (meta, fits)
 }
 
 /// A request's place in the singleflight map: it became the fetcher for `key`, and other
@@ -2080,6 +2091,136 @@ mod tests {
         assert_eq!(origin_freshness(&h), None);
     }
 
+    // ── Cache-Control split across field lines (RFC 9110 §5.3) ──
+    // hyper's HTTP/1 client keeps each upstream field line as its own value
+    // (`headers.append`), so two lines reach these functions as two values. RFC 9110
+    // §5.3 makes them equivalent to one comma-joined line.
+
+    /// `Cache-Control: <first>` then `Cache-Control: <second>`, as hyper builds it.
+    fn split_cc(first: &str, second: &str) -> hyper::HeaderMap {
+        let mut h = hdr(hyper::header::CACHE_CONTROL, first);
+        h.append(hyper::header::CACHE_CONTROL, second.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn a_later_cache_control_line_forbids_shared_storage() {
+        for forbid in ["private", "no-store", "no-cache"] {
+            let joined = hdr(
+                hyper::header::CACHE_CONTROL,
+                &format!("max-age=300, {forbid}"),
+            );
+            assert!(
+                !is_shared_cacheable(false, &joined, TTL, 0),
+                "control: one line `max-age=300, {forbid}` is refused"
+            );
+            let split = split_cc("max-age=300", forbid);
+            assert!(
+                !is_shared_cacheable(false, &split, TTL, 0),
+                "two lines `max-age=300` + `{forbid}` must be refused like the joined line, \
+                 but is_shared_cacheable stored it"
+            );
+        }
+        // control: two lines that forbid nothing are stored
+        assert!(is_shared_cacheable(
+            false,
+            &split_cc("max-age=300", "public"),
+            TTL,
+            0
+        ));
+    }
+
+    #[test]
+    fn a_later_private_line_is_honoured_for_an_authenticated_request() {
+        let joined = hdr(hyper::header::CACHE_CONTROL, "public, max-age=300, private");
+        assert!(
+            !is_shared_cacheable(true, &joined, TTL, 0),
+            "control: joined line refused"
+        );
+        let split = split_cc("public, max-age=300", "private");
+        assert!(
+            !is_shared_cacheable(true, &split, TTL, 0),
+            "authenticated request: `public, max-age=300` + `private` on two lines was stored"
+        );
+        // an opt-in on the second line is an opt-in
+        assert!(is_shared_cacheable(
+            true,
+            &split_cc("max-age=300", "public"),
+            TTL,
+            0
+        ));
+    }
+
+    #[test]
+    fn an_authenticated_response_opts_in_with_a_whole_directive_only() {
+        for not_opt_in in [
+            "max-age=300, x-public-ish",
+            "nonpublic",
+            "x-s-maxage-like=5",
+        ] {
+            let h = hdr(hyper::header::CACHE_CONTROL, not_opt_in);
+            assert!(
+                !is_shared_cacheable(true, &h, TTL, 0),
+                "`{not_opt_in}` is not a §3.5 opt-in"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_freshness_reads_every_cache_control_line() {
+        assert_eq!(
+            origin_freshness(&hdr(hyper::header::CACHE_CONTROL, "public, max-age=0")),
+            Some(0),
+            "control: joined line"
+        );
+        assert_eq!(
+            origin_freshness(&split_cc("public", "max-age=0")),
+            Some(0),
+            "`public` + `max-age=0` on two lines: lifetime 0, not the profile TTL"
+        );
+        assert_eq!(
+            origin_freshness(&split_cc("max-age=60", "s-maxage=600")),
+            Some(600),
+            "s-maxage on the second line wins"
+        );
+        assert_eq!(
+            origin_freshness(&split_cc("max-age=300", "max-age=0")),
+            Some(0),
+            "two different lifetimes: stale (RFC 9111 §4.2.1)"
+        );
+    }
+
+    #[test]
+    fn origin_swr_reads_every_cache_control_line() {
+        let mut joined = hyper::HeaderMap::new();
+        joined.insert(
+            hyper::header::CACHE_CONTROL,
+            "max-age=60, stale-while-revalidate=30".parse().unwrap(),
+        );
+        assert_eq!(origin_swr(&joined), 30, "control: joined line");
+        assert_eq!(
+            origin_swr(&split_cc("max-age=60", "stale-while-revalidate=30")),
+            30,
+            "`stale-while-revalidate=30` on a second line is read"
+        );
+    }
+
+    #[test]
+    fn a_request_cache_control_line_after_the_first_counts() {
+        for (second, want) in [
+            ("no-store", (true, false, false)),
+            ("no-cache", (false, true, false)),
+            ("max-age=0", (false, true, false)),
+            ("only-if-cached", (false, false, true)),
+        ] {
+            assert_eq!(
+                parse_request_cache_control(&split_cc("max-stale=5", second)),
+                want,
+                "request `max-stale=5` + `{second}` on two lines"
+            );
+        }
+    }
+
     #[test]
     fn origin_freshness_ignores_substring_of_s_maxage() {
         // "max-age" must not falsely match inside "s-maxage".
@@ -2297,6 +2438,200 @@ mod tests {
         assert_eq!(cc("No-Store"), (true, false, false));
     }
 
+    // ── What an answer from the cache carries of the origin's headers ──
+
+    /// The headers an upload origin sends with an SVG: what makes it inert in a browser
+    /// (`Content-Disposition`, `Content-Security-Policy`), and the rest a hit must keep too.
+    fn upload_origin_headers() -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        for (k, v) in [
+            ("content-type", "image/svg+xml"),
+            ("cache-control", "public, max-age=60"),
+            ("content-security-policy", "sandbox"),
+            ("content-disposition", "attachment; filename=\"upload.svg\""),
+            ("vary", "Accept-Language"),
+            ("link", "</a.css>; rel=preload"),
+            ("link", "</b.js>; rel=preload"),
+            ("expires", "Thu, 01 Jan 2099 00:00:00 GMT"),
+            ("content-location", "/media/upload.svg"),
+            ("etag", "\"u1\""),
+            ("content-length", "10"),
+            ("date", "Thu, 01 Jan 2026 00:00:00 GMT"),
+        ] {
+            h.append(
+                hyper::header::HeaderName::from_static(k),
+                hyper::header::HeaderValue::from_static(v),
+            );
+        }
+        h
+    }
+
+    fn stored_hit(origin: &hyper::HeaderMap) -> cache::CacheHit {
+        cache::CacheHit {
+            body: Bytes::from_static(b"0123456789"),
+            meta: Arc::new(cached_meta(StatusCode::OK, origin).expect("fits")),
+            age_secs: 5,
+            max_age_secs: 60,
+        }
+    }
+
+    fn values(resp: &Response<ZionBody>, name: &str) -> Vec<String> {
+        resp.headers()
+            .get_all(name)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn request(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    /// The headers of `origin` an answer with the stored body must carry, each as many times
+    /// as the origin sent it: all of them but what is recomputed for each answer.
+    fn assert_carries_the_origin_headers(resp: &Response<ZionBody>, origin: &hyper::HeaderMap) {
+        for name in origin.keys() {
+            if matches!(name.as_str(), "content-length" | "date") {
+                continue;
+            }
+            let want: Vec<String> = origin
+                .get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                values(resp, name.as_str()),
+                want,
+                "{name} on a {} from the cache",
+                resp.status()
+            );
+        }
+    }
+
+    #[test]
+    fn a_hit_carries_the_origin_headers_once_and_its_own_cache_headers() {
+        let origin = upload_origin_headers();
+        let resp = fresh_hit_response(
+            stored_hit(&origin),
+            &hyper::Method::GET,
+            &hyper::HeaderMap::new(),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_carries_the_origin_headers(&resp, &origin);
+        assert_eq!(values(&resp, "x-zion-cache"), ["HIT"]);
+        assert_eq!(values(&resp, "age"), ["5"]);
+        assert_eq!(values(&resp, "accept-ranges"), ["bytes"]);
+        assert!(
+            values(&resp, "date").is_empty() && values(&resp, "content-length").is_empty(),
+            "recomputed when the answer is sent"
+        );
+        // The stale and revalidated answers carry them too.
+        for disposition in ["STALE", "REVALIDATED", "STALE-WHILE-REVALIDATE"] {
+            let resp = cache_response(stored_hit(&origin), disposition);
+            assert_carries_the_origin_headers(&resp, &origin);
+            assert_eq!(values(&resp, "x-zion-cache"), [disposition]);
+        }
+    }
+
+    #[test]
+    fn a_hit_without_an_origin_cache_control_carries_the_entry_lifetime_as_the_miss_did() {
+        let mut origin = upload_origin_headers();
+        origin.remove(hyper::header::CACHE_CONTROL);
+        let resp = cache_response(stored_hit(&origin), "HIT");
+        assert_eq!(values(&resp, "cache-control"), ["public, max-age=60"]);
+        assert_eq!(values(&resp, "content-security-policy"), ["sandbox"]);
+    }
+
+    #[test]
+    fn a_ranged_hit_carries_the_origin_headers() {
+        let origin = upload_origin_headers();
+        let get = &hyper::Method::GET;
+        let partial = fresh_hit_response(
+            stored_hit(&origin),
+            get,
+            &request(&[("range", "bytes=0-3")]),
+        );
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_carries_the_origin_headers(&partial, &origin);
+        assert_eq!(values(&partial, "content-range"), ["bytes 0-3/10"]);
+        assert_eq!(values(&partial, "accept-ranges"), ["bytes"]);
+        assert_eq!(values(&partial, "x-zion-cache"), ["HIT"]);
+
+        let unsatisfiable = fresh_hit_response(
+            stored_hit(&origin),
+            get,
+            &request(&[("range", "bytes=50-")]),
+        );
+        assert_eq!(unsatisfiable.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_carries_the_origin_headers(&unsatisfiable, &origin);
+        assert_eq!(values(&unsatisfiable, "content-range"), ["bytes */10"]);
+    }
+
+    #[test]
+    fn a_304_from_the_cache_carries_the_headers_rfc_9110_lists_for_it() {
+        let origin = upload_origin_headers();
+        let resp = fresh_hit_response(
+            stored_hit(&origin),
+            &hyper::Method::GET,
+            &request(&[("if-none-match", "\"u1\"")]),
+        );
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        // RFC 9110 §15.4.5: Cache-Control, Content-Location, Date, ETag, Expires, Vary.
+        assert_eq!(values(&resp, "cache-control"), ["public, max-age=60"]);
+        assert_eq!(values(&resp, "content-location"), ["/media/upload.svg"]);
+        assert_eq!(values(&resp, "etag"), ["\"u1\""]);
+        assert_eq!(values(&resp, "expires"), ["Thu, 01 Jan 2099 00:00:00 GMT"]);
+        assert_eq!(values(&resp, "vary"), ["Accept-Language"]);
+        assert_eq!(values(&resp, "x-zion-cache"), ["HIT"]);
+        // ... and not the representation's other metadata: the client keeps what it stored.
+        for absent in ["content-type", "content-security-policy", "link"] {
+            assert!(values(&resp, absent).is_empty(), "{absent} on a 304");
+        }
+    }
+
+    #[test]
+    fn a_revalidating_304_updates_the_entry_and_a_too_large_result_is_not_kept() {
+        let origin = upload_origin_headers();
+        let stored = cached_meta(StatusCode::OK, &origin).unwrap();
+        let not_modified = request(&[
+            ("cache-control", "public, max-age=120, must-revalidate"),
+            ("x-new", "1"),
+            ("set-cookie", "sid=other"),
+        ]);
+        let (meta, fits) = revalidated_meta(&stored, &not_modified);
+        assert!(fits);
+        assert!(
+            meta.must_revalidate,
+            "the 304's Cache-Control sets the rules"
+        );
+        let resp = cache_response(
+            cache::CacheHit {
+                meta: Arc::new(meta),
+                ..stored_hit(&origin)
+            },
+            "REVALIDATED",
+        );
+        assert_eq!(
+            values(&resp, "cache-control"),
+            ["public, max-age=120, must-revalidate"]
+        );
+        assert_eq!(values(&resp, "x-new"), ["1"]);
+        assert_eq!(values(&resp, "content-security-policy"), ["sandbox"]);
+        assert!(values(&resp, "set-cookie").is_empty());
+
+        let huge = "x".repeat(cache::MAX_STORED_HEADER_BYTES);
+        let (_, fits) = revalidated_meta(&stored, &request(&[("x-huge", huge.as_str())]));
+        assert!(!fits, "over the bound: served, not kept");
+        assert!(cached_meta(StatusCode::OK, &request(&[("x-huge", huge.as_str())])).is_none());
+    }
+
     #[test]
     fn client_conditional_304_matching() {
         let meta = |etag: Option<&str>, lm: Option<&str>| cache::CachedMeta {
@@ -2307,6 +2642,7 @@ mod tests {
             last_modified: lm.map(|l| l.parse().unwrap()),
             stale_while_revalidate_secs: 0,
             must_revalidate: false,
+            headers: Vec::new(),
         };
         let req = |name: hyper::header::HeaderName, val: &str| {
             let mut h = hyper::HeaderMap::new();

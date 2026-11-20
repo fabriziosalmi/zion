@@ -11,7 +11,7 @@
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use hyper::header::HeaderValue;
+use hyper::header::{HeaderName, HeaderValue};
 use hyper::StatusCode;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -19,9 +19,89 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Cached response metadata — stored alongside the body so cache hits
-/// preserve upstream Content-Type, Content-Encoding, status, and other
-/// essential headers.
+/// Most bytes of origin headers one entry keeps in [`CachedMeta::headers`], each field counted
+/// as its name, its value and 32 bytes (the HTTP/2 accounting, RFC 7541 §4.1, so a flood of
+/// empty fields counts too). A response with more is not stored: leaving some of its headers out
+/// of a hit is the bug the list exists to prevent.
+pub const MAX_STORED_HEADER_BYTES: usize = 32 * 1024;
+
+/// Response headers an entry does not keep. A hit sets its own, or none.
+const NOT_STORED: &[&str] = &[
+    // Hop-by-hop (RFC 9110 §7.6.1), and those of the proxy itself (RFC 9111 §3.1). The fields a
+    // `Connection` line names are left out too, see `end_to_end_headers`.
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "proxy-authenticate",
+    "proxy-authentication-info",
+    "proxy-authorization",
+    // Computed again for each answer from the entry.
+    "content-length",
+    "content-range",
+    "date",
+    "age",
+    // Kept in fields of their own.
+    "content-type",
+    "content-encoding",
+    "etag",
+    "last-modified",
+    // A session for one client: a response that sets a cookie is never stored, and a `304`
+    // that revalidates an entry does not add one to it.
+    "set-cookie",
+    "set-cookie2",
+    // Set or removed by zion on every response, whatever the origin sent.
+    "x-zion-cache",
+    "x-request-id",
+    "alt-svc",
+    "server",
+    "surrogate-key",
+    "strict-transport-security",
+    "x-content-type-options",
+    "x-frame-options",
+    "referrer-policy",
+    "permissions-policy",
+];
+
+/// The origin's end-to-end response headers an entry keeps and a hit replays, in order: all of
+/// them but [`NOT_STORED`] and the fields any `Connection` line names. Not bounded here: see
+/// [`CachedMeta::headers_fit`].
+pub fn end_to_end_headers(headers: &hyper::HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
+    let listed: Vec<&[u8]> = headers
+        .get_all(hyper::header::CONNECTION)
+        .iter()
+        .flat_map(|line| line.as_bytes().split(|&b| b == b','))
+        .map(<[u8]>::trim_ascii)
+        .filter(|token| !token.is_empty())
+        .collect();
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            let name = name.as_str();
+            !NOT_STORED.contains(&name)
+                && !listed
+                    .iter()
+                    .any(|token| token.eq_ignore_ascii_case(name.as_bytes()))
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+/// A header value that owns its bytes (see [`CachedMeta::detached`]).
+fn detach(value: &mut HeaderValue) {
+    // `from_bytes` accepts every value hyper's parser does; if it ever refused one, the
+    // original (shared) value is kept rather than lost.
+    if let Ok(mut owned) = HeaderValue::from_bytes(value.as_bytes()) {
+        owned.set_sensitive(value.is_sensitive());
+        *value = owned;
+    }
+}
+
+/// Cached response metadata, stored alongside the body: a hit is built from it, so it carries
+/// what the origin's response carried.
 #[derive(Clone, Debug)]
 pub struct CachedMeta {
     pub content_type: Option<HeaderValue>,
@@ -41,6 +121,12 @@ pub struct CachedMeta {
     /// proxy-revalidate semantics for a shared cache: RFC 9111 §4.2.4, §5.2.2). It
     /// must then neither be served stale-while-revalidate nor on an origin error.
     pub must_revalidate: bool,
+    /// Every other end-to-end header of the origin's response ([`end_to_end_headers`]):
+    /// `Cache-Control`, `Vary`, `Content-Security-Policy`, `Content-Disposition`, `Link`, ...
+    /// A hit replays them, so it carries what the miss carried. A hit rebuilt from the fields
+    /// above alone served an upload marked `Content-Disposition: attachment` and
+    /// `Content-Security-Policy: sandbox` inline and unsandboxed.
+    pub headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 impl CachedMeta {
@@ -49,7 +135,8 @@ impl CachedMeta {
     /// hyper parses response headers without copying: each `HeaderValue` is a slice of the
     /// connection's read buffer. Storing one keeps that whole buffer alive (8 KiB or more,
     /// the body's bytes included) for as long as the entry is cached, on top of the body the
-    /// cache copies itself. A copy of a few dozen bytes lets the buffer go.
+    /// cache copies itself. A copy of a few dozen bytes lets the buffer go. (Header names
+    /// own their bytes already: hyper copies a name that is not a standard one.)
     fn detached(mut self) -> Self {
         for value in [
             &mut self.content_type,
@@ -60,14 +147,51 @@ impl CachedMeta {
         .into_iter()
         .flatten()
         {
-            // `from_bytes` accepts every value hyper's parser does; if it ever refused one,
-            // the original (shared) value is kept rather than lost.
-            if let Ok(mut owned) = HeaderValue::from_bytes(value.as_bytes()) {
-                owned.set_sensitive(value.is_sensitive());
-                *value = owned;
-            }
+            detach(value);
+        }
+        for (_, value) in &mut self.headers {
+            detach(value);
         }
         self
+    }
+
+    /// What [`Self::headers`] count for against [`MAX_STORED_HEADER_BYTES`] and the byte budget.
+    fn headers_bytes(&self) -> usize {
+        self.headers
+            .iter()
+            .map(|(name, value)| name.as_str().len() + value.len() + 32)
+            .sum()
+    }
+
+    /// [`Self::headers`] are within [`MAX_STORED_HEADER_BYTES`]: the entry may be stored.
+    pub fn headers_fit(&self) -> bool {
+        self.headers_bytes() <= MAX_STORED_HEADER_BYTES
+    }
+
+    /// The entry once a `304` carrying `not_modified` confirmed it (RFC 9111 §4.3.4): each
+    /// end-to-end header of the 304 replaces every stored value of that name, and the others
+    /// are kept (§3.2). The body and what describes it (`Content-Type`, `Content-Encoding`) and
+    /// the validators it was selected by stay as stored. The stale-serving rules are the
+    /// caller's to update: they come from `Cache-Control`.
+    pub fn updated_by(&self, not_modified: &hyper::HeaderMap) -> CachedMeta {
+        let fresh = end_to_end_headers(not_modified);
+        let mut headers: Vec<(HeaderName, HeaderValue)> = self
+            .headers
+            .iter()
+            .filter(|(name, _)| !fresh.iter().any(|(f, _)| f == name))
+            .cloned()
+            .collect();
+        headers.extend(fresh);
+        CachedMeta {
+            content_type: self.content_type.clone(),
+            content_encoding: self.content_encoding.clone(),
+            status: self.status,
+            etag: self.etag.clone(),
+            last_modified: self.last_modified.clone(),
+            stale_while_revalidate_secs: self.stale_while_revalidate_secs,
+            must_revalidate: self.must_revalidate,
+            headers,
+        }
     }
 }
 
@@ -500,14 +624,14 @@ fn stripe_of(key: &str) -> usize {
 /// Queue items tolerated beyond twice the entries before the queue is rebuilt.
 const QUEUE_SLACK: usize = 1024;
 
-/// What one entry is counted as, on top of its key and body: the entry itself, its
-/// metadata (a few short header values) and its slot in the map. An estimate, there so
-/// that a cache of empty bodies is not counted as free.
+/// What one entry is counted as, on top of its key, its body and the origin headers it keeps:
+/// the entry itself, its other metadata (a few short header values) and its slot in the map. An
+/// estimate, there so that a cache of empty bodies is not counted as free.
 const ENTRY_OVERHEAD_BYTES: u64 = 256;
 
 /// The memory one stored entry is counted as.
 fn entry_cost(key: &str, entry: &L2Entry) -> u64 {
-    (key.len() + entry.body.len()) as u64 + ENTRY_OVERHEAD_BYTES
+    (key.len() + entry.body.len() + entry.meta.headers_bytes()) as u64 + ENTRY_OVERHEAD_BYTES
 }
 
 /// The largest body a worker thread keeps in its own L1 cache. L1 entries are not in the
@@ -1342,6 +1466,7 @@ mod tests {
             last_modified: None,
             stale_while_revalidate_secs: 0,
             must_revalidate: false,
+            headers: Vec::new(),
         }
     }
 
@@ -1363,6 +1488,7 @@ mod tests {
                 ),
                 stale_while_revalidate_secs: 0,
                 must_revalidate: false,
+                headers: Vec::new(),
             }
         }
         const N: u64 = 2_000_000;
@@ -1438,6 +1564,7 @@ mod tests {
             last_modified: None,
             stale_while_revalidate_secs: 0,
             must_revalidate: false,
+            headers: Vec::new(),
         };
         cache.insert("/a.js", Bytes::from("v2"), meta2, 3600, 0, 100);
         let hit = cache.get("/a.js").fresh().unwrap();
@@ -1604,6 +1731,7 @@ mod tests {
             last_modified: None,
             stale_while_revalidate_secs: 0,
             must_revalidate: false,
+            headers: Vec::new(),
         };
         cache.insert("/no-ct", Bytes::from("data"), meta, 3600, 0, 100);
         let hit = cache.get("/no-ct").fresh().unwrap();
@@ -1621,6 +1749,7 @@ mod tests {
             last_modified: None,
             stale_while_revalidate_secs: 0,
             must_revalidate: false,
+            headers: Vec::new(),
         };
         cache.insert("/304", Bytes::new(), meta, 3600, 0, 100);
         let hit = cache.get("/304").fresh().unwrap();
@@ -2064,6 +2193,11 @@ mod tests {
             last_modified: Some(slice_of(40..69)),
             stale_while_revalidate_secs: 0,
             must_revalidate: false,
+            // the origin headers a hit replays are slices of the same buffer
+            headers: vec![(
+                HeaderName::from_static("content-security-policy"),
+                slice_of(100..107),
+            )],
         };
         assert!(
             !read_buffer.is_unique(),
@@ -2092,6 +2226,146 @@ mod tests {
             hit.meta.last_modified.clone().unwrap().as_bytes(),
             &[b'a'; 29][..]
         );
+        assert_eq!(hit.meta.headers[0].1.as_bytes(), &[b'a'; 7][..]);
+    }
+
+    // ── The origin headers an entry keeps (what a hit replays) ───────────────
+
+    fn response_headers(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    fn names(kept: &[(HeaderName, HeaderValue)]) -> Vec<String> {
+        kept.iter()
+            .map(|(n, v)| format!("{n}: {}", v.to_str().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn an_entry_keeps_the_end_to_end_headers_and_leaves_out_the_rest() {
+        let h = response_headers(&[
+            ("content-security-policy", "sandbox"),
+            ("content-disposition", "attachment; filename=\"upload.svg\""),
+            ("vary", "Accept-Language"),
+            ("cache-control", "public, max-age=60"),
+            ("cache-control", "no-transform"),
+            ("link", "</a.css>; rel=preload"),
+            ("link", "</b.js>; rel=preload"),
+            ("expires", "Thu, 01 Jan 2099 00:00:00 GMT"),
+            ("x-origin-thing", "1"),
+            // hop-by-hop, and the fields `Connection` names (on its second line)
+            ("connection", "close"),
+            ("connection", "X-Hop"),
+            ("x-hop", "per-connection"),
+            ("keep-alive", "timeout=5"),
+            ("transfer-encoding", "chunked"),
+            ("upgrade", "h2c"),
+            ("proxy-authenticate", "Basic"),
+            // recomputed, or kept in fields of their own
+            ("content-length", "12"),
+            ("date", "Thu, 01 Jan 2026 00:00:00 GMT"),
+            ("age", "30"),
+            ("content-type", "image/svg+xml"),
+            ("etag", "\"u1\""),
+            // one client's session
+            ("set-cookie", "sid=alice"),
+            // zion's own
+            ("x-zion-cache", "HIT"),
+            ("x-request-id", "abc"),
+            ("alt-svc", "h3=\":443\""),
+            ("strict-transport-security", "max-age=1"),
+            ("surrogate-key", "post-1"),
+            ("server", "nginx"),
+        ]);
+        assert_eq!(
+            names(&end_to_end_headers(&h)),
+            [
+                "content-security-policy: sandbox",
+                "content-disposition: attachment; filename=\"upload.svg\"",
+                "vary: Accept-Language",
+                "cache-control: public, max-age=60",
+                "cache-control: no-transform",
+                "link: </a.css>; rel=preload",
+                "link: </b.js>; rel=preload",
+                "expires: Thu, 01 Jan 2099 00:00:00 GMT",
+                "x-origin-thing: 1",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_stored_headers_are_bounded_and_counted_in_the_budget() {
+        let meta = |value_len: usize| CachedMeta {
+            headers: vec![(
+                HeaderName::from_static("x-big"),
+                HeaderValue::from_str(&"v".repeat(value_len)).unwrap(),
+            )],
+            ..default_meta()
+        };
+        let at_bound = MAX_STORED_HEADER_BYTES - "x-big".len() - 32;
+        assert!(meta(at_bound).headers_fit());
+        assert!(!meta(at_bound + 1).headers_fit());
+        // many empty fields count too
+        let flood = CachedMeta {
+            headers: (0..1100)
+                .map(|_| (HeaderName::from_static("x"), HeaderValue::from_static("")))
+                .collect(),
+            ..default_meta()
+        };
+        assert!(!flood.headers_fit());
+
+        // what an entry keeps is part of what it costs
+        let cache = StaticCache::with_byte_budget(1 << 30);
+        cache.insert("/h", Bytes::from_static(b"body"), meta(1000), 3600, 0, 0);
+        assert_eq!(
+            cache.recount(),
+            cost("/h", 4) + ("x-big".len() + 1000 + 32) as u64
+        );
+        assert_eq!(cache.recount(), cache.bytes());
+    }
+
+    #[test]
+    fn a_304_replaces_the_headers_it_carries_and_keeps_the_others() {
+        let stored = CachedMeta {
+            etag: Some(HeaderValue::from_static("\"v1\"")),
+            headers: end_to_end_headers(&response_headers(&[
+                ("cache-control", "max-age=60"),
+                ("cache-control", "must-revalidate"),
+                ("content-security-policy", "sandbox"),
+                ("expires", "Thu, 01 Jan 2099 00:00:00 GMT"),
+            ])),
+            ..default_meta()
+        };
+        let updated = stored.updated_by(&response_headers(&[
+            ("cache-control", "max-age=120"),
+            ("etag", "\"v1\""),
+            ("x-new", "1"),
+            ("content-type", "text/html"),
+            ("set-cookie", "sid=bob"),
+            ("date", "Thu, 01 Jan 2026 00:00:00 GMT"),
+        ]));
+        assert_eq!(
+            names(&updated.headers),
+            [
+                "content-security-policy: sandbox",
+                "expires: Thu, 01 Jan 2099 00:00:00 GMT",
+                "cache-control: max-age=120",
+                "x-new: 1",
+            ],
+            "both stored Cache-Control lines are replaced by the 304's; nothing else is lost"
+        );
+        assert_eq!(
+            updated.content_type, stored.content_type,
+            "the stored body's type stays"
+        );
+        assert_eq!(updated.etag, stored.etag);
     }
     // ── L1 invalidation by stripe (#525) ─────────────────────────────────────
 
