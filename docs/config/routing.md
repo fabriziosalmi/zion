@@ -169,6 +169,8 @@ The `:80` ACME fallback applies the same lists before it forwards.
 
 Bind a route to one or more `hosts` to serve different backends for different domains on the same listener — the `Host` header (HTTP/1) or `:authority` (HTTP/2) selects the route. A route **without** `hosts` is *shared*: it matches every host and acts as a fallback.
 
+A request names one host. One that names two that disagree, a request-target authority (HTTP/2 or HTTP/3 `:authority`, an HTTP/1.1 absolute-form target such as `GET http://a.example/`) together with a `Host` header for another authority, or a target authority with userinfo (`user@host`), is refused with `400` before routing, on the HTTPS and the `:80` listeners. Routing, the route's policy and the cache key go by the target's authority while the upstream is told the `Host` header, so such a request would be decided as one host and served as the other. Host and port are compared as RFC 3986 §6.2.3 has it: `A.example` and `a.example:443` name the same authority as `https://a.example/`.
+
 ```toml
 # api.example.com → API backend
 [[route]]
@@ -211,7 +213,7 @@ Authorities are normalized before matching: lowercased, port stripped (`api.exam
 
 ### Performance
 
-Host routing is **opt-in and zero-cost when unused**: with no `hosts` anywhere, lookups skip authority extraction and behave exactly as the path-only router. When active, a lookup adds one hash-map probe plus authority normalization, and the thread-local route cache is keyed on `(host, path)` so different domains never share a cache slot.
+Host routing is **opt-in and zero-cost when unused**: with no `hosts` anywhere, lookups skip authority extraction and behave exactly as the path-only router. When active, a lookup adds one hash-map probe plus authority normalization, and the thread-local route cache is keyed on `(host, path)`, compared in full on every hit, so different domains never share a cached route.
 
 ## Route modes
 

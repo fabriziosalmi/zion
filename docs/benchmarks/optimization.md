@@ -10,7 +10,7 @@ Changes made to improve throughput and latency, with rationale. Throughput claim
 | TLS connection pre-warming | Health checks reuse shared HttpClient; startup pre-warm task fires GET to all upstreams |
 | `TCP_CORK` on listener (Linux) | Batches TLS record + HTTP headers into full MSS segments |
 | Connection pool pre-warming | Fires GET to all upstreams before accept loop starts |
-| Thread-local route lookup cache | FNV hash of path maps to cached `Arc<ResolvedRoute>` (~5ns vs ~30ns radix tree) |
+| Thread-local route lookup cache | FNV hash of `(host, path)` picks the slot of a cached `Arc<ResolvedRoute>`, a hit compares the full `(host, path)` (~5ns vs ~30ns radix tree) |
 
 ## Compiler / build
 

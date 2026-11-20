@@ -10,6 +10,10 @@
 //! build the panic hook still writes its record to the last-gasp file, which is what this
 //! test watches.
 //!
+//! The same raw-frame client also pins that an h2c request whose `host` field disagrees with
+//! its `:authority` gets a 400: the HTTP/2 decoding hands zion both, and zion refuses a request
+//! that names two authorities before anything routes by one of them.
+//!
 //! Like the other binary-booting tests, a missing `openssl` (for a throwaway certificate)
 //! skips with a message.
 #![cfg(unix)]
@@ -253,5 +257,40 @@ fn a_del_byte_in_the_h2c_path_is_a_400_not_a_crash() {
     assert!(
         after.iter().any(|(s, _)| *s == 1),
         "zion still answers after it: {after:?}"
+    );
+}
+
+/// A complete `GET /` on `stream` with `:authority localhost` and a `host` field of `host`.
+/// HPACK: `:method GET` (0x82), `:scheme http` (0x86), `:path /` (0x84), `:authority` as above,
+/// then `host` as a literal with incremental indexing on static name index 38 (0x40 | 38).
+fn get_with_host(stream: u32, host: &[u8]) -> Vec<u8> {
+    assert!(host.len() < 127, "one-byte HPACK length");
+    let mut hpack = vec![0x82, 0x86, 0x84, 0x41, 9];
+    hpack.extend_from_slice(b"localhost");
+    hpack.extend_from_slice(&[0x40 | 38, host.len() as u8]);
+    hpack.extend_from_slice(host);
+    frame(HEADERS, 0x5, stream, &hpack) // END_STREAM | END_HEADERS
+}
+
+/// An h2c request whose `host` field names another authority than its `:authority` gets a 400
+/// (RFC 9113 §8.3.1 makes it malformed), and one that names the same authority in both is
+/// answered as usual. This is the HTTP/2 path end to end: h2 hands zion both fields, and the
+/// check the HTTPS pipeline runs as a gate before routing refuses the disagreement on :80 too
+/// (where the ACME fallback routes by `:authority` and forwards `host`).
+#[test]
+fn an_h2c_request_whose_host_disagrees_with_its_authority_is_a_400() {
+    let Some(zion) = Zion::start() else {
+        return;
+    };
+    let same = speak_h2c(zion.http, &get_with_host(1, b"localhost"));
+    assert!(
+        matches!(same.as_slice(), [(1, Some(first))] if *first != STATUS_400),
+        "control: the same authority in :authority and host is answered (a 301), got {same:?}"
+    );
+    let other = speak_h2c(zion.http, &get_with_host(1, b"evil.example"));
+    assert_eq!(
+        other,
+        vec![(1, Some(STATUS_400))],
+        "a host field that disagrees with :authority gets one response, a 400"
     );
 }

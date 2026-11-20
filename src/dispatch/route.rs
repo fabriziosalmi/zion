@@ -56,20 +56,24 @@ pub(super) fn resolve(
     };
     let host = host_cow.as_deref();
 
-    // Cache key folds the host in when present, so two authorities sharing a
-    // path never collide (ADR-0010 cache invariant); with no host it is the
-    // bare path hash — byte-identical to the pre-host-routing key.
+    // The hash folds the host in when present, so two authorities sharing a
+    // path take different slots; with no host it is the bare path hash. It
+    // only picks the slot: a hit also compares the full (host, path), so a
+    // crafted hash collision is a miss, never another route's policy
+    // (ADR-0010 cache invariant).
     let cache_key = route_cache_key(host, path);
 
     // Thread-local cache hit (~5ns) — touch promotes to MRU
-    if let Some(route) = ROUTE_CACHE.with(|cache| cache.borrow_mut().get(cache_key)) {
+    if let Some(route) = ROUTE_CACHE.with(|cache| cache.borrow_mut().get(cache_key, host, path)) {
         return Some(route);
     }
 
     // Radix tree fallback (~30ns)
     let route = cfg.router.at(host, path)?.clone();
     ROUTE_CACHE.with(|cache| {
-        cache.borrow_mut().insert(cache_key, route.clone());
+        cache
+            .borrow_mut()
+            .insert(cache_key, host, path, route.clone());
     });
     Some(route)
 }

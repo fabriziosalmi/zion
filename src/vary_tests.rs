@@ -3717,6 +3717,179 @@ async fn preserve_host_sends_the_clients_host_in_every_mode() {
     }
 }
 
+// ── one authority per request: the target's and the Host header must agree ───
+// Routing, the route's policy and the response-cache key read the request target's authority
+// (`security::request_host`, authority first); the upstream is told the client's `Host` header
+// (`X-Forwarded-Host`, and `Host` under `preserve_host`). A client that sends both and makes
+// them differ (an HTTP/1.1 absolute-form target plus `Host`, HTTP/2 or HTTP/3 `:authority`
+// plus a `host` field) had a request decided as one host and served as another. It is refused
+// with 400 before routing. These model the absolute-form / `:authority` request the way hyper
+// hands it over: a URI with an authority, and the `Host` header beside it.
+
+/// An origin that answers from `X-Forwarded-Host` (a multi-tenant app; Rack and Rails honour it
+/// by default) must not have its answer for one host filed under another host's cache key.
+#[tokio::test]
+async fn a_host_that_disagrees_with_the_target_authority_cannot_poison_the_cache() {
+    let (p, hits) = named_origin("O").await;
+    let st = hosts_state(
+        r#"
+[[route]]
+path = "/{*rest}"
+upstream = "o"
+mode = "static_cache"
+cache_profile = "c"
+"#,
+        &format!("o = \"http://127.0.0.1:{p}\""),
+    );
+    // Attacker: the absolute-form target names the victim's host, the Host header the
+    // attacker's. Keyed under www.victim.example, the origin would answer for attacker.example.
+    let (attacker_status, attacker_body) = body_for(
+        &st,
+        "http://www.victim.example/p",
+        &[("host", "attacker.example")],
+    )
+    .await;
+    settle().await;
+    // Victim: an ordinary HTTP/1.1 browser, origin-form target, its own host.
+    let (victim_cache, victim_body) = fetch(&st, "/p", &[("host", "www.victim.example")]).await;
+    assert_eq!(
+        victim_body, "O:www.victim.example",
+        "the victim must get the origin's answer for its own host, not one the attacker's \
+         request filed under its key (cache {victim_cache:?}; the attacker got \
+         {attacker_status} {attacker_body:?})"
+    );
+    assert_eq!(attacker_status, 400, "the disagreeing request is refused");
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        1,
+        "only the victim's request reached the origin"
+    );
+    // A target that names the same host as its Host header is served as usual.
+    assert_eq!(
+        body_for(
+            &st,
+            "http://WWW.victim.example:80/p",
+            &[("host", "www.victim.example")]
+        )
+        .await,
+        (200, "O:www.victim.example".to_string())
+    );
+}
+
+/// Two host-bound routes share one `preserve_host` backend; one host is `internal_only`. A
+/// request whose target names the open host and whose Host names the protected one must not
+/// reach the protected host with the open host's (absent) policy.
+#[tokio::test]
+async fn a_host_that_disagrees_with_the_target_authority_cannot_reach_an_internal_only_host() {
+    let (port, hits) = host_echo_origin("no-store").await;
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstream.u]
+urls = ["http://127.0.0.1:{port}"]
+preserve_host = true
+[[route]]
+path = "/{{*rest}}"
+hosts = ["public.example"]
+upstream = "u"
+mode = "standard"
+[[route]]
+path = "/{{*rest}}"
+hosts = ["admin.example"]
+upstream = "u"
+mode = "standard"
+internal_only = true
+"#
+    );
+    let st = AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"));
+    // Control: the protected host refuses this (non-internal) client, by Host or by target.
+    assert_eq!(
+        body_for(&st, "/p", &[("host", "admin.example")]).await.0,
+        403,
+        "internal_only must refuse a non-internal client"
+    );
+    assert_eq!(
+        body_for(&st, "https://admin.example/p", &[]).await.0,
+        403,
+        "and an HTTP/2 client that names it in :authority"
+    );
+    // Attack: target = the open host, Host = the protected host.
+    let (code, body) = body_for(&st, "http://public.example/p", &[("host", "admin.example")]).await;
+    assert!(
+        !body.contains("admin.example"),
+        "a request routed by the open host's policy reached the internal_only host on the \
+         shared backend (status {code}, upstream saw {body:?})"
+    );
+    assert_eq!(code, 400, "the disagreeing request is refused");
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        0,
+        "nothing reached the backend"
+    );
+    // The open host, named the same way in both, is served as itself.
+    assert_eq!(
+        body_for(
+            &st,
+            "http://public.example/p",
+            &[("host", "public.example")]
+        )
+        .await,
+        (200, "host=public.example".to_string())
+    );
+}
+
+/// The `:80` ACME fallback routes by the target's authority and forwards on its own, outside
+/// the HTTPS pipeline: it refuses a request whose Host disagrees with it the same way.
+#[tokio::test]
+async fn the_port_80_acme_fallback_refuses_a_host_that_disagrees_with_the_target_authority() {
+    let (port, hits) = host_echo_origin("no-store").await;
+    let st = preserve_state(
+        "standard",
+        &format!("\"http://127.0.0.1:{port}\""),
+        true,
+        "",
+    );
+    let on_80 = |uri: &'static str, host: &'static str| {
+        let st = st.clone();
+        async move {
+            let resp = crate::accept::handle_http(
+                get(uri, &[("host", host)]),
+                st,
+                "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+            )
+            .await
+            .unwrap();
+            let status = resp.status().as_u16();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+    assert_eq!(
+        on_80(
+            "http://other.example/.well-known/acme-challenge/tok",
+            "app.example"
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(hits.load(Ordering::Relaxed), 0, "nothing was forwarded");
+    assert_eq!(
+        on_80(
+            "http://app.example/.well-known/acme-challenge/tok",
+            "app.example"
+        )
+        .await,
+        (200, "host=app.example".to_string()),
+        "the same authority twice is forwarded as usual"
+    );
+}
+
 #[tokio::test]
 async fn preserve_host_survives_a_pool_failover() {
     let (port, _) = host_echo_origin("no-store").await;

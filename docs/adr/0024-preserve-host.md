@@ -52,7 +52,9 @@ two upstreams (or reported).
 
 The inbound `Host` header, or the HTTP/2 `:authority` when the client spoke HTTP/2, byte
 for byte (port included), like nginx `$http_host` and Traefik. It is already a valid
-header value and, when host routing is on, the authority the route matched. A request
+header value and, when host routing is on, the authority the route matched: a request
+whose `Host` names another authority than its target (`:authority`, an absolute-form
+target) is refused with `400` before routing (ADR-0010, amendment of 2026-11-20). A request
 with neither (HTTP/1.0) falls back to the upstream's authority. `X-Forwarded-Host` keeps
 being set as today, and client-supplied override headers stay scrubbed (#461).
 

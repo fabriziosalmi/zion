@@ -197,7 +197,7 @@ Client
 | `DashMap` for cache + rate limiter | Sharded concurrent map, avoids single-mutex bottleneck |
 | `FnvHashSet` for CORS origins | O(1) origin lookup vs O(n) linear scan |
 | Thread-local L1 with O(1) LRU | Index-based doubly-linked list, zero contention on cache hits |
-| Same primitive for the route LRU | Per-worker thread-local cache (cap 256). Replaces a previous "first 256 then no more inserts" map that could be locked out by a flood of distinct paths. |
+| Same primitive for the route LRU | Per-worker thread-local cache (cap 256). Replaces a previous "first 256 then no more inserts" map that could be locked out by a flood of distinct paths. The FNV hash only picks the slot: each entry keeps the `(host, path)` it was resolved for (up to 512 bytes; a longer one is not cached) and a hit compares it in full, so a crafted hash collision is a miss, never another route's policy. |
 | Generation counter for L1/L2 coherence | Stale L1 entries detected via atomic compare, no broadcast needed |
 | Singleflight via `tokio::sync::watch` | `Receiver::wait_for` inspects the current value at first poll, so a waiter that subscribes *after* the fetcher has already published completion still observes it — race that the previous `Notify`-based implementation could lose, leaving a waiter hung until the client timed out |
 | SHA-256 leaf fingerprint for mTLS forward header | Replaces a 64-bit XOR-fold (which produced massive collision classes) emitted as `X-Client-Cert-DN`. Header renamed to `X-Client-Cert-Fingerprint` and prefixed `sha256:`; ACL via fingerprint is now safe. |

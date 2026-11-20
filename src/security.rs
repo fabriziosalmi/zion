@@ -433,6 +433,53 @@ pub fn request_host<B>(req: &hyper::Request<B>) -> Option<Cow<'_, str>> {
         .and_then(normalize_host)
 }
 
+/// Whether a request names its authority twice and the two disagree, so that it cannot be
+/// served as one host: a request-target authority (HTTP/2 and HTTP/3 `:authority`, an
+/// HTTP/1.1 absolute-form target) with a `Host` header that names another authority, or a
+/// target authority that carries userinfo (`user@host`).
+///
+/// Routing, the route's policy (`internal_only`, auth, WAF) and the response-cache key read
+/// the target's authority first ([`request_host`]); the upstream is told the `Host` header,
+/// in `X-Forwarded-Host` and, with `preserve_host`, as `Host`. A request for which the two
+/// differ was decided as one host and served as another, so it is refused before routing.
+/// RFC 9113 §8.3.1 and RFC 9114 §4.3.1 make such an HTTP/2 or HTTP/3 request malformed;
+/// for HTTP/1.1, RFC 9112 §3.2.2 has a server answer from the target alone, and refusing
+/// instead also keeps the authority a client wrote in an absolute-form target from ever
+/// reaching the upstream. RFC 9110 §4.2.4 has a recipient treat userinfo in an `http(s)`
+/// target as an error; `request_host` cannot route it (`user@host` is not a host), while
+/// the upstream would be told it as the host.
+///
+/// The comparison is the scheme-based one RFC 9113 asks of an intermediary (RFC 3986
+/// §6.2.3): the host without regard to case, and an absent port equal to the scheme's
+/// default. A request without a target authority (HTTP/1.1 origin-form) has nothing to
+/// compare and is never refused here; the `Host` rules for it live in `accept`.
+pub fn authority_is_ambiguous<B>(req: &hyper::Request<B>) -> bool {
+    use hyper::http::uri::Authority;
+    let Some(target) = req.uri().authority() else {
+        return false;
+    };
+    if target.as_str().contains('@') {
+        return true;
+    }
+    let default_port = match req.uri().scheme_str() {
+        Some(s) if s.eq_ignore_ascii_case("https") => Some(443),
+        Some(s) if s.eq_ignore_ascii_case("http") => Some(80),
+        _ => None,
+    };
+    let port = |a: &Authority| a.port_u16().or(default_port);
+    req.headers()
+        .get_all(hyper::header::HOST)
+        .iter()
+        .any(|host| match Authority::try_from(host.as_bytes()) {
+            Ok(host) => {
+                host.as_str().contains('@')
+                    || !host.host().eq_ignore_ascii_case(target.host())
+                    || port(&host) != port(target)
+            }
+            Err(_) => true,
+        })
+}
+
 /// Check if an IP is internal (loopback, private RFC1918, link-local).
 #[inline]
 pub fn is_internal_ip(ip: &std::net::IpAddr) -> bool {
@@ -1472,6 +1519,59 @@ mod normalize_host_tests {
         // A bare (illegal) IPv6 literal must not be mangled by the port splitter
         // into a truncated key — it stays intact and simply misses the host map.
         assert_eq!(normalize_host("::1").as_deref(), Some("::1"));
+    }
+
+    fn with_hosts(uri: &str, hosts: &[&str]) -> hyper::Request<()> {
+        let mut b = hyper::Request::builder().uri(uri);
+        for h in hosts {
+            b = b.header(hyper::header::HOST, *h);
+        }
+        b.body(()).unwrap()
+    }
+
+    /// Each row: request target, `Host` header lines, whether the request names two
+    /// authorities that disagree. The comparison is scheme-based (RFC 3986 §6.2.3): the host
+    /// without regard to case, an absent port equal to the scheme's default.
+    #[test]
+    fn a_host_that_names_another_authority_than_the_target_is_ambiguous() {
+        use super::authority_is_ambiguous;
+        let cases: &[(&str, &[&str], bool)] = &[
+            // origin-form: nothing to compare (the Host rules for it live in `accept`)
+            ("/p", &["a.example"], false),
+            ("/p", &[], false),
+            // a target authority alone (an HTTP/2 or HTTP/3 request without `host`)
+            ("https://a.example/p", &[], false),
+            // the same authority twice
+            ("https://a.example/p", &["a.example"], false),
+            ("https://a.example/p", &["A.Example"], false),
+            ("https://a.example/p", &["a.example:443"], false),
+            ("https://a.example:443/p", &["a.example"], false),
+            ("http://a.example/p", &["a.example:80"], false),
+            ("https://a.example:8443/p", &["a.example:8443"], false),
+            ("https://[::1]:8443/p", &["[::1]:8443"], false),
+            ("https://a.example/p", &["a.example", "a.example"], false),
+            // two different authorities
+            ("https://a.example/p", &["b.example"], true),
+            ("http://public.example/p", &["admin.example"], true),
+            ("https://a.example/p", &["a.example:8443"], true),
+            ("https://a.example:8443/p", &["a.example"], true),
+            ("http://a.example/p", &["a.example:443"], true),
+            ("https://a.example/p", &["a.example."], true),
+            ("https://a.example/p", &["a.example", "b.example"], true),
+            // a `Host` that is not an authority, or carries userinfo
+            ("https://a.example/p", &["a example"], true),
+            ("https://a.example/p", &["u@a.example"], true),
+            // userinfo in the target: an error on its own (RFC 9110 §4.2.4)
+            ("https://u@a.example/p", &[], true),
+            ("https://u@a.example/p", &["a.example"], true),
+        ];
+        for (uri, hosts, want) in cases {
+            assert_eq!(
+                authority_is_ambiguous(&with_hosts(uri, hosts)),
+                *want,
+                "{uri} with Host {hosts:?}"
+            );
+        }
     }
 }
 

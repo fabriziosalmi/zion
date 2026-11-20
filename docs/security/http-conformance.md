@@ -38,7 +38,8 @@ token are stripped before the upstream. Ordinary end-to-end headers are forwarde
 | Form | Behaviour |
 |---|---|
 | origin-form (`/path`) | forwarded |
-| absolute-form (`http://host/path`) | accepted and re-framed to origin-form upstream; the absolute URI and its authority never reach the upstream |
+| absolute-form (`http://host/path`) naming the same authority as `Host` | accepted and re-framed to origin-form upstream; the absolute URI never reaches the upstream |
+| absolute-form naming another authority than `Host` | refused (`400`), never forwarded (pinned in the smuggling corpus, case 8) |
 | asterisk-form (`OPTIONS *`) | refused (`404`), never forwarded |
 | authority-form (`CONNECT host:port`) | refused (`405`), never forwarded |
 
@@ -48,6 +49,13 @@ token are stripped before the upstream. Ordinary end-to-end headers are forwarde
 |---|---|
 | default | rewritten to the upstream authority; the client's original `Host` is carried in `X-Forwarded-Host` |
 | `preserve_host = true` | the client's `Host` is forwarded as-is (HTTP/1.1 only) |
+
+A `Host` that names another authority than the request target (an absolute-form target, or
+an HTTP/2 or HTTP/3 `:authority`) is refused with `400` before routing, on every route, so the
+`Host` forwarded is always the host the request was routed, checked and cache-keyed as. With
+the real binary this is asserted for HTTP/1.1 on the TLS listener (smuggling corpus, case 8)
+and for HTTP/2 over h2c on `:80` (`tests/h2c_redirect_panic.rs`); the in-process pipeline
+tests cover the HTTPS gate for every protocol.
 
 ## Expect: 100-continue
 

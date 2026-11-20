@@ -103,6 +103,41 @@ no port; lowercased at load. `(host, path)` collisions are rejected per
 host-group (the same `path` may legitimately recur across different hosts and
 in the shared layer). An empty-string host is rejected.
 
+## Amendment (2026-11-20): one authority per request, and a hit compares the full key
+
+Two ways around the two load-bearing risks above were found and closed.
+
+**The precedence alone did not settle Host against `:authority`.** Routing, the
+route's policy and the response-cache key took the URI authority first, but the
+forwarding path re-surfaced the `Host` header in `X-Forwarded-Host` (and, with
+`preserve_host`, as `Host`). A client that sent both and made them differ (an
+HTTP/1.1 absolute-form target plus `Host`, HTTP/2 `:authority` plus a `host`
+field) had its request decided as one host and served as another: it reached an
+`internal_only` vhost through an open host's route on a shared backend, and
+filed an origin's answer for one host under another host's cache key. A request
+that names two authorities that disagree (compared as RFC 3986 §6.2.3 has it:
+host case-insensitive, an absent port equal to the scheme's default), or a target
+authority with userinfo, is now refused with `400` by a pre-routing gate (after
+the method whitelist) and by the same check on the `:80` handler. RFC 9113 §8.3.1
+and RFC 9114 §4.3.1 make such an HTTP/2 or HTTP/3 request malformed. For
+HTTP/1.1, RFC 9112 §3.2.2 would let the server answer from the target alone and
+forward that authority; refusing was preferred because it keeps the authority a
+client wrote in an absolute-form target from ever reaching the upstream (the
+#697 corpus invariant) and leaves nothing else that reads `Host` (WAF rules, the
+access log) looking at a different host than routing did.
+
+**The cache key was a hash, not the key.** The cache invariant above was
+enforced by folding the host into an unseeded 64-bit FNV hash, and a hit
+returned whatever the slot held. FNV is public: a colliding pair of paths can be
+computed offline (the pair in the regression test came from a distinguished-point
+search, about 20 seconds of wall time on six threads), and the second path of the
+pair was then served under the first path's cached route. Each entry now keeps the `(host, path)` it was resolved for and a
+hit compares it in full; a collision is a miss and the radix tree answers. The
+key is kept in one allocation, and a key over 512 bytes is not cached, which
+bounds what a flood of long distinct paths makes a worker thread hold. A seeded
+hash was not added: with the full compare it would change only which pairs
+share a slot, not whether a hit can be wrong.
+
 ## Alternatives considered
 
 - **Combined `/host/path` radix key (single tree).** Encode the host as a path

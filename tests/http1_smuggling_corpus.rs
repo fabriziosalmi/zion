@@ -372,11 +372,23 @@ fn no_desync_form_smuggles_a_request_past_zion() {
         origin_bytes(&seen)
     );
 
-    // 8. an absolute-form target that names a foreign authority is re-framed to origin-form; the
-    // foreign authority never reaches the upstream, and the path is forwarded faithfully.
+    // 8. an absolute-form target that names another authority than the Host header is refused
+    // with 400 and never forwarded: routing, the route's policy and the cache key go by the
+    // target's authority while the upstream is told the Host header, so a request that names
+    // two hosts would be decided as one and served as the other.
     let line = send_raw(
         port,
-        b"GET http://evil.example/abs8 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n",
+        b"GET http://evil.example/abs8-foreign HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        line.starts_with("HTTP/1.1 400"),
+        "an absolute-form target that disagrees with Host must be refused with 400: {line:?}"
+    );
+    // 8a. one that names the same authority as Host is re-framed to origin-form; the absolute URI
+    // never reaches the upstream, and the path is forwarded faithfully.
+    let line = send_raw(
+        port,
+        b"GET http://A.example:80/abs8 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n",
     );
     assert!(
         !line.is_empty() && !line.contains(" 5"),
@@ -389,8 +401,8 @@ fn no_desync_form_smuggles_a_request_past_zion() {
     );
     let upstream = origin_bytes(&seen);
     assert!(
-        !upstream.contains("evil.example"),
-        "the absolute-form authority leaked to the upstream:\n{upstream}"
+        !upstream.contains("/abs8-foreign") && !upstream.contains("evil.example"),
+        "the request that named a foreign authority reached the upstream:\n{upstream}"
     );
     assert!(
         !upstream.to_ascii_lowercase().contains("http://"),
