@@ -37,7 +37,8 @@ pub(super) async fn run(
         return Ok(req);
     }
     // hyper knows the length of an HTTP/1.1 body from `Content-Length` and of an HTTP/2 one
-    // from the header too, and holds the body to it. The header alone is a claim (HTTP/3).
+    // from the header too, and holds the body to it. An HTTP/3 body reports no length, and the
+    // HTTP/3 listener holds it to its header (a body that does not match it ends broken).
     let known = req.body().size_hint().exact();
     if let Some(cap) = rule.body_cap {
         let declared = known.or_else(|| content_length(req.headers()));

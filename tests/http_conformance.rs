@@ -1006,6 +1006,179 @@ fn http2_parity_status_and_vary_passthrough() {
     eprintln!("=== end matrix ===\n");
 }
 
+/// Accepts the suite's self-signed certificate.
+#[derive(Debug)]
+struct AnyCert;
+impl rustls::client::danger::ServerCertVerifier for AnyCert {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// One HTTP/2 POST of `body` whose HEADERS carry one `content-length` line per entry of
+/// `declared`, as written: hyper's h2 client adds no length to a request that has one, and an
+/// empty body ends the stream with the HEADERS. zion's status, or 0 when the stream failed.
+async fn h2_post_declaring(port: u16, path: &str, declared: &[&str], body: &'static [u8]) -> u16 {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let mut cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCert))
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            tcp,
+        )
+        .await
+        .unwrap();
+    let (mut send, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(tls),
+    )
+    .await
+    .unwrap();
+    tokio::spawn(conn);
+    let mut req = hyper::Request::post(format!("https://localhost{path}"));
+    for value in declared {
+        req = req.header("content-length", *value);
+    }
+    let req = req
+        .body(http_body_util::Full::new(bytes::Bytes::from_static(body)))
+        .unwrap();
+    match send.send_request(req).await {
+        Ok(resp) => resp.status().as_u16(),
+        Err(_) => 0,
+    }
+}
+
+/// The `content-length` lines of the head the origin recorded for `POST /<marker>`.
+fn origin_content_lengths(seen: &Arc<Mutex<Vec<String>>>, marker: &str) -> Vec<String> {
+    let start = format!("POST /{marker} ");
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|h| h.lines().next().is_some_and(|l| l.starts_with(&start)))
+        .flat_map(|h| {
+            h.lines()
+                .skip(1)
+                .filter_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().to_string())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[test]
+fn http2_content_length_is_one_valid_length_and_is_reframed_from_the_body() {
+    if !have_openssl() {
+        common::skip("http_conformance slice 4: openssl not installed");
+        return;
+    }
+    let dir = tempdir();
+    let (origin_port, seen) = origin();
+    let (_zion, port) = start(&dir, origin_port);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let post = |path: &str, declared: &[&str], body: &'static [u8]| {
+        rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                h2_post_declaring(port, path, declared, body),
+            )
+            .await
+            .unwrap_or(0)
+        })
+    };
+
+    let mut matrix: Vec<(String, String)> = Vec::new();
+    let mut record = |case: &str, outcome: String| matrix.push((case.to_string(), outcome));
+
+    // ---- Refused: lines that do not declare one length (RFC 9113 §8.1.1) ----
+    // h2 checks only the first line against the DATA frames; the rest went upstream as written,
+    // so `0` then `1000` on a request that ended with its headers told the upstream to wait for
+    // 1000 bytes zion never sent.
+    for (marker, declared, body) in [
+        ("h2cl-zero-then-1000", &["0", "1000"][..], &b""[..]),
+        ("h2cl-5-then-1000", &["5", "1000"], b"hello"),
+        ("h2cl-5-then-nan", &["5", "five"], b"hello"),
+    ] {
+        let c = post(&format!("/{marker}"), declared, body);
+        let saw = origin_saw_method(&seen, "POST", marker);
+        record(
+            &format!("h2 Content-Length {declared:?}"),
+            format!("zion {c}, forwarded ({saw})"),
+        );
+        assert_eq!(
+            c, 400,
+            "{declared:?}: an HTTP/2 request with these lines is malformed"
+        );
+        assert!(
+            !saw,
+            "{declared:?}: the malformed request reached the upstream"
+        );
+    }
+
+    // ---- Re-framed: the upstream gets one length, the one of the body zion sends ----
+    for (marker, declared) in [("h2cl-once", &["5"][..]), ("h2cl-twice", &["5", "5"])] {
+        let c = post(&format!("/{marker}"), declared, b"hello");
+        assert!(origin_saw_method(&seen, "POST", marker), "{marker}");
+        let forwarded = origin_content_lengths(&seen, marker);
+        record(
+            &format!("h2 Content-Length {declared:?}"),
+            format!("zion {c}, upstream Content-Length {forwarded:?}"),
+        );
+        assert_eq!(c, 200, "{declared:?}");
+        assert_eq!(
+            forwarded,
+            ["5"],
+            "{declared:?}: one line, the body's length"
+        );
+    }
+
+    eprintln!("\n=== HTTP conformance matrix (slice 4: HTTP/2 Content-Length) ===");
+    for (case, outcome) in &matrix {
+        eprintln!("  {case:30}  {outcome}");
+    }
+    eprintln!("=== end matrix ===\n");
+}
+
 /// How many requests the origin recorded whose start-line begins with `prefix`.
 fn origin_count(seen: &Arc<Mutex<Vec<String>>>, prefix: &str) -> usize {
     seen.lock()

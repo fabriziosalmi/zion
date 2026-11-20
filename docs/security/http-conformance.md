@@ -92,6 +92,15 @@ status is passed through unchanged on both HTTP/1.1 and HTTP/2 for 2xx, 3xx, 4xx
 5xx (an origin `5xx` is forwarded, not rewritten to `502`, which is reserved for a
 dead upstream).
 
+| HTTP/2 request | Behaviour |
+|---|---|
+| `content-length` lines that do not declare one valid length (`0` then `1000`, `5` then `1000`, `5` then `five`) | malformed (RFC 9113 §8.1.1): refused with `400` before routing, never forwarded |
+| one valid length, on one line or repeated (`5`, or `5` and `5`) | forwarded with one `Content-Length`: the length of the body Zion sends |
+
+The `Content-Length` Zion sends upstream always comes from the body it sends, on every
+protocol; the client's lines are never copied. h2 checks only the first `content-length`
+line against the DATA frames, so a second line used to reach the upstream as written.
+
 ## Caching and `Vary`
 
 A `cache_profile` route caches a `GET 200`. When the upstream marks a response
@@ -110,4 +119,11 @@ requires before a client (a browser) completes the handshake.
 ## Not yet pinned
 
 `1xx` interim responses other than `100 Continue` (for example `103 Early Hints`),
-multi-range requests, and HTTP/3 parity are not yet covered by the suite.
+multi-range requests, and HTTP/3 parity are not yet covered by the suite. HTTP/3 request
+bodies are pinned apart, by
+[`tests/h3_request_body.rs`](https://github.com/fabriziosalmi/zion/blob/master/tests/h3_request_body.rs)
+(needs `--features http3`). `content-length` lines that do not declare one length are
+refused with `400` before routing; a body shorter or longer than its `Content-Length` is
+refused with `400` and never reaches the upstream as a whole body: a route that reads it
+first (a WAF, `require_content_length`) forwards nothing, and a streamed one aborts the
+upstream request (RFC 9114 §4.1.2; h3 checks neither).

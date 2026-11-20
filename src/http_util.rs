@@ -287,6 +287,88 @@ mod connection_listed_tests {
     }
 }
 
+/// A request's `Content-Length` lines do not declare one length: a value that is not a decimal
+/// number, or two values that differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InvalidContentLength;
+
+/// The body length a request's `Content-Length` declares (RFC 9110 §8.6): `None` without the
+/// header, `Err` when its lines do not agree on one valid decimal value. Lines and
+/// comma-separated elements that all repeat the same value declare that value, which is how
+/// hyper reads an HTTP/1.1 request; hyper refuses any other HTTP/1.1 request itself. h2 checks
+/// only the first line of an HTTP/2 request against its DATA frames and h3 checks none, so the
+/// HTTP/2 and HTTP/3 listeners ask this before a request goes on.
+pub(crate) fn content_length(
+    headers: &hyper::HeaderMap,
+) -> Result<Option<u64>, InvalidContentLength> {
+    let mut declared = None;
+    for line in headers.get_all(hyper::header::CONTENT_LENGTH) {
+        let line = line.to_str().map_err(|_| InvalidContentLength)?;
+        for element in line.split(',') {
+            let element = element.trim();
+            if element.is_empty() || !element.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(InvalidContentLength);
+            }
+            let len: u64 = element.parse().map_err(|_| InvalidContentLength)?;
+            match declared {
+                None => declared = Some(len),
+                Some(seen) if seen == len => {}
+                Some(_) => return Err(InvalidContentLength),
+            }
+        }
+    }
+    Ok(declared)
+}
+
+#[cfg(test)]
+mod content_length_tests {
+    use super::{content_length, InvalidContentLength};
+    use hyper::HeaderMap;
+
+    fn lines(values: &[&str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for v in values {
+            h.append(hyper::header::CONTENT_LENGTH, v.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn one_length_however_often_it_is_repeated() {
+        assert_eq!(content_length(&lines(&[])), Ok(None));
+        assert_eq!(content_length(&lines(&["0"])), Ok(Some(0)));
+        assert_eq!(content_length(&lines(&["1000"])), Ok(Some(1000)));
+        assert_eq!(content_length(&lines(&["5", "5"])), Ok(Some(5)));
+        assert_eq!(content_length(&lines(&["5, 5", "5"])), Ok(Some(5)));
+        assert_eq!(
+            content_length(&lines(&["18446744073709551615"])),
+            Ok(Some(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn lines_that_disagree_or_are_not_a_number_declare_no_length() {
+        for bad in [
+            &["0", "1000"][..],
+            &["5", "7"],
+            &["5, 7"],
+            &["5", "abc"],
+            &["-1"],
+            &["+5"],
+            &["0x10"],
+            &["5,"],
+            &[""],
+            &["18446744073709551616"],
+        ] {
+            assert_eq!(
+                content_length(&lines(bad)),
+                Err(InvalidContentLength),
+                "{bad:?}"
+            );
+        }
+    }
+}
+
 /// A URL without the `user:pass@` of its authority. Upstream URLs may carry basic-auth
 /// credentials, and they are written to metric labels, the JSON snapshot, the logs and
 /// config error messages: none of those may show them.

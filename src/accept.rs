@@ -549,6 +549,9 @@ fn spawn_https_handler(
                     if http1_host_is_wrong(&req) {
                         return Ok(bad_request_and_close());
                     }
+                    if http2_content_length_is_wrong(&req) {
+                        return Ok(text_response(StatusCode::BAD_REQUEST, "bad request"));
+                    }
                     // RFC 9110 §7.6.1: headers named in `Connection` are not for the next hop.
                     // Before the attestations below, so nothing zion sets can be named away.
                     crate::http_util::strip_connection_listed(req.headers_mut());
@@ -609,6 +612,16 @@ fn http1_host_is_wrong<B>(req: &Request<B>) -> bool {
     }
 }
 
+/// Whether an HTTP/2 request breaks RFC 9113 §8.1.1 on `Content-Length`: lines that do not
+/// declare one valid length. Such a request is malformed and an intermediary must not forward
+/// it. h2 checks only the first `content-length` line against the DATA frames, so a second line
+/// with another value (`0` then `1000` on a request that ended with its headers) reached the
+/// upstream as written. hyper refuses such an HTTP/1.1 request itself.
+fn http2_content_length_is_wrong<B>(req: &Request<B>) -> bool {
+    req.version() == hyper::Version::HTTP_2
+        && crate::http_util::content_length(req.headers()).is_err()
+}
+
 /// A 400 that also ends the connection: a client that sends a request the protocol forbids is not
 /// one whose next request on the same connection is worth parsing.
 fn bad_request_and_close() -> Response<ZionBody> {
@@ -666,6 +679,30 @@ mod host_tests {
         assert!(!http1_host_is_wrong(&req(Version::HTTP_10, &[])));
         assert!(!http1_host_is_wrong(&req(Version::HTTP_2, &[])));
         assert!(!http1_host_is_wrong(&req(Version::HTTP_3, &[])));
+    }
+
+    fn with_content_length(version: Version, values: &[&str]) -> Request<()> {
+        let mut b = Request::builder().version(version).method("POST").uri("/p");
+        for v in values {
+            b = b.header("content-length", *v);
+        }
+        b.body(()).unwrap()
+    }
+
+    #[test]
+    fn an_http2_request_needs_one_valid_content_length_when_it_has_any() {
+        use super::http2_content_length_is_wrong as wrong;
+        for ok in [&[][..], &["0"], &["1000"], &["5", "5"]] {
+            assert!(!wrong(&with_content_length(Version::HTTP_2, ok)), "{ok:?}");
+        }
+        for bad in [&["0", "1000"][..], &["5", "abc"], &["5, 7"]] {
+            assert!(wrong(&with_content_length(Version::HTTP_2, bad)), "{bad:?}");
+            // HTTP/1.1 framing is hyper's, which refuses these before zion sees them
+            assert!(
+                !wrong(&with_content_length(Version::HTTP_11, bad)),
+                "{bad:?}"
+            );
+        }
     }
 }
 

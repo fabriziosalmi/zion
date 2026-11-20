@@ -5,6 +5,11 @@
 //! WAF), reads it first (a WAF) or reads it to give it a length (`require_content_length`). A body
 //! that arrives whole still reaches the upstream whole.
 //!
+//! The same holds for a body that does not match its `Content-Length` (h3 checks neither the
+//! header nor the DATA against it): shorter, longer, or declared by lines that disagree, it is
+//! refused and never forwarded with a length it does not have, which on a pooled keep-alive
+//! upstream connection made the upstream read the next request as the rest of the body.
+//!
 //! Needs `--features http3` (CI's all-features test job) and `openssl` (skipped without).
 #![cfg(all(unix, feature = "http3"))]
 
@@ -261,6 +266,13 @@ async fn h3_post(port: u16, path: &str, reset: bool) -> Option<u16> {
 /// finished immediately with no DATA frame (HEADERS carrying FIN). Returns the client-visible
 /// status, or None if the request was rejected at the stream level (#697 form 9).
 async fn h3_headers_fin_with_cl(port: u16, path: &str, declared: usize) -> Option<u16> {
+    h3_post_declaring(port, path, &[&declared.to_string()], 0).await
+}
+
+/// POST over HTTP/3 whose HEADERS carry one `content-length` line per entry of `declared`, then
+/// `sent` bytes of DATA (none: the stream ends right after the HEADERS) and FIN, whatever the
+/// lines say. Returns the client-visible status, or None if the request got no response.
+async fn h3_post_declaring(port: u16, path: &str, declared: &[&str], sent: usize) -> Option<u16> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut tls = rustls::ClientConfig::builder()
         .dangerous()
@@ -281,14 +293,17 @@ async fn h3_headers_fin_with_cl(port: u16, path: &str, declared: usize) -> Optio
     let _drive = tokio::spawn(async move {
         let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
     });
-    let req = hyper::Request::post(format!("https://localhost{path}"))
-        .header("content-type", "application/octet-stream")
-        .header("content-length", declared.to_string())
-        .body(())
-        .unwrap();
-    let mut stream = send.send_request(req).await.ok()?;
-    // Finish the stream with no DATA: the headers promised `declared` bytes that never come.
-    stream.finish().await.ok()?;
+    let mut req = hyper::Request::post(format!("https://localhost{path}"))
+        .header("content-type", "application/octet-stream");
+    for value in declared {
+        req = req.header("content-length", *value);
+    }
+    let mut stream = send.send_request(req.body(()).unwrap()).await.ok()?;
+    if sent > 0 {
+        // zion may stop reading once it has seen the body is too long: the answer still comes
+        let _ = stream.send_data(bytes::Bytes::from(vec![b'a'; sent])).await;
+    }
+    let _ = stream.finish().await;
     let resp = stream.recv_response().await.ok()?;
     Some(resp.status().as_u16())
 }
@@ -450,6 +465,322 @@ async fn a_h3_header_section_over_16_kib_is_not_served() {
     assert!(
         matches!(&big, Ok(431)) || matches!(&big, Err(e) if e.contains("16384")),
         "a 20 KiB header section is refused (431, or the client refuses on zion's 16384): {big:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// What an nginx-like upstream made of one request on a keep-alive connection: the path and
+/// `Content-Length` of the head zion wrote, then the bytes it drained as that declared body.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // `eof` is evidence, read only through the Debug of a failed assertion
+struct DesyncSeen {
+    path: String,
+    declared: usize,
+    received: usize,
+    body_prefix: String,
+    eof: bool,
+}
+
+/// An HTTP/1.1 keep-alive upstream that answers a request BEFORE it reads the declared body,
+/// then drains `Content-Length` bytes before it parses the next request: nginx's static and
+/// `discard_body` path, Node/llhttp's `req._dump`, h11's auto-drain. It hands zion a response
+/// while it still expects the body it was promised, so a head that declares more than zion
+/// sends leaves the pooled connection reading the next request as that body.
+fn nginx_like_upstream(seen: Arc<Mutex<Vec<DesyncSeen>>>) -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in l.incoming().flatten() {
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                // Give up draining after 3 s so a desynced connection records and ends rather
+                // than hanging the test; a well-framed body of this size arrives at once.
+                let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    match r.read_line(&mut line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                    let path = line.split_whitespace().nth(1).unwrap_or("?").to_string();
+                    let mut declared = 0usize;
+                    loop {
+                        let mut h = String::new();
+                        match r.read_line(&mut h) {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        if h == "\r\n" {
+                            break;
+                        }
+                        let h = h.to_ascii_lowercase();
+                        if let Some(v) = h.strip_prefix("content-length:") {
+                            declared = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    // Answer first: zion gets its 2xx and returns the connection to its idle pool.
+                    {
+                        let mut w = s.try_clone().unwrap();
+                        let _ = w.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+                    }
+                    // Only now drain the body the head declared. On a well-framed request these
+                    // are this request's own bytes; on a desynced connection, the NEXT request.
+                    let mut drained: Vec<u8> = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    let mut eof = false;
+                    while drained.len() < declared {
+                        let want = (declared - drained.len()).min(buf.len());
+                        match r.read(&mut buf[..want]) {
+                            Ok(0) => {
+                                eof = true;
+                                break;
+                            }
+                            Ok(k) => drained.extend_from_slice(&buf[..k]),
+                            Err(_) => break, // read timeout: nothing (more) came
+                        }
+                    }
+                    let body_prefix =
+                        String::from_utf8_lossy(&drained[..drained.len().min(96)]).into_owned();
+                    seen.lock().unwrap().push(DesyncSeen {
+                        path,
+                        declared,
+                        received: drained.len(),
+                        body_prefix,
+                        eof,
+                    });
+                    // What the test needs is recorded; do not parse past a body.
+                    if declared > 0 {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// Send an HTTP/3 POST of `n` body bytes to `path` and finish the stream, without reading the
+/// response: the test reads what the upstream made of it, whatever the upstream answered.
+async fn h3_send_body_no_wait(port: u16, path: &str, n: usize) {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let mut tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCert))
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let qc = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(qc)));
+    let conn = ep
+        .connect(format!("127.0.0.1:{port}").parse().unwrap(), "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn))
+        .await
+        .unwrap();
+    let _drive = tokio::spawn(async move {
+        let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+    let req = hyper::Request::post(format!("https://localhost{path}"))
+        .header("content-type", "application/octet-stream")
+        .body(())
+        .unwrap();
+    let mut stream = send.send_request(req).await.unwrap();
+    stream
+        .send_data(bytes::Bytes::from(vec![b'B'; n]))
+        .await
+        .unwrap();
+    stream.finish().await.unwrap();
+    // Let zion collect the body and write it to the upstream.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
+
+/// An HTTP/3 request to a WAF route whose HEADERS declare `content-length: 1000` and whose stream
+/// ends with no DATA. The WAF buffered the empty body and the client's `content-length: 1000`
+/// was forwarded with it: hyper wrote no body bytes and returned the connection to its pool,
+/// and the next request on it was drained by the upstream as the missing 1000 bytes (request
+/// smuggling from zion into the upstream). The request is now refused, and the upstream reads
+/// the next request on its own framing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_h3_body_shorter_than_its_content_length_is_refused_and_the_upstream_stays_in_sync() {
+    let dir = std::env::temp_dir().join(format!(
+        "zion-h3-desync-{}-{}",
+        std::process::id(),
+        free_port()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let Some((_daemon, port)) = boot(&dir, nginx_like_upstream(seen.clone())) else {
+        return;
+    };
+
+    // Request 1: WAF route, HEADERS declare content-length: 1000, the stream ends with no DATA.
+    let status = tokio::time::timeout(
+        Duration::from_secs(10),
+        h3_headers_fin_with_cl(port, "/waf/x", 1000),
+    )
+    .await
+    .expect("zion hung on a WAF-route HEADERS+FIN request that declared a Content-Length");
+
+    // Request 2: another WAF-route request, on the connection request 1 would have left idle.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    h3_send_body_no_wait(port, "/waf/y", 1000).await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let recorded = loop {
+        let recorded = seen.lock().unwrap().clone();
+        if recorded
+            .iter()
+            .any(|s| s.path == "/waf/y" || s.body_prefix.contains("/waf/y"))
+        {
+            break recorded;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the upstream never recorded the /waf/y request: {recorded:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // A proxy declares only the length it sends: request 1 sent no body.
+    for req1 in recorded.iter().filter(|s| s.path == "/waf/x") {
+        assert_eq!(
+            req1.declared, 0,
+            "zion forwarded content-length: {} for an HTTP/3 request it sent with an EMPTY body, \
+             and the upstream read the next request as that body: {req1:?}",
+            req1.declared
+        );
+    }
+    // The next request on the connection is read on its own framing, whole.
+    let req2: Vec<&DesyncSeen> = recorded.iter().filter(|s| s.path == "/waf/y").collect();
+    assert!(
+        req2.len() == 1
+            && req2[0].declared == 1000
+            && req2[0].received == 1000
+            && req2[0].body_prefix.bytes().all(|b| b == b'B'),
+        "the request after it did not reach the upstream whole: {recorded:?}"
+    );
+    // And the malformed request is refused, never forwarded: RFC 9114 §4.1.2.
+    assert_eq!(
+        status,
+        Some(400),
+        "a body short of its Content-Length is a malformed request: {recorded:?}"
+    );
+    assert!(
+        recorded.iter().all(|s| s.path != "/waf/x"),
+        "the malformed request reached the upstream: {recorded:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A body longer than its `Content-Length`: refused on every route, and never handed on as a
+/// whole body of either length. Streamed or buffered by the WAF, hyper cut it at the declared
+/// 10 bytes and the upstream took that prefix as the whole body; `require_content_length`
+/// rewrote the length and sent all 1000.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_h3_body_longer_than_its_content_length_is_refused() {
+    let dir = std::env::temp_dir().join(format!(
+        "zion-h3-long-{}-{}",
+        std::process::id(),
+        free_port()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let Some((_daemon, port)) = boot(&dir, upstream(seen.clone())) else {
+        return;
+    };
+
+    for path in ["/open/long", "/waf/long", "/framed/long"] {
+        let status = tokio::time::timeout(
+            Duration::from_secs(10),
+            h3_post_declaring(port, path, &["10"], 1000),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{path}: zion hung on a body longer than its Content-Length"));
+        std::thread::sleep(Duration::from_millis(300));
+        let whole: Vec<Seen> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.path == path && s.complete)
+            .cloned()
+            .collect();
+        assert!(
+            whole.is_empty(),
+            "{path}: the upstream took a body that did not match its Content-Length as a whole \
+             one: {whole:?}"
+        );
+        assert_eq!(status, Some(400), "{path}");
+    }
+
+    // the same request with the length it has goes through whole
+    assert_eq!(
+        h3_post_declaring(port, "/waf/fits", &["1000"], 1000).await,
+        Some(200)
+    );
+    let fits: Vec<Seen> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.path == "/waf/fits")
+        .cloned()
+        .collect();
+    assert!(
+        fits.len() == 1 && fits[0].complete && fits[0].received == 1000,
+        "{fits:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `Content-Length` lines that do not declare one length (`0` then `1000`, or a value that is no
+/// number) make the request malformed: refused before routing, never forwarded. They went to
+/// the upstream as written, next to whatever body zion sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_h3_request_whose_content_length_lines_disagree_is_refused() {
+    let dir = std::env::temp_dir().join(format!(
+        "zion-h3-cl-lines-{}-{}",
+        std::process::id(),
+        free_port()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let Some((_daemon, port)) = boot(&dir, upstream(seen.clone())) else {
+        return;
+    };
+
+    for (path, declared, sent) in [
+        ("/open/two", &["0", "1000"][..], 0),
+        ("/waf/two", &["0", "1000"], 0),
+        ("/waf/nan", &["5", "five"], 5),
+    ] {
+        let status = tokio::time::timeout(
+            Duration::from_secs(10),
+            h3_post_declaring(port, path, declared, sent),
+        )
+        .await
+        .unwrap_or(None);
+        std::thread::sleep(Duration::from_millis(200));
+        let reached: Vec<Seen> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.path == path)
+            .cloned()
+            .collect();
+        assert_eq!(status, Some(400), "{path} {declared:?}: {reached:?}");
+        assert!(
+            reached.is_empty(),
+            "{path} {declared:?} reached the upstream: {reached:?}"
+        );
+    }
+
+    // one length, repeated, is one length
+    assert_eq!(
+        h3_post_declaring(port, "/waf/twice", &["5", "5"], 5).await,
+        Some(200)
     );
     let _ = std::fs::remove_dir_all(dir);
 }
