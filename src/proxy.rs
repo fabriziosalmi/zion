@@ -431,6 +431,7 @@ const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto
 const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
+const PROXY_AUTHENTICATION_INFO: HeaderName = HeaderName::from_static("proxy-authentication-info");
 const TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
 
 /// The `X-Forwarded-For` that `append` sends: every inbound line joined in order with `, `,
@@ -637,22 +638,28 @@ fn watch_upstream_body(
 /// standard set plus any header named in the response's own `Connection` token
 /// list (RFC 9110 §7.6.1: "intermediaries MUST ... remove ... fields ... listed
 /// in the Connection header field").
+///
+/// Every `Connection` line counts, read as bytes (RFC 9110 §5.3: the lines are one list).
+/// Reading the first line only, as text, let `Connection: keep-alive` followed by
+/// `Connection: X-Backend-Session` (or a first line with a byte that is not ASCII) pass
+/// `X-Backend-Session` to the client, and into the cache entry a hit replays to everyone.
 fn scrub_response_hop_by_hop(headers: &mut hyper::HeaderMap) {
     // Headers nominated by the Connection token list, e.g.
     // `Connection: close, X-Foo` also strips `X-Foo`.
-    if let Some(conn) = headers.get(hyper::header::CONNECTION).cloned() {
-        if let Ok(conn) = conn.to_str() {
-            for token in conn.split(',') {
-                let name = token.trim();
-                // "close"/"keep-alive" are connection options, not field names.
-                if !name.is_empty()
-                    && !name.eq_ignore_ascii_case("close")
-                    && !name.eq_ignore_ascii_case("keep-alive")
-                {
-                    headers.remove(name);
-                }
-            }
-        }
+    let named: Vec<hyper::header::HeaderName> = headers
+        .get_all(hyper::header::CONNECTION)
+        .iter()
+        .flat_map(|line| line.as_bytes().split(|&b| b == b','))
+        .map(<[u8]>::trim_ascii)
+        // "close"/"keep-alive" are connection options, not field names; a token that is not
+        // a field name names nothing to remove.
+        .filter(|token| {
+            !token.eq_ignore_ascii_case(b"close") && !token.eq_ignore_ascii_case(b"keep-alive")
+        })
+        .filter_map(|token| hyper::header::HeaderName::from_bytes(token).ok())
+        .collect();
+    for name in named {
+        headers.remove(name);
     }
     // The standard hop-by-hop set (RFC 9110 §7.6.1 + well-known extras).
     headers.remove(hyper::header::CONNECTION);
@@ -661,6 +668,8 @@ fn scrub_response_hop_by_hop(headers: &mut hyper::HeaderMap) {
     headers.remove(hyper::header::TRAILER);
     headers.remove(hyper::header::UPGRADE);
     headers.remove(hyper::header::PROXY_AUTHENTICATE);
+    // For the next client on the response chain only, which is zion (RFC 9110 §11.7.4).
+    headers.remove(&PROXY_AUTHENTICATION_INFO);
     headers.remove(&PROXY_CONNECTION);
     headers.remove(&KEEP_ALIVE);
 }
@@ -1789,6 +1798,31 @@ mod tests {
             "text/html"
         );
         assert_eq!(headers.get("X-Keep-Me").unwrap(), "ok");
+    }
+
+    /// Every `Connection` line names fields to remove, whatever line it is and whatever bytes
+    /// it carries: a field named on the second line, or on a line that is not ASCII, used to
+    /// reach the client and the cache entry every hit replays.
+    #[test]
+    fn scrub_reads_every_connection_line_as_bytes() {
+        let mut headers = hyper::HeaderMap::new();
+        for (name, value) in [
+            ("connection", &b"keep-alive"[..]),
+            ("connection", b"X-Backend-Session"),
+            ("connection", b"X-Opaque-Hop, caf\xe9"),
+            ("x-backend-session", b"abc"),
+            ("x-opaque-hop", b"1"),
+            ("proxy-authentication-info", b"nextnonce=\"n\""),
+            ("x-keep-me", b"ok"),
+        ] {
+            headers.append(
+                hyper::header::HeaderName::from_static(name),
+                hyper::header::HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        scrub_response_hop_by_hop(&mut headers);
+        let left: Vec<&str> = headers.keys().map(|n| n.as_str()).collect();
+        assert_eq!(left, ["x-keep-me"], "named on a later or non-ASCII line");
     }
 
     #[test]

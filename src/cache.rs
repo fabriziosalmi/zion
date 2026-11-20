@@ -27,8 +27,11 @@ pub const MAX_STORED_HEADER_BYTES: usize = 32 * 1024;
 
 /// Response headers an entry does not keep. A hit sets its own, or none.
 const NOT_STORED: &[&str] = &[
-    // Hop-by-hop (RFC 9110 §7.6.1), and those of the proxy itself (RFC 9111 §3.1). The fields a
-    // `Connection` line names are left out too, see `end_to_end_headers`.
+    // Hop-by-hop (RFC 9110 §7.6.1), and those of the proxy itself (RFC 9111 §3.1). The proxy
+    // removes them, and the fields any `Connection` line names, from every upstream response
+    // before the cache sees it (`proxy::scrub_response_hop_by_hop`); they are listed here, and
+    // `end_to_end_headers` drops what `Connection` names, so that headers which did not go
+    // through it are not stored with them either.
     "connection",
     "keep-alive",
     "proxy-connection",
@@ -53,7 +56,8 @@ const NOT_STORED: &[&str] = &[
     // that revalidates an entry does not add one to it.
     "set-cookie",
     "set-cookie2",
-    // Set or removed by zion on every response, whatever the origin sent.
+    // Set or removed by zion on every response, whatever the origin sent (`Alt-Svc` is zion's
+    // own with `--features http3`, and removed without it).
     "x-zion-cache",
     "x-request-id",
     "alt-svc",
@@ -66,9 +70,10 @@ const NOT_STORED: &[&str] = &[
     "permissions-policy",
 ];
 
-/// The origin's end-to-end response headers an entry keeps and a hit replays, in order: all of
-/// them but [`NOT_STORED`] and the fields any `Connection` line names. Not bounded here: see
-/// [`CachedMeta::headers_fit`].
+/// The origin's end-to-end response headers an entry keeps and a hit replays: all of them but
+/// [`NOT_STORED`] and the fields any `Connection` line names, each field's values in the order
+/// the origin sent them (`HeaderMap` keeps the values of one name together). Not bounded here:
+/// see [`CachedMeta::headers_fit`].
 pub fn end_to_end_headers(headers: &hyper::HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
     let listed: Vec<&[u8]> = headers
         .get_all(hyper::header::CONNECTION)
@@ -99,6 +104,23 @@ fn detach(value: &mut HeaderValue) {
         *value = owned;
     }
 }
+
+/// A header name that owns its bytes (see [`CachedMeta::detached`]). A standard name is a
+/// constant and comes back as one; any other is a reference-counted buffer, copied here.
+fn detach_name(name: &mut HeaderName) {
+    if let Ok(owned) = HeaderName::from_bytes(name.as_str().as_bytes()) {
+        *name = owned;
+    }
+}
+
+/// What one field of [`CachedMeta::headers`] costs in memory besides its name's and value's
+/// bytes: its slot in the list (exact-size once stored, see [`CachedMeta::detached`]) and, for
+/// the value and for the name, the `bytes::Shared` record (a pointer, a capacity and a count)
+/// that the first clone of a copied buffer allocates. A standard name owns no bytes and is
+/// counted as if it did, a few dozen bytes too many. The allocator's own rounding is not
+/// counted, as it is not for the body.
+const STORED_FIELD_OVERHEAD_BYTES: usize =
+    std::mem::size_of::<(HeaderName, HeaderValue)>() + 2 * 3 * std::mem::size_of::<usize>();
 
 /// Cached response metadata, stored alongside the body: a hit is built from it, so it carries
 /// what the origin's response carried.
@@ -135,8 +157,14 @@ impl CachedMeta {
     /// hyper parses response headers without copying: each `HeaderValue` is a slice of the
     /// connection's read buffer. Storing one keeps that whole buffer alive (8 KiB or more,
     /// the body's bytes included) for as long as the entry is cached, on top of the body the
-    /// cache copies itself. A copy of a few dozen bytes lets the buffer go. (Header names
-    /// own their bytes already: hyper copies a name that is not a standard one.)
+    /// cache copies itself. A copy of a few dozen bytes lets the buffer go.
+    ///
+    /// The names are copied too. hyper copies a name that is not a standard one out of its
+    /// buffer, but into a reference-counted one: the private L1 copy of an entry (see
+    /// [`L1_PRIVATE_BODY_BYTES`]) would otherwise share every such name with the shared entry and
+    /// with every other thread's copy, and each hit's clone and drop of it would be the contended
+    /// atomic #577 removed. The list is made exact-size, so that it holds no slot it does not
+    /// use ([`STORED_FIELD_OVERHEAD_BYTES`]).
     fn detached(mut self) -> Self {
         for value in [
             &mut self.content_type,
@@ -149,17 +177,29 @@ impl CachedMeta {
         {
             detach(value);
         }
-        for (_, value) in &mut self.headers {
+        for (name, value) in &mut self.headers {
+            detach_name(name);
             detach(value);
         }
+        self.headers.shrink_to_fit();
         self
     }
 
-    /// What [`Self::headers`] count for against [`MAX_STORED_HEADER_BYTES`] and the byte budget.
+    /// What [`Self::headers`] count for against [`MAX_STORED_HEADER_BYTES`]: each field's name,
+    /// value and 32 bytes, as HTTP/2 counts a header list.
     fn headers_bytes(&self) -> usize {
         self.headers
             .iter()
             .map(|(name, value)| name.as_str().len() + value.len() + 32)
+            .sum()
+    }
+
+    /// The memory [`Self::headers`] take once stored: what they count for in the byte budget and
+    /// against the L1 limits ([`STORED_FIELD_OVERHEAD_BYTES`]).
+    fn headers_memory(&self) -> usize {
+        self.headers
+            .iter()
+            .map(|(name, value)| name.as_str().len() + value.len() + STORED_FIELD_OVERHEAD_BYTES)
             .sum()
     }
 
@@ -631,23 +671,28 @@ const ENTRY_OVERHEAD_BYTES: u64 = 256;
 
 /// The memory one stored entry is counted as.
 fn entry_cost(key: &str, entry: &L2Entry) -> u64 {
-    (key.len() + entry.body.len() + entry.meta.headers_bytes()) as u64 + ENTRY_OVERHEAD_BYTES
+    (key.len() + entry.body.len() + entry.meta.headers_memory()) as u64 + ENTRY_OVERHEAD_BYTES
 }
 
-/// The largest body a worker thread keeps in its own L1 cache. L1 entries are not in the
-/// byte budget (they are clones the shared store may have evicted since), and each thread
-/// holds up to `l1_hot_entries` of them: without a cap, a few hundred large objects per
-/// thread could stay alive long after the store dropped them. Larger bodies are served
-/// from the shared store on every hit.
+/// What an entry holds for L1's limits: its body and the origin headers it keeps.
+fn l1_size(body: &Bytes, meta: &CachedMeta) -> usize {
+    body.len() + meta.headers_memory()
+}
+
+/// The largest entry (body and stored headers, [`l1_size`]) a worker thread keeps in its own
+/// L1 cache. L1 entries are not in the byte budget (they are clones the shared store may
+/// have evicted since), and each thread holds up to `l1_hot_entries` of them: without a cap,
+/// a few hundred large objects per thread could stay alive long after the store dropped
+/// them. Larger entries are served from the shared store on every hit.
 const L1_MAX_BODY_BYTES: usize = 64 * 1024;
 
-/// The largest body promoted to L1 as a copy of its own. A hit clones the body and the
-/// header values it carries; when those are shared with the shared store and with every
-/// other thread's copy, each clone and drop is an atomic read-modify-write on a cache line
-/// the other cores are hitting too, and a hot key costs eight threads ten times what it
-/// costs one (#577). A copy owned by this thread makes them uncontended. Larger bodies stay
-/// shared (a copy per thread would hold up to `l1_hot_entries` times this per thread, outside
-/// the byte budget, as L1_MAX_BODY_BYTES describes) and pay the contention.
+/// The largest entry ([`l1_size`]) promoted to L1 as a copy of its own. A hit clones the body
+/// and the header names and values it carries; when those are shared with the shared store
+/// and with every other thread's copy, each clone and drop is an atomic read-modify-write on
+/// a cache line the other cores are hitting too, and a hot key costs eight threads ten times
+/// what it costs one (#577). A copy owned by this thread makes them uncontended. Larger
+/// entries stay shared (a copy per thread would hold up to `l1_hot_entries` times this per
+/// thread, outside the byte budget, as L1_MAX_BODY_BYTES describes) and pay the contention.
 const L1_PRIVATE_BODY_BYTES: usize = 16 * 1024;
 
 /// Queue entries one eviction round looks at.
@@ -1130,9 +1175,10 @@ impl StaticCache {
         drop(entry); // release DashMap read lock
 
         // Promote to L1 preserving the original birth time, TTL and generation. Small
-        // bodies only: see L1_MAX_BODY_BYTES.
-        if body.len() <= L1_MAX_BODY_BYTES {
-            let (l1_body, l1_meta) = if body.len() <= L1_PRIVATE_BODY_BYTES {
+        // entries only: see L1_MAX_BODY_BYTES.
+        let size = l1_size(&body, &meta);
+        if size <= L1_MAX_BODY_BYTES {
+            let (l1_body, l1_meta) = if size <= L1_PRIVATE_BODY_BYTES {
                 (
                     Bytes::copy_from_slice(&body),
                     Arc::new(CachedMeta::clone(&meta).detached()),
@@ -2260,7 +2306,10 @@ mod tests {
             ("link", "</b.js>; rel=preload"),
             ("expires", "Thu, 01 Jan 2099 00:00:00 GMT"),
             ("x-origin-thing", "1"),
-            // hop-by-hop, and the fields `Connection` names (on its second line)
+            // hop-by-hop, and the fields `Connection` names (on its second line). The proxy has
+            // removed them before a response reaches the cache (`scrub_response_hop_by_hop`,
+            // tested through the real binary in tests/cache_hit_origin_headers.rs); this is the
+            // guard for headers that did not go through it.
             ("connection", "close"),
             ("connection", "X-Hop"),
             ("x-hop", "per-connection"),
@@ -2321,14 +2370,22 @@ mod tests {
         };
         assert!(!flood.headers_fit());
 
-        // what an entry keeps is part of what it costs
+        // what an entry keeps is part of what it costs, at its size in memory: the field's slot
+        // in the list (a name and a value, 72 bytes on a 64-bit target), its bytes, and the
+        // two reference-count records a first clone of its name and value allocates
         let cache = StaticCache::with_byte_budget(1 << 30);
         cache.insert("/h", Bytes::from_static(b"body"), meta(1000), 3600, 0, 0);
-        assert_eq!(
-            cache.recount(),
-            cost("/h", 4) + ("x-big".len() + 1000 + 32) as u64
-        );
+        let slot = std::mem::size_of::<(HeaderName, HeaderValue)>();
+        if cfg!(target_pointer_width = "64") {
+            assert_eq!(slot, 72);
+        }
+        let field = slot + "x-big".len() + 1000 + 2 * 3 * std::mem::size_of::<usize>();
+        assert_eq!(cache.recount(), cost("/h", 4) + field as u64);
         assert_eq!(cache.recount(), cache.bytes());
+        assert!(
+            field > "x-big".len() + 1000 + 32,
+            "more than the bound counts the field for"
+        );
     }
 
     #[test]
@@ -3160,6 +3217,92 @@ mod tests {
         };
         assert!(in_l1("/small"), "a body at the cap is promoted");
         assert!(!in_l1("/large"), "one byte more and it is not");
+    }
+
+    /// The private L1 copy owns the names of the headers it keeps, not only their values: a
+    /// name that is not a standard one is a reference-counted buffer, and one shared with the
+    /// shared store and every other thread's copy makes each hit's clone of it the contended
+    /// atomic #577 removed. And the stored headers count toward the L1 limits with the body.
+    #[test]
+    fn an_l1_copy_owns_its_header_names_and_its_headers_count_toward_the_l1_limits() {
+        let cache = StaticCache::new();
+        let Some(l2) = &cache.l2 else {
+            return; // a single-core machine has no L1 tier
+        };
+        let with_headers = || CachedMeta {
+            headers: vec![
+                (
+                    HeaderName::from_bytes(b"x-origin-thing").unwrap(),
+                    HeaderValue::from_bytes(&[b'v'; 1000]).unwrap(),
+                ),
+                (
+                    hyper::header::CACHE_CONTROL,
+                    HeaderValue::from_static("max-age=60"),
+                ),
+            ],
+            ..default_meta()
+        };
+        let mut roomy = with_headers();
+        roomy.headers.reserve(30); // as a list collected from an iterator can be
+        cache.insert("/named", Bytes::from_static(b"b"), roomy, 3600, 0, 100);
+        assert!(cache.get("/named").fresh().is_some()); // promotes
+        let hit = cache.get("/named").fresh().expect("served from L1");
+        let stored = l2.get("/named").expect("stored");
+        assert_eq!(
+            stored.meta.headers.capacity(),
+            2,
+            "stored without unused slots"
+        );
+        assert!(!Arc::ptr_eq(&hit.meta, &stored.meta), "a private copy");
+        let ((l1_name, l1_value), (l2_name, l2_value)) =
+            (&hit.meta.headers[0], &stored.meta.headers[0]);
+        assert_eq!((l1_name, l1_value), (l2_name, l2_value), "equal");
+        assert_ne!(
+            l1_name.as_str().as_ptr(),
+            l2_name.as_str().as_ptr(),
+            "the L1 copy shares the name's bytes with the shared store"
+        );
+        assert_ne!(l1_value.as_bytes().as_ptr(), l2_value.as_bytes().as_ptr());
+
+        // A body that fits the L1 limits alone, but not with its headers.
+        let headers = with_headers().headers_memory();
+        let in_l1 = |key: &str| {
+            L1.with(|l1| {
+                l1.borrow()
+                    .as_ref()
+                    .is_some_and(|l1| l1.map.contains_key(key))
+            })
+        };
+        let body = |len: usize| Bytes::from(vec![7u8; len]);
+        cache.insert(
+            "/near-private",
+            body(L1_PRIVATE_BODY_BYTES - headers + 1),
+            with_headers(),
+            3600,
+            0,
+            100,
+        );
+        cache.insert(
+            "/near-max",
+            body(L1_MAX_BODY_BYTES - headers + 1),
+            with_headers(),
+            3600,
+            0,
+            100,
+        );
+        for key in ["/near-private", "/near-max"] {
+            assert!(cache.get(key).fresh().is_some());
+        }
+        let shared = cache.get("/near-private").fresh().expect("hit");
+        assert!(
+            Arc::ptr_eq(&shared.meta, &l2.get("/near-private").unwrap().meta),
+            "over the private limit with its headers: shared, not copied"
+        );
+        assert!(in_l1("/near-private"));
+        assert!(
+            !in_l1("/near-max"),
+            "over the L1 limit with its headers: not promoted"
+        );
     }
 
     mod byte_count_properties {

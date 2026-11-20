@@ -1082,7 +1082,7 @@ impl Metrics {
             ),
             (
                 "zion_cache_too_large",
-                "Responses not stored because they exceeded the cache profile's max_object_mb, or carried more origin headers than a cache entry keeps (32 KiB).",
+                "Responses not stored because they exceeded the cache profile's max_object_mb, or carried more origin headers than a cache entry keeps (32 KiB); 304 updates over that bound count too.",
                 &self.cache_too_large,
             ),
             (

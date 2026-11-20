@@ -33,6 +33,12 @@ for byte) and an HTTP/2 client (`curl --http2`).
 `Connection`, `Keep-Alive`, `Upgrade`, and any header named in a `Connection`
 token are stripped before the upstream. Ordinary end-to-end headers are forwarded.
 
+The upstream's response is treated the same way before it reaches the client or the cache:
+the hop-by-hop set (with `Proxy-Authenticate` and `Proxy-Authentication-Info`, which are for
+zion) and every field named on any of its `Connection` lines, read as bytes, are removed. The
+origin's `Alt-Svc` is not passed on either: zion sends its own with `--features http3`, and none
+without it.
+
 ## Request-target forms
 
 | Form | Behaviour |

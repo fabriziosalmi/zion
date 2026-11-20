@@ -505,10 +505,15 @@ async fn process_request_inner(
             resp.headers_mut().insert("X-Request-ID", rid);
         }
 
-        // Alt-Svc: advertise HTTP/3 to clients (zero cost if feature disabled)
+        // Alt-Svc: advertise HTTP/3 to clients (zero cost if feature disabled). Either way the
+        // origin's is not passed on: it names the origin's alternatives, and a client would
+        // take them for zion's own authority. (The cache does not store it for that reason, so
+        // a hit and a miss agree.)
         #[cfg(feature = "http3")]
         resp.headers_mut()
-            .insert("Alt-Svc", crate::quic::ALT_SVC_H3.clone());
+            .insert(hyper::header::ALT_SVC, crate::quic::ALT_SVC_H3.clone());
+        #[cfg(not(feature = "http3"))]
+        resp.headers_mut().remove(hyper::header::ALT_SVC);
 
         Ok(resp)
     };
@@ -1052,22 +1057,24 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
     }
 
     if resp.status() == StatusCode::NOT_MODIFIED {
-        let initial_age = upstream_age(resp.headers());
-        let ttl = origin_freshness(resp.headers())
-            .map(|o| o.min(job.cache_ttl))
-            .unwrap_or(job.cache_ttl);
-        // The 304's headers update the stored ones (RFC 9111 §4.3.4); a result too large to
-        // keep leaves the entry as it is.
-        let (meta, fits) = revalidated_meta(&job.stale.meta, resp.headers());
+        // The 304's headers update the stored ones (RFC 9111 §4.3.4). A result too large to
+        // keep, or a 304 that could not have been stored itself, leaves the entry as it is.
+        // The refresh carries no credentials, so the request is not "authenticated".
+        let rv = revalidated(&job.stale.meta, resp.headers(), false, job.cache_ttl);
+        if !rv.fits {
+            metrics::METRICS
+                .cache_too_large
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // Not revived if a tag purge ran since this refresh was scheduled (it may have removed
         // the very entry being revalidated).
-        if !fits
+        if !rv.renews()
             || !job.state.static_cache.refresh_checked(
                 &job.key,
                 job.stale.body.clone(),
-                meta,
-                ttl,
-                initial_age,
+                rv.meta,
+                rv.ttl,
+                rv.initial_age,
                 job.cache_max,
                 job.tag_epoch,
             )
@@ -1107,6 +1114,9 @@ async fn run_swr_refresh(job: &SwrRefresh) -> bool {
     }
     // Headers too large to keep: not stored (see `cached_meta`).
     let Some(meta) = cached_meta(parts.status, &parts.headers) else {
+        metrics::METRICS
+            .cache_too_large
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return false;
     };
     let Ok(collected) = http_body_util::Limited::new(body, job.max_object)
@@ -1433,6 +1443,13 @@ const NOT_MODIFIED_REPLAYS: [hyper::header::HeaderName; 4] = [
 const X_ZION_CACHE: hyper::header::HeaderName =
     hyper::header::HeaderName::from_static("x-zion-cache");
 
+/// Digests computed over a message's content, the whole stored body: a `206` or `416` from the
+/// cache does not carry them (see [`ranged_hit_response`]).
+const WHOLE_CONTENT_DIGESTS: [hyper::header::HeaderName; 2] = [
+    hyper::header::HeaderName::from_static("content-digest"),
+    hyper::header::HeaderName::from_static("content-md5"),
+];
+
 /// An answer from a cache entry: the origin's end-to-end headers the entry kept
 /// ([`cache::CachedMeta::headers`]), so that it carries what the miss carried, then the ones
 /// this answer sets, each replacing a stored one of the same name:
@@ -1549,9 +1566,15 @@ fn ranged_hit_response(
                 hit.body.slice(start as usize..=end as usize),
             ),
         };
-    // The stored origin headers, as on a whole hit (see `from_cache`).
+    // The stored origin headers, as on a whole hit (see `from_cache`), but for the digests of
+    // the whole content: they do not describe a part of it (RFC 9530 §2; `Content-MD5`, RFC
+    // 1864), and a client that checks one would reject the part. `Repr-Digest`, over the
+    // representation, stays.
     let mut resp = from_cache(hit, status, "HIT", Replay::All, body);
     let h = resp.headers_mut();
+    for whole_content in WHOLE_CONTENT_DIGESTS {
+        h.remove(whole_content);
+    }
     h.insert(
         hyper::header::ACCEPT_RANGES,
         hyper::header::HeaderValue::from_static("bytes"),
@@ -1651,6 +1674,29 @@ fn not_modified_response(hit: &cache::CacheHit) -> Response<ZionBody> {
     )
 }
 
+/// Every line of a field as one value, the lines joined with `, ` (RFC 9110 §5.3 makes them one
+/// list), for a field an entry keeps in a slot of its own. `Content-Encoding: gzip` then
+/// `Content-Encoding: br` is a body that went through both codings: keeping the first line
+/// only had a hit tell the client to gunzip a brotli stream.
+fn every_line(
+    headers: &hyper::HeaderMap,
+    name: hyper::header::HeaderName,
+) -> Option<hyper::header::HeaderValue> {
+    let mut lines = headers.get_all(name).iter();
+    let first = lines.next()?;
+    let mut rest = lines.peekable();
+    if rest.peek().is_none() {
+        return Some(first.clone());
+    }
+    let mut joined = first.as_bytes().to_vec();
+    for line in rest {
+        joined.extend_from_slice(b", ");
+        joined.extend_from_slice(line.as_bytes());
+    }
+    // Valid lines joined by `, ` are a valid value; were one ever refused, the first line stays.
+    Some(hyper::header::HeaderValue::from_bytes(&joined).unwrap_or_else(|_| first.clone()))
+}
+
 /// The metadata an entry keeps of the origin's response, headers included
 /// ([`cache::end_to_end_headers`]); `None` when those headers are more than an entry may hold
 /// ([`cache::MAX_STORED_HEADER_BYTES`]): such a response is served, not stored.
@@ -1658,9 +1704,9 @@ fn cached_meta(status: StatusCode, headers: &hyper::HeaderMap) -> Option<cache::
     use hyper::header;
     let meta = cache::CachedMeta {
         // Preserve Content-Type and Content-Encoding (S-05): without Content-Encoding,
-        // gzip-compressed bodies are served garbled.
-        content_type: headers.get(header::CONTENT_TYPE).cloned(),
-        content_encoding: headers.get(header::CONTENT_ENCODING).cloned(),
+        // gzip-compressed bodies are served garbled. Every line of each.
+        content_type: every_line(headers, header::CONTENT_TYPE),
+        content_encoding: every_line(headers, header::CONTENT_ENCODING),
         status,
         // Validators for conditional requests (client If-None-Match → 304) and revalidation.
         etag: headers.get(header::ETAG).cloned(),
@@ -1672,23 +1718,74 @@ fn cached_meta(status: StatusCode, headers: &hyper::HeaderMap) -> Option<cache::
     meta.headers_fit().then_some(meta)
 }
 
+/// What a `304` from the origin makes of the entry it revalidated (RFC 9111 §4.3.4).
+struct Revalidation {
+    /// The entry as the 304 updated it: what the answer to this request carries, and what the
+    /// entry becomes when it is renewed.
+    meta: cache::CachedMeta,
+    /// Its freshness lifetime, capped by the profile.
+    ttl: u64,
+    /// The 304's `Age`.
+    initial_age: u64,
+    /// The updated headers fit in an entry ([`cache::CachedMeta::headers_fit`]).
+    fits: bool,
+    /// The 304 may update the shared entry ([`is_shared_cacheable`] on it).
+    shareable: bool,
+}
+
+impl Revalidation {
+    /// The entry is renewed with [`Self::meta`]; otherwise the answer is served from it and
+    /// the entry is left as it was, stale.
+    fn renews(&self) -> bool {
+        self.fits && self.shareable
+    }
+}
+
 /// The entry `stored` once the origin answered its revalidation with a `304` carrying
 /// `not_modified` (RFC 9111 §4.3.4): the 304's headers replace the stored ones of the same name
 /// and the rest are kept ([`cache::CachedMeta::updated_by`]); a 304 with a `Cache-Control` also
-/// sets the stale-serving rules again. The bool is whether the result fits in an entry
-/// ([`cache::CachedMeta::headers_fit`]): when it does not, it is served and the entry is not
-/// renewed.
-fn revalidated_meta(
+/// sets the stale-serving rules again.
+///
+/// The lifetime is that of the updated response, so from the 304's `Cache-Control` or, when it
+/// sent none, from the stored one: a bare `304` used to renew an entry the origin gave
+/// `max-age=60` for the whole profile TTL, while its hits said `max-age=60`.
+///
+/// The 304 is the answer to this request, sent with its `Cookie` and `Authorization`: it
+/// updates the shared entry only when it could have been stored itself, as a `200` is
+/// ([`is_shared_cacheable`]: no `Set-Cookie`, no `private` / `no-store` / `no-cache`, the
+/// §3.5 opt-in on the 304 itself when the request carried `Authorization`, a `Vary` zion can key
+/// on, and fresh). Otherwise one user's `304` (`private`, with that user's `X-Account`) became
+/// the entry every other user was served.
+fn revalidated(
     stored: &cache::CachedMeta,
     not_modified: &hyper::HeaderMap,
-) -> (cache::CachedMeta, bool) {
+    req_authenticated: bool,
+    cache_ttl: u64,
+) -> Revalidation {
     let mut meta = stored.updated_by(not_modified);
     if not_modified.contains_key(hyper::header::CACHE_CONTROL) {
         meta.stale_while_revalidate_secs = origin_swr(not_modified);
         meta.must_revalidate = forbids_stale(not_modified);
     }
+    let updated_cache_control: hyper::HeaderMap = meta
+        .headers
+        .iter()
+        .filter(|(name, _)| *name == hyper::header::CACHE_CONTROL)
+        .cloned()
+        .collect();
+    let ttl = origin_freshness(&updated_cache_control)
+        .map(|o| o.min(cache_ttl))
+        .unwrap_or(cache_ttl);
+    let initial_age = upstream_age(not_modified);
+    let shareable = is_shared_cacheable(req_authenticated, not_modified, ttl, initial_age);
     let fits = meta.headers_fit();
-    (meta, fits)
+    Revalidation {
+        meta,
+        ttl,
+        initial_age,
+        fits,
+        shareable,
+    }
 }
 
 /// A request's place in the singleflight map: it became the fetcher for `key`, and other
@@ -2442,11 +2539,13 @@ mod tests {
 
     /// The headers an upload origin sends with an SVG: what makes it inert in a browser
     /// (`Content-Disposition`, `Content-Security-Policy`), and the rest a hit must keep too.
+    /// The `Cache-Control` is written as `profile_cache_control` never writes it, so that a
+    /// hit carrying one made up from the entry's lifetime (60 s here too) fails.
     fn upload_origin_headers() -> hyper::HeaderMap {
         let mut h = hyper::HeaderMap::new();
         for (k, v) in [
             ("content-type", "image/svg+xml"),
-            ("cache-control", "public, max-age=60"),
+            ("cache-control", "max-age=60, public"),
             ("content-security-policy", "sandbox"),
             ("content-disposition", "attachment; filename=\"upload.svg\""),
             ("vary", "Accept-Language"),
@@ -2549,17 +2648,41 @@ mod tests {
         assert_eq!(values(&resp, "content-security-policy"), ["sandbox"]);
     }
 
+    /// A ranged answer carries the origin's headers but the digests of the whole content: a
+    /// `206` of ten bytes with the whole file's `Content-Digest` is rejected as corrupt by a
+    /// client that checks it (RFC 9530 §2). `Repr-Digest` describes the representation and stays.
     #[test]
-    fn a_ranged_hit_carries_the_origin_headers() {
-        let origin = upload_origin_headers();
+    fn a_ranged_hit_carries_the_origin_headers_but_the_whole_content_digests() {
+        let mut origin = upload_origin_headers();
+        for (k, v) in [
+            ("content-digest", "sha-256=:d2hvbGUgZmlsZQ==:"),
+            ("content-md5", "Q2hlY2sgSW50ZWdyaXR5IQ=="),
+            ("repr-digest", "sha-256=:d2hvbGUgZmlsZQ==:"),
+        ] {
+            origin.append(
+                hyper::header::HeaderName::from_static(k),
+                hyper::header::HeaderValue::from_static(v),
+            );
+        }
+        let mut for_a_part = origin.clone();
+        for_a_part.remove("content-digest");
+        for_a_part.remove("content-md5");
         let get = &hyper::Method::GET;
+        let whole = fresh_hit_response(stored_hit(&origin), get, &hyper::HeaderMap::new());
+        assert_carries_the_origin_headers(&whole, &origin);
         let partial = fresh_hit_response(
             stored_hit(&origin),
             get,
             &request(&[("range", "bytes=0-3")]),
         );
         assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
-        assert_carries_the_origin_headers(&partial, &origin);
+        assert_carries_the_origin_headers(&partial, &for_a_part);
+        for whole_content in ["content-digest", "content-md5"] {
+            assert!(
+                values(&partial, whole_content).is_empty(),
+                "{whole_content} on a 206"
+            );
+        }
         assert_eq!(values(&partial, "content-range"), ["bytes 0-3/10"]);
         assert_eq!(values(&partial, "accept-ranges"), ["bytes"]);
         assert_eq!(values(&partial, "x-zion-cache"), ["HIT"]);
@@ -2570,8 +2693,33 @@ mod tests {
             &request(&[("range", "bytes=50-")]),
         );
         assert_eq!(unsatisfiable.status(), StatusCode::RANGE_NOT_SATISFIABLE);
-        assert_carries_the_origin_headers(&unsatisfiable, &origin);
+        assert_carries_the_origin_headers(&unsatisfiable, &for_a_part);
+        assert!(values(&unsatisfiable, "content-digest").is_empty());
         assert_eq!(values(&unsatisfiable, "content-range"), ["bytes */10"]);
+    }
+
+    /// Every `Content-Encoding` line is a coding the body went through, and every
+    /// `Content-Type` line is part of the one value a browser reads: a hit says all of them,
+    /// joined, as one line (RFC 9110 §5.3), and not the first alone.
+    #[test]
+    fn a_hit_carries_every_content_encoding_and_content_type_line() {
+        let origin = request(&[
+            ("content-encoding", "gzip"),
+            ("content-encoding", "br"),
+            ("content-type", "text/plain"),
+            ("content-type", "text/html"),
+            ("cache-control", "max-age=60"),
+        ]);
+        let resp = cache_response(stored_hit(&origin), "HIT");
+        assert_eq!(values(&resp, "content-encoding"), ["gzip, br"]);
+        assert_eq!(values(&resp, "content-type"), ["text/plain, text/html"]);
+        let one = request(&[("content-encoding", "gzip")]);
+        let resp = cache_response(stored_hit(&one), "HIT");
+        assert_eq!(
+            values(&resp, "content-encoding"),
+            ["gzip"],
+            "one line as it was"
+        );
     }
 
     #[test]
@@ -2584,7 +2732,7 @@ mod tests {
         );
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
         // RFC 9110 §15.4.5: Cache-Control, Content-Location, Date, ETag, Expires, Vary.
-        assert_eq!(values(&resp, "cache-control"), ["public, max-age=60"]);
+        assert_eq!(values(&resp, "cache-control"), ["max-age=60, public"]);
         assert_eq!(values(&resp, "content-location"), ["/media/upload.svg"]);
         assert_eq!(values(&resp, "etag"), ["\"u1\""]);
         assert_eq!(values(&resp, "expires"), ["Thu, 01 Jan 2099 00:00:00 GMT"]);
@@ -2603,17 +2751,17 @@ mod tests {
         let not_modified = request(&[
             ("cache-control", "public, max-age=120, must-revalidate"),
             ("x-new", "1"),
-            ("set-cookie", "sid=other"),
         ]);
-        let (meta, fits) = revalidated_meta(&stored, &not_modified);
-        assert!(fits);
+        let rv = revalidated(&stored, &not_modified, false, 3600);
+        assert!(rv.fits && rv.shareable && rv.renews());
+        assert_eq!(rv.ttl, 120);
         assert!(
-            meta.must_revalidate,
+            rv.meta.must_revalidate,
             "the 304's Cache-Control sets the rules"
         );
         let resp = cache_response(
             cache::CacheHit {
-                meta: Arc::new(meta),
+                meta: Arc::new(rv.meta),
                 ..stored_hit(&origin)
             },
             "REVALIDATED",
@@ -2624,12 +2772,100 @@ mod tests {
         );
         assert_eq!(values(&resp, "x-new"), ["1"]);
         assert_eq!(values(&resp, "content-security-policy"), ["sandbox"]);
-        assert!(values(&resp, "set-cookie").is_empty());
 
         let huge = "x".repeat(cache::MAX_STORED_HEADER_BYTES);
-        let (_, fits) = revalidated_meta(&stored, &request(&[("x-huge", huge.as_str())]));
-        assert!(!fits, "over the bound: served, not kept");
+        let rv = revalidated(&stored, &request(&[("x-huge", huge.as_str())]), false, 3600);
+        assert!(!rv.fits && !rv.renews(), "over the bound: served, not kept");
         assert!(cached_meta(StatusCode::OK, &request(&[("x-huge", huge.as_str())])).is_none());
+    }
+
+    /// RFC 9111 §4.3.4: the entry's lifetime after a `304` is that of the updated response, so
+    /// the stored `Cache-Control` when the 304 sent none, not the profile TTL.
+    #[test]
+    fn a_bare_304_keeps_the_lifetime_the_origin_gave_the_entry() {
+        let stored = cached_meta(StatusCode::OK, &upload_origin_headers()).unwrap(); // max-age=60
+        let bare = request(&[("etag", "\"u1\"")]);
+        let ttl = |stored: &cache::CachedMeta, not_modified: &hyper::HeaderMap| {
+            revalidated(stored, not_modified, false, 3600).ttl
+        };
+        assert_eq!(
+            ttl(&stored, &bare),
+            60,
+            "the stored max-age, not the profile's 3600"
+        );
+        assert_eq!(
+            ttl(&stored, &request(&[("cache-control", "max-age=120")])),
+            120
+        );
+        assert_eq!(
+            ttl(&stored, &request(&[("cache-control", "max-age=99999")])),
+            3600,
+            "capped by the profile"
+        );
+        let mut no_cc = upload_origin_headers();
+        no_cc.remove(hyper::header::CACHE_CONTROL);
+        let stored_no_cc = cached_meta(StatusCode::OK, &no_cc).unwrap();
+        assert_eq!(
+            ttl(&stored_no_cc, &bare),
+            3600,
+            "no lifetime anywhere: the profile's"
+        );
+        let rv = revalidated(&stored, &request(&[("age", "7")]), false, 3600);
+        assert_eq!((rv.ttl, rv.initial_age), (60, 7), "the 304's Age");
+    }
+
+    /// A `304` answers the request that was sent, with the client's `Cookie` and
+    /// `Authorization`: it renews the shared entry only when it could have been stored itself.
+    #[test]
+    fn a_304_that_could_not_be_stored_itself_does_not_renew_the_entry() {
+        let stored = cached_meta(StatusCode::OK, &upload_origin_headers()).unwrap();
+        let shareable = |authenticated: bool, pairs: &[(&str, &str)]| {
+            revalidated(&stored, &request(pairs), authenticated, 3600).shareable
+        };
+        // what may update it
+        assert!(
+            shareable(false, &[("etag", "\"u1\"")]),
+            "a bare 304, anonymous"
+        );
+        assert!(shareable(
+            false,
+            &[("cache-control", "max-age=60"), ("x-new", "1")]
+        ));
+        assert!(
+            shareable(true, &[("cache-control", "public, max-age=60")]),
+            "opted in"
+        );
+        // what may not
+        for (authenticated, pairs) in [
+            (
+                false,
+                &[
+                    ("cache-control", "private, max-age=60"),
+                    ("x-account", "alice"),
+                ][..],
+            ),
+            (
+                false,
+                &[
+                    ("cache-control", "max-age=60"),
+                    ("cache-control", "no-store"),
+                ],
+            ),
+            (false, &[("cache-control", "no-cache")]),
+            (false, &[("set-cookie", "sid=alice")]),
+            (false, &[("vary", "Cookie")]),
+            (false, &[("cache-control", "max-age=0")]),
+            (false, &[("age", "61")]),
+            // §3.5: the opt-in must be on the 304 itself, not inherited from the stored entry
+            (true, &[("etag", "\"u1\""), ("x-account", "alice")]),
+            (true, &[("cache-control", "max-age=60")]),
+        ] {
+            let rv = revalidated(&stored, &request(pairs), authenticated, 3600);
+            assert!(
+                !rv.shareable && !rv.renews(),
+                "{pairs:?} (authenticated: {authenticated}) renewed the shared entry"
+            );
+        }
     }
 
     #[test]
