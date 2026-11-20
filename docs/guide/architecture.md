@@ -2,7 +2,7 @@
 
 Zion is a single async Rust binary built on Tokio, Hyper, and rustls.
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-86 modules, ~91,400 lines of Rust.
+86 modules, ~91,600 lines of Rust.
 
 ## Module map
 

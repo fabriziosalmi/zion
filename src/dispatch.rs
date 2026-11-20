@@ -2043,8 +2043,9 @@ fn one_client_cache_control(meta: &cache::CachedMeta) -> hyper::header::HeaderVa
 ///
 /// A pattern, not a list: each CDN names its own targeted field, and a list of the three names
 /// known when it was written missed `Vercel-CDN-Cache-Control` and `Akamai-Cache-Control`. RFC
-/// 9213 §2.4 tells a cache that obeys targeted fields not to recognise one by the suffix alone;
-/// zion obeys none, it only leaves them off an answer that is `private`, so a name the pattern
+/// 9213 §2.4 says the `-Cache-Control` suffix MUST NOT be used on its own to identify targeted
+/// fields: it is only a convention. zion uses it only to leave such fields off an answer that is
+/// `private`, never to obey one (it reads none of them for its own caching), so a name the pattern
 /// takes by mistake costs that one answer a field. An answer for one client alone carries none
 /// of them ([`revalidated_response`]): a CDN that reads one would keep that client's answer, the
 /// 304's per-user headers and `Set-Cookie` included, for every client. The entry keeps them, and

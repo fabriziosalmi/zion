@@ -738,6 +738,13 @@ pub(crate) async fn handle_http(
         return Ok(empty_response(StatusCode::URI_TOO_LONG));
     }
 
+    // Userinfo in the target's authority (absolute-form, an h2c `:authority`) is a 400 here as in
+    // the HTTPS pipeline's gate, and for the same reason: the ACME fallback below routes on the
+    // authority and forwards it (`security::target_has_userinfo`).
+    if security::target_has_userinfo(&req) {
+        return Ok(empty_response(StatusCode::BAD_REQUEST));
+    }
+
     // Normalize the path before ANYTHING below decides from it (RFC 3986 §6.2.2): this
     // handler matches the snapshot / ACME paths and routes ACME fallbacks on its own,
     // outside the HTTPS pipeline, so `/.well-known/acme-challenge/../../x` must not be

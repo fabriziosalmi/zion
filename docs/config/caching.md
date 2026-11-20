@@ -367,14 +367,16 @@ The cache preserves each entry's `ETag` and `Last-Modified`. On a fresh hit:
 
 A match returns a bodyless **`304 Not Modified`** with the validators and the
 stored `Cache-Control`, `Content-Location`, `Date`, `Expires` and `Vary` (RFC 9110 §15.4.5),
-which saves the transfer on the common browser-revalidation path.
+which saves the transfer on the common browser-revalidation path. Only a `GET` is answered
+from the cache: a `HEAD` (what `curl -I` sends) goes to the origin, conditional or not.
 
 ```console
-$ curl -I -H 'If-None-Match: "v1-abc"' https://host/static/app.js
+$ curl -sk -o /dev/null -D- -H 'If-None-Match: "v1-abc"' https://host/static/app.js \
+    | grep -iE '^(HTTP/|cache-control:|x-zion-cache:|age:|etag:)'
 HTTP/2 304
 cache-control: public, max-age=3600
 x-zion-cache: HIT
-age: 12
+age: 3
 etag: "v1-abc"
 ```
 
