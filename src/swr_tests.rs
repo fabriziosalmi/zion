@@ -34,6 +34,14 @@ struct Origin {
     extra_304: Mutex<Vec<(&'static str, &'static str)>>,
     /// When set, the `Cache-Control` of a `304` instead of `cache_control` (empty: none).
     cache_control_304: Mutex<Option<String>>,
+    /// The headers of every request, in order.
+    requests: Mutex<Vec<hyper::HeaderMap>>,
+    /// The `Last-Modified` the origin sends (empty: none). An empty ETag in `body` sends none.
+    last_modified: Mutex<String>,
+    /// When set, the origin chooses the representation by this request header, says so in
+    /// `Vary`, and gives each representation its own body and ETag (`<body> for <value>`,
+    /// `nobody` when the request has none).
+    vary_on: Mutex<Option<&'static str>>,
 }
 
 impl Origin {
@@ -63,6 +71,7 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                         let creds = req.headers().contains_key("authorization")
                             || req.headers().contains_key("cookie");
                         o.seen.lock().unwrap().push((inm.clone(), creds));
+                        o.requests.lock().unwrap().push(req.headers().clone());
                         if o.down.load(Ordering::Relaxed) {
                             return Err("origin down");
                         }
@@ -70,7 +79,18 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                         if d > 0 {
                             tokio::time::sleep(Duration::from_millis(d)).await;
                         }
-                        let (body, etag) = o.body.lock().unwrap().clone();
+                        let (mut body, mut etag) = o.body.lock().unwrap().clone();
+                        let vary_on = *o.vary_on.lock().unwrap();
+                        if let Some(name) = vary_on {
+                            let value = req
+                                .headers()
+                                .get(name)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("nobody");
+                            body = format!("{body} for {value}");
+                            etag = format!("\"{}-{value}\"", etag.trim_matches('"'));
+                        }
+                        let lm = o.last_modified.lock().unwrap().clone();
                         let cc = o.cache_control.lock().unwrap().clone();
                         // (an unrelated header stands in when the flag is off)
                         let vary = if o.vary_ae.load(Ordering::Relaxed) {
@@ -78,12 +98,29 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                         } else {
                             ("x-test", "-")
                         };
-                        let resp = if inm.as_deref() == Some(etag.as_str()) {
+                        // RFC 9110 §13.2.2: `If-None-Match` first (`*` matches any current
+                        // representation), and `If-Modified-Since` only without it.
+                        let ims = req
+                            .headers()
+                            .get("if-modified-since")
+                            .and_then(|v| v.to_str().ok());
+                        let not_modified = match inm.as_deref() {
+                            Some(inm) => inm == "*" || (!etag.is_empty() && inm == etag),
+                            None => !lm.is_empty() && ims == Some(lm.as_str()),
+                        };
+                        let mut b = Response::builder().header(vary.0, vary.1);
+                        if !etag.is_empty() {
+                            b = b.header("etag", &etag);
+                        }
+                        if !lm.is_empty() {
+                            b = b.header("last-modified", &lm);
+                        }
+                        if let Some(name) = vary_on {
+                            b = b.header("vary", name);
+                        }
+                        let resp = if not_modified {
                             let cc = o.cache_control_304.lock().unwrap().clone().unwrap_or(cc);
-                            let mut b = Response::builder()
-                                .header(vary.0, vary.1)
-                                .status(StatusCode::NOT_MODIFIED)
-                                .header("etag", &etag);
+                            b = b.status(StatusCode::NOT_MODIFIED);
                             if !cc.is_empty() {
                                 b = b.header("cache-control", &cc);
                             }
@@ -92,10 +129,7 @@ async fn start_origin(o: Arc<Origin>) -> u16 {
                             }
                             b.body(Full::new(Bytes::new()))
                         } else {
-                            let mut b = Response::builder()
-                                .header(vary.0, vary.1)
-                                .status(StatusCode::OK)
-                                .header("etag", &etag);
+                            b = b.status(StatusCode::OK);
                             if !cc.is_empty() {
                                 b = b.header("cache-control", &cc);
                             }
@@ -1069,4 +1103,232 @@ async fn a_response_whose_etag_is_more_than_an_entry_keeps_is_not_stored() {
         ("BYPASS", 2),
         "stored: the origin was not asked again"
     );
+}
+
+/// A variant keyed on a header the background refresh leaves out (here the TLS fingerprint the
+/// HTTPS listener attests in `X-Client-TLS-JA4`; behind an auth gate, `X-Auth-Subject`) is not
+/// refreshed in the background. The refresh reached the origin without the header, got the
+/// representation for a request without it, and stored that under this variant's key: every
+/// client with this fingerprint was then served the page for no fingerprint as a `HIT`. It is
+/// now revalidated in the foreground with the client's own request, as an entry without the
+/// stale-while-revalidate window is.
+#[tokio::test]
+async fn a_variant_keyed_on_a_header_the_refresh_leaves_out_is_not_refreshed_in_the_background() {
+    const JA4: &str = "t13d1516h2_8daaf6152771_02713d6af862";
+    let chrome = [("x-client-tls-ja4", JA4)];
+    let mine = format!("v1 for {JA4}");
+    let (o, st) = origin_and_state("public, max-age=1, stale-while-revalidate=30").await;
+    *o.vary_on.lock().unwrap() = Some("x-client-tls-ja4");
+    let miss = fetch(&st, "/ja4", &chrome).await;
+    assert_eq!(
+        (miss.cache.as_str(), miss.body.as_str()),
+        ("MISS", mine.as_str())
+    );
+    let key = format!("/ja4\u{1f}\u{1c}\u{1e}x-client-tls-ja4={JA4}\u{1f}");
+    until("variant stored", || {
+        st.static_cache.get(&key).fresh().is_some()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let stale = fetch(&st, "/ja4", &chrome).await;
+    assert_eq!(
+        (stale.cache.as_str(), stale.body.as_str()),
+        ("REVALIDATED", mine.as_str()),
+        "refreshed in the background without the header it is keyed on"
+    );
+    let after = fetch(&st, "/ja4", &chrome).await;
+    assert_eq!(
+        (after.cache.as_str(), after.body.as_str()),
+        ("HIT", mine.as_str())
+    );
+    let requests = o.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "the miss and the revalidation");
+    for sent in requests.iter() {
+        assert_eq!(
+            sent.get("x-client-tls-ja4").map(|v| v.to_str().unwrap()),
+            Some(JA4),
+            "the origin was asked without the fingerprint"
+        );
+    }
+}
+
+/// A `304` that answered one client alone (it sets a cookie) makes that client's answer: it says
+/// `private` whatever the 304 or the entry said, and carries the 304's `Set-Cookie`. It went out
+/// with the entry's `public, max-age=1` (or the 304's `public, max-age=60`), alice's `X-Session`,
+/// and no cookie: the session the origin rotated never reached her, and a shared cache downstream
+/// that does not keep a response with a `Set-Cookie` kept this one. The next client gets neither.
+#[tokio::test]
+async fn a_304_for_one_client_says_private_and_brings_its_set_cookie() {
+    for (n, cc_304, expected) in [
+        (0, None, "private, max-age=1"),
+        (1, Some(""), "private, max-age=1"),
+        (2, Some("public, max-age=60"), "private, max-age=60"),
+    ] {
+        let uri = format!("/rv-one{n}");
+        let (o, st) = origin_and_state("public, max-age=1").await;
+        *o.cache_control_304.lock().unwrap() = cc_304.map(str::to_string);
+        *o.extra_304.lock().unwrap() = vec![("set-cookie", "sid=rotated"), ("x-session", "alice")];
+        fetch(&st, &uri, &[]).await;
+        stored_then_stale(&st, &uri).await;
+        let hers = fetch(&st, &uri, &[("cookie", "sid=alice")]).await;
+        assert_eq!(
+            (hers.cache.as_str(), hers.body.as_str()),
+            ("REVALIDATED", "v1")
+        );
+        assert_eq!(
+            header(&hers, "cache-control").as_deref(),
+            Some(expected),
+            "304 Cache-Control {cc_304:?}"
+        );
+        assert_eq!(
+            header(&hers, "set-cookie").as_deref(),
+            Some("sid=rotated"),
+            "304 Cache-Control {cc_304:?}: the 304's cookie"
+        );
+        assert_eq!(header(&hers, "x-session").as_deref(), Some("alice"));
+        o.extra_304.lock().unwrap().clear();
+        *o.cache_control_304.lock().unwrap() = None;
+        let next = fetch(&st, &uri, &[]).await;
+        assert_eq!(
+            (
+                next.cache.as_str(),
+                header(&next, "set-cookie"),
+                header(&next, "x-session"),
+                header(&next, "cache-control").as_deref()
+            ),
+            ("REVALIDATED", None, None, Some("public, max-age=1")),
+            "304 Cache-Control {cc_304:?}: the next client"
+        );
+    }
+}
+
+const OLD_LM: &str = "Thu, 01 Jan 2026 00:00:00 GMT";
+const NEW_LM: &str = "Fri, 02 Jan 2026 00:00:00 GMT";
+
+/// Preconditions and a range of a client's own, sent with a request that finds a stale entry.
+fn clients_own_preconditions(if_none_match: &'static str) -> [(&'static str, &'static str); 5] {
+    [
+        ("if-none-match", if_none_match),
+        ("if-match", "*"),
+        ("if-unmodified-since", NEW_LM),
+        ("if-range", OLD_LM),
+        ("range", "bytes=0-0"),
+    ]
+}
+
+/// What the origin was sent on its `n`-th request: zion's `If-Modified-Since` and none of the
+/// client's own preconditions or its range.
+fn assert_only_the_stored_validator(o: &Origin, n: usize) {
+    let sent = o.requests.lock().unwrap()[n].clone();
+    assert_eq!(
+        sent.get("if-modified-since").map(|v| v.to_str().unwrap()),
+        Some(OLD_LM),
+        "the stored Last-Modified"
+    );
+    for name in [
+        "if-none-match",
+        "if-match",
+        "if-unmodified-since",
+        "if-range",
+        "range",
+    ] {
+        assert_eq!(
+            sent.get(name),
+            None,
+            "the revalidation sent the client's {name}"
+        );
+    }
+}
+
+/// An origin that sends `Last-Modified` and no `ETag`, its entry stored, stale, and the origin's
+/// content changed since.
+async fn changed_since_stored(cc: &str, uri: &str) -> (Arc<Origin>, Arc<AppState>) {
+    let (o, st) = origin_and_state(cc).await;
+    *o.body.lock().unwrap() = ("v1".into(), String::new());
+    *o.last_modified.lock().unwrap() = OLD_LM.into();
+    let miss = fetch(&st, uri, &[]).await;
+    assert_eq!((miss.cache.as_str(), miss.body.as_str()), ("MISS", "v1"));
+    stored_then_stale(&st, uri).await;
+    *o.body.lock().unwrap() = ("v2".into(), String::new());
+    *o.last_modified.lock().unwrap() = NEW_LM.into();
+    (o, st)
+}
+
+/// A foreground revalidation sends the validators zion stored and none of the client's own. For
+/// an entry with only `Last-Modified`, the client's `If-None-Match: *` went to the origin beside
+/// zion's `If-Modified-Since`; the origin evaluates `If-None-Match` first (RFC 9110 §13.2.2), `*`
+/// matches whatever it has, and its `304` renewed the entry the origin had since changed. Every
+/// client was then served the old version as a `HIT`, again at each expiry the request was
+/// repeated.
+#[tokio::test]
+async fn a_revalidation_sends_the_stored_validators_and_not_the_clients() {
+    let (o, st) = changed_since_stored("public, max-age=1", "/lm-only").await;
+    let theirs = fetch(&st, "/lm-only", &clients_own_preconditions("*")).await;
+    assert_eq!(
+        (theirs.status, theirs.body.as_str()),
+        (200, "v2"),
+        "the client's If-None-Match renewed the old entry ({})",
+        theirs.cache
+    );
+    assert_only_the_stored_validator(&o, 1);
+    until("the new version stored", || {
+        st.static_cache
+            .get("/lm-only\u{1f}\u{1c}")
+            .fresh()
+            .is_some_and(|h| h.body == "v2")
+    })
+    .await;
+}
+
+/// The stale-while-revalidate refresh does the same.
+#[tokio::test]
+async fn a_background_refresh_sends_the_stored_validators_and_not_the_clients() {
+    let (o, st) = changed_since_stored(
+        "public, max-age=1, stale-while-revalidate=30",
+        "/swr-lm-only",
+    )
+    .await;
+    let stale = fetch(&st, "/swr-lm-only", &clients_own_preconditions("\"nope\"")).await;
+    assert_eq!(
+        (stale.cache.as_str(), stale.body.as_str()),
+        ("STALE-WHILE-REVALIDATE", "v1")
+    );
+    until("the new version stored", || {
+        st.static_cache
+            .get("/swr-lm-only\u{1f}\u{1c}")
+            .fresh()
+            .is_some_and(|h| h.body == "v2")
+    })
+    .await;
+    assert_only_the_stored_validator(&o, 1);
+}
+
+/// A request that finds an entry stale while another one is revalidating it waits for that
+/// revalidation, then is answered from the entry it renewed: with the body, as the plain `GET`
+/// it is.
+#[tokio::test]
+async fn a_request_that_waited_on_a_revalidation_gets_the_body() {
+    let (o, st) = origin_and_state("public, max-age=1").await;
+    fetch(&st, "/wait-rv", &[]).await;
+    stored_then_stale(&st, "/wait-rv").await;
+    o.delay_ms.store(300, Ordering::Relaxed);
+    let first = {
+        let st = st.clone();
+        tokio::spawn(async move { fetch(&st, "/wait-rv", &[]).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let second = fetch(&st, "/wait-rv", &[]).await;
+    let first = first.await.unwrap();
+    assert_eq!(
+        (first.status, first.cache.as_str(), first.body.as_str()),
+        (200, "REVALIDATED", "v1")
+    );
+    assert_eq!(
+        (second.status, second.body.as_str()),
+        (200, "v1"),
+        "the waiter was answered {} {}",
+        second.status,
+        second.cache
+    );
+    assert_eq!(o.count(), 2, "one revalidation");
 }

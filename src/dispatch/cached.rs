@@ -75,7 +75,7 @@ struct TeeEntry {
 /// Serve a request on a cached route.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle(
-    mut req: Request<ReqBody>,
+    req: Request<ReqBody>,
     state: Arc<AppState>,
     rule: &ResolvedRoute,
     remote_addr: SocketAddr,
@@ -190,7 +190,7 @@ pub(super) async fn handle(
     // `Miss` → fall through to a full fetch. Skipped when the client demanded a
     // fresh response (`no-cache` / `no-store`).
     let lookup = if !rcc_no_cache && !rcc_no_store {
-        match cx.ram_lookup(&mut req) {
+        match cx.ram_lookup(&req) {
             Ok(lookup) => lookup,
             Err(resp) => return Ok(resp),
         }
@@ -380,7 +380,7 @@ impl Cx<'_> {
     /// The RAM lookup. `Err` is an answer: a fresh hit, or a stale one served inside its
     /// stale-while-revalidate window (the refresh runs in the background). `Ok` is a stale entry to
     /// revalidate, or nothing.
-    fn ram_lookup(&self, req: &mut Request<ReqBody>) -> Result<Lookup, Response<ZionBody>> {
+    fn ram_lookup(&self, req: &Request<ReqBody>) -> Result<Lookup, Response<ZionBody>> {
         let state = self.state;
         let rule = self.rule;
         let dyn_scheme = self.dyn_scheme;
@@ -404,11 +404,14 @@ impl Cx<'_> {
                 // background, so the client does not wait for the origin.
                 // `age_secs` is whole seconds (floored), so the real staleness is in
                 // [staleness, staleness + 1): `<` keeps us from ever serving past the
-                // window the origin allowed.
+                // window the origin allowed. A variant keyed on a header the refresh does not
+                // send is not refreshed in the background: it is answered as an entry without
+                // the window is (`refresh_sends_what_it_varies_on`).
                 let staleness = hit.age_secs.saturating_sub(hit.max_age_secs);
                 if hit.meta.stale_while_revalidate_secs > 0
                     && !hit.meta.must_revalidate
                     && staleness < hit.meta.stale_while_revalidate_secs
+                    && refresh_sends_what_it_varies_on(state, &at_key, &at_primary)
                 {
                     if client_conditional_hit(req.headers(), &hit.meta) {
                         return Err(not_modified_response(&hit));
@@ -419,7 +422,7 @@ impl Cx<'_> {
                         identity_entry: at_primary == *identity_primary,
                         primary_key: Arc::from(at_primary.as_str()),
                         stale: hit.clone(),
-                        request: swr_request(&req),
+                        request: swr_request(req),
                         req_authenticated: self.req_authenticated,
                         client_spec: rule.client_spec(),
                         scheme: dyn_scheme.clone(),
@@ -439,9 +442,11 @@ impl Cx<'_> {
                     return Err(cache_response(hit, "STALE-WHILE-REVALIDATE"));
                 }
                 // Only revalidate when we hold a validator; without one a
-                // conditional GET is pointless, so fall through to a full fetch.
+                // conditional GET is pointless, so fall through to a full fetch. The validators
+                // go on the request sent to the origin (`fetch`), not on the client's: a request
+                // waiting on this key is answered with its own headers (`join_flight`), and with
+                // zion's `If-None-Match` among them a plain `GET` got a bodiless `304`.
                 if hit.meta.etag.is_some() || hit.meta.last_modified.is_some() {
-                    add_conditional_headers(req.headers_mut(), &hit.meta);
                     revalidate = Some(hit);
                 }
             }
@@ -556,7 +561,7 @@ impl Cx<'_> {
     /// when the origin allowed one; a failed fetch falls back on the entry being revalidated.
     async fn fetch(
         &self,
-        req: Request<ReqBody>,
+        mut req: Request<ReqBody>,
         fetching: Fetching,
         lookup: Lookup,
     ) -> Result<Response<ZionBody>, hyper::Error> {
@@ -597,6 +602,11 @@ impl Cx<'_> {
         // The varied request headers must outlive `req`, which the fetch consumes: the
         // response may reveal (via `Vary`) which of them the entry is keyed on.
         let req_headers = req.headers().clone();
+        // A revalidation is conditional on the stored validators, and on nothing of the client's
+        // (`add_conditional_headers`).
+        if let Some(hit) = &revalidate {
+            add_conditional_headers(req.headers_mut(), &hit.meta);
+        }
 
         // RAM miss — fetch from upstream.
         // On error `fetching` is dropped. Waiters' wait_for() returns Err (channel

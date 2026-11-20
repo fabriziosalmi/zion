@@ -3390,6 +3390,10 @@ mod tests {
             "the L1 copy shares the name's bytes with the shared store"
         );
         assert_ne!(l1_value.as_bytes().as_ptr(), l2_value.as_bytes().as_ptr());
+        // `stored` holds a read lock on its shard of the store: kept past here, an insert below
+        // whose key falls in the same shard (the hasher is seeded per process) waits for it
+        // forever, and the test hangs.
+        drop(stored);
 
         // A body that fits the L1 limits alone, but not with its headers.
         let headers = with_headers().headers_memory();
