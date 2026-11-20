@@ -353,10 +353,11 @@ async fn client_auth_required_holds_over_http3_from_boot() {
 
     // Control 2: TCP with no certificate is refused at the handshake.
     let before = count();
-    let tcp_no_cert = tcp_get(port, None);
+    // (Only whether it was refused goes in the messages: the TLS error text is not needed.)
+    let tcp_refused = tcp_get(port, None).is_err();
     assert!(
-        tcp_no_cert.is_err(),
-        "client_auth = required refuses a client with no certificate on TCP: {tcp_no_cert:?}"
+        tcp_refused,
+        "client_auth = required refuses a client with no certificate on TCP"
     );
     assert_eq!(count(), before, "nothing reached the upstream over TCP");
 
@@ -365,8 +366,9 @@ async fn client_auth_required_holds_over_http3_from_boot() {
     let h3 = h3_get_within(port, None).await;
     assert!(
         h3.is_err() && count() == before,
-        "mTLS bypass over HTTP/3: the client has no certificate (refused on TCP: \
-         {tcp_no_cert:?}), yet over QUIC it got {h3:?} and {} request(s) reached the upstream",
+        "mTLS bypass over HTTP/3: the client has no certificate (refused on TCP), yet over \
+         QUIC it got status {:?} and {} request(s) reached the upstream",
+        h3.as_ref().ok(),
         count() - before
     );
 
