@@ -629,14 +629,18 @@ pub fn resolve_auth_profile(config: &AuthProfileConfig) -> Result<ResolvedAuthPr
                 previous.len()
             ));
         }
-        previous_decoding_key = Some(Arc::new(DecodingKey::from_secret(previous.as_bytes())));
+        let key = DecodingKey::from_secret(previous.as_bytes())
+            .map_err(|e| format!("auth previous secret for {alg_str} is not a usable key: {e}"))?;
+        previous_decoding_key = Some(Arc::new(key));
     }
 
     let mut decoding_key = None;
     let jwk_set_arc = Arc::new(arc_swap::ArcSwapOption::empty());
 
     if let Some(ref secret) = effective_secret {
-        decoding_key = Some(Arc::new(DecodingKey::from_secret(secret.as_bytes())));
+        let key = DecodingKey::from_secret(secret.as_bytes())
+            .map_err(|e| format!("auth secret for {alg_str} is not a usable key: {e}"))?;
+        decoding_key = Some(Arc::new(key));
     } else if let Some(ref jwks_url) = config.jwks_url {
         let url = jwks_url.clone();
         // What the logs show: the URL without a `user:password@`, as config validation shows it.
@@ -833,7 +837,7 @@ mod tests {
             encode(
                 &Header::default(),
                 &claims,
-                &EncodingKey::from_secret(secret.as_bytes()),
+                &EncodingKey::from_secret(secret.as_bytes()).expect("non-empty HMAC key"),
             )
             .unwrap()
         };
@@ -884,7 +888,7 @@ mod tests {
         let token = encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(secret.as_bytes()),
+            &EncodingKey::from_secret(secret.as_bytes()).expect("non-empty HMAC key"),
         )
         .unwrap();
 
@@ -929,7 +933,8 @@ mod tests {
         let token = encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(b"secret-a-padding-padding-padding-padding"),
+            &EncodingKey::from_secret(b"secret-a-padding-padding-padding-padding")
+                .expect("non-empty HMAC key"),
         )
         .unwrap();
 
@@ -971,7 +976,8 @@ mod tests {
         let token = encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(b"secret-padding-padding-padding-padding"),
+            &EncodingKey::from_secret(b"secret-padding-padding-padding-padding")
+                .expect("non-empty HMAC key"),
         )
         .unwrap();
 
@@ -1028,7 +1034,8 @@ mod tests {
             jsonwebtoken::encode(
                 &jsonwebtoken::Header::new(Algorithm::HS256),
                 &serde_json::json!({"sub": "u", "exp": now + exp_in}),
-                &jsonwebtoken::EncodingKey::from_secret(key.as_bytes()),
+                &jsonwebtoken::EncodingKey::from_secret(key.as_bytes())
+                    .expect("non-empty HMAC key"),
             )
             .unwrap()
         };
@@ -1161,7 +1168,8 @@ mod tests {
             jsonwebtoken::encode(
                 &jsonwebtoken::Header::new(Algorithm::HS256),
                 &serde_json::json!({"sub": "u", "exp": now + secs}),
-                &jsonwebtoken::EncodingKey::from_secret(KEY.as_bytes()),
+                &jsonwebtoken::EncodingKey::from_secret(KEY.as_bytes())
+                    .expect("non-empty HMAC key"),
             )
             .unwrap()
         };
@@ -1305,7 +1313,8 @@ mod tests {
         let token = encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(b"env-secret-padding-padding-padding-padding"),
+            &EncodingKey::from_secret(b"env-secret-padding-padding-padding-padding")
+                .expect("non-empty HMAC key"),
         )
         .unwrap();
 
@@ -1384,7 +1393,8 @@ mod tests {
         encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(b"unit-test-secret-padding-padding-padding-padding"),
+            &EncodingKey::from_secret(b"unit-test-secret-padding-padding-padding-padding")
+                .expect("non-empty HMAC key"),
         )
         .unwrap()
     }
@@ -1431,7 +1441,8 @@ mod tests {
         encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(b"unit-test-secret-padding-padding-padding-padding"),
+            &EncodingKey::from_secret(b"unit-test-secret-padding-padding-padding-padding")
+                .expect("non-empty HMAC key"),
         )
         .unwrap()
     }
