@@ -20,6 +20,8 @@ version: 2
 updates:
   # ── Rust crates ───────────────────────────────────────────────────────────
   - package-ecosystem: "cargo"
+    cooldown:
+      default-days: 7
     directory: "/"
     schedule:
       interval: "weekly"
@@ -146,6 +148,8 @@ updates:
 
   # Benchmarks workspace has its own Cargo.toml — keep it on the same cadence.
   - package-ecosystem: "cargo"
+    cooldown:
+      default-days: 7
     directory: "/benchmarks/backend"
     schedule:
       interval: "weekly"
@@ -161,6 +165,8 @@ updates:
 
   # ── GitHub Actions ────────────────────────────────────────────────────────
   - package-ecosystem: "github-actions"
+    cooldown:
+      default-days: 7
     directory: "/"
     schedule:
       interval: "weekly"
@@ -180,6 +186,8 @@ updates:
 
   # ── Docker base image ─────────────────────────────────────────────────────
   - package-ecosystem: "docker"
+    cooldown:
+      default-days: 7
     directory: "/"
     schedule:
       interval: "weekly"
@@ -195,6 +203,8 @@ updates:
 
   # ── VitePress docs site ───────────────────────────────────────────────────
   - package-ecosystem: "npm"
+    cooldown:
+      default-days: 7
     directory: "/docs"
     schedule:
       interval: "weekly"
@@ -216,6 +226,8 @@ updates:
   # proposed once the freeze below lifts; active advisory detection runs in the
   # `pip-audit` CI job regardless of this limit.
   - package-ecosystem: "pip"
+    cooldown:
+      default-days: 7
     directory: "/ml"
     schedule:
       interval: "weekly"
