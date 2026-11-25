@@ -2,7 +2,7 @@
 
 Zion is a single async Rust binary built on Tokio, Hyper, and rustls.
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-86 modules, ~92,300 lines of Rust.
+87 modules, ~93,400 lines of Rust.
 
 ## Module map
 
@@ -13,8 +13,8 @@ src/
 ├── accept.rs      # Accept loops, the per-connection HTTPS service (mTLS/JA4 identity headers, health fast path) and the :80 handler
 ├── state.rs       # AppState, ResolvedAppConfig (ArcSwap snapshot) and the per-source limiters shared by every handler
 ├── http_util.rs   # Request-ID generation and the small response builders (empty/text/405/401, security headers)
-├── dispatch.rs    # Request pipeline: routing (LRU + radix), WAF gates, cache, CORS, metrics; thread-local route LRU lives here
-├── dispatch/      # The pipeline's stages as modules: `gates` (pre-routing, CORS, auth), `route` (route lookup, upstream choice), `waf_gate` (URI, headers, body), `cached` (cached routes: lookup, singleflight, revalidation, store), `telemetry` (trace context, access log)
+├── dispatch.rs    # Request pipeline: routing (LRU + radix), WAF gates, cache, CORS, metrics
+├── dispatch/      # The pipeline's stages as modules: `gates` (pre-routing, CORS, auth), `route` (route lookup, upstream choice), `route_cache` (the per-thread route LRU; a hit compares the full `(host, path)`), `waf_gate` (URI, headers, body), `cached` (cached routes: lookup, singleflight, revalidation, store), `telemetry` (trace context, access log)
 ├── config.rs      # TOML schema (serde types), parsing and validation
 ├── routing.rs     # Resolves the parsed routes into ResolvedRoute + the host-aware radix HostRouter
 ├── tls.rs         # TLS config, SNI resolution, session tickets, 0-RTT, hot-reload, predictive prewarming
@@ -109,10 +109,12 @@ Client
   │  4. Target with userinfo (user@host, → 400)            │
   │  5. Path normalisation (RFC 3986 §6.2.2)               │
   │  6. Method whitelist (7 methods, else 405)             │
-  │  7. 0-RTT replay protection (non-idempotent → 425)    │
-  │  8. Loop detection (Via, → 508)                        │
-  │  9. Per-IP rate limiter (packed atomic, lock-free)     │
-  │ 10. Feature-gated: sovereign class, TLS fingerprint,   │
+  │  7. One authority per request (target vs Host,         │
+  │     invalid host or port → 400)                        │
+  │  8. 0-RTT replay protection (non-idempotent → 425)     │
+  │  9. Loop detection (Via, → 508)                        │
+  │ 10. Per-IP rate limiter (packed atomic, lock-free)     │
+  │ 11. Feature-gated: sovereign class, TLS fingerprint,   │
   │     mesh score                                         │
   │  then: built-in endpoints (/metrics → internal IPs),   │
   │        CORS pre-flight (OPTIONS → 204)                 │
@@ -199,7 +201,7 @@ Client
 | `DashMap` for cache + rate limiter | Sharded concurrent map, avoids single-mutex bottleneck |
 | `FnvHashSet` for CORS origins | O(1) origin lookup vs O(n) linear scan |
 | Thread-local L1 with O(1) LRU | Index-based doubly-linked list, zero contention on cache hits |
-| Same primitive for the route LRU | Per-worker thread-local cache (cap 256). Replaces a previous "first 256 then no more inserts" map that could be locked out by a flood of distinct paths. |
+| Same primitive for the route LRU | Per-worker thread-local cache (cap 256). Replaces a previous "first 256 then no more inserts" map that could be locked out by a flood of distinct paths. The FNV hash only picks the slot: each entry keeps the `(host, path)` it was resolved for (up to 512 bytes; a longer one is not cached) and a hit compares it in full, so a crafted hash collision is a miss, never another route's policy. |
 | Generation counter for L1/L2 coherence | Stale L1 entries detected via atomic compare, no broadcast needed |
 | Singleflight via `tokio::sync::watch` | `Receiver::wait_for` inspects the current value at first poll, so a waiter that subscribes *after* the fetcher has already published completion still observes it — race that the previous `Notify`-based implementation could lose, leaving a waiter hung until the client timed out |
 | SHA-256 leaf fingerprint for mTLS forward header | Replaces a 64-bit XOR-fold (which produced massive collision classes) emitted as `X-Client-Cert-DN`. Header renamed to `X-Client-Cert-Fingerprint` and prefixed `sha256:`; ACL via fingerprint is now safe. |

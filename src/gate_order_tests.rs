@@ -194,6 +194,66 @@ async fn a_target_with_userinfo_answers_after_the_uri_length_and_before_the_meth
     );
 }
 
+/// A request whose `Host` names another authority than its target is refused after the method
+/// whitelist (a `CONNECT`, whose target is an authority, stays a 405) and before every gate
+/// that comes later: early data, the rate limiter, routing and a route's policy, which would go
+/// by one of the two hosts.
+#[tokio::test]
+async fn the_authority_check_answers_after_the_method_whitelist_and_before_the_early_data_check() {
+    let st = state(0);
+    let other_host = [("host", "b.example")];
+    let target = "http://a.example/open/x";
+    // TRACE is refused by the method whitelist first.
+    assert_eq!(
+        status(
+            &st,
+            EXTERNAL,
+            req(Method::TRACE, target, &other_host),
+            false
+        )
+        .await,
+        405
+    );
+    // A POST in early data would be 425; the disagreeing authorities are refused first.
+    assert_eq!(
+        status(&st, EXTERNAL, req(Method::POST, target, &other_host), true).await,
+        400
+    );
+    // sanity: the same authority twice passes the gate and meets the early-data check
+    assert_eq!(
+        status(
+            &st,
+            EXTERNAL,
+            req(Method::POST, target, &[("host", "a.example")]),
+            true
+        )
+        .await,
+        425
+    );
+    // a route's own refusal (internal_only, 403) comes after it too
+    let internal = "http://a.example/internal/x";
+    assert_eq!(
+        status(
+            &st,
+            EXTERNAL,
+            req(Method::GET, internal, &other_host),
+            false
+        )
+        .await,
+        400
+    );
+    assert_eq!(
+        status(
+            &st,
+            EXTERNAL,
+            req(Method::GET, internal, &[("host", "a.example")]),
+            false
+        )
+        .await,
+        403
+    );
+}
+
 #[tokio::test]
 async fn method_whitelist_answers_before_the_early_data_check() {
     let st = state(0);
@@ -290,6 +350,68 @@ async fn a_reload_that_changes_a_routes_policy_applies_to_the_next_request() {
         403,
         "the old policy is gone again"
     );
+}
+
+/// The route cache picks a slot by an unseeded 64-bit FNV hash of `(host, path)`, which is
+/// public, so two paths with one hash can be computed offline. The two below are such a pair
+/// (found with a distinguished-point collision search): one is a public route, the other an
+/// `internal_only` route on the same upstream, the usual sub-path protection shape. Once the
+/// public path has filled the slot on this worker thread, the protected path must still be
+/// resolved to its own route and refused, not served under the public route's policy (a
+/// hash-only hit answered it from the upstream, here a dead port: `502`).
+#[tokio::test]
+async fn a_route_cache_hash_collision_cannot_carry_a_path_into_another_routes_policy() {
+    const PUBLIC_PATH: &str = "/00b762d743310b77";
+    const PROTECTED_PATH: &str = "/ad7c78d3fbb7b504";
+    // Precondition, against the real slot hash: two distinct paths, one slot.
+    assert_ne!(PUBLIC_PATH, PROTECTED_PATH);
+    assert_eq!(
+        crate::dispatch::route_cache_key(None, PUBLIC_PATH),
+        crate::dispatch::route_cache_key(None, PROTECTED_PATH),
+        "precondition: both paths share one route-cache slot"
+    );
+
+    let toml = r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstreams]
+live = "http://127.0.0.1:9"
+[[route]]
+path = "/00b762d743310b77"
+upstream = "live"
+[[route]]
+path = "/ad7c78d3fbb7b504"
+upstream = "live"
+internal_only = true
+"#;
+    let cfg: ZionConfig = toml::from_str(toml).expect("test config parses");
+    let st = AppState::for_tests(&cfg);
+    assert!(
+        st.cfg()
+            .router
+            .at(None, PROTECTED_PATH)
+            .expect("protected route is registered")
+            .internal_only,
+        "sanity: {PROTECTED_PATH} is an internal_only route in the router"
+    );
+
+    // The public path fills the shared slot on this thread (a current-thread runtime).
+    let warm = get(&st, EXTERNAL, PUBLIC_PATH).await;
+    assert_ne!(warm, 403, "control: the public route is not internal-only");
+
+    let got = get(&st, EXTERNAL, PROTECTED_PATH).await;
+    assert_eq!(
+        got, 403,
+        "internal_only must be enforced for {PROTECTED_PATH}, not the policy of the public \
+         route that filled its cache slot (status {got})"
+    );
+    // and the public path, whose slot the protected one now holds, keeps its own policy
+    assert_ne!(get(&st, EXTERNAL, PUBLIC_PATH).await, 403);
+    assert_ne!(get(&st, INTERNAL, PROTECTED_PATH).await, 403);
 }
 
 // ── path normalization: a route's policy cannot be dodged by how the path is written ──

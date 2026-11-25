@@ -482,9 +482,9 @@ fn apply_forwarding_hygiene<B: hyper::body::Body>(
     // host. `http://shop.example@evil.example/` told the origin `shop.example@evil.example` (links
     // built from it go to evil.example) and `http://user:pass@shop.example/` gave it the
     // password. The pipeline and the `:80` handler refuse such a target with a 400
-    // (`security::target_has_userinfo`); this holds for any path that skips them, and for a `Host`
-    // header with one where nothing refused it (HTTP/1.0, the `:80` ACME fallback, an HTTP/2
-    // request without `:authority`). Routing and the cache key found no host in it
+    // (`security::target_has_userinfo`), and a `Host` header with one, or one that names another
+    // host than the target, with a 400 too (`security::authority_is_ambiguous`); this holds for
+    // any path that skips them. Routing and the cache key find no host in such a value
     // (`request_host` refuses an `@`), so telling the origin none keeps the three in agreement.
     let inbound_host = match req.uri().authority() {
         Some(a) => hyper::header::HeaderValue::from_str(a.as_str()).ok(),

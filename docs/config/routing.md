@@ -1,6 +1,6 @@
 # Routing
 
-Zion routes requests using a radix tree (via the [`matchit`](https://crates.io/crates/matchit) crate -- the same engine used by Axum). Route lookup is ~15ns regardless of route count.
+Zion routes requests using a radix tree (via the [`matchit`](https://crates.io/crates/matchit) crate -- the same engine used by Axum). `cargo bench --bench route_cache` measures a lookup in a tree of 17 routes and the per-thread route cache in front of it.
 
 ## Route patterns
 
@@ -172,6 +172,10 @@ The `:80` ACME fallback applies the same lists before it forwards.
 
 Bind a route to one or more `hosts` to serve different backends for different domains on the same listener — the `Host` header (HTTP/1) or `:authority` (HTTP/2) selects the route. A route **without** `hosts` is *shared*: it matches every host and acts as a fallback.
 
+A request names one host. One that names two that disagree, a request-target authority (HTTP/2 `:authority`, an HTTP/1.1 absolute-form target such as `GET http://a.example/`) together with a `Host` header for another authority, is refused with `400` before routing, on the HTTPS and the `:80` listeners. So is one whose target or `Host` authority is not `host[:port]`: userinfo (`user@host`), a host that is neither a DNS-style name or IPv4 address (ASCII letters, digits, `-`, `.` and `_`) nor an IPv6 address in brackets (`a.example,x`, `a.example;x`, a tab), or a port that is not a port number (`a.example:x`, `a.example:+443`, `a.example:99999`, `a.example:1:2`, a bare `::1`). Routing, the route's policy, the cache key and the host the upstream is told (`X-Forwarded-Host`, and `Host` with `preserve_host`) go by the target's authority when the request has one, and an upstream reads the host before the `:`, or before the `,` of what it takes for a list (`X-Forwarded-Host`), where routing would key the whole text, so such a request would be decided as one host and served as another. Host and port are compared as RFC 3986 §6.2.3 has it: `A.example`, `a.example:443` and `a.example:` (an empty port) name the same authority as `https://a.example/`.
+
+Over HTTP/2 and HTTP/3 some of these never reach zion, and get a stream reset instead of the `400`. An `:authority` that the `http` crate does not parse (a second `:` outside brackets, as in `a.example:1:2` or `::1`, or a tab) is reset by `h2` (`PROTOCOL_ERROR`) and by `h3` (`H3_MESSAGE_ERROR`); the same text in an HTTP/2 `host` field reaches zion and gets the `400`. Over HTTP/3 the `h3` crate also compares `:authority` and `host` itself, byte for byte, and resets the request stream (`H3_MESSAGE_ERROR`) when they differ at all, before zion sees the request.
+
 ```toml
 # api.example.com → API backend
 [[route]]
@@ -206,7 +210,7 @@ An exact host beats a wildcard, and a matched host never falls through to *anoth
 
 ### Host normalization
 
-Authorities are normalized before matching: lowercased, port stripped (`api.example.com:8443` → `api.example.com`), and a trailing FQDN dot removed. Config `hosts` entries must be canonical bare hostnames — no scheme, path, port, or trailing dot (uppercase is folded). Only leading-label wildcards (`*.example.com`) are supported.
+Authorities are normalized before matching: lowercased, port stripped (`api.example.com:8443` → `api.example.com`, and an empty port, `api.example.com:`, is no port), and a trailing FQDN dot removed. An authority that is not `host[:port]` is not normalized: the request is refused (see above). Config `hosts` entries must be canonical bare hostnames: no scheme, path, port (an empty one included), or trailing dot (uppercase is folded), and an IPv6 literal in brackets (`[::1]`). Only leading-label wildcards (`*.example.com`) are supported.
 
 ### Relationship to TLS SNI
 
@@ -214,7 +218,7 @@ Authorities are normalized before matching: lowercased, port stripped (`api.exam
 
 ### Performance
 
-Host routing is **opt-in and zero-cost when unused**: with no `hosts` anywhere, lookups skip authority extraction and behave exactly as the path-only router. When active, a lookup adds one hash-map probe plus authority normalization, and the thread-local route cache is keyed on `(host, path)` so different domains never share a cache slot.
+Host routing is **opt-in and zero-cost when unused**: with no `hosts` anywhere, lookups skip authority extraction and behave exactly as the path-only router. When active, a lookup adds one hash-map probe plus authority normalization, and the thread-local route cache is keyed on `(host, path)`, compared in full on every hit, so different domains never share a cached route.
 
 ## Route modes
 

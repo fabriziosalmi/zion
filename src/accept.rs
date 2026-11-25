@@ -795,6 +795,12 @@ pub(crate) async fn handle_http(
         return Ok(empty_response(StatusCode::BAD_REQUEST));
     }
 
+    // One authority per request, as in the HTTPS pipeline: the ACME fallback below routes by
+    // the target's authority and forwards the `Host` header.
+    if security::authority_is_ambiguous(&req) {
+        return Ok(empty_response(StatusCode::BAD_REQUEST));
+    }
+
     // Normalize the path before ANYTHING below decides from it (RFC 3986 §6.2.2): this
     // handler matches the snapshot / ACME paths and routes ACME fallbacks on its own,
     // outside the HTTPS pipeline, so `/.well-known/acme-challenge/../../x` must not be

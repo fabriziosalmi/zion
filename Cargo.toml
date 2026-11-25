@@ -333,6 +333,10 @@ harness = false
 name = "numa"
 harness = false
 
+[[bench]]
+name = "route_cache"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"

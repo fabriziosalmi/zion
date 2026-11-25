@@ -256,25 +256,6 @@ fn early_data_rejected(is_early_data: bool, method: &hyper::Method) -> bool {
     is_early_data && !matches!(*method, hyper::Method::GET | hyper::Method::HEAD)
 }
 
-/// Thread-local route-cache key. Folds the normalized host into the key when a
-/// host is present (host routing active) so two authorities that share a path
-/// never collide — the ADR-0010 cache invariant. A collision would let one
-/// host's request reuse another host's cached `ResolvedRoute`, bypassing a
-/// per-route WAF/auth profile or an `internal_only` gate. With `host = None`
-/// the key is the bare path hash, byte-identical to the pre-host-routing key,
-/// so hostless deployments are unchanged. `str`'s `Hash` writes a terminator,
-/// so `(host, path)` can never alias a different host/path split.
-#[inline]
-fn route_cache_key(host: Option<&str>, path: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = fnv::FnvHasher::default();
-    if let Some(host) = host {
-        host.hash(&mut h);
-    }
-    path.hash(&mut h);
-    h.finish()
-}
-
 /// Render a 16-byte W3C trace id as 32 lowercase hex chars — the join key that
 /// links an access-log line and a signed audit record to the distributed trace.
 fn trace_id_to_hex(bytes: &[u8; 16]) -> String {
@@ -2150,162 +2131,9 @@ impl Drop for Fetching {
     }
 }
 
-// ==========================================================================
-// Thread-local route LRU
-// --------------------------------------------------------------------------
-// O(1) get/insert/evict via an intrusive doubly-linked list backed by a Vec.
-// Same primitive as cache::L1Cache but stripped to what the route cache needs:
-// no TTL (routes are immutable for the lifetime of the daemon — they come
-// from the static config) and no generation counter. The cache key is the
-// FNV hash of the request path (already computed at the call site).
-// ==========================================================================
-mod route_cache {
-    pub(super) const ROUTE_CACHE_CAP: usize = 256;
-    const NIL: usize = usize::MAX;
-
-    struct Node {
-        key: u64,
-        prev: usize,
-        next: usize,
-    }
-
-    /// Generic on V so tests can drive the LRU with a trivial value type
-    /// (e.g. u32) without needing to construct a fully populated
-    /// ResolvedRoute. Monomorphises to the same code at the call site.
-    pub(super) struct RouteCache<V: Clone> {
-        map: fnv::FnvHashMap<u64, (V, usize)>,
-        nodes: Vec<Node>,
-        free: Vec<usize>,
-        head: usize, // LRU — evicted first
-        tail: usize, // MRU
-        cap: usize,
-    }
-
-    impl<V: Clone> RouteCache<V> {
-        /// Drop every entry (the capacity and allocations are kept).
-        pub(super) fn clear(&mut self) {
-            self.map.clear();
-            self.nodes.clear();
-            self.free.clear();
-            self.head = NIL;
-            self.tail = NIL;
-        }
-
-        pub(super) fn new(cap: usize) -> Self {
-            Self {
-                map: fnv::FnvHashMap::with_capacity_and_hasher(cap, Default::default()),
-                nodes: Vec::with_capacity(cap),
-                free: Vec::new(),
-                head: NIL,
-                tail: NIL,
-                cap,
-            }
-        }
-
-        #[inline]
-        fn unlink(&mut self, idx: usize) {
-            let prev = self.nodes[idx].prev;
-            let next = self.nodes[idx].next;
-            if prev != NIL {
-                self.nodes[prev].next = next;
-            } else {
-                self.head = next;
-            }
-            if next != NIL {
-                self.nodes[next].prev = prev;
-            } else {
-                self.tail = prev;
-            }
-            self.nodes[idx].prev = NIL;
-            self.nodes[idx].next = NIL;
-        }
-
-        #[inline]
-        fn push_tail(&mut self, idx: usize) {
-            self.nodes[idx].prev = self.tail;
-            self.nodes[idx].next = NIL;
-            if self.tail != NIL {
-                self.nodes[self.tail].next = idx;
-            } else {
-                self.head = idx;
-            }
-            self.tail = idx;
-        }
-
-        #[inline]
-        fn alloc_node(&mut self, key: u64) -> usize {
-            if let Some(idx) = self.free.pop() {
-                self.nodes[idx] = Node {
-                    key,
-                    prev: NIL,
-                    next: NIL,
-                };
-                idx
-            } else {
-                let idx = self.nodes.len();
-                self.nodes.push(Node {
-                    key,
-                    prev: NIL,
-                    next: NIL,
-                });
-                idx
-            }
-        }
-
-        /// Lookup with MRU promotion. Returns a clone of the value (for
-        /// `Arc<T>` this is just an atomic refcount bump).
-        pub(super) fn get(&mut self, key: u64) -> Option<V> {
-            let (value, idx) = self.map.get(&key)?;
-            let value = value.clone();
-            let idx = *idx;
-            self.unlink(idx);
-            self.push_tail(idx);
-            Some(value)
-        }
-
-        /// Insert or update. On capacity full, evicts the LRU entry. Always
-        /// places the inserted/updated key at MRU.
-        pub(super) fn insert(&mut self, key: u64, value: V) {
-            if let Some((existing, idx)) = self.map.get_mut(&key) {
-                *existing = value;
-                let idx = *idx;
-                self.unlink(idx);
-                self.push_tail(idx);
-                return;
-            }
-            // Evict LRU if at capacity (must run BEFORE allocating, otherwise
-            // a single-shot of cap+1 distinct keys would never reclaim space).
-            while self.map.len() >= self.cap && self.head != NIL {
-                let lru_idx = self.head;
-                let lru_key = self.nodes[lru_idx].key;
-                self.unlink(lru_idx);
-                self.free.push(lru_idx);
-                self.map.remove(&lru_key);
-            }
-            let idx = self.alloc_node(key);
-            self.push_tail(idx);
-            self.map.insert(key, (value, idx));
-        }
-
-        #[cfg(test)]
-        pub(super) fn len(&self) -> usize {
-            self.map.len()
-        }
-
-        /// Returns keys in LRU→MRU order. Test-only helper that walks the
-        /// intrusive list, so it also implicitly verifies link integrity.
-        #[cfg(test)]
-        pub(super) fn order(&self) -> Vec<u64> {
-            let mut out = Vec::with_capacity(self.map.len());
-            let mut cur = self.head;
-            while cur != NIL {
-                out.push(self.nodes[cur].key);
-                cur = self.nodes[cur].next;
-            }
-            out
-        }
-    }
-}
+// Thread-local route LRU: `dispatch/route_cache.rs`.
+mod route_cache;
+pub(crate) use route_cache::route_cache_key;
 
 // ==========================================================================
 // TESTS
@@ -2368,20 +2196,20 @@ mod tests {
     fn route_cache_clear_empties_it_and_it_stays_usable() {
         let mut c = route_cache::RouteCache::<u32>::new(3);
         for k in 0..3u64 {
-            c.insert(k, k as u32 + 10);
+            put(&mut c, k, k as u32 + 10);
         }
-        assert_eq!(c.get(1), Some(11));
+        assert_eq!(hit(&mut c, 1), Some(11));
         c.clear();
-        assert!((0..3u64).all(|k| c.get(k).is_none()), "cleared");
+        assert!((0..3u64).all(|k| hit(&mut c, k).is_none()), "cleared");
         // refills to capacity and evicts normally afterwards
         for k in 10..14u64 {
-            c.insert(k, k as u32);
+            put(&mut c, k, k as u32);
         }
         assert!(
-            c.get(10).is_none(),
+            hit(&mut c, 10).is_none(),
             "the LRU entry was evicted past capacity"
         );
-        assert_eq!(c.get(13), Some(13));
+        assert_eq!(hit(&mut c, 13), Some(13));
     }
 
     #[test]
@@ -4089,34 +3917,43 @@ mod tests {
     // new behaviour: O(1) insert with LRU eviction, and — crucially —
     // adversarial path flooding does NOT lock out subsequent hot routes.
 
+    /// The LRU tests drive the cache by number: entry `k` is the hostless path `/k` in slot `k`.
+    fn put(c: &mut route_cache::RouteCache<u32>, k: u64, v: u32) {
+        c.insert(k, None, &format!("/{k}"), v);
+    }
+
+    fn hit(c: &mut route_cache::RouteCache<u32>, k: u64) -> Option<u32> {
+        c.get(k, None, &format!("/{k}"))
+    }
+
     #[test]
     fn route_lru_get_returns_inserted_value() {
         let mut c = route_cache::RouteCache::<u32>::new(4);
-        c.insert(1, 100);
-        assert_eq!(c.get(1), Some(100));
-        assert_eq!(c.get(2), None);
+        put(&mut c, 1, 100);
+        assert_eq!(hit(&mut c, 1), Some(100));
+        assert_eq!(hit(&mut c, 2), None);
     }
 
     #[test]
     fn route_lru_get_promotes_to_mru() {
         let mut c = route_cache::RouteCache::<u32>::new(4);
-        c.insert(1, 10);
-        c.insert(2, 20);
-        c.insert(3, 30);
+        put(&mut c, 1, 10);
+        put(&mut c, 2, 20);
+        put(&mut c, 3, 30);
         // Order LRU→MRU: 1, 2, 3
         assert_eq!(c.order(), vec![1, 2, 3]);
         // Touch key 1: it should move to MRU.
-        let _ = c.get(1);
+        let _ = hit(&mut c, 1);
         assert_eq!(c.order(), vec![2, 3, 1]);
     }
 
     #[test]
     fn route_lru_insert_existing_key_updates_and_promotes() {
         let mut c = route_cache::RouteCache::<u32>::new(4);
-        c.insert(1, 10);
-        c.insert(2, 20);
-        c.insert(1, 11); // update + promote to MRU
-        assert_eq!(c.get(1), Some(11));
+        put(&mut c, 1, 10);
+        put(&mut c, 2, 20);
+        put(&mut c, 1, 11); // update + promote to MRU
+        assert_eq!(hit(&mut c, 1), Some(11));
         assert_eq!(c.order(), vec![2, 1]);
         assert_eq!(c.len(), 2);
     }
@@ -4124,12 +3961,12 @@ mod tests {
     #[test]
     fn route_lru_evicts_lru_at_capacity() {
         let mut c = route_cache::RouteCache::<u32>::new(3);
-        c.insert(1, 10);
-        c.insert(2, 20);
-        c.insert(3, 30);
-        c.insert(4, 40); // forces eviction of 1 (LRU)
+        put(&mut c, 1, 10);
+        put(&mut c, 2, 20);
+        put(&mut c, 3, 30);
+        put(&mut c, 4, 40); // forces eviction of 1 (LRU)
         assert_eq!(c.len(), 3);
-        assert_eq!(c.get(1), None, "1 should have been evicted");
+        assert_eq!(hit(&mut c, 1), None, "1 should have been evicted");
         assert_eq!(c.order(), vec![2, 3, 4]);
     }
 
@@ -4137,12 +3974,12 @@ mod tests {
     fn route_lru_recency_preserved_under_mixed_access() {
         // Touch promotes; new insert evicts the genuinely least-recently-used.
         let mut c = route_cache::RouteCache::<u32>::new(3);
-        c.insert(1, 10);
-        c.insert(2, 20);
-        c.insert(3, 30);
-        let _ = c.get(1); // 1 → MRU; LRU order now: 2, 3, 1
-        c.insert(4, 40); // evict LRU=2
-        assert_eq!(c.get(2), None);
+        put(&mut c, 1, 10);
+        put(&mut c, 2, 20);
+        put(&mut c, 3, 30);
+        let _ = hit(&mut c, 1); // 1 → MRU; LRU order now: 2, 3, 1
+        put(&mut c, 4, 40); // evict LRU=2
+        assert_eq!(hit(&mut c, 2), None);
         assert_eq!(c.order(), vec![3, 1, 4]);
     }
 
@@ -4157,15 +3994,19 @@ mod tests {
         let cap = 8;
         let mut c = route_cache::RouteCache::<u32>::new(cap);
         for k in 0..(cap as u64) {
-            c.insert(k, k as u32);
+            put(&mut c, k, k as u32);
         }
         assert_eq!(c.len(), cap);
         // A new hot path arrives:
-        c.insert(9999, 0xBEEF);
-        assert_eq!(c.get(9999), Some(0xBEEF), "hot path must be cacheable");
+        put(&mut c, 9999, 0xBEEF);
+        assert_eq!(
+            hit(&mut c, 9999),
+            Some(0xBEEF),
+            "hot path must be cacheable"
+        );
         assert_eq!(c.len(), cap, "capacity bound must hold");
         // The LRU (key 0) is the one that was evicted, not the new one.
-        assert_eq!(c.get(0), None);
+        assert_eq!(hit(&mut c, 0), None);
     }
 
     #[test]
@@ -4173,12 +4014,12 @@ mod tests {
         let cap = 16;
         let mut c = route_cache::RouteCache::<u32>::new(cap);
         for k in 0..1024u64 {
-            c.insert(k, k as u32);
+            put(&mut c, k, k as u32);
             assert!(c.len() <= cap, "capacity must never be exceeded");
         }
         // The most recently inserted `cap` keys must all be present.
         for k in (1024 - cap as u64)..1024 {
-            assert_eq!(c.get(k), Some(k as u32));
+            assert_eq!(hit(&mut c, k), Some(k as u32));
         }
     }
 
@@ -4189,11 +4030,71 @@ mod tests {
         let cap = 4;
         let mut c = route_cache::RouteCache::<u32>::new(cap);
         for k in 0..1000u64 {
-            c.insert(k, k as u32);
+            put(&mut c, k, k as u32);
         }
         assert_eq!(c.len(), cap);
         // Last 4 inserts must be the survivors, in MRU order.
         assert_eq!(c.order(), vec![996, 997, 998, 999]);
+    }
+
+    /// Two requests whose hash is the same slot are still two requests: a lookup returns only
+    /// the value cached for its own `(host, path)`, never the one another request left in the
+    /// slot. A hash-only hit served a path under another route's `internal_only`, auth and WAF
+    /// policy, given a colliding pair (unseeded FNV, computable offline).
+    #[test]
+    fn route_lru_a_colliding_slot_is_a_miss_not_another_routes_value() {
+        let mut c = route_cache::RouteCache::<u32>::new(4);
+        c.insert(7, None, "/public", 1);
+        assert_eq!(
+            c.get(7, None, "/protected"),
+            None,
+            "another path, same slot"
+        );
+        assert_eq!(c.get(7, Some("a.example"), "/public"), None, "another host");
+        assert_eq!(c.get(7, None, "/public"), Some(1), "the slot's own request");
+        // the colliding request is resolved and cached: the slot is now its own
+        c.insert(7, None, "/protected", 2);
+        assert_eq!(c.get(7, None, "/protected"), Some(2));
+        assert_eq!(c.get(7, None, "/public"), None);
+        assert_eq!(c.len(), 1);
+        // a host-scoped entry is not the hostless one either
+        c.insert(8, Some("a.example"), "/x", 3);
+        assert_eq!(c.get(8, None, "/x"), None);
+        assert_eq!(c.get(8, Some("b.example"), "/x"), None);
+        assert_eq!(c.get(8, Some("a.example"), "/x"), Some(3));
+        // host and path are kept in one allocation: the same bytes split elsewhere differ
+        c.insert(9, Some("ab"), "/x", 4);
+        assert_eq!(c.get(9, Some("a"), "b/x"), None);
+        assert_eq!(c.get(9, Some("ab/"), "x"), None);
+        assert_eq!(c.get(9, None, "ab/x"), None);
+        assert_eq!(c.get(9, Some("ab"), "/x"), Some(4));
+    }
+
+    /// The pair `gate_order_tests` uses for the end-to-end case really is one slot under the
+    /// real hash, so that test exercises a collision and not two separate slots.
+    #[test]
+    fn the_crafted_route_cache_pair_collides_under_the_real_hash() {
+        assert_eq!(
+            route_cache_key(None, "/00b762d743310b77"),
+            route_cache_key(None, "/ad7c78d3fbb7b504")
+        );
+    }
+
+    /// Each entry keeps its key, so a key over the length cap is not kept: a flood of long
+    /// distinct paths cannot make a worker thread hold 256 of them.
+    #[test]
+    fn route_lru_does_not_keep_a_key_over_the_length_cap() {
+        let mut c = route_cache::RouteCache::<u32>::new(4);
+        let cap = route_cache::ROUTE_CACHE_MAX_KEY_LEN;
+        let at_cap = format!("/{}", "a".repeat(cap - 1));
+        let over = format!("/{}", "a".repeat(cap));
+        c.insert(1, None, &at_cap, 1);
+        c.insert(2, None, &over, 2);
+        c.insert(3, Some("h.example"), &at_cap, 3); // the host counts too
+        assert_eq!(c.get(1, None, &at_cap), Some(1));
+        assert_eq!(c.get(2, None, &over), None);
+        assert_eq!(c.get(3, Some("h.example"), &at_cap), None);
+        assert_eq!(c.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

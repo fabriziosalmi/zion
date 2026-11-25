@@ -367,9 +367,11 @@ pub fn is_valid_host(host: &str) -> bool {
 /// Normalize a request authority — the URI `:authority` (HTTP/2, absolute-form)
 /// or `Host` header (HTTP/1, origin-form) — into a canonical host-routing key
 /// per ADR-0010: lowercased, `:port` stripped (IPv6-literal-safe), and any
-/// trailing FQDN dot removed. Returns `None` when the authority is empty or
-/// fails [`is_valid_host`]; the caller then routes via the hostless/shared
-/// layer rather than a bogus key.
+/// trailing FQDN dot removed. Returns `None` when the authority is empty, is not
+/// `host[:port]` ([`split_authority`]) or fails [`is_valid_host`]; the caller then
+/// routes via the hostless/shared layer rather than a bogus key. A request whose
+/// authority is not `host[:port]` never gets that far: the pre-routing gate
+/// refuses it ([`authority_is_ambiguous`]).
 ///
 /// Borrows when the input is already canonical (the common case — lowercase,
 /// no port) so the hot path allocates only when it must actually fold case.
@@ -378,29 +380,9 @@ pub fn is_valid_host(host: &str) -> bool {
 /// request authorities pass through it at lookup, so a config key and a request
 /// key are compared in the same normal form (no silent host mismatch).
 pub fn normalize_host(raw: &str) -> Option<Cow<'_, str>> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-
-    // Split off an optional `:port`, keeping an IPv6 literal's own colons intact.
-    let host = if raw.starts_with('[') {
-        // `[2001:db8::1]` or `[2001:db8::1]:443` → keep through the closing ']'.
-        let end = raw.find(']')?; // malformed literal (no ']') ⇒ no key ⇒ shared
-        &raw[..=end]
-    } else {
-        match raw.rsplit_once(':') {
-            // Exactly one colon and a numeric suffix ⇒ `host:port`. A bare
-            // (unbracketed) IPv6 literal has multiple colons and is left intact
-            // — it can't be a legal authority, so it just misses the map.
-            Some((h, p))
-                if !h.contains(':') && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) =>
-            {
-                h
-            }
-            _ => raw,
-        }
-    };
+    // Split off the optional `:port`, keeping an IPv6 literal's own colons intact. An authority
+    // that is not `host[:port]` has no key (and the pipeline refuses a request naming one).
+    let (host, _port) = split_authority(raw.trim())?;
 
     let host = host.trim_end_matches('.'); // drop the root FQDN dot(s)
     if host.is_empty() || !is_valid_host(host) {
@@ -431,6 +413,124 @@ pub fn request_host<B>(req: &hyper::Request<B>) -> Option<Cow<'_, str>> {
                 .and_then(|h| h.to_str().ok())
         })
         .and_then(normalize_host)
+}
+
+/// Split a request authority (a `Host` value, an HTTP/2 or HTTP/3 `:authority`, an absolute-form
+/// target's) into its host and its port: the one way zion reads an authority, for routing
+/// ([`normalize_host`]) and for the gate that refuses what it cannot read
+/// ([`authority_is_ambiguous`]).
+///
+/// The host is a DNS-style name or an IPv4 address (ASCII letters, digits, `-`, `.` and `_`
+/// only), or an IPv6 address in brackets. `None` when the authority is not `host[:port]`:
+///
+/// - a host with any other byte: userinfo (`user@host`), a `,` or a `;` (`a.example,x`),
+///   whitespace or a tab (`x\ta.example`), a `%`; an unclosed `[`, or brackets around
+///   something that is not an IPv6 address (a zone ID included);
+/// - anything after the host other than a `:` and a port number (`a.example:x`,
+///   `a.example:+443`, `a.example:99999`, `a.example:1:2`, a bare IPv6 literal such as `::1`).
+///
+/// An upstream cuts the host at the first `:` (nginx) or splits host and port itself (Go's
+/// `net.SplitHostPort`), and can read `X-Forwarded-Host` as a list (Express 5 keeps the part
+/// before the first `,`). Routing keys such a text by its whole bytes, a key no host group
+/// matches, so the request gets the shared routes while the upstream reads the host inside it.
+/// An empty port (`a.example:`) is no port: RFC 3986 §6.2.3 and RFC 9110 §4.2.3 make it the
+/// scheme's default, like an absent one.
+pub fn split_authority(raw: &str) -> Option<(&str, Option<u16>)> {
+    let (host, port) = match raw.strip_prefix('[') {
+        // `[2001:db8::1]`, `[2001:db8::1]:443`: the host runs through the closing `]`, and
+        // what the brackets hold is an IPv6 address.
+        Some(literal) => {
+            let (address, rest) = literal.split_once(']')?;
+            address.parse::<std::net::Ipv6Addr>().ok()?;
+            // `[`, the address, `]`: all ASCII, so the length is a char boundary
+            let host = raw.get(..address.len() + 2)?;
+            if rest.is_empty() {
+                (host, rest)
+            } else {
+                (host, rest.strip_prefix(':')?)
+            }
+        }
+        None => {
+            let (host, port) = raw.split_once(':').unwrap_or((raw, ""));
+            if !host.bytes().all(is_host_name_byte) {
+                return None;
+            }
+            (host, port)
+        }
+    };
+    if port.is_empty() {
+        return Some((host, None));
+    }
+    // ASCII digits only: `u16::from_str` alone would also take a leading `+`.
+    if !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    port.parse().ok().map(|port| (host, Some(port)))
+}
+
+/// A byte of a DNS-style host name or an IPv4 address: RFC 3986's unreserved set without `~`.
+/// The rest of a `reg-name` (sub-delims such as `,` and `;`, `%`-encoding) and every control or
+/// whitespace byte are left out, because an upstream can read them as a separator.
+#[inline]
+fn is_host_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_')
+}
+
+/// Whether a request does not name one host that routing and the upstream both read the same
+/// way, so that it cannot be served as one host:
+///
+/// - an authority, in the request target (HTTP/2 and HTTP/3 `:authority`, an HTTP/1.1
+///   absolute-form target) or in a `Host` header, that is not `host[:port]`
+///   ([`split_authority`]): userinfo, a host that is neither a DNS-style name nor an IP
+///   address (a `,`, a tab), a port that is not a port, a `Host` that is not visible ASCII;
+/// - a target authority with a `Host` header that names another authority.
+///
+/// Routing, the route's policy (`internal_only`, auth, WAF) and the response-cache key read
+/// the target's authority first ([`request_host`]), and so does the host the upstream is told,
+/// in `X-Forwarded-Host` and, with `preserve_host`, as `Host`. A request whose `Host` names
+/// another host names two, one decided on and one dropped, so it is refused before routing.
+/// RFC 9113 §8.3.1 makes such an HTTP/2 request malformed; for HTTP/1.1, RFC 9112 §3.2.2 has
+/// a server answer from the target alone, and refusing instead also keeps the authority a
+/// client wrote in an absolute-form target from ever reaching the upstream. (For HTTP/3,
+/// RFC 9114 §4.3.1 likewise, and the `h3` crate already resets a request stream whose
+/// `:authority` and first `host` field differ by a byte, before zion sees it.) An authority
+/// that is not `host[:port]` is refused for the same reason: routing would key it by its
+/// whole text, a key no host group matches, so it would get the shared routes, while the
+/// upstream reads the host before the `:`, or before the `,` of what it takes for a list.
+/// RFC 9110 §4.2.4 has a recipient treat userinfo in an `http(s)` target as an error.
+///
+/// The comparison is the scheme-based one RFC 9113 asks of an intermediary (RFC 3986
+/// §6.2.3): the host without regard to case, and an absent or empty port equal to the
+/// scheme's default. A request without a target authority (HTTP/1.1 origin-form) has nothing
+/// to compare, and only its `Host` values are checked; the other `Host` rules for HTTP/1.1
+/// (exactly one, a valid host) live in `accept`.
+pub fn authority_is_ambiguous<B>(req: &hyper::Request<B>) -> bool {
+    let target = match req.uri().authority() {
+        Some(authority) => match split_authority(authority.as_str()) {
+            Some(target) => Some(target),
+            None => return true,
+        },
+        None => None,
+    };
+    let default_port = match req.uri().scheme_str() {
+        Some(s) if s.eq_ignore_ascii_case("https") => Some(443),
+        Some(s) if s.eq_ignore_ascii_case("http") => Some(80),
+        _ => None,
+    };
+    req.headers()
+        .get_all(hyper::header::HOST)
+        .iter()
+        .any(|value| {
+            // as `normalize_host` reads it: trimmed
+            let Some((host, port)) = value.to_str().ok().and_then(|v| split_authority(v.trim()))
+            else {
+                return true;
+            };
+            target.is_some_and(|(target_host, target_port)| {
+                !host.eq_ignore_ascii_case(target_host)
+                    || port.or(default_port) != target_port.or(default_port)
+            })
+        })
 }
 
 /// Whether the request target's authority carries userinfo (`user@host`, `user:pass@host`): an
@@ -1492,6 +1592,33 @@ mod normalize_host_tests {
             (":8443", None),                              // port only ⇒ shared
             ("host/with/slash", None),                    // path char ⇒ invalid
             ("user@host", None),                          // userinfo ⇒ invalid
+            // an empty port is no port (RFC 3986 §6.2.3)
+            ("api.example.com:", Some("api.example.com")),
+            ("[2001:db8::1]:", Some("[2001:db8::1]")),
+            // a port that is not a port: no key (the pipeline refuses the request first)
+            ("api.example.com:x", None),
+            ("api.example.com:+443", None),
+            ("api.example.com:99999", None),
+            ("api.example.com:443:443", None),
+            ("[2001:db8::1]x", None),
+            ("[2001:db8::1]:x", None),
+            // a host is a DNS-style name or an IP address: letters, digits, `-`, `.`, `_`
+            ("_acme-1.Example.com", Some("_acme-1.example.com")),
+            ("10.0.0.5:8080", Some("10.0.0.5")),
+            // any other byte has no key: an upstream may read a list separator in it
+            ("api.example.com,x", None),
+            ("x,api.example.com", None),
+            ("api.example.com;x", None),
+            ("x\tapi.example.com", None),
+            ("api.example.com x", None),
+            ("api%2eexample.com", None),
+            ("api.example.com~", None),
+            ("*.example.com", None),
+            // brackets hold an IPv6 address and nothing else
+            ("[api.example.com]", None),
+            ("[2001:db8::1,x]", None),
+            ("[fe80::1%25en0]", None),
+            ("[]", None),
         ];
         for (raw, want) in cases {
             assert_eq!(
@@ -1529,8 +1656,117 @@ mod normalize_host_tests {
     #[test]
     fn unbracketed_v6_is_not_port_split() {
         // A bare (illegal) IPv6 literal must not be mangled by the port splitter
-        // into a truncated key — it stays intact and simply misses the host map.
-        assert_eq!(normalize_host("::1").as_deref(), Some("::1"));
+        // into a truncated key: it is not an authority, so it has no key at all
+        // (and a request that names one is refused before routing).
+        assert_eq!(normalize_host("::1").as_deref(), None);
+        assert_eq!(normalize_host("2001:db8::1").as_deref(), None);
+    }
+
+    fn with_hosts(uri: &str, hosts: &[&str]) -> hyper::Request<()> {
+        let mut b = hyper::Request::builder().uri(uri);
+        for h in hosts {
+            b = b.header(hyper::header::HOST, *h);
+        }
+        b.body(()).unwrap()
+    }
+
+    /// Each row: request target, `Host` header lines, whether the request fails to name one
+    /// host: two authorities that disagree, or one that is not `host[:port]`. The comparison
+    /// is scheme-based (RFC 3986 §6.2.3): the host without regard to case, an absent or empty
+    /// port equal to the scheme's default.
+    #[test]
+    fn a_host_that_names_another_authority_than_the_target_is_ambiguous() {
+        use super::authority_is_ambiguous;
+        let cases: &[(&str, &[&str], bool)] = &[
+            // origin-form: nothing to compare (the other Host rules for it live in `accept`)
+            ("/p", &["a.example"], false),
+            ("/p", &[], false),
+            // a target authority alone (an HTTP/2 or HTTP/3 request without `host`)
+            ("https://a.example/p", &[], false),
+            // the same authority twice
+            ("https://a.example/p", &["a.example"], false),
+            ("https://a.example/p", &["A.Example"], false),
+            ("https://a.example/p", &["a.example:443"], false),
+            ("https://a.example:443/p", &["a.example"], false),
+            ("http://a.example/p", &["a.example:80"], false),
+            ("https://a.example:8443/p", &["a.example:8443"], false),
+            ("https://[::1]:8443/p", &["[::1]:8443"], false),
+            ("https://a.example/p", &["a.example", "a.example"], false),
+            // two different authorities
+            ("https://a.example/p", &["b.example"], true),
+            ("http://public.example/p", &["admin.example"], true),
+            ("https://a.example/p", &["a.example:8443"], true),
+            ("https://a.example:8443/p", &["a.example"], true),
+            ("http://a.example/p", &["a.example:443"], true),
+            ("https://a.example/p", &["a.example."], true),
+            ("https://a.example/p", &["a.example", "b.example"], true),
+            // a `Host` that is not an authority, or carries userinfo
+            ("https://a.example/p", &["a example"], true),
+            ("https://a.example/p", &["u@a.example"], true),
+            // userinfo in the target: an error on its own (RFC 9110 §4.2.4)
+            ("https://u@a.example/p", &[], true),
+            ("https://u@a.example/p", &["a.example"], true),
+            // an empty port is the scheme's default (RFC 3986 §6.2.3)
+            ("https://a.example:/p", &["a.example"], false),
+            ("https://a.example:/p", &["a.example:443"], false),
+            ("https://a.example/p", &["a.example:"], false),
+            ("https://a.example:/p", &[], false),
+            ("https://[::1]:/p", &["[::1]"], false),
+            ("/p", &["a.example:"], false),
+            // a port that is not a port, in the target or in a `Host`, with or without the
+            // other: routing would key the whole text, the upstream the host before the `:`
+            ("https://a.example:x/p", &["a.example"], true),
+            ("https://a.example:+443/p", &["a.example"], true),
+            ("https://a.example:99999/p", &["a.example"], true),
+            ("https://a.example:x/p", &[], true),
+            ("https://a.example/p", &["a.example:x"], true),
+            ("https://a.example/p", &["a.example:+443"], true),
+            ("https://a.example/p", &["a.example:99999"], true),
+            ("https://a.example/p", &["a.example:443:443"], true),
+            ("/p", &["a.example:x"], true),
+            ("/p", &["a.example:+443"], true),
+            ("/p", &["a.example:-1"], true),
+            ("/p", &["a.example:99999"], true),
+            ("/p", &["a.example:443:443"], true),
+            ("/p", &["a.example: 443"], true),
+            ("/p", &["::1"], true),
+            ("/p", &["[::1]x"], true),
+            ("/p", &["[::1]:x"], true),
+            ("/p", &["[::1"], true),
+            ("/p", &["a.example", "a.example:x"], true),
+            // userinfo in a `Host`, also without a target
+            ("/p", &["u@a.example"], true),
+            // a host that is neither a DNS-style name nor an IP address, in the target or in
+            // a `Host`: routing would key the whole text, an upstream that reads
+            // `X-Forwarded-Host` as a list the host before the `,`
+            ("/p", &["a_b-1.example"], false),
+            ("/p", &["10.0.0.5:8080"], false),
+            ("/p", &["a.example,x"], true),
+            ("/p", &["x,a.example"], true),
+            ("/p", &["a.example;x"], true),
+            ("/p", &["x\ta.example"], true),
+            ("/p", &["a.example,x:443"], true),
+            ("/p", &["[a.example]"], true),
+            ("/p", &["[::1,x]"], true),
+            ("https://a.example,x/p", &[], true),
+            ("https://a.example,x/p", &["a.example,x"], true),
+            ("https://a.example/p", &["a.example,x"], true),
+            ("https://[a.example]/p", &["[a.example]"], true),
+        ];
+        for (uri, hosts, want) in cases {
+            assert_eq!(
+                authority_is_ambiguous(&with_hosts(uri, hosts)),
+                *want,
+                "{uri} with Host {hosts:?}"
+            );
+        }
+        // a `Host` that is not visible ASCII, which routing cannot read at all
+        let mut req = with_hosts("/p", &[]);
+        req.headers_mut().insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_bytes(b"a.example:\xff").unwrap(),
+        );
+        assert!(authority_is_ambiguous(&req), "a non-ASCII Host");
     }
 }
 

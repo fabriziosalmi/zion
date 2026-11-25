@@ -15,8 +15,9 @@ pub(super) fn resolve(
     cfg: &Arc<ResolvedAppConfig>,
     req: &Request<ReqBody>,
 ) -> Option<Arc<ResolvedRoute>> {
-    // Hot routes hit the thread-local cache in ~5ns. Cache misses fall through
-    // to the radix tree (~30ns) and are promoted to MRU. The cache is a true
+    // Hot routes hit the thread-local cache; misses fall through to the radix
+    // tree and are promoted to MRU (`cargo bench --bench route_cache` measures
+    // both on the real cache module). The cache is a true
     // O(1) LRU bounded at ROUTE_CACHE_CAP entries: when full, the LRU entry is
     // evicted on insert. The earlier "if len < 256 { insert }" stopped
     // promoting any new path once the cap was reached, so a client hitting
@@ -56,20 +57,24 @@ pub(super) fn resolve(
     };
     let host = host_cow.as_deref();
 
-    // Cache key folds the host in when present, so two authorities sharing a
-    // path never collide (ADR-0010 cache invariant); with no host it is the
-    // bare path hash — byte-identical to the pre-host-routing key.
+    // The hash folds the host in when present, so two authorities sharing a
+    // path take different slots; with no host it is the bare path hash. It
+    // only picks the slot: a hit also compares the full (host, path), so a
+    // crafted hash collision is a miss, never another route's policy
+    // (ADR-0010 cache invariant).
     let cache_key = route_cache_key(host, path);
 
-    // Thread-local cache hit (~5ns) — touch promotes to MRU
-    if let Some(route) = ROUTE_CACHE.with(|cache| cache.borrow_mut().get(cache_key)) {
+    // Thread-local cache hit: the full (host, path) matched; promotes to MRU
+    if let Some(route) = ROUTE_CACHE.with(|cache| cache.borrow_mut().get(cache_key, host, path)) {
         return Some(route);
     }
 
-    // Radix tree fallback (~30ns)
+    // Radix tree fallback
     let route = cfg.router.at(host, path)?.clone();
     ROUTE_CACHE.with(|cache| {
-        cache.borrow_mut().insert(cache_key, route.clone());
+        cache
+            .borrow_mut()
+            .insert(cache_key, host, path, route.clone());
     });
     Some(route)
 }

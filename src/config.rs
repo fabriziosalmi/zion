@@ -3654,7 +3654,13 @@ mod tests {
         assert!(c.upstream["u"].preserve_host);
         assert!(toml::from_str::<ZionConfig>(&cfg("preserve_host = \"yes\"")).is_err());
         assert_eq!(d.upstream["u"].health_host, None);
-        for good in ["app.example", "app.example:8443", "10.0.0.5"] {
+        for good in [
+            "app.example",
+            "app.example:8443",
+            "10.0.0.5",
+            "[::1]",
+            "[2001:db8::10]:8443",
+        ] {
             let c = cfg(&format!("health_host = \"{good}\""));
             assert!(
                 !validate_str(&c, "t")
@@ -3670,6 +3676,12 @@ mod tests {
             "app example",
             "app.example/x",
             "http://app.example",
+            // not `host[:port]`: the same parser as a request's authority
+            "app.example:x",
+            "app.example:99999",
+            "::1",
+            "fe80::1",
+            "app.example,x",
         ] {
             let e = validate_str(&cfg(&format!("health_host = \"{bad}\"")), "t")
                 .err()
@@ -4513,6 +4525,14 @@ mtls_fingerprint = false
             "api.example.com/x",
             "user@api.example.com",
             "",
+            // not `host[:port]`, or an empty port: no request is routed by that text
+            "api.example.com:",
+            "api.example.com:x",
+            "::1",
+            // a byte no host name has
+            "api.example.com,x",
+            "api_example;com",
+            "[api.example.com]",
         ] {
             assert!(
                 validate_host_entry("r", bad).is_some(),
@@ -4531,6 +4551,7 @@ mtls_fingerprint = false
         for bad in [
             "*.",
             "*.example.com:8443",
+            "*.example.com,x",
             "api.*.example.com",
             "www.example.*",
             "*",

@@ -372,13 +372,22 @@ fn no_desync_form_smuggles_a_request_past_zion() {
         origin_bytes(&seen)
     );
 
-    // 8. an absolute-form target is re-framed to origin-form, and the path is forwarded
-    // faithfully. Its authority, not the `Host` sent with it, is the request's host (RFC 9112
-    // §3.2.2): zion routes and caches the request on it, so the upstream is told that one in
-    // `X-Forwarded-Host`, never the `Host` the target overrides.
+    // 8. an absolute-form target that names another authority than the Host header is refused
+    // with 400 and never forwarded: a request names one host, the one routing, the route's
+    // policy, the cache key and the upstream all go by.
     let line = send_raw(
         port,
-        b"GET http://evil.example/abs8 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n",
+        b"GET http://evil.example/abs8-foreign HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        line.starts_with("HTTP/1.1 400"),
+        "an absolute-form target that disagrees with Host must be refused with 400: {line:?}"
+    );
+    // 8a. one that names the same authority as Host is re-framed to origin-form; the absolute URI
+    // never reaches the upstream, and the path is forwarded faithfully.
+    let line = send_raw(
+        port,
+        b"GET http://A.example:80/abs8 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n",
     );
     assert!(
         !line.is_empty() && !line.contains(" 5"),
@@ -391,6 +400,10 @@ fn no_desync_form_smuggles_a_request_past_zion() {
     );
     let upstream = origin_bytes(&seen);
     assert!(
+        !upstream.contains("/abs8-foreign") && !upstream.contains("evil.example"),
+        "the request that named a foreign authority reached the upstream:\n{upstream}"
+    );
+    assert!(
         !upstream.to_ascii_lowercase().contains("http://"),
         "a non-origin-form target reached the upstream:\n{upstream}"
     );
@@ -402,8 +415,11 @@ fn no_desync_form_smuggles_a_request_past_zion() {
         .cloned()
         .unwrap_or_default()
         .to_ascii_lowercase();
+    // Its authority, not the `Host` sent with it, is the request's host (RFC 9112 §3.2.2): zion
+    // routes and caches the request on it, so the upstream is told that one in
+    // `X-Forwarded-Host` (`A.example:80`), never the `Host` the target overrides (`a.example`).
     assert!(
-        head.contains("\nx-forwarded-host: evil.example") && !head.contains("a.example"),
+        head.lines().any(|l| l == "x-forwarded-host: a.example:80"),
         "the upstream was not told the host the request is routed and cached on:\n{head}"
     );
 
@@ -434,6 +450,32 @@ fn no_desync_form_smuggles_a_request_past_zion() {
     assert!(
         !origin_bytes(&seen).contains("CONNECT"),
         "a CONNECT reached the upstream:\n{}",
+        origin_bytes(&seen)
+    );
+
+    // 8d. an authority whose port is not a port, or whose host is not a host name, in an
+    // absolute-form target or in Host, is refused with 400 and never forwarded: routing would key
+    // the whole text, while an upstream reads the host before the `:`, or before the `,` of what
+    // it takes for a list (`X-Forwarded-Host`).
+    for raw in [
+        &b"GET http://a.example:x/abs8d-target HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n"[..],
+        b"GET /abs8d-host HTTP/1.1\r\nHost: a.example:x\r\nConnection: close\r\n\r\n",
+        b"GET /abs8d-plus HTTP/1.1\r\nHost: a.example:+443\r\nConnection: close\r\n\r\n",
+        b"GET /abs8d-comma HTTP/1.1\r\nHost: a.example,x\r\nConnection: close\r\n\r\n",
+        b"GET /abs8d-tab HTTP/1.1\r\nHost: x\ta.example\r\nConnection: close\r\n\r\n",
+        b"GET http://a.example,x/abs8d-comma-target HTTP/1.1\r\nHost: a.example,x\r\nConnection: close\r\n\r\n",
+    ] {
+        let line = send_raw(port, raw);
+        assert!(
+            line.starts_with("HTTP/1.1 400"),
+            "{:?} must be refused with 400: {line:?}",
+            String::from_utf8_lossy(raw)
+        );
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !origin_bytes(&seen).contains("/abs8d"),
+        "a request whose authority port is not a port reached the upstream:\n{}",
         origin_bytes(&seen)
     );
 

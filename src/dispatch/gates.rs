@@ -58,6 +58,9 @@ pub(super) enum Gate {
     NormalizePath,
     /// 405 for a method outside the whitelist.
     Method,
+    /// 400 for a request whose `Host` names another authority than its request target, or
+    /// whose target or `Host` authority is not `host[:port]`.
+    Authority,
     /// 425 for a state-changing method in early data.
     EarlyData,
     /// 508 for a request whose `Via` already names this process (it has looped).
@@ -85,6 +88,7 @@ pub(super) const PRE_ROUTING: &[Gate] = &[
     Gate::TargetUserinfo,
     Gate::NormalizePath,
     Gate::Method,
+    Gate::Authority,
     Gate::EarlyData,
     Gate::LoopDetection,
     Gate::RateLimit,
@@ -118,6 +122,7 @@ pub(super) async fn run_pre_routing(
             Gate::TargetUserinfo => target_userinfo(req),
             Gate::NormalizePath => normalize_path(req),
             Gate::Method => method_whitelist(req),
+            Gate::Authority => authority(req),
             Gate::EarlyData => early_data(ctx, req),
             Gate::LoopDetection => loop_detection(req),
             Gate::RateLimit => rate_limit(ctx, state),
@@ -151,6 +156,15 @@ pub(crate) fn uri_too_long<B>(req: &Request<B>) -> bool {
 /// Gate: URI length (reject oversized URIs before routing).
 fn uri_length(req: &Request<ReqBody>) -> Option<Response<ZionBody>> {
     uri_too_long(req).then(|| empty_response(StatusCode::URI_TOO_LONG))
+}
+
+/// Gate: one authority per request. Routing, the route's policy, the cache key and the host the
+/// upstream is told go by the request target's authority when it has one: a request whose
+/// `Host` names another, or that names an authority routing would key differently from the
+/// upstream (`a.example:x`), is refused before either is used (see
+/// [`crate::security::authority_is_ambiguous`]).
+fn authority(req: &Request<ReqBody>) -> Option<Response<ZionBody>> {
+    crate::security::authority_is_ambiguous(req).then(|| empty_response(StatusCode::BAD_REQUEST))
 }
 
 /// Gate: a request target whose authority carries userinfo (`GET http://user:pass@shop.example/`,
@@ -856,6 +870,7 @@ mod tests {
             Gate::TargetUserinfo,
             Gate::NormalizePath,
             Gate::Method,
+            Gate::Authority,
             Gate::EarlyData,
             Gate::LoopDetection,
             Gate::RateLimit,
