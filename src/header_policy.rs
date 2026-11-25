@@ -12,12 +12,18 @@
 //!   * A header named `__proto__` or `constructor` is refused: an upstream that copies the
 //!     headers into a JavaScript object pollutes its prototype.
 //!
-//! Names are compared without case, and with `_` and `-` as the same character: a CGI or PHP
-//! upstream reads `X_Debug` as `X-Debug` (both become `HTTP_X_DEBUG`). Cookie names are
-//! compared exactly (RFC 6265 names are case-sensitive) and also percent-decoded, because PHP
-//! decodes them (`%43acheWarmer` is `CacheWarmer` to it).
+//! Names are compared without case, and with every byte that is neither a letter nor a digit
+//! (`-`, `_`, `.`, ...) as the same character ([`same_name`]): a CGI upstream reads `X_Debug` as
+//! `X-Debug`, and PHP also `X.Debug` (all become `HTTP_X_DEBUG`). Cookie names are
+//! compared exactly (RFC 6265 names are case-sensitive), percent-decoded (`%43acheWarmer` is
+//! `CacheWarmer` to an upstream that decodes cookie names), and as the key PHP files them under,
+//! as sent (`XDEBUG.SESSION` is `$_COOKIE['XDEBUG_SESSION']`) and url-decoded, as PHP did before
+//! 7.2.34, 7.3.23 and 7.4.11 (`XDEBUG%2ESESSION` and `%20CacheWarmer`), see
+//! [`crate::virtual_patch::cookie_is`]. A `Cookie` field is read as bytes: a byte outside ASCII
+//! in one cookie does not hide the others.
 
 use crate::http_util::{empty_response, ZionBody};
+use crate::reserved_headers::same_name;
 use hyper::header::{HeaderMap, HeaderName, COOKIE};
 use hyper::{Response, StatusCode};
 
@@ -53,9 +59,9 @@ impl HeaderLists {
 /// What one route strips and refuses: the built-in names, the global lists, the route's own.
 #[derive(Clone, Debug)]
 pub struct HeaderPolicy {
-    /// Lower-case, `_` folded to `-`.
+    /// Lower-case, every byte that is neither a letter nor a digit folded to `-` ([`fold`]).
     strip: Vec<String>,
-    /// Lower-case, `_` folded to `-`.
+    /// Lower-case, every byte that is neither a letter nor a digit folded to `-` ([`fold`]).
     deny: Vec<String>,
     /// As written.
     deny_cookies: Vec<String>,
@@ -106,12 +112,14 @@ impl HeaderPolicy {
         }
         if !self.deny_cookies.is_empty() {
             for value in headers.get_all(COOKIE) {
-                let Ok(value) = value.to_str() else { continue };
-                if value.split(';').any(|pair| {
-                    let name = pair.split_once('=').map_or(pair, |(n, _)| n).trim();
+                // As bytes: a byte outside ASCII in one cookie (obs-text, which hyper and h2
+                // accept in a field value) made `to_str()` fail, and the whole field, with the
+                // denied cookie next to it, was let through.
+                if value.as_bytes().split(|&b| b == b';').any(|pair| {
+                    let name = pair.split(|&b| b == b'=').next().unwrap_or_default();
                     self.deny_cookies
                         .iter()
-                        .any(|d| d == name || percent_decoded(name).is_some_and(|n| *d == n))
+                        .any(|d| crate::virtual_patch::cookie_is(name, d))
                 }) {
                     return Some(empty_response(StatusCode::BAD_REQUEST));
                 }
@@ -124,42 +132,19 @@ impl HeaderPolicy {
     }
 }
 
-/// `name` lower-cased (hyper stores it so) with `_` as `-`.
+/// `name` lower-cased (hyper stores it so) with every byte that is neither a letter nor a digit
+/// as `-`: the one spelling [`same_name`] compares a request's header names with, so a list entry
+/// written `X_Debug` or `X.Debug` names the same header as `X-Debug`.
 fn fold(name: &str) -> String {
-    name.to_ascii_lowercase().replace('_', "-")
-}
-
-/// `folded` (from [`fold`]) and a request header name (lower-case) are the same name, with
-/// `_` and `-` as one character.
-fn same_name(folded: &str, name: &str) -> bool {
-    folded.len() == name.len()
-        && folded
-            .bytes()
-            .zip(name.bytes())
-            .all(|(a, b)| a == b || (a == b'-' && b == b'_'))
-}
-
-/// `name` with its percent-escapes decoded, or `None` when it has none (or a malformed one,
-/// or decodes to bytes that are not UTF-8).
-fn percent_decoded(name: &str) -> Option<String> {
-    if !name.contains('%') {
-        return None;
-    }
-    let b = name.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' {
-            let hex = |c: u8| (c as char).to_digit(16);
-            let (h, l) = (hex(*b.get(i + 1)?)?, hex(*b.get(i + 2)?)?);
-            out.push((h * 16 + l) as u8);
-            i += 3;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
+    name.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                b.to_ascii_lowercase() as char
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn header_names(owner: &str, key: &str, written: Vec<String>) -> Result<Vec<String>, String> {
@@ -267,6 +252,43 @@ mod tests {
         );
     }
 
+    /// PHP files a request header under `HTTP_` + its name with `-` and `.` as `_`, so its
+    /// built-in server reads `X.Debug` as `HTTP_X_DEBUG`. A name that differs from a listed one
+    /// only in bytes that are neither letters nor digits is that name, whichever way either is
+    /// written.
+    #[test]
+    fn a_dot_or_another_separator_names_the_same_header_as_a_dash() {
+        let p = HeaderPolicy::merge(
+            &lists(&["X-Debug"], &["X-Evil", "X.Other_Evil"], &[]),
+            &HeaderLists::default(),
+        );
+        let let_through: Vec<&str> = [
+            "x.evil",
+            "X.Evil",
+            "x~evil",
+            "x-other-evil",
+            "x_other_evil",
+            "x.other.evil",
+        ]
+        .into_iter()
+        .filter(|name| !refused(&p, &[(name, "1")]))
+        .collect();
+        assert!(
+            let_through.is_empty(),
+            "deny_headers let through: {let_through:?}"
+        );
+        for name in ["x0evil", "xevil", "x-evil-", "x.evil.x"] {
+            assert!(!refused(&p, &[(name, "1")]), "{name}");
+        }
+        let mut h = map(&[("x.debug", "1"), ("x+debug", "2"), ("x.debugger", "3")]);
+        assert!(p.apply(&mut h).is_none());
+        assert_eq!(
+            h.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+            ["x.debugger"],
+            "both spellings stripped, a longer name kept"
+        );
+    }
+
     #[test]
     fn a_cookie_is_refused_by_its_exact_or_percent_decoded_name() {
         let p = HeaderPolicy::merge(&lists(&[], &[], &["CacheWarmer"]), &HeaderLists::default());
@@ -286,6 +308,108 @@ mod tests {
             &[("cookie", "a=1"), ("cookie", "CacheWarmer=x")]
         ));
         for cookie in ["cachewarmer=x", "CacheWarmerX=x", "a=CacheWarmer", "%zz=1"] {
+            assert!(!refused(&p, &[("cookie", cookie)]), "{cookie}");
+        }
+    }
+
+    /// hyper (httparse) and h2 accept obs-text (0x80-0xFF) in a header value, and a PHP, Go or
+    /// Node upstream still reads `CacheWarmer` from this field. `to_str()` fails on the high
+    /// byte, so the field must not be skipped.
+    #[test]
+    fn a_high_byte_elsewhere_in_the_cookie_field_does_not_hide_a_denied_cookie() {
+        let p = HeaderPolicy::merge(&lists(&[], &[], &["CacheWarmer"]), &HeaderLists::default());
+        for field in [
+            &b"a=\x80; CacheWarmer=O:8:\"stdClass\":0:{}"[..],
+            b"CacheWarmer=x; a=\xff",
+            b"a=\xc3\xa9; %43acheWarmer=x",
+            b"\xe2\x82\xac=1; CacheWarmer=x",
+        ] {
+            let mut h = HeaderMap::new();
+            h.append(
+                COOKIE,
+                hyper::header::HeaderValue::from_bytes(field)
+                    .expect("http accepts obs-text, as hyper and h2 do"),
+            );
+            assert!(
+                p.apply(&mut h).is_some(),
+                "the field reaches the upstream unrefused: {h:?}"
+            );
+        }
+        // A high byte alone refuses nothing.
+        let mut h = HeaderMap::new();
+        h.append(
+            COOKIE,
+            hyper::header::HeaderValue::from_bytes(b"a=\x80; theme=d\xc3\xa9").unwrap(),
+        );
+        assert!(p.apply(&mut h).is_none());
+    }
+
+    /// PHP drops the whitespace before a cookie name and turns ' ', '.' and an unclosed '[' in
+    /// it into '_', so each of these is `$_COOKIE['XDEBUG_SESSION']` to it and must be refused
+    /// like the exact name.
+    #[test]
+    fn a_cookie_name_php_reads_as_a_denied_one_is_refused() {
+        let p = HeaderPolicy::merge(
+            &lists(&[], &[], &["XDEBUG_SESSION"]),
+            &HeaderLists::default(),
+        );
+        assert!(refused(&p, &[("cookie", "XDEBUG_SESSION=1")]), "control");
+        let missed: Vec<&str> = [
+            "XDEBUG.SESSION=1",
+            "XDEBUG SESSION=1",
+            "XDEBUG[SESSION=1",
+            "XDEBUG_SESSION[x]=1",
+            "a=1;  XDEBUG.SESSION=1",
+        ]
+        .into_iter()
+        .filter(|c| !refused(&p, &[("cookie", c)]))
+        .collect();
+        assert!(
+            missed.is_empty(),
+            "deny_cookies XDEBUG_SESSION let through: {missed:?}"
+        );
+        // Names PHP keeps apart from it are not refused.
+        for cookie in ["XDEBUG_SESSIONS=1", "XDEBUG-SESSION=1", "xdebug_session=1"] {
+            assert!(!refused(&p, &[("cookie", cookie)]), "{cookie}");
+        }
+        // A denied name written with '.' is the same PHP key as its '_' spelling.
+        let dotted = HeaderPolicy::merge(&lists(&[], &[], &["my.cookie"]), &HeaderLists::default());
+        for cookie in ["my.cookie=1", "my_cookie=1", "my cookie=1"] {
+            assert!(refused(&dotted, &[("cookie", cookie)]), "{cookie}");
+        }
+    }
+
+    /// PHP before 7.2.34, 7.3.23 and 7.4.11 (the PHP 7.0 of the lab's WordPress image among
+    /// them) url-decoded a cookie name and then filed it under its key: a leading space it
+    /// decoded is dropped, a decoded NUL ends the name, and a decoded '.' or a '+' (a space)
+    /// becomes '_'. Each of these is a denied cookie to it.
+    #[test]
+    fn a_cookie_name_an_older_php_decodes_to_a_denied_one_is_refused() {
+        let p = HeaderPolicy::merge(
+            &lists(&[], &[], &["CacheWarmer", "XDEBUG_SESSION"]),
+            &HeaderLists::default(),
+        );
+        let missed: Vec<&str> = [
+            "%20CacheWarmer=O:8:\"stdClass\":0:{}",
+            "+CacheWarmer=x",
+            "CacheWarmer%00x=x",
+            "a=1; %20%20CacheWarmer=x",
+            "XDEBUG%2ESESSION=1",
+            "XDEBUG+SESSION=1",
+            "XDEBUG%20SESSION=1",
+            "XDEBUG%5BSESSION=1",
+            "XDEBUG%5FSESSION=1",
+        ]
+        .into_iter()
+        .filter(|c| !refused(&p, &[("cookie", c)]))
+        .collect();
+        assert!(missed.is_empty(), "deny_cookies let through: {missed:?}");
+        for cookie in [
+            "CacheWarmer%01=x",
+            "CacheWarmerX%00=x",
+            "XDEBUG%2DSESSION=1",
+            "XDEBUG_SESSION+=1",
+        ] {
             assert!(!refused(&p, &[("cookie", cookie)]), "{cookie}");
         }
     }
@@ -331,7 +455,7 @@ mod tests {
     use proptest::prelude::*;
 
     fn name_like() -> impl Strategy<Value = String> {
-        let c = prop::sample::select(vec!['a', 'B', 'x', '-', '_', '9', 'Z', '.']);
+        let c = prop::sample::select(vec!['a', 'B', 'x', '-', '_', '9', 'Z', '.', '~']);
         prop::collection::vec(c, 1..16).prop_map(|cs| cs.into_iter().collect())
     }
 
@@ -345,54 +469,95 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(2048))]
 
-        // Case and `_`/`-` never change the folded name; folding is idempotent.
+        // Case and `-`/`_`/`.` never change the folded name; folding is idempotent.
         #[test]
-        fn fold_erases_case_and_dash_underscore(s in name_like()) {
+        fn fold_erases_case_and_separators(s in name_like()) {
             let f = fold(&s);
             prop_assert_eq!(&f, &fold(&f), "not idempotent: {:?}", s);
             prop_assert_eq!(&f, &fold(&s.to_ascii_uppercase()), "case leaked: {:?}", s);
             prop_assert_eq!(&f, &fold(&s.replace('-', "_")), "dash/underscore leaked: {:?}", s);
+            prop_assert_eq!(&f, &fold(&s.replace(['-', '_'], ".")), "dot leaked: {:?}", s);
         }
 
         // The strip/deny matcher is exactly fold-equality: a listed name matches a
         // request header iff they share a canonical form. If this breaks, a denied
-        // header can be smuggled past by respelling its case or `_`/`-`.
+        // header can be smuggled past by respelling its case or `-`/`_`/`.`.
         #[test]
         fn same_name_is_exactly_fold_equality(a in name_like(), b in name_like()) {
             let got = same_name(&fold(&a), &b.to_ascii_lowercase());
             prop_assert_eq!(got, fold(&a) == fold(&b), "a={:?} b={:?}", a, b);
         }
 
-        // percent_decoded never panics and reports "no escapes" as None.
+        // Two random names rarely share a canonical form, so the test above seldom sees a
+        // respelling. This one only does: each letter in either case, each byte that is neither
+        // a letter nor a digit swapped for any other such byte a header name may hold. Every one
+        // must name the listed header.
         #[test]
-        fn percent_decoded_is_total(s in ".{0,32}") {
-            let d = percent_decoded(&s);
-            if !s.contains('%') {
-                prop_assert!(d.is_none(), "no % but decoded: {:?}", s);
-            }
+        fn every_respelling_of_a_listed_name_names_it(
+            listed in name_like(),
+            seps in prop::collection::vec(prop::sample::select(b"-_.!#$%&'*+^`|~".to_vec()), 16),
+            upper in any::<u16>(),
+        ) {
+            let sent: String = listed
+                .bytes()
+                .enumerate()
+                .map(|(i, c)| {
+                    if c.is_ascii_alphanumeric() {
+                        let flip = (upper >> (i % 16)) & 1 == 1;
+                        (if flip { c.to_ascii_uppercase() } else { c }) as char
+                    } else {
+                        seps.get(i).copied().unwrap_or(b'_') as char
+                    }
+                })
+                .collect();
+            prop_assert!(
+                same_name(&fold(&listed), &sent.to_ascii_lowercase()),
+                "listed {:?}, sent {:?}", listed, sent
+            );
         }
 
-        // Percent-encoding any subset of a token's bytes still decodes back to it:
-        // a denied cookie name cannot be hidden behind percent-escapes.
+        // A byte outside ASCII anywhere in another cookie of the same field never changes the
+        // verdict: the denied cookie next to it is still refused.
         #[test]
-        fn encoding_a_cookie_name_round_trips(tok in token_no_pct(), mask in any::<u64>()) {
+        fn a_high_byte_in_another_cookie_never_hides_a_denied_one(
+            other in "[a-z]{1,6}=[a-z0-9]{0,8}",
+            at in any::<prop::sample::Index>(),
+            high in 0x80u8..=0xff,
+            denied_first in any::<bool>(),
+        ) {
+            let p = HeaderPolicy::merge(&lists(&[], &[], &["CacheWarmer"]), &HeaderLists::default());
+            let mut other = other.into_bytes();
+            other.insert(at.index(other.len() + 1), high);
+            let field = if denied_first {
+                [&b"CacheWarmer=x; "[..], &other].concat()
+            } else {
+                [&other[..], b"; CacheWarmer=x"].concat()
+            };
+            let mut h = HeaderMap::new();
+            h.append(COOKIE, hyper::header::HeaderValue::from_bytes(&field).unwrap());
+            prop_assert!(p.apply(&mut h).is_some(), "{:?}", field.escape_ascii().to_string());
+        }
+
+        // Percent-encoding any subset of a denied name's bytes never hides the cookie: the
+        // request is still refused.
+        #[test]
+        fn a_percent_encoded_denied_cookie_is_still_refused(tok in token_no_pct(), mask in any::<u64>()) {
             let mut enc = String::new();
-            let mut encoded_any = false;
             for (i, b) in tok.bytes().enumerate() {
                 if (mask >> (i % 64)) & 1 == 1 {
                     enc.push('%');
                     enc.push_str(&format!("{b:02X}"));
-                    encoded_any = true;
                 } else {
                     enc.push(b as char);
                 }
             }
-            let decoded = percent_decoded(&enc);
-            if encoded_any {
-                prop_assert_eq!(decoded.as_deref(), Some(tok.as_str()), "enc={:?}", enc);
-            } else {
-                prop_assert!(decoded.is_none());
-            }
+            let p = HeaderPolicy::merge(&lists(&[], &[], &[tok.as_str()]), &HeaderLists::default());
+            // `other` has no byte of the token alphabet, so only the encoded cookie can match.
+            let cookie = format!("other=1; {enc}=x");
+            prop_assert!(
+                refused(&p, &[("cookie", cookie.as_str())]),
+                "deny {:?}, sent {:?}", tok, cookie
+            );
         }
     }
 }

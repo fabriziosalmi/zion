@@ -20,3 +20,19 @@ action = "deny"
 path_glob = "/wp-json/wp/v2/posts/*"
 [[rule.query]]
 name = "id"
+
+# The same CVE reached through the 'rest_route' query variable, which WordPress serves from any
+# path (rest_api_init() adds it as a public query var, WP::parse_request() fills it from the
+# query string, rest_api_loaded() serves the route it names): PUT /?rest_route=/wp/v2/posts/1&id=1z
+# has no /wp-json/ in its path, so the rule above never sees it. Probe
+# 'cve-2017-1001000-rest-route-query-var' in probes.toml. Mirrors the shipped pack's
+# 'wordpress-rest-route-id-param-override'.
+[[rule]]
+id = "wp-rest-route-id-param-override"
+cve = "CVE-2017-1001000"
+source = "https://github.com/advisories/GHSA-qm68-r9p4-ghhx"
+action = "deny"
+[[rule.query]]
+name = "rest_route"
+[[rule.query]]
+name = "id"
