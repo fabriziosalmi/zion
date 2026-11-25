@@ -50,6 +50,17 @@ jobs:
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
         with:
           tool: cargo-llvm-cov
+      # --all-features builds ktls. Without the kernel TLS module the boot probe sends zion
+      # to userspace TLS (src/ktls.rs); with it, the tests run the kTLS upgrade, the path this
+      # job exists to cover. Before that fall-back, a runner without the module closed every
+      # TLS connection and admin_api.rs failed with status 0 and ~70 "failed to enable TLS
+      # ULP ... os error 2" lines, on master c732f21, c76e014 and 7482a11, and passed on
+      # runners that had it. The same step as ci.yml "Load the kernel TLS module (ktls)".
+      - name: Load the kernel TLS module (ktls)
+        run: |
+          if grep -q '^tls ' /proc/modules; then echo "tls module: already loaded"
+          else echo "tls module: not loaded, loading it"; sudo modprobe tls; fi
+          grep -q '^tls ' /proc/modules
       - name: Run tests with coverage
         run: cargo llvm-cov --locked --all-features --lcov --output-path lcov.info
       - name: Summary
