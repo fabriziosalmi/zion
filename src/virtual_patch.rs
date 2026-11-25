@@ -47,7 +47,8 @@ pub struct HeaderMatch {
 pub struct QueryMatch {
     /// Parameter name (case-sensitive), compared with the request's after percent-decoding, and
     /// also with where PHP files the request's (`?id[]=` is `$_GET['id']`; a name with an index,
-    /// `name[x]`, matches that element and the ones inside it, not a plain `name`).
+    /// `name[x]`, matches that element and the ones inside it, not a plain `name`; an empty index,
+    /// `name[x][]`, matches every element at that level, `name[x][0]` and `name[x][y]` alike).
     pub name: String,
     /// Exact value the parameter must have. Omit to match on mere presence.
     #[serde(default)]
@@ -427,16 +428,80 @@ pub(crate) fn cookie_is(raw: &[u8], want: &str) -> bool {
 /// [`php_key_byte`] maps them, without building either key. When `want` names an array element
 /// (`name[x]`), `sent` must name that element or one inside it (`name[x]` or `name[x][y]`), so
 /// a rule for `name[x]` does not match a plain `name` or `name[y]`. A `want` without an index
-/// matches every element: `id[]` and `id[x]` are both `$_GET['id']`.
+/// matches every element: `id[]` and `id[x]` are both `$_GET['id']`. The indexes are compared one
+/// by one as PHP reads them ([`php_indexes`], [`same_php_index`]).
 fn same_php_name(sent: &[u8], want: &[u8]) -> bool {
     let ((sent_key, sent_index), (want_key, want_index)) = (php_name(sent), php_name(want));
-    !want_key.is_empty()
-        && sent_key.len() == want_key.len()
-        && sent_key
+    if want_key.is_empty()
+        || sent_key.len() != want_key.len()
+        || !sent_key
             .iter()
             .zip(want_key)
             .all(|(&x, &y)| php_key_byte(x) == php_key_byte(y))
-        && sent_index.starts_with(want_index)
+    {
+        return false;
+    }
+    let mut sent_indexes = php_indexes(sent_index);
+    php_indexes(want_index).all(|w| sent_indexes.next().is_some_and(|s| same_php_index(s, w)))
+}
+
+/// One `[...]` after a key, as PHP reads it: `None` appends (`[]`, or one whitespace byte alone
+/// between the brackets, `[ ]`), `Some(key)` names the key, as written.
+type PhpIndex<'a> = Option<&'a [u8]>;
+
+/// Does an element PHP files under the index `sent` sit where the rule's index `want` points?
+///
+/// - A `want` that appends (`name[x][]`) names every element at that level, since PHP gives the
+///   appended value the next integer key: `name[x][0]`, `name[x][5]`, `name[x][y]` and
+///   `name[x][ ]` are all elements of the array `$_GET['name']['x']`.
+/// - A `sent` that appends lands on an integer key, which one depending on the elements filed
+///   before it (`?a[5]=1&a[]=2` puts `2` at `6`), so it can be any element a `want` names with an
+///   integer key ([`php_int_key`]).
+/// - Otherwise the two keys are the same bytes. PHP keeps a key's bytes as sent: `[ x]` is the key
+///   `" x"`, `[00]` the string `"00"`, not `0`.
+fn same_php_index(sent: PhpIndex<'_>, want: PhpIndex<'_>) -> bool {
+    match (sent, want) {
+        (_, None) => true,
+        (None, Some(want)) => php_int_key(want),
+        (Some(sent), Some(want)) => sent == want,
+    }
+}
+
+/// Is `key` an array key PHP stores as an integer (`ZEND_HANDLE_NUMERIC_STR`): a decimal with no
+/// leading `0` or `+`, an optional `-` (not `-0`), within the range of a 64-bit integer. Read
+/// in place: no string is built.
+fn php_int_key(key: &[u8]) -> bool {
+    let digits = key.strip_prefix(b"-").unwrap_or(key);
+    let canonical = match digits {
+        [b'0'] => digits.len() == key.len(),
+        [b'1'..=b'9', rest @ ..] => rest.iter().all(u8::is_ascii_digit),
+        _ => false,
+    };
+    canonical
+        && std::str::from_utf8(key)
+            .ok()
+            .is_some_and(|s| s.parse::<i64>().is_ok())
+}
+
+/// The indexes after a key ([`php_name`]'s second part), read as `php_register_variable_ex` reads
+/// them: from each `[`, one whitespace byte (C `isspace`: PHP 7.0's `parse_str` appends for
+/// `[%0B]` and `[%0C]` too) is skipped and a `]` right after it appends; otherwise the index runs to the next `]`, the byte skipped included. The indexes end
+/// at a byte after a `]` that is not `[` (PHP ignores the rest: `a[b]c[d]` is `$_GET['a']['b']`)
+/// and at a `[` with no `]` after it.
+fn php_indexes(index: &[u8]) -> impl Iterator<Item = PhpIndex<'_>> {
+    let mut rest = index;
+    std::iter::from_fn(move || {
+        let inner = rest.strip_prefix(b"[")?;
+        let close = inner.iter().position(|&b| b == b']')?;
+        let key = inner.get(..close)?;
+        rest = inner.get(close + 1..)?;
+        let appends = match key {
+            [] => true,
+            [b] => matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'),
+            _ => false,
+        };
+        Some((!appends).then_some(key))
+    })
 }
 
 /// `name` split where PHP splits a request variable's name before it files it in `$_GET`,
@@ -1172,6 +1237,117 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// `[]` in a name appends: PHP gives the value the next integer key of that array. So a rule
+    /// for `name[#post_render][]` names every element of `$_GET['name']['#post_render']`, and
+    /// `[0]`, `[1]`, `[x]`, `[ ]` or `[\t]` put a value in that array just as `[]` does (PHP 7.0's
+    /// `parse_str` gives `[0]`, `[ ]` and `[]` the same array). Each row follows
+    /// `php_register_variable_ex`, as measured with `parse_str` in the lab's PHP 7.0.
+    #[test]
+    fn an_append_index_in_a_rule_name_matches_every_element_php_files_there() {
+        let want = "name[#post_render][]";
+        let missed: Vec<&str> = [
+            "name[#post_render][]",
+            "name[#post_render][0]",
+            "name[#post_render][1]",
+            "name[#post_render][x]",
+            "name[#post_render][ ]",
+            "name[#post_render][\t]",
+            "name[#post_render][\n]",
+            "name[#post_render][\x0b]",
+            "name[#post_render][\x0c]",
+            "name[#post_render][\r]",
+            "name[#post_render][  ]",
+            "name[#post_render][0][1]",
+            "name[#post_render][0]junk",
+            " name[#post_render][0]",
+        ]
+        .into_iter()
+        .filter(|sent| !same_php_name(sent.as_bytes(), want.as_bytes()))
+        .collect();
+        assert!(missed.is_empty(), "{want} let through: {missed:?}");
+        // Not an element of that array: a plain value there, a different key, or indexes PHP
+        // ignores (after a `]` not followed by `[`, or from a `[` with no `]`).
+        for sent in [
+            "name[#post_render]",
+            "name[#post_render]x[0]",
+            "name[#post_render][0",
+            "name[ #post_render][0]",
+            "name[#post_render ][0]",
+            "name[]",
+            "name[0][0]",
+        ] {
+            assert!(
+                !same_php_name(sent.as_bytes(), want.as_bytes()),
+                "{sent:?} vs {want:?}"
+            );
+        }
+        // A request's `[]` lands on an integer key, so it can be any element a rule names with
+        // one; never a string key, and `00`, `-0` and `+1` are string keys to PHP.
+        for (sent, want) in [
+            ("a[]", "a[0]"),
+            ("a[ ]", "a[7]"),
+            ("a[]", "a[-3]"),
+            ("a[x][]", "a[x][9223372036854775807]"),
+        ] {
+            assert!(
+                same_php_name(sent.as_bytes(), want.as_bytes()),
+                "{sent:?} vs {want:?}"
+            );
+        }
+        for (sent, want) in [
+            ("a[]", "a[x]"),
+            ("a[]", "a[00]"),
+            ("a[]", "a[-0]"),
+            ("a[]", "a[+1]"),
+            ("a[]", "a[ 1]"),
+            ("a[]", "a[9223372036854775808]"),
+        ] {
+            assert!(
+                !same_php_name(sent.as_bytes(), want.as_bytes()),
+                "{sent:?} vs {want:?}"
+            );
+        }
+
+        // Through a query rule, percent-encoded as a client sends it.
+        let rules = VirtualPatchRules::from_toml_str(
+            "[[rule]]\nid='q'\ncve='CVE-2099-19'\naction='deny'\n\
+             [[rule.query]]\nname='name[#post_render][]'\n",
+        )
+        .unwrap();
+        let none = hm(&[]);
+        let let_through: Vec<&str> = [
+            "name[%23post_render][]=passthru",
+            "name[%23post_render][0]=passthru",
+            "name[%23post_render][1]=passthru",
+            "name[%23post_render][x]=passthru",
+            "name[%23post_render][%20]=passthru",
+            "name[%23post_render][+]=passthru",
+            "name[%23post_render][%09]=passthru",
+            "name%5B%23post_render%5D%5B0%5D=passthru",
+        ]
+        .into_iter()
+        .filter(|q| {
+            !matches!(
+                rules.evaluate(&target("GET", "/", Some(q), &none), false),
+                Verdict::Block(_)
+            )
+        })
+        .collect();
+        assert!(
+            let_through.is_empty(),
+            "a rule for {want} let through: {let_through:?}"
+        );
+        for q in ["name[%23post_render]=passthru", "name=bob", "name[]=bob"] {
+            assert!(
+                matches!(
+                    rules.evaluate(&target("GET", "/", Some(q), &none), false),
+                    Verdict::NoMatch
+                ),
+                "{q}"
+            );
+        }
+    }
+
     /// PHP before 7.2.34, 7.3.23 and 7.4.11 url-decoded a cookie name before it filed it, so
     /// each of these is `$_COOKIE['wp_evil']` to it (`%20` and `+` a leading space it drops,
     /// `%00` the end of the name, `%2E`, `+` and `%5F` an `_`).
@@ -1497,6 +1673,20 @@ mod tests {
             prop_assert!(same_php_name(elem.as_bytes(), key.as_bytes()));
             prop_assert!(same_php_name(elem.as_bytes(), elem.as_bytes()));
             prop_assert!(!same_php_name(key.as_bytes(), elem.as_bytes()));
+        }
+
+        // Whatever a request writes between the brackets after `name[x]` (up to a NUL, where PHP
+        // ends the name), PHP files the value in the array `$_GET['name']['x']`, so a rule for
+        // `name[x][]` matches it.
+        #[test]
+        fn an_append_index_in_a_rule_matches_any_index_at_that_level(
+            key in "[a-z]{1,6}",
+            elem in "[a-z0-9#]{1,4}",
+            index in "[^\\x00]{0,4}",
+        ) {
+            let want = format!("{key}[{elem}][]");
+            let sent = format!("{key}[{elem}][{index}]");
+            prop_assert!(same_php_name(sent.as_bytes(), want.as_bytes()), "{:?}", sent);
         }
     }
 }

@@ -492,9 +492,10 @@ fn apply_forwarding_hygiene<B: hyper::body::Body>(
     }
     .filter(|h| !h.as_bytes().contains(&b'@'));
     req.headers_mut().remove(&X_FORWARDED_HOST);
-    // `X_Real_IP`, `X_Forwarded_Proto` and the like: copies that the code below neither
-    // overwrites nor reads, and that a CGI-style upstream merges with zion's own value.
-    crate::reserved_headers::drop_underscore_spellings(
+    // `X_Real_IP`, `X.Forwarded.Proto` and the like: copies that the code below neither
+    // overwrites nor reads, and that a CGI-style or PHP upstream reads as zion's own header
+    // (merged with it, or in its place).
+    crate::reserved_headers::drop_other_spellings(
         req.headers_mut(),
         &crate::reserved_headers::FORWARDING_HEADERS,
     );
@@ -2093,9 +2094,11 @@ mod tests {
     }
 
     #[test]
-    fn prepare_drops_the_underscore_spelling_of_a_forwarding_header_it_sets() {
+    fn prepare_drops_every_other_spelling_of_a_forwarding_header_it_sets() {
         // A CGI-style upstream reads `X_Real_IP` as `X-Real-IP` and joins the two values
-        // (Python's wsgiref put the client's claim first, ahead of zion's).
+        // (Python's wsgiref put the client's claim first, ahead of zion's). PHP also reads
+        // `X.Real.IP` as `X-Real-IP`, and its built-in server kept the copy that came last, so a
+        // dashed decoy sent first (overwritten by zion in place) let the dotted copy win.
         let addr: SocketAddr = "1.2.3.4:5678".parse().unwrap();
         for xff_mode in [XffMode::Append, XffMode::Rewrite, XffMode::Drop] {
             let req = Request::builder()
@@ -2106,7 +2109,14 @@ mod tests {
                 .header("x-real_ip", "203.0.113.66")
                 .header("X_Forwarded_Proto", "forged")
                 .header("X_Forwarded_Host", "evil.example")
+                .header("X-Real-IP", "decoy")
+                .header("X.Real.IP", "6.6.6.6")
+                .header("X-Forwarded-Proto", "decoy")
+                .header("X.Forwarded.Proto", "forged")
+                .header("X.Forwarded.For", "6.6.6.6")
+                .header("X~Forwarded~Host", "evil.example")
                 .header("X_Other", "kept")
+                .header("X.Other", "kept")
                 .body(Empty::<Bytes>::new())
                 .unwrap();
             let req = prepare_request(req, &scheme(), &authority(), Some(addr), "https", xff_mode)
@@ -2118,6 +2128,10 @@ mod tests {
                 "x-real_ip",
                 "x_forwarded_proto",
                 "x_forwarded_host",
+                "x.real.ip",
+                "x.forwarded.proto",
+                "x.forwarded.for",
+                "x~forwarded~host",
             ] {
                 assert!(
                     !h.contains_key(alias),
@@ -2132,6 +2146,7 @@ mod tests {
                 "{xff_mode:?}"
             );
             assert_eq!(h.get("X_Other").unwrap(), "kept", "{xff_mode:?}");
+            assert_eq!(h.get("X.Other").unwrap(), "kept", "{xff_mode:?}");
         }
     }
 

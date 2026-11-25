@@ -12,8 +12,9 @@
 //!   * A header named `__proto__` or `constructor` is refused: an upstream that copies the
 //!     headers into a JavaScript object pollutes its prototype.
 //!
-//! Names are compared without case, and with `_` and `-` as the same character: a CGI or PHP
-//! upstream reads `X_Debug` as `X-Debug` (both become `HTTP_X_DEBUG`). Cookie names are
+//! Names are compared without case, and with every byte that is neither a letter nor a digit
+//! (`-`, `_`, `.`, ...) as the same character ([`same_name`]): a CGI upstream reads `X_Debug` as
+//! `X-Debug`, and PHP also `X.Debug` (all become `HTTP_X_DEBUG`). Cookie names are
 //! compared exactly (RFC 6265 names are case-sensitive), percent-decoded (`%43acheWarmer` is
 //! `CacheWarmer` to an upstream that decodes cookie names), and as the key PHP files them under,
 //! as sent (`XDEBUG.SESSION` is `$_COOKIE['XDEBUG_SESSION']`) and url-decoded, as PHP did before
@@ -58,9 +59,9 @@ impl HeaderLists {
 /// What one route strips and refuses: the built-in names, the global lists, the route's own.
 #[derive(Clone, Debug)]
 pub struct HeaderPolicy {
-    /// Lower-case, `_` folded to `-`.
+    /// Lower-case, every byte that is neither a letter nor a digit folded to `-` ([`fold`]).
     strip: Vec<String>,
-    /// Lower-case, `_` folded to `-`.
+    /// Lower-case, every byte that is neither a letter nor a digit folded to `-` ([`fold`]).
     deny: Vec<String>,
     /// As written.
     deny_cookies: Vec<String>,
@@ -131,9 +132,19 @@ impl HeaderPolicy {
     }
 }
 
-/// `name` lower-cased (hyper stores it so) with `_` as `-`.
+/// `name` lower-cased (hyper stores it so) with every byte that is neither a letter nor a digit
+/// as `-`: the one spelling [`same_name`] compares a request's header names with, so a list entry
+/// written `X_Debug` or `X.Debug` names the same header as `X-Debug`.
 fn fold(name: &str) -> String {
-    name.to_ascii_lowercase().replace('_', "-")
+    name.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                b.to_ascii_lowercase() as char
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn header_names(owner: &str, key: &str, written: Vec<String>) -> Result<Vec<String>, String> {
@@ -237,6 +248,43 @@ mod tests {
         assert_eq!(
             h.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
             ["x-debugger"],
+            "both spellings stripped, a longer name kept"
+        );
+    }
+
+    /// PHP files a request header under `HTTP_` + its name with `-` and `.` as `_`, so its
+    /// built-in server reads `X.Debug` as `HTTP_X_DEBUG`. A name that differs from a listed one
+    /// only in bytes that are neither letters nor digits is that name, whichever way either is
+    /// written.
+    #[test]
+    fn a_dot_or_another_separator_names_the_same_header_as_a_dash() {
+        let p = HeaderPolicy::merge(
+            &lists(&["X-Debug"], &["X-Evil", "X.Other_Evil"], &[]),
+            &HeaderLists::default(),
+        );
+        let let_through: Vec<&str> = [
+            "x.evil",
+            "X.Evil",
+            "x~evil",
+            "x-other-evil",
+            "x_other_evil",
+            "x.other.evil",
+        ]
+        .into_iter()
+        .filter(|name| !refused(&p, &[(name, "1")]))
+        .collect();
+        assert!(
+            let_through.is_empty(),
+            "deny_headers let through: {let_through:?}"
+        );
+        for name in ["x0evil", "xevil", "x-evil-", "x.evil.x"] {
+            assert!(!refused(&p, &[(name, "1")]), "{name}");
+        }
+        let mut h = map(&[("x.debug", "1"), ("x+debug", "2"), ("x.debugger", "3")]);
+        assert!(p.apply(&mut h).is_none());
+        assert_eq!(
+            h.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+            ["x.debugger"],
             "both spellings stripped, a longer name kept"
         );
     }
@@ -407,7 +455,7 @@ mod tests {
     use proptest::prelude::*;
 
     fn name_like() -> impl Strategy<Value = String> {
-        let c = prop::sample::select(vec!['a', 'B', 'x', '-', '_', '9', 'Z', '.']);
+        let c = prop::sample::select(vec!['a', 'B', 'x', '-', '_', '9', 'Z', '.', '~']);
         prop::collection::vec(c, 1..16).prop_map(|cs| cs.into_iter().collect())
     }
 
@@ -421,22 +469,51 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(2048))]
 
-        // Case and `_`/`-` never change the folded name; folding is idempotent.
+        // Case and `-`/`_`/`.` never change the folded name; folding is idempotent.
         #[test]
-        fn fold_erases_case_and_dash_underscore(s in name_like()) {
+        fn fold_erases_case_and_separators(s in name_like()) {
             let f = fold(&s);
             prop_assert_eq!(&f, &fold(&f), "not idempotent: {:?}", s);
             prop_assert_eq!(&f, &fold(&s.to_ascii_uppercase()), "case leaked: {:?}", s);
             prop_assert_eq!(&f, &fold(&s.replace('-', "_")), "dash/underscore leaked: {:?}", s);
+            prop_assert_eq!(&f, &fold(&s.replace(['-', '_'], ".")), "dot leaked: {:?}", s);
         }
 
         // The strip/deny matcher is exactly fold-equality: a listed name matches a
         // request header iff they share a canonical form. If this breaks, a denied
-        // header can be smuggled past by respelling its case or `_`/`-`.
+        // header can be smuggled past by respelling its case or `-`/`_`/`.`.
         #[test]
         fn same_name_is_exactly_fold_equality(a in name_like(), b in name_like()) {
             let got = same_name(&fold(&a), &b.to_ascii_lowercase());
             prop_assert_eq!(got, fold(&a) == fold(&b), "a={:?} b={:?}", a, b);
+        }
+
+        // Two random names rarely share a canonical form, so the test above seldom sees a
+        // respelling. This one only does: each letter in either case, each byte that is neither
+        // a letter nor a digit swapped for any other such byte a header name may hold. Every one
+        // must name the listed header.
+        #[test]
+        fn every_respelling_of_a_listed_name_names_it(
+            listed in name_like(),
+            seps in prop::collection::vec(prop::sample::select(b"-_.!#$%&'*+^`|~".to_vec()), 16),
+            upper in any::<u16>(),
+        ) {
+            let sent: String = listed
+                .bytes()
+                .enumerate()
+                .map(|(i, c)| {
+                    if c.is_ascii_alphanumeric() {
+                        let flip = (upper >> (i % 16)) & 1 == 1;
+                        (if flip { c.to_ascii_uppercase() } else { c }) as char
+                    } else {
+                        seps.get(i).copied().unwrap_or(b'_') as char
+                    }
+                })
+                .collect();
+            prop_assert!(
+                same_name(&fold(&listed), &sent.to_ascii_lowercase()),
+                "listed {:?}, sent {:?}", listed, sent
+            );
         }
 
         // A byte outside ASCII anywhere in another cookie of the same field never changes the

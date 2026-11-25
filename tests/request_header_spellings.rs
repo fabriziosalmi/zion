@@ -8,7 +8,8 @@
 //! - A cookie name PHP files under a denied name (`XDEBUG.SESSION` is
 //!   `$_COOKIE['XDEBUG_SESSION']`, and `XDEBUG%2ESESSION` is too to a PHP that url-decodes
 //!   cookie names) is refused like that name. A rule that names an array element
-//!   (`name[#post_render][]`) does not refuse the plain `name`.
+//!   (`name[#post_render][]`) does not refuse the plain `name`, and refuses every index PHP files
+//!   in that array (`name[#post_render][0]`, `[x]`, `[ ]`).
 //! - Whitespace at the start or end of a header value, which h2 keeps and an HTTP/1.1 upstream
 //!   drops, does not hide a `content_types` or `headers` value from a rule over HTTP/2 (a
 //!   hyper client: curl drops the whitespace itself).
@@ -17,6 +18,9 @@
 //!   headers the CGI way (RFC 3875; Python's `wsgiref` is one) folds `_` and `-` into one
 //!   `HTTP_X_CLIENT_CERT_FINGERPRINT` variable, and would read the client's value as the one zion
 //!   attests. Shown against a recording origin and against `wsgiref`.
+//! - Nor does a spelling with `.` (PHP reads `X.Client.Cert.Fingerprint` as
+//!   `HTTP_X_CLIENT_CERT_FINGERPRINT` too) or with another byte that is neither a letter nor a
+//!   digit for a `-`, over HTTP/1.1 and HTTP/2, and `deny_headers` refuses each of them.
 //!
 //! Each case is paired with a control that must already get the answer (the plain ASCII cookie,
 //! the dashed header name), so the controls prove the configuration is active and only the
@@ -144,8 +148,8 @@ action = "deny"
 name = "name[#post_render][]"
 "#;
 
-/// Boot zion in front of `origin_port` with `deny_cookies`, the virtual-patch [`RULES`] and
-/// optional mTLS; returns the HTTPS port.
+/// Boot zion in front of `origin_port` with `deny_cookies`, `deny_headers`, the virtual-patch
+/// [`RULES`] and optional mTLS; returns the HTTPS port.
 fn start(dir: &Path, origin_port: u16) -> (Proc, u16) {
     let https_port = free_port();
     let p = |f: &str| dir.join(f).to_string_lossy().into_owned();
@@ -154,7 +158,8 @@ fn start(dir: &Path, origin_port: u16) -> (Proc, u16) {
         dir.join("zion.toml"),
         format!(
             "[server]\nlisten_http = \"127.0.0.1:{}\"\nlisten_https = \"127.0.0.1:{https_port}\"\n\
-             deny_cookies = [\"CacheWarmer\", \"XDEBUG_SESSION\"]\n\n\
+             deny_cookies = [\"CacheWarmer\", \"XDEBUG_SESSION\"]\n\
+             deny_headers = [\"X-Debug\"]\n\n\
              [tls]\ncert_path = \"{}\"\nkey_path = \"{}\"\nhot_reload = false\n\
              client_auth = \"optional\"\nclient_ca_path = \"{}\"\n\n\
              [virtual_patch]\nrules_file = \"{}\"\n\n\
@@ -608,6 +613,56 @@ fn a_rule_naming_an_array_element_does_not_block_the_plain_name() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// `[]` in a name appends, and PHP gives the value the next integer key, so `[0]`, `[1]`, `[x]`,
+/// `[ ]`, `[+]` or `[%09]` after `name[#post_render]` put a value in the same
+/// `$_GET['name']['#post_render']` array as `[]` does (the lab's PHP 7.0 builds the same array
+/// for `[]`, `[0]` and `[ ]`). A rule for `name[#post_render][]` refuses each of them, and still
+/// forwards a plain value at `name[#post_render]`, which is no array.
+#[test]
+fn a_rule_naming_an_append_index_blocks_every_index_php_files_there() {
+    let Some(dir) = pki("php-append") else {
+        common::skip("openssl could not make the certificates");
+        return;
+    };
+    let (origin_port, _seen) = origin();
+    let (_z, port) = start(&dir, origin_port);
+    let get = |path: &str, query: &str| {
+        format!("GET {path}?{query} HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n")
+    };
+    let mut cases: Vec<(String, String, &str)> = [
+        "name[%23post_render][]=passthru",
+        "name[%23post_render][0]=passthru",
+        "name[%23post_render][1]=passthru",
+        "name[%23post_render][x]=passthru",
+        "name[%23post_render][%20]=passthru",
+        "name[%23post_render][+]=passthru",
+        "name[%23post_render][%09]=passthru",
+        "name%5B%23post_render%5D%5B0%5D=passthru",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, q)| (format!("/a{i}"), q.to_string(), "HTTP/1.1 403"))
+    .collect();
+    cases.push((
+        "/a-plain".into(),
+        "name[%23post_render]=x".into(),
+        "HTTP/1.1 200",
+    ));
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|(path, query, want)| {
+            let line = status_line(port, get(path, query).as_bytes());
+            (!line.starts_with(want))
+                .then(|| format!("{path}?{query}: expected {want:?}, got {line:?}"))
+        })
+        .collect();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        wrong.is_empty(),
+        "a rule for name[#post_render][] answered: {wrong:#?}"
+    );
+}
+
 #[derive(Debug)]
 struct NoVerify;
 impl rustls::client::danger::ServerCertVerifier for NoVerify {
@@ -762,10 +817,10 @@ fn whitespace_around_an_h2_value_does_not_hide_it_from_a_rule() {
     );
 }
 
-/// The underscore spelling of every reserved header that has a `-` in its name, and of every
-/// forwarding header zion sets, in the mixed case a client would send
-/// (`x-client-cert-fingerprint` is sent as `X_Client_Cert_Fingerprint`).
-fn underscore_spellings() -> Vec<(&'static str, String)> {
+/// Every reserved header that has a `-` in its name, and every forwarding header zion sets,
+/// spelled with `sep` for each `-`, in the mixed case a client would send
+/// (`x-client-cert-fingerprint` is sent as `X_Client_Cert_Fingerprint` for `sep = "_"`).
+fn spellings_with(sep: &str) -> Vec<(&'static str, String)> {
     zion::reserved_headers::RESERVED_HEADERS
         .iter()
         .map(|(name, _)| *name)
@@ -781,10 +836,14 @@ fn underscore_spellings() -> Vec<(&'static str, String)> {
                         .unwrap_or_default()
                 })
                 .collect::<Vec<_>>()
-                .join("_");
+                .join(sep);
             (name, alias)
         })
         .collect()
+}
+
+fn underscore_spellings() -> Vec<(&'static str, String)> {
+    spellings_with("_")
 }
 
 #[test]
@@ -843,6 +902,140 @@ fn no_underscore_spelling_of_a_reserved_or_forwarding_header_reaches_the_upstrea
         "{} of {} underscore spellings reached the origin: {leaked:#?}\n{under}",
         leaked.len(),
         spellings.len()
+    );
+}
+
+/// The `$_SERVER` entries PHP's built-in server makes of the request headers in `head` (as
+/// [`forwarded`] escapes it): `HTTP_` and the name upper-cased with `-` as `_`, then ` ` and `.`
+/// as `_` too (`php_register_variable_ex`), the last header under one name winning. Measured on
+/// PHP 7.0.15's `php -S`: `X-Real-IP: zion` then `X.Real.IP: forged` gives
+/// `HTTP_X_REAL_IP=forged`, the reverse order `zion`; `X~Real~IP` stays `HTTP_X~REAL~IP`.
+fn php_server_vars(head: &str) -> std::collections::HashMap<String, String> {
+    let mut vars = std::collections::HashMap::new();
+    for line in head.split("\\r\\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let var: String = name
+            .bytes()
+            .map(|b| match b {
+                b'-' | b'.' | b' ' => '_',
+                b => b.to_ascii_uppercase() as char,
+            })
+            .collect();
+        vars.insert(format!("HTTP_{var}"), value.trim().to_string());
+    }
+    vars
+}
+
+/// PHP files a request header under `HTTP_` + its name upper-cased with `-` and `.` as `_`: its
+/// built-in server reads `X.Client.Cert.Fingerprint` as `HTTP_X_CLIENT_CERT_FINGERPRINT`, and an
+/// `X.Real.IP` sent after an `X-Real-IP` decoy (which zion overwrites in place) as
+/// `HTTP_X_REAL_IP`, in place of zion's value. No spelling with `.`, or with another byte that is
+/// neither a letter nor a digit, for a `-` may reach the upstream, over HTTP/1.1 or HTTP/2, and
+/// `deny_headers = ["X-Debug"]` refuses each of them.
+#[test]
+fn no_dotted_or_other_spelling_of_a_reserved_or_forwarding_header_reaches_the_upstream() {
+    let Some(dir) = pki("dotted") else {
+        common::skip("openssl could not make the certificates");
+        return;
+    };
+    let (origin_port, seen) = origin();
+    let (_z, port) = start(&dir, origin_port);
+
+    let mut leaked = Vec::new();
+    for (path, sep) in [("/dot", "."), ("/tilde", "~"), ("/plus", "+")] {
+        let spellings = spellings_with(sep);
+        let mut raw = format!("GET {path} HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n");
+        // The dashed decoys come first, the other spellings after them.
+        for name in zion::reserved_headers::FORWARDING_HEADERS {
+            raw.push_str(&format!("{name}: decoy\r\n"));
+        }
+        for (_, alias) in &spellings {
+            raw.push_str(&format!("{alias}: forged-by-client\r\n"));
+        }
+        raw.push_str(&format!("X{sep}Control: kept\r\n\r\n"));
+        let line = status_line(port, raw.as_bytes());
+        assert!(line.starts_with("HTTP/1.1 200"), "{path}: {line:?}");
+        let raw_head =
+            forwarded(&seen, path).unwrap_or_else(|| panic!("the origin never saw {path}"));
+        // What PHP's built-in server would read from that head.
+        let vars = php_server_vars(&raw_head);
+        for (var, want) in [
+            ("HTTP_X_REAL_IP", Some("127.0.0.1")),
+            ("HTTP_X_FORWARDED_PROTO", Some("https")),
+            ("HTTP_X_FORWARDED_HOST", Some("a.example")),
+            ("HTTP_X_CLIENT_CERT_FINGERPRINT", None),
+            ("HTTP_X_AUTH_SUBJECT", None),
+            ("HTTP_X_ORIGINAL_URL", None),
+        ] {
+            let got = vars.get(var).map(String::as_str);
+            if got != want {
+                leaked.push(format!("{path}: PHP reads {var} as {got:?}, not {want:?}"));
+            }
+        }
+        let head = raw_head.to_ascii_lowercase();
+        assert!(
+            head.contains(&format!("x{sep}control: kept")),
+            "an unrelated header must still reach the origin:\n{head}"
+        );
+        assert!(
+            head.contains("x-real-ip: 127.0.0.1\\r\\n")
+                && head.contains("x-forwarded-proto: https"),
+            "zion's own forwarding headers are set:\n{head}"
+        );
+        let before = leaked.len();
+        leaked.extend(
+            spellings
+                .iter()
+                .filter(|(_, alias)| head.contains(&format!("{}: ", alias.to_ascii_lowercase())))
+                .map(|(name, alias)| format!("{alias} ({name})")),
+        );
+        if leaked.len() == before && head.contains("forged-by-client") {
+            leaked.push(format!("{path}: a forged value arrived:\n{head}"));
+        }
+    }
+
+    // HTTP/2 (curl): the dotted fingerprint alone, no certificate.
+    let h2 = h2_status(
+        port,
+        "/h2dot",
+        b"x.client.cert.fingerprint: sha256:forged-over-h2",
+    );
+    if h2.is_empty() || !h2.ends_with("h2") {
+        common::skip(&format!(
+            "the HTTP/2 case needs curl with HTTP/2; curl answered {h2:?}"
+        ));
+    } else {
+        assert!(h2.starts_with("200"), "h2: {h2:?}");
+        let head = forwarded(&seen, "/h2dot").unwrap_or_else(|| "<nothing>".into());
+        if head.contains("forged-over-h2") {
+            leaked.push(format!("/h2dot (HTTP/2): {head}"));
+        }
+    }
+
+    // deny_headers = ["X-Debug"]: the dashed control and every other spelling are refused.
+    let requests: Vec<(String, Vec<u8>)> = ["X-Debug", "X_Debug", "X.Debug", "X~Debug"]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let path = format!("/deny{i}");
+            let raw = format!(
+                "GET {path} HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n{name}: 1\r\n\r\n"
+            );
+            (path, raw.into_bytes())
+        })
+        .collect();
+    let deny: Vec<(&str, &[u8], &str)> = requests
+        .iter()
+        .map(|(path, raw)| (path.as_str(), raw.as_slice(), "HTTP/1.1 400"))
+        .collect();
+    let not_refused = check_all(port, &seen, &deny);
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        leaked.is_empty() && not_refused.is_empty(),
+        "spellings of a header zion owns reached the origin: {leaked:#?}\n\
+         deny_headers let through: {not_refused:#?}"
     );
 }
 
