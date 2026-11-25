@@ -874,6 +874,7 @@ fn snapshot_request(host: &str, port: u16, path: &str) -> String {
          Accept: application/json\r\n\
          Connection: close\r\n\
          \r\n",
+        path = path,
         authority = host_field(host, port),
         ver = env!("CARGO_PKG_VERSION"),
     )
