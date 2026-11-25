@@ -118,14 +118,15 @@ jobs:
           shared-key: test-${{ matrix.flavor }}
       - name: Install build deps
         uses: ./.github/actions/build-deps
-      # --all-features builds ktls, and that build closes every TLS connection
-      # whose kTLS upgrade fails (src/accept.rs). On runners where the kernel
+      # --all-features builds ktls, and that build closed every TLS connection
+      # whose kTLS upgrade failed (src/accept.rs). On runners where the kernel
       # TLS module is not loaded the upgrade fails with "failed to enable TLS
       # ULP ... os error 2", and the integration tests that talk TLS to zion
-      # fail with it: on 2026-10-31 this job failed that way on #756, #758
+      # failed with it: on 2026-10-31 this job failed that way on #756, #758
       # and master 8838cd7, and passed on other runners of the same image.
-      # Load the module up front, and fail here, not in the tests, if it
-      # cannot be loaded.
+      # zion now serves such a kernel on userspace TLS (src/ktls.rs), but the
+      # tests should run the upgrade path: load the module up front, and fail
+      # here, not in the tests, if it cannot be loaded.
       - name: Load the kernel TLS module (ktls)
         if: matrix.flavor == 'all-features'
         run: |

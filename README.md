@@ -196,7 +196,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 ```
 
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-87 modules, ~96,400 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
+87 modules, ~96,600 lines of Rust. See [architecture docs](https://fabriziosalmi.github.io/zion/guide/architecture) for the full module map and request lifecycle.
 
 ## Features
 
@@ -223,7 +223,7 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 **Operations** — fail-fast config validation, graceful 30 s drain that closes idle connections immediately, adaptive upstream recovery (decorrelated-jitter backoff: a recovered origin returns in ~1.4 s vs up to 30 s), boot-time platform auto-detection + performance-tier calibration, `zion doctor` diagnostics, TCP tuning (NODELAY / DEFER_ACCEPT / FASTOPEN / QUICKACK), systemd unit, distroless container (health probes live in the orchestrator), Helm chart rendered and checked with `zion doctor` in CI.
 
 **Opt-in tracks (feature-gated, default-off)**
-- **kTLS offload** (`--features ktls`, Linux 5.10+) — *experimental*: flips the socket into in-kernel TLS after handshake toward `sendfile`-class zero-copy. The offload is wired but not yet exercised end-to-end in CI (issue #52).
+- **kTLS offload** (`--features ktls`, Linux 5.10+) — *experimental*: flips the socket into in-kernel TLS after handshake toward `sendfile`-class zero-copy. The offload is wired but not yet exercised end-to-end in CI (issue #52). On a kernel that does not advertise kTLS (the `tls` module not loaded), zion logs one warning at boot and serves HTTPS on userspace TLS.
 - **ML-augmented WAF** (`--features ml-waf`) — *experimental*: 16-dim tract-onnx scorer on the WAF hot path (200 µs p99 budget), advisory metric/header — never a hard gate. Ships no bundled model.
 - **AIMP serverless mesh** (`--features sovereign-aimp`, **experimental** — off by default and not in the release artefacts, wire protocol not stable; rotation/revocation and fleet-wide rate/health claims are frozen) — Ed25519-signed UDP gossip of WAF deltas + IP reputation across a fleet, no central control plane.
 
