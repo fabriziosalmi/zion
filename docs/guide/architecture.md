@@ -2,7 +2,7 @@
 
 Zion is a single async Rust binary built on Tokio, Hyper, and rustls.
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-87 modules, ~95,200 lines of Rust.
+87 modules, ~95,300 lines of Rust.
 
 ## Module map
 
@@ -233,7 +233,7 @@ Zion uses Tokio's multi-threaded runtime. Worker count is set to available CPU c
 | FIPS 140-3 | `--features fips` | aws-lc-rs FIPS-validated backend |
 | Sovereign geo | `--features geo-ita` / `geo-eu` | Baked-in IT/EU ASN+CIDR classification |
 | AIMP mesh *(experimental)* | `--features sovereign-aimp` | Ed25519-signed fleet gossip of WAF/reputation |
-| kTLS offload *(experimental)* | `--features ktls` | In-kernel TLS after handshake; wired, not yet exercised e2e in CI |
+| kTLS offload *(experimental)* | `--features ktls` | In-kernel TLS after handshake; wired, not yet exercised e2e in CI. A kernel without kTLS: one boot warning, HTTPS on userspace TLS |
 | ML-augmented WAF *(experimental)* | `--features ml-waf` | ONNX scorer on the WAF hot path; ships no bundled model |
 
 The release bundle is `--features dist` (= `acme` + `init` + `auth`). The full flag list

@@ -422,57 +422,60 @@ fn spawn_https_handler(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // kTLS upgrade requires the rustls handshake to happen on a
-        // `CorkStream<TcpStream>` adapter (ktls 6.x API). Wrap up-front
-        // when the feature is on; the cfg-gated branch costs nothing
-        // when compiled without it.
+        // `CorkStream<TcpStream>` adapter (ktls 6.x API). The boot probe
+        // decides, before the handshake, whether this connection is
+        // going to be upgraded: corked if so, bare socket (userspace TLS
+        // for the connection's life) when the kernel cannot offload. The
+        // cfg-gated branch costs nothing when compiled without it.
         #[cfg(all(target_os = "linux", feature = "ktls"))]
-        let inner_for_handshake = crate::ktls::cork_for_handshake(tcp_stream);
+        let handshake = crate::ktls::accept(&acceptor, tcp_stream, crate::ktls::offload_enabled());
         #[cfg(not(all(target_os = "linux", feature = "ktls")))]
-        let inner_for_handshake = tcp_stream;
+        let handshake = (*acceptor).accept(tcp_stream);
 
         let tls_start = std::time::Instant::now();
         let hs_timeout = state.config.load().tls_handshake_timeout_secs;
-        let mut tls_stream = match tokio::time::timeout(
-            std::time::Duration::from_secs(hs_timeout),
-            (*acceptor).accept(inner_for_handshake),
-        )
-        .await
-        {
-            Ok(Ok(s)) => {
-                metrics::METRICS
-                    .tls_handshake_duration
-                    .observe(tls_start.elapsed());
-                s
-            }
-            Ok(Err(e)) => {
-                if tls_handshake_log_allowed() {
-                    logq::line(&format!(
-                        "  tls handshake failed from {}: {e}",
-                        state.redact.ip_label(remote_addr.ip())
-                    ));
+        let mut tls_stream =
+            match tokio::time::timeout(std::time::Duration::from_secs(hs_timeout), handshake).await
+            {
+                Ok(Ok(s)) => {
+                    metrics::METRICS
+                        .tls_handshake_duration
+                        .observe(tls_start.elapsed());
+                    s
                 }
-                metrics::METRICS
-                    .tls_handshake_errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
-            Err(_) => {
-                if tls_handshake_log_allowed() {
-                    logq::line(&format!(
-                        "  tls handshake timed out ({hs_timeout}s) from {remote_addr}"
-                    ));
+                Ok(Err(e)) => {
+                    if tls_handshake_log_allowed() {
+                        logq::line(&format!(
+                            "  tls handshake failed from {}: {e}",
+                            state.redact.ip_label(remote_addr.ip())
+                        ));
+                    }
+                    metrics::METRICS
+                        .tls_handshake_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
                 }
-                metrics::METRICS
-                    .tls_handshake_errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
-        };
+                Err(_) => {
+                    if tls_handshake_log_allowed() {
+                        logq::line(&format!(
+                            "  tls handshake timed out ({hs_timeout}s) from {remote_addr}"
+                        ));
+                    }
+                    metrics::METRICS
+                        .tls_handshake_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            };
 
         // 0-RTT: Check if this connection accepted early data. Only the
         // first request on the connection can be early data. We pass
         // this flag to handle_https for method gating (425 Too Early).
-        let is_early_data = tls_stream.get_mut().1.early_data().is_some();
+        #[cfg(all(target_os = "linux", feature = "ktls"))]
+        let tls_conn = tls_stream.conn_mut();
+        #[cfg(not(all(target_os = "linux", feature = "ktls")))]
+        let tls_conn = tls_stream.get_mut().1;
+        let is_early_data = tls_conn.early_data().is_some();
         let early_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(is_early_data));
 
         // mTLS: stable SHA-256 fingerprint of the leaf cert DER. See the
@@ -480,9 +483,7 @@ fn spawn_https_handler(
         // pseudo-DN. Forwarded as `X-Client-Cert-Fingerprint`. Read the
         // peer certificates BEFORE any kTLS upgrade — after the upgrade
         // the rustls connection state is gone (kernel owns the AEAD).
-        let client_cert_fingerprint: Option<String> = tls_stream
-            .get_ref()
-            .1
+        let client_cert_fingerprint: Option<String> = tls_conn
             .peer_certificates()
             .and_then(|certs| certs.first())
             .map(|cert| security::client_cert_fingerprint(cert.as_ref()));
@@ -490,9 +491,11 @@ fn spawn_https_handler(
 
         // Optionally swap the userspace TLS stream for an in-kernel
         // KtlsStream. The kernel takes over record framing + AEAD so
-        // hyper sees plaintext directly. Failure here closes the
-        // connection — there is no fall-back to userspace mode on the
-        // same stream (the cork adapter is consumed by `try_upgrade`).
+        // hyper sees plaintext directly. A connection handshaken bare
+        // (the boot probe found no kernel kTLS) is served on userspace
+        // TLS. A corked connection whose upgrade fails is closed: there
+        // is no fall-back to userspace mode on the same stream (the cork
+        // adapter is consumed by `try_upgrade`).
         //
         // The cfg-arms are mutually exclusive, so `io` resolves to a
         // single concrete type per build (no dyn / boxing needed —
@@ -505,11 +508,11 @@ fn spawn_https_handler(
         // ALPN selected `h2`: the connection is HTTP/2 by agreement, and the guard refuses
         // one that does not open with the client preface (#663). Read before any kTLS
         // upgrade, for the reason the client certificate is.
-        let negotiated_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
+        let negotiated_h2 = tls_conn.alpn_protocol() == Some(b"h2".as_slice());
         #[cfg(all(target_os = "linux", feature = "ktls"))]
-        let io = match crate::ktls::try_upgrade(tls_stream).await {
-            Ok(ktls_stream) => {
-                h2_guard::H2Guard::new(ktls_stream, h2_limits).http2_was_negotiated(negotiated_h2)
+        let io = match tls_stream.into_served().await {
+            Ok(served) => {
+                h2_guard::H2Guard::new(served, h2_limits).http2_was_negotiated(negotiated_h2)
             }
             Err(e) => {
                 logq::line(&format!("  kTLS upgrade failed, closing connection: {e}"));

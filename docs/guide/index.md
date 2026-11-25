@@ -20,7 +20,7 @@ Zion is a TLS reverse proxy with a built-in WAF, written in Rust. One binary, on
 | Log privacy | `[redact]`: header and query-string values, and the client IP (truncated or HMAC-pseudonymised) |
 | TLS hot-reload | Filesystem watcher (notify) + ArcSwap atomic pointer swap |
 | Platform detection | Reads CPU count, RAM, AES-NI, SO_REUSEPORT, TCP_FASTOPEN at boot |
-| kTLS offload (experimental) | Post-handshake socket flip into in-kernel TLS; wired but not yet exercised end-to-end in CI. `--features ktls` (Linux 5.10+) |
+| kTLS offload (experimental) | Post-handshake socket flip into in-kernel TLS; wired but not yet exercised end-to-end in CI; a kernel without kTLS gets userspace TLS. `--features ktls` (Linux 5.10+) |
 | ML-augmented WAF (experimental) | 16-dim ONNX model on the WAF hot path, 200µs p99 budget. Score is a signal, never a hard gate; ships no bundled model. `--features ml-waf` |
 | AIMP mesh (**experimental**, v0.2.x) | Ed25519-signed UDP gossip of WAF + IP-reputation deltas across a fleet. Anti-entropy convergence. `--features sovereign-aimp` (off by default and not in the release artefacts; the wire protocol is not stable; rotation, revocation and fleet-wide rate/health claims are frozen). |
 

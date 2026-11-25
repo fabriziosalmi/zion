@@ -443,7 +443,10 @@ pub(crate) fn resolve_config(
     // socket() + setsockopt(TCP_ULP, "tls") + close — cheap.
     #[cfg(all(target_os = "linux", feature = "ktls"))]
     {
-        if crate::ktls::probe_kernel_support() {
+        // The probe runs once here and its result is kept for every
+        // connection (`ktls::offload_enabled`), so this is the only line
+        // an operator sees about it, not one per connection.
+        if crate::ktls::offload_enabled() {
             logging::info(
                 "ktls",
                 "kernel supports kTLS (TCP_ULP=tls) — handshake corker active, sendfile path pending follow-up",
@@ -451,7 +454,7 @@ pub(crate) fn resolve_config(
         } else {
             logging::warn(
                 "ktls",
-                "kernel does NOT advertise kTLS support — try_upgrade will fail and the connection will close",
+                "kernel does NOT advertise kTLS support (is the `tls` module loaded?): HTTPS is served on userspace TLS, no connection is upgraded",
             );
         }
     }
