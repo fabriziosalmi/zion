@@ -130,6 +130,25 @@ there is none. It never carries userinfo: a target whose authority has one
 routing, and a `Host` header with an `@` is not forwarded. The upstream's `Host` is its own authority, or the client's host when the upstream
 sets [`preserve_host`](/config/#forward-the-client-s-host-preserve-host-opt-in).
 
+Each of these headers is dropped under any case and with any byte that is neither a letter nor
+a digit in place of any `-`: `X_Client_Cert_Fingerprint`, `X.Client.Cert.Fingerprint`,
+`X-Client_Cert.Fingerprint` and `X~Client~Cert~Fingerprint` are all dropped. CGI names the
+variable of a request header by upper-casing the name and turning `-` into `_` (RFC 3875), and
+WSGI and Rack do the same, so `X_Client_Cert_Fingerprint` and `X-Client-Cert-Fingerprint` are
+one `HTTP_X_CLIENT_CERT_FINGERPRINT` to a server that does not drop underscore names itself
+(Python's `wsgiref` does not). PHP also turns `.` into `_` when it files that variable, so its
+built-in server reads `X.Client.Cert.Fingerprint` as the same one, and of two copies keeps the
+one that came last. A header name cannot hold a space, the other byte PHP turns into `_`. The
+other bytes a header name may hold (`` !#$%&'*+^`|~ ``) PHP's built-in server keeps as written
+(`X~Real~IP` is `HTTP_X~REAL~IP` to it), and they are dropped too: such a name has no use but to
+pass for the header. A name that differs
+in a letter, a digit or its length (`X-Client-Cert-Fingerprints`, `XClient-Cert-Fingerprint`)
+is another header and is kept. For the same reason, every such spelling of the forwarding headers
+zion sets itself (`X_Forwarded_For`, `X.Forwarded.Host`, `X_Forwarded_Proto`, `X.Real.IP`) is
+dropped from every request it forwards, a trusted proxy's included, and the dashed spelling is
+set, extended or dropped as described above: `wsgiref` joins the client's value with zion's, and PHP's
+built-in server reads a dotted copy sent after the dashed one in place of zion's.
+
 ### Headers and cookies you strip or refuse
 
 Three lists name request headers and cookies by name, in `[server]` for every route and in a
@@ -152,10 +171,20 @@ strip_headers = ["X-Debug"]
 deny_headers = ["X-Forwarded-Debug"]
 ```
 
-Header names are compared without case and with `_` and `-` as the same character, because
-a CGI or PHP upstream reads `X_Debug` as `X-Debug`. Cookie names are compared as written
-(they are case-sensitive) and also percent-decoded, because PHP reads `%43acheWarmer` as
-`CacheWarmer`. A name that is not a header name or a cookie name is a config error.
+Header names are compared without case and with every byte that is neither a letter nor a digit
+as the same character, because a CGI upstream reads `X_Debug` as `X-Debug` and PHP also reads
+`X.Debug` as it: `deny_headers = ["X-Debug"]` also refuses `X_Debug`, `X.Debug` and `X~Debug`. Cookie names are compared as written
+(they are case-sensitive), percent-decoded (`%43acheWarmer` is `CacheWarmer` to an upstream
+that decodes cookie names, as PHP did before 7.2.34, 7.3.23 and 7.4.11), and as the key PHP
+files them under: PHP drops the whitespace before a cookie name, turns ` ` and `.` into `_`,
+and reads `name[...]` as the array `name` (an unclosed `[` also becomes `_`), so
+`XDEBUG.SESSION`, `XDEBUG SESSION` and `XDEBUG[SESSION` are all `XDEBUG_SESSION` to it. A
+PHP before those versions url-decoded the name first (`+` is a space, `%XX` the byte it
+names, and a decoded NUL ends the name), so the key of the url-decoded name is compared too:
+`%20CacheWarmer` and `CacheWarmer%00x` are `CacheWarmer`, and `XDEBUG%2ESESSION` and
+`XDEBUG+SESSION` are `XDEBUG_SESSION`. The `Cookie` field is read as bytes: a byte outside
+ASCII in one cookie does not hide the others.
+A name that is not a header name or a cookie name is a config error.
 
 Some are built in, on every route, with no configuration:
 
