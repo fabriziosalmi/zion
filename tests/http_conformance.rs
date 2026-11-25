@@ -405,6 +405,7 @@ fn boot(dir: &Path, origin_port: u16, https_port: u16) -> Result<Proc, String> {
             cert.to_string_lossy(),
             key.to_string_lossy(),
             www = www.to_string_lossy(),
+            origin_port = origin_port,
         ),
     )
     .unwrap();
