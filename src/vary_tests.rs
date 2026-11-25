@@ -473,6 +473,68 @@ async fn per_user_vary_is_still_never_stored() {
     }
 }
 
+/// A `Vary` naming a header zion writes for the origin (`X-Real-IP`, `X-Forwarded-For`, ...)
+/// is never stored: the origin chose the response by what zion sent, the key would be built
+/// from what the client sent. A browser sends no `X-Real-IP`, so with `Vary: X-Real-IP` the first
+/// client's answer (its address, its location) was served to every other client as a `HIT`.
+#[tokio::test]
+async fn a_vary_on_a_header_zion_writes_for_the_origin_is_never_stored() {
+    for (n, vary) in [
+        "X-Real-IP",
+        "X-Forwarded-For",
+        "X-Forwarded-Host",
+        "Forwarded",
+        "Via",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (o, st) = rig(vary).await;
+        // a path of its own per case: the route cache is thread-local and keyed by path
+        let uri = format!("/fw{n}");
+        for _ in 0..3 {
+            let (c, _) = fetch(&st, &uri, &[]).await;
+            assert_eq!(c, "BYPASS", "Vary: {vary}");
+            settle().await;
+        }
+        assert_eq!(
+            hits(&o),
+            3,
+            "Vary: {vary}: every request must reach the origin"
+        );
+    }
+}
+
+/// zion sends the origin `X-Forwarded-Proto: https` on every request it caches, whatever the
+/// client sent, so a response that varies on it was chosen by a value every client shares. It is
+/// stored and served as a `HIT`. Kept out of the cache with the headers above, every request to
+/// an origin that sends `Vary: X-Forwarded-Proto` (an app behind a TLS-terminating proxy) went to
+/// the origin, where the first one used to be stored.
+#[tokio::test]
+async fn a_vary_on_x_forwarded_proto_is_cached() {
+    let (o, st) = rig("Accept-Encoding, X-Forwarded-Proto").await;
+    let mut answers = Vec::new();
+    for _ in 0..3 {
+        answers.push(fetch(&st, "/xfp", &[]).await.0);
+        settle().await;
+    }
+    assert_eq!(
+        (answers, hits(&o)),
+        (vec!["MISS".to_string(), "HIT".into(), "HIT".into()], 1),
+        "Vary: X-Forwarded-Proto"
+    );
+    assert_eq!(
+        seen(&o, "x-forwarded-proto").as_deref(),
+        Some("https"),
+        "what the origin chose by"
+    );
+    // keyed on what the client sent: a client that sends a value has a variant of its own, and
+    // the origin is told `https` all the same
+    let (c, _) = fetch(&st, "/xfp", &[("x-forwarded-proto", "http")]).await;
+    assert_eq!((c.as_str(), hits(&o)), ("MISS", 2));
+    assert_eq!(seen(&o, "x-forwarded-proto").as_deref(), Some("https"));
+}
+
 #[tokio::test]
 async fn the_number_of_variants_per_key_is_bounded() {
     let (o, st) = rig("X-Foo").await;
@@ -3466,6 +3528,48 @@ cache_profile = "c"
     assert_eq!(fetch(&st, "/t", &[("host", "one.test")]).await.0, "MISS");
 }
 
+/// A target with an authority (absolute-form, or an HTTP/2 `:authority` sent with a `host` field)
+/// names the request's host (RFC 9112 §3.2.2), and zion routes and keys the request on it. The
+/// origin was told the `Host` header's instead: `GET http://shop.test/` with `Host: evil.test`
+/// stored the page the origin built for evil.test (its links, its scripts) under shop.test's key,
+/// and every later client of shop.test was served it as a `HIT`. Such a request now gets a `400`
+/// before routing (the one-authority gate), and one whose `Host` names the same host in another
+/// spelling tells the origin the target's, the authority the entry is keyed under.
+#[tokio::test]
+async fn the_origin_is_told_the_host_the_entry_is_keyed_under() {
+    let (p, hits) = named_origin("O").await;
+    let st = hosts_state(
+        r#"
+[[route]]
+path = "/{*rest}"
+upstream = "o"
+mode = "static_cache"
+cache_profile = "c"
+"#,
+        &format!("o = \"http://127.0.0.1:{p}\""),
+    );
+    for (n, target) in ["http://shop.test", "https://shop.test"].iter().enumerate() {
+        let path = format!("/abs{n}");
+        // two hosts: refused, so nothing reaches the origin or the cache
+        let refused = body_for(&st, &format!("{target}{path}"), &[("host", "evil.test")]).await;
+        assert_eq!(refused.0, 400, "{target}{path} with Host: evil.test");
+        // one host, spelled `SHOP.test` in the target: the origin is told the target's spelling
+        let upper = target.replace("shop", "SHOP");
+        let planted = fetch(&st, &format!("{upper}{path}"), &[("host", "shop.test")]).await;
+        settle().await;
+        let served = fetch(&st, &path, &[("host", "shop.test")]).await;
+        assert_eq!(
+            (
+                (planted.0.as_str(), planted.1.as_str()),
+                (served.0.as_str(), served.1.as_str())
+            ),
+            (("MISS", "O:SHOP.test"), ("HIT", "O:SHOP.test")),
+            "{upper}{path} with Host: shop.test, then {path} with Host: shop.test"
+        );
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+}
+
 async fn send_host(st: &Arc<AppState>, method: Method, uri: &str, host: &str) -> u16 {
     let req = Request::builder()
         .method(method)
@@ -3600,6 +3704,64 @@ async fn a_websocket_upgrade_reaches_the_upstream_with_host_and_an_origin_form_t
         "{head}"
     );
     assert!(lower.contains("x-forwarded-host: app.test"), "{head}");
+}
+
+/// An upstream that declines the upgrade answers with its own headers: its `Alt-Svc` names its
+/// own alternatives and is not passed on, on the WebSocket path as on every other (zion's own
+/// with `--features http3`, none without it).
+#[tokio::test]
+async fn a_declined_websocket_upgrade_does_not_pass_the_origins_alt_svc_on() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut c, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match c.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let _ = c
+                    .write_all(
+                        b"HTTP/1.1 426 Upgrade Required\r\nAlt-Svc: h3=\":9443\"; ma=60\r\n\
+                          X-Origin-Thing: kept\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            });
+        }
+    });
+    let st = hosts_state(
+        "[[route]]\npath = \"/{*rest}\"\nupstream = \"w\"\n",
+        &format!("w = \"http://127.0.0.1:{port}\""),
+    );
+    let resp = process_request(
+        ws_request("/chat"),
+        st.clone(),
+        "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 426);
+    assert_eq!(
+        resp.headers().get("x-origin-thing").unwrap(),
+        "kept",
+        "the origin's answer"
+    );
+    let alt_svc: Vec<&str> = resp
+        .headers()
+        .get_all("alt-svc")
+        .iter()
+        .map(|v| v.to_str().unwrap())
+        .collect();
+    #[cfg(feature = "http3")]
+    assert_eq!(alt_svc, [crate::quic::ALT_SVC_H3.to_str().unwrap()]);
+    #[cfg(not(feature = "http3"))]
+    assert!(alt_svc.is_empty(), "the origin's Alt-Svc: {alt_svc:?}");
 }
 
 // ── [upstream.x] preserve_host (ADR-0024) ───────────────────────────────────
@@ -4141,6 +4303,57 @@ async fn a_background_refresh_sends_the_clients_host_too() {
     // what the refresh stored is what the origin answered to the client's Host
     let (_, body) = body_for(&st, "/r", &h).await;
     assert_eq!(body, "host=app.example", "the refreshed entry");
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+}
+
+/// A background refresh goes out with the target and the `Host` of the request that found the
+/// entry stale. An absolute-form target named the entry's host while its `Host` named another:
+/// the refresh told the origin the `Host` header's, and the answer for that host replaced the
+/// entry of the target's, inside the window, without waiting for a miss. Such a request now gets
+/// a `400` before the cache and starts no refresh; one whose target and `Host` name the same host
+/// in two spellings has its refresh tell the origin the target's.
+#[tokio::test]
+async fn a_background_refresh_tells_the_origin_the_host_of_the_entry_it_refreshes() {
+    let (port, hits) = host_echo_origin("public, max-age=1, stale-while-revalidate=30").await;
+    let st = preserve_state(
+        "static_cache",
+        &format!("\"http://127.0.0.1:{port}\""),
+        true,
+        "",
+    );
+    let shop = [("host", "shop.example")];
+    assert_eq!(body_for(&st, "/sw", &shop).await.1, "host=shop.example");
+    settle().await;
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    // stale, but two hosts: refused, and no refresh starts
+    assert_eq!(
+        body_for(&st, "http://shop.example/sw", &[("host", "evil.example")])
+            .await
+            .0,
+        400
+    );
+    settle().await;
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        1,
+        "a refused request refreshed"
+    );
+    // stale: served at once, and refreshed with this request's target and Host
+    assert_eq!(
+        body_for(&st, "http://SHOP.example/sw", &shop).await.1,
+        "host=shop.example"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while hits.load(Ordering::Relaxed) < 2 {
+        assert!(std::time::Instant::now() < deadline, "no refresh");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    settle().await;
+    assert_eq!(
+        body_for(&st, "/sw", &shop).await.1,
+        "host=SHOP.example",
+        "the refreshed entry of shop.example, refreshed with the target's spelling"
+    );
     assert_eq!(hits.load(Ordering::Relaxed), 2);
 }
 

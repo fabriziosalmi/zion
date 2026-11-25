@@ -536,12 +536,16 @@ fn spawn_https_handler(
                 #[cfg(feature = "tls-fingerprint")]
                 let tls_fp_identity = tls_fp_identity.clone();
                 async move {
-                    // Fast-path: health probes bypass the full pipeline (~1us vs ~5us).
+                    // Fast-path: health probes bypass the full pipeline (~1us vs ~5us). A target
+                    // with userinfo is no probe: it goes on to the pipeline, whose gate answers it
+                    // 400 as HTTP/3 and :80 do (`security::target_has_userinfo`).
                     let path = req.uri().path();
-                    if path == "/healthz" {
+                    let probe = (path == "/healthz" || path == "/readyz")
+                        && !security::target_has_userinfo(&req);
+                    if probe && path == "/healthz" {
                         return Ok(text_response(StatusCode::OK, "ok"));
                     }
-                    if path == "/readyz" {
+                    if probe && path == "/readyz" {
                         return Ok(text_response(StatusCode::OK, "ready"));
                     }
 
@@ -736,6 +740,13 @@ pub(crate) async fn handle_http(
     // URI length cap: the same function the HTTPS pipeline's gate uses.
     if dispatch::uri_too_long(&req) {
         return Ok(empty_response(StatusCode::URI_TOO_LONG));
+    }
+
+    // Userinfo in the target's authority (absolute-form, an h2c `:authority`) is a 400 here as in
+    // the HTTPS pipeline's gate, and for the same reason: the ACME fallback below routes on the
+    // authority and forwards it (`security::target_has_userinfo`).
+    if security::target_has_userinfo(&req) {
+        return Ok(empty_response(StatusCode::BAD_REQUEST));
     }
 
     // One authority per request, as in the HTTPS pipeline: the ACME fallback below routes by

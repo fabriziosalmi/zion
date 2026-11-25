@@ -2,7 +2,7 @@
 
 Zion is a single async Rust binary built on Tokio, Hyper, and rustls.
 <!-- zion-stats:modules-lines (kept in sync by scripts/update-readme-stats.sh) -->
-87 modules, ~88,000 lines of Rust.
+86 modules, ~91,600 lines of Rust.
 
 ## Module map
 
@@ -98,6 +98,7 @@ Client
        ▼
   ┌─ Health Probe Fast-Path ───────────────────────────┐
   │  /healthz, /readyz → 200 OK (~1us, bypasses below) │
+  │  (a target with userinfo goes on to gate 4)        │
   └────────────────────────────────────────────────────┘
        │
        ▼
@@ -105,15 +106,16 @@ Client
   │  1. Scrub client-supplied identity headers             │
   │  2. Scrub client routing/host override headers         │
   │  3. URI length check (path+query >8192 bytes → 414)   │
-  │  4. Path normalisation (RFC 3986 §6.2.2)               │
-  │  5. Method whitelist (7 methods, else 405)             │
-  │  6. One authority per request (target vs Host,         │
-  │     invalid host or port, userinfo → 400)              │
-  │  7. 0-RTT replay protection (non-idempotent → 425)     │
-  │  8. Loop detection (Via, → 508)                        │
-  │  9. Per-IP rate limiter (packed atomic, lock-free)     │
-  │  10. Feature-gated: sovereign class, TLS fingerprint,  │
-  │      mesh score                                        │
+  │  4. Target with userinfo (user@host, → 400)            │
+  │  5. Path normalisation (RFC 3986 §6.2.2)               │
+  │  6. Method whitelist (7 methods, else 405)             │
+  │  7. One authority per request (target vs Host,         │
+  │     invalid host or port → 400)                        │
+  │  8. 0-RTT replay protection (non-idempotent → 425)     │
+  │  9. Loop detection (Via, → 508)                        │
+  │ 10. Per-IP rate limiter (packed atomic, lock-free)     │
+  │ 11. Feature-gated: sovereign class, TLS fingerprint,   │
+  │     mesh score                                         │
   │  then: built-in endpoints (/metrics → internal IPs),   │
   │        CORS pre-flight (OPTIONS → 204)                 │
   └────────────────────────────────────────────────────────┘

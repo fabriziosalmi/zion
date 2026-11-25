@@ -486,9 +486,9 @@ fn is_host_name_byte(b: u8) -> bool {
 /// - a target authority with a `Host` header that names another authority.
 ///
 /// Routing, the route's policy (`internal_only`, auth, WAF) and the response-cache key read
-/// the target's authority first ([`request_host`]); the upstream is told the `Host` header,
-/// in `X-Forwarded-Host` and, with `preserve_host`, as `Host`. A request for which the two
-/// differ was decided as one host and served as another, so it is refused before routing.
+/// the target's authority first ([`request_host`]), and so does the host the upstream is told,
+/// in `X-Forwarded-Host` and, with `preserve_host`, as `Host`. A request whose `Host` names
+/// another host names two, one decided on and one dropped, so it is refused before routing.
 /// RFC 9113 §8.3.1 makes such an HTTP/2 request malformed; for HTTP/1.1, RFC 9112 §3.2.2 has
 /// a server answer from the target alone, and refusing instead also keeps the authority a
 /// client wrote in an absolute-form target from ever reaching the upstream. (For HTTP/3,
@@ -531,6 +531,24 @@ pub fn authority_is_ambiguous<B>(req: &hyper::Request<B>) -> bool {
                     || port.or(default_port) != target_port.or(default_port)
             })
         })
+}
+
+/// Whether the request target's authority carries userinfo (`user@host`, `user:pass@host`): an
+/// absolute-form target of HTTP/1.x, or the `:authority` of HTTP/2 or HTTP/3 (h3 also builds the
+/// authority from a `host` field sent without `:authority`). In an authority an `@` can only
+/// belong to the userinfo, so its presence is the test.
+///
+/// RFC 9110 §4.2.4: a recipient SHOULD treat userinfo in an `http` or `https` URI as an error, it
+/// is how a link hides its real host (`http://shop.example@evil.example/` goes to evil.example).
+/// RFC 9113 §8.3.1 and RFC 9114 §4.3.1 forbid it in `:authority`. hyper, h2 and h3 all accept it
+/// (the `http` crate parses it as userinfo), so the pipeline's gate and the `:80` handler refuse
+/// such a request with a 400 before routing. Let through, [`request_host`] finds no host in it, so
+/// it is routed on the shared layer, and its authority as received names a host the origin may
+/// build links to (`shop.example@evil.example`) or carries a password.
+pub fn target_has_userinfo<B>(req: &hyper::Request<B>) -> bool {
+    req.uri()
+        .authority()
+        .is_some_and(|a| a.as_str().as_bytes().contains(&b'@'))
 }
 
 /// Check if an IP is internal (loopback, private RFC1918, link-local).
@@ -1504,6 +1522,47 @@ mod proptests {
             // implicitly because we count each IP separately.
             prop_assert!(allowed_a <= 2 * rps as usize);
             prop_assert!(allowed_b <= 2 * rps as usize);
+        }
+    }
+}
+
+#[cfg(test)]
+mod userinfo_tests {
+    use super::target_has_userinfo;
+
+    fn req(uri: &str, host: Option<&str>) -> hyper::Request<()> {
+        let mut b = hyper::Request::builder().uri(uri);
+        if let Some(h) = host {
+            b = b.header(hyper::header::HOST, h);
+        }
+        b.body(()).unwrap()
+    }
+
+    /// Userinfo in the target's authority, as the parsers hand it over: a name, a password, a
+    /// familiar host in front of the real one, an empty one. An `@` in the path or the query is
+    /// not in the authority, and a `Host` header is not the target.
+    #[test]
+    fn userinfo_in_the_targets_authority_is_seen_and_nothing_else() {
+        for uri in [
+            "http://user@shop.example/",
+            "http://user:pass@shop.example/p",
+            "https://shop.example@evil.example/",
+            "http://@shop.example/",
+            "http://user:pass@[2001:db8::1]:8443/",
+        ] {
+            assert!(target_has_userinfo(&req(uri, None)), "{uri}");
+            assert!(
+                target_has_userinfo(&req(uri, Some("shop.example"))),
+                "{uri} with a clean Host"
+            );
+        }
+        for (uri, host) in [
+            ("http://shop.example/", None),
+            ("https://shop.example:8443/a@b?u=a@b", None),
+            ("/p@q", Some("shop.example")),
+            ("/p", Some("user@shop.example")),
+        ] {
+            assert!(!target_has_userinfo(&req(uri, host)), "{uri} {host:?}");
         }
     }
 }

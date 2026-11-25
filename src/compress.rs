@@ -21,9 +21,9 @@
 //! a route that asks for compression on a build without the backend degrades to
 //! no-op rather than failing.
 
-use crate::http_util::ZionBody;
+use crate::http_util::{CacheControl, ZionBody};
 use hyper::body::Body as _;
-use hyper::header::{HeaderMap, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, SET_COOKIE};
+use hyper::header::{HeaderMap, CONTENT_ENCODING, CONTENT_TYPE, SET_COOKIE};
 use hyper::{Method, Response, StatusCode};
 use serde::Deserialize;
 
@@ -189,15 +189,12 @@ pub fn negotiate(
     if headers.contains_key(CONTENT_ENCODING) {
         return None;
     }
-    let cache_control = headers
-        .get(CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_ascii_lowercase());
+    // Every `Cache-Control` line counts (RFC 9110 §5.3): a `no-transform` or a `private` on the
+    // second line is as binding as on the first.
+    let cache_control = CacheControl::of(headers);
     // `no-transform` forbids a proxy from changing the representation.
-    if let Some(cc) = &cache_control {
-        if cc.contains("no-transform") {
-            return None;
-        }
+    if cache_control.mentions("no-transform") {
+        return None;
     }
     // Non-text content types are not worth compressing.
     let compressible = headers
@@ -218,9 +215,7 @@ pub fn negotiate(
     // BREACH guard: a response that mixes a secret (a cookie, or a response marked
     // private) with reflected input is the BREACH oracle when compressed over TLS.
     if !cfg.allow_cookied {
-        let private = cache_control
-            .as_deref()
-            .is_some_and(|cc| cc.contains("private"));
+        let private = cache_control.mentions("private");
         if headers.contains_key(SET_COOKIE) || private {
             return None;
         }
@@ -376,9 +371,19 @@ mod encode {
         append_vary_accept_encoding(&mut parts.headers);
         // A strong ETag no longer identifies these bytes; weaken it to a weak validator.
         weaken_etag(&mut parts.headers);
+        // The origin's digests are of the bytes it sent, not of these: `Content-Digest` and
+        // `Content-MD5` are over the content, `Repr-Digest` over the representation, whose
+        // content coding has just changed (RFC 9530 §2, §3; RFC 1864). A client that checks
+        // one would reject the response as corrupt.
+        for digest in IDENTITY_DIGESTS {
+            parts.headers.remove(digest);
+        }
         let body = CompressBody::new(body, enc, permit).boxed();
         Response::from_parts(parts, body)
     }
+
+    /// The digests an origin sends of the bytes it sent, see [`compress_response`].
+    const IDENTITY_DIGESTS: [&str; 3] = ["content-digest", "content-md5", "repr-digest"];
 
     fn append_vary_accept_encoding(headers: &mut hyper::HeaderMap) {
         // If Vary already lists accept-encoding (any case) or is `*`, leave it.
@@ -535,6 +540,7 @@ mod encode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::header::CACHE_CONTROL;
 
     fn hv(s: &str) -> hyper::header::HeaderValue {
         hyper::header::HeaderValue::from_str(s).unwrap()
@@ -710,6 +716,38 @@ mod tests {
         assert_eq!(neg("br", &h, Some(4096), &enabled()), None);
     }
 
+    /// hyper keeps each upstream `Cache-Control` field line as its own value; RFC 9110 §5.3
+    /// makes them one list. A `private` or `no-transform` on a later line stops compression
+    /// like the joined line does.
+    #[test]
+    fn breach_guard_and_no_transform_read_every_cache_control_line() {
+        for later in ["private", "no-transform"] {
+            let mut joined = text_headers();
+            joined.insert(CACHE_CONTROL, hv(&format!("max-age=300, {later}")));
+            assert_eq!(
+                neg("br", &joined, Some(4096), &enabled()),
+                None,
+                "control: joined `max-age=300, {later}` declines"
+            );
+            let mut split = text_headers();
+            split.insert(CACHE_CONTROL, hv("max-age=300"));
+            split.append(CACHE_CONTROL, hv(later));
+            assert_eq!(
+                neg("br", &split, Some(4096), &enabled()),
+                None,
+                "`max-age=300` + `{later}` on two lines was compressed"
+            );
+        }
+        // control: two lines that forbid nothing still compress
+        let mut plain = text_headers();
+        plain.insert(CACHE_CONTROL, hv("max-age=300"));
+        plain.append(CACHE_CONTROL, hv("public"));
+        assert_eq!(
+            neg("br", &plain, Some(4096), &enabled()),
+            Some(Encoding::Brotli)
+        );
+    }
+
     #[test]
     fn compressible_types() {
         for ct in [
@@ -859,6 +897,36 @@ mod encode_tests {
             .read_to_end(&mut out)
             .unwrap();
         assert!(out.is_empty());
+    }
+
+    /// The origin's digests describe the bytes it sent: on a compressed answer a client that checks
+    /// one rejects the response as corrupt. They go with the coding change; the rest stays.
+    #[test]
+    fn a_compressed_answer_does_not_carry_the_digests_of_the_identity_bytes() {
+        let mut resp = hyper::Response::new(chunked_body(vec![sample(4096)]));
+        for (k, v) in [
+            ("content-type", "text/css"),
+            ("content-digest", "sha-256=:d2hvbGUgZmlsZQ==:"),
+            ("content-md5", "Q2hlY2sgSW50ZWdyaXR5IQ=="),
+            ("repr-digest", "sha-256=:d2hvbGUgZmlsZQ==:"),
+            ("content-security-policy", "sandbox"),
+        ] {
+            resp.headers_mut().append(
+                hyper::header::HeaderName::from_static(k),
+                hyper::header::HeaderValue::from_static(v),
+            );
+        }
+        let cfg = super::ResolvedCompress {
+            min_bytes: 1024,
+            allow_cookied: false,
+        };
+        let out = super::apply(resp, Some(&cfg), &hyper::Method::GET, Some("br"), 0);
+        let h = out.headers();
+        assert_eq!(h.get("content-encoding").unwrap(), "br", "compressed");
+        for digest in ["content-digest", "content-md5", "repr-digest"] {
+            assert!(h.get(digest).is_none(), "{digest} on a compressed answer");
+        }
+        assert_eq!(h.get("content-security-policy").unwrap(), "sandbox");
     }
 }
 

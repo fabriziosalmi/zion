@@ -373,9 +373,8 @@ fn no_desync_form_smuggles_a_request_past_zion() {
     );
 
     // 8. an absolute-form target that names another authority than the Host header is refused
-    // with 400 and never forwarded: routing, the route's policy and the cache key go by the
-    // target's authority while the upstream is told the Host header, so a request that names
-    // two hosts would be decided as one and served as the other.
+    // with 400 and never forwarded: a request names one host, the one routing, the route's
+    // policy, the cache key and the upstream all go by.
     let line = send_raw(
         port,
         b"GET http://evil.example/abs8-foreign HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n",
@@ -407,6 +406,21 @@ fn no_desync_form_smuggles_a_request_past_zion() {
     assert!(
         !upstream.to_ascii_lowercase().contains("http://"),
         "a non-origin-form target reached the upstream:\n{upstream}"
+    );
+    let head = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|h| h.starts_with("GET /abs8 "))
+        .cloned()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    // Its authority, not the `Host` sent with it, is the request's host (RFC 9112 §3.2.2): zion
+    // routes and caches the request on it, so the upstream is told that one in
+    // `X-Forwarded-Host` (`A.example:80`), never the `Host` the target overrides (`a.example`).
+    assert!(
+        head.lines().any(|l| l == "x-forwarded-host: a.example:80"),
+        "the upstream was not told the host the request is routed and cached on:\n{head}"
     );
 
     // 8b. asterisk-form (`OPTIONS *`) matches no route and is refused, never forwarded.

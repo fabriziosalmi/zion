@@ -144,6 +144,56 @@ async fn uri_length_answers_before_the_method_whitelist() {
     );
 }
 
+/// A target whose authority carries userinfo is a 400 after the URI length cap and before
+/// everything else: the method whitelist, the rate limiter, the built-in endpoints, routing.
+#[tokio::test]
+async fn a_target_with_userinfo_answers_after_the_uri_length_and_before_the_method_whitelist() {
+    let st = state(1);
+    // alone, in each shape (the authority is the same whichever protocol carried it)
+    for uri in [
+        "http://user:pass@shop.example/open/x",
+        "https://shop.example@evil.example/open/x",
+        "http://user@shop.example/healthz",
+    ] {
+        assert_eq!(get(&st, EXTERNAL, uri).await, 400, "{uri}");
+    }
+    // TRACE would be 405; the userinfo is refused first.
+    assert_eq!(
+        status(
+            &st,
+            EXTERNAL,
+            req(Method::TRACE, "http://user@shop.example/open/x", &[]),
+            false
+        )
+        .await,
+        400
+    );
+    // An oversized target is a 414 first.
+    let long = format!("http://user@shop.example/open/{}", "a".repeat(9000));
+    assert_eq!(
+        status(&st, EXTERNAL, req(Method::GET, &long, &[]), false).await,
+        414
+    );
+    // None of the above spent the client's one token: the rate limiter comes after.
+    assert_eq!(
+        get(&st, EXTERNAL, "http://shop.example/healthz").await,
+        200,
+        "the budget is untouched"
+    );
+    assert_eq!(get(&st, EXTERNAL, "http://shop.example/healthz").await, 429);
+    // sanity: without userinfo the same TRACE is the whitelist's 405
+    assert_eq!(
+        status(
+            &st,
+            "198.51.100.7:1",
+            req(Method::TRACE, "http://shop.example/open/x", &[]),
+            false
+        )
+        .await,
+        405
+    );
+}
+
 /// A request whose `Host` names another authority than its target is refused after the method
 /// whitelist (a `CONNECT`, whose target is an authority, stays a 405) and before every gate
 /// that comes later: early data, the rate limiter, routing and a route's policy, which would go
