@@ -5916,7 +5916,8 @@ async fn the_port_80_acme_fallback_leaves_a_route_with_something_to_bypass_to_ht
 /// (RFC 9112 §3.2, `accept::http1_host_is_wrong`), before routing. The shortcut used to forward
 /// such a challenge `GET`: routed on the first line or on no host at all, with the client's value
 /// sent upstream as `X-Forwarded-Host` (measured on the real binary: `:443` 400, `:80` 200 from
-/// the upstream). It is now redirected, never forwarded. The controls: one valid `Host` is
+/// the upstream). It is now redirected, or refused with 400 by the :80 authority checks, never
+/// forwarded. The controls: one valid `Host` is
 /// forwarded, and so is an HTTP/1.0 request without one, which the TLS listener serves too.
 #[tokio::test]
 async fn the_port_80_acme_fallback_takes_only_a_host_the_tls_listener_accepts() {
@@ -5948,14 +5949,16 @@ async fn the_port_80_acme_fallback_takes_only_a_host_the_tls_listener_accepts() 
         );
     }
     let mut leaks = Vec::new();
-    for (what, hosts) in [
-        ("no Host", &[][..]),
-        ("two Host lines", &["api.example.com", "other.example"]),
-        ("Host x@api.example.com", &["x@api.example.com"]),
-        ("Host 'exa mple.com'", &["exa mple.com"]),
+    // A Host with userinfo or one that is not a host name is answered 400 by the :80 handler's
+    // own authority checks before the shortcut; the rest is redirected. Neither is forwarded.
+    for (what, hosts, want) in [
+        ("no Host", &[][..], 301),
+        ("two Host lines", &["api.example.com", "other.example"], 301),
+        ("Host x@api.example.com", &["x@api.example.com"], 400),
+        ("Host 'exa mple.com'", &["exa mple.com"], 400),
     ] {
         let (status, reached) = via_port_80(&st, &seen, req(h11, hosts)).await;
-        if (status, &reached) != (301, &None) {
+        if (status, &reached) != (want, &None) {
             leaks.push(format!(
                 "{what}: {status}, the upstream received {reached:?}"
             ));
