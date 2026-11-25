@@ -1331,6 +1331,11 @@ fn multipart_boundary(ct: &str) -> Option<Vec<u8>> {
     let b = match raw.strip_prefix(b"\"").and_then(|v| v.strip_suffix(b"\"")) {
         Some(quoted) => quoted,
         None if raw.iter().all(|&c| is_token_bchar(c)) => raw,
+        // An unquoted value that starts with a byte Werkzeug does not take as a token character
+        // (codejava.net's MultipartUtility sends `===<millis>===`): Werkzeug reads no boundary
+        // from it and parses no form, while PHP and Django read the whole value. PHP ends an
+        // unquoted boundary at ',', so a ',' in it stays refused.
+        None if raw.first().is_some_and(|&c| !is_tchar(c)) && !raw.contains(&b',') => raw,
         None => return None,
     };
     if b.is_empty() || b.len() > 70 || b.last() == Some(&b' ') || !b.iter().all(|&c| is_bchar(c)) {
@@ -1392,6 +1397,7 @@ fn field_name_index_exceeds(name: &[u8], cap: u64) -> bool {
 fn inspect_part_headers(block: &[u8], profile: &WafProfile, form_data: bool) -> PartHeaders {
     let mut count = 0usize;
     let mut name: Option<&[u8]> = None;
+    let mut name_quoted = false;
     let mut is_file = false;
     let mut seen_disposition = false;
     let mut rest = block;
@@ -1405,6 +1411,12 @@ fn inspect_part_headers(block: &[u8], profile: &WafProfile, form_data: bool) -> 
         // or another field name, than this walk does.
         if memchr::memchr2(b'\r', b'\n', line).is_some() {
             return PartHeaders::Deny("bare line break in multipart part headers");
+        }
+        // A line that starts with whitespace: Werkzeug folds a space or a tab at the start into
+        // the header above (obs-fold), PHP folds any C isspace byte (VT and FF too), and Django
+        // strips it and reads the line as a header of its own. Browsers never send one.
+        if ws_prefix(line) > 0 {
+            return PartHeaders::Deny("folded or indented multipart part header");
         }
         if !line.is_empty() {
             count += 1;
@@ -1432,6 +1444,7 @@ fn inspect_part_headers(block: &[u8], profile: &WafProfile, form_data: bool) -> 
                 match disposition_params(&line[colon + 1..]) {
                     Ok(params) => {
                         name = params.name;
+                        name_quoted = params.name_quoted;
                         is_file = params.is_file;
                     }
                     Err(reason) => return PartHeaders::Deny(reason),
@@ -1453,7 +1466,7 @@ fn inspect_part_headers(block: &[u8], profile: &WafProfile, form_data: bool) -> 
             if profile
                 .deny_field_names
                 .iter()
-                .any(|d| d.as_bytes().eq_ignore_ascii_case(n))
+                .any(|d| field_name_is(n, name_quoted, d.as_bytes()))
             {
                 return PartHeaders::Deny("denied multipart field name");
             }
@@ -1469,11 +1482,139 @@ fn inspect_part_headers(block: &[u8], profile: &WafProfile, form_data: bool) -> 
 struct Disposition<'a> {
     /// The `name` parameter, one layer of surrounding quotes stripped.
     name: Option<&'a [u8]>,
+    /// The `name` value was a quoted string, so a backslash in it escapes the next byte.
+    name_quoted: bool,
     /// It has a `filename` (an empty `filename=""` included) or a `filename*` parameter.
     is_file: bool,
 }
 
+/// Does the field name `raw` (as [`disposition_params`] returns it) read as `want`, ASCII
+/// case-insensitive? In a quoted value a backslash escapes the next byte: Werkzeug drops a
+/// backslash before any byte, Django and PHP only before a backslash or a quote, so the gate
+/// matches the unescaped form, the one more names hit.
+fn field_name_is(raw: &[u8], quoted: bool, want: &[u8]) -> bool {
+    if !quoted || !raw.contains(&b'\\') {
+        return raw.eq_ignore_ascii_case(want);
+    }
+    let mut it = raw.iter();
+    let mut want = want.iter();
+    while let Some(&b) = it.next() {
+        let b = if b == b'\\' {
+            it.next().copied().unwrap_or(b)
+        } else {
+            b
+        };
+        match want.next() {
+            Some(w) if w.eq_ignore_ascii_case(&b) => {}
+            _ => return false,
+        }
+    }
+    want.next().is_none()
+}
+
+/// The length of the whitespace character at the start of `s`, 0 if there is none. Whitespace
+/// is what one of the backends strips around a header name, a parameter name or a value: Python's
+/// `str.strip()` (Django decodes a part header as UTF-8, then strips every Unicode space, and the
+/// ASCII separators 0x1C to 0x1F), and C `isspace` (PHP: VT and FF too).
+fn ws_prefix(s: &[u8]) -> usize {
+    match s {
+        [b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | 0x1c..=0x1f | b' ', ..] => 1,
+        [0xc2, 0x85 | 0xa0, ..] => 2,
+        [0xe1, 0x9a, 0x80, ..]
+        | [0xe2, 0x80, 0x80..=0x8a | 0xa8 | 0xa9 | 0xaf, ..]
+        | [0xe2, 0x81, 0x9f, ..]
+        | [0xe3, 0x80, 0x80, ..] => 3,
+        _ => 0,
+    }
+}
+
+/// The length of the whitespace character (see [`ws_prefix`]) at the end of `s`, 0 if none.
+fn ws_suffix(s: &[u8]) -> usize {
+    match s {
+        [.., b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | 0x1c..=0x1f | b' '] => 1,
+        [.., 0xc2, 0x85 | 0xa0] => 2,
+        [.., 0xe1, 0x9a, 0x80]
+        | [.., 0xe2, 0x80, 0x80..=0x8a | 0xa8 | 0xa9 | 0xaf]
+        | [.., 0xe2, 0x81, 0x9f]
+        | [.., 0xe3, 0x80, 0x80] => 3,
+        _ => 0,
+    }
+}
+
+/// `s` with the whitespace of [`ws_prefix`] trimmed from both ends.
+fn trim_ws(mut s: &[u8]) -> &[u8] {
+    loop {
+        let n = ws_prefix(s);
+        if n == 0 {
+            break;
+        }
+        s = s.get(n..).unwrap_or_default();
+    }
+    loop {
+        let n = ws_suffix(s);
+        if n == 0 {
+            break;
+        }
+        s = s.get(..s.len() - n).unwrap_or_default();
+    }
+    s
+}
+
+const MALFORMED_QUOTED: &str = "malformed quoted string in a multipart part header";
+
+/// Where a segment's quoted string opens and closes (byte offsets of the two quotes).
+type QuoteSpan = Option<(usize, usize)>;
+
+/// One `;`-separated segment of a Content-Disposition value: its length up to the `;` (or the
+/// end) that ends it outside a quoted string, and where its quoted string opens and closes.
+/// Refused (see [`disposition_params`]) when the backends could end the segment, or the quoted
+/// string, at different bytes: an unterminated quoted string, a second quoted string, and an
+/// escaped backslash right before a quote (`\\"`), which ends the string for Werkzeug and is an
+/// escaped quote for Django and PHP.
+fn disposition_segment(s: &[u8]) -> Result<(usize, QuoteSpan), &'static str> {
+    let mut quote: QuoteSpan = None;
+    let mut open: Option<usize> = None;
+    let mut i = 0;
+    while let Some(&b) = s.get(i) {
+        match (open, b) {
+            (None, b';') => break,
+            (None, b'"') => {
+                if quote.is_some() {
+                    return Err(MALFORMED_QUOTED);
+                }
+                open = Some(i);
+            }
+            (Some(_), b'\\') => {
+                if s.get(i + 1) == Some(&b'\\') && s.get(i + 2) == Some(&b'"') {
+                    return Err(MALFORMED_QUOTED);
+                }
+                i += 1; // the escaped byte
+            }
+            (Some(o), b'"') => {
+                quote.get_or_insert((o, i));
+                open = None;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if open.is_some() {
+        return Err(MALFORMED_QUOTED);
+    }
+    Ok((i.min(s.len()), quote))
+}
+
 /// The field name and the file flag of a Content-Disposition value (case-insensitive keys).
+///
+/// The value is split on `;` outside quoted strings, as Werkzeug, Django and PHP split it, so a
+/// browser's `filename="a; name=b"` is one parameter. They agree on where a quoted string ends
+/// only when it is the whole value of a `token="..."` parameter, so a quote anywhere else is
+/// refused: in the disposition type (Werkzeug splits it at its first `;`), after anything but a
+/// token, `=` and nothing between (Werkzeug reads a parameter only there and otherwise takes the
+/// next `;` inside the quotes as the end of it, while Django and PHP keep the quotes whole), or a
+/// second time in the same parameter. Names and values are trimmed of the whitespace of
+/// [`ws_prefix`], which Django and PHP strip, so a `name` after a VT or a form feed is read too.
+///
 /// Refused when a common backend would read another field name from it: a second `name`
 /// (Werkzeug, Django and PHP keep the last one), or a `name*` / `name*0` (RFC 2231), which
 /// Werkzeug and Django take as the name. A `filename*` / `filename*0` makes it a file part, as
@@ -1481,32 +1622,47 @@ struct Disposition<'a> {
 fn disposition_params(value: &[u8]) -> Result<Disposition<'_>, &'static str> {
     let mut d = Disposition {
         name: None,
+        name_quoted: false,
         is_file: false,
     };
-    for raw in value.split(|&b| b == b';') {
-        let param = trim_lws(raw);
-        let eq = match memchr::memchr(b'=', param) {
-            Some(i) => i,
-            None => continue, // the disposition type ("form-data"), not a parameter
-        };
-        let key = trim_lws(&param[..eq]);
-        if key.eq_ignore_ascii_case(b"name") {
-            if d.name.is_some() {
-                return Err("repeated multipart field name");
+    let mut rest = value;
+    let mut first = true;
+    loop {
+        let (len, quote) = disposition_segment(rest)?;
+        let param = rest.get(..len).unwrap_or_default();
+        let eq = memchr::memchr(b'=', param);
+        if let Some((open, _)) = quote {
+            let key_ok = eq.is_some_and(|eq| {
+                let key = param.get(..eq).unwrap_or_default();
+                let key = trim_leading_lws(key);
+                eq + 1 == open && !key.is_empty() && key.iter().all(|&c| is_tchar(c))
+            });
+            if first || !key_ok {
+                return Err(MALFORMED_QUOTED);
             }
-            let v = trim_lws(&param[eq + 1..]);
-            d.name = Some(
-                if v.len() >= 2 && v.first() == Some(&b'"') && v.last() == Some(&b'"') {
-                    &v[1..v.len() - 1]
-                } else {
-                    v
-                },
-            );
-        } else if starts_with_ci(key, b"name*") {
-            return Err("multipart field name in an extended parameter");
-        } else if key.eq_ignore_ascii_case(b"filename") || starts_with_ci(key, b"filename*") {
-            d.is_file = true;
         }
+        if let Some(eq) = eq {
+            let key = trim_ws(param.get(..eq).unwrap_or_default());
+            if key.eq_ignore_ascii_case(b"name") {
+                if d.name.is_some() {
+                    return Err("repeated multipart field name");
+                }
+                let v = trim_ws(param.get(eq + 1..).unwrap_or_default());
+                let unquoted = v.strip_prefix(b"\"").and_then(|v| v.strip_suffix(b"\""));
+                d.name_quoted = unquoted.is_some();
+                d.name = Some(unquoted.unwrap_or(v));
+            } else if starts_with_ci(key, b"name*") {
+                return Err("multipart field name in an extended parameter");
+            } else if key.eq_ignore_ascii_case(b"filename") || starts_with_ci(key, b"filename*") {
+                d.is_file = true;
+            }
+        }
+        // a parameter without "=" is the disposition type ("form-data"), or ignored
+        match rest.get(len + 1..) {
+            Some(tail) => rest = tail,
+            None => break,
+        }
+        first = false;
     }
     Ok(d)
 }
@@ -1523,7 +1679,8 @@ fn disposition_params(value: &[u8]) -> Result<Disposition<'_>, &'static str> {
 /// that ends a part (PHP, Werkzeug and Django also split on a bare LF before it, Werkzeug and
 /// Django on a bare CR, Django on `--B` anywhere); nothing but spaces, tabs, CR and LF after the
 /// close delimiter (PHP and Django read parts after it); and a part's headers with no CR or LF
-/// outside a CRLF (PHP breaks a line at a bare LF, Werkzeug at a bare LF or CR), one
+/// outside a CRLF (PHP breaks a line at a bare LF, Werkzeug at a bare LF or CR) and no line that
+/// starts with whitespace (Werkzeug and PHP fold it into the header above), one
 /// Content-Disposition and one plain `name` (see `disposition_params`). This does not make
 /// every backend read the same field names: the shape of a parameter value is still open (bytes
 /// after a quoted value, `name="x"y`, or after an unquoted one, `name=x y`, which Werkzeug
@@ -4601,6 +4758,267 @@ mod tests {
         assert_eq!(
             validate_request("POST", Some(&ct("B")), dotnet.as_bytes(), &one_file),
             WafVerdict::Allow
+        );
+    }
+
+    // ── Multipart: whitespace, folding and quoted strings in a part's headers ────
+    //
+    // Werkzeug 3.1.9 and Django 5.1.15 were run on the bytes of each refused body and read the
+    // hidden field or file; PHP is read from php-src main/rfc1867.c (multipart_buffer_headers
+    // folds a line that starts with C isspace into the header above; the Content-Disposition
+    // loop skips isspace before each parameter name; php_ap_getword keeps a quoted string whole).
+
+    /// One part with the header block `headers`, then the close delimiter.
+    fn one_part(headers: &[u8]) -> Vec<u8> {
+        [&b"--B\r\n"[..], headers, b"\r\n\r\nx\r\n--B--\r\n"].concat()
+    }
+
+    #[test]
+    fn a_folded_or_indented_part_header_is_refused() {
+        let p = tight_php_profile();
+        let folded = "folded or indented multipart part header";
+        for (headers, who) in [
+            // Werkzeug and PHP fold the line into the Content-Disposition, and keep the last name
+            (
+                &b"Content-Disposition: form-data; name=\"a\";\r\n name=\"PHP_SESSION_UPLOAD_PROGRESS\"; x=\":\""[..],
+                "Werkzeug: field PHP_SESSION_UPLOAD_PROGRESS",
+            ),
+            (
+                b"Content-Disposition: form-data; name=\"a\";\r\n\tfilename=\"f:x.txt\"",
+                "Werkzeug: a file",
+            ),
+            // PHP folds a VT or a form feed too; Django strips it and reads a second header
+            (
+                b"Content-Disposition: form-data; name=\"a\"\r\n\x0bContent-Disposition: form-data; name=\"PHP_SESSION_UPLOAD_PROGRESS\"",
+                "Django: field PHP_SESSION_UPLOAD_PROGRESS",
+            ),
+            (
+                b"Content-Disposition: form-data; name=\"a\"\r\n\x0cContent-Type: text/plain",
+                "PHP: folded",
+            ),
+            // the first line indented: Werkzeug and Django strip the space and read it
+            (
+                b" Content-Disposition: form-data; name=\"PHP_SESSION_UPLOAD_PROGRESS\"",
+                "Werkzeug, Django: field PHP_SESSION_UPLOAD_PROGRESS",
+            ),
+        ] {
+            assert_eq!(
+                validate_request("POST", Some(&ct("B")), &one_part(headers), &p),
+                WafVerdict::Deny(folded),
+                "{} ({who})",
+                String::from_utf8_lossy(headers)
+            );
+        }
+        // The control: the same headers on lines of their own are read, a second line passes.
+        let ok =
+            one_part(b"Content-Disposition: form-data; name=\"a\"\r\nContent-Type: text/plain");
+        assert_eq!(
+            validate_request("POST", Some(&ct("B")), &ok, &p),
+            WafVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn whitespace_django_or_php_strip_around_a_parameter_does_not_hide_it() {
+        let p = tight_php_profile();
+        for (cd, want, who) in [
+            // Django (str.strip) and PHP (isspace) skip a VT or FF before the parameter name (with
+            // a quoted value the quoted-string rule refuses it first: Werkzeug skips the parameter)
+            (
+                &b"form-data; name=\"a\";\x0bname=PHP_SESSION_UPLOAD_PROGRESS"[..],
+                "repeated multipart field name",
+                "Django, PHP: the last name",
+            ),
+            (
+                b"form-data; name=\"a\"; \x0cname=PHP_SESSION_UPLOAD_PROGRESS",
+                "repeated multipart field name",
+                "Django, PHP: the last name",
+            ),
+            (
+                b"form-data; name=\"a\";\x0bfilename=x.txt",
+                "too many multipart file parts",
+                "Django, PHP: a file",
+            ),
+            // Django decodes the header as UTF-8 and strips a no-break space as well
+            (
+                b"form-data; name=\"a\";\xc2\xa0name=PHP_SESSION_UPLOAD_PROGRESS",
+                "repeated multipart field name",
+                "Django: the last name",
+            ),
+            // and a VT after the value: Werkzeug and Django still read the quoted name
+            (
+                b"form-data; name=\"PHP_SESSION_UPLOAD_PROGRESS\"\x0b",
+                "denied multipart field name",
+                "Werkzeug, Django",
+            ),
+            (
+                b"form-data; name=\x0bPHP_SESSION_UPLOAD_PROGRESS",
+                "denied multipart field name",
+                "Django, PHP",
+            ),
+            // Werkzeug drops a backslash before any byte of a quoted value
+            (
+                b"form-data; name=\"PHP_SESSION_UPLOAD_PROGRES\\S\"",
+                "denied multipart field name",
+                "Werkzeug",
+            ),
+        ] {
+            let headers = [&b"Content-Disposition: "[..], cd].concat();
+            assert_eq!(
+                validate_request("POST", Some(&ct("B")), &one_part(&headers), &p),
+                WafVerdict::Deny(want),
+                "{} ({who})",
+                String::from_utf8_lossy(cd)
+            );
+        }
+    }
+
+    #[test]
+    fn a_quoted_string_the_backends_end_at_different_bytes_is_refused() {
+        // One file part allowed, so a file the gate counts is not refused for being a file.
+        let p = WafProfile {
+            max_file_parts: 1,
+            ..tight_php_profile()
+        };
+        let mut wrong = Vec::new();
+        for (cd, who) in [
+            // Werkzeug reads a quoted value only right after "key=", and otherwise takes the
+            // next ";" inside the quotes as the end of the parameter
+            (
+                &b"form-data; name=\"a\"; filename= \"q; name=PHP_SESSION_UPLOAD_PROGRESS\""[..],
+                "Werkzeug: field PHP_SESSION_UPLOAD_PROGRESS",
+            ),
+            (
+                b"form-data; name=\"a\"; filename =\"q; name=PHP_SESSION_UPLOAD_PROGRESS\"",
+                "Werkzeug: field PHP_SESSION_UPLOAD_PROGRESS",
+            ),
+            (
+                b"form-data; name=\"a\";\x0bfilename=\"q; name=PHP_SESSION_UPLOAD_PROGRESS\"",
+                "Werkzeug: field PHP_SESSION_UPLOAD_PROGRESS",
+            ),
+            (
+                b"form-data; name=\"a\"; filename=x\"; name=PHP_SESSION_UPLOAD_PROGRESS; y=\"",
+                "Werkzeug: file PHP_SESSION_UPLOAD_PROGRESS",
+            ),
+            (
+                b"form-data; name=\"a\"; filename=\"q\"\"; name=PHP_SESSION_UPLOAD_PROGRESS\"",
+                "Werkzeug: file PHP_SESSION_UPLOAD_PROGRESS",
+            ),
+            // Werkzeug splits the disposition type at its first ";", quotes or not
+            (
+                b"form-data\"; name=\"PHP_SESSION_UPLOAD_PROGRESS\"; y=\"",
+                "Werkzeug: field PHP_SESSION_UPLOAD_PROGRESS",
+            ),
+            // "\\" then a quote ends the string for Werkzeug, is an escaped quote for Django, PHP
+            (
+                b"form-data; name=\"a\"; filename=\"x\\\\\"; name=\"PHP_SESSION_UPLOAD_PROGRESS\"; y=\"",
+                "Werkzeug: file PHP_SESSION_UPLOAD_PROGRESS",
+            ),
+            (
+                b"form-data; name=\"a\"; filename=\"q\\\\\"; r=\"; name=PHP_SESSION_UPLOAD_PROGRESS; s=\"",
+                "Django: file PHP_SESSION_UPLOAD_PROGRESS",
+            ),
+            // unterminated: Werkzeug drops the parameter and reads a field, Django and PHP a file
+            (
+                b"form-data; name=\"a\"; filename=\"q; name=PHP_SESSION_UPLOAD_PROGRESS",
+                "unterminated",
+            ),
+        ] {
+            let headers = [&b"Content-Disposition: "[..], cd].concat();
+            let got = validate_request("POST", Some(&ct("B")), &one_part(&headers), &p);
+            if got != WafVerdict::Deny("malformed quoted string in a multipart part header") {
+                wrong.push(format!("{} ({who}): {got:?}", String::from_utf8_lossy(cd)));
+            }
+        }
+        assert!(wrong.is_empty(), "\n  {}", wrong.join("\n  "));
+        // A quoted string in the disposition type, even a well-formed one: Werkzeug reads a file.
+        let cd = b"Content-Disposition: form-data=\"; filename=x.txt\"; name=\"a\"";
+        assert_eq!(
+            validate_request("POST", Some(&ct("B")), &one_part(cd), &tight_php_profile()),
+            WafVerdict::Deny("malformed quoted string in a multipart part header"),
+            "Werkzeug: a file"
+        );
+    }
+
+    #[test]
+    fn a_quoted_filename_that_contains_a_name_parameter_is_one_parameter() {
+        // A browser sends the file name as typed, inside quotes: Werkzeug, Django and PHP read
+        // the field "f" and a file named "a; name=x.txt".
+        let one_file = WafProfile {
+            max_file_parts: 1,
+            deny_field_names: vec!["x".to_string(), "PHP_SESSION_UPLOAD_PROGRESS".to_string()],
+            ..WafProfile::default()
+        };
+        for cd in [
+            &b"form-data; name=\"f\"; filename=\"a; name=x.txt\""[..],
+            b"form-data; name=\"f\"; filename=\"a; name*=x.txt\"",
+            b"form-data; filename=\"a; name=x.txt\"; name=\"f\"",
+            b"form-data; name=\"f\"; filename=\"a\\\"; name=PHP_SESSION_UPLOAD_PROGRESS.txt\"",
+            b"form-data; name=\"f\"; filename=\"C:\\dir\\a.txt\"",
+        ] {
+            let headers = [&b"Content-Disposition: "[..], cd].concat();
+            assert_eq!(
+                validate_request("POST", Some(&ct("B")), &one_part(&headers), &one_file),
+                WafVerdict::Allow,
+                "{}",
+                String::from_utf8_lossy(cd)
+            );
+        }
+        // the name it reads is "f": denying "f" refuses it, a second file is still counted
+        let deny_f = WafProfile {
+            deny_field_names: vec!["f".to_string()],
+            ..one_file.clone()
+        };
+        let cd = b"Content-Disposition: form-data; name=\"f\"; filename=\"a; name=x.txt\"";
+        assert_eq!(
+            validate_request("POST", Some(&ct("B")), &one_part(cd), &deny_f),
+            WafVerdict::Deny("denied multipart field name")
+        );
+        let no_file = WafProfile {
+            max_file_parts: 0,
+            ..one_file
+        };
+        assert_eq!(
+            validate_request("POST", Some(&ct("B")), &one_part(cd), &no_file),
+            WafVerdict::Deny("too many multipart file parts")
+        );
+    }
+
+    #[test]
+    fn an_unquoted_boundary_werkzeug_reads_no_boundary_from_passes() {
+        // codejava.net MultipartUtility: boundary "===" + millis + "===". Werkzeug finds no
+        // token after "=" and reads no boundary (no form at all), Django and PHP the whole value.
+        let p = tight_php_profile();
+        for b in ["===1732530000000===", "(x)", "/x", "=a/b?c"] {
+            let ct = format!("multipart/form-data; boundary={b}");
+            assert_eq!(
+                validate_request("POST", Some(&ct), &mp(b, &[("a", None, b"v")]), &p),
+                WafVerdict::Allow,
+                "{ct}"
+            );
+            // the gate still reads its fields
+            let hidden = mp(
+                b,
+                &[
+                    ("a", None, b"v"),
+                    ("PHP_SESSION_UPLOAD_PROGRESS", None, b"x"),
+                ],
+            );
+            assert_eq!(
+                validate_request("POST", Some(&ct), &hidden, &p),
+                WafVerdict::Deny("denied multipart field name"),
+                "{ct}"
+            );
+        }
+        // PHP ends an unquoted boundary at ",", Django does not
+        assert_eq!(
+            validate_request(
+                "POST",
+                Some("multipart/form-data; boundary==a,b"),
+                &mp("=a,b", &[("a", None, b"v")]),
+                &p
+            ),
+            WafVerdict::Deny("malformed multipart boundary")
         );
     }
 

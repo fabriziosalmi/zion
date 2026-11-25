@@ -88,12 +88,16 @@ leaves them another reading is refused too:
 
 - a `boundary` parameter another backend reads differently: an RFC 2231 form
   (`boundary*`, `boundary*0`), which Werkzeug and Django take as the boundary; an
-  unquoted value with a space or one of `( ) , / : = ?` in it, which RFC 2045
-  wants quoted and Werkzeug cuts short there; a space or tab right after the `=`,
-  which PHP keeps in the boundary; or a `boundary` substring before the parameter
-  (`xboundary=C; boundary=B`, or inside another parameter's value), since PHP takes
-  the first one it finds. A quoted value (`boundary="a/b c"`) is read the same way
-  by all three and passes.
+  unquoted value that starts with a token character and has a space or one of
+  `( ) , / : = ?` in it, which RFC 2045 wants quoted and Werkzeug cuts short there
+  (`B` from `boundary=B/C`); a `,` in an unquoted value, where PHP ends it; a space
+  or tab right after the `=`, which PHP keeps in the boundary; or a `boundary`
+  substring before the parameter (`xboundary=C; boundary=B`, or inside another
+  parameter's value), since PHP takes the first one it finds. A quoted value
+  (`boundary="a/b c"`) passes. So does an unquoted value that starts with a byte
+  that is not a token character, such as `===1732530000000===` from codejava.net's
+  `MultipartUtility`: Werkzeug reads no boundary from it and parses no form, while
+  Django and PHP read the whole value.
 - `--boundary` anywhere except at the start of the body and right after the CRLF
   that ends a part. PHP, Werkzeug and Django also split parts on a bare LF before
   it, Werkzeug and Django on a bare CR, and Django on `--boundary` anywhere, so a
@@ -104,11 +108,35 @@ leaves them another reading is refused too:
 - a CR or LF in a part's headers that is not part of a CRLF. PHP breaks a header
   line at a bare LF and Werkzeug at either, and Werkzeug also ends the headers at
   `\n\n` or `\r\r`, so they would read another field `name` than the gate.
+- a part header line that starts with whitespace (`folded or indented multipart
+  part header`). Werkzeug joins a line that starts with a space or a tab to the
+  header above (obs-fold) and PHP one that starts with any C `isspace` byte, VT and
+  form feed included, so a second `name` or a `filename` on it is theirs; Django
+  strips it and reads the line as a header of its own.
+- a quote in a `Content-Disposition` value anywhere but as the whole value of a
+  `token="..."` parameter, an unterminated quoted string, and `\\"` in one
+  (`malformed quoted string in a multipart part header`). Werkzeug reads a quoted
+  value only right after `key=`: after a space (`filename= "..."`), a key with a
+  space or a VT in it, a quote in the middle of a value, a second quote in a
+  parameter or a quote in the disposition type (which it splits at the first `;`),
+  it takes a `;` inside the quotes as the end of the parameter and reads the
+  `name=` after it. `\\"` ends the string for Werkzeug and is an escaped quote for
+  Django and PHP. With an unterminated one Werkzeug drops the parameter and Django
+  reads it to the end.
 - a part with two `Content-Disposition` headers (PHP and Werkzeug read the first,
   Django the last), two `name` parameters (all three keep the last), or a `name*`
   or `name*0` parameter (RFC 2231), which Werkzeug and Django take as the field
   name. A `filename*` parameter makes a part a file part, as it does for them; .NET
   sends one next to every `filename`, which still passes.
+
+The `Content-Disposition` value is split on `;` outside quoted strings, as
+Werkzeug, Django and PHP split it, so a browser upload whose file name contains
+`; name=` (`filename="a; name=x.txt"`) is one file of its real field. Parameter
+names and values are trimmed of the whitespace Django strips (what Python's
+`str.strip()` strips: VT, form feed, 0x1C to 0x1F and the Unicode spaces, in
+UTF-8) and PHP skips (C `isspace`), so `;<VT>name=x` is read as a `name`. A
+`deny_field_names` entry also matches a quoted name with its backslash escapes
+removed (`"PHP_SESSION_UPLOAD_PROGRES\S"`), which is how Werkzeug reads it.
 
 The field-name rules apply to every media type that a backend reads as
 `multipart/form-data`: spaces and tabs before it and before the `;` are skipped
@@ -128,7 +156,7 @@ these at the content-type gate; this covers the lenient profiles that accept the
 ### What is still open
 
 The gate reads a part's field name as the value of its one `name` parameter, with
-one layer of double quotes removed. A backend can read a malformed value another
+one layer of double quotes and surrounding whitespace removed. A backend can read a malformed value another
 way, so a name in `deny_field_names` can still reach it in that shape: Werkzeug
 ignores bytes after a closing quote (`name="x"y`) and after an unquoted value and a
 space (`name=x y`), and PHP also strips single quotes (`name='x'`, read from its
