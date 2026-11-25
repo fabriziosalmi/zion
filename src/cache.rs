@@ -11,7 +11,7 @@
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use hyper::header::HeaderValue;
+use hyper::header::{HeaderName, HeaderValue};
 use hyper::StatusCode;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -19,9 +19,114 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Cached response metadata — stored alongside the body so cache hits
-/// preserve upstream Content-Type, Content-Encoding, status, and other
-/// essential headers.
+/// Most bytes of origin headers one entry keeps, in [`CachedMeta::headers`] and in the fields of
+/// their own (`Content-Type`, `Content-Encoding`, `ETag`, `Last-Modified`), each field counted
+/// as its name, its value and 32 bytes (the HTTP/2 accounting, RFC 7541 §4.1, so a flood of
+/// empty fields counts too). A response with more is not stored: leaving some of its headers out
+/// of a hit is the bug the list exists to prevent.
+pub const MAX_STORED_HEADER_BYTES: usize = 32 * 1024;
+
+/// Response headers an entry does not keep. A hit sets its own, or none.
+const NOT_STORED: &[&str] = &[
+    // Hop-by-hop (RFC 9110 §7.6.1), and those of the proxy itself (RFC 9111 §3.1). The proxy
+    // removes them, and the fields any `Connection` line names, from every upstream response
+    // before the cache sees it (`proxy::scrub_response_hop_by_hop`); they are listed here, and
+    // `end_to_end_headers` drops what `Connection` names, so that headers which did not go
+    // through it are not stored with them either.
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "proxy-authenticate",
+    "proxy-authentication-info",
+    "proxy-authorization",
+    // Computed again for each answer from the entry. `Date` is kept: a hit says when the origin
+    // made the response, as the miss did, so that `Expires` minus `Date` is still the lifetime the
+    // origin gave it and a downstream cache does not count the time spent here twice (once in
+    // `Age`, once in a `Date` of now). A `304` that renews the entry brings its own.
+    "content-length",
+    "content-range",
+    "age",
+    // Kept in fields of their own.
+    "content-type",
+    "content-encoding",
+    "etag",
+    "last-modified",
+    // A session for one client: a response that sets a cookie is never stored, and a `304`
+    // that revalidates an entry does not add one to it.
+    "set-cookie",
+    "set-cookie2",
+    // Set or removed by zion on every response, whatever the origin sent (`Alt-Svc` is zion's
+    // own with `--features http3`, and removed without it).
+    "x-zion-cache",
+    "x-request-id",
+    "alt-svc",
+    "server",
+    "surrogate-key",
+    "strict-transport-security",
+    "x-content-type-options",
+    "x-frame-options",
+    "referrer-policy",
+    "permissions-policy",
+];
+
+/// The origin's end-to-end response headers an entry keeps and a hit replays: all of them but
+/// [`NOT_STORED`] and the fields any `Connection` line names, each field's values in the order
+/// the origin sent them (`HeaderMap` keeps the values of one name together). Not bounded here:
+/// see [`CachedMeta::headers_fit`].
+pub fn end_to_end_headers(headers: &hyper::HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
+    let listed: Vec<&[u8]> = headers
+        .get_all(hyper::header::CONNECTION)
+        .iter()
+        .flat_map(|line| line.as_bytes().split(|&b| b == b','))
+        .map(<[u8]>::trim_ascii)
+        .filter(|token| !token.is_empty())
+        .collect();
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            let name = name.as_str();
+            !NOT_STORED.contains(&name)
+                && !listed
+                    .iter()
+                    .any(|token| token.eq_ignore_ascii_case(name.as_bytes()))
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+/// A header value that owns its bytes (see [`CachedMeta::detached`]).
+fn detach(value: &mut HeaderValue) {
+    // `from_bytes` accepts every value hyper's parser does; if it ever refused one, the
+    // original (shared) value is kept rather than lost.
+    if let Ok(mut owned) = HeaderValue::from_bytes(value.as_bytes()) {
+        owned.set_sensitive(value.is_sensitive());
+        *value = owned;
+    }
+}
+
+/// A header name that owns its bytes (see [`CachedMeta::detached`]). A standard name is a
+/// constant and comes back as one; any other is a reference-counted buffer, copied here.
+fn detach_name(name: &mut HeaderName) {
+    if let Ok(owned) = HeaderName::from_bytes(name.as_str().as_bytes()) {
+        *name = owned;
+    }
+}
+
+/// What one field of [`CachedMeta::headers`] costs in memory besides its name's and value's
+/// bytes: its slot in the list (exact-size once stored, see [`CachedMeta::detached`]) and, for
+/// the value and for the name, the `bytes::Shared` record (a pointer, a capacity and a count)
+/// that the first clone of a copied buffer allocates. A standard name owns no bytes and is
+/// counted as if it did, a few dozen bytes too many. The allocator's own rounding is not
+/// counted, as it is not for the body.
+const STORED_FIELD_OVERHEAD_BYTES: usize =
+    std::mem::size_of::<(HeaderName, HeaderValue)>() + 2 * 3 * std::mem::size_of::<usize>();
+
+/// Cached response metadata, stored alongside the body: a hit is built from it, so it carries
+/// what the origin's response carried.
 #[derive(Clone, Debug)]
 pub struct CachedMeta {
     pub content_type: Option<HeaderValue>,
@@ -41,6 +146,12 @@ pub struct CachedMeta {
     /// proxy-revalidate semantics for a shared cache: RFC 9111 §4.2.4, §5.2.2). It
     /// must then neither be served stale-while-revalidate nor on an origin error.
     pub must_revalidate: bool,
+    /// Every other end-to-end header of the origin's response ([`end_to_end_headers`]):
+    /// `Cache-Control`, `Vary`, `Content-Security-Policy`, `Content-Disposition`, `Link`, ...
+    /// A hit replays them, so it carries what the miss carried. A hit rebuilt from the fields
+    /// above alone served an upload marked `Content-Disposition: attachment` and
+    /// `Content-Security-Policy: sandbox` inline and unsandboxed.
+    pub headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 impl CachedMeta {
@@ -50,6 +161,13 @@ impl CachedMeta {
     /// connection's read buffer. Storing one keeps that whole buffer alive (8 KiB or more,
     /// the body's bytes included) for as long as the entry is cached, on top of the body the
     /// cache copies itself. A copy of a few dozen bytes lets the buffer go.
+    ///
+    /// The names are copied too. hyper copies a name that is not a standard one out of its
+    /// buffer, but into a reference-counted one: the private L1 copy of an entry (see
+    /// [`L1_PRIVATE_BODY_BYTES`]) would otherwise share every such name with the shared entry and
+    /// with every other thread's copy, and each hit's clone and drop of it would be the contended
+    /// atomic #577 removed. The list is made exact-size, so that it holds no slot it does not
+    /// use ([`STORED_FIELD_OVERHEAD_BYTES`]).
     fn detached(mut self) -> Self {
         for value in [
             &mut self.content_type,
@@ -60,14 +178,95 @@ impl CachedMeta {
         .into_iter()
         .flatten()
         {
-            // `from_bytes` accepts every value hyper's parser does; if it ever refused one,
-            // the original (shared) value is kept rather than lost.
-            if let Ok(mut owned) = HeaderValue::from_bytes(value.as_bytes()) {
-                owned.set_sensitive(value.is_sensitive());
-                *value = owned;
-            }
+            detach(value);
         }
+        for (name, value) in &mut self.headers {
+            detach_name(name);
+            detach(value);
+        }
+        self.headers.shrink_to_fit();
         self
+    }
+
+    /// The header values kept in fields of their own, with the names a hit sends them under.
+    /// They are origin headers like [`Self::headers`], and as large as the origin makes them
+    /// (`Content-Type` and `Content-Encoding` join every line): the bound and the memory count
+    /// include them.
+    fn slots(&self) -> impl Iterator<Item = (&'static str, &HeaderValue)> {
+        [
+            ("content-type", &self.content_type),
+            ("content-encoding", &self.content_encoding),
+            ("etag", &self.etag),
+            ("last-modified", &self.last_modified),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.as_ref().map(|value| (name, value)))
+    }
+
+    /// What the origin headers an entry keeps count for against [`MAX_STORED_HEADER_BYTES`]:
+    /// each field's name, value and 32 bytes, as HTTP/2 counts a header list, for
+    /// [`Self::headers`] and the fields of their own ([`Self::slots`]).
+    fn headers_bytes(&self) -> usize {
+        let listed: usize = self
+            .headers
+            .iter()
+            .map(|(name, value)| name.as_str().len() + value.len() + 32)
+            .sum();
+        let slots: usize = self
+            .slots()
+            .map(|(name, value)| name.len() + value.len() + 32)
+            .sum();
+        listed + slots
+    }
+
+    /// The memory the origin headers an entry keeps take once stored: what they count for in the
+    /// byte budget and against the L1 limits. A field of [`Self::headers`] costs its bytes and
+    /// [`STORED_FIELD_OVERHEAD_BYTES`]; a value in a field of its own costs its bytes and the
+    /// `bytes::Shared` record its first clone allocates (the field itself is part of the entry,
+    /// [`ENTRY_OVERHEAD_BYTES`]).
+    fn headers_memory(&self) -> usize {
+        let listed: usize = self
+            .headers
+            .iter()
+            .map(|(name, value)| name.as_str().len() + value.len() + STORED_FIELD_OVERHEAD_BYTES)
+            .sum();
+        let slots: usize = self
+            .slots()
+            .map(|(_, value)| value.len() + 3 * std::mem::size_of::<usize>())
+            .sum();
+        listed + slots
+    }
+
+    /// The origin headers an entry keeps, the fields of their own included, are within
+    /// [`MAX_STORED_HEADER_BYTES`]: the entry may be stored.
+    pub fn headers_fit(&self) -> bool {
+        self.headers_bytes() <= MAX_STORED_HEADER_BYTES
+    }
+
+    /// The entry once a `304` carrying `not_modified` confirmed it (RFC 9111 §4.3.4): each
+    /// end-to-end header of the 304 replaces every stored value of that name, and the others
+    /// are kept (§3.2). The body and what describes it (`Content-Type`, `Content-Encoding`) and
+    /// the validators it was selected by stay as stored. The stale-serving rules are the
+    /// caller's to update: they come from `Cache-Control`.
+    pub fn updated_by(&self, not_modified: &hyper::HeaderMap) -> CachedMeta {
+        let fresh = end_to_end_headers(not_modified);
+        let mut headers: Vec<(HeaderName, HeaderValue)> = self
+            .headers
+            .iter()
+            .filter(|(name, _)| !fresh.iter().any(|(f, _)| f == name))
+            .cloned()
+            .collect();
+        headers.extend(fresh);
+        CachedMeta {
+            content_type: self.content_type.clone(),
+            content_encoding: self.content_encoding.clone(),
+            status: self.status,
+            etag: self.etag.clone(),
+            last_modified: self.last_modified.clone(),
+            stale_while_revalidate_secs: self.stale_while_revalidate_secs,
+            must_revalidate: self.must_revalidate,
+            headers,
+        }
     }
 }
 
@@ -85,6 +284,11 @@ pub struct CacheHit {
     /// The entry's freshness lifetime in seconds — the `max-age` to emit so
     /// downstream caches compute the same expiry zion does.
     pub max_age_secs: u64,
+    /// The origin answered a background stale-while-revalidate refresh of this entry, and the
+    /// answer could not renew it ([`StaticCache::refuse_refresh`]): the entry is no longer served
+    /// stale-while-revalidate, and the next request revalidates it in the foreground, with its own
+    /// headers. Never set on a fresh hit: the mark goes on a stale entry, and a store replaces it.
+    pub refresh_refused: bool,
 }
 
 /// Outcome of a cache lookup (RFC 9111 §4.3). `Stale` returns the stored entry
@@ -140,6 +344,9 @@ struct L2Entry {
     initial_age_secs: u64,
     /// Freshness lifetime used for this entry (origin-derived, clamped to profile).
     freshness_secs: u64,
+    /// See [`CacheHit::refresh_refused`]. Only [`StaticCache::refuse_refresh`] sets it; a store
+    /// under the key makes a new entry without it.
+    refresh_refused: bool,
 }
 
 /// Expiry instant from a freshness lifetime and the age the object already
@@ -284,6 +491,8 @@ impl L1Cache {
             meta,
             age_secs,
             max_age_secs,
+            // L1 holds fresh entries only, and the mark is only ever on a stale one.
+            refresh_refused: false,
         })
     }
 
@@ -465,6 +674,11 @@ pub struct StaticCache {
     bytes: std::sync::atomic::AtomicU64,
     /// A budget for this cache alone, in place of the process-wide one (tests).
     own_budget: Option<std::sync::atomic::AtomicU64>,
+    /// The refusals [`StaticCache::count_too_large`] counted for this cache. `zion_cache_too_large`
+    /// is one counter for the whole process, which the tests running beside one another all add
+    /// to: a test reads this one to know what its own requests were counted for.
+    #[cfg(test)]
+    too_large: std::sync::atomic::AtomicU64,
 }
 
 /// The memory budget of the response cache, in bytes: `[server] cache_max_memory_mb`,
@@ -500,30 +714,37 @@ fn stripe_of(key: &str) -> usize {
 /// Queue items tolerated beyond twice the entries before the queue is rebuilt.
 const QUEUE_SLACK: usize = 1024;
 
-/// What one entry is counted as, on top of its key and body: the entry itself, its
-/// metadata (a few short header values) and its slot in the map. An estimate, there so
-/// that a cache of empty bodies is not counted as free.
+/// What one entry is counted as, on top of its key, its body and the origin headers it keeps
+/// (the values of the fields of their own included): the entry itself, its other metadata (the
+/// fields those values sit in, the status, the stale-serving rules) and its slot in the map. An
+/// estimate, there so that a cache of empty bodies is not counted as free.
 const ENTRY_OVERHEAD_BYTES: u64 = 256;
 
 /// The memory one stored entry is counted as.
 fn entry_cost(key: &str, entry: &L2Entry) -> u64 {
-    (key.len() + entry.body.len()) as u64 + ENTRY_OVERHEAD_BYTES
+    (key.len() + entry.body.len() + entry.meta.headers_memory()) as u64 + ENTRY_OVERHEAD_BYTES
 }
 
-/// The largest body a worker thread keeps in its own L1 cache. L1 entries are not in the
-/// byte budget (they are clones the shared store may have evicted since), and each thread
-/// holds up to `l1_hot_entries` of them: without a cap, a few hundred large objects per
-/// thread could stay alive long after the store dropped them. Larger bodies are served
-/// from the shared store on every hit.
+/// What an entry holds for L1's limits: its body and the origin headers it keeps, those in
+/// fields of their own included (a private L1 copy copies them too, see [`CachedMeta::detached`]).
+fn l1_size(body: &Bytes, meta: &CachedMeta) -> usize {
+    body.len() + meta.headers_memory()
+}
+
+/// The largest entry (body and stored headers, [`l1_size`]) a worker thread keeps in its own
+/// L1 cache. L1 entries are not in the byte budget (they are clones the shared store may
+/// have evicted since), and each thread holds up to `l1_hot_entries` of them: without a cap,
+/// a few hundred large objects per thread could stay alive long after the store dropped
+/// them. Larger entries are served from the shared store on every hit.
 const L1_MAX_BODY_BYTES: usize = 64 * 1024;
 
-/// The largest body promoted to L1 as a copy of its own. A hit clones the body and the
-/// header values it carries; when those are shared with the shared store and with every
-/// other thread's copy, each clone and drop is an atomic read-modify-write on a cache line
-/// the other cores are hitting too, and a hot key costs eight threads ten times what it
-/// costs one (#577). A copy owned by this thread makes them uncontended. Larger bodies stay
-/// shared (a copy per thread would hold up to `l1_hot_entries` times this per thread, outside
-/// the byte budget, as L1_MAX_BODY_BYTES describes) and pay the contention.
+/// The largest entry ([`l1_size`]) promoted to L1 as a copy of its own. A hit clones the body
+/// and the header names and values it carries; when those are shared with the shared store
+/// and with every other thread's copy, each clone and drop is an atomic read-modify-write on
+/// a cache line the other cores are hitting too, and a hot key costs eight threads ten times
+/// what it costs one (#577). A copy owned by this thread makes them uncontended. Larger
+/// entries stay shared (a copy per thread would hold up to `l1_hot_entries` times this per
+/// thread, outside the byte budget, as L1_MAX_BODY_BYTES describes) and pay the contention.
 const L1_PRIVATE_BODY_BYTES: usize = 16 * 1024;
 
 /// Queue entries one eviction round looks at.
@@ -597,13 +818,17 @@ impl StaticCache {
 
     /// Remove the entry under `key` if it is the one stored at `stored_at`, with its cost.
     fn map_remove_stored_at(&self, key: &str, stored_at: Instant) -> Option<L2Entry> {
+        self.map_remove_if(key, |e| e.inserted_at == stored_at)
+    }
+
+    /// Remove the entry under `key` if `this` says it is the one, with its cost. The test and the
+    /// removal are one step: an entry stored under the key in between is not the one tested.
+    fn map_remove_if(&self, key: &str, this: impl Fn(&L2Entry) -> bool) -> Option<L2Entry> {
         let removed = match &self.l2 {
-            Some(l2) => l2
-                .remove_if(key, |_, e| e.inserted_at == stored_at)
-                .map(|(_, e)| e),
+            Some(l2) => l2.remove_if(key, |_, e| this(e)).map(|(_, e)| e),
             None => LOCAL_L2.with(|m| {
                 let mut m = m.borrow_mut();
-                if m.get(key).is_some_and(|e| e.inserted_at == stored_at) {
+                if m.get(key).is_some_and(&this) {
                     m.remove(key)
                 } else {
                     None
@@ -724,7 +949,27 @@ impl StaticCache {
             queue: Mutex::new(VecDeque::new()),
             bytes: std::sync::atomic::AtomicU64::new(0),
             own_budget: None,
+            #[cfg(test)]
+            too_large: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// A response this cache does not store because it is over a limit of an entry (the
+    /// profile's `max_object_mb`, or [`MAX_STORED_HEADER_BYTES`]): counted in
+    /// `zion_cache_too_large`.
+    pub fn count_too_large(&self) {
+        crate::metrics::METRICS
+            .cache_too_large
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        self.too_large
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// What [`Self::count_too_large`] counted for this cache alone.
+    #[cfg(test)]
+    pub fn too_large(&self) -> u64 {
+        self.too_large.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A cache with a byte budget of its own, whatever the process-wide one is.
@@ -896,6 +1141,36 @@ impl StaticCache {
         true
     }
 
+    /// Take out the entry under `key` if it is still the one `seen` was read from, and nothing
+    /// else: every store makes the entry's metadata anew, so an entry stored under the key since
+    /// (a fetch that ended in between) is not the same allocation, and stays. For a revalidation
+    /// that found the stale entry it read no longer valid under its key. `true` when it was
+    /// taken out. Its tags stay in the index, as an evicted entry's do, until a store under the
+    /// key replaces them, a purge of one of them, or the index making room drops them.
+    pub fn remove_unchanged(&self, key: &str, seen: &CacheHit) -> bool {
+        self.map_remove_if(key, |e| Arc::ptr_eq(&e.meta, &seen.meta))
+            .is_some()
+    }
+
+    /// Mark the entry under `key`, if it is still the one `seen` was read from (as in
+    /// [`Self::remove_unchanged`]), as one whose background refresh the origin answered with
+    /// something that cannot renew it ([`CacheHit::refresh_refused`]). The entry stays, with its
+    /// body, age and expiry, for the foreground revalidation and stale-if-error; nothing else
+    /// about it changes. `true` when it was marked.
+    pub fn refuse_refresh(&self, key: &str, seen: &CacheHit) -> bool {
+        let mark = |e: &mut L2Entry| {
+            let this = Arc::ptr_eq(&e.meta, &seen.meta);
+            if this {
+                e.refresh_refused = true;
+            }
+            this
+        };
+        match &self.l2 {
+            Some(l2) => l2.get_mut(key).is_some_and(|mut e| mark(e.value_mut())),
+            None => LOCAL_L2.with(|m| m.borrow_mut().get_mut(key).is_some_and(mark)),
+        }
+    }
+
     /// Drop every entry stored under any of `tags`. One generation bump however many go;
     /// returns the entries removed.
     pub fn purge_tags(&self, tags: &[&str]) -> usize {
@@ -941,6 +1216,7 @@ impl StaticCache {
                             age_secs: entry.initial_age_secs
                                 + entry.inserted_at.elapsed().as_secs(),
                             max_age_secs: entry.freshness_secs,
+                            refresh_refused: entry.refresh_refused,
                         };
                         if Instant::now() >= entry.expires_at {
                             CacheLookup::Stale(hit)
@@ -991,12 +1267,14 @@ impl StaticCache {
         let age_secs = entry.initial_age_secs + entry.inserted_at.elapsed().as_secs();
         let freshness_secs = entry.freshness_secs;
         if Instant::now() >= entry.expires_at {
+            let refresh_refused = entry.refresh_refused;
             drop(entry); // release the DashMap read lock; leave the entry stored
             return CacheLookup::Stale(CacheHit {
                 body,
                 meta,
                 age_secs,
                 max_age_secs: freshness_secs,
+                refresh_refused,
             });
         }
         let key: Arc<str> = entry.key().clone();
@@ -1006,9 +1284,10 @@ impl StaticCache {
         drop(entry); // release DashMap read lock
 
         // Promote to L1 preserving the original birth time, TTL and generation. Small
-        // bodies only: see L1_MAX_BODY_BYTES.
-        if body.len() <= L1_MAX_BODY_BYTES {
-            let (l1_body, l1_meta) = if body.len() <= L1_PRIVATE_BODY_BYTES {
+        // entries only: see L1_MAX_BODY_BYTES.
+        let size = l1_size(&body, &meta);
+        if size <= L1_MAX_BODY_BYTES {
+            let (l1_body, l1_meta) = if size <= L1_PRIVATE_BODY_BYTES {
                 (
                     Bytes::copy_from_slice(&body),
                     Arc::new(CachedMeta::clone(&meta).detached()),
@@ -1043,6 +1322,7 @@ impl StaticCache {
             meta,
             age_secs,
             max_age_secs: freshness_secs,
+            refresh_refused: false,
         })
     }
 
@@ -1098,6 +1378,7 @@ impl StaticCache {
             expires_at: expiry_from(now, freshness_secs, initial_age_secs),
             initial_age_secs,
             freshness_secs,
+            refresh_refused: false,
         };
         let cost = entry_cost(&key, &entry);
         let budget = self.budget();
@@ -1304,6 +1585,86 @@ mod tests {
         }
     }
 
+    /// `remove_unchanged` takes out the entry a lookup read and nothing else: not one stored under
+    /// the key since, nor another key's, on either backend, and the byte count follows.
+    #[test]
+    fn remove_unchanged_takes_out_only_the_entry_that_was_read() {
+        for cache in [
+            StaticCache::with_byte_budget(0),
+            StaticCache::single_worker_with_byte_budget(0),
+        ] {
+            // A lifetime of 0: stale at once, as an entry being revalidated is.
+            let put = |k: &str, body: &'static [u8]| {
+                cache.insert(k, Bytes::from_static(body), default_meta(), 0, 0, 100)
+            };
+            put("/a", b"old");
+            put("/b", b"other");
+            let CacheLookup::Stale(seen) = cache.get("/a") else {
+                panic!("/a is stale")
+            };
+            put("/a", b"new");
+            assert!(
+                !cache.remove_unchanged("/a", &seen),
+                "an entry stored since was taken out"
+            );
+            assert!(matches!(cache.get("/a"), CacheLookup::Stale(h) if h.body == "new"));
+            let CacheLookup::Stale(seen) = cache.get("/a") else {
+                panic!("/a is stale")
+            };
+            assert!(
+                !cache.remove_unchanged("/b", &seen),
+                "another key's entry was taken out"
+            );
+            assert!(cache.remove_unchanged("/a", &seen));
+            assert!(matches!(cache.get("/a"), CacheLookup::Miss));
+            assert!(!cache.remove_unchanged("/a", &seen), "gone already");
+            assert!(matches!(cache.get("/b"), CacheLookup::Stale(h) if h.body == "other"));
+            assert_eq!(cache.bytes(), cache.recount());
+        }
+    }
+
+    /// `refuse_refresh` marks the entry a lookup read, keeps it as it was otherwise, and marks
+    /// nothing else: not one stored under the key since, nor another key's, on either backend. A
+    /// store under the key makes an entry without the mark.
+    #[test]
+    fn refuse_refresh_marks_only_the_entry_that_was_read() {
+        for cache in [
+            StaticCache::with_byte_budget(0),
+            StaticCache::single_worker_with_byte_budget(0),
+        ] {
+            let put = |k: &str, body: &'static [u8]| {
+                cache.insert(k, Bytes::from_static(body), default_meta(), 0, 0, 100)
+            };
+            let marked = |k: &str| match cache.get(k) {
+                CacheLookup::Stale(h) => Some((h.refresh_refused, h.body)),
+                _ => None,
+            };
+            put("/a", b"old");
+            put("/b", b"other");
+            let CacheLookup::Stale(seen) = cache.get("/a") else {
+                panic!("/a is stale")
+            };
+            assert!(!seen.refresh_refused, "a new entry is not marked");
+            put("/a", b"new");
+            assert!(
+                !cache.refuse_refresh("/a", &seen),
+                "an entry stored since was marked"
+            );
+            assert_eq!(marked("/a"), Some((false, Bytes::from_static(b"new"))));
+            let CacheLookup::Stale(seen) = cache.get("/a") else {
+                panic!("/a is stale")
+            };
+            assert!(!cache.refuse_refresh("/b", &seen), "another key's entry");
+            assert!(cache.refuse_refresh("/a", &seen));
+            assert_eq!(marked("/a"), Some((true, Bytes::from_static(b"new"))));
+            assert_eq!(marked("/b"), Some((false, Bytes::from_static(b"other"))));
+            assert_eq!(cache.bytes(), cache.recount());
+            put("/a", b"renewed");
+            assert_eq!(marked("/a"), Some((false, Bytes::from_static(b"renewed"))));
+            assert!(!cache.refuse_refresh("/c", &seen), "no entry");
+        }
+    }
+
     /// One invalidation over a full default-sized cache stays cheap.
     #[test]
     fn invalidate_path_cost_with_a_full_cache() {
@@ -1342,6 +1703,7 @@ mod tests {
             last_modified: None,
             stale_while_revalidate_secs: 0,
             must_revalidate: false,
+            headers: Vec::new(),
         }
     }
 
@@ -1363,6 +1725,7 @@ mod tests {
                 ),
                 stale_while_revalidate_secs: 0,
                 must_revalidate: false,
+                headers: Vec::new(),
             }
         }
         const N: u64 = 2_000_000;
@@ -1438,6 +1801,7 @@ mod tests {
             last_modified: None,
             stale_while_revalidate_secs: 0,
             must_revalidate: false,
+            headers: Vec::new(),
         };
         cache.insert("/a.js", Bytes::from("v2"), meta2, 3600, 0, 100);
         let hit = cache.get("/a.js").fresh().unwrap();
@@ -1604,6 +1968,7 @@ mod tests {
             last_modified: None,
             stale_while_revalidate_secs: 0,
             must_revalidate: false,
+            headers: Vec::new(),
         };
         cache.insert("/no-ct", Bytes::from("data"), meta, 3600, 0, 100);
         let hit = cache.get("/no-ct").fresh().unwrap();
@@ -1621,6 +1986,7 @@ mod tests {
             last_modified: None,
             stale_while_revalidate_secs: 0,
             must_revalidate: false,
+            headers: Vec::new(),
         };
         cache.insert("/304", Bytes::new(), meta, 3600, 0, 100);
         let hit = cache.get("/304").fresh().unwrap();
@@ -2064,6 +2430,11 @@ mod tests {
             last_modified: Some(slice_of(40..69)),
             stale_while_revalidate_secs: 0,
             must_revalidate: false,
+            // the origin headers a hit replays are slices of the same buffer
+            headers: vec![(
+                HeaderName::from_static("content-security-policy"),
+                slice_of(100..107),
+            )],
         };
         assert!(
             !read_buffer.is_unique(),
@@ -2092,6 +2463,215 @@ mod tests {
             hit.meta.last_modified.clone().unwrap().as_bytes(),
             &[b'a'; 29][..]
         );
+        assert_eq!(hit.meta.headers[0].1.as_bytes(), &[b'a'; 7][..]);
+    }
+
+    // ── The origin headers an entry keeps (what a hit replays) ───────────────
+
+    fn response_headers(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    fn names(kept: &[(HeaderName, HeaderValue)]) -> Vec<String> {
+        kept.iter()
+            .map(|(n, v)| format!("{n}: {}", v.to_str().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn an_entry_keeps_the_end_to_end_headers_and_leaves_out_the_rest() {
+        let h = response_headers(&[
+            ("content-security-policy", "sandbox"),
+            ("content-disposition", "attachment; filename=\"upload.svg\""),
+            ("vary", "Accept-Language"),
+            ("cache-control", "public, max-age=60"),
+            ("cache-control", "no-transform"),
+            ("link", "</a.css>; rel=preload"),
+            ("link", "</b.js>; rel=preload"),
+            ("expires", "Thu, 01 Jan 2099 00:00:00 GMT"),
+            ("x-origin-thing", "1"),
+            // when the origin made it: `Expires` minus `Date` is the lifetime it gave
+            ("date", "Thu, 01 Jan 2026 00:00:00 GMT"),
+            // hop-by-hop, and the fields `Connection` names (on its second line). The proxy has
+            // removed them before a response reaches the cache (`scrub_response_hop_by_hop`,
+            // tested through the real binary in tests/cache_hit_origin_headers.rs); this is the
+            // guard for headers that did not go through it.
+            ("connection", "close"),
+            ("connection", "X-Hop"),
+            ("x-hop", "per-connection"),
+            ("keep-alive", "timeout=5"),
+            ("transfer-encoding", "chunked"),
+            ("upgrade", "h2c"),
+            ("proxy-authenticate", "Basic"),
+            // recomputed, or kept in fields of their own
+            ("content-length", "12"),
+            ("age", "30"),
+            ("content-type", "image/svg+xml"),
+            ("etag", "\"u1\""),
+            // one client's session
+            ("set-cookie", "sid=alice"),
+            // zion's own
+            ("x-zion-cache", "HIT"),
+            ("x-request-id", "abc"),
+            ("alt-svc", "h3=\":443\""),
+            ("strict-transport-security", "max-age=1"),
+            ("surrogate-key", "post-1"),
+            ("server", "nginx"),
+        ]);
+        assert_eq!(
+            names(&end_to_end_headers(&h)),
+            [
+                "content-security-policy: sandbox",
+                "content-disposition: attachment; filename=\"upload.svg\"",
+                "vary: Accept-Language",
+                "cache-control: public, max-age=60",
+                "cache-control: no-transform",
+                "link: </a.css>; rel=preload",
+                "link: </b.js>; rel=preload",
+                "expires: Thu, 01 Jan 2099 00:00:00 GMT",
+                "x-origin-thing: 1",
+                "date: Thu, 01 Jan 2026 00:00:00 GMT",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_stored_headers_are_bounded_and_counted_in_the_budget() {
+        let meta = |value_len: usize| CachedMeta {
+            headers: vec![(
+                HeaderName::from_static("x-big"),
+                HeaderValue::from_str(&"v".repeat(value_len)).unwrap(),
+            )],
+            ..default_meta()
+        };
+        // `default_meta`'s `Content-Type`, in a field of its own, counts too
+        let content_type = "content-type".len() + "text/css".len() + 32;
+        let at_bound = MAX_STORED_HEADER_BYTES - content_type - "x-big".len() - 32;
+        assert!(meta(at_bound).headers_fit());
+        assert!(!meta(at_bound + 1).headers_fit());
+        // many empty fields count too
+        let flood = CachedMeta {
+            headers: (0..1100)
+                .map(|_| (HeaderName::from_static("x"), HeaderValue::from_static("")))
+                .collect(),
+            ..default_meta()
+        };
+        assert!(!flood.headers_fit());
+
+        // what an entry keeps is part of what it costs, at its size in memory: the field's slot
+        // in the list (a name and a value, 72 bytes on a 64-bit target), its bytes, and the
+        // two reference-count records a first clone of its name and value allocates
+        let cache = StaticCache::with_byte_budget(1 << 30);
+        cache.insert("/h", Bytes::from_static(b"body"), meta(1000), 3600, 0, 0);
+        let slot = std::mem::size_of::<(HeaderName, HeaderValue)>();
+        if cfg!(target_pointer_width = "64") {
+            assert_eq!(slot, 72);
+        }
+        let field = slot + "x-big".len() + 1000 + 2 * 3 * std::mem::size_of::<usize>();
+        assert_eq!(cache.recount(), cost("/h", 4) + field as u64);
+        assert_eq!(cache.recount(), cache.bytes());
+        assert!(
+            field > "x-big".len() + 1000 + 32,
+            "more than the bound counts the field for"
+        );
+    }
+
+    /// `Content-Type`, `Content-Encoding`, `ETag` and `Last-Modified` live in fields of their own,
+    /// not in [`CachedMeta::headers`], and are as large as the origin makes them: an entry with a
+    /// one-byte body and a 300 KB `ETag` was charged a few hundred bytes against the budget, fit
+    /// the bound, and was copied into each worker thread's L1.
+    #[test]
+    fn the_fields_of_their_own_count_in_the_bound_the_budget_and_the_l1_limits() {
+        let with_etag = |len: usize| CachedMeta {
+            etag: Some(HeaderValue::from_str(&"e".repeat(len)).unwrap()),
+            ..default_meta()
+        };
+        let content_type = "content-type".len() + "text/css".len() + 32;
+        let at_bound = MAX_STORED_HEADER_BYTES - content_type - "etag".len() - 32;
+        assert!(with_etag(at_bound).headers_fit());
+        assert!(
+            !with_etag(at_bound + 1).headers_fit(),
+            "the ETag over the bound"
+        );
+        for slot in [
+            |m: &mut CachedMeta, v: HeaderValue| m.content_type = Some(v),
+            |m: &mut CachedMeta, v: HeaderValue| m.content_encoding = Some(v),
+            |m: &mut CachedMeta, v: HeaderValue| m.last_modified = Some(v),
+        ] {
+            let mut meta = default_meta();
+            slot(
+                &mut meta,
+                HeaderValue::from_str(&"v".repeat(MAX_STORED_HEADER_BYTES)).unwrap(),
+            );
+            assert!(!meta.headers_fit());
+        }
+
+        // In the budget: the value's bytes and the record its first clone allocates.
+        let cache = StaticCache::with_byte_budget(1 << 30);
+        cache.insert(
+            "/e",
+            Bytes::from_static(b"b"),
+            with_etag(10_000),
+            3600,
+            0,
+            0,
+        );
+        let etag = 10_000 + 3 * std::mem::size_of::<usize>();
+        assert_eq!(cache.recount(), cost("/e", 1) + etag as u64);
+        assert_eq!(cache.recount(), cache.bytes());
+        // Toward the L1 limits, with the body.
+        assert_eq!(
+            l1_size(&Bytes::from_static(b"b"), &with_etag(10_000)),
+            1 + default_meta().headers_memory() + etag
+        );
+        assert!(l1_size(&Bytes::new(), &with_etag(L1_MAX_BODY_BYTES)) > L1_MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn a_304_replaces_the_headers_it_carries_and_keeps_the_others() {
+        let stored = CachedMeta {
+            etag: Some(HeaderValue::from_static("\"v1\"")),
+            headers: end_to_end_headers(&response_headers(&[
+                ("cache-control", "max-age=60"),
+                ("cache-control", "must-revalidate"),
+                ("content-security-policy", "sandbox"),
+                ("expires", "Thu, 01 Jan 2099 00:00:00 GMT"),
+                ("date", "Wed, 31 Dec 2025 00:00:00 GMT"),
+            ])),
+            ..default_meta()
+        };
+        let updated = stored.updated_by(&response_headers(&[
+            ("cache-control", "max-age=120"),
+            ("etag", "\"v1\""),
+            ("x-new", "1"),
+            ("content-type", "text/html"),
+            ("set-cookie", "sid=bob"),
+            ("date", "Thu, 01 Jan 2026 00:00:00 GMT"),
+        ]));
+        assert_eq!(
+            names(&updated.headers),
+            [
+                "content-security-policy: sandbox",
+                "expires: Thu, 01 Jan 2099 00:00:00 GMT",
+                "cache-control: max-age=120",
+                "x-new: 1",
+                "date: Thu, 01 Jan 2026 00:00:00 GMT",
+            ],
+            "both stored Cache-Control lines, and the stored Date, are replaced by the 304's; \
+             nothing else is lost"
+        );
+        assert_eq!(
+            updated.content_type, stored.content_type,
+            "the stored body's type stays"
+        );
+        assert_eq!(updated.etag, stored.etag);
     }
     // ── L1 invalidation by stripe (#525) ─────────────────────────────────────
 
@@ -2429,8 +3009,10 @@ mod tests {
         !matches!(cache.get(key), CacheLookup::Miss)
     }
 
+    /// What an entry of `len` body bytes with [`default_meta`] costs (its `Content-Type` value
+    /// counts).
     fn cost(key: &str, len: usize) -> u64 {
-        (key.len() + len) as u64 + ENTRY_OVERHEAD_BYTES
+        (key.len() + len + default_meta().headers_memory()) as u64 + ENTRY_OVERHEAD_BYTES
     }
 
     #[test]
@@ -2483,7 +3065,8 @@ mod tests {
             assert_eq!(cache.len(), 40);
             // A body that costs as much as sixteen small ones and a bit: seventeen have to
             // go, in one insert, and no more than that.
-            put(&cache, "/big", 20 * 1_000, 1_000);
+            let big = (16 * cost("/s00", 1_000) + 1 - cost("/big", 0)) as usize;
+            put(&cache, "/big", big, 1_000);
             assert!(stored(&cache, "/big"), "room was made");
             assert!(cache.bytes() <= budget);
             assert_eq!(cache.bytes(), cache.recount());
@@ -2593,6 +3176,7 @@ mod tests {
                 expires_at: expiry_from(now, 400, 0),
                 initial_age_secs: 0,
                 freshness_secs: 400,
+                refresh_refused: false,
             };
             let new_cost = entry_cost(&key, &entry);
             let reserved = cache.make_room(&key, new_cost, 0, budget).expect("room");
@@ -2634,6 +3218,7 @@ mod tests {
                 expires_at: expiry_from(now, 1_000, 0),
                 initial_age_secs: 0,
                 freshness_secs: 1_000,
+                refresh_refused: false,
             };
             let new_cost = entry_cost(&key, &entry);
             let reserved = cache.make_room(&key, new_cost, 0, budget).expect("room");
@@ -2827,11 +3412,13 @@ mod tests {
             m.etag = Some(HeaderValue::from_bytes(b"\"v1\"").unwrap());
             m
         };
+        // The limits are on the body and the headers the entry keeps (`l1_size`).
+        let headers = meta().headers_memory();
         for (len, shared) in [
             (1, false),
-            (L1_PRIVATE_BODY_BYTES, false),
-            (L1_PRIVATE_BODY_BYTES + 1, true),
-            (L1_MAX_BODY_BYTES, true),
+            (L1_PRIVATE_BODY_BYTES - headers, false),
+            (L1_PRIVATE_BODY_BYTES - headers + 1, true),
+            (L1_MAX_BODY_BYTES - headers, true),
         ] {
             let path = format!("/b{len}");
             cache.insert(&path, Bytes::from(vec![7u8; len]), meta(), 3600, 0, 100);
@@ -2871,8 +3458,10 @@ mod tests {
         if cache.l2.is_none() {
             return; // a single-core machine has no L1 tier
         }
-        put(&cache, "/small", L1_MAX_BODY_BYTES, 60);
-        put(&cache, "/large", L1_MAX_BODY_BYTES + 1, 60);
+        // With the `Content-Type` the entry keeps, which counts toward the cap too.
+        let headers = default_meta().headers_memory();
+        put(&cache, "/small", L1_MAX_BODY_BYTES - headers, 60);
+        put(&cache, "/large", L1_MAX_BODY_BYTES - headers + 1, 60);
         for key in ["/small", "/large"] {
             assert!(matches!(cache.get(key), CacheLookup::Fresh(_)));
             assert!(matches!(cache.get(key), CacheLookup::Fresh(_)), "and again");
@@ -2884,8 +3473,98 @@ mod tests {
                     .is_some_and(|l1| l1.map.contains_key(key))
             })
         };
-        assert!(in_l1("/small"), "a body at the cap is promoted");
+        assert!(in_l1("/small"), "an entry at the cap is promoted");
         assert!(!in_l1("/large"), "one byte more and it is not");
+    }
+
+    /// The private L1 copy owns the names of the headers it keeps, not only their values: a
+    /// name that is not a standard one is a reference-counted buffer, and one shared with the
+    /// shared store and every other thread's copy makes each hit's clone of it the contended
+    /// atomic #577 removed. And the stored headers count toward the L1 limits with the body.
+    #[test]
+    fn an_l1_copy_owns_its_header_names_and_its_headers_count_toward_the_l1_limits() {
+        let cache = StaticCache::new();
+        let Some(l2) = &cache.l2 else {
+            return; // a single-core machine has no L1 tier
+        };
+        let with_headers = || CachedMeta {
+            headers: vec![
+                (
+                    HeaderName::from_bytes(b"x-origin-thing").unwrap(),
+                    HeaderValue::from_bytes(&[b'v'; 1000]).unwrap(),
+                ),
+                (
+                    hyper::header::CACHE_CONTROL,
+                    HeaderValue::from_static("max-age=60"),
+                ),
+            ],
+            ..default_meta()
+        };
+        let mut roomy = with_headers();
+        roomy.headers.reserve(30); // as a list collected from an iterator can be
+        cache.insert("/named", Bytes::from_static(b"b"), roomy, 3600, 0, 100);
+        assert!(cache.get("/named").fresh().is_some()); // promotes
+        let hit = cache.get("/named").fresh().expect("served from L1");
+        let stored = l2.get("/named").expect("stored");
+        assert_eq!(
+            stored.meta.headers.capacity(),
+            2,
+            "stored without unused slots"
+        );
+        assert!(!Arc::ptr_eq(&hit.meta, &stored.meta), "a private copy");
+        let ((l1_name, l1_value), (l2_name, l2_value)) =
+            (&hit.meta.headers[0], &stored.meta.headers[0]);
+        assert_eq!((l1_name, l1_value), (l2_name, l2_value), "equal");
+        assert_ne!(
+            l1_name.as_str().as_ptr(),
+            l2_name.as_str().as_ptr(),
+            "the L1 copy shares the name's bytes with the shared store"
+        );
+        assert_ne!(l1_value.as_bytes().as_ptr(), l2_value.as_bytes().as_ptr());
+        // `stored` holds a read lock on its shard of the store: kept past here, an insert below
+        // whose key falls in the same shard (the hasher is seeded per process) waits for it
+        // forever, and the test hangs.
+        drop(stored);
+
+        // A body that fits the L1 limits alone, but not with its headers.
+        let headers = with_headers().headers_memory();
+        let in_l1 = |key: &str| {
+            L1.with(|l1| {
+                l1.borrow()
+                    .as_ref()
+                    .is_some_and(|l1| l1.map.contains_key(key))
+            })
+        };
+        let body = |len: usize| Bytes::from(vec![7u8; len]);
+        cache.insert(
+            "/near-private",
+            body(L1_PRIVATE_BODY_BYTES - headers + 1),
+            with_headers(),
+            3600,
+            0,
+            100,
+        );
+        cache.insert(
+            "/near-max",
+            body(L1_MAX_BODY_BYTES - headers + 1),
+            with_headers(),
+            3600,
+            0,
+            100,
+        );
+        for key in ["/near-private", "/near-max"] {
+            assert!(cache.get(key).fresh().is_some());
+        }
+        let shared = cache.get("/near-private").fresh().expect("hit");
+        assert!(
+            Arc::ptr_eq(&shared.meta, &l2.get("/near-private").unwrap().meta),
+            "over the private limit with its headers: shared, not copied"
+        );
+        assert!(in_l1("/near-private"));
+        assert!(
+            !in_l1("/near-max"),
+            "over the L1 limit with its headers: not promoted"
+        );
     }
 
     mod byte_count_properties {
