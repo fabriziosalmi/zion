@@ -80,6 +80,11 @@ fn curl_h2(port: u16, method: &str, path: &str, headers: &[&str], body: &str) ->
 /// An origin that parses a keep-alive stream of HTTP/1.1 requests, records the head (start-line and
 /// header lines) of each, consumes its body (Content-Length or chunked) so the next request starts
 /// at a boundary, and answers `ok`.
+///
+/// Between two requests it waits as long as zion keeps the connection open; only the reads inside
+/// a request are bounded. An origin that closes an idle connection races zion reusing it: zion
+/// pools upstream connections, and a request it writes on one as the close arrives fails with a
+/// `502`, which none of these cases is about.
 fn origin() -> (u16, Arc<Mutex<Vec<String>>>) {
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -90,17 +95,20 @@ fn origin() -> (u16, Arc<Mutex<Vec<String>>>) {
             let Ok(s) = stream else { continue };
             let log = log.clone();
             std::thread::spawn(move || {
-                s.set_read_timeout(Some(Duration::from_millis(500))).ok();
                 let mut w = match s.try_clone() {
                     Ok(w) => w,
                     Err(_) => return,
                 };
                 let mut r = BufReader::new(s);
                 loop {
+                    r.get_ref().set_read_timeout(None).ok();
                     let mut start = String::new();
                     if r.read_line(&mut start).unwrap_or(0) == 0 {
                         break;
                     }
+                    r.get_ref()
+                        .set_read_timeout(Some(Duration::from_millis(500)))
+                        .ok();
                     let start = start.trim_end().to_string();
                     if start.is_empty() {
                         continue;
@@ -192,6 +200,39 @@ fn origin() -> (u16, Arc<Mutex<Vec<String>>>) {
     (port, seen)
 }
 
+/// The origin answers a second request on a keep-alive connection that sat idle for longer than
+/// its read bound inside a request (500 ms), as `origin` says it does.
+#[test]
+fn the_origin_keeps_an_idle_keep_alive_connection_open() {
+    let (port, seen) = origin();
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut r = BufReader::new(c.try_clone().unwrap());
+    // One request on the connection; its status line, with the head and the 2-byte body consumed.
+    let mut ask = |path: &str| -> String {
+        let _ = c.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes());
+        let mut status = String::new();
+        let _ = r.read_line(&mut status);
+        loop {
+            let mut h = String::new();
+            if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim_end().is_empty() {
+                break;
+            }
+        }
+        let mut body = [0u8; 2];
+        let _ = r.read_exact(&mut body);
+        status.trim_end().to_string()
+    };
+    assert_eq!(ask("/first"), "HTTP/1.1 200 OK");
+    std::thread::sleep(Duration::from_millis(800));
+    let second = ask("/second");
+    assert_eq!(
+        second, "HTTP/1.1 200 OK",
+        "the origin closed a keep-alive connection that sat idle for 800 ms"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
 /// zion's response to `raw`: the status line and the full header block, read until the blank line.
 /// An empty status means zion hung (a timeout), which is itself a failure for the caller to assert.
 struct Resp {
@@ -257,7 +298,34 @@ fn code(resp: &Resp) -> u16 {
         .unwrap_or(0)
 }
 
+/// Boot zion for a test and return it with its HTTPS port once it serves. A boot that finds the
+/// port taken is repeated on fresh ports (see `boot`).
 fn start(dir: &Path, origin_port: u16) -> (Proc, u16) {
+    start_on(dir, origin_port, free_port)
+}
+
+/// `start`, with the HTTPS port of each boot taken from `next_port`.
+fn start_on(dir: &Path, origin_port: u16, mut next_port: impl FnMut() -> u16) -> (Proc, u16) {
+    prepare(dir);
+    let mut taken = Vec::new();
+    for _ in 0..3 {
+        let https_port = next_port();
+        match boot(dir, origin_port, https_port) {
+            Ok(z) => return (z, https_port),
+            Err(log) => {
+                eprintln!("zion could not bind port {https_port}; booting it on fresh ports");
+                taken.push(format!("port {https_port}:\n{log}"));
+            }
+        }
+    }
+    panic!(
+        "zion could not bind its port on three boots in a row:\n{}",
+        taken.join("\n")
+    );
+}
+
+/// The certificate and the static files every boot in `dir` serves.
+fn prepare(dir: &Path) {
     let (cert, key) = (dir.join("c.pem"), dir.join("k.pem"));
     assert!(
         Command::new("openssl")
@@ -291,7 +359,34 @@ fn start(dir: &Path, origin_port: u16) -> (Proc, u16) {
     fs::create_dir_all(&www).unwrap();
     let doc = "the quick brown fox jumps over the lazy dog\n".repeat(60);
     fs::write(www.join("doc.txt"), &doc).unwrap();
-    let https_port = free_port();
+    // The file `boot` asks for to know zion serves; named after this test's directory.
+    fs::write(www.join(ready_file(dir)), "ready").unwrap();
+}
+
+/// The name of the file only the static routes of a zion booted in `dir` serve.
+fn ready_file(dir: &Path) -> String {
+    let name = dir.file_name().unwrap_or_default().to_string_lossy();
+    format!("ready-{name}.txt")
+}
+
+/// Start zion on `https_port` with the files `prepare` wrote in `dir`, and return it once it
+/// serves: its log says it bound that port, and it answers 200 for the file only `dir` holds.
+///
+/// A port that accepts a TCP connection is not enough. `free_port` releases the port before zion
+/// binds it, and on macOS this process can lose it in between: the standard library marks a new
+/// socket close-on-exec in a second call after creating it, so a process that a parallel test
+/// spawns in that gap (zion, openssl, curl) inherits the socket `free_port` is about to bind, and
+/// keeps it listening on that port after `free_port` has closed its own copy, until that process
+/// exits. Zion then fails to bind the port and exits, while a connection to it still succeeds. A
+/// build with `http3` also binds the same port number over UDP, which `free_port` does not
+/// reserve, so another process can hold that one.
+///
+/// Zion exits with code 4 when it cannot bind its HTTPS listener, and with code 3 and
+/// `bind QUIC on <addr>: Address already in use` when the UDP port is taken: either returns
+/// `Err` with its log, for `start` to boot again on fresh ports. Any other exit fails the test.
+fn boot(dir: &Path, origin_port: u16, https_port: u16) -> Result<Proc, String> {
+    let (cert, key) = (dir.join("c.pem"), dir.join("k.pem"));
+    let www = dir.join("www");
     fs::write(
         dir.join("zion.toml"),
         format!(
@@ -310,24 +405,101 @@ fn start(dir: &Path, origin_port: u16) -> (Proc, u16) {
             cert.to_string_lossy(),
             key.to_string_lossy(),
             www = www.to_string_lossy(),
+            origin_port = origin_port,
         ),
     )
     .unwrap();
+    let log_path = dir.join("daemon.log");
     let child = Command::new(env!("CARGO_BIN_EXE_zion"))
         .env("ZION_CONFIG", dir.join("zion.toml"))
         .env("ZION_BOOT_FAST", "1")
         .env("ZION_LAST_GASP_PATH", dir.join("gasp.jsonl"))
         .stdout(Stdio::null())
-        .stderr(fs::File::create(dir.join("daemon.log")).unwrap())
+        .stderr(fs::File::create(&log_path).unwrap())
         .spawn()
         .expect("spawn zion");
-    let z = Proc(child);
+    let mut z = Proc(child);
+    // Printed with `eprintln!` right after the bind, so it is in the file once the port is zion's.
+    let bound = format!("listening HTTPS on 127.0.0.1:{https_port}");
+    let ready = format!(
+        "GET /s/{} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ready_file(dir)
+    );
+    let quic_taken = format!("bind QUIC on 127.0.0.1:{https_port}: Address already in use");
     let deadline = Instant::now() + Duration::from_secs(20);
-    while TcpStream::connect(("127.0.0.1", https_port)).is_err() {
-        assert!(Instant::now() < deadline, "zion never listened");
-        std::thread::sleep(Duration::from_millis(100));
+    loop {
+        if let Ok(Some(status)) = z.0.try_wait() {
+            let log = fs::read_to_string(&log_path).unwrap_or_default();
+            if status.code() == Some(4) || log.contains(&quic_taken) {
+                return Err(log);
+            }
+            panic!("zion exited at boot ({status}):\n{log}");
+        }
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        if log.contains(&bound) && code(&send(https_port, ready.as_bytes())) == 200 {
+            return Ok(z);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "zion did not serve on port {https_port} within 20 s:\n{log}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
-    (z, https_port)
+}
+
+/// The readiness of `start`: when another socket listens on the port zion is given, zion cannot
+/// bind it, and `start` returns a zion that serves on a fresh port. A listener of this test
+/// stands in for the inherited socket described on `boot`: a TCP connect to that port succeeds,
+/// so a readiness check that only connects takes it for zion.
+#[test]
+fn a_boot_that_finds_its_port_taken_boots_again_on_a_fresh_one() {
+    if !have_openssl() {
+        common::skip("http_conformance boot readiness: openssl not installed");
+        return;
+    }
+    let dir = tempdir();
+    let (origin_port, _seen) = origin();
+    let squatter = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let taken = squatter.local_addr().unwrap().port();
+    let mut ports = [taken].into_iter();
+    let (_zion, port) = start_on(&dir, origin_port, || ports.next().unwrap_or_else(free_port));
+    assert_ne!(
+        port, taken,
+        "start returned port {taken}, which another socket held: zion never bound it"
+    );
+    let c = code(&send(
+        port,
+        b"GET /s/doc.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    ));
+    assert_eq!(c, 200, "zion booted on fresh port {port} did not serve");
+    drop(squatter);
+}
+
+/// As above, for the UDP port a build with `http3` binds for QUIC: when another socket holds it,
+/// `start` returns a zion that serves on a fresh port.
+#[cfg(feature = "http3")]
+#[test]
+fn a_boot_that_finds_its_quic_port_taken_boots_again_on_a_fresh_one() {
+    if !have_openssl() {
+        common::skip("http_conformance boot readiness: openssl not installed");
+        return;
+    }
+    let dir = tempdir();
+    let (origin_port, _seen) = origin();
+    let squatter = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let taken = squatter.local_addr().unwrap().port();
+    let mut ports = [taken].into_iter();
+    let (_zion, port) = start_on(&dir, origin_port, || ports.next().unwrap_or_else(free_port));
+    assert_ne!(
+        port, taken,
+        "start returned port {taken}, whose UDP side another socket held"
+    );
+    let c = code(&send(
+        port,
+        b"GET /s/doc.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    ));
+    assert_eq!(c, 200, "zion booted on fresh port {port} did not serve");
+    drop(squatter);
 }
 
 /// Did the origin receive a request whose start-line begins with `method ` and targets `/marker`?
