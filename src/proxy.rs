@@ -431,6 +431,7 @@ const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto
 const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
 const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
+const PROXY_AUTHENTICATION_INFO: HeaderName = HeaderName::from_static("proxy-authentication-info");
 const TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
 
 /// The `X-Forwarded-For` that `append` sends: every inbound line joined in order with `, `,
@@ -455,8 +456,8 @@ fn appended_xff(headers: &hyper::HeaderMap, client: &HeaderValue) -> HeaderValue
 /// and the WebSocket upgrade ([`proxy_websocket`]). Strips the dangerous
 /// hop-by-hop / credential headers that must never reach the upstream
 /// (Transfer-Encoding, TE, Trailer, Proxy-Authorization, Proxy-Connection,
-/// Keep-Alive), drops the inbound Host (re-surfaced as `X-Forwarded-Host` for
-/// vhost-routing upstreams), and sets the `X-Forwarded-*` / `X-Real-IP` trust
+/// Keep-Alive), drops the inbound Host (the request's host is re-surfaced as `X-Forwarded-Host`
+/// for vhost-routing upstreams), and sets the `X-Forwarded-*` / `X-Real-IP` trust
 /// headers per the XFF policy. `Connection` / `Upgrade` are intentionally left
 /// to the caller: the normal proxy strips `Connection`, a WS upgrade keeps
 /// both for the handshake. `Content-Length` is set from the body that is sent
@@ -468,14 +469,28 @@ fn apply_forwarding_hygiene<B: hyper::body::Body>(
     xff_mode: XffMode,
 ) {
     frame_by_body(req);
-    // Capture the inbound host for X-Forwarded-Host before we strip it: the Host header, or the
-    // URI authority when there is none (HTTP/2 carries it there and sends no Host header).
+    // Capture the request's host for X-Forwarded-Host before we strip the Host header. It is read
+    // from the field routing and the cache key read it from (`security::request_host`): the URI
+    // authority when the target has one (absolute-form, an HTTP/2 or HTTP/3 `:authority`), else
+    // the Host header. RFC 9112 §3.2.2: the target's host replaces a Host received with it. Read
+    // from the Host header first, `GET http://shop.example/` with `Host: evil.example` was routed
+    // and cached as shop.example's while the origin was told evil.example, and the answer it built
+    // for evil.example was stored under shop.example's key, for every client of shop.example.
     // Whatever X-Forwarded-Host the client sent is discarded either way.
-    let inbound_host = req.headers().get(hyper::header::HOST).cloned().or_else(|| {
-        req.uri()
-            .authority()
-            .and_then(|a| hyper::header::HeaderValue::from_str(a.as_str()).ok())
-    });
+    //
+    // A value with an `@` is never forwarded, whichever field it came from: userinfo is not a
+    // host. `http://shop.example@evil.example/` told the origin `shop.example@evil.example` (links
+    // built from it go to evil.example) and `http://user:pass@shop.example/` gave it the
+    // password. The pipeline and the `:80` handler refuse such a target with a 400
+    // (`security::target_has_userinfo`); this holds for any path that skips them, and for a `Host`
+    // header with one where nothing refused it (HTTP/1.0, the `:80` ACME fallback, an HTTP/2
+    // request without `:authority`). Routing and the cache key found no host in it
+    // (`request_host` refuses an `@`), so telling the origin none keeps the three in agreement.
+    let inbound_host = match req.uri().authority() {
+        Some(a) => hyper::header::HeaderValue::from_str(a.as_str()).ok(),
+        None => req.headers().get(hyper::header::HOST).cloned(),
+    }
+    .filter(|h| !h.as_bytes().contains(&b'@'));
     req.headers_mut().remove(&X_FORWARDED_HOST);
     let preserve_host = req.extensions().get::<PreserveHost>().is_some();
     // RFC 9110 §7.6.3: name this proxy in `Via` (also what loop detection reads).
@@ -528,13 +543,13 @@ fn apply_forwarding_hygiene<B: hyper::body::Body>(
             PROTO_HTTP.clone()
         },
     );
-    // X-Forwarded-Host: re-surface the original Host so a vhost-routing
+    // X-Forwarded-Host: re-surface the request's host so a vhost-routing
     // upstream still sees it (the module doc claimed this header was set but
     // it never was).
     if let Some(host) = inbound_host {
         // `preserve_host`: the client's host is also the upstream's `Host`, as received
-        // (for an HTTP/2 client, its `:authority`). The pooled client only adds `Host` when
-        // it is absent, so this survives the URI rewrite.
+        // (the target's authority when it has one, an HTTP/2 client's `:authority`). The pooled
+        // client only adds `Host` when it is absent, so this survives the URI rewrite.
         if preserve_host {
             req.headers_mut().insert(hyper::header::HOST, host.clone());
         }
@@ -670,22 +685,28 @@ fn watch_upstream_body(
 /// standard set plus any header named in the response's own `Connection` token
 /// list (RFC 9110 §7.6.1: "intermediaries MUST ... remove ... fields ... listed
 /// in the Connection header field").
+///
+/// Every `Connection` line counts, read as bytes (RFC 9110 §5.3: the lines are one list).
+/// Reading the first line only, as text, let `Connection: keep-alive` followed by
+/// `Connection: X-Backend-Session` (or a first line with a byte that is not ASCII) pass
+/// `X-Backend-Session` to the client, and into the cache entry a hit replays to everyone.
 fn scrub_response_hop_by_hop(headers: &mut hyper::HeaderMap) {
     // Headers nominated by the Connection token list, e.g.
     // `Connection: close, X-Foo` also strips `X-Foo`.
-    if let Some(conn) = headers.get(hyper::header::CONNECTION).cloned() {
-        if let Ok(conn) = conn.to_str() {
-            for token in conn.split(',') {
-                let name = token.trim();
-                // "close"/"keep-alive" are connection options, not field names.
-                if !name.is_empty()
-                    && !name.eq_ignore_ascii_case("close")
-                    && !name.eq_ignore_ascii_case("keep-alive")
-                {
-                    headers.remove(name);
-                }
-            }
-        }
+    let named: Vec<hyper::header::HeaderName> = headers
+        .get_all(hyper::header::CONNECTION)
+        .iter()
+        .flat_map(|line| line.as_bytes().split(|&b| b == b','))
+        .map(<[u8]>::trim_ascii)
+        // "close"/"keep-alive" are connection options, not field names; a token that is not
+        // a field name names nothing to remove.
+        .filter(|token| {
+            !token.eq_ignore_ascii_case(b"close") && !token.eq_ignore_ascii_case(b"keep-alive")
+        })
+        .filter_map(|token| hyper::header::HeaderName::from_bytes(token).ok())
+        .collect();
+    for name in named {
+        headers.remove(name);
     }
     // The standard hop-by-hop set (RFC 9110 §7.6.1 + well-known extras).
     headers.remove(hyper::header::CONNECTION);
@@ -694,6 +715,8 @@ fn scrub_response_hop_by_hop(headers: &mut hyper::HeaderMap) {
     headers.remove(hyper::header::TRAILER);
     headers.remove(hyper::header::UPGRADE);
     headers.remove(hyper::header::PROXY_AUTHENTICATE);
+    // For the next client on the response chain only, which is zion (RFC 9110 §11.7.3).
+    headers.remove(&PROXY_AUTHENTICATION_INFO);
     headers.remove(&PROXY_CONNECTION);
     headers.remove(&KEEP_ALIVE);
 }
@@ -1872,6 +1895,122 @@ mod tests {
         assert!(forwarded_content_length(streamed(b"hello"), &[]).is_empty());
     }
 
+    /// The upstream is told the host zion routes and caches the request on
+    /// (`security::request_host`): the target's authority when it has one, the `Host` header
+    /// otherwise (RFC 9112 §3.2.2). It was told the `Host` header's whenever there was one, so an
+    /// absolute-form target, or an HTTP/2 `:authority` sent with a `host` field, named one host
+    /// to the cache and another to the origin.
+    #[test]
+    fn the_upstream_is_told_the_host_the_request_is_routed_on() {
+        for (uri, host, expected) in [
+            (
+                "http://shop.example/p",
+                Some("evil.example"),
+                "shop.example",
+            ),
+            (
+                "https://Shop.Example:8443/p",
+                Some("evil.example"),
+                "Shop.Example:8443",
+            ),
+            ("http://shop.example/p", None, "shop.example"),
+            ("/p", Some("shop.example"), "shop.example"),
+        ] {
+            for preserve in [false, true] {
+                let mut b = Request::builder().method("GET").uri(uri);
+                if let Some(h) = host {
+                    b = b.header(hyper::header::HOST, h);
+                }
+                let mut req = b.body(Empty::<Bytes>::new()).unwrap();
+                if preserve {
+                    req.extensions_mut().insert(PreserveHost);
+                }
+                assert_eq!(
+                    crate::security::request_host(&req).as_deref(),
+                    Some(expected.to_ascii_lowercase().split(':').next().unwrap()),
+                    "{uri} {host:?}: what routing and the cache key read"
+                );
+                let req =
+                    prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append)
+                        .unwrap();
+                assert_eq!(
+                    req.headers().get("x-forwarded-host").unwrap(),
+                    expected,
+                    "{uri} {host:?} preserve_host={preserve}"
+                );
+                let sent_host = req.headers().get(hyper::header::HOST);
+                if preserve {
+                    assert_eq!(sent_host.unwrap(), expected, "{uri} {host:?}: Host");
+                } else {
+                    assert!(
+                        sent_host.is_none(),
+                        "{uri} {host:?}: the pooled client adds its own"
+                    );
+                }
+            }
+        }
+    }
+
+    /// No host with userinfo reaches the upstream, in `X-Forwarded-Host` or as `Host` with
+    /// `preserve_host`, from the target's authority or from a `Host` header: the gate that
+    /// refuses such a target is not what keeps it from the origin. Routing and the cache key
+    /// found no host in it, and the upstream is told none (the pooled client adds its own `Host`).
+    #[test]
+    fn a_host_with_userinfo_is_never_forwarded() {
+        for (uri, host) in [
+            ("http://shop.example@evil.example/p", None),
+            ("http://user:pass@shop.example/p", None),
+            ("http://user:pass@shop.example/p", Some("shop.example")),
+            (
+                "https://shop.example@evil.example:8443/p",
+                Some("evil.example"),
+            ),
+            ("/p", Some("user:pass@shop.example")),
+            ("/p", Some("shop.example@evil.example")),
+        ] {
+            for preserve in [false, true] {
+                let mut b = Request::builder().method("GET").uri(uri);
+                if let Some(h) = host {
+                    b = b.header(hyper::header::HOST, h);
+                }
+                let mut req = b.body(Empty::<Bytes>::new()).unwrap();
+                req.headers_mut().insert(
+                    "x-forwarded-host",
+                    HeaderValue::from_static("client.example"),
+                );
+                if preserve {
+                    req.extensions_mut().insert(PreserveHost);
+                }
+                assert_eq!(
+                    crate::security::request_host(&req),
+                    None,
+                    "{uri} {host:?}: routing and the cache key find no host"
+                );
+                let req =
+                    prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append)
+                        .unwrap();
+                let at = |name: hyper::header::HeaderName| {
+                    req.headers()
+                        .get_all(&name)
+                        .iter()
+                        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    at(X_FORWARDED_HOST),
+                    Vec::<String>::new(),
+                    "{uri} {host:?} preserve_host={preserve}: X-Forwarded-Host"
+                );
+                assert_eq!(
+                    at(hyper::header::HOST),
+                    Vec::<String>::new(),
+                    "{uri} {host:?} preserve_host={preserve}: Host"
+                );
+                assert_eq!(req.uri().to_string(), "http://127.0.0.1:8000/p");
+            }
+        }
+    }
+
     #[test]
     fn scrub_strips_response_hop_by_hop_headers() {
         // RFC 9110 §7.6.1: the upstream response's hop-by-hop headers + any
@@ -1902,6 +2041,31 @@ mod tests {
             "text/html"
         );
         assert_eq!(headers.get("X-Keep-Me").unwrap(), "ok");
+    }
+
+    /// Every `Connection` line names fields to remove, whatever line it is and whatever bytes
+    /// it carries: a field named on the second line, or on a line that is not ASCII, used to
+    /// reach the client and the cache entry every hit replays.
+    #[test]
+    fn scrub_reads_every_connection_line_as_bytes() {
+        let mut headers = hyper::HeaderMap::new();
+        for (name, value) in [
+            ("connection", &b"keep-alive"[..]),
+            ("connection", b"X-Backend-Session"),
+            ("connection", b"X-Opaque-Hop, caf\xe9"),
+            ("x-backend-session", b"abc"),
+            ("x-opaque-hop", b"1"),
+            ("proxy-authentication-info", b"nextnonce=\"n\""),
+            ("x-keep-me", b"ok"),
+        ] {
+            headers.append(
+                hyper::header::HeaderName::from_static(name),
+                hyper::header::HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        scrub_response_hop_by_hop(&mut headers);
+        let left: Vec<&str> = headers.keys().map(|n| n.as_str()).collect();
+        assert_eq!(left, ["x-keep-me"], "named on a later or non-ASCII line");
     }
 
     #[test]

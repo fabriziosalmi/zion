@@ -10,6 +10,12 @@
 //!   * `Vary: *` (the origin says nothing about the request can be reused);
 //!   * any varied credential header (`Cookie`, `Authorization`, …): such a response is
 //!     per-user, and a shared cache must not hold a copy per session;
+//!   * any varied header zion itself sets or rewrites on the way to the origin (`X-Real-IP`,
+//!     `X-Forwarded-For`, …): the variant would be keyed on what the client sent, while the
+//!     origin chose the response by what zion sent. Every client that sends none would share
+//!     the first one's variant (its address, its location), and a client could pick a variant
+//!     by sending a value the origin never sees. Not `X-Forwarded-Proto`, which zion sets to the
+//!     same value on every request it caches, and which is keyed (see `FORWARDING_HEADERS`);
 //!   * more than [`MAX_VARY_NAMES`] varied headers, or a varied request value longer
 //!     than [`MAX_VALUE_LEN`].
 //!
@@ -38,6 +44,25 @@ const CREDENTIAL_HEADERS: [&str; 4] = [
     "set-cookie",
 ];
 
+/// Request headers the forwarding path sets, replaces or extends for the origin
+/// (`proxy::apply_forwarding_hygiene`, and `Forwarded`, which is dropped unless a trusted proxy
+/// sent it): what the origin varied on is not what the client sent, and differs between clients
+/// (their address, the host as each one wrote it, the protocol each one spoke to zion).
+///
+/// Not `X-Forwarded-Proto`: zion replaces it too, but with the same value on every request it
+/// caches (each origin fetch of a cached route, background refresh included, says `https`), so
+/// the origin chose by a value every client shares. Keyed on what the client sent, a response
+/// that varies on it is stored once for the clients that send none, every browser, and once per
+/// value a client sends, within [`MAX_VARIANTS_PER_KEY`]. Kept out of the cache, every request to
+/// an origin that varies on it went to that origin.
+const FORWARDING_HEADERS: [&str; 5] = [
+    "x-real-ip",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "forwarded",
+    "via",
+];
+
 /// What a response's `Vary` means for storing it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum VaryPolicy {
@@ -62,6 +87,7 @@ pub fn policy(resp_headers: &hyper::HeaderMap) -> VaryPolicy {
             }
             if t == "*"
                 || CREDENTIAL_HEADERS.contains(&t.as_str())
+                || FORWARDING_HEADERS.contains(&t.as_str())
                 || hyper::header::HeaderName::from_bytes(t.as_bytes()).is_err()
             {
                 return VaryPolicy::Uncacheable;
@@ -336,6 +362,43 @@ mod tests {
             policy(&resp(&["bad name"])),
             VaryPolicy::Uncacheable,
             "not a header name"
+        );
+    }
+
+    /// The origin varies on what zion sent it, the client's address in `X-Real-IP` for one; the
+    /// variant key would be built from what the client sent, which a browser leaves out: every
+    /// client was served the first one's variant.
+    #[test]
+    fn a_vary_on_a_header_zion_writes_for_the_origin_is_not_keyed() {
+        for name in [
+            "X-Real-IP",
+            "x-forwarded-for",
+            "X-Forwarded-Host",
+            "Forwarded",
+            "Via",
+        ] {
+            assert_eq!(policy(&resp(&[name])), VaryPolicy::Uncacheable, "{name}");
+            assert_eq!(
+                policy(&resp(&["Accept-Language", name])),
+                VaryPolicy::Uncacheable,
+                "{name} on a second line"
+            );
+        }
+        // a header of the same family zion does not write is still keyed
+        assert_eq!(
+            policy(&resp(&["X-Forwarded-Prefix-Hint"])),
+            VaryPolicy::Keyed(vec!["x-forwarded-prefix-hint".into()])
+        );
+    }
+
+    /// zion sends the origin `X-Forwarded-Proto: https` on every request it caches, so the origin
+    /// chose a response that varies on it by a value every client shares: it is keyed, as it was
+    /// before the headers above were taken out, not kept out of the cache.
+    #[test]
+    fn a_vary_on_x_forwarded_proto_is_keyed() {
+        assert_eq!(
+            policy(&resp(&["Accept-Encoding, X-Forwarded-Proto"])),
+            VaryPolicy::Keyed(vec!["x-forwarded-proto".into()])
         );
     }
 

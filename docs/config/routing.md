@@ -123,8 +123,11 @@ else, a trusted proxy included, is dropped; zion then sets the real value, or no
 
 All of these and the list above come from one table in the code
 (`src/reserved_headers.rs`), and one test walks that table through the real HTTPS listener. `X-Forwarded-Host` is always overwritten with
-the request's own host (the `Host` header, or the URI authority for HTTP/2), and dropped when there
-is none. The upstream's `Host` is its own authority, or the client's host when the upstream
+the request's own host, the one routing and the cache key read (the target's authority when it has
+one, an HTTP/2 `:authority` or an absolute-form target, else the `Host` header), and dropped when
+there is none. It never carries userinfo: a target whose authority has one
+(`http://user:pass@host/`, an `:authority` of `host@other.example`) is refused with a `400` before
+routing, and a `Host` header with an `@` is not forwarded. The upstream's `Host` is its own authority, or the client's host when the upstream
 sets [`preserve_host`](/config/#forward-the-client-s-host-preserve-host-opt-in).
 
 ### Headers and cookies you strip or refuse
