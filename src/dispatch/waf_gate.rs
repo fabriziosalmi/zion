@@ -660,4 +660,79 @@ waf_profile = "streamed"
         let (status, seen) = post(&st, &got, "/enforce/pattern", &flagged, true).await;
         assert_eq!((status, seen.len()), (400, 0), "{seen:?}");
     }
+
+    /// With `require_content_length`, a body flagged in shadow mode is read whole before it goes,
+    /// and is held to the profile's `max_body_mb` (12 MiB here), not to the 10 MiB the body stage
+    /// reads on a route without a cap: an 11 MiB body reaches the upstream whole with its length,
+    /// a 13 MiB one is refused with `413` and never forwarded.
+    #[tokio::test]
+    async fn a_flagged_body_in_shadow_mode_under_require_content_length_is_held_to_the_profile_cap()
+    {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let port = origin(got.clone()).await;
+        let toml = format!(
+            r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+
+[tls]
+cert_path = "/c"
+key_path = "/k"
+
+[upstreams]
+o = "http://127.0.0.1:{port}"
+
+[waf_profile.streamed]
+streaming = true
+max_body_mb = 12
+deny_unknown_content_types = false
+entropy_check = false
+
+[[route]]
+path = "/shadow/{{*rest}}"
+upstream = "o"
+waf_profile = "streamed"
+waf_shadow = true
+require_content_length = true
+"#
+        );
+        let st = AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"));
+        let pattern = Bytes::from_static(b"name=<script>alert(1)</script>");
+        let one_mib = Bytes::from(vec![b'c'; 1_048_576]);
+        let frames = |mib: usize| {
+            let mut f = vec![pattern.clone()];
+            f.extend(std::iter::repeat_n(one_mib.clone(), mib));
+            f
+        };
+
+        for declared in [true, false] {
+            let body = frames(11);
+            let sent: usize = body.iter().map(Bytes::len).sum();
+            let path = format!("/shadow/eleven-{declared}");
+            let (status, seen) = post(&st, &got, &path, &body, declared).await;
+            assert!(
+                status == 200
+                    && seen.len() == 1
+                    && seen[0].body.as_ref().map(Bytes::len) == Some(sent)
+                    && seen[0].declared.as_deref() == Some(&sent.to_string()[..]),
+                "{path}: status {status}, the upstream got {:?} (declared {:?}) of the {sent} \
+                 bytes sent",
+                seen.iter()
+                    .map(|g| g.body.as_ref().map(Bytes::len))
+                    .collect::<Vec<_>>(),
+                seen.iter().map(|g| g.declared.clone()).collect::<Vec<_>>(),
+            );
+
+            let path = format!("/shadow/thirteen-{declared}");
+            let (status, seen) = post(&st, &got, &path, &frames(13), declared).await;
+            assert!(
+                status == 413 && seen.is_empty(),
+                "{path}: status {status}, the upstream got {:?}",
+                seen.iter()
+                    .map(|g| g.body.as_ref().map(Bytes::len))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }

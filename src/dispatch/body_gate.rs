@@ -13,8 +13,8 @@ use crate::upstream_body::BodyCap;
 use hyper::body::Body;
 use hyper::header::{HeaderValue, CONTENT_LENGTH, TRANSFER_ENCODING};
 
-/// How much `require_content_length` reads on a route that sets no `max_body_mb`: the body cap
-/// of the WAF when it has none either.
+/// How much `require_content_length` reads on a route that sets no `max_body_mb` and whose body
+/// carries no cap from the WAF stage: the body cap of the WAF when it has none either.
 const DEFAULT_BUFFER_CAP: u64 = 10 * 1_048_576;
 
 /// Apply the route's body cap and `require_content_length`.
@@ -70,14 +70,21 @@ fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
     values.next().is_none().then_some(len)
 }
 
-/// Read a body of unknown length whole, within the route's cap and 60 s, and put it back with
-/// the `Content-Length` it turned out to have.
+/// Read a body of unknown length whole, within the route's cap (or the WAF profile's, for a body
+/// the WAF stage sent on in shadow mode) and 60 s, and put it back with the `Content-Length` it
+/// turned out to have.
 async fn read_whole(
     rule: &ResolvedRoute,
     remote_addr: SocketAddr,
     req: Request<ReqBody>,
 ) -> Result<Request<ReqBody>, Response<ZionBody>> {
-    let cap = rule.body_cap.unwrap_or(DEFAULT_BUFFER_CAP);
+    // A body the WAF stage flagged in shadow mode and sent on unread carries the profile's
+    // `max_body_mb` as its `BodyCap`: it is held to that, not to the default, so shadow mode
+    // refuses no body the profile allows.
+    let cap = rule
+        .body_cap
+        .or_else(|| req.extensions().get::<BodyCap>().map(|c| c.0))
+        .unwrap_or(DEFAULT_BUFFER_CAP);
     let (mut parts, body) = req.into_parts();
     let bytes = match tokio::time::timeout(BODY_COLLECT_TIMEOUT, read_capped(body, cap)).await {
         Ok(Ok(bytes)) => bytes,

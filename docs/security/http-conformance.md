@@ -124,11 +124,13 @@ multi-range requests, and HTTP/3 parity are not yet covered by the suite. HTTP/3
 bodies are pinned apart, by
 [`tests/h3_request_body.rs`](https://github.com/fabriziosalmi/zion/blob/master/tests/h3_request_body.rs)
 (needs `--features http3`). `content-length` lines that do not declare one length are
-refused with `400` before routing. A body shorter or longer than its `Content-Length` is
-refused with `400` and never reaches the upstream as a whole body, on a streamed route, a
-WAF route and a `require_content_length` route alike: a route that reads it first (a WAF,
-`require_content_length`) forwards nothing, and a streamed one aborts the upstream request
-(RFC 9114 §4.1.2; h3 checks neither). The upstream request reads a body no further than its
+refused with `400` before routing. A body shorter or longer than its `Content-Length` never
+reaches the upstream as a whole body, on a streamed route, a WAF route and a
+`require_content_length` route alike (RFC 9114 §4.1.2; h3 checks neither). A route that reads
+it first (a WAF, `require_content_length`) refuses it with `400` and forwards nothing. A
+streamed route aborts the upstream request: the client gets `400`, unless the upstream
+answered before it read the body, in which case the client gets that response, status
+included. The upstream request reads a body no further than its
 declared length, so the DATA that completes the length is held back until the stream shows
 whether more follows, and a body declared `0` is read to its end before the request goes on
 (DATA after it is refused before anything is forwarded). h3 0.0.8 reports a zero-length DATA
@@ -137,6 +139,7 @@ Zion asks again before it takes a body as ended, and a run of up to 15 empty DAT
 read through: a body with empty frames inside reaches the upstream whole, and DATA past the
 length after them is refused. Not covered: a 16th empty DATA frame in a row still ends the body
 there, so a body past its length then goes upstream cut at the length, and a body without a
-`Content-Length` cut at that run. h3 reports a trailer section the same way, so DATA after one
-(malformed, RFC 9114 §4.1) is read as more of the body. The WAF, a buffer and the upstream
+`Content-Length` cut at that run. h3 reports a trailer section the same way, so DATA after one,
+an invalid frame sequence that RFC 9114 §4.1 makes a connection error (`H3_FRAME_UNEXPECTED`),
+is read as more of the body. The WAF, a buffer and the upstream
 request read the body from the same place, so a cut body is the same cut body for all of them.
