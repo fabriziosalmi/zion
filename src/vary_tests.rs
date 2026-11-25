@@ -3532,7 +3532,9 @@ cache_profile = "c"
 /// names the request's host (RFC 9112 §3.2.2), and zion routes and keys the request on it. The
 /// origin was told the `Host` header's instead: `GET http://shop.test/` with `Host: evil.test`
 /// stored the page the origin built for evil.test (its links, its scripts) under shop.test's key,
-/// and every later client of shop.test was served it as a `HIT`.
+/// and every later client of shop.test was served it as a `HIT`. Such a request now gets a `400`
+/// before routing (the one-authority gate), and one whose `Host` names the same host in another
+/// spelling tells the origin the target's, the authority the entry is keyed under.
 #[tokio::test]
 async fn the_origin_is_told_the_host_the_entry_is_keyed_under() {
     let (p, hits) = named_origin("O").await;
@@ -3548,7 +3550,12 @@ cache_profile = "c"
     );
     for (n, target) in ["http://shop.test", "https://shop.test"].iter().enumerate() {
         let path = format!("/abs{n}");
-        let planted = fetch(&st, &format!("{target}{path}"), &[("host", "evil.test")]).await;
+        // two hosts: refused, so nothing reaches the origin or the cache
+        let refused = body_for(&st, &format!("{target}{path}"), &[("host", "evil.test")]).await;
+        assert_eq!(refused.0, 400, "{target}{path} with Host: evil.test");
+        // one host, spelled `SHOP.test` in the target: the origin is told the target's spelling
+        let upper = target.replace("shop", "SHOP");
+        let planted = fetch(&st, &format!("{upper}{path}"), &[("host", "shop.test")]).await;
         settle().await;
         let served = fetch(&st, &path, &[("host", "shop.test")]).await;
         assert_eq!(
@@ -3556,8 +3563,8 @@ cache_profile = "c"
                 (planted.0.as_str(), planted.1.as_str()),
                 (served.0.as_str(), served.1.as_str())
             ),
-            (("MISS", "O:shop.test"), ("HIT", "O:shop.test")),
-            "{target}{path} with Host: evil.test, then {path} with Host: shop.test"
+            (("MISS", "O:SHOP.test"), ("HIT", "O:SHOP.test")),
+            "{upper}{path} with Host: shop.test, then {path} with Host: shop.test"
         );
     }
     assert_eq!(hits.load(Ordering::Relaxed), 2);
@@ -3872,6 +3879,388 @@ async fn preserve_host_sends_the_clients_host_in_every_mode() {
     }
 }
 
+// ── one authority per request: the target's and the Host header must agree ───
+// Routing, the route's policy and the response-cache key read the request target's authority
+// (`security::request_host`, authority first); the upstream is told the client's `Host` header
+// (`X-Forwarded-Host`, and `Host` under `preserve_host`). A client that sends both and makes
+// them differ (an HTTP/1.1 absolute-form target plus `Host`, HTTP/2 `:authority` plus a `host`
+// field) had a request decided as one host and served as another. It is refused with 400
+// before routing. (HTTP/3 never got that far: the `h3` crate resets a request stream whose
+// `:authority` and `host` differ by a byte.) These model the absolute-form / `:authority`
+// request the way hyper hands it over: a URI with an authority, and the `Host` header beside
+// it, at the default HTTP/1.1 version; the same gate runs for every protocol.
+
+/// An origin that answers from `X-Forwarded-Host` (a multi-tenant app; Rack and Rails honour it
+/// by default) must not have its answer for one host filed under another host's cache key.
+#[tokio::test]
+async fn a_host_that_disagrees_with_the_target_authority_cannot_poison_the_cache() {
+    let (p, hits) = named_origin("O").await;
+    let st = hosts_state(
+        r#"
+[[route]]
+path = "/{*rest}"
+upstream = "o"
+mode = "static_cache"
+cache_profile = "c"
+"#,
+        &format!("o = \"http://127.0.0.1:{p}\""),
+    );
+    // Attacker: the absolute-form target names the victim's host, the Host header the
+    // attacker's. Keyed under www.victim.example, the origin would answer for attacker.example.
+    // The second has the same host in both but a Host port that is not a port: the gate took
+    // it for the default port, so it was keyed as www.victim.example while the origin was told
+    // `www.victim.example:x`.
+    let mut attackers = Vec::new();
+    for host in ["attacker.example", "www.victim.example:x"] {
+        let answer = body_for(&st, "http://www.victim.example/p", &[("host", host)]).await;
+        attackers.push((host, answer));
+    }
+    settle().await;
+    // Victim: an ordinary HTTP/1.1 browser, origin-form target, its own host.
+    let (victim_cache, victim_body) = fetch(&st, "/p", &[("host", "www.victim.example")]).await;
+    assert_eq!(
+        victim_body, "O:www.victim.example",
+        "the victim must get the origin's answer for its own host, not one the attacker's \
+         request filed under its key (cache {victim_cache:?}; the attackers got {attackers:?})"
+    );
+    for (host, (status, _)) in &attackers {
+        assert_eq!(
+            *status, 400,
+            "Host {host:?}: the disagreeing request is refused"
+        );
+    }
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        1,
+        "only the victim's request reached the origin"
+    );
+    // A target that names the same host as its Host header is served as usual.
+    assert_eq!(
+        body_for(
+            &st,
+            "http://WWW.victim.example:80/p",
+            &[("host", "www.victim.example")]
+        )
+        .await,
+        (200, "O:www.victim.example".to_string())
+    );
+}
+
+/// Two host-bound routes share one `preserve_host` backend; one host is `internal_only`. A
+/// request whose target names the open host and whose Host names the protected one must not
+/// reach the protected host with the open host's (absent) policy.
+#[tokio::test]
+async fn a_host_that_disagrees_with_the_target_authority_cannot_reach_an_internal_only_host() {
+    let (port, hits) = host_echo_origin("no-store").await;
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstream.u]
+urls = ["http://127.0.0.1:{port}"]
+preserve_host = true
+[[route]]
+path = "/{{*rest}}"
+hosts = ["public.example"]
+upstream = "u"
+mode = "standard"
+[[route]]
+path = "/{{*rest}}"
+hosts = ["admin.example"]
+upstream = "u"
+mode = "standard"
+internal_only = true
+"#
+    );
+    let st = AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"));
+    // Control: the protected host refuses this (non-internal) client, by Host or by target.
+    assert_eq!(
+        body_for(&st, "/p", &[("host", "admin.example")]).await.0,
+        403,
+        "internal_only must refuse a non-internal client"
+    );
+    assert_eq!(
+        body_for(&st, "https://admin.example/p", &[]).await.0,
+        403,
+        "and an HTTP/2 client that names it in :authority"
+    );
+    // Attack: target = the open host, Host = the protected host.
+    let (code, body) = body_for(&st, "http://public.example/p", &[("host", "admin.example")]).await;
+    assert!(
+        !body.contains("admin.example"),
+        "a request routed by the open host's policy reached the internal_only host on the \
+         shared backend (status {code}, upstream saw {body:?})"
+    );
+    assert_eq!(code, 400, "the disagreeing request is refused");
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        0,
+        "nothing reached the backend"
+    );
+    // The open host, named the same way in both, is served as itself.
+    assert_eq!(
+        body_for(
+            &st,
+            "http://public.example/p",
+            &[("host", "public.example")]
+        )
+        .await,
+        (200, "host=public.example".to_string())
+    );
+}
+
+/// A shared route and an `internal_only` host-bound route on one `preserve_host` backend. Routing
+/// keyed an authority whose port is not a port (`admin.example:x`, `:+443`, `:1:2`) by its whole
+/// text, which no host group matches, so the request got the shared route, while the upstream
+/// cuts the host at the first `:` (nginx) and served the protected host. Such an authority is
+/// refused, as a target and as a `Host`. An empty port is the scheme's default (RFC 3986 §6.2.3):
+/// `admin.example:` names the protected host, and gets its policy.
+#[tokio::test]
+async fn an_authority_whose_port_is_not_a_port_cannot_reach_an_internal_only_host() {
+    let (port, hits) = host_echo_origin("no-store").await;
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstream.u]
+urls = ["http://127.0.0.1:{port}"]
+preserve_host = true
+[[route]]
+path = "/{{*rest}}"
+upstream = "u"
+mode = "standard"
+[[route]]
+path = "/{{*rest}}"
+hosts = ["admin.example"]
+upstream = "u"
+mode = "standard"
+internal_only = true
+"#
+    );
+    let st = AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"));
+    // Control: the shared route serves any other host; the protected host refuses this
+    // (non-internal) client.
+    assert_eq!(
+        body_for(&st, "/p", &[("host", "www.example")]).await,
+        (200, "host=www.example".to_string())
+    );
+    assert_eq!(
+        body_for(&st, "/p", &[("host", "admin.example")]).await.0,
+        403
+    );
+    let served = hits.load(Ordering::Relaxed);
+    assert_eq!(
+        served, 1,
+        "only the shared-route control reached the backend"
+    );
+
+    // (target, Host): an HTTP/1.1 absolute-form target or an HTTP/2 `:authority` with a `host`
+    // field, the target alone (HTTP/2, HTTP/3), and an origin-form `Host`.
+    let empty_port: &[(&str, Option<&str>)] = &[
+        ("https://admin.example:/p", Some("admin.example")),
+        ("https://admin.example:/p", None),
+        ("/p", Some("admin.example:")),
+        ("https://admin.example/p", Some("admin.example:")),
+    ];
+    for (uri, host) in empty_port {
+        let headers: Vec<(&str, &str)> = host.iter().map(|h| ("host", *h)).collect();
+        let (code, body) = body_for(&st, uri, &headers).await;
+        assert_eq!(
+            code, 403,
+            "{uri} with Host {host:?} names the protected host and gets its policy (upstream \
+             saw {body:?})"
+        );
+    }
+    let not_a_port: &[(&str, Option<&str>)] = &[
+        ("https://admin.example:x/p", Some("admin.example")),
+        ("https://admin.example:+443/p", Some("admin.example")),
+        ("https://admin.example:x/p", None),
+        ("https://admin.example:99999/p", None),
+        ("https://admin.example/p", Some("admin.example:x")),
+        ("/p", Some("admin.example:x")),
+        ("/p", Some("admin.example:+443")),
+        ("/p", Some("admin.example:443:443")),
+        ("/p", Some("admin.example:99999")),
+    ];
+    for (uri, host) in not_a_port {
+        let headers: Vec<(&str, &str)> = host.iter().map(|h| ("host", *h)).collect();
+        let (code, body) = body_for(&st, uri, &headers).await;
+        assert!(
+            !body.contains("admin.example"),
+            "{uri} with Host {host:?} got the shared route and reached the internal_only host \
+             (status {code}, upstream saw {body:?})"
+        );
+        assert_eq!(code, 400, "{uri} with Host {host:?} is refused");
+    }
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        served,
+        "nothing after the control reached the backend"
+    );
+}
+
+/// A shared route, a public `*.example.com` wildcard and two `internal_only` hosts, all on one
+/// `preserve_host` backend. Routing keyed an authority with a byte no host name has
+/// (`admin.example,x`, `x<TAB>admin.example`) by its whole text: no exact group matched it, so
+/// it got the shared route, or the wildcard whose suffix it ends with. The upstream reads
+/// `X-Forwarded-Host` as a list (Express 5 keeps the part before the first `,`) and served the
+/// protected host. Such an authority is refused, as a target, as a `Host`, and as both.
+#[tokio::test]
+async fn an_authority_with_a_list_separator_cannot_reach_an_internal_only_host() {
+    let (port, hits) = host_echo_origin("no-store").await;
+    let toml = format!(
+        r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+[tls]
+cert_path = "/c"
+key_path = "/k"
+[upstream.u]
+urls = ["http://127.0.0.1:{port}"]
+preserve_host = true
+[[route]]
+path = "/{{*rest}}"
+upstream = "u"
+mode = "standard"
+[[route]]
+path = "/{{*rest}}"
+hosts = ["*.example.com"]
+upstream = "u"
+mode = "standard"
+[[route]]
+path = "/{{*rest}}"
+hosts = ["admin.example", "admin.example.com"]
+upstream = "u"
+mode = "standard"
+internal_only = true
+"#
+    );
+    let st = AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"));
+    // Controls: the shared route and the wildcard serve their hosts; the protected hosts
+    // refuse this (non-internal) client.
+    assert_eq!(
+        body_for(&st, "/p", &[("host", "www.example")]).await,
+        (200, "host=www.example".to_string())
+    );
+    assert_eq!(
+        body_for(&st, "/p", &[("host", "x.example.com")]).await,
+        (200, "host=x.example.com".to_string())
+    );
+    for host in ["admin.example", "admin.example.com"] {
+        assert_eq!(
+            body_for(&st, "/p", &[("host", host)]).await.0,
+            403,
+            "{host}"
+        );
+    }
+    let served = hits.load(Ordering::Relaxed);
+    assert_eq!(served, 2, "only the two open controls reached the backend");
+
+    // (target, Host): an origin-form `Host`, an HTTP/2 or HTTP/3 `:authority` alone, and an
+    // absolute-form target with the same text in `Host`.
+    let cases: &[(&str, Option<&str>)] = &[
+        ("/p", Some("admin.example,x")),
+        ("/p", Some("admin.example, x")),
+        ("/p", Some("x,admin.example")),
+        ("/p", Some("admin.example;x")),
+        ("/p", Some("x\tadmin.example")),
+        ("/p", Some("admin.example,x:443")),
+        ("/p", Some("[admin.example]")),
+        ("/p", Some("admin.example.com,x.example.com")),
+        ("https://admin.example,x/p", None),
+        ("https://admin.example.com,x.example.com/p", None),
+        ("http://admin.example,x/p", Some("admin.example,x")),
+    ];
+    for (uri, host) in cases {
+        let headers: Vec<(&str, &str)> = host.iter().map(|h| ("host", *h)).collect();
+        let (code, body) = body_for(&st, uri, &headers).await;
+        assert!(
+            !body.contains("admin.example"),
+            "{uri} with Host {host:?} got an open route and reached the internal_only host \
+             (status {code}, upstream saw {body:?})"
+        );
+        assert_eq!(code, 400, "{uri} with Host {host:?} is refused");
+    }
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        served,
+        "nothing after the controls reached the backend"
+    );
+}
+
+/// The `:80` ACME fallback routes by the target's authority and forwards on its own, outside
+/// the HTTPS pipeline: it refuses a request whose Host disagrees with it the same way.
+#[tokio::test]
+async fn the_port_80_acme_fallback_refuses_a_host_that_disagrees_with_the_target_authority() {
+    let (port, hits) = host_echo_origin("no-store").await;
+    let st = preserve_state(
+        "standard",
+        &format!("\"http://127.0.0.1:{port}\""),
+        true,
+        "",
+    );
+    let on_80 = |uri: &'static str, host: &'static str| {
+        let st = st.clone();
+        async move {
+            let resp = crate::accept::handle_http(
+                get(uri, &[("host", host)]),
+                st,
+                "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+            )
+            .await
+            .unwrap();
+            let status = resp.status().as_u16();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+    assert_eq!(
+        on_80(
+            "http://other.example/.well-known/acme-challenge/tok",
+            "app.example"
+        )
+        .await
+        .0,
+        400
+    );
+    // and an authority whose port is not a port, or whose host is not a host name, as a
+    // target or as the Host
+    for (uri, host) in [
+        (
+            "http://app.example:x/.well-known/acme-challenge/tok",
+            "app.example",
+        ),
+        ("/.well-known/acme-challenge/tok", "app.example:x"),
+        ("/.well-known/acme-challenge/tok", "app.example,x"),
+        ("/.well-known/acme-challenge/tok", "x\tapp.example"),
+        (
+            "http://app.example,x/.well-known/acme-challenge/tok",
+            "app.example,x",
+        ),
+    ] {
+        assert_eq!(on_80(uri, host).await.0, 400, "{uri} with Host {host:?}");
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 0, "nothing was forwarded");
+    assert_eq!(
+        on_80(
+            "http://app.example/.well-known/acme-challenge/tok",
+            "app.example"
+        )
+        .await,
+        (200, "host=app.example".to_string()),
+        "the same authority twice is forwarded as usual"
+    );
+}
+
 #[tokio::test]
 async fn preserve_host_survives_a_pool_failover() {
     let (port, _) = host_echo_origin("no-store").await;
@@ -3918,9 +4307,11 @@ async fn a_background_refresh_sends_the_clients_host_too() {
 }
 
 /// A background refresh goes out with the target and the `Host` of the request that found the
-/// entry stale. An absolute-form target names the entry's host while its `Host` names another:
+/// entry stale. An absolute-form target named the entry's host while its `Host` named another:
 /// the refresh told the origin the `Host` header's, and the answer for that host replaced the
-/// entry of the target's, inside the window, without waiting for a miss.
+/// entry of the target's, inside the window, without waiting for a miss. Such a request now gets
+/// a `400` before the cache and starts no refresh; one whose target and `Host` name the same host
+/// in two spellings has its refresh tell the origin the target's.
 #[tokio::test]
 async fn a_background_refresh_tells_the_origin_the_host_of_the_entry_it_refreshes() {
     let (port, hits) = host_echo_origin("public, max-age=1, stale-while-revalidate=30").await;
@@ -3934,11 +4325,22 @@ async fn a_background_refresh_tells_the_origin_the_host_of_the_entry_it_refreshe
     assert_eq!(body_for(&st, "/sw", &shop).await.1, "host=shop.example");
     settle().await;
     tokio::time::sleep(Duration::from_millis(1300)).await;
-    // stale: served at once, and refreshed with this request's target and Host
+    // stale, but two hosts: refused, and no refresh starts
     assert_eq!(
         body_for(&st, "http://shop.example/sw", &[("host", "evil.example")])
             .await
-            .1,
+            .0,
+        400
+    );
+    settle().await;
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        1,
+        "a refused request refreshed"
+    );
+    // stale: served at once, and refreshed with this request's target and Host
+    assert_eq!(
+        body_for(&st, "http://SHOP.example/sw", &shop).await.1,
         "host=shop.example"
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -3949,8 +4351,8 @@ async fn a_background_refresh_tells_the_origin_the_host_of_the_entry_it_refreshe
     settle().await;
     assert_eq!(
         body_for(&st, "/sw", &shop).await.1,
-        "host=shop.example",
-        "the refreshed entry of shop.example"
+        "host=SHOP.example",
+        "the refreshed entry of shop.example, refreshed with the target's spelling"
     );
     assert_eq!(hits.load(Ordering::Relaxed), 2);
 }
