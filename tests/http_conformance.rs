@@ -1423,15 +1423,20 @@ fn http2_content_length_is_one_valid_length_and_is_reframed_from_the_body() {
             "{declared:?} over h2c: the malformed request reached the upstream"
         );
     }
+    // A well-formed POST is not forwarded either: the fallback takes only a bodyless GET or HEAD
+    // (an HTTP-01 fetch) and redirects the rest to HTTPS, where the TLS cases below check the
+    // re-framing.
     let marker = ".well-known/acme-challenge/h2c-once";
     let c = post_h2c(&format!("/{marker}"), &["5"], b"hello");
-    assert!(origin_saw_method(&seen, "POST", marker), "{marker}");
-    let forwarded = origin_content_lengths(&seen, marker);
+    let saw = origin_saw_method(&seen, "POST", marker);
     record(
         "h2c :80 Content-Length [\"5\"]",
-        format!("zion {c}, upstream Content-Length {forwarded:?}"),
+        format!("zion {c}, forwarded ({saw})"),
     );
-    assert_eq!((c, forwarded), (200, vec!["5".to_string()]), "{marker}");
+    assert!(
+        (300..400).contains(&c) && !saw,
+        "{marker}: a POST to the :80 fallback is redirected, not forwarded (zion {c}, forwarded {saw})"
+    );
 
     // ---- Re-framed: the upstream gets one length, the one of the body zion sends ----
     for (marker, declared) in [("h2cl-once", &["5"][..]), ("h2cl-twice", &["5", "5"])] {
