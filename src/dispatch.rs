@@ -61,7 +61,7 @@ mod gates;
 mod route;
 mod telemetry;
 mod waf_gate;
-pub(crate) use gates::{path_shape, uri_too_long};
+pub(crate) use gates::{path_shape, uri_too_long, virtual_patch};
 
 /// Issue #151: turn an enforcement *deny* into a bounded held (tarpit)
 /// response when the operator enabled it, otherwise the plain immediate
@@ -801,6 +801,12 @@ fn breaker_entry(
         .get(&rule.upstream_url[0])
         .filter(|h| h.breaker.is_configured())
         .cloned()
+}
+
+/// Does a circuit breaker guard this route's upstream? The `:80` ACME fallback forwards on its
+/// own, without the admission stage, so such a route is served through the HTTPS pipeline.
+pub(crate) fn has_circuit_breaker(cfg: &ResolvedAppConfig, rule: &ResolvedRoute) -> bool {
+    breaker_entry(cfg, rule).is_some()
 }
 
 /// The upstream is at `max_in_flight`: refuse at once rather than queue.

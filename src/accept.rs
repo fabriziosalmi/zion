@@ -818,12 +818,25 @@ pub(crate) async fn handle_http(
             };
             cfg.router.at(host.as_deref(), path).cloned()
         };
-        // Only a route with nothing to bypass may take this shortcut, with a path the
-        // route accepts (`;`, `%2F`); otherwise fall through to the redirect (the HTTPS
-        // pipeline then applies auth/WAF and answers the path itself).
-        if let Some(rule) = rule
-            .filter(|r| r.serves_acme_fallback() && dispatch::path_shape(&cfg, r, &req).is_none())
-        {
+        // The shortcut runs only some of the pipeline's gates, so it takes only what an HTTP-01
+        // validation is: a GET (RFC 8555 §8.3) or a HEAD, with no body. That leaves the method
+        // whitelist, CORS and the body gates (which pass a bodyless request) nothing to check.
+        // It also takes only a `Host` the TLS listener accepts (exactly one valid line on
+        // HTTP/1.1, RFC 9112 §3.2): that listener answers 400 to any other before routing, while
+        // this one would route on the first line or on no host at all, and forward the client's
+        // value upstream (`X-Forwarded-Host`, and `Host` under `preserve_host`).
+        // The route must have nothing else to bypass (`serves_acme_fallback`, no circuit
+        // breaker) and accept the path (`;`, `%2F`). Anything else falls through to the
+        // redirect, and the HTTPS pipeline applies every gate.
+        let challenge_fetch = matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD)
+            && hyper::body::Body::is_end_stream(req.body())
+            && !http1_host_is_wrong(&req);
+        if let Some(rule) = rule.filter(|r| {
+            challenge_fetch
+                && r.serves_acme_fallback()
+                && !dispatch::has_circuit_breaker(&cfg, r)
+                && dispatch::path_shape(&cfg, r, &req).is_none()
+        }) {
             // This path skips process_request, so drop the identity headers the
             // pipeline would have scrubbed: upstreams trust X-Auth-* as verified.
             dispatch::scrub_reserved_identity_headers(req.headers_mut());
@@ -832,6 +845,11 @@ pub(crate) async fn handle_http(
             }
             // and the route's header policy, as the pipeline applies it
             if let Some(resp) = rule.headers.apply(req.headers_mut()) {
+                return Ok(resp);
+            }
+            // The virtual patches apply to every route, so they cannot rule a route out: run
+            // the pipeline's own gate, at the same point (after the header policy).
+            if let Some(resp) = dispatch::virtual_patch(&cfg, &state, remote_addr, &req) {
                 return Ok(resp);
             }
             if rule.preserve_host {

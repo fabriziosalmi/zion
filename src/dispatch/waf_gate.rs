@@ -169,10 +169,12 @@ async fn scan_body(
 
         // Borrow content-type from parts.headers — no String allocation needed.
         // The header lives in `parts` which is alive through this scope.
-        let ct: Option<&str> = parts
-            .headers
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok());
+        let mut ct_lines = parts.headers.get_all(hyper::header::CONTENT_TYPE).iter();
+        let ct: Option<&str> = ct_lines.next().and_then(|v| v.to_str().ok());
+        // Content-Type is a singleton field (RFC 9110 §5.3, §8.3). The gates read the first
+        // line, zion forwards every line, and an upstream may act on another one: gunicorn 23
+        // hands the app the last. A body that comes with more than one is refused.
+        let ct_repeated = ct_lines.next().is_some();
 
         let max_body_bytes = (waf_profile.max_body_mb * 1_048_576) as usize;
         let body_bytes = collect_body(
@@ -190,7 +192,9 @@ async fn scan_body(
         // On the streaming path the raw Aho-Corasick pass already ran
         // incrementally over these bytes, so skip the redundant buffered
         // raw scan; the encoded/entropy/JSON gates still run.
-        let verdict = if waf_profile.streaming {
+        let verdict = if ct_repeated && !body_bytes.is_empty() {
+            waf::WafVerdict::Deny("repeated content-type header")
+        } else if waf_profile.streaming {
             waf::validate_request_prescanned(method, ct, &body_bytes, waf_profile)
         } else {
             waf::validate_request(method, ct, &body_bytes, waf_profile)

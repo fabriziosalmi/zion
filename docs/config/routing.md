@@ -296,7 +296,9 @@ deny_paths = ["/wp-json/batch/{*rest}"]
   The match ignores case and parameters (`application/json; charset=utf-8` is
   `application/json`), and `application/jsonp` is not `application/json`. Only a request that
   carries a body is checked: a `GET`, or a `POST` with an empty body, needs no `Content-Type`. A
-  body with no `Content-Type` is refused.
+  body with no `Content-Type` is refused, and so is a body with more than one `Content-Type`
+  line: zion forwards every line, and an upstream may act on another one than the first
+  (gunicorn 23 hands the app the last). A WAF profile refuses such a body too.
 
 The checks run in that order, once the route is known: after CORS and `internal_only`, before an
 upstream is chosen, authentication and the WAF. A refused request costs no upstream work.

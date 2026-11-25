@@ -14,10 +14,12 @@ use zion::waf::{
     WafProfile, WafVerdict,
 };
 
-const CONTENT_TYPES: [&str; 3] = [
+// The multipart type sends the body through the multipart structure gate on both paths.
+const CONTENT_TYPES: [&str; 4] = [
     "application/x-www-form-urlencoded",
     "text/plain",
     "application/json",
+    "multipart/form-data; boundary=B",
 ];
 
 fuzz_target!(|data: &[u8]| {

