@@ -177,7 +177,7 @@ async fn scan_body(
         let ct_repeated = ct_lines.next().is_some();
 
         let max_body_bytes = (waf_profile.max_body_mb * 1_048_576) as usize;
-        let body_bytes = collect_body(
+        let body_bytes = match collect_body(
             rule,
             state,
             remote_addr,
@@ -187,7 +187,19 @@ async fn scan_body(
             body,
             max_body_bytes,
         )
-        .await?;
+        .await?
+        {
+            Collected::Whole(bytes) => bytes,
+            // Shadow mode, a pattern flagged while the body streamed in: logged, and the body
+            // goes on as it is, held to the profile's cap by the proxy (`413` past it, the
+            // upstream request aborted).
+            Collected::Flagged(body) => {
+                let mut req = Request::from_parts(parts, body);
+                req.extensions_mut()
+                    .insert(crate::upstream_body::BodyCap(max_body_bytes as u64));
+                return Ok(req);
+            }
+        };
 
         // On the streaming path the raw Aho-Corasick pass already ran
         // incrementally over these bytes, so skip the redundant buffered
@@ -278,6 +290,15 @@ async fn scan_body(
     Ok(req)
 }
 
+/// The request body as the WAF stage read it.
+enum Collected {
+    /// Read whole, to be scanned as a whole and sent on.
+    Whole(Bytes),
+    /// Shadow mode, where the streaming scan flagged a pattern before the body's end: the
+    /// frames read so far, the one that was flagged, then the rest as it arrives, not buffered.
+    Flagged(ReqBody),
+}
+
 /// Read the request body whole, within the profile's size cap and the idle/total timeouts. With
 /// `streaming = true` each frame is scanned as it arrives, so an injection in the first chunk denies
 /// before the rest of the upload is read.
@@ -291,13 +312,13 @@ async fn collect_body(
     parts: &hyper::http::request::Parts,
     body: ReqBody,
     max_body_bytes: usize,
-) -> Result<Bytes, Response<ZionBody>> {
+) -> Result<Collected, Response<ZionBody>> {
     let body_bytes = if waf_profile.streaming {
         let mut scanner = waf::StreamingScanner::new(waf_profile.mode, max_body_bytes as u64);
         let mut chunks: Vec<Bytes> = Vec::new();
         let mut total: usize = 0;
         let mut body = body;
-        let mut early_deny: Option<&'static str> = None;
+        let mut early_deny: Option<(&'static str, Bytes)> = None;
         loop {
             match tokio::time::timeout(BODY_FRAME_IDLE_TIMEOUT, BodyExt::frame(&mut body)).await {
                 Ok(Some(Ok(frame))) => match frame.into_data() {
@@ -305,7 +326,7 @@ async fn collect_body(
                         match scanner.feed(&data) {
                             waf::StreamVerdict::Allow => {}
                             waf::StreamVerdict::Deny(reason) => {
-                                early_deny = Some(reason);
+                                early_deny = Some((reason, data));
                                 break;
                             }
                         }
@@ -333,7 +354,15 @@ async fn collect_body(
             }
         }
 
-        if let Some(reason) = early_deny {
+        if let Some((reason, flagged)) = early_deny {
+            // A body past the cap is refused in shadow mode too, as the buffered path refuses
+            // it, which reads no further than the cap.
+            if rule.waf_shadow && total.saturating_add(flagged.len()) > max_body_bytes {
+                return Err(text_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body too large",
+                ));
+            }
             if rule.waf_shadow {
                 metrics::METRICS
                     .waf_shadow_would_block
@@ -347,12 +376,22 @@ async fn collect_body(
                         parts.uri.path()
                     ),
                 );
-                // Shadow mode: don't deny. We did NOT read the rest
-                // of the body off the wire; reconstruct from what
-                // we have and forward — this produces a truncated
-                // request to upstream, which is the correct shadow-
-                // mode trade-off (we never silently buffer attacks
-                // for the upstream after a streaming match).
+                // Shadow mode blocks no pattern, so the body goes on whole: what was read, the
+                // frame that was flagged, then the rest of it as it arrives. Nothing more is
+                // buffered. Sending only what had been read handed the upstream a truncated
+                // body, and since the upstream request takes its length from the body it
+                // sends, one the upstream took as complete (an upload stored cut short).
+                chunks.push(flagged);
+                let read: Vec<Result<hyper::body::Frame<Bytes>, crate::http_util::BoxError>> =
+                    chunks
+                        .into_iter()
+                        .map(|c| Ok(hyper::body::Frame::data(c)))
+                        .collect();
+                use tokio_stream::StreamExt as _;
+                let whole = tokio_stream::iter(read).chain(http_body_util::BodyStream::new(body));
+                return Ok(Collected::Flagged(
+                    http_body_util::StreamBody::new(whole).boxed(),
+                ));
             } else {
                 metrics::METRICS
                     .waf_denied
@@ -401,5 +440,303 @@ async fn collect_body(
             }
         }
     };
-    Ok(body_bytes)
+    Ok(Collected::Whole(body_bytes))
+}
+
+#[cfg(test)]
+mod shadow_tests {
+    //! Shadow mode on a streaming profile, end to end: the real `process_request` in front of an
+    //! in-process origin that reads each request body by its framing.
+
+    use crate::config::ZionConfig;
+    use crate::dispatch::process_request;
+    use crate::http_util::{BoxError, ReqBody};
+    use crate::state::AppState;
+    use bytes::Bytes;
+    use http_body_util::BodyExt;
+    use hyper::{Request, Response};
+    use hyper_util::rt::TokioIo;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// What the origin made of one request: its path, its `Content-Length`, and its body if the
+    /// body ended where its framing said.
+    #[derive(Debug, Clone)]
+    struct Got {
+        path: String,
+        declared: Option<String>,
+        body: Option<Bytes>,
+    }
+
+    async fn origin(got: Arc<Mutex<Vec<Got>>>) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let got = got.clone();
+                tokio::spawn(async move {
+                    let svc =
+                        hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                            let got = got.clone();
+                            async move {
+                                let path = req.uri().path().to_string();
+                                let declared = req
+                                    .headers()
+                                    .get(hyper::header::CONTENT_LENGTH)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_string);
+                                let body =
+                                    req.into_body().collect().await.ok().map(|c| c.to_bytes());
+                                got.lock().unwrap().push(Got {
+                                    path,
+                                    declared,
+                                    body,
+                                });
+                                Ok::<_, std::convert::Infallible>(Response::new(
+                                    http_body_util::Full::new(Bytes::from_static(b"ok")),
+                                ))
+                            }
+                        });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+        port
+    }
+
+    /// `/shadow/*` and `/enforce/*` on one streaming profile capped at 1 MiB, the first in shadow
+    /// mode.
+    fn state(port: u16) -> Arc<AppState> {
+        let toml = format!(
+            r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+
+[tls]
+cert_path = "/c"
+key_path = "/k"
+
+[upstreams]
+o = "http://127.0.0.1:{port}"
+
+[waf_profile.streamed]
+streaming = true
+max_body_mb = 1
+deny_unknown_content_types = false
+entropy_check = false
+
+[[route]]
+path = "/shadow/{{*rest}}"
+upstream = "o"
+waf_profile = "streamed"
+waf_shadow = true
+
+[[route]]
+path = "/enforce/{{*rest}}"
+upstream = "o"
+waf_profile = "streamed"
+"#
+        );
+        AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"))
+    }
+
+    /// POST `frames` as a body that arrives frame by frame, with `content-length` when
+    /// `declared`: the status, and what the origin made of it.
+    async fn post(
+        st: &Arc<AppState>,
+        got: &Arc<Mutex<Vec<Got>>>,
+        path: &str,
+        frames: &[Bytes],
+        declared: bool,
+    ) -> (u16, Vec<Got>) {
+        let total: usize = frames.iter().map(Bytes::len).sum();
+        let frames: Vec<Result<hyper::body::Frame<Bytes>, BoxError>> = frames
+            .iter()
+            .map(|f| Ok(hyper::body::Frame::data(f.clone())))
+            .collect();
+        let body: ReqBody = http_body_util::StreamBody::new(tokio_stream::iter(frames)).boxed();
+        let mut req = Request::post(path)
+            .header("host", "example.test")
+            .header("content-type", "application/octet-stream");
+        if declared {
+            req = req.header("content-length", total.to_string());
+        }
+        let resp = process_request(
+            req.body(body).unwrap(),
+            st.clone(),
+            "203.0.113.9:1".parse::<SocketAddr>().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        let status = resp.status().as_u16();
+        let _ = resp.into_body().collect().await;
+        // let the origin finish reading whatever it was sent
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let seen = got
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|g| g.path == path)
+            .cloned()
+            .collect();
+        (status, seen)
+    }
+
+    /// A pattern the streaming scan flags in shadow mode is logged and the body still reaches the
+    /// upstream whole, under its own length, with and without a declared one. Only what had been
+    /// read before the flagged frame went, under the length of what had been read, so the upstream
+    /// took a truncated body as a complete request. The profile's cap still holds: a body past it
+    /// is refused with `413` and never reaches the upstream whole, flagged for its size or for a
+    /// pattern before it got there.
+    #[tokio::test]
+    async fn a_flagged_body_in_shadow_mode_reaches_the_upstream_whole_within_the_cap() {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let st = state(origin(got.clone()).await);
+        let a = Bytes::from(vec![b'a'; 64 * 1024]);
+        let pattern = Bytes::from_static(b"name=<script>alert(1)</script>");
+        let half_mib = Bytes::from(vec![b'b'; 512 * 1024]);
+        let flagged = vec![a.clone(), pattern.clone(), a.clone()];
+        for declared in [true, false] {
+            let sent: Vec<u8> = flagged.iter().flat_map(|f| f.iter().copied()).collect();
+            let path = format!("/shadow/pattern-{declared}");
+            let (status, seen) = post(&st, &got, &path, &flagged, declared).await;
+            assert!(
+                status == 200
+                    && seen.len() == 1
+                    && seen[0].body.as_deref() == Some(&sent[..])
+                    && (!declared
+                        || seen[0].declared.as_deref() == Some(&sent.len().to_string()[..])),
+                "{path}: status {status}, the upstream got {:?} (declared {:?}) of the {} bytes \
+                 sent",
+                seen.iter()
+                    .map(|g| g.body.as_ref().map(Bytes::len))
+                    .collect::<Vec<_>>(),
+                seen.iter().map(|g| g.declared.clone()).collect::<Vec<_>>(),
+                sent.len()
+            );
+        }
+
+        // Past the 1 MiB cap. Flagged for its size in the third frame: refused before anything
+        // goes. Flagged for a pattern in the first frame and past the cap later, while the rest
+        // streams on: the upstream request is cut at the cap and never ends whole.
+        let over = [
+            (
+                "over-the-cap",
+                vec![half_mib.clone(), half_mib.clone(), half_mib.clone()],
+                false,
+            ),
+            (
+                "pattern-then-over-the-cap",
+                vec![
+                    pattern.clone(),
+                    half_mib.clone(),
+                    half_mib.clone(),
+                    half_mib.clone(),
+                ],
+                true,
+            ),
+        ];
+        for (case, frames, may_start) in &over {
+            for declared in [true, false] {
+                let path = format!("/shadow/{case}-{declared}");
+                let (status, seen) = post(&st, &got, &path, frames, declared).await;
+                assert!(
+                    status == 413
+                        && seen.iter().all(|g| g.body.is_none())
+                        && (*may_start || seen.is_empty()),
+                    "{path}: status {status}, the upstream got {:?}",
+                    seen.iter()
+                        .map(|g| g.body.as_ref().map(Bytes::len))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+
+        // the pattern on the enforcing route is refused and never forwarded
+        let (status, seen) = post(&st, &got, "/enforce/pattern", &flagged, true).await;
+        assert_eq!((status, seen.len()), (400, 0), "{seen:?}");
+    }
+
+    /// With `require_content_length`, a body flagged in shadow mode is read whole before it goes,
+    /// and is held to the profile's `max_body_mb` (12 MiB here), not to the 10 MiB the body stage
+    /// reads on a route without a cap: an 11 MiB body reaches the upstream whole with its length,
+    /// a 13 MiB one is refused with `413` and never forwarded.
+    #[tokio::test]
+    async fn a_flagged_body_in_shadow_mode_under_require_content_length_is_held_to_the_profile_cap()
+    {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let port = origin(got.clone()).await;
+        let toml = format!(
+            r#"
+[server]
+listen_http = "127.0.0.1:0"
+listen_https = "127.0.0.1:0"
+
+[tls]
+cert_path = "/c"
+key_path = "/k"
+
+[upstreams]
+o = "http://127.0.0.1:{port}"
+
+[waf_profile.streamed]
+streaming = true
+max_body_mb = 12
+deny_unknown_content_types = false
+entropy_check = false
+
+[[route]]
+path = "/shadow/{{*rest}}"
+upstream = "o"
+waf_profile = "streamed"
+waf_shadow = true
+require_content_length = true
+"#
+        );
+        let st = AppState::for_tests(&toml::from_str::<ZionConfig>(&toml).expect("config parses"));
+        let pattern = Bytes::from_static(b"name=<script>alert(1)</script>");
+        let one_mib = Bytes::from(vec![b'c'; 1_048_576]);
+        let frames = |mib: usize| {
+            let mut f = vec![pattern.clone()];
+            f.extend(std::iter::repeat_n(one_mib.clone(), mib));
+            f
+        };
+
+        for declared in [true, false] {
+            let body = frames(11);
+            let sent: usize = body.iter().map(Bytes::len).sum();
+            let path = format!("/shadow/eleven-{declared}");
+            let (status, seen) = post(&st, &got, &path, &body, declared).await;
+            assert!(
+                status == 200
+                    && seen.len() == 1
+                    && seen[0].body.as_ref().map(Bytes::len) == Some(sent)
+                    && seen[0].declared.as_deref() == Some(&sent.to_string()[..]),
+                "{path}: status {status}, the upstream got {:?} (declared {:?}) of the {sent} \
+                 bytes sent",
+                seen.iter()
+                    .map(|g| g.body.as_ref().map(Bytes::len))
+                    .collect::<Vec<_>>(),
+                seen.iter().map(|g| g.declared.clone()).collect::<Vec<_>>(),
+            );
+
+            let path = format!("/shadow/thirteen-{declared}");
+            let (status, seen) = post(&st, &got, &path, &frames(13), declared).await;
+            assert!(
+                status == 413 && seen.is_empty(),
+                "{path}: status {status}, the upstream got {:?}",
+                seen.iter()
+                    .map(|g| g.body.as_ref().map(Bytes::len))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }

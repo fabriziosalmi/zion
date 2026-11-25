@@ -380,7 +380,7 @@ pub struct PreserveHost;
 /// Rewrite URI for upstream forwarding and add proxy headers.
 /// Uses pre-parsed scheme+authority from config — only path is set at runtime.
 #[inline]
-fn prepare_request<B>(
+fn prepare_request<B: hyper::body::Body>(
     mut req: Request<B>,
     scheme: &hyper::http::uri::Scheme,
     authority: &hyper::http::uri::Authority,
@@ -460,13 +460,15 @@ fn appended_xff(headers: &hyper::HeaderMap, client: &HeaderValue) -> HeaderValue
 /// for vhost-routing upstreams), and sets the `X-Forwarded-*` / `X-Real-IP` trust
 /// headers per the XFF policy. `Connection` / `Upgrade` are intentionally left
 /// to the caller: the normal proxy strips `Connection`, a WS upgrade keeps
-/// both for the handshake.
-fn apply_forwarding_hygiene<B>(
+/// both for the handshake. `Content-Length` is set from the body that is sent
+/// ([`frame_by_body`]), never copied from the client.
+fn apply_forwarding_hygiene<B: hyper::body::Body>(
     req: &mut Request<B>,
     remote_addr: Option<SocketAddr>,
     proto: &str,
     xff_mode: XffMode,
 ) {
+    frame_by_body(req);
     // Capture the request's host for X-Forwarded-Host before we strip the Host header. It is read
     // from the field routing and the cache key read it from (`security::request_host`): the URI
     // authority when the target has one (absolute-form, an HTTP/2 or HTTP/3 `:authority`), else
@@ -552,6 +554,37 @@ fn apply_forwarding_hygiene<B>(
             req.headers_mut().insert(hyper::header::HOST, host.clone());
         }
         req.headers_mut().insert(X_FORWARDED_HOST, host);
+    }
+}
+
+/// Make the request's `Content-Length` say what the upstream client sends.
+///
+/// hyper frames an upstream request from its body: an empty body as no body at all, a body of
+/// known length with that length, and a body of unknown length with a valid `Content-Length`
+/// when the request has one (it never writes more than that, and a body that ends short
+/// aborts the connection) or chunked when it has none. It writes the request's own
+/// `Content-Length` lines as they are, though. A client's value the body did not match (an
+/// HTTP/3 one h3 never checks, a second HTTP/2 line h2 never reads, a body the WAF buffered)
+/// told the upstream to wait for bytes that never came, and on a pooled keep-alive connection
+/// the upstream read the next request as the rest of this body. Every line the client sent is
+/// dropped here and one is written for the body that goes: `0` for an empty body when the
+/// client declared a length, the length of a body that knows it, the client's single valid
+/// value for a streamed body (hyper holds the body to it), and none otherwise.
+fn frame_by_body<B: hyper::body::Body>(req: &mut Request<B>) {
+    let declared = crate::http_util::content_length(req.headers());
+    let body = req.body();
+    let length = if body.is_end_stream() {
+        // hyper sends no body: say so if the client said anything.
+        (declared != Ok(None)).then_some(0)
+    } else if let Some(exact) = body.size_hint().exact() {
+        Some(exact)
+    } else {
+        declared.ok().flatten()
+    };
+    let headers = req.headers_mut();
+    headers.remove(hyper::header::CONTENT_LENGTH);
+    if let Some(length) = length {
+        headers.insert(hyper::header::CONTENT_LENGTH, HeaderValue::from(length));
     }
 }
 
@@ -1732,10 +1765,15 @@ mod tests {
             "upstream=https://api.internal trace_id=-"
         );
     }
+    use http_body_util::Empty;
     use hyper::http::uri::{Authority, Scheme};
 
-    fn make_request(method: &str, uri: &str) -> Request<()> {
-        Request::builder().method(method).uri(uri).body(()).unwrap()
+    fn make_request(method: &str, uri: &str) -> Request<Empty<Bytes>> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Empty::<Bytes>::new())
+            .unwrap()
     }
 
     fn scheme() -> Scheme {
@@ -1774,12 +1812,87 @@ mod tests {
             .uri("/test")
             .header(hyper::header::HOST, "original.com")
             .header(hyper::header::CONNECTION, "keep-alive")
-            .body(())
+            .body(Empty::<Bytes>::new())
             .unwrap();
         let req =
             prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).unwrap();
         assert!(req.headers().get(hyper::header::HOST).is_none());
         assert!(req.headers().get(hyper::header::CONNECTION).is_none());
+    }
+
+    /// `body` sent with the client's `Content-Length` lines `declared`: the lines prepared for the
+    /// upstream.
+    fn forwarded_content_length(body: ReqBody, declared: &[&str]) -> Vec<String> {
+        let mut req = Request::builder().method("POST").uri("/upload");
+        for value in declared {
+            req = req.header(hyper::header::CONTENT_LENGTH, *value);
+        }
+        let req = prepare_request(
+            req.body(body).unwrap(),
+            &scheme(),
+            &authority(),
+            None,
+            "https",
+            XffMode::Append,
+        )
+        .unwrap();
+        req.headers()
+            .get_all(hyper::header::CONTENT_LENGTH)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn whole(bytes: &'static [u8]) -> ReqBody {
+        Full::new(Bytes::from_static(bytes))
+            .map_err(|never| match never {})
+            .boxed()
+    }
+
+    /// A body of unknown length, as an HTTP/3 or a chunked one is.
+    fn streamed(bytes: &'static [u8]) -> ReqBody {
+        let frames: Vec<Result<hyper::body::Frame<Bytes>, crate::http_util::BoxError>> =
+            vec![Ok(hyper::body::Frame::data(Bytes::from_static(bytes)))];
+        http_body_util::StreamBody::new(tokio_stream::iter(frames)).boxed()
+    }
+
+    #[test]
+    fn an_empty_body_is_forwarded_with_length_zero_whatever_the_client_declared() {
+        // the HTTP/3 request the WAF buffered: 1000 declared, nothing sent
+        assert_eq!(forwarded_content_length(whole(b""), &["1000"]), ["0"]);
+        // the HTTP/2 request with two lines, h2 having checked only the first
+        assert_eq!(forwarded_content_length(whole(b""), &["0", "1000"]), ["0"]);
+        assert_eq!(forwarded_content_length(whole(b""), &["0"]), ["0"]);
+        // no length declared, none sent: hyper sends no body
+        assert!(forwarded_content_length(whole(b""), &[]).is_empty());
+    }
+
+    #[test]
+    fn a_body_of_known_length_is_forwarded_with_that_length_alone() {
+        assert_eq!(
+            forwarded_content_length(whole(b"hello"), &["5", "1000"]),
+            ["5"]
+        );
+        assert_eq!(forwarded_content_length(whole(b"hello"), &["1000"]), ["5"]);
+        assert_eq!(
+            forwarded_content_length(whole(b"hello"), &["5", "5"]),
+            ["5"]
+        );
+        assert_eq!(forwarded_content_length(whole(b"hello"), &[]), ["5"]);
+    }
+
+    #[test]
+    fn a_streamed_body_keeps_one_valid_declared_length_and_no_invalid_one() {
+        // hyper holds a streamed body to a valid length: one line of it goes
+        assert_eq!(forwarded_content_length(streamed(b"hello"), &["5"]), ["5"]);
+        assert_eq!(
+            forwarded_content_length(streamed(b"hello"), &["5, 5", "5"]),
+            ["5"]
+        );
+        // lines that disagree declare nothing: hyper chunks the body, with no length beside it
+        assert!(forwarded_content_length(streamed(b"hello"), &["5", "7"]).is_empty());
+        assert!(forwarded_content_length(streamed(b"hello"), &["abc"]).is_empty());
+        assert!(forwarded_content_length(streamed(b"hello"), &[]).is_empty());
     }
 
     /// The upstream is told the host zion routes and caches the request on
@@ -1808,7 +1921,7 @@ mod tests {
                 if let Some(h) = host {
                     b = b.header(hyper::header::HOST, h);
                 }
-                let mut req = b.body(()).unwrap();
+                let mut req = b.body(Empty::<Bytes>::new()).unwrap();
                 if preserve {
                     req.extensions_mut().insert(PreserveHost);
                 }
@@ -1860,7 +1973,7 @@ mod tests {
                 if let Some(h) = host {
                     b = b.header(hyper::header::HOST, h);
                 }
-                let mut req = b.body(()).unwrap();
+                let mut req = b.body(Empty::<Bytes>::new()).unwrap();
                 req.headers_mut().insert(
                     "x-forwarded-host",
                     HeaderValue::from_static("client.example"),
@@ -2029,7 +2142,7 @@ mod tests {
         let req = Request::builder()
             .method("GET")
             .uri("http://example.com")
-            .body(())
+            .body(Empty::<Bytes>::new())
             .unwrap();
         assert!(
             prepare_request(req, &scheme(), &authority(), None, "https", XffMode::Append).is_some()
@@ -2098,16 +2211,16 @@ mod tests {
 
     /// Helper: build a request that already carries an attacker-controlled
     /// X-Forwarded-For header, simulating a client trying to spoof their IP.
-    fn req_with_spoofed_xff(spoofed: &str) -> Request<()> {
+    fn req_with_spoofed_xff(spoofed: &str) -> Request<Empty<Bytes>> {
         Request::builder()
             .method("GET")
             .uri("/test")
             .header("X-Forwarded-For", spoofed)
-            .body(())
+            .body(Empty::<Bytes>::new())
             .unwrap()
     }
 
-    fn xff_values(req: &Request<()>) -> Vec<String> {
+    fn xff_values(req: &Request<Empty<Bytes>>) -> Vec<String> {
         req.headers()
             .get_all("X-Forwarded-For")
             .iter()
@@ -2144,7 +2257,7 @@ mod tests {
             .uri("/test")
             .header("X-Forwarded-For", "9.9.9.9")
             .header("X-Forwarded-For", "10.0.0.1, 203.0.113.9")
-            .body(())
+            .body(Empty::<Bytes>::new())
             .unwrap();
         let addr: SocketAddr = "203.0.113.9:5000".parse().unwrap();
         let req = prepare_request(
@@ -2239,7 +2352,7 @@ mod tests {
             .method("GET")
             .uri("/test")
             .header("X-Real-IP", "9.9.9.9") // attacker-supplied
-            .body(())
+            .body(Empty::<Bytes>::new())
             .unwrap();
         let addr: SocketAddr = "1.2.3.4:5000".parse().unwrap();
         let req = prepare_request(

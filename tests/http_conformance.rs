@@ -301,25 +301,40 @@ fn code(resp: &Resp) -> u16 {
 /// Boot zion for a test and return it with its HTTPS port once it serves. A boot that finds the
 /// port taken is repeated on fresh ports (see `boot`).
 fn start(dir: &Path, origin_port: u16) -> (Proc, u16) {
-    start_on(dir, origin_port, free_port)
+    let (zion, https_port, _) = start_with_http(dir, origin_port);
+    (zion, https_port)
+}
+
+/// [`start`], also returning the port of the plaintext listener.
+fn start_with_http(dir: &Path, origin_port: u16) -> (Proc, u16, u16) {
+    boot_on(dir, origin_port, free_port)
 }
 
 /// `start`, with the HTTPS port of each boot taken from `next_port`.
-fn start_on(dir: &Path, origin_port: u16, mut next_port: impl FnMut() -> u16) -> (Proc, u16) {
+fn start_on(dir: &Path, origin_port: u16, next_port: impl FnMut() -> u16) -> (Proc, u16) {
+    let (zion, https_port, _) = boot_on(dir, origin_port, next_port);
+    (zion, https_port)
+}
+
+/// Boot zion with the HTTPS port of each boot taken from `next_port` and a fresh plaintext port,
+/// and return it with both ports once it serves.
+fn boot_on(dir: &Path, origin_port: u16, mut next_port: impl FnMut() -> u16) -> (Proc, u16, u16) {
     prepare(dir);
     let mut taken = Vec::new();
     for _ in 0..3 {
-        let https_port = next_port();
-        match boot(dir, origin_port, https_port) {
-            Ok(z) => return (z, https_port),
+        let (https_port, http_port) = (next_port(), free_port());
+        match boot(dir, origin_port, https_port, http_port) {
+            Ok(z) => return (z, https_port, http_port),
             Err(log) => {
-                eprintln!("zion could not bind port {https_port}; booting it on fresh ports");
-                taken.push(format!("port {https_port}:\n{log}"));
+                eprintln!(
+                    "zion could not bind port {https_port} or {http_port}; booting it on fresh ports"
+                );
+                taken.push(format!("ports {https_port} and {http_port}:\n{log}"));
             }
         }
     }
     panic!(
-        "zion could not bind its port on three boots in a row:\n{}",
+        "zion could not bind its ports on three boots in a row:\n{}",
         taken.join("\n")
     );
 }
@@ -369,8 +384,9 @@ fn ready_file(dir: &Path) -> String {
     format!("ready-{name}.txt")
 }
 
-/// Start zion on `https_port` with the files `prepare` wrote in `dir`, and return it once it
-/// serves: its log says it bound that port, and it answers 200 for the file only `dir` holds.
+/// Start zion on `https_port` and `http_port` with the files `prepare` wrote in `dir`, and return
+/// it once it serves: its log says it bound both ports, and it answers 200 for the file only `dir`
+/// holds.
 ///
 /// A port that accepts a TCP connection is not enough. `free_port` releases the port before zion
 /// binds it, and on macOS this process can lose it in between: the standard library marks a new
@@ -384,13 +400,15 @@ fn ready_file(dir: &Path) -> String {
 /// Zion exits with code 4 when it cannot bind its HTTPS listener, and with code 3 and
 /// `bind QUIC on <addr>: Address already in use` when the UDP port is taken: either returns
 /// `Err` with its log, for `start` to boot again on fresh ports. Any other exit fails the test.
-fn boot(dir: &Path, origin_port: u16, https_port: u16) -> Result<Proc, String> {
+/// A plaintext port it cannot bind does not stop zion (it logs a warning and serves HTTPS alone),
+/// so that warning also returns `Err`, after this stops the zion that logged it.
+fn boot(dir: &Path, origin_port: u16, https_port: u16, http_port: u16) -> Result<Proc, String> {
     let (cert, key) = (dir.join("c.pem"), dir.join("k.pem"));
     let www = dir.join("www");
     fs::write(
         dir.join("zion.toml"),
         format!(
-            "[server]\nlisten_http = \"127.0.0.1:{}\"\nlisten_https = \"127.0.0.1:{https_port}\"\n\n\
+            "[server]\nlisten_http = \"127.0.0.1:{http_port}\"\nlisten_https = \"127.0.0.1:{https_port}\"\n\n\
              [tls]\ncert_path = \"{}\"\nkey_path = \"{}\"\nhot_reload = false\n\n\
              [upstream.backend]\nurl = \"http://127.0.0.1:{origin_port}\"\n\n\
              [upstream.ph]\nurl = \"http://127.0.0.1:{origin_port}\"\npreserve_host = true\n\n\
@@ -401,7 +419,6 @@ fn boot(dir: &Path, origin_port: u16, https_port: u16) -> Result<Proc, String> {
              [[route]]\npath = \"/cache/{{*rest}}\"\nupstream = \"backend\"\nmode = \"standard\"\ncache_profile = \"short\"\n\n\
              [[route]]\npath = \"/ws/{{*rest}}\"\nupstream = \"backend\"\nmode = \"websocket\"\n\n\
              [[route]]\npath = \"/{{*rest}}\"\nupstream = \"backend\"\nmode = \"standard\"\n",
-            free_port(),
             cert.to_string_lossy(),
             key.to_string_lossy(),
             www = www.to_string_lossy(),
@@ -421,6 +438,8 @@ fn boot(dir: &Path, origin_port: u16, https_port: u16) -> Result<Proc, String> {
     let mut z = Proc(child);
     // Printed with `eprintln!` right after the bind, so it is in the file once the port is zion's.
     let bound = format!("listening HTTPS on 127.0.0.1:{https_port}");
+    let bound_http = format!("listening HTTP  on 127.0.0.1:{http_port}");
+    let http_taken = format!("HTTP listener on 127.0.0.1:{http_port} unavailable");
     let ready = format!(
         "GET /s/{} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         ready_file(dir)
@@ -436,7 +455,14 @@ fn boot(dir: &Path, origin_port: u16, https_port: u16) -> Result<Proc, String> {
             panic!("zion exited at boot ({status}):\n{log}");
         }
         let log = fs::read_to_string(&log_path).unwrap_or_default();
-        if log.contains(&bound) && code(&send(https_port, ready.as_bytes())) == 200 {
+        if log.contains(&http_taken) {
+            drop(z);
+            return Err(log);
+        }
+        if log.contains(&bound)
+            && log.contains(&bound_http)
+            && code(&send(https_port, ready.as_bytes())) == 200
+        {
             return Ok(z);
         }
         assert!(
@@ -1172,6 +1198,264 @@ fn http2_parity_status_and_vary_passthrough() {
     }
 
     eprintln!("\n=== HTTP conformance matrix (slice 4: HTTP/2, status, Vary) ===");
+    for (case, outcome) in &matrix {
+        eprintln!("  {case:30}  {outcome}");
+    }
+    eprintln!("=== end matrix ===\n");
+}
+
+/// Accepts the suite's self-signed certificate.
+#[derive(Debug)]
+struct AnyCert;
+impl rustls::client::danger::ServerCertVerifier for AnyCert {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// One HTTP/2 POST of `body` whose HEADERS carry one `content-length` line per entry of
+/// `declared`, as written: hyper's h2 client adds no length to a request that has one, and an
+/// empty body ends the stream with the HEADERS. zion's status, or 0 when the stream failed.
+async fn h2_post_declaring(port: u16, path: &str, declared: &[&str], body: &'static [u8]) -> u16 {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let mut cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCert))
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            tcp,
+        )
+        .await
+        .unwrap();
+    h2_send_declaring(tls, &format!("https://localhost{path}"), declared, body).await
+}
+
+/// [`h2_post_declaring`] in cleartext to the plaintext listener, which speaks HTTP/2 to a client
+/// that opens with the connection preface (h2c with prior knowledge).
+async fn h2c_post_declaring(port: u16, path: &str, declared: &[&str], body: &'static [u8]) -> u16 {
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    h2_send_declaring(tcp, &format!("http://localhost{path}"), declared, body).await
+}
+
+/// One HTTP/2 POST to `uri` over `io`, as [`h2_post_declaring`] describes.
+async fn h2_send_declaring<T>(io: T, uri: &str, declared: &[&str], body: &'static [u8]) -> u16
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut send, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(io),
+    )
+    .await
+    .unwrap();
+    tokio::spawn(conn);
+    let mut req = hyper::Request::post(uri);
+    for value in declared {
+        req = req.header("content-length", *value);
+    }
+    let req = req
+        .body(http_body_util::Full::new(bytes::Bytes::from_static(body)))
+        .unwrap();
+    match send.send_request(req).await {
+        Ok(resp) => resp.status().as_u16(),
+        Err(_) => 0,
+    }
+}
+
+/// The `content-length` lines of the head the origin recorded for `POST /<marker>`.
+fn origin_content_lengths(seen: &Arc<Mutex<Vec<String>>>, marker: &str) -> Vec<String> {
+    let start = format!("POST /{marker} ");
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|h| h.lines().next().is_some_and(|l| l.starts_with(&start)))
+        .flat_map(|h| {
+            h.lines()
+                .skip(1)
+                .filter_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().to_string())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[test]
+fn http2_content_length_is_one_valid_length_and_is_reframed_from_the_body() {
+    if !have_openssl() {
+        common::skip("http_conformance slice 4: openssl not installed");
+        return;
+    }
+    let dir = tempdir();
+    let (origin_port, seen) = origin();
+    let (_zion, port, http_port) = start_with_http(&dir, origin_port);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let post = |path: &str, declared: &[&str], body: &'static [u8]| {
+        rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                h2_post_declaring(port, path, declared, body),
+            )
+            .await
+            .unwrap_or(0)
+        })
+    };
+    let post_h2c = |path: &str, declared: &[&str], body: &'static [u8]| {
+        rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                h2c_post_declaring(http_port, path, declared, body),
+            )
+            .await
+            .unwrap_or(0)
+        })
+    };
+
+    let mut matrix: Vec<(String, String)> = Vec::new();
+    let mut record = |case: &str, outcome: String| matrix.push((case.to_string(), outcome));
+
+    // ---- Refused: lines that do not declare one length (RFC 9113 §8.1.1) ----
+    // h2 checks only the first line against the DATA frames; the rest went upstream as written,
+    // so `0` then `1000` on a request that ended with its headers told the upstream to wait for
+    // 1000 bytes zion never sent.
+    for (marker, declared, body) in [
+        ("h2cl-zero-then-1000", &["0", "1000"][..], &b""[..]),
+        ("h2cl-5-then-1000", &["5", "1000"], b"hello"),
+        ("h2cl-5-then-nan", &["5", "five"], b"hello"),
+    ] {
+        let c = post(&format!("/{marker}"), declared, body);
+        let saw = origin_saw_method(&seen, "POST", marker);
+        record(
+            &format!("h2 Content-Length {declared:?}"),
+            format!("zion {c}, forwarded ({saw})"),
+        );
+        assert_eq!(
+            c, 400,
+            "{declared:?}: an HTTP/2 request with these lines is malformed"
+        );
+        assert!(
+            !saw,
+            "{declared:?}: the malformed request reached the upstream"
+        );
+    }
+
+    // A first line that is not a number is h2's to refuse, and it does so by resetting the
+    // stream (PROTOCOL_ERROR) before zion sees the request: no status, nothing forwarded. A
+    // first line of `5, 5` too, which zion's own parser reads as one length.
+    for (marker, declared) in [
+        ("h2cl-nan-first", &["five"][..]),
+        ("h2cl-list-first", &["5, 5"]),
+    ] {
+        let c = post(&format!("/{marker}"), declared, b"hello");
+        let saw = origin_saw_method(&seen, "POST", marker);
+        record(
+            &format!("h2 Content-Length {declared:?}"),
+            format!("zion {c} (0: stream reset), forwarded ({saw})"),
+        );
+        assert_eq!(c, 0, "{declared:?}: h2 resets the stream");
+        assert!(
+            !saw,
+            "{declared:?}: the malformed request reached the upstream"
+        );
+    }
+
+    // ---- The plaintext listener, which forwards an ACME challenge it does not hold ----
+    // It speaks HTTP/2 to a client that opens with the preface, and its ACME fallback forwards
+    // without the HTTPS pipeline: the same lines went upstream from there.
+    for (marker, declared, body) in [
+        ("h2c-zero-then-1000", &["0", "1000"][..], &b""[..]),
+        ("h2c-5-then-1000", &["5", "1000"], b"hello"),
+    ] {
+        let marker = format!(".well-known/acme-challenge/{marker}");
+        let c = post_h2c(&format!("/{marker}"), declared, body);
+        let saw = origin_saw_method(&seen, "POST", &marker);
+        record(
+            &format!("h2c :80 Content-Length {declared:?}"),
+            format!("zion {c}, forwarded ({saw})"),
+        );
+        assert_eq!(
+            c, 400,
+            "{declared:?} over h2c to the plaintext listener: malformed"
+        );
+        assert!(
+            !saw,
+            "{declared:?} over h2c: the malformed request reached the upstream"
+        );
+    }
+    // A well-formed POST is not forwarded either: the fallback takes only a bodyless GET or HEAD
+    // (an HTTP-01 fetch) and redirects the rest to HTTPS, where the TLS cases below check the
+    // re-framing.
+    let marker = ".well-known/acme-challenge/h2c-once";
+    let c = post_h2c(&format!("/{marker}"), &["5"], b"hello");
+    let saw = origin_saw_method(&seen, "POST", marker);
+    record(
+        "h2c :80 Content-Length [\"5\"]",
+        format!("zion {c}, forwarded ({saw})"),
+    );
+    assert!(
+        (300..400).contains(&c) && !saw,
+        "{marker}: a POST to the :80 fallback is redirected, not forwarded (zion {c}, forwarded {saw})"
+    );
+
+    // ---- Re-framed: the upstream gets one length, the one of the body zion sends ----
+    for (marker, declared) in [("h2cl-once", &["5"][..]), ("h2cl-twice", &["5", "5"])] {
+        let c = post(&format!("/{marker}"), declared, b"hello");
+        assert!(origin_saw_method(&seen, "POST", marker), "{marker}");
+        let forwarded = origin_content_lengths(&seen, marker);
+        record(
+            &format!("h2 Content-Length {declared:?}"),
+            format!("zion {c}, upstream Content-Length {forwarded:?}"),
+        );
+        assert_eq!(c, 200, "{declared:?}");
+        assert_eq!(
+            forwarded,
+            ["5"],
+            "{declared:?}: one line, the body's length"
+        );
+    }
+
+    eprintln!("\n=== HTTP conformance matrix (slice 4: HTTP/2 Content-Length) ===");
     for (case, outcome) in &matrix {
         eprintln!("  {case:30}  {outcome}");
     }

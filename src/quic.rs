@@ -241,13 +241,9 @@ pub fn spawn_quic_listener(
 
 /// Send an H3 error response.
 ///
-/// Reserved for the QUIC error path; not currently called by the
-/// `quic.rs` request loop, which lets hyper translate WAF/router denials
-/// into HTTP responses on the H3 stream like any other status. Kept as a
-/// documented helper because reaching for it again is the natural fix
-/// the next time the H3 path needs to short-circuit before constructing
-/// a `Response`.
-#[allow(dead_code)]
+/// For a request refused before it is bridged into the pipeline (a `Content-Length` that is
+/// not one valid length); the pipeline's own denials (WAF, router) come back as a `Response`
+/// and are sent like any other status.
 async fn h3_error_response<S>(
     stream: &mut h3::server::RequestStream<S, Bytes>,
     status: hyper::StatusCode,
@@ -282,6 +278,64 @@ pub(crate) fn bridge_request(
     hyper::Request::from_parts(parts, body)
 }
 
+/// An HTTP/3 request body whose DATA frames do not add up to the `Content-Length` its headers
+/// declared: RFC 9114 §4.1.2 makes the request malformed, and an intermediary must not forward
+/// it. h3 does not check the length, so the bridge does.
+#[derive(Debug)]
+struct BodyLengthMismatch {
+    declared: u64,
+    /// What had arrived when the mismatch was seen: all of it at the end of the stream, or the
+    /// first count past `declared`.
+    received: u64,
+}
+
+impl std::fmt::Display for BodyLengthMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.received > self.declared {
+            write!(
+                f,
+                "request body longer than its Content-Length of {} bytes ({} or more arrived)",
+                self.declared, self.received
+            )
+        } else {
+            write!(
+                f,
+                "request body ended at {} of the {} bytes its Content-Length declared",
+                self.received, self.declared
+            )
+        }
+    }
+}
+
+impl std::error::Error for BodyLengthMismatch {}
+
+/// How many times in a row h3 has to answer `recv_data` with `Ok(None)` before the bridge
+/// takes a request body as ended. h3 0.0.8 answers `Ok(None)` at a zero-length DATA frame as
+/// it does at the end of the stream (hyperium/h3#372), and DATA may follow such a frame: RFC
+/// 9114 does not forbid one. Asked again, h3 reads on to the next frame, while at the end of
+/// the stream it answers `Ok(None)` again at once. So a run of up to 15 empty DATA frames is
+/// read through, and a 16th in a row still ends the body there.
+const H3_BODY_END_ANSWERS: usize = 16;
+
+/// The next DATA of a request body, `None` once h3 has answered [`H3_BODY_END_ANSWERS`] times
+/// in a row that the body ended. A trailer section is also answered `Ok(None)`, and what
+/// follows one is read on as more of the body.
+async fn recv_body_data<R>(
+    stream: &mut h3::server::RequestStream<R, Bytes>,
+) -> Result<Option<Bytes>, h3::error::StreamError>
+where
+    R: h3::quic::RecvStream,
+{
+    use bytes::Buf;
+    for _ in 0..H3_BODY_END_ANSWERS {
+        if let Some(mut buf) = stream.recv_data().await? {
+            let n = buf.remaining();
+            return Ok(Some(buf.copy_to_bytes(n)));
+        }
+    }
+    Ok(None)
+}
+
 /// Log an HTTP/3 request that failed inside zion, a few lines every ten seconds at most
 /// (a peer can make this happen as often as it likes). Without it the only trace is a
 /// `500` in the metrics.
@@ -310,7 +364,7 @@ fn log_h3_failure(remote: &SocketAddr, method: &str, path: &str, what: &str) {
 ///  10. Metrics recording
 async fn handle_h3_request<S>(
     req: hyper::Request<()>,
-    stream: h3::server::RequestStream<S, Bytes>,
+    mut stream: h3::server::RequestStream<S, Bytes>,
     state: Arc<crate::state::AppState>,
     remote_addr: SocketAddr,
     client_fp: Option<Arc<str>>,
@@ -319,6 +373,53 @@ where
     S: h3::quic::BidiStream<Bytes>,
     <S as h3::quic::BidiStream<Bytes>>::RecvStream: Send + 'static,
 {
+    // RFC 9114 §4.1.2: a request whose `Content-Length` is not one valid length is malformed,
+    // and h3 does not look at the header. Forwarded as it was, its lines reached the upstream
+    // whatever the body turned out to be.
+    let Ok(declared) = crate::http_util::content_length(req.headers()) else {
+        log_h3_failure(
+            &remote_addr,
+            req.method().as_str(),
+            req.uri().path(),
+            "request refused: its Content-Length is not one valid length",
+        );
+        crate::metrics::METRICS.record_status(400);
+        return h3_error_response(&mut stream, hyper::StatusCode::BAD_REQUEST).await;
+    };
+
+    // A body declared empty must end empty, and the upstream request sends no body for it:
+    // hyper never reads a body whose `Content-Length` is 0, so DATA after such headers was
+    // dropped unseen and the request answered as if it were whole. Its end is waited for here,
+    // before the request goes on (a client that sends no body ends the stream with its HEADERS),
+    // past any zero-length DATA frame, as [`recv_body_data`] reads it.
+    if declared == Some(0) {
+        let refused = match tokio::time::timeout(
+            crate::dispatch::BODY_FRAME_IDLE_TIMEOUT,
+            recv_body_data(&mut stream),
+        )
+        .await
+        {
+            Ok(Ok(None)) => None,
+            Ok(Ok(Some(_))) => Some((
+                hyper::StatusCode::BAD_REQUEST,
+                "request refused: DATA after a Content-Length of 0".to_string(),
+            )),
+            Ok(Err(e)) => Some((
+                hyper::StatusCode::BAD_REQUEST,
+                format!("request body stream broke: {e}"),
+            )),
+            Err(_elapsed) => Some((
+                hyper::StatusCode::REQUEST_TIMEOUT,
+                "request refused: no end to a body declared empty".to_string(),
+            )),
+        };
+        if let Some((status, why)) = refused {
+            log_h3_failure(&remote_addr, req.method().as_str(), req.uri().path(), &why);
+            crate::metrics::METRICS.record_status(status.as_u16());
+            return h3_error_response(&mut stream, status).await;
+        }
+    }
+
     // Bridge HTTP/3 QUIC connection directly into the universal pipeline
     let (mut send_stream, mut recv_stream) = stream.split();
     let (tx, rx) = tokio::sync::mpsc::channel::<
@@ -330,13 +431,41 @@ where
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
 
-    // Spawn task to sequentially copy HTTP/3 request payload chunks into the Request stream body
+    // Spawn task to sequentially copy HTTP/3 request payload chunks into the Request stream body.
+    // A declared `Content-Length` holds the body to it, as h2 holds an HTTP/2 one: the body ends
+    // with a `BodyLengthMismatch` at a FIN short of the length, or instead of the DATA that
+    // would go past it, so whatever reads it (the WAF, a buffer, the upstream request) sees a
+    // broken body and never a whole one of another length.
+    //
+    // The DATA that brings the body to its declared length is held back until the stream says
+    // whether more follows. Handed on at once, it let the upstream request write its last
+    // declared byte, and hyper reads no further than that: DATA past the length, arriving
+    // after it, went unseen, and the declared bytes went upstream as the whole body.
+    //
+    // The receive half is never asked to stop here: h3-quinn panics on `stop_sending` while a
+    // read of the stream is in flight (it unwraps the stream the read holds). It is dropped
+    // when this task ends instead, and quinn then sends STOP_SENDING for the bytes not read.
+    //
+    // The body ends where [`recv_body_data`] says so, not at h3's first `Ok(None)`: that comes
+    // at a zero-length DATA frame too, and ending there handed on the bytes before it as the
+    // whole body, with or without a `Content-Length`.
     let body_log = (remote_addr, method.clone(), path.clone());
     tokio::spawn(async move {
+        let mut received: u64 = 0;
+        let mut last: Option<Bytes> = None;
         loop {
-            let mut buf = match recv_stream.recv_data().await {
-                Ok(Some(buf)) => buf,
-                Ok(None) => break,
+            let bytes = match recv_body_data(&mut recv_stream).await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    if let Some(declared) = declared.filter(|&d| d != received) {
+                        let e = BodyLengthMismatch { declared, received };
+                        log_h3_failure(&body_log.0, &body_log.1, &body_log.2, &e.to_string());
+                        let _ = tx.send(Err(Box::new(e))).await;
+                    } else if let Some(last) = last.take() {
+                        let _ = tx.send(Ok(hyper::body::Frame::data(last))).await;
+                    }
+                    break;
+                }
                 // The stream broke: the body ends with the error, so whatever reads it (the
                 // WAF, a buffer, the upstream request) sees a broken body. Ending it cleanly
                 // would hand on what had arrived as the whole body.
@@ -351,9 +480,20 @@ where
                     break;
                 }
             };
-            use bytes::Buf;
-            let rem = buf.remaining();
-            let bytes = bytes::Buf::copy_to_bytes(&mut buf, rem);
+            if bytes.is_empty() {
+                continue;
+            }
+            received = received.saturating_add(bytes.len() as u64);
+            if let Some(declared) = declared.filter(|&d| received > d) {
+                let e = BodyLengthMismatch { declared, received };
+                log_h3_failure(&body_log.0, &body_log.1, &body_log.2, &e.to_string());
+                let _ = tx.send(Err(Box::new(e))).await;
+                break;
+            }
+            if declared == Some(received) {
+                last = Some(bytes);
+                continue;
+            }
             if tx.send(Ok(hyper::body::Frame::data(bytes))).await.is_err() {
                 break;
             }

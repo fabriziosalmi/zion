@@ -30,8 +30,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-/// The route's body cap, in bytes, for a request whose body has no declared length. The
-/// request carries it as an extension from the body gate to the proxy, which applies it when
+/// The route's body cap, in bytes, for a request body zion streams on without having counted
+/// it: one with no declared length past the body gate, or one a shadow-mode WAF flagged while
+/// it streamed in. The request carries it as an extension to the proxy, which applies it when
 /// it hands the body to the upstream client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BodyCap(pub u64);

@@ -121,6 +121,16 @@ status is passed through unchanged on both HTTP/1.1 and HTTP/2 for 2xx, 3xx, 4xx
 5xx (an origin `5xx` is forwarded, not rewritten to `502`, which is reserved for a
 dead upstream).
 
+| HTTP/2 request | Behaviour |
+|---|---|
+| `content-length` lines that do not declare one valid length (`0` then `1000`, `5` then `1000`, `5` then `five`) | malformed (RFC 9113 §8.1.1): refused with `400` before routing, never forwarded, on the TLS listener and in h2c on the plaintext one (whose ACME fallback forwards) |
+| a first `content-length` line that is not a number (`five`, `5, 5`) | refused by h2 itself: the stream is reset (`PROTOCOL_ERROR`), no status is sent, never forwarded |
+| one valid length, on one line or repeated (`5`, or `5` and `5`) | forwarded with one `Content-Length`: the length of the body Zion sends |
+
+The `Content-Length` Zion sends upstream always comes from the body it sends, on every
+protocol; the client's lines are never copied. h2 checks only the first `content-length`
+line against the DATA frames, so a second line used to reach the upstream as written.
+
 ## Caching and `Vary`
 
 A `cache_profile` route caches a `GET 200`. When the upstream marks a response
@@ -140,4 +150,26 @@ requires before a client (a browser) completes the handshake.
 ## Not yet pinned
 
 `1xx` interim responses other than `100 Continue` (for example `103 Early Hints`),
-multi-range requests, and HTTP/3 parity are not yet covered by the suite.
+multi-range requests, and HTTP/3 parity are not yet covered by the suite. HTTP/3 request
+bodies are pinned apart, by
+[`tests/h3_request_body.rs`](https://github.com/fabriziosalmi/zion/blob/master/tests/h3_request_body.rs)
+(needs `--features http3`). `content-length` lines that do not declare one length are
+refused with `400` before routing. A body shorter or longer than its `Content-Length` never
+reaches the upstream as a whole body, on a streamed route, a WAF route and a
+`require_content_length` route alike (RFC 9114 §4.1.2; h3 checks neither). A route that reads
+it first (a WAF, `require_content_length`) refuses it with `400` and forwards nothing. A
+streamed route aborts the upstream request: the client gets `400`, unless the upstream
+answered before it read the body, in which case the client gets that response, status
+included. The upstream request reads a body no further than its
+declared length, so the DATA that completes the length is held back until the stream shows
+whether more follows, and a body declared `0` is read to its end before the request goes on
+(DATA after it is refused before anything is forwarded). h3 0.0.8 reports a zero-length DATA
+frame as the end of the body ([hyperium/h3#372](https://github.com/hyperium/h3/issues/372)), so
+Zion asks again before it takes a body as ended, and a run of up to 15 empty DATA frames is
+read through: a body with empty frames inside reaches the upstream whole, and DATA past the
+length after them is refused. Not covered: a 16th empty DATA frame in a row still ends the body
+there, so a body past its length then goes upstream cut at the length, and a body without a
+`Content-Length` cut at that run. h3 reports a trailer section the same way, so DATA after one,
+an invalid frame sequence that RFC 9114 §4.1 makes a connection error (`H3_FRAME_UNEXPECTED`),
+is read as more of the body. The WAF, a buffer and the upstream
+request read the body from the same place, so a cut body is the same cut body for all of them.
