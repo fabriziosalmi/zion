@@ -3,8 +3,8 @@
 What Zion does with each shape of request: forward it unchanged, refuse it, or
 re-frame it. Every row below is asserted on the real TLS listener against a real
 origin by [`tests/http_conformance.rs`](https://github.com/fabriziosalmi/zion/blob/master/tests/http_conformance.rs)
-(issue #741), so this page is the HTTP contract and a behaviour change fails the
-suite. It is the positive counterpart to the request-smuggling corpus
+(issue #741), or by the test file its row or section names, so this page is the HTTP
+contract and a behaviour change fails the suite. It is the positive counterpart to the request-smuggling corpus
 ([`tests/http1_smuggling_corpus.rs`](https://github.com/fabriziosalmi/zion/blob/master/tests/http1_smuggling_corpus.rs),
 #697), which proves the negative: no desync form reaches the upstream.
 
@@ -33,12 +33,19 @@ for byte) and an HTTP/2 client (`curl --http2`).
 `Connection`, `Keep-Alive`, `Upgrade`, and any header named in a `Connection`
 token are stripped before the upstream. Ordinary end-to-end headers are forwarded.
 
+The upstream's response is treated the same way before it reaches the client or the cache:
+the hop-by-hop set (with `Proxy-Authenticate` and `Proxy-Authentication-Info`, which are for
+zion) and every field named on any of its `Connection` lines, read as bytes, are removed. The
+origin's `Alt-Svc` is not passed on either: zion sends its own with `--features http3`, and none
+without it.
+
 ## Request-target forms
 
 | Form | Behaviour |
 |---|---|
 | origin-form (`/path`) | forwarded |
-| absolute-form (`http://host/path`) | accepted and re-framed to origin-form upstream; the absolute URI and its authority never reach the upstream |
+| absolute-form (`http://host/path`) | accepted and re-framed to origin-form upstream; the absolute URI never reaches the upstream. Its authority, not a `Host` sent with it, is the request's host (RFC 9112 §3.2.2): zion routes and caches on it and tells the upstream that one in `X-Forwarded-Host` (and as `Host` with `preserve_host`) |
+| absolute-form with userinfo (`http://user:pass@host/path`, `http://host@other.example/path`) | refused (`400`) before routing, on the TLS listener (its `/healthz` and `/readyz` fast path included) and on `:80` (the ACME fallback included), never forwarded. The same for an HTTP/2 or HTTP/3 `:authority` with userinfo. RFC 9110 §4.2.4 has a recipient treat userinfo in an `http(s)` URI as an error (it hides the real host), RFC 9113 §8.3.1 and RFC 9114 §4.3.1 forbid it in `:authority`. Asserted on each listener and protocol by `tests/authority_userinfo.rs` |
 | asterisk-form (`OPTIONS *`) | refused (`404`), never forwarded |
 | authority-form (`CONNECT host:port`) | refused (`405`), never forwarded |
 
@@ -46,8 +53,8 @@ token are stripped before the upstream. Ordinary end-to-end headers are forwarde
 
 | Route | `Host` sent upstream |
 |---|---|
-| default | rewritten to the upstream authority; the client's original `Host` is carried in `X-Forwarded-Host` |
-| `preserve_host = true` | the client's `Host` is forwarded as-is (HTTP/1.1 only) |
+| default | rewritten to the upstream authority; the request's host (the target's authority when it has one, else the client's `Host`) is carried in `X-Forwarded-Host` |
+| `preserve_host = true` | the request's host is forwarded as-is (HTTP/1.1 only) |
 
 ## Expect: 100-continue
 
@@ -80,7 +87,7 @@ from Zion, then the request is forwarded.
 | `Accept-Encoding: br` on a `compress` route | `Content-Encoding: br`, `Vary: Accept-Encoding`, `Content-Length` dropped |
 | `Accept-Encoding: gzip` | `Content-Encoding: gzip` |
 | no `Accept-Encoding` | identity |
-| a secret-bearing response (`Set-Cookie` / `Cache-Control: private`) | identity unless the route sets `allow_cookied` (BREACH guard, [ADR-0025](https://github.com/fabriziosalmi/zion/blob/master/docs/adr/0025-response-compression.md)) |
+| a secret-bearing response (`Set-Cookie`, or `private` on any `Cache-Control` line) | identity unless the route sets `allow_cookied` (BREACH guard, [ADR-0025](https://github.com/fabriziosalmi/zion/blob/master/docs/adr/0025-response-compression.md)) |
 
 Built without the feature, a `compress` route serves identity.
 
@@ -98,7 +105,8 @@ A `cache_profile` route caches a `GET 200`. When the upstream marks a response
 `Vary: Accept-Encoding`, Zion keys the cache by that variant: a repeated request
 with the same `Accept-Encoding` is served from the cache (the upstream is not asked
 again), while a different `Accept-Encoding` is a separate variant. An upstream's
-`Vary` header is forwarded to the client.
+`Vary` header is forwarded to the client, on a cache hit as on the miss (with the
+origin's other end-to-end headers; `tests/cache_hit_origin_headers.rs`).
 
 ## WebSocket upgrade
 

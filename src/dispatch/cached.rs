@@ -32,7 +32,11 @@ struct Cx<'a> {
     identity_primary: String,
     takes_identity: bool,
     cache_key: String,
+    /// The `Vary` rule `cache_key` was built from (`None`: `primary_key` does not vary).
+    cache_filed: Option<Arc<vary::VaryRule>>,
     identity_key: Option<String>,
+    /// The `Vary` rule `identity_key` was built from.
+    identity_filed: Option<Arc<vary::VaryRule>>,
     /// `request_timeout_ms` of the route's upstream: how long a cache fill may go without
     /// progress before it is given up.
     fill_idle: std::time::Duration,
@@ -46,6 +50,13 @@ struct Lookup {
     stale_entry: Option<cache::CacheHit>,
     /// The key the entry being revalidated lives under (its own key or the identity key).
     found_key: String,
+    /// The `Vary` rule `found_key` was built from when the entry was looked up (`None`: it does
+    /// not vary): the rule the entry was filed under, which a `304` to its revalidation is held to
+    /// ([`filed_key`]). Read once, here: a request that waits on another one's fetch keeps this
+    /// lookup, and by the time its own revalidation is answered another request may have filed a
+    /// `200` under a new `Vary`. Matched against that rule, the waiter's `304` with the new `Vary`
+    /// renewed the entry under the key that no longer varies, with the waiter's headers.
+    filed: Option<Arc<vary::VaryRule>>,
 }
 
 /// Where the response of a fetch is to be stored, and how fresh it is.
@@ -75,7 +86,7 @@ struct TeeEntry {
 /// Serve a request on a cached route.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle(
-    mut req: Request<ReqBody>,
+    req: Request<ReqBody>,
     state: Arc<AppState>,
     rule: &ResolvedRoute,
     remote_addr: SocketAddr,
@@ -133,7 +144,7 @@ pub(super) async fn handle(
     let (primary_key, identity_primary, takes_identity) = derive_keys(&req, normalize_query);
     // If this primary key's responses vary (RFC 9111 §4.1), the entry for THIS request
     // lives under a secondary key built from the varied request headers.
-    let Some(cache_key) = lookup_key(&state, &primary_key, req.headers()) else {
+    let Some((cache_key, cache_filed)) = filed_key(&state, &primary_key, req.headers()) else {
         return bypass_unkeyable(
             req,
             &state,
@@ -147,11 +158,12 @@ pub(super) async fn handle(
         .await;
     };
 
-    // Where the shared identity entry for this request would live.
-    let identity_key: Option<String> = if takes_identity {
-        lookup_key(&state, &identity_primary, req.headers())
+    // Where the shared identity entry for this request would live, and the rule it is filed under.
+    let (identity_key, identity_filed) = if takes_identity {
+        filed_key(&state, &identity_primary, req.headers())
+            .map_or((None, None), |(key, filed)| (Some(key), filed))
     } else {
-        None
+        (None, None)
     };
     let cx = Cx {
         state: &state,
@@ -171,7 +183,9 @@ pub(super) async fn handle(
         identity_primary,
         takes_identity,
         cache_key,
+        cache_filed,
         identity_key,
+        identity_filed,
         fill_idle: proxy::request_timeout(&req),
     };
 
@@ -190,7 +204,7 @@ pub(super) async fn handle(
     // `Miss` → fall through to a full fetch. Skipped when the client demanded a
     // fresh response (`no-cache` / `no-store`).
     let lookup = if !rcc_no_cache && !rcc_no_store {
-        match cx.ram_lookup(&mut req) {
+        match cx.ram_lookup(&req) {
             Ok(lookup) => lookup,
             Err(resp) => return Ok(resp),
         }
@@ -199,6 +213,7 @@ pub(super) async fn handle(
             revalidate: None,
             stale_entry: None,
             found_key: cx.cache_key.clone(),
+            filed: cx.cache_filed.clone(),
         }
     };
 
@@ -363,8 +378,16 @@ async fn bypass_unkeyable(
 
 impl Cx<'_> {
     /// Look the request up under its own key, then under the identity key. Returns the
-    /// outcome and the key (and primary key) it was found under.
-    fn find(&self) -> (cache::CacheLookup, String, String) {
+    /// outcome, the key it was found under, that key's primary key and the `Vary` rule the key was
+    /// built from.
+    fn find(
+        &self,
+    ) -> (
+        cache::CacheLookup,
+        String,
+        String,
+        Option<Arc<vary::VaryRule>>,
+    ) {
         let state = self.state;
         let own = state.static_cache.get(&self.cache_key);
         match (&own, &self.identity_key) {
@@ -372,15 +395,21 @@ impl Cx<'_> {
                 state.static_cache.get(ik),
                 ik.clone(),
                 self.identity_primary.clone(),
+                self.identity_filed.clone(),
             ),
-            _ => (own, self.cache_key.clone(), self.primary_key.clone()),
+            _ => (
+                own,
+                self.cache_key.clone(),
+                self.primary_key.clone(),
+                self.cache_filed.clone(),
+            ),
         }
     }
 
     /// The RAM lookup. `Err` is an answer: a fresh hit, or a stale one served inside its
     /// stale-while-revalidate window (the refresh runs in the background). `Ok` is a stale entry to
     /// revalidate, or nothing.
-    fn ram_lookup(&self, req: &mut Request<ReqBody>) -> Result<Lookup, Response<ZionBody>> {
+    fn ram_lookup(&self, req: &Request<ReqBody>) -> Result<Lookup, Response<ZionBody>> {
         let state = self.state;
         let rule = self.rule;
         let dyn_scheme = self.dyn_scheme;
@@ -390,7 +419,7 @@ impl Cx<'_> {
         let (identity_primary, breaker) = (&self.identity_primary, &self.breaker);
         let mut revalidate: Option<cache::CacheHit> = None;
         let mut stale_entry: Option<cache::CacheHit> = None;
-        let (outcome, at_key, at_primary) = self.find();
+        let (outcome, at_key, at_primary, filed) = self.find();
         let found_key = at_key.clone();
         match outcome {
             cache::CacheLookup::Fresh(hit) => {
@@ -404,11 +433,17 @@ impl Cx<'_> {
                 // background, so the client does not wait for the origin.
                 // `age_secs` is whole seconds (floored), so the real staleness is in
                 // [staleness, staleness + 1): `<` keeps us from ever serving past the
-                // window the origin allowed.
+                // window the origin allowed. A variant keyed on a header the refresh does not
+                // send is not refreshed in the background: it is answered as an entry without
+                // the window is (`refresh_sends_what_it_varies_on`). So is an entry whose last
+                // background refresh the origin answered with something that could not renew it
+                // (`CacheHit::refresh_refused`): this request's own headers may get it renewed.
                 let staleness = hit.age_secs.saturating_sub(hit.max_age_secs);
                 if hit.meta.stale_while_revalidate_secs > 0
                     && !hit.meta.must_revalidate
                     && staleness < hit.meta.stale_while_revalidate_secs
+                    && !hit.refresh_refused
+                    && refresh_sends_what_it_varies_on(filed.as_deref())
                 {
                     if client_conditional_hit(req.headers(), &hit.meta) {
                         return Err(not_modified_response(&hit));
@@ -417,9 +452,10 @@ impl Cx<'_> {
                         state: state.clone(),
                         key: Arc::from(at_key.as_str()),
                         identity_entry: at_primary == *identity_primary,
-                        primary_key: Arc::from(at_primary.as_str()),
+                        filed: filed.clone(),
                         stale: hit.clone(),
-                        request: swr_request(&req),
+                        request: swr_request(req),
+                        req_authenticated: self.req_authenticated,
                         client_spec: rule.client_spec(),
                         scheme: dyn_scheme.clone(),
                         authority: dyn_authority.clone(),
@@ -438,9 +474,11 @@ impl Cx<'_> {
                     return Err(cache_response(hit, "STALE-WHILE-REVALIDATE"));
                 }
                 // Only revalidate when we hold a validator; without one a
-                // conditional GET is pointless, so fall through to a full fetch.
+                // conditional GET is pointless, so fall through to a full fetch. The validators
+                // go on the request sent to the origin (`fetch`), not on the client's: a request
+                // waiting on this key is answered with its own headers (`join_flight`), and with
+                // zion's `If-None-Match` among them a plain `GET` got a bodiless `304`.
                 if hit.meta.etag.is_some() || hit.meta.last_modified.is_some() {
-                    add_conditional_headers(req.headers_mut(), &hit.meta);
                     revalidate = Some(hit);
                 }
             }
@@ -450,6 +488,7 @@ impl Cx<'_> {
             revalidate,
             stale_entry,
             found_key,
+            filed,
         })
     }
 
@@ -555,7 +594,7 @@ impl Cx<'_> {
     /// when the origin allowed one; a failed fetch falls back on the entry being revalidated.
     async fn fetch(
         &self,
-        req: Request<ReqBody>,
+        mut req: Request<ReqBody>,
         fetching: Fetching,
         lookup: Lookup,
     ) -> Result<Response<ZionBody>, hyper::Error> {
@@ -569,6 +608,7 @@ impl Cx<'_> {
             revalidate,
             stale_entry,
             found_key,
+            filed,
         } = lookup;
         // Opt-in circuit breaker: if the upstream's circuit is open, do not contact it. A stale
         // copy (when the origin allowed stale responses) stands in for it; otherwise the client
@@ -596,6 +636,11 @@ impl Cx<'_> {
         // The varied request headers must outlive `req`, which the fetch consumes: the
         // response may reveal (via `Vary`) which of them the entry is keyed on.
         let req_headers = req.headers().clone();
+        // A revalidation is conditional on the stored validators, and on nothing of the client's
+        // (`add_conditional_headers`).
+        if let Some(hit) = &revalidate {
+            add_conditional_headers(req.headers_mut(), &hit.meta);
+        }
 
         // RAM miss — fetch from upstream.
         // On error `fetching` is dropped. Waiters' wait_for() returns Err (channel
@@ -635,8 +680,15 @@ impl Cx<'_> {
             breaker_record(entry, resp.status(), probe.take());
         }
 
-        self.conclude(resp, revalidate, fetching, &found_key, &req_headers)
-            .await
+        self.conclude(
+            resp,
+            revalidate,
+            fetching,
+            &found_key,
+            filed.as_deref(),
+            &req_headers,
+        )
+        .await
     }
 
     /// What to do with the origin's answer: serve the stale copy when the origin failed
@@ -647,6 +699,7 @@ impl Cx<'_> {
         revalidate: Option<cache::CacheHit>,
         fetching: Fetching,
         found_key: &str,
+        filed: Option<&vary::VaryRule>,
         req_headers: &hyper::HeaderMap,
     ) -> Result<Response<ZionBody>, hyper::Error> {
         let state = self.state;
@@ -673,31 +726,47 @@ impl Cx<'_> {
         // store-and-serve path, replacing the stale entry with the new content.
         if let Some(hit) = revalidate {
             if resp.status() == StatusCode::NOT_MODIFIED {
-                let initial_age = upstream_age(resp.headers());
-                let effective_ttl = origin_freshness(resp.headers())
-                    .map(|o| o.min(cache_ttl))
-                    .unwrap_or(cache_ttl);
-                let mut refreshed_meta = (*hit.meta).clone();
-                if resp.headers().contains_key(hyper::header::CACHE_CONTROL) {
-                    refreshed_meta.stale_while_revalidate_secs = origin_swr(resp.headers());
-                    refreshed_meta.must_revalidate = forbids_stale(resp.headers());
-                }
-                // Skipped when a tag purge ran since this request began: it must not bring back an
-                // entry the purge may have just removed.
-                state.static_cache.refresh_checked(
-                    &found_key,
-                    hit.body.clone(),
-                    refreshed_meta,
-                    effective_ttl,
-                    initial_age,
-                    cache_max,
-                    tag_epoch,
+                // The 304's headers update the stored ones (RFC 9111 §4.3.4), for this answer,
+                // and for the entry when the 304 may update it (see `revalidated`: it answers
+                // this client's request, credentials included, and the entry is filed under the
+                // `Vary` rule it was found under, `Lookup::filed`).
+                let rv = revalidated(
+                    &hit.meta,
+                    resp.headers(),
+                    self.req_authenticated,
+                    cache_ttl,
+                    filed.map(|rule| rule.names.as_slice()),
                 );
-                fetching.stored(); // waiters observe the revived (fresh) entry
+                if rv.too_large() {
+                    state.static_cache.count_too_large();
+                }
+                if rv.renews() {
+                    // Skipped when a tag purge ran since this request began: it must not bring
+                    // back an entry the purge may have just removed.
+                    state.static_cache.refresh_checked(
+                        &found_key,
+                        hit.body.clone(),
+                        rv.meta.clone(),
+                        rv.ttl,
+                        rv.initial_age,
+                        cache_max,
+                        tag_epoch,
+                    );
+                    fetching.stored(); // waiters observe the revived (fresh) entry
+                } else {
+                    // A 304 whose `Vary` is not the entry's takes the entry out, so that the next
+                    // request misses and its `200` files the response under the new `Vary`
+                    // (`Revalidation::vary_changed`).
+                    if rv.vary_changed {
+                        state.static_cache.remove_unchanged(found_key, &hit);
+                    }
+                    // Served, and the entry stays stale (or is gone): waiters fetch for themselves.
+                    drop(fetching);
+                }
                 crate::metrics::METRICS
                     .cache_revalidations
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(cache_response(hit, "REVALIDATED"));
+                return Ok(revalidated_response(hit, rv));
             }
             // else: origin returned new content (200) or a non-304 status — drop the
             // stale hit and let the normal path below store/serve the fresh response.
@@ -716,8 +785,15 @@ impl Cx<'_> {
     }
 
     /// Decide whether the 200 is stored and under which key: its freshness (the origin's, capped by
-    /// the profile), the RFC 9111 storability gate, and the `Vary` policy.
-    fn plan_storage(&self, headers: &hyper::HeaderMap, req_headers: &hyper::HeaderMap) -> Storage {
+    /// the profile), the RFC 9111 storability gate, and the `Vary` policy. `headers_fit` is
+    /// whether an entry can hold its headers ([`cached_meta`]): a response that cannot is refused
+    /// here, before the `Vary` policy installs a rule or admits a variant for it.
+    fn plan_storage(
+        &self,
+        headers: &hyper::HeaderMap,
+        req_headers: &hyper::HeaderMap,
+        headers_fit: bool,
+    ) -> Storage {
         let state = self.state;
         let (cache_ttl, cache_max, max_object) = (self.cache_ttl, self.cache_max, self.max_object);
         let (takes_identity, rcc_no_store, req_authenticated) = (
@@ -745,14 +821,15 @@ impl Cx<'_> {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<usize>().ok())
             .is_some_and(|n| n > max_object);
-        if too_big {
-            metrics::METRICS
-                .cache_too_large
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        let cacheable = !rcc_no_store
-            && !too_big
+        let storable = !rcc_no_store
             && is_shared_cacheable(req_authenticated, headers, effective_ttl, initial_age);
+        // `zion_cache_too_large` counts what a limit alone kept out: a response that may not be
+        // stored anyway (`private`, a `Set-Cookie`, a request's `no-store`) is not counted however
+        // large it is.
+        if storable && (too_big || !headers_fit) {
+            state.static_cache.count_too_large();
+        }
+        let cacheable = storable && !too_big && headers_fit;
         // Where the entry lives: the primary key, or — when the response varies — the
         // secondary key of THIS request's varied headers (bounded; see `vary`).
         // An identity body the origin did not select by Accept-Encoding goes under the
@@ -810,14 +887,19 @@ impl Cx<'_> {
         req_headers: &hyper::HeaderMap,
     ) -> Response<ZionBody> {
         let (parts, body) = resp.into_parts();
+        // What the entry keeps of the response, its end-to-end headers included, so that a hit
+        // carries what this miss carries. `None`: headers too large to keep, and the response
+        // is streamed, not stored (see `plan_storage`).
+        let meta = cached_meta(parts.status, &parts.headers);
         let Storage {
             initial_age,
             effective_ttl,
             cacheable,
             store_key,
-        } = self.plan_storage(&parts.headers, req_headers);
+        } = self.plan_storage(&parts.headers, req_headers, meta.is_some());
 
-        let Some(store_key) = store_key else {
+        // (`store_key` is `None` whenever `meta` is: the headers that do not fit are refused there.)
+        let (Some(store_key), Some(meta)) = (store_key, meta) else {
             // Stream the body straight to the client without caching.
             // Drop the registration (no `true` sent): waiters fetch for themselves,
             // since the cache will not be populated for this key.
@@ -849,24 +931,6 @@ impl Cx<'_> {
                 hyper::header::HeaderValue::from_static("BYPASS"),
             );
             return resp;
-        };
-
-        // Preserve Content-Type and Content-Encoding for cache (S-05 fix).
-        // Without Content-Encoding, gzip-compressed bodies are served garbled.
-        let content_type = parts.headers.get(hyper::header::CONTENT_TYPE).cloned();
-        let content_encoding = parts.headers.get(hyper::header::CONTENT_ENCODING).cloned();
-        // Preserve validators for conditional requests (client If-None-Match →
-        // 304; origin revalidation in a later phase).
-        let etag = parts.headers.get(hyper::header::ETAG).cloned();
-        let last_modified = parts.headers.get(hyper::header::LAST_MODIFIED).cloned();
-        let meta = cache::CachedMeta {
-            content_type,
-            content_encoding,
-            status: parts.status,
-            etag,
-            last_modified,
-            stale_while_revalidate_secs: origin_swr(&parts.headers),
-            must_revalidate: forbids_stale(&parts.headers),
         };
 
         let (sender, receiver) =
@@ -971,9 +1035,7 @@ fn spawn_tee(
                                 total_bytes += data.len();
                                 if total_bytes > max_object {
                                     cache_aborted = true; // Stop buffering, but continue streaming!
-                                    metrics::METRICS
-                                        .cache_too_large
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    state_clone.static_cache.count_too_large();
                                 } else {
                                     cache_buffer.extend_from_slice(&data);
                                 }

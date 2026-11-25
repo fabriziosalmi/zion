@@ -13,7 +13,7 @@ When `--features http3` is enabled:
 1. Zion binds a **UDP socket** on the same HTTPS port (default `:443`)
 2. QUIC connections are handled via the `quinn` library
 3. HTTP/3 semantics via the `h3` library
-4. The `Alt-Svc` header is automatically injected on HTTP/1.1 and HTTP/2 responses to advertise HTTP/3 availability
+4. The `Alt-Svc` header is automatically injected on HTTP/1.1 and HTTP/2 responses to advertise HTTP/3 availability, in place of any `Alt-Svc` the origin sent (a build without the feature removes the origin's)
 
 ```http
 Alt-Svc: h3=":443"; ma=86400

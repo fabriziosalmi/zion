@@ -409,7 +409,8 @@ pub struct Metrics {
     /// Stale entries served because the origin failed while revalidating (stale-if-error).
     pub cache_stale_if_error: ShardedCounter,
     /// Responses not stored because they exceeded the profile's `max_object_mb`
-    /// (declared up front, or discovered while streaming).
+    /// (declared up front, or discovered while streaming), or carried more origin headers
+    /// than an entry keeps (`cache::MAX_STORED_HEADER_BYTES`).
     pub cache_too_large: ShardedCounter,
     /// Cache fills given up because the upstream sent no body for `request_timeout_ms`: the
     /// response was not stored and the requests waiting on the fill fetched for themselves.
@@ -1081,7 +1082,7 @@ impl Metrics {
             ),
             (
                 "zion_cache_too_large",
-                "Responses not stored because they exceeded the cache profile's max_object_mb.",
+                "Responses not stored because they exceeded the cache profile's max_object_mb, or carried more origin headers than a cache entry keeps (32 KiB); 304 updates over that bound count too.",
                 &self.cache_too_large,
             ),
             (
