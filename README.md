@@ -19,7 +19,7 @@
 [![License](https://img.shields.io/github/license/fabriziosalmi/zion)](https://github.com/fabriziosalmi/zion/blob/master/LICENSE)
 
 <!-- Capabilities -->
-[![Performance](https://img.shields.io/badge/TLS_proxy-107k%20req%2Fs%20%C2%B7%20cache%20222k%20(M4%2C%20v0.3.2)-success?style=flat&color=brightgreen)](https://github.com/fabriziosalmi/zion/tree/master/benchmarks)
+[![Performance](https://img.shields.io/badge/TLS_proxy-107k%20req%2Fs%20%C2%B7%20cache%20222k%20(M4%2C%20zion%200.3.2)-success?style=flat&color=brightgreen)](https://github.com/fabriziosalmi/zion/tree/master/benchmarks)
 [![WAF](https://img.shields.io/badge/WAF-Zero%20Regex-orange)](https://github.com/fabriziosalmi/zion/blob/master/src/waf.rs)
 
 <p align="center">
@@ -263,7 +263,7 @@ It polls `/_zion/snapshot.json` (internal-only; non-loopback IPs get 403). Keys:
 
 ## Performance
 
-Indicative figures measured on **v0.3.2** (June 2026, not re-measured since) on an Apple M4 (end-to-end TLS 1.3 over loopback to a
+Indicative figures measured on **zion 0.3.2** (June 2026, not re-measured since) on an Apple M4 (end-to-end TLS 1.3 over loopback to a
 zero-overhead hyper backend; median of 5×10 s `wrk` runs, c=100, **0 errors /
 all 2xx**):
 
@@ -273,7 +273,7 @@ all 2xx**):
 | TLS proxy + WAF on every request | **~101k** |
 | TLS + **cache hit** from RAM | **~190–222k** |
 
-Against **nginx 1.27**, also on v0.3.2, under identical cgroup limits (Docker, 1 CPU / 256 MB,
+Against **nginx 1.27**, also on zion 0.3.2, under identical cgroup limits (Docker, 1 CPU / 256 MB,
 HTTP/1.1 over TLS 1.3, byte-identical responses): nginx leads raw uncached proxy
 by ~3–27%; Zion is at parity on API GET / WAF POST and **wins on cacheable assets
 (+40–52%)** where the in-RAM cache skips the origin round-trip, all while
