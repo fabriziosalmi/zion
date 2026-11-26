@@ -11,7 +11,7 @@
 [![FIPS-ready](https://img.shields.io/badge/FIPS_140--3-ready_(--features_fips)-success.svg)](docs/security/fips.md)
 [![ASVS L2](https://img.shields.io/badge/OWASP_ASVS-L2_mapped-blue.svg)](docs/security/asvs.md)
 
-<sub>The SLSA / cosign provenance above covers the **default** release binaries. A `--features fips` build is a manual, currently unattested build — see [fips.md](docs/security/fips.md#compliance-posture-summary).</sub>
+<sub>The SLSA / cosign provenance above covers the **default** release binaries. A `--features fips` build is a manual, currently unattested build; see [fips.md](docs/security/fips.md#compliance-posture-summary).</sub>
 
 <!-- Project metadata -->
 [![Version](https://img.shields.io/github/v/release/fabriziosalmi/zion?include_prereleases&color=blue&label=release)](https://github.com/fabriziosalmi/zion/releases)
@@ -19,7 +19,7 @@
 [![License](https://img.shields.io/github/license/fabriziosalmi/zion)](https://github.com/fabriziosalmi/zion/blob/master/LICENSE)
 
 <!-- Capabilities -->
-[![Performance](https://img.shields.io/badge/TLS_proxy-107k%20req%2Fs%20%C2%B7%20cache%20222k%20(M4)-success?style=flat&color=brightgreen)](https://github.com/fabriziosalmi/zion/tree/master/benchmarks)
+[![Performance](https://img.shields.io/badge/TLS_proxy-107k%20req%2Fs%20%C2%B7%20cache%20222k%20(M4%2C%20v0.3.2)-success?style=flat&color=brightgreen)](https://github.com/fabriziosalmi/zion/tree/master/benchmarks)
 [![WAF](https://img.shields.io/badge/WAF-Zero%20Regex-orange)](https://github.com/fabriziosalmi/zion/blob/master/src/waf.rs)
 
 <p align="center">
@@ -27,14 +27,14 @@
 </p>
 
 **Zion is a single-binary TLS reverse proxy with a built-in WAF, RAM cache, and a
-sovereign edge toolkit — written in Rust.** It terminates TLS 1.3, scans every
+sovereign edge toolkit, written in Rust.** It terminates TLS 1.3, scans every
 request with a zero-regex WAF, serves hot assets from a two-level in-RAM cache,
-and proxies the rest to your upstreams — with hot-reload, HTTP/1.1·2·3, and
+and proxies the rest to your upstreams, with hot-reload, HTTP/1.1·2·3, and
 Prometheus metrics out of the box. No sidecars, no GeoIP database, no control
 plane.
 
 **Use it when** you want one auditable Rust binary at the edge instead of a stack
-of nginx + a WAF module + a cache + a geo-tagger — and you want explicit knobs,
+of nginx + a WAF module + a cache + a geo-tagger, and you want explicit knobs,
 not an auto-magic black box.
 
 ```bash
@@ -46,7 +46,7 @@ cargo build --release --features init,tui
 
 ## Quick start
 
-Fastest path — TLS in front of a dev backend, one command:
+Fastest path: TLS in front of a dev backend, one command:
 
 ```bash
 cargo build --release --features init,tui
@@ -80,27 +80,27 @@ zion import nginx /etc/nginx/sites-enabled/app.conf -o zion.toml
 ```
 
 `import` translates the reverse-proxy subset of nginx into a **validated**
-`zion.toml` and prints an honest findings report — every directive lands in
+`zion.toml` and prints an honest findings report: every directive lands in
 exactly one bucket (convert / partial / auto / unsupported), and anything Zion
 cannot express faithfully is flagged loudly, never silently mistranslated
 ([ADR-0011](docs/adr/0011-zion-import-nginx.md)).
 
 The claim is not taken on faith. The **equivalence harness** starts real nginx
 and real Zion side by side on the original and converted configs, replays a
-request corpus against both, and diffs the routing decision request by request
-— and the `Host` each one forwards to the backend — the intentional differences
+request corpus against both, and diffs the routing decision request by request,
+and the `Host` each one forwards to the backend; the intentional differences
 are exactly the ones the report declared:
 
 ![zion import equivalence harness](docs/assets/zion-import-equivalence.svg)
 
-Reproduce it yourself (`docker`, `curl`, `openssl`): `./tests/equivalence/run.sh`
-— see [tests/equivalence/](tests/equivalence/).
+Reproduce it yourself (`docker`, `curl`, `openssl`): `./tests/equivalence/run.sh`;
+see [tests/equivalence/](tests/equivalence/).
 
 ### Automatic HTTPS (Let's Encrypt)
 
 The release binary and official container ship automatic HTTPS. Scaffold a
 production config for a public domain and Zion obtains and auto-renews a real
-certificate on first boot — no manual cert step:
+certificate on first boot, no manual cert step:
 
 ```bash
 zion init --hostname app.example.com --email ops@example.com
@@ -142,7 +142,7 @@ cargo build --release --features init,tui,acme,auth,http3,otel
 listen_http = "0.0.0.0:80"
 listen_https = "0.0.0.0:443"
 # Outbound X-Forwarded-For policy: "append" (default), "rewrite", "drop".
-# Use "rewrite" when Zion is the front edge — it strips inbound XFF and
+# Use "rewrite" when Zion is the front edge: it strips inbound XFF and
 # emits a single trusted entry (the resolved client IP).
 xff_mode = "append"
 
@@ -178,7 +178,7 @@ upstream = "frontend"
 ```
 
 `zion.toml` is **hot-reloaded**: edit routes, upstreams, WAF profiles, CORS,
-rate limits, or even the **listen ports** and save — the daemon atomic-swaps the
+rate limits, or even the **listen ports** and save: the daemon atomic-swaps the
 new config (and rebinds listeners, draining the old ones) without dropping
 in-flight connections. Invalid configs are rejected; the previous state
 survives. See [zion.example.toml](zion.example.toml) for the full reference and
@@ -204,46 +204,46 @@ Client -> TLS 1.3 -> Security Gates -> Radix Router -> WAF Pipeline (5 gates) ->
 - TLS 1.3 termination (rustls + hardware AES-NI / AES-CE)
 - HTTP/1.1, HTTP/2, HTTP/3 QUIC (`--features http3`); HTTP/2 upstream multiplexing
 - Multi-SNI with per-domain certificates (FNV O(1) lookup)
-- Zero-downtime TLS, QUIC, and full-config hot-reload (ArcSwap + watch channels) — including live listener rebind
+- Zero-downtime TLS, QUIC, and full-config hot-reload (ArcSwap + watch channels), including live listener rebind
 - Session tickets + 0-RTT early data with method gating (425 Too Early, RFC 8470)
 - WebSocket proxy (bidirectional pipe, TLS-to-upstream) and zero-buffer SSE streaming
 - ACME auto-renewal and a JWT/OIDC auth gate, both in the release binaries (`--features dist`); a custom build without `auth` refuses a config with `auth_profile` routes instead of serving them unauthenticated
 - `preserve_host` per upstream (forward the client's `Host`, as nginx `proxy_set_header Host $http_host`, Traefik and Caddy do) with `health_host` for backends that refuse unknown hosts
 
-**Cache** — two-level RAM cache: L1 thread-local (O(1) intrusive-LRU) + L2 sharded DashMap, generation-based coherence (no stale data after update), request coalescing (singleflight: N concurrent misses → 1 upstream fetch). Honors the origin's `Cache-Control` (RFC 9111: `Vary` secondary keys, conditional requests → `304`, `stale-while-revalidate` / `stale-if-error`, `Range` → `206` / `416` served from RAM), emits `Age` and an `X-Zion-Cache: HIT|MISS|BYPASS` decision header, and exposes `POST /_zion/cache/purge` to flush everything, a path prefix, or every entry carrying a `Surrogate-Key` tag.
+**Cache**: two-level RAM cache: L1 thread-local (O(1) intrusive-LRU) + L2 sharded DashMap, generation-based coherence (no stale data after update), request coalescing (singleflight: N concurrent misses → 1 upstream fetch). Honors the origin's `Cache-Control` (RFC 9111: `Vary` secondary keys, conditional requests → `304`, `stale-while-revalidate` / `stale-if-error`, `Range` → `206` / `416` served from RAM), emits `Age` and an `X-Zion-Cache: HIT|MISS|BYPASS` decision header, and exposes `POST /_zion/cache/purge` to flush everything, a path prefix, or every entry carrying a `Surrogate-Key` tag.
 
-**WAF (zero-regex, O(N) single-pass)** — Aho-Corasick scanner, two pattern sets (`balanced` ~100 high-precision / `aggressive` ~240 broad-recall), Shannon-entropy analysis (bodies ≥256 B; restricted to JSON string values only for `application/json`, whole-body otherwise), simd-json structural limits, Content-Type enforcement, iterative normalization (URL-decode / SQL-comment / unicode), mTLS `X-Client-Cert-Fingerprint` forwarding, and a shadow mode (log + count, never block); opt-in scanning of request header values (`scan_headers`: Log4Shell in a `User-Agent`), with its false-positive rate measured on a benign header corpus.
+**WAF (zero-regex, O(N) single-pass)**: Aho-Corasick scanner, two pattern sets (`balanced` ~100 high-precision / `aggressive` ~240 broad-recall), Shannon-entropy analysis (bodies ≥256 B; restricted to JSON string values only for `application/json`, whole-body otherwise), simd-json structural limits, Content-Type enforcement, iterative normalization (URL-decode / SQL-comment / unicode), mTLS `X-Client-Cert-Fingerprint` forwarding, and a shadow mode (log + count, never block); opt-in scanning of request header values (`scan_headers`: Log4Shell in a `User-Agent`), with its false-positive rate measured on a benign header corpus.
 
-**Resilience** — pools pick a member by *power of two choices* on in-flight requests × peak-EWMA latency measured on real traffic (`load_balancing = "p2c"`), with opt-in passive **outlier ejection**; opt-in per-upstream **circuit breaker** and `max_in_flight` **bulkhead** (an immediate `503` + `Retry-After` instead of piling on a struggling backend); upstream **DNS keeps the last good answer** when a lookup fails or hangs; **graceful drain** (idle keep-alive connections closed at once, HTTP/2 `GOAWAY`, requests in flight finished); a **non-blocking log queue** (a stalled stderr never stalls a request); opt-in `TCP_USER_TIMEOUT` to free the slots of clients that vanish mid-response; a per-upstream **response deadline** (`request_timeout_ms`, default 30 s, never "none"). See the [resilience guide](https://fabriziosalmi.github.io/zion/guide/resilience).
+**Resilience**: pools pick a member by *power of two choices* on in-flight requests × peak-EWMA latency measured on real traffic (`load_balancing = "p2c"`), with opt-in passive **outlier ejection**; opt-in per-upstream **circuit breaker** and `max_in_flight` **bulkhead** (an immediate `503` + `Retry-After` instead of piling on a struggling backend); upstream **DNS keeps the last good answer** when a lookup fails or hangs; **graceful drain** (idle keep-alive connections closed at once, HTTP/2 `GOAWAY`, requests in flight finished); a **non-blocking log queue** (a stalled stderr never stalls a request); opt-in `TCP_USER_TIMEOUT` to free the slots of clients that vanish mid-response; a per-upstream **response deadline** (`request_timeout_ms`, default 30 s, never "none"). See the [resilience guide](https://fabriziosalmi.github.io/zion/guide/resilience).
 
-**Security** — HSTS preload, nosniff, frame-deny, Referrer-Policy, Permissions-Policy, per-route CSP; `Server`/hop-by-hop stripping (RFC 7230); URI-length cap + 7-method whitelist; per-IP rate limit **and** per-IP concurrent-connection cap (enforced at accept); CORS (FNV O(1)); header-bomb limits (64 headers / 16 KB). Admin API on its own listener, with its own client CA for mTLS and a bearer token required for every change; **client certificates can be revoked** with a CRL that is re-read when it changes (data plane and admin); zion can present its own client certificate to an upstream and trust a private CA for it (`client_cert_path`, `ca_path`); JWT revocations survive a restart and HMAC keys rotate without an outage (`previous_secret_env`); the headers an upstream trusts as zion's word (`X-Auth-*`, `X-Client-Cert-*`, `X-Zion-Mesh-Score`) come from one table and are stripped from every client; the cache purge answers loopback only unless you name the networks; the gossip mesh accepts claims only from listed node keys. Settings that would silently weaken security (a short JWT secret, an `http://` JWKS, an unknown `xff_mode`) are config errors.
+**Security**: bounded resources for clients that stop reading (a per-connection, per-address and per-process budget for static responses, and `send_stall_secs` resets a stream or closes an HTTP/1.1 connection whose client takes nothing), HSTS preload, nosniff, frame-deny, Referrer-Policy, Permissions-Policy, per-route CSP; `Server`/hop-by-hop stripping (RFC 7230); URI-length cap + 7-method whitelist; per-IP rate limit **and** per-IP concurrent-connection cap (enforced at accept); CORS (FNV O(1)); header-bomb limits (64 headers / 16 KB). Admin API on its own listener, with its own client CA for mTLS and a bearer token required for every change; **client certificates can be revoked** with a CRL that is re-read when it changes (data plane and admin); zion can present its own client certificate to an upstream and trust a private CA for it (`client_cert_path`, `ca_path`); JWT revocations survive a restart and HMAC keys rotate without an outage (`previous_secret_env`); the headers an upstream trusts as zion's word (`X-Auth-*`, `X-Client-Cert-*`, `X-Zion-Mesh-Score`) come from one table and are stripped from every client; the cache purge answers loopback only unless you name the networks; the gossip mesh accepts claims only from listed node keys. Settings that would silently weaken security (a short JWT secret, an `http://` JWKS, an unknown `xff_mode`) are config errors.
 
-**Observability** — `/healthz` · `/readyz` fast-path (~1 µs), `/metrics` Prometheus (lock-free sharded counters), `X-Request-ID` + W3C `traceparent` propagation, structured text/JSON logs (client IPs can be truncated or HMAC-pseudonymised with `[redact] ip` for GDPR / NIS2; upstream credentials and config secrets never reach the snapshot, the logs or an error message), and the `zion top` live TUI.
+**Observability**: `/healthz` · `/readyz` fast-path, `/metrics` Prometheus (lock-free sharded counters), `X-Request-ID` + W3C `traceparent` propagation, structured text/JSON logs (client IPs can be truncated or HMAC-pseudonymised with `[redact] ip` for GDPR / NIS2; upstream credentials and config secrets never reach the snapshot, the logs or an error message), and the `zion top` live TUI.
 
-**Operations** — fail-fast config validation, graceful 30 s drain that closes idle connections immediately, adaptive upstream recovery (decorrelated-jitter backoff: a recovered origin returns in ~1.4 s vs up to 30 s), boot-time platform auto-detection + performance-tier calibration, `zion doctor` diagnostics, TCP tuning (NODELAY / DEFER_ACCEPT / FASTOPEN / QUICKACK), systemd unit, distroless container (health probes live in the orchestrator), Helm chart rendered and checked with `zion doctor` in CI.
+**Operations**: fail-fast config validation, graceful 30 s drain that closes idle connections immediately, adaptive upstream recovery (decorrelated-jitter backoff: a recovered origin returns in ~1.4 s vs up to 30 s), boot-time platform auto-detection + performance-tier calibration, `zion doctor` diagnostics, TCP tuning (NODELAY / DEFER_ACCEPT / FASTOPEN / QUICKACK), systemd unit, distroless container (health probes live in the orchestrator), Helm chart rendered and checked with `zion doctor` in CI.
 
 **Opt-in tracks (feature-gated, default-off)**
-- **kTLS offload** (`--features ktls`, Linux 5.10+) — *experimental*: flips the socket into in-kernel TLS after handshake toward `sendfile`-class zero-copy. The offload is wired but not yet exercised end-to-end in CI (issue #52). On a kernel that does not advertise kTLS (the `tls` module not loaded), zion logs one warning at boot and serves HTTPS on userspace TLS.
-- **ML-augmented WAF** (`--features ml-waf`) — *experimental*: 16-dim tract-onnx scorer on the WAF hot path (200 µs p99 budget), advisory metric/header — never a hard gate. Ships no bundled model.
-- **AIMP serverless mesh** (`--features sovereign-aimp`, **experimental** — off by default and not in the release artefacts, wire protocol not stable; rotation/revocation and fleet-wide rate/health claims are frozen) — Ed25519-signed UDP gossip of WAF deltas + IP reputation across a fleet, no central control plane.
+- **kTLS offload** (`--features ktls`, Linux 5.10+, *experimental*: flips the socket into in-kernel TLS after handshake toward `sendfile`-class zero-copy. The offload is wired but not yet exercised end-to-end in CI (issue #52). On a kernel that does not advertise kTLS (the `tls` module not loaded), zion logs one warning at boot and serves HTTPS on userspace TLS.
+- **ML-augmented WAF** (`--features ml-waf`, *experimental*: 16-dim tract-onnx scorer on the WAF hot path (200 µs p99 budget), advisory metric/header, never a hard gate. Ships no bundled model.
+- **AIMP serverless mesh** (`--features sovereign-aimp`, **experimental**, off by default and not in the release artefacts, wire protocol not stable; rotation/revocation and fleet-wide rate/health claims are frozen): Ed25519-signed UDP gossip of WAF deltas + IP reputation across a fleet, no central control plane.
 
 ## Sovereign edge & DDoS resistance
 
-Zion is the **operator's toolkit at the edge** — sharp, composable primitives
+Zion is the **operator's toolkit at the edge**: sharp, composable primitives
 with explicit knobs, each cheap enough to leave on under load. Defence is
 layered, outside-in:
 
 | Layer | Primitive |
 |---|---|
-| **L7 — pre-routing** | Zero-cost edge gates before any work: URI-length cap, method whitelist, XFF-spoof-resistant client-IP resolution. |
-| **L7 — admission** | Per-IP **rate** limiter (`429` over budget) **and** per-IP **concurrent-connection** cap (enforced at accept, before the TLS handshake) — the lever a slow/backed flood actually hits. |
-| **L7 — inspection** | WAF: zero-regex Aho-Corasick O(N) single-pass, entropy, simd-json limits, 5 gates. |
-| **Origin tagging** | IT/EU range classification (`--features geo-ita` / `geo-eu`), IPv4 + IPv6 — O(log N) over baked CIDR data, **no GeoIP DB, no syscall**. Answers "% EU vs non-EU traffic" out of the box. |
-| **Fleet signal** | AIMP mesh: Ed25519-signed gossip of blocks + reputation, source-bound revocation, no control plane. Reputation rides upstream as `X-Zion-Mesh-Score` — an advisory signal, not a gate. |
+| **L7, pre-routing** | Zero-cost edge gates before any work: URI-length cap, method whitelist, XFF-spoof-resistant client-IP resolution. |
+| **L7, admission** | Per-IP **rate** limiter (`429` over budget) **and** per-IP **concurrent-connection** cap (enforced at accept, before the TLS handshake): the lever a slow/backed flood actually hits. |
+| **L7, inspection** | WAF: zero-regex Aho-Corasick O(N) single-pass, entropy, simd-json limits, 5 gates. |
+| **Origin tagging** | IT/EU range classification (`--features geo-ita` / `geo-eu`), IPv4 + IPv6, O(log N) over baked CIDR data, **no GeoIP DB, no syscall**. Answers "% EU vs non-EU traffic" out of the box. |
+| **Fleet signal** | AIMP mesh: Ed25519-signed gossip of blocks + reputation, source-bound revocation, no control plane. Reputation rides upstream as `X-Zion-Mesh-Score`, an advisory signal, not a gate. |
 | **Tag-driven enforcement** | `[sovereign.enforce]` promotes the tag / mesh score from *signal* to an opt-in `403` deny (e.g. `deny = ["unknown"]` blocks non-EU sources; or deny above a reputation threshold). Off by default. |
 | **L7 tarpit** | `[sovereign.enforce.tarpit]` escalates a deny from a cheap `403` to a *held* connection, so a flood pays wall-clock + socket budget; a global ceiling sheds back to `403` so it can't self-DoS. Off by default. |
 
-The design rule: tagging and reputation never *silently* gate — the operator
+The design rule: tagging and reputation never *silently* gate: the operator
 opts a signal into enforcement explicitly; the local rate-limiter / WAF / auth
 stay authoritative.
 
@@ -263,7 +263,7 @@ It polls `/_zion/snapshot.json` (internal-only; non-loopback IPs get 403). Keys:
 
 ## Performance
 
-Indicative figures on an Apple M4 (end-to-end TLS 1.3 over loopback to a
+Indicative figures measured on **v0.3.2** (June 2026, not re-measured since) on an Apple M4 (end-to-end TLS 1.3 over loopback to a
 zero-overhead hyper backend; median of 5×10 s `wrk` runs, c=100, **0 errors /
 all 2xx**):
 
@@ -273,10 +273,10 @@ all 2xx**):
 | TLS proxy + WAF on every request | **~101k** |
 | TLS + **cache hit** from RAM | **~190–222k** |
 
-Against **nginx 1.27** under identical cgroup limits (Docker, 1 CPU / 256 MB,
+Against **nginx 1.27**, also on v0.3.2, under identical cgroup limits (Docker, 1 CPU / 256 MB,
 HTTP/1.1 over TLS 1.3, byte-identical responses): nginx leads raw uncached proxy
 by ~3–27%; Zion is at parity on API GET / WAF POST and **wins on cacheable assets
-(+40–52%)** where the in-RAM cache skips the origin round-trip — all while
+(+40–52%)** where the in-RAM cache skips the origin round-trip, all while
 terminating TLS *and* running the WAF inline.
 
 Numbers are a regression baseline on fixed hardware, not a WAN figure. The
@@ -305,18 +305,18 @@ cargo test --test integration -- --ignored --test-threads=1
 
 ## Compliance & security docs
 
-- [Threat model (STRIDE)](docs/security/threat-model.md) — surfaces, mitigations, residual risk
-- [OWASP ASVS L2 mapping](docs/security/asvs.md) — control → implementation site → evidence
-- [SOC 2 + FedRAMP control mapping](docs/security/compliance-mapping.md) — TSC + NIST 800-53 rev5
-- [FIPS 140-3 build](docs/security/fips.md) — `--features fips` (validated AWS-LC backend)
-- [TLS conformance](docs/security/tls-conformance.md) — BoGo / RFC 8446 / SSL Labs recipes
-- [Supply chain](docs/security/supply-chain.md) — SLSA L3 provenance, cosign, SBOM
-- [Mesh integration](docs/mesh/integration.md) — `--features sovereign-aimp` operator guide
-- [Architecture Decision Records](docs/adr/) — the load-bearing choices, in writing
+- [Threat model (STRIDE)](docs/security/threat-model.md): surfaces, mitigations, residual risk
+- [OWASP ASVS L2 mapping](docs/security/asvs.md): control → implementation site → evidence
+- [SOC 2 + FedRAMP control mapping](docs/security/compliance-mapping.md): TSC + NIST 800-53 rev5
+- [FIPS 140-3 build](docs/security/fips.md): `--features fips` (validated AWS-LC backend)
+- [TLS conformance](docs/security/tls-conformance.md): BoGo / RFC 8446 / SSL Labs recipes
+- [Supply chain](docs/security/supply-chain.md): SLSA L3 provenance, cosign, SBOM
+- [Mesh integration](docs/mesh/integration.md): `--features sovereign-aimp` operator guide
+- [Architecture Decision Records](docs/adr/): the load-bearing choices, in writing
 
 ## Verifying a release
 
-Every release is signed and carries SLSA v1.0 build provenance — see
+Every release is signed and carries SLSA v1.0 build provenance; see
 [Supply Chain Security](docs/security/supply-chain.md). The short version:
 
 ```bash
@@ -333,5 +333,5 @@ cosign verify ghcr.io/fabriziosalmi/zion:v0.18.0 \
 
 ## Changelog & license
 
-See [CHANGELOG.md](CHANGELOG.md) for release history. Licensed under Apache-2.0 —
+See [CHANGELOG.md](CHANGELOG.md) for release history. Licensed under Apache-2.0;
 see [LICENSE](LICENSE) and [NOTICE](NOTICE).
