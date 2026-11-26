@@ -17,7 +17,6 @@ use crate::{
     logging, net, numa, observability, proxy, security, tls,
 };
 use arc_swap::ArcSwap;
-use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -38,8 +37,10 @@ type Bound = Option<(SocketAddr, tokio::net::TcpListener)>;
 // HTTP/2 Bomb chains an HPACK decompression bomb with a flow-control "hold";
 // the defence is (a) a small decoded-header-list cap that h2 enforces
 // incrementally during HPACK decode, (b) a stream cap bounding how many such
-// lists can be held open at once, (c) the Rapid-Reset bound, and (d)
-// keep-alive PINGs that reap a connection gone silent mid-hold.
+// lists can be held open at once, (c) the Rapid-Reset bound, (d)
+// keep-alive PINGs that reap a connection gone silent mid-hold, and (e) for
+// a client that answers the PINGs and still never opens its windows, the
+// send deadline and the static-response slots of `h2_stream`.
 //
 // Worst-case retained decoded-header memory per connection is therefore
 // bounded by `H2_MAX_CONCURRENT_STREAMS * H2_MAX_HEADER_LIST_SIZE`
@@ -57,8 +58,12 @@ const H2_MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
 /// pending-accept before the connection is treated as abusive.
 const H2_MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 20;
 /// Keep-alive PING cadence / deadline. A client that opens streams and then
-/// goes silent (the flow-control "hold" half of the bomb) fails the PING and
-/// is dropped instead of pinning stream state indefinitely.
+/// goes silent fails the PING and is dropped instead of pinning stream state
+/// indefinitely. A PING is answered by the peer's HTTP/2 stack whether or not it
+/// reads, so this does not reap a client that answers PINGs and keeps its
+/// flow-control windows closed (the "hold" half of the bomb): the send deadline
+/// (`[server] send_stall_secs`) and the static-response slots in `h2_stream`
+/// bound that one.
 const H2_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const H2_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -403,6 +408,16 @@ pub(crate) fn resolve_config(
             );
         }
     }
+    let (static_all, static_share) = crate::static_budget::sizes();
+    logging::info(
+        "boot",
+        &format!(
+            "static responses may hold {all} MiB at once, {share} MiB for one client address (128 KiB per connection of the ceiling, at most an eighth of {ram} MB)",
+            all = static_all >> 20,
+            share = static_share >> 20,
+            ram = platform.ram_mb,
+        ),
+    );
     let resolved = ResolvedAppConfig::try_build(&config, conn_ceiling)?;
     dns::configure(resolved.dns_stale_secs, resolved.dns_timeout_ms);
     cache::configure(resolved.cache_budget_bytes);
@@ -588,8 +603,9 @@ pub(crate) async fn start_aimp_control_plane(
 }
 
 /// The connection builder shared by :80 and :443: timeouts, header limits, and the explicit HTTP/2 limits above.
-fn http_server_builder() -> AutoBuilder<TokioExecutor> {
-    let mut b = AutoBuilder::new(TokioExecutor::new());
+fn http_server_builder() -> AutoBuilder<crate::h2_stream::Executor> {
+    // The executor runs each HTTP/2 stream under the send deadline (see `h2_stream`).
+    let mut b = AutoBuilder::new(crate::h2_stream::Executor);
     // A clock MUST be installed or hyper's header_read_timeout (and any
     // other time-based limit) is silently a no-op — hyper logs "no timer
     // set". With the timer in place, a client that opens a connection
@@ -609,8 +625,9 @@ fn http_server_builder() -> AutoBuilder<TokioExecutor> {
     // H2_* consts + `h2_limit_tests`). max_concurrent_streams ×
     // max_header_list_size bounds retained decoded-header memory per
     // connection; the Rapid-Reset bound blunts CVE-2023-44487; the
-    // keep-alive PING reaps a connection gone silent mid-hold (the
-    // flow-control half of the bomb). The keep-alive PING is time-based,
+    // keep-alive PING reaps a connection gone silent mid-hold (one that
+    // answers PINGs and withholds its windows is the send deadline's, see
+    // `h2_stream`). The keep-alive PING is time-based,
     // so — exactly as on http1 above — a timer MUST be installed on the
     // http2 builder too, or hyper panics "You must supply a timer." the
     // first time it tries to schedule the PING deadline.

@@ -23,6 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::http_util::ZionBody;
+use crate::static_budget::{Admission, Client, Need, StaticSlot};
 
 /// Size of one frame of a streamed file body.
 const STREAM_FRAME: usize = 64 * 1024;
@@ -30,8 +31,14 @@ const STREAM_FRAME: usize = 64 * 1024;
 /// allocation, shared by the frames cut from it; a read per frame cost twice the trips and
 /// copied each chunk twice more (#564).
 const STREAM_BLOCK: usize = 2 * STREAM_FRAME;
-/// Frames in flight for one response: the block being read and the frames queued behind the
-/// socket. Bounds in-flight memory to `STREAM_FRAME * STREAM_IN_FLIGHT_FRAMES` (576 KiB).
+/// Frames in flight between the file and hyper for one response: the block being read and the
+/// frames queued behind it (576 KiB). A stalled response holds more than these. hyper takes the
+/// next frame before it waits for the client's window (hyper 1.12), which frees a place in the
+/// queue for one more block to be read: 640 KiB, five blocks, when the window was never opened.
+/// A frame is a slice of its block, and the block lives while either of its frames does: after
+/// a window that opened part of the way, h2 holds the rest of one frame while hyper waits with
+/// the next, of another block, and six blocks are alive, 768 KiB
+/// (`static_budget::STREAMED_HOLD`).
 const STREAM_IN_FLIGHT_FRAMES: usize = 9;
 /// Frames buffered between the file reader and the socket (the rest of the in-flight
 /// frames are the block being read).
@@ -43,13 +50,23 @@ const STREAM_CHANNEL_CAP: usize = STREAM_IN_FLIGHT_FRAMES - STREAM_BLOCK / STREA
 /// (see [`stream_file`]).
 ///
 /// It is what a streamed body holds in flight anyway (576 KiB), so no request holds
-/// more than that, whatever the file. Every request reads its own copy, and one
-/// HTTP/2 connection carries 128 of them: when this was 64 MiB, a single connection
-/// asking 100 times for a 60 MiB file took the process from 12 MiB to 4.6 GB, and
-/// kept it there for as long as it did not read (#562).
+/// more than that, whatever the file. Every request reads its own copy: when this was
+/// 64 MiB, a single HTTP/2 connection asking 100 times for a 60 MiB file took the
+/// process from 12 MiB to 4.6 GB, and kept it there for as long as it did not read
+/// (#562). An HTTP/2 or HTTP/3 connection now holds at most eight of these at once
+/// (`h2_stream::STATIC_WHOLE_BYTES_PER_CONN`), and at most eight streamed files, and a client
+/// address at most its share of the process's budget (`static_budget`).
 const BUFFER_WHOLE_MAX_BYTES: u64 = (STREAM_FRAME * STREAM_IN_FLIGHT_FRAMES) as u64;
 // Whatever the stream constants become, no request reads megabytes whole.
 const _: () = assert!(BUFFER_WHOLE_MAX_BYTES <= 1024 * 1024);
+// What a stalled streamed response holds (see `STREAM_IN_FLIGHT_FRAMES`) is what it is counted
+// as in the static-response budget: the frames in flight and the one hyper holds, rounded up to
+// whole blocks, and one block more.
+const _: () = assert!(
+    crate::static_budget::STREAMED_HOLD
+        == (((STREAM_IN_FLIGHT_FRAMES + 1) * STREAM_FRAME).div_ceil(STREAM_BLOCK) * STREAM_BLOCK
+            + STREAM_BLOCK) as u64
+);
 
 /// Turn a request-path tail (already stripped of the route prefix) into a safe
 /// RELATIVE path under the serve root, or `None` if it must be refused. Pure —
@@ -147,11 +164,15 @@ fn full_body(bytes: Bytes) -> ZionBody {
 /// opened, so a fault here is a rare disk error, not a routine path, and the
 /// client sees a short read rather than a hang. The channel item type is
 /// `Result<_, hyper::Error>` to match [`ZionBody`]; only `Ok` frames are ever sent.
-fn stream_file(file: tokio::fs::File, limit: Option<u64>) -> ZionBody {
+///
+/// `slot`, the response's static-response slot, is kept by the reader for as long as the file is
+/// open (the response's body and its pieces keep it after that, see `h2_stream::watch`).
+fn stream_file(file: tokio::fs::File, limit: Option<u64>, slot: Option<StaticSlot>) -> ZionBody {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, hyper::Error>>(
         STREAM_CHANNEL_CAP,
     );
     tokio::spawn(async move {
+        let _slot = slot;
         let mut file = file.into_std().await;
         let mut remaining = limit;
         loop {
@@ -208,7 +229,10 @@ fn stream_file(file: tokio::fs::File, limit: Option<u64>) -> ZionBody {
 
 /// Serve `tail` from `root`. `method` gates to GET/HEAD; `spa_fallback` serves
 /// the root `index.html` for a miss (single-page apps); `precompressed` opts the
-/// route into `.br`/`.gz` sidecar content-negotiation.
+/// route into `.br`/`.gz` sidecar content-negotiation. A `GET` takes a slot for `client`
+/// before its file is opened (`static_budget`), and the response carries it in its extensions,
+/// for the listener to keep while the body is sent.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     root: &Path,
     tail: &str,
@@ -216,12 +240,17 @@ pub async fn serve(
     precompressed: bool,
     method: &Method,
     req_headers: &HeaderMap,
+    client: Client,
 ) -> Response<ZionBody> {
     if method != Method::GET && method != Method::HEAD {
         return resp(StatusCode::METHOD_NOT_ALLOWED);
     }
+    // A GET takes a slot before its file is opened (a HEAD holds nothing): a file kept open, or
+    // bytes kept, for a client that does not read are bounded per connection, per client and
+    // in all, not one per request (see `static_budget`).
+    let admission = (method == Method::GET).then(|| crate::static_budget::admission(client));
     if !precompressed {
-        return serve_plain(root, tail, spa_fallback, method, req_headers).await;
+        return serve_plain(root, tail, spa_fallback, method, req_headers, admission).await;
     }
     // The root itself must resolve; a missing serve_dir is a 404, not a leak.
     let canon_root = match tokio::fs::canonicalize(root).await {
@@ -232,12 +261,14 @@ pub async fn serve(
         return resp(StatusCode::FORBIDDEN);
     };
 
+    let adm = admission.as_ref();
     if let Some(path) = resolve_file(&canon_root, &rel).await {
-        return serve_resolved(&canon_root, &path, precompressed, method, req_headers).await;
+        return serve_resolved(&canon_root, &path, precompressed, method, req_headers, adm).await;
     }
     if spa_fallback {
         if let Some(index) = resolve_file(&canon_root, Path::new("index.html")).await {
-            return serve_resolved(&canon_root, &index, precompressed, method, req_headers).await;
+            return serve_resolved(&canon_root, &index, precompressed, method, req_headers, adm)
+                .await;
         }
     }
     resp(StatusCode::NOT_FOUND)
@@ -253,45 +284,126 @@ struct Opened {
     body: Option<Vec<u8>>,
 }
 
+/// What a `GET` for a file of `len` bytes holds while it is sent (see `static_budget`): its open
+/// file and read-ahead when it is streamed, its bytes when it is read whole. A ranged `GET` is
+/// counted by the file, which is never less than what the range holds.
+fn need_for(len: u64) -> Need {
+    if len > BUFFER_WHOLE_MAX_BYTES {
+        Need::File
+    } else {
+        Need::Whole(len)
+    }
+}
+
+// A body read whole always fits the connection's budget for such bodies.
+const _: () = assert!(BUFFER_WHOLE_MAX_BYTES <= crate::h2_stream::STATIC_WHOLE_BYTES_PER_CONN);
+
+/// A static-response slot, with what it was taken for.
+type Slot = (Need, StaticSlot);
+
+/// How many times a request looks for its file again after waiting for a slot. Only a file
+/// that is replaced by a larger one while the request waits needs a second look.
+const ADMISSION_TRIES: usize = 4;
+
+/// What [`open_in`] found.
+// `Found` is what nearly every request gets, and it is moved once: boxing it would add an
+// allocation to every static request to make the rare `Wait` smaller.
+#[allow(clippy::large_enum_variant)]
+enum Opening {
+    /// Opened, with the slot it holds (`None` for a `HEAD`).
+    Found(Opened, Option<Slot>),
+    /// No slot is free for what serving it needs: nothing was opened.
+    Wait(Need),
+    NotFound,
+}
+
 /// Resolve `rel` under `canon_root` the way [`resolve_file`] does (canonicalize, stay inside the
 /// tree, a directory maps to its `index.html`, only regular files), then open it and `fstat` the
 /// handle. With `preload`, a file up to [`BUFFER_WHOLE_MAX_BYTES`] is read here too.
 ///
+/// For a `GET` (`admission`), the slot is taken before the file is opened, from `held` when the
+/// request already waited for one, otherwise only if one is free: when none is, nothing is opened
+/// and the caller waits for one ([`Opening::Wait`]).
+///
 /// Blocking: run it on the blocking pool, once. Doing the same work as `tokio::fs` calls costs one
 /// hand-off to a blocking thread per call (canonicalize, canonicalize, stat, stat, open, read, close),
 /// and a hand-off is far dearer than the page-cache read it serves.
-fn open_in(canon_root: &Path, rel: &Path, preload: bool) -> Option<Opened> {
-    let mut path = std::fs::canonicalize(canon_root.join(rel)).ok()?;
+fn open_in(
+    canon_root: &Path,
+    rel: &Path,
+    preload: bool,
+    admission: Option<&Admission>,
+    held: &mut Option<Slot>,
+) -> Opening {
+    let Some(mut path) = std::fs::canonicalize(canon_root.join(rel)).ok() else {
+        return Opening::NotFound;
+    };
     if !path.starts_with(canon_root) {
-        return None; // a symlink (or a race) escaped the tree
+        return Opening::NotFound; // a symlink (or a race) escaped the tree
     }
-    let mut meta = std::fs::metadata(&path).ok()?;
+    let Ok(mut meta) = std::fs::metadata(&path) else {
+        return Opening::NotFound;
+    };
     if meta.is_dir() {
-        path = std::fs::canonicalize(path.join("index.html")).ok()?;
-        if !path.starts_with(canon_root) {
-            return None;
-        }
-        meta = std::fs::metadata(&path).ok()?;
+        path = match std::fs::canonicalize(path.join("index.html")) {
+            Ok(p) if p.starts_with(canon_root) => p,
+            _ => return Opening::NotFound,
+        };
+        meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => return Opening::NotFound,
+        };
     }
     if !meta.is_file() {
-        return None; // device / socket / fifo — never opened, never served (opening a fifo blocks)
+        // A device, socket or fifo is never opened, never served (opening a fifo blocks).
+        return Opening::NotFound;
     }
-    let mut file = std::fs::File::open(&path).ok()?;
-    let meta = file.metadata().ok()?;
+    let slot = match admission {
+        None => None,
+        Some(adm) => {
+            let need = need_for(meta.len());
+            match held.take() {
+                Some(slot) if slot.0.covers(need) => Some(slot),
+                _ => match adm.try_take(need) {
+                    Some(s) => Some((need, s)),
+                    None => return Opening::Wait(need),
+                },
+            }
+        }
+    };
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return Opening::NotFound;
+    };
+    let Ok(meta) = file.metadata() else {
+        return Opening::NotFound;
+    };
+    // The handle's length is what is served. A file replaced since its path was looked at may
+    // need more than the slot taken for it: wait for that, with the file closed.
+    if let Some((had, _)) = &slot {
+        let need = need_for(meta.len());
+        if !had.covers(need) {
+            return Opening::Wait(need);
+        }
+    }
     let body = if preload && meta.len() <= BUFFER_WHOLE_MAX_BYTES {
         use std::io::Read;
         let mut buf = Vec::with_capacity(meta.len() as usize);
-        file.read_to_end(&mut buf).ok()?;
+        if file.read_to_end(&mut buf).is_err() {
+            return Opening::NotFound;
+        }
         Some(buf)
     } else {
         None
     };
-    Some(Opened {
-        path,
-        file,
-        meta,
-        body,
-    })
+    Opening::Found(
+        Opened {
+            path,
+            file,
+            meta,
+            body,
+        },
+        slot,
+    )
 }
 
 /// The route without precompressed sidecars (the common one): the whole file-system side of the
@@ -302,6 +414,7 @@ async fn serve_plain(
     spa_fallback: bool,
     method: &Method,
     req_headers: &HeaderMap,
+    admission: Option<Admission>,
 ) -> Response<ZionBody> {
     let Some(rel) = sanitize(tail) else {
         return resp(StatusCode::FORBIDDEN);
@@ -316,35 +429,66 @@ async fn serve_plain(
         ]
         .iter()
         .any(|h| req_headers.contains_key(h));
-    let root = root.to_path_buf();
-    let found = tokio::task::spawn_blocking(move || {
-        // The root itself must resolve; a missing serve_dir is a 404, not a leak.
-        let canon_root = std::fs::canonicalize(&root).ok()?;
-        open_in(&canon_root, &rel, preload).or_else(|| {
-            spa_fallback
-                .then(|| open_in(&canon_root, Path::new("index.html"), preload))
-                .flatten()
+    // The paths go to the blocking pool and come back with its answer, so a request that waits
+    // for a slot and looks again copies nothing.
+    let mut paths = (root.to_path_buf(), rel);
+    let mut held: Option<Slot> = None;
+    for _ in 0..ADMISSION_TRIES {
+        let adm = admission.clone();
+        let mut slot = held.take();
+        let ((root, rel), found) = match tokio::task::spawn_blocking(move || {
+            let (root, rel) = paths;
+            // The root itself must resolve; a missing serve_dir is a 404, not a leak.
+            let found = std::fs::canonicalize(&root).ok().map(|canon_root| {
+                match open_in(&canon_root, &rel, preload, adm.as_ref(), &mut slot) {
+                    Opening::NotFound if spa_fallback => open_in(
+                        &canon_root,
+                        Path::new("index.html"),
+                        preload,
+                        adm.as_ref(),
+                        &mut slot,
+                    ),
+                    found => found,
+                }
+            });
+            ((root, rel), found)
         })
-    })
-    .await
-    .ok()
-    .flatten();
-    let Some(o) = found else {
-        return resp(StatusCode::NOT_FOUND);
-    };
-    let mime = mime_for(&o.path);
-    respond(
-        &o.path,
-        Source {
-            meta: o.meta,
-            file: Some(o.file),
-            body: o.body,
-        },
-        mime,
-        method,
-        req_headers,
-    )
-    .await
+        .await
+        {
+            Ok(answer) => answer,
+            Err(_) => return resp(StatusCode::NOT_FOUND),
+        };
+        paths = (root, rel);
+        let (o, slot) = match (found, admission.as_ref()) {
+            (Some(Opening::Found(o, slot)), _) => (o, slot),
+            // Every slot this needs is taken: wait for one, holding no file and no bytes of
+            // it, then look again.
+            (Some(Opening::Wait(need)), Some(adm)) => {
+                match adm.take(need).await {
+                    Ok(s) => held = Some((need, s)),
+                    Err(_) => return resp(StatusCode::SERVICE_UNAVAILABLE),
+                }
+                continue;
+            }
+            _ => return resp(StatusCode::NOT_FOUND),
+        };
+        let mime = mime_for(&o.path);
+        return respond(
+            &o.path,
+            Source {
+                meta: o.meta,
+                file: Some(o.file),
+                body: o.body,
+                slot: slot.map(|(_, s)| s),
+            },
+            mime,
+            method,
+            req_headers,
+        )
+        .await;
+    }
+    // The file was replaced by a larger one every time the request had waited for a slot.
+    resp(StatusCode::SERVICE_UNAVAILABLE)
 }
 
 /// Serve an already-resolved file, applying precompressed-sidecar negotiation
@@ -359,6 +503,7 @@ async fn serve_resolved(
     precompressed: bool,
     method: &Method,
     req_headers: &HeaderMap,
+    admission: Option<&Admission>,
 ) -> Response<ZionBody> {
     let mime = mime_for(path);
     if precompressed {
@@ -370,7 +515,7 @@ async fn serve_resolved(
             for (coding, ext) in [("br", "br"), ("gzip", "gz")] {
                 if accepts(ae, coding) {
                     if let Some(side) = resolve_sidecar(canon_root, path, ext).await {
-                        let mut resp = read_file(&side, mime, method, req_headers).await;
+                        let mut resp = read_file(&side, mime, method, req_headers, admission).await;
                         apply_negotiation_headers(&mut resp, Some(coding));
                         return resp;
                     }
@@ -378,11 +523,11 @@ async fn serve_resolved(
             }
         }
         // A precompressed route that serves identity must still advertise Vary.
-        let mut resp = read_file(path, mime, method, req_headers).await;
+        let mut resp = read_file(path, mime, method, req_headers, admission).await;
         apply_negotiation_headers(&mut resp, None);
         return resp;
     }
-    read_file(path, mime, method, req_headers).await
+    read_file(path, mime, method, req_headers, admission).await
 }
 
 /// Resolve the precompressed sidecar `<path>.<ext>`, applying the SAME
@@ -486,15 +631,26 @@ async fn read_file(
     mime: &'static str,
     method: &Method,
     req_headers: &HeaderMap,
+    admission: Option<&Admission>,
 ) -> Response<ZionBody> {
     let meta = match tokio::fs::metadata(path).await {
         Ok(m) => m,
         Err(_) => return resp(StatusCode::NOT_FOUND),
     };
+    // A GET takes its slot before the file is opened (see `serve_plain`); nothing is open while
+    // it waits.
+    let slot = match admission {
+        Some(adm) => match adm.take(need_for(meta.len())).await {
+            Ok(slot) => Some(slot),
+            Err(_) => return resp(StatusCode::SERVICE_UNAVAILABLE),
+        },
+        None => None,
+    };
     let source = Source {
         meta,
         file: None,
         body: None,
+        slot,
     };
     respond(path, source, mime, method, req_headers).await
 }
@@ -507,9 +663,12 @@ struct Source {
     meta: std::fs::Metadata,
     file: Option<std::fs::File>,
     body: Option<Vec<u8>>,
+    /// The static-response slot the request took (a `GET`).
+    slot: Option<StaticSlot>,
 }
 
-/// Build the response for `path` (see [`read_file`]): conditional, then range, then the full body.
+/// Build the response for `path` (see [`read_file`]), carrying the request's slot in its
+/// extensions for the listener to keep while the body is sent (`h2_stream::watch`).
 async fn respond(
     path: &Path,
     source: Source,
@@ -517,7 +676,28 @@ async fn respond(
     method: &Method,
     req_headers: &HeaderMap,
 ) -> Response<ZionBody> {
-    let Source { meta, file, body } = source;
+    let slot = source.slot.clone();
+    let mut resp = respond_with(path, source, mime, method, req_headers).await;
+    if let Some(slot) = slot {
+        resp.extensions_mut().insert(slot);
+    }
+    resp
+}
+
+/// [`respond`]: conditional, then range, then the full body.
+async fn respond_with(
+    path: &Path,
+    source: Source,
+    mime: &'static str,
+    method: &Method,
+    req_headers: &HeaderMap,
+) -> Response<ZionBody> {
+    let Source {
+        meta,
+        file,
+        body,
+        slot,
+    } = source;
     let (etag, last_modified) = validators(&meta);
     let total = meta.len();
 
@@ -549,7 +729,8 @@ async fn respond(
                         full_body(Bytes::new()),
                     );
                 }
-                return read_range(path, mime, start, end, total, etag, last_modified).await;
+                return read_range(path, mime, (start, end, total), etag, last_modified, slot)
+                    .await;
             }
             RangeOutcome::Full => {} // no usable Range — fall through to the full 200.
         }
@@ -571,7 +752,13 @@ async fn respond(
                 Err(_) => return resp(StatusCode::NOT_FOUND),
             },
         };
-        return file_response(mime, total, etag, last_modified, stream_file(file, None));
+        return file_response(
+            mime,
+            total,
+            etag,
+            last_modified,
+            stream_file(file, None, slot),
+        );
     }
     let data = match (body, file) {
         (Some(d), _) => d,
@@ -782,11 +969,10 @@ pub(crate) fn if_range_allows_stored(
 async fn read_range(
     path: &Path,
     mime: &'static str,
-    start: u64,
-    end: u64,
-    total: u64,
+    (start, end, total): (u64, u64, u64),
     etag: Option<HeaderValue>,
     last_modified: Option<HeaderValue>,
+    slot: Option<StaticSlot>,
 ) -> Response<ZionBody> {
     let len = end - start + 1;
     let mut f = match tokio::fs::File::open(path).await {
@@ -805,7 +991,7 @@ async fn read_range(
             total,
             etag,
             last_modified,
-            stream_file(f, Some(len)),
+            stream_file(f, Some(len), slot),
         );
     }
     let mut buf = vec![0u8; len as usize];
@@ -902,6 +1088,13 @@ fn mime_for(path: &Path) -> &'static str {
         _ => "application/octet-stream",
     }
 }
+
+/// A client of the tests' static requests.
+#[cfg(all(test, unix))]
+const TEST_CLIENT: Client = Client {
+    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10)),
+    via_trusted_proxy: false,
+};
 
 #[cfg(test)]
 mod tests {
@@ -1174,7 +1367,16 @@ mod serve_tests {
     }
 
     async fn get(root: &Path, tail: &str, spa: bool) -> (StatusCode, String) {
-        let r = serve(root, tail, spa, false, &Method::GET, &HeaderMap::new()).await;
+        let r = serve(
+            root,
+            tail,
+            spa,
+            false,
+            &Method::GET,
+            &HeaderMap::new(),
+            crate::static_files::TEST_CLIENT,
+        )
+        .await;
         let status = r.status();
         let body = r.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&body).into_owned())
@@ -1183,7 +1385,16 @@ mod serve_tests {
     /// GET with a set of request headers; returns the full response so tests can
     /// inspect status + response headers (validators, 304, …).
     async fn get_h(root: &Path, tail: &str, req: HeaderMap) -> Response<ZionBody> {
-        serve(root, tail, false, false, &Method::GET, &req).await
+        serve(
+            root,
+            tail,
+            false,
+            false,
+            &Method::GET,
+            &req,
+            crate::static_files::TEST_CLIENT,
+        )
+        .await
     }
 
     fn one(k: hyper::header::HeaderName, v: &str) -> HeaderMap {
@@ -1290,6 +1501,7 @@ mod serve_tests {
             false,
             &Method::HEAD,
             &HeaderMap::new(),
+            crate::static_files::TEST_CLIENT,
         )
         .await;
         assert_eq!(r.status(), StatusCode::OK);
@@ -1404,12 +1616,22 @@ mod serve_tests {
             false,
             &Method::HEAD,
             &HeaderMap::new(),
+            crate::static_files::TEST_CLIENT,
         )
         .await;
         let etag = first.headers().get(hyper::header::ETAG).unwrap().clone();
         let mut h = HeaderMap::new();
         h.insert(hyper::header::IF_NONE_MATCH, etag);
-        let second = serve(&root.0, "css/main.css", false, false, &Method::HEAD, &h).await;
+        let second = serve(
+            &root.0,
+            "css/main.css",
+            false,
+            false,
+            &Method::HEAD,
+            &h,
+            crate::static_files::TEST_CLIENT,
+        )
+        .await;
         assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
     }
 
@@ -1499,6 +1721,7 @@ mod serve_tests {
             false,
             &Method::HEAD,
             &one(hyper::header::RANGE, "bytes=1-3"),
+            crate::static_files::TEST_CLIENT,
         )
         .await;
         assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
@@ -1554,15 +1777,15 @@ mod serve_tests {
         let path = root.0.join("css/main.css");
 
         let whole = tokio::fs::File::open(&path).await.unwrap();
-        assert_eq!(&collect(stream_file(whole, None)).await, b"body{}");
+        assert_eq!(&collect(stream_file(whole, None, None)).await, b"body{}");
 
         let capped = tokio::fs::File::open(&path).await.unwrap();
-        assert_eq!(&collect(stream_file(capped, Some(3))).await, b"bod");
+        assert_eq!(&collect(stream_file(capped, Some(3), None)).await, b"bod");
 
         // A seek before streaming (how the range path drives it): last 4 bytes.
         let mut seeked = tokio::fs::File::open(&path).await.unwrap();
         seeked.seek(SeekFrom::Start(2)).await.unwrap();
-        assert_eq!(&collect(stream_file(seeked, Some(4))).await, b"dy{}");
+        assert_eq!(&collect(stream_file(seeked, Some(4), None)).await, b"dy{}");
     }
 
     #[tokio::test]
@@ -1577,13 +1800,13 @@ mod serve_tests {
         std::fs::write(&path, &data).unwrap();
 
         let whole = tokio::fs::File::open(&path).await.unwrap();
-        let got = collect(stream_file(whole, None)).await;
+        let got = collect(stream_file(whole, None, None)).await;
         assert_eq!(got.len(), n);
         assert_eq!(got, data, "whole streamed body must be byte-exact");
 
         let limit = STREAM_FRAME + 7; // stop mid-second-chunk
         let capped = tokio::fs::File::open(&path).await.unwrap();
-        let got = collect(stream_file(capped, Some(limit as u64))).await;
+        let got = collect(stream_file(capped, Some(limit as u64), None)).await;
         assert_eq!(got.len(), limit);
         assert_eq!(got, data[..limit], "limited stream stops on the exact byte");
     }
@@ -1621,7 +1844,7 @@ mod serve_tests {
             for limit in limits {
                 let want = limit.map_or(n, |l| (l as usize).min(n));
                 let file = tokio::fs::File::open(&path).await.unwrap();
-                let mut body = stream_file(file, limit);
+                let mut body = stream_file(file, limit, None);
                 let (mut got, mut frames) = (Vec::new(), Vec::new());
                 while let Some(frame) = body.frame().await {
                     let data = frame.unwrap().into_data().unwrap();
@@ -1712,7 +1935,16 @@ mod serve_tests {
                 HeaderValue::from_str(a).unwrap(),
             );
         }
-        serve(root, tail, false, true, &Method::GET, &h).await // precompressed = true
+        serve(
+            root,
+            tail,
+            false,
+            true,
+            &Method::GET,
+            &h,
+            crate::static_files::TEST_CLIENT,
+        )
+        .await // precompressed = true
     }
 
     #[tokio::test]
@@ -1792,7 +2024,16 @@ mod serve_tests {
             hyper::header::ACCEPT_ENCODING,
             HeaderValue::from_static("br"),
         );
-        let r = serve(&root.0, "css/main.css", false, false, &Method::GET, &h).await;
+        let r = serve(
+            &root.0,
+            "css/main.css",
+            false,
+            false,
+            &Method::GET,
+            &h,
+            crate::static_files::TEST_CLIENT,
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::OK);
         assert!(r.headers().get(hyper::header::CONTENT_ENCODING).is_none());
         assert!(r.headers().get(hyper::header::VARY).is_none());

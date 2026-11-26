@@ -540,6 +540,14 @@ pub struct Metrics {
     /// The most control frames any one HTTP/2 connection sent in one second since start:
     /// what to look at before choosing `h2_control_frames_per_sec`.
     pub h2_control_frames_peak: AtomicU64,
+    /// HTTP/2 and HTTP/3 streams reset, and HTTP/1.1 connections closed, because their response
+    /// waited `send_stall_secs` for a client that took nothing of it.
+    pub streams_stalled: AtomicU64,
+    /// Static `GET`s that found their client address's share of the static-response budget,
+    /// or the budget, spent, and waited for it (`static_budget`).
+    pub static_budget_waited: AtomicU64,
+    /// ... of which were answered `503` because none came free within the wait.
+    pub static_budget_refused: AtomicU64,
     /// Total bytes received on the gossip socket (decoded or not).
     pub mesh_gossip_bytes_in: AtomicU64,
     /// Errors reading the gossip socket (the receiver backs off between them).
@@ -676,6 +684,9 @@ impl Metrics {
             h2_flood_closed_control: AtomicU64::new(0),
             h2_flood_closed_window_update: AtomicU64::new(0),
             h2_control_frames_peak: AtomicU64::new(0),
+            streams_stalled: AtomicU64::new(0),
+            static_budget_waited: AtomicU64::new(0),
+            static_budget_refused: AtomicU64::new(0),
             mesh_gossip_bytes_in: AtomicU64::new(0),
             mesh_recv_errors: AtomicU64::new(0),
             mesh_gossip_bytes_out: AtomicU64::new(0),
@@ -1575,6 +1586,36 @@ impl Metrics {
         out.extend_from_slice(
             itoa_buf
                 .format(self.h2_control_frames_peak.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(
+            b"\n# HELP zion_streams_stalled_total HTTP/2 and HTTP/3 streams reset, and HTTP/1.1 connections closed, because their response waited send_stall_secs for a client that took nothing of it.\n\
+                                # TYPE zion_streams_stalled_total counter\n\
+                                zion_streams_stalled_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.streams_stalled.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(
+            b"\n# HELP zion_static_budget_waited_total Static GETs that waited for their client address's share of the static-response budget, or for the budget.\n\
+                                # TYPE zion_static_budget_waited_total counter\n\
+                                zion_static_budget_waited_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.static_budget_waited.load(Relaxed))
+                .as_bytes(),
+        );
+        out.extend_from_slice(
+            b"\n# HELP zion_static_budget_refused_total Static GETs answered 503 because their share of the static-response budget did not come free in time.\n\
+                                # TYPE zion_static_budget_refused_total counter\n\
+                                zion_static_budget_refused_total ",
+        );
+        out.extend_from_slice(
+            itoa_buf
+                .format(self.static_budget_refused.load(Relaxed))
                 .as_bytes(),
         );
         out.extend_from_slice(

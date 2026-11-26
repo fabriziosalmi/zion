@@ -735,6 +735,36 @@ mod tests {
         assert_eq!(build("h2_control_frames_per_sec = 750"), 750);
     }
 
+    /// `send_stall_secs` is read from the live snapshot when a connection is accepted, so a
+    /// reload that sets, changes or removes it must reach the snapshot.
+    #[test]
+    fn the_send_stall_deadline_is_carried_in_the_snapshot() {
+        let build = |line: &str| {
+            let cfg = parse_inline(&format!(
+                r#"
+            [server]
+            listen_http = "0.0.0.0:8080"
+            listen_https = "0.0.0.0:8443"
+            {line}
+            [tls]
+            cert_path = "/tmp/zion-test.crt"
+            key_path  = "/tmp/zion-test.key"
+            [upstreams]
+            api = "http://api:8000"
+            [[route]]
+            path = "/api/{{*rest}}"
+            upstream = "api"
+        "#
+            ));
+            ResolvedAppConfig::try_build(&cfg, TEST_CONN_LIMIT_MAX)
+                .expect("test config builds")
+                .send_stall_secs
+        };
+        assert_eq!(build(""), 300);
+        assert_eq!(build("send_stall_secs = 45"), 45);
+        assert_eq!(build("send_stall_secs = 0"), 0);
+    }
+
     /// The WebSocket limits are read from the live snapshot when an upgrade starts, so a
     /// reload that sets, changes or removes them must reach the snapshot.
     #[test]

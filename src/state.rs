@@ -20,7 +20,6 @@ use crate::{
     acme, audit, cache, config, connlimit, error, health, logging, numa, proxy, routing, security,
 };
 use arc_swap::ArcSwap;
-use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -84,6 +83,8 @@ pub(crate) struct ResolvedAppConfig {
     pub(crate) virtual_patch_shadow: bool,
     /// `[server] h2_control_frames_per_sec` (0 = no limit).
     pub(crate) h2_control_frames_per_sec: u32,
+    /// `[server] send_stall_secs` (0 = no deadline). Read at accept.
+    pub(crate) send_stall_secs: u64,
     /// The response cache's byte budget (`[server] cache_max_memory_mb`, or derived from
     /// memory; `0` = none). Applied by `crate::cache::configure` when the snapshot is
     /// published.
@@ -162,6 +163,7 @@ impl ResolvedAppConfig {
             virtual_patch_enabled: true,
             virtual_patch_shadow: false,
             h2_control_frames_per_sec: 0,
+            send_stall_secs: crate::h2_stream::DEFAULT_SEND_STALL_SECS,
             max_connections: None,
             cache_budget_bytes: 0,
             dns_stale_secs: crate::dns::DEFAULT_STALE_SECS,
@@ -538,6 +540,7 @@ impl ResolvedAppConfig {
             virtual_patch_enabled: config.virtual_patch.enabled,
             virtual_patch_shadow: config.virtual_patch.shadow,
             h2_control_frames_per_sec: config.server.h2_control_frames_per_sec,
+            send_stall_secs: config.server.send_stall_secs,
             max_connections: config.server.max_connections,
             cache_budget_bytes: config
                 .server
@@ -629,7 +632,7 @@ pub(crate) struct AppState {
     pub(crate) http_clients: dashmap::DashMap<crate::proxy::ClientSpec, HttpClient>,
     pub(crate) static_cache: cache::StaticCache,
     pub(crate) conn_limit: Arc<Semaphore>,
-    pub(crate) http_builder: Arc<AutoBuilder<TokioExecutor>>,
+    pub(crate) http_builder: Arc<AutoBuilder<crate::h2_stream::Executor>>,
     /// ACME HTTP-01 challenge tokens (empty when no challenge active).
     pub(crate) acme_challenges: acme::ChallengeStore,
     /// Virtual-patch rules (#698), hot-swapped by the rule-file watcher. Empty when the feature
@@ -720,7 +723,7 @@ impl AppState {
             http_clients: dashmap::DashMap::new(),
             static_cache: cache::StaticCache::new(),
             conn_limit: Arc::new(Semaphore::new(1024)),
-            http_builder: Arc::new(AutoBuilder::new(TokioExecutor::new())),
+            http_builder: Arc::new(AutoBuilder::new(crate::h2_stream::Executor)),
             acme_challenges: acme::new_challenge_store(),
             virtual_patch: Arc::new(ArcSwap::from_pointee(
                 crate::virtual_patch::VirtualPatchRules::default(),

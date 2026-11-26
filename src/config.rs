@@ -526,6 +526,19 @@ pub struct ServerConfig {
     /// to new connections.
     #[serde(default)]
     pub h2_control_frames_per_sec: u32,
+    /// Seconds a response may wait for a client that takes nothing of it (an HTTP/2 or HTTP/3
+    /// client that does not open its flow-control window, an HTTP/1.1 client that does not
+    /// read its socket) to take the next piece of it, before that one stream is reset
+    /// (`RST_STREAM(CANCEL)`, `H3_REQUEST_CANCELLED`), or on HTTP/1.1 the connection closed, and
+    /// what it holds (an open file, an upstream connection, buffered bytes) is freed. Default
+    /// 300; `0` = no deadline. A body is
+    /// handed over in pieces of at most 64 KiB, whatever the size of its chunks, and the time
+    /// counts from the last piece the client took, so a slow reader is not cut: one that takes
+    /// nothing at all for this long is. The keep-alive `PING` does not cover this case: a
+    /// client that answers it can still hold the window closed for the hour a connection may
+    /// last. Read at accept, so a reload applies it to new connections.
+    #[serde(default = "default_send_stall_secs")]
+    pub send_stall_secs: u64,
     /// The most client connections held open at once, on both listeners together; the
     /// next one is refused at accept and counted in
     /// `zion_connections_rejected_global_total`. Unset (the default), it is derived from
@@ -624,6 +637,10 @@ fn default_tcp_user_timeout_secs() -> u64 {
 
 fn default_tcp_keepalive_secs() -> u64 {
     crate::net::DEFAULT_TCP_KEEPALIVE_SECS
+}
+
+fn default_send_stall_secs() -> u64 {
+    crate::h2_stream::DEFAULT_SEND_STALL_SECS
 }
 
 fn default_dns_stale_secs() -> u64 {
@@ -3817,6 +3834,21 @@ mod tests {
             );
         }
         assert!(toml::from_str::<ZionConfig>(&cfg("h2_control_frames_per_sec = -1")).is_err());
+    }
+
+    #[test]
+    fn send_stall_secs_defaults_to_five_minutes_and_zero_turns_it_off() {
+        let secs = |extra: &str| -> u64 {
+            toml::from_str::<ZionConfig>(&format!(
+                "[server]\nlisten_http=\"0.0.0.0:80\"\nlisten_https=\"0.0.0.0:443\"\n{extra}\n[tls]\ncert_path=\"/c\"\nkey_path=\"/k\"\n[upstream.u]\nurl=\"http://a:1\"\n[[route]]\npath=\"/{{*r}}\"\nupstream=\"u\"\n"
+            ))
+            .unwrap()
+            .server
+            .send_stall_secs
+        };
+        assert_eq!(secs(""), 300, "on by default");
+        assert_eq!(secs("send_stall_secs = 0"), 0);
+        assert_eq!(secs("send_stall_secs = 30"), 30);
     }
 
     #[test]

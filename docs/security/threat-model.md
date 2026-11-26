@@ -101,6 +101,42 @@ streams it never opened) at wire speed.
   bounds how many such connections one address holds. See
   [Hardening](hardening.md#http-2-control-frame-floods).
 
+**D - denial of service**: one HTTP/2 connection that opens its 128 streams
+and never opens their flow-control windows, answering the keep-alive `PING`,
+so every response stays held: 128 open files on a static route, 128 upstream
+connections on a proxied one, for the hour a connection may last. The same
+through an HTTP/3 connection that grants no stream credit, with 256 streams,
+and one address may open many connections (an eighth of the connection
+ceiling over TCP, any number over QUIC).
+- **Mitigation**: on HTTP/2 and HTTP/3, a connection streams at most eight
+  static files at once, and the smaller files it reads whole share 4.5 MiB
+  (the others wait, holding nothing), except on a connection from a
+  `trusted_proxies` peer. On every protocol, every static response also
+  takes what it holds (768 KiB for a streamed file) from its client
+  address's share of a budget for the whole process, derived from the
+  connection ceiling (2 GiB and 256 MiB for one address on a 16 GiB host);
+  behind a trusted proxy the address is the client the request resolves to.
+  A request that finds the share or the budget spent waits at most 10 s,
+  then gets `503`. A stream whose response has waited `[server]
+  send_stall_secs` (default 300) for the client to take a piece of at most
+  64 KiB is reset, or on HTTP/1.1 its connection closed, freeing what it
+  holds; on HTTP/2 a static response's stream ends only once its last piece
+  has left, so the deadline covers it.
+- **Residual**: proxied streams have no per-connection cap and no budget,
+  only the deadline, so a connection can hold up to 128 upstream connections
+  for up to `send_stall_secs` and open new streams after the resets.
+  Clients behind one address share its share. About eight addresses that
+  fill their shares spend the whole budget: static `GET`s from every client
+  then get `503` after 10 s until `send_stall_secs` resets the holders
+  (measured: a ninth client got the 2 responses left and 3 `503`s, and was
+  served again once the holders were reset). That replaces memory
+  exhaustion of the host; `zion_static_budget_refused_total` is the signal
+  to alert on. A ninth large static file on one connection waits,
+  without its headers, until one of the eight is sent or reset: behind long
+  downloads that can be long, and a client that wants the headers of more
+  than eight large responses before it reads any waits for the deadline. See
+  [Hardening](hardening.md#http-2-responses-a-client-does-not-read).
+
 **E — elevation of privilege**: cert reload races with in-flight handshake,
 allowing an attacker to keep using a revoked cert.
 - **Mitigation**: hot-reload is `ArcSwap` ([ADR-0001](../adr/0001-arcswap-config-hot-reload.md))

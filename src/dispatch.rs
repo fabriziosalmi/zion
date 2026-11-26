@@ -732,6 +732,14 @@ async fn dispatch_by_mode(
                         rule.precompressed,
                         req.method(),
                         req.headers(),
+                        // The client the request resolves to (behind a trusted proxy, the one
+                        // the proxy names) holds the response's share of the static budget.
+                        crate::static_budget::Client {
+                            ip: forward_addr.ip(),
+                            via_trusted_proxy: cfg
+                                .trusted_proxies
+                                .is_trusted(&remote_addr.ip().to_canonical()),
+                        },
                     )
                     .await
                 }
