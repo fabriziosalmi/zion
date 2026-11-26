@@ -2,7 +2,7 @@
 layout: home
 title: Zion Edge Gateway
 titleTemplate: TLS reverse proxy · WAF · RAM cache, in Rust
-description: One auditable Rust binary at the edge: TLS 1.3 termination, a zero-regex WAF, and a two-level RAM cache. No sidecars, no GeoIP database, no control plane.
+description: "One auditable Rust binary at the edge: TLS 1.3 termination, a zero-regex WAF, and a two-level RAM cache. No sidecars, no GeoIP database, no control plane."
 ---
 
 <div class="ds-home">
