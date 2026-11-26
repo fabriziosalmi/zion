@@ -1090,7 +1090,7 @@ fn mime_for(path: &Path) -> &'static str {
 }
 
 /// A client of the tests' static requests.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 const TEST_CLIENT: Client = Client {
     ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10)),
     via_trusted_proxy: false,

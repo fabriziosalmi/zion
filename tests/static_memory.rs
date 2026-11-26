@@ -343,18 +343,7 @@ impl Peer {
             .with_no_client_auth();
         cfg.alpn_protocols = vec![b"h2".to_vec()];
         let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        tcp.set_read_timeout(Some(Duration::from_millis(50)))
-            .unwrap();
-        let conn = rustls::ClientConnection::new(
-            Arc::new(cfg),
-            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
-        )
-        .unwrap();
-        Peer::start(
-            Box::new(rustls::StreamOwned::new(conn, tcp)),
-            settings,
-            then,
-        )
+        Peer::start(Box::new(tls_connect(Arc::new(cfg), tcp)), settings, then)
     }
 
     fn send(&mut self, bytes: &[u8]) {
@@ -1170,14 +1159,7 @@ fn one_address_over_many_http1_connections_holds_at_most_its_share() {
     let conns: Vec<_> = (0..CONNS)
         .map(|_| {
             let tcp = TcpStream::connect(("127.0.0.1", zion.https)).unwrap();
-            tcp.set_read_timeout(Some(Duration::from_millis(50)))
-                .unwrap();
-            let conn = rustls::ClientConnection::new(
-                cfg.clone(),
-                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
-            )
-            .unwrap();
-            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            let mut tls = tls_connect(cfg.clone(), tcp);
             tls.write_all(b"GET /files/huge.bin HTTP/1.1\r\nHost: localhost\r\n\r\n")
                 .unwrap();
             tls.flush().unwrap();
@@ -1552,6 +1534,27 @@ fn waiting_for_the_share_ends_with_the_deadline_of_the_stalled_and_never_for_rea
     assert_eq!(bytes, 64 * BIG_BYTES);
 }
 
+/// A TLS client to `localhost` on `tcp`, its handshake finished on the blocking socket, then a
+/// 50 ms read timeout set for the reads the tests poll with. rustls reads during the handshake,
+/// and under the timeout a server slower than 50 ms (a loaded CI runner) made that read fail
+/// with `WouldBlock`.
+fn tls_connect(
+    cfg: Arc<rustls::ClientConfig>,
+    mut tcp: TcpStream,
+) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    let mut conn = rustls::ClientConnection::new(
+        cfg,
+        rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+    )
+    .unwrap();
+    while conn.is_handshaking() {
+        conn.complete_io(&mut tcp).unwrap();
+    }
+    tcp.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    rustls::StreamOwned::new(conn, tcp)
+}
+
 /// An HTTP/1.1 client over TLS whose socket receive buffer is 16 KiB, so the server's sends
 /// stop as soon as the client stops reading, after it has sent `GET <path>`.
 fn h1_get(port: u16, path: &str) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
@@ -1566,14 +1569,7 @@ fn h1_get(port: u16, path: &str) -> rustls::StreamOwned<rustls::ClientConnection
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     sock.connect(&addr.into()).unwrap();
     let tcp: TcpStream = sock.into();
-    tcp.set_read_timeout(Some(Duration::from_millis(50)))
-        .unwrap();
-    let conn = rustls::ClientConnection::new(
-        Arc::new(cfg),
-        rustls::pki_types::ServerName::try_from("localhost").unwrap(),
-    )
-    .unwrap();
-    let mut tls = rustls::StreamOwned::new(conn, tcp);
+    let mut tls = tls_connect(Arc::new(cfg), tcp);
     let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
     tls.write_all(req.as_bytes()).unwrap();
     tls.flush().unwrap();
